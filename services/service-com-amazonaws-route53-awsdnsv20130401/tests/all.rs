@@ -19,6 +19,8 @@ mod checker_ip_ranges;
 mod error_classification;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/health_checks.rs"]
+mod health_checks;
 #[path = "all/hosted_zone_config.rs"]
 mod hosted_zone_config;
 #[path = "all/hosted_zone_count.rs"]

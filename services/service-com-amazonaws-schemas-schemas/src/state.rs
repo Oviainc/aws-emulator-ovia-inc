@@ -80,6 +80,104 @@ impl ComAmazonawsSchemasSchemasState {
             .values()
             .find(|discoverer| discoverer.source_arn == source_arn)
     }
+
+    /// The tags this store holds for the resource a `ResourceArn` names, as the
+    /// resource reports its ARN to a request signed for `region`.
+    ///
+    /// A resource is identified by the ARN this service ISSUES for it, not by its name
+    /// alone: a caller's registry, schema or discoverer by the ARN its create minted,
+    /// and a service-owned registry by the ARN it reports to the asking region
+    /// ([`Registry::arn_in`]). So an ARN this service never issued — another account's,
+    /// another region's, or one of a service-owned SCHEMA, which carries no ARN at all
+    /// ([`Registry::schema_arn_in`]) — names no resource here.
+    ///
+    /// `Err` keeps the two refusals apart: a value that is no resource ARN of this
+    /// service, and one that is but names nothing this store holds.
+    pub fn tags_for_arn(
+        &self,
+        arn: &str,
+        region: &str,
+    ) -> Result<&BTreeMap<String, String>, ResourceArnError> {
+        let held = match parse_resource_arn(arn).ok_or(ResourceArnError::NotAResourceArn)? {
+            TaggedResource::Registry { registry } => self
+                .registries
+                .get(&registry)
+                .filter(|held| held.arn_in(region) == arn)
+                .map(|held| &held.tags),
+            TaggedResource::Schema { registry, schema } => {
+                self.registries.get(&registry).and_then(|held| {
+                    let schema = held.schemas.get(&schema)?;
+                    (held.schema_arn_in(region, schema).as_deref() == Some(arn))
+                        .then_some(&schema.tags)
+                })
+            }
+            TaggedResource::Discoverer { discoverer_id } => self
+                .discoverers
+                .get(&discoverer_id)
+                .filter(|held| held.arn == arn)
+                .map(|held| &held.tags),
+        };
+        held.ok_or(ResourceArnError::NoSuchResource)
+    }
+
+    /// The tag set a caller's WRITE reaches through a `ResourceArn`, as the resource
+    /// reports its ARN to a request signed for `region`.
+    ///
+    /// Which resource an ARN names is the READ's answer — this resolves through
+    /// [`Self::tags_for_arn`], so a write cannot reach a resource a read of the same
+    /// ARN would not, and the two can never disagree about which ARN names what.
+    ///
+    /// What a write adds is the one refusal a read does not have: what is in a
+    /// service-owned registry is AWS's, so a caller may read it but not write to it —
+    /// the same refusal every other write to one gets. A service-owned SCHEMA needs
+    /// no case here: it carries no ARN at all ([`Registry::schema_arn_in`]), so no
+    /// ARN names one and the resolve above already answers that nothing is there.
+    pub fn writable_tags_for_arn(
+        &mut self,
+        arn: &str,
+        region: &str,
+    ) -> Result<&mut BTreeMap<String, String>, ResourceArnWriteError> {
+        // Resolve as a read does, and refuse what a read refuses: this is what makes
+        // the write reach the same tag set a later read of the same ARN reports.
+        self.tags_for_arn(arn, region)?;
+        let resource = parse_resource_arn(arn).ok_or(ResourceArnWriteError::NotAResourceArn)?;
+        // The registry whose scope says whether AWS or the caller owns what the ARN
+        // names: the registry itself, or the registry a schema belongs to.
+        let owning_registry = match &resource {
+            TaggedResource::Registry { registry } | TaggedResource::Schema { registry, .. } => {
+                Some(registry.clone())
+            }
+            TaggedResource::Discoverer { .. } => None,
+        };
+        if let Some(registry) = owning_registry {
+            if self
+                .registries
+                .get(&registry)
+                .is_some_and(|held| held.scope.is_managed())
+            {
+                return Err(ResourceArnWriteError::ServiceOwned(registry));
+            }
+        }
+        // The resolve above already established that this store holds the resource
+        // this ARN names, so these lookups answer; they are fallible only because a
+        // map lookup is.
+        let held = match resource {
+            TaggedResource::Registry { registry } => self
+                .registries
+                .get_mut(&registry)
+                .map(|held| &mut held.tags),
+            TaggedResource::Schema { registry, schema } => self
+                .registries
+                .get_mut(&registry)
+                .and_then(|held| held.schemas.get_mut(&schema))
+                .map(|held| &mut held.tags),
+            TaggedResource::Discoverer { discoverer_id } => self
+                .discoverers
+                .get_mut(&discoverer_id)
+                .map(|held| &mut held.tags),
+        };
+        held.ok_or(ResourceArnWriteError::NoSuchResource)
+    }
 }
 
 /// A fresh store already holds the service-owned registries: they exist in every
@@ -2507,19 +2605,128 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
 }
 
+/// The `service` field every ARN of this service carries — its signing name.
+pub const ARN_SERVICE: &str = "schemas";
+
 /// `arn:aws:schemas:<region>:<account>:registry/<registry>`.
 pub fn registry_arn(region: &str, registry: &str) -> String {
-    ::engine::emulator_arn("schemas", region, &format!("registry/{registry}"))
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("registry/{registry}"))
 }
 
 /// `arn:aws:schemas:<region>:<account>:schema/<registry>/<schema>`.
 pub fn schema_arn(region: &str, registry: &str, schema: &str) -> String {
-    ::engine::emulator_arn("schemas", region, &format!("schema/{registry}/{schema}"))
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("schema/{registry}/{schema}"))
 }
 
 /// `arn:aws:schemas:<region>:<account>:discoverer/<id>`.
 pub fn discoverer_arn(region: &str, discoverer_id: &str) -> String {
-    ::engine::emulator_arn("schemas", region, &format!("discoverer/{discoverer_id}"))
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("discoverer/{discoverer_id}"))
+}
+
+/// A resource of this service that carries a tag set: what a `ResourceArn` names.
+///
+/// The three resource types this service's ARNs name — the registry, the schema and
+/// the discoverer — each identified by the part of the ARN after the account field,
+/// which is what tells one resource of a type from another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `registry/<name>`.
+    Registry { registry: String },
+    /// `schema/<registry>/<name>` — a schema is named within its registry.
+    Schema { registry: String, schema: String },
+    /// `discoverer/<id>`, by the id the service minted.
+    Discoverer { discoverer_id: String },
+}
+
+/// Why a `ResourceArn` names no tag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceArnError {
+    /// The value is no resource ARN of this service, so it could name no resource in
+    /// any store: the request's own form is wrong.
+    NotAResourceArn,
+    /// A resource ARN of this service, naming a resource this store does not hold.
+    NoSuchResource,
+}
+
+/// Why a `ResourceArn` names no tag set a caller may WRITE.
+///
+/// The two refusals a read has ([`ResourceArnError`]), plus the one only a write can
+/// meet: the ARN names content AWS owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceArnWriteError {
+    /// The value is no resource ARN of this service: the request's own form is wrong.
+    NotAResourceArn,
+    /// A resource ARN of this service, naming a resource this store does not hold.
+    NoSuchResource,
+    /// A resource of a service-owned registry, named here — AWS owns what is in it,
+    /// so a caller may read it but not write to it.
+    ServiceOwned(String),
+}
+
+/// A write meets every refusal a read of the same ARN meets, and words it the same
+/// way, so the one resolution serves both.
+impl From<ResourceArnError> for ResourceArnWriteError {
+    fn from(error: ResourceArnError) -> Self {
+        match error {
+            ResourceArnError::NotAResourceArn => Self::NotAResourceArn,
+            ResourceArnError::NoSuchResource => Self::NoSuchResource,
+        }
+    }
+}
+
+/// The resource an ARN of THIS service names, or `None` for a value that names none of
+/// them: one that is not an ARN at all ([`is_arn`]), one whose `service` field is
+/// another service's, or one whose resource part is not a resource type this service
+/// has — such a value can name no resource of this service in any account or region.
+///
+/// The partition, region and account fields are not read here: they say WHERE a
+/// resource lives, not which resource it is, and whether one of this store's resources
+/// reports exactly this ARN is what
+/// [`ComAmazonawsSchemasSchemasState::tags_for_arn`] then decides.
+pub fn parse_resource_arn(candidate: &str) -> Option<TaggedResource> {
+    if !is_arn(candidate) {
+        return None;
+    }
+    let mut fields = candidate.splitn(6, ':');
+    // `arn`, partition, service, region, account, resource — the six an ARN has.
+    fields.next();
+    fields.next();
+    if fields.next() != Some(ARN_SERVICE) {
+        return None;
+    }
+    fields.next();
+    fields.next();
+    let resource = fields.next()?;
+    // A registry and a schema name are each ONE path segment of the resource part (the
+    // model binds both to a non-greedy URI label, so neither can hold a `/`), so a
+    // resource part carrying a segment more than its type takes names no resource.
+    let mut parts = resource.splitn(4, '/');
+    let kind = parts.next()?;
+    let (first, second, extra) = (parts.next(), parts.next(), parts.next());
+    if extra.is_some() {
+        return None;
+    }
+    match (kind, first, second) {
+        ("registry", Some(registry), None) if !registry.is_empty() => {
+            Some(TaggedResource::Registry {
+                registry: registry.to_string(),
+            })
+        }
+        ("schema", Some(registry), Some(schema))
+            if !registry.is_empty() && !schema.is_empty() =>
+        {
+            Some(TaggedResource::Schema {
+                registry: registry.to_string(),
+                schema: schema.to_string(),
+            })
+        }
+        ("discoverer", Some(discoverer_id), None) if !discoverer_id.is_empty() => {
+            Some(TaggedResource::Discoverer {
+                discoverer_id: discoverer_id.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Store the `Tags` member of a request. An absent map and an empty one are the same
@@ -3137,6 +3344,33 @@ pub fn is_arn(candidate: &str) -> bool {
         && fields.next().is_some()
         && fields.next().is_some()
         && fields.next().is_some_and(|resource| !resource.is_empty())
+}
+
+/// Refuse a `ResourceArn` that is no resource ARN of this service
+/// ([`parse_resource_arn`]).
+///
+/// A tagging operation acts on the resource its ARN IDENTIFIES, so a value that is not
+/// an ARN, or is an ARN of another service or of no resource type this service has,
+/// names no resource anywhere and is refused on its form. Names the member and what it
+/// must carry, never the value — as [`source_arn_not_an_arn`] does for the other ARN
+/// member this service takes.
+pub fn resource_arn_not_a_resource_arn() -> BadRequestException {
+    bad_request(format!(
+        "ResourceArn must be the ARN of a {ARN_SERVICE} registry, schema or discoverer, \
+         in the form arn:<partition>:{ARN_SERVICE}:<region>:<account>:registry/<name>, \
+         arn:<partition>:{ARN_SERVICE}:<region>:<account>:schema/<registry>/<name> or \
+         arn:<partition>:{ARN_SERVICE}:<region>:<account>:discoverer/<id>."
+    ))
+}
+
+/// Message for a resource ARN this store holds no resource for. The template is the
+/// service's own for a missing resource — "«Resource» with «identifier» «value» does
+/// not exist.", as [`registry_not_found`] carries it — built from the request's
+/// `ResourceArn`, which is the only identifier such a request names.
+pub fn tagged_resource_not_found(resource_arn: &str) -> NotFoundException {
+    not_found(format!(
+        "Resource with ARN {resource_arn} does not exist."
+    ))
 }
 
 /// Refuse a `CreateSchema` for a name its registry already holds. The template is

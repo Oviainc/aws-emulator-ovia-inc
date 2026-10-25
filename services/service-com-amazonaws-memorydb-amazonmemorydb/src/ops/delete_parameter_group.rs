@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the named parameter group from [`crate::state`] and answers the
+//! record it removed, so a later `DescribeParameterGroups` / `DescribeParameters` for
+//! that name answers the modelled not-found fault. The two rules the operation
+//! documents are enforced from state: a group MemoryDB itself owns (`default.<family>`)
+//! is not the caller's to delete, and a group a cluster still references cannot go away
+//! under it.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteParameterGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); the request is refused rather than reported
+            // as a delete nothing performed.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // A parameter-group name is a case-insensitive identifier, so the name this
+        // request deletes is folded exactly as the store is keyed.
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        // The groups the account ALREADY HAD before any call — the `default.<family>`
+        // ones MemoryDB owns — are materialised on first touch, exactly as
+        // `DescribeParameterGroups` does, so a delete naming one is refused as the
+        // service's own group rather than answered not-found for it.
+        state.ensure_builtins(&region);
+
+        // WHICH GROUP FIRST: a request naming a group state does not hold is answered
+        // not-found whatever else is wrong with it.
+        let Some(group) = state.parameter_groups.get(&parameter_group_name) else {
+            return Err(DeleteParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                ParameterGroupNotFoundFault {
+                    message: Some(crate::state::parameter_group_not_found_message(
+                        &parameter_group_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "You cannot delete the default parameter groups in your account": a group
+        // MemoryDB itself provides carries a family's engine defaults, so it is not the
+        // caller's to remove. The refusal is the one rule every write path over a
+        // parameter group reads.
+        if let Some(message) = crate::state::immutable_parameter_group_rejection(
+            &parameter_group_name,
+            crate::state::Mutation::Delete,
+        ) {
+            return Err(
+                DeleteParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "You cannot delete a parameter group if it is associated with any clusters":
+        // a cluster's settings come from the group it names, so a group still named by
+        // one cannot go away under it. The list is derived from the clusters in state,
+        // so the refusal names exactly the clusters a caller reads in
+        // `Cluster$ParameterGroupName`.
+        let clusters = state.clusters_using_parameter_group(&parameter_group_name);
+        if !clusters.is_empty() {
+            return Err(
+                DeleteParameterGroupErrorModeled::InvalidParameterGroupStateFault(
+                    InvalidParameterGroupStateFault {
+                        message: Some(format!(
+                            "Parameter group {parameter_group_name} is associated with \
+                             cluster(s) {} and must be disassociated from them before it \
+                             can be deleted.",
+                            clusters.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The response describes the group as the caller last had it, built from the
+        // record this call removes.
+        let response = group.to_api();
+        let arn = group.arn.clone();
+        // Gone from the store, so no later call reports it and the readers answer the
+        // modelled not-found fault for its name.
+        state.parameter_groups.remove(&parameter_group_name);
+        // Its tags go with it: a tag set keyed by an ARN nothing resolves would be read
+        // by a later `ListTags` for a resource that no longer exists.
+        state.tags.remove(&arn);
+        // The change this call made, recorded against the resource it made it to, so
+        // `DescribeEvents` reports it.
+        state.record_event(
+            crate::state::event_source_type::PARAMETER_GROUP,
+            &parameter_group_name,
+            crate::state::EventKind::Deleted,
+        );
+        Ok(DeleteParameterGroupOutput {
+            parameter_group: Some(response),
+        })
     }
 }

@@ -145,6 +145,8 @@ mod fpga_image_tasks_and_volume_io;
 mod get_password_data;
 #[path = "all/host_reservation_offerings.rs"]
 mod host_reservation_offerings;
+#[path = "all/image_references.rs"]
+mod image_references;
 #[path = "all/image_usage_reports.rs"]
 mod image_usage_reports;
 #[path = "all/images.rs"]
@@ -229,6 +231,9 @@ mod stale_security_groups;
 mod state_roundtrip;
 #[path = "all/store_image_tasks.rs"]
 mod store_image_tasks;
+// Reserving part of a subnet's CIDR range, and reading the reservations of one subnet back.
+#[path = "all/subnet_cidr_reservations.rs"]
+mod subnet_cidr_reservations;
 #[path = "all/transit_gateway_acceptance.rs"]
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]

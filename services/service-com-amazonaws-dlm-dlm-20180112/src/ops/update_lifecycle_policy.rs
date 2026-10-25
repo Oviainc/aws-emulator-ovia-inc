@@ -165,7 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateLifecyclePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -207,8 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The policy this update addresses is the one in the region the request
+        // was signed for: an id belonging to another region names no policy here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(policy) = store.policies.get_mut(&input.policy_id) else {
+        let Some(policy) = store.policy_mut(&region, &input.policy_id) else {
             return Err(
                 UpdateLifecyclePolicyErrorModeled::ResourceNotFoundException(
                     crate::state::policies_not_found(&[input.policy_id]),

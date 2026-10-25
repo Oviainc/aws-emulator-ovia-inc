@@ -47,6 +47,8 @@ mod modify_cluster_snapshot;
 mod orderable_cluster_options;
 #[path = "all/qev2_idc_applications.rs"]
 mod qev2_idc_applications;
+#[path = "all/reboot_cluster.rs"]
+mod reboot_cluster;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/reserved_node_offerings.rs"]

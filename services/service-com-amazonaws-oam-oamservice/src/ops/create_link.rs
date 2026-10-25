@@ -188,6 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::service` words it as. The resource-type catalog is checked again
         // here so this handler never stores a type the model does not declare,
         // whatever refused it first.
+        //
+        // A `SinkIdentifier` naming the OTHER resource kind cannot be authorized for
+        // this action — the permission to attach a link is granted by the SINK's own
+        // resource policy — and that decision is taken before the sink table is
+        // consulted, so the refusal says nothing about what is stored.
+        crate::state::require_resource_kind(
+            Self::NAME,
+            &input.sink_identifier,
+            crate::state::ResourceKind::Sink,
+        )?;
+
         if let Some(unmodelled) = crate::state::unmodelled_resource_type(&input.resource_types) {
             // The offending value is caller-controlled text, so only its first
             // characters are echoed back.

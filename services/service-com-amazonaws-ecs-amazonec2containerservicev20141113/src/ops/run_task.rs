@@ -5,8 +5,11 @@
 //! Each task is persisted — ARN, containers derived from the STORED container
 //! definitions, timestamps — so `DescribeTasks`, `ListTasks` and the cluster counters
 //! all read the same record back. A task is answered in `PENDING`, the status AWS
-//! reports for a task that has not started yet; the move to `RUNNING` is owed by the
-//! clock (see `crate::state`).
+//! reports for a task that has been placed but has not started yet; the move to
+//! `RUNNING` is owed by the clock (see `crate::state`). A task whose placement still has
+//! to have capacity acquired for it — routed through a capacity provider that scales its
+//! own Auto Scaling group, into a cluster holding no container instance — is answered in
+//! `PROVISIONING` instead, and reaches `PENDING` only once that capacity registers.
 //!
 //! ## Shape of an operation
 //!
@@ -531,7 +534,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let created_at = crate::state::now();
-        let running_due_at = now + crate::state::TRANSITION_SPAN;
+        // Where the placement is routed through a capacity provider that still has to
+        // ACQUIRE the capacity for it, the task has been accepted but not placed: Amazon
+        // ECS has to add a container instance first, which is what `PROVISIONING` reports,
+        // and no start is owed until it has. A placement onto capacity that already exists
+        // is `PENDING` with its start owed by the clock.
+        let awaiting_capacity = crate::state::awaits_provisioned_capacity(
+            capacity_provider_name
+                .as_deref()
+                .and_then(|name| guard.capacity_providers.get(name)),
+            guard.registered_container_instances(&cluster_name),
+        );
+        let initial_status = crate::state::initial_task_status(awaiting_capacity);
+        let running_due_at = if awaiting_capacity {
+            None
+        } else {
+            Some(now + crate::state::TRANSITION_SPAN)
+        };
         let mut created = Vec::with_capacity(requested);
         for _ in 0..count {
             let task_id = guard.next_task_id();
@@ -542,7 +561,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &task_id,
                 &task_arn,
                 &definition,
-                crate::state::STATUS_PENDING,
+                initial_status,
             );
 
             let record = crate::state::TaskRecord {
@@ -552,7 +571,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cluster_arn: cluster_arn.clone(),
                 task_definition_arn: definition.arn.clone(),
                 family: definition.family.clone(),
-                last_status: crate::state::STATUS_PENDING.to_string(),
+                last_status: initial_status.to_string(),
                 desired_status: crate::state::STATUS_RUNNING.to_string(),
                 containers,
                 cpu: definition.cpu.clone(),
@@ -576,7 +595,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stopped_reason: None,
                 stop_code: None,
                 version: 1,
-                running_due_at: Some(running_due_at),
+                pending_due_at: None,
+                running_due_at,
                 stopped_due_at: None,
             };
             // `RunTask` has no `include` member to narrow the response with, so the

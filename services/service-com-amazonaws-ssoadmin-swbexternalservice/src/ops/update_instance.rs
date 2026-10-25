@@ -301,11 +301,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.permission_sets_enabled = true;
         }
         if let Some(configuration) = input.encryption_configuration {
-            instance.encryption = Some(crate::state::EncryptionConfigurationRecord::new(
+            // REPLACES the configuration the instance already had (the Amazon Web
+            // Services owned default, until a caller opts into a key of its own): the key
+            // change is asynchronous, so the new record reports `UPDATING` until it is
+            // due.
+            instance.encryption = crate::state::EncryptionConfigurationRecord::new(
                 configuration.key_type,
                 configuration.kms_key_arn,
                 ::std::time::SystemTime::now(),
-            ));
+            );
         }
 
         // `UpdateInstanceResponse` models no members: the updated record is read back

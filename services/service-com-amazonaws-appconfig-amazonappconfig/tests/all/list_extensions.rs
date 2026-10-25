@@ -1,39 +1,54 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListExtensions` as a paginated report over the extensions one account holds.
+//! `ListExtensions` as a paginated report over the extension catalogue one account sees.
 //!
-//! The rule under test: the listing reports exactly the extensions this account created —
-//! every one of them, each exactly once, each as the LATEST version `GetExtension`
-//! answers for it — in an order that is stable across calls, cut into pages of at most
-//! `MaxResults` entries, with a `NextToken` handed back only when entries are left over
-//! and a token that resumes the traversal where the previous page ended. A `Name` narrows
-//! the listing to the extension carrying that name, which is unique per account.
+//! The rule under test: the listing reports exactly the extensions the account can see —
+//! AppConfig's AWS-authored extensions and every extension this account created — each
+//! exactly once, each as the LATEST version `GetExtension` answers for it — in an order
+//! that is stable across calls, cut into pages of at most `MaxResults` entries, with a
+//! `NextToken` handed back only when entries are left over and a token that resumes the
+//! traversal where the previous page ended. A `Name` narrows the listing to the extension
+//! carrying that name, which is unique per account.
 //!
-//! The tables span what that rule generalises over: HOW MANY extensions the account holds
-//! (none, one, several, and more than a page), WHICH page size the request asks for
-//! (absent, the published bounds of `MaxResults` and values in between), HOW MANY versions
-//! an extension has (so the reported version is the latest rather than the first), and
-//! WHAT each extension carries (a description or none). Every assertion names its case and
-//! prints the actual value.
+//! The tables span what that rule generalises over: HOW MANY extensions the account
+//! created (none, one, several, and more than a page), WHICH page size the request asks
+//! for (absent, the published bounds of `MaxResults` and values in between), HOW MANY
+//! versions an extension has (so the reported version is the latest rather than the
+//! first), and WHAT each extension carries (a description or none). Every assertion names
+//! its case and prints the actual value.
 //!
-//! `ListExtensions` reports no Amazon Web Services authored extension: this emulator
-//! stores no record for one, so a fresh account's listing is empty rather than a catalog
-//! nothing here could have created.
+//! The AWS-authored half of the catalogue has its own suite
+//! (`crate::aws_authored_extensions`); here it is the fixed set every listing also
+//! reports, so these cases assert the account's own extensions AGAINST it rather than
+//! against an empty store.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_appconfig_amazonappconfig::ops::types::ACTION_POINT_VALUES;
-use service_com_amazonaws_appconfig_amazonappconfig::state::MAX_LIST_PAGE_SIZE;
+use service_com_amazonaws_appconfig_amazonappconfig::state::{
+    AWS_AUTHORED_EXTENSIONS, MAX_LIST_PAGE_SIZE,
+};
 
 use crate::appconfig_workflow::{json_call, router, Answer};
 use crate::extensions::{actions, create_extension, get_extension, minted_id};
 use crate::resource_tags::pct;
 
+/// The names of AppConfig's AWS-authored extensions, which every listing reports beside
+/// the account's own: read from the service's published catalogue, so these cases cannot
+/// drift from it by hand-copying a name.
+pub(crate) fn authored_names() -> Vec<String> {
+    AWS_AUTHORED_EXTENSIONS
+        .iter()
+        .map(|authored| authored.name.to_string())
+        .collect()
+}
+
 /// `GET /extensions` with `query` as the raw query string (empty for a request that names
 /// neither `MaxResults`, `NextToken` nor `Name`). All three are `httpQuery` members, named
-/// `max_results`, `next_token` and `name`.
-async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
+/// `max_results`, `next_token` and `name`. `pub(crate)` because the AWS-authored suite
+/// reads the same listing.
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
     let uri = if query.is_empty() {
         "/extensions".to_string()
     } else {
@@ -43,8 +58,9 @@ async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
 }
 
 /// The `Items` of a listing, asserted to be a 200 (an answer with no `Items` at all reads
-/// as empty, which is the shape a fresh account answers with).
-fn items(case: &str, answer: &Answer) -> Vec<Value> {
+/// as empty, which is the shape a fresh account answers with). `pub(crate)` because the
+/// AWS-authored suite asserts over the same listing.
+pub(crate) fn items(case: &str, answer: &Answer) -> Vec<Value> {
     assert_eq!(
         answer.status,
         200,
@@ -101,8 +117,13 @@ async fn fixture(
 /// Walk the whole listing one page at a time and return the entries in the order they
 /// were served, asserting the per-page half of the rule as it goes: a page never exceeds
 /// the size the request asked for, and a page that carries a `NextToken` is exactly that
-/// size, because a traversal is only cut where a page filled up.
-async fn walk(router: &MultiServiceRouter, case: &str, max_results: Option<i32>) -> Vec<Value> {
+/// size, because a traversal is only cut where a page filled up. `pub(crate)` because the
+/// AWS-authored suite paginates the same listing the way a client discovers an extension.
+pub(crate) async fn walk(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<i32>,
+) -> Vec<Value> {
     let page_size = max_results.map_or(MAX_LIST_PAGE_SIZE, |size| size as usize);
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
@@ -138,10 +159,10 @@ async fn walk(router: &MultiServiceRouter, case: &str, max_results: Option<i32>)
     panic!("case {case:?}: the paginated walk did not terminate");
 }
 
-/// The listing reports every extension the account holds, each exactly once, as the same
+/// The listing reports every extension the account can see, each exactly once, as the same
 /// record `GetExtension` answers for it — whatever page size the walk uses.
 ///
-/// Rows differ along how many extensions the account holds and the page size the walk asks
+/// Rows differ along how many extensions the account created and the page size the walk asks
 /// for: both published bounds of `MaxResults` (1 and 50), values in between, and no
 /// `MaxResults` at all.
 #[tokio::test]
@@ -161,7 +182,7 @@ async fn a_listing_reports_every_stored_extension_once_whatever_the_page_size() 
         let router = router();
         // Created out of name order, so a listing that reported insertion order rather
         // than a stable one fails here.
-        let mut expected: Vec<String> = Vec::new();
+        let mut expected: Vec<String> = authored_names();
         for index in 0..count {
             let name = format!("extension-{:02}", (index * 7) % 100);
             fixture(&router, &name, None, None).await;
@@ -258,29 +279,38 @@ async fn a_listing_reports_each_extension_at_its_latest_version() {
 
         let answer = list(&router, "").await;
         let page = items(&case, &answer);
+        let named: Vec<&Value> = page
+            .iter()
+            .filter(|item| item.get("Name").and_then(Value::as_str) == Some(name))
+            .collect();
         assert_eq!(
-            page.len(),
+            named.len(),
             1,
             "case {case:?}: an extension is one entry however many versions it holds, got {page:?}"
         );
+        assert_eq!(
+            page.len(),
+            authored_names().len() + 1,
+            "case {case:?}: the catalogue is the authored extensions and this one, got {page:?}"
+        );
         let read = get_extension(&router, &id, None).await;
         assert_eq!(
-            page[0].get("VersionNumber").and_then(Value::as_i64),
+            named[0].get("VersionNumber").and_then(Value::as_i64),
             Some(i64::from(version)),
             "case {case:?}: expected the latest version {version}, got {}",
-            page[0]
+            named[0]
         );
         assert_eq!(
-            page[0].get("Description").and_then(Value::as_str),
+            named[0].get("Description").and_then(Value::as_str),
             Some(format!("version {version}").as_str()),
             "case {case:?}: expected the latest version's Description, got {}",
-            page[0]
+            named[0]
         );
         assert_eq!(
-            page[0].get("Arn").cloned(),
+            named[0].get("Arn").cloned(),
             read.json().get("Arn").cloned(),
             "case {case:?}: expected the latest version's own ARN, got {}",
-            page[0]
+            named[0]
         );
     }
 }
@@ -335,7 +365,7 @@ async fn a_name_filters_the_listing_to_the_extension_carrying_it() {
     let all = listed("unfiltered", &list(&router, "").await, "Name");
     assert_eq!(
         all.len(),
-        stored.len(),
+        stored.len() + authored_names().len(),
         "the unfiltered listing must still report every extension, got {all:?}"
     );
 }
@@ -390,23 +420,31 @@ async fn a_token_this_listing_did_not_mint_is_refused() {
     let page = items("after the refusals", &list(&router, "").await);
     assert_eq!(
         page.len(),
-        1,
-        "the stored extension must still be listed, got {page:?}"
+        authored_names().len() + 1,
+        "the stored extension must still be listed beside the authored ones, got {page:?}"
     );
 }
 
-/// A fresh account holds no extensions, so the listing is empty and hands out no token —
-/// this emulator reports no Amazon Web Services authored catalog, because it stores no
-/// record for one.
+/// A fresh account already sees AppConfig's AWS-authored extensions, which it did not
+/// create: an account-visible catalogue, reported by the same listing its own extensions
+/// are reported by.
 #[tokio::test]
-async fn a_fresh_account_lists_no_extension() {
+async fn a_fresh_account_lists_the_aws_authored_catalogue() {
     let router = router();
-    for query in ["", "max_results=50", "name=AWS.AppConfig.FeatureFlags"] {
+    let expected = {
+        let mut names = authored_names();
+        names.sort();
+        names
+    };
+    for query in ["", "max_results=50"] {
         let answer = list(&router, query).await;
-        let page = items(query, &answer);
-        assert!(
-            page.is_empty(),
-            "case {query:?}: expected an empty listing on a fresh account, got {page:?}"
+        let names: Vec<String> = listed(query, &answer, "Name")
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            names, expected,
+            "case {query:?}: expected the authored catalogue on a fresh account"
         );
         assert!(
             answer.string("NextToken").is_none(),
@@ -414,4 +452,12 @@ async fn a_fresh_account_lists_no_extension() {
             answer.string("NextToken")
         );
     }
+
+    // A name no extension of either half carries still reports nothing.
+    let answer = list(&router, "name=nobody-created-this").await;
+    let page = items("an unused name", &answer);
+    assert!(
+        page.is_empty(),
+        "a name no extension carries reports nothing, got {page:?}"
+    );
 }

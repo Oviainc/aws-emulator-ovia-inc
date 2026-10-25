@@ -43,7 +43,11 @@
 //! policies live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::access_policies`], keyed by the
 //! minted `accessPolicyId`, each record naming the identity, the Monitor
-//! resource and the permission the last write to it stated. Every
+//! resource and the permission the last write to it stated. An interface asset
+//! model applied to an asset model lives in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_relationships`],
+//! keyed by the two models, carrying the property and hierarchy mappings the
+//! application resolved to. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -58,10 +62,10 @@ use crate::ops::types::{
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, Identity, ImageLocation,
-    LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry,
-    ProcessingInput, PropertyType, QueryStatistics, ResolveTo, Resource, ResourceStatus,
-    TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
+    ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
+    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, ResolveTo,
+    Resource, ResourceStatus, TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
     WorkspaceEncryptionConfiguration,
     WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
     VIDEO_DATA_TYPE_VALUES,
@@ -862,6 +866,46 @@ impl AssetModelRecord {
         path
     }
 
+    /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to
+    /// the id of a property THIS model declares.
+    ///
+    /// The property-list counterpart of [`Self::resolve_composite_model_id`], so
+    /// every operation that addresses a model property by label resolves it the
+    /// same way.
+    pub fn resolve_property_id(&self, label: &str) -> Option<String> {
+        self.properties
+            .iter()
+            .find(|property| {
+                matches_id_label(
+                    property.id.as_deref(),
+                    property.external_id.as_deref(),
+                    label,
+                )
+            })
+            .and_then(|property| property.id.clone())
+    }
+
+    /// The id of the property this model declares under `name`, if any.
+    ///
+    /// A property's name is the only identity two asset models can share — ids
+    /// are minted per model — so this is how an interface's property is paired
+    /// with the property of the model the interface is applied to.
+    pub fn property_id_named(&self, name: &str) -> Option<String> {
+        self.properties
+            .iter()
+            .find(|property| property.name == name)
+            .and_then(|property| property.id.clone())
+    }
+
+    /// The id of the hierarchy this model declares under `name`, if any. The
+    /// hierarchy counterpart of [`Self::property_id_named`].
+    pub fn hierarchy_id_named(&self, name: &str) -> Option<String> {
+        self.hierarchies
+            .iter()
+            .find(|hierarchy| hierarchy.name == name)
+            .and_then(|hierarchy| hierarchy.id.clone())
+    }
+
     /// Composite model `id` as the summary both `DescribeAssetModel` and
     /// `DescribeAssetModelCompositeModel` report it as, so the two views of one
     /// stored composite model cannot disagree.
@@ -910,6 +954,27 @@ impl AssetModelRecord {
             path: self.asset_composite_model_path(id),
         })
     }
+}
+
+/// A stored interface relationship: an interface asset model applied to an
+/// asset model, and the mappings that application resolved to.
+///
+/// The mappings are RESOLVED ONCE, by the call that applies the interface, and
+/// stored: they pair ids of two different models, which nothing else in the
+/// store relates, so a later read reports the pairing the application made
+/// rather than re-deriving one from definitions that may have moved since.
+#[derive(Debug, Clone)]
+pub struct InterfaceRelationshipRecord {
+    /// The stored `assetModelId` of the model the interface is applied to.
+    pub asset_model_id: String,
+    /// The stored `assetModelId` of the interface asset model.
+    pub interface_asset_model_id: String,
+    /// Each property of the interface asset model, paired with the property of
+    /// [`Self::asset_model_id`] it maps to.
+    pub property_mappings: Vec<PropertyMapping>,
+    /// Each hierarchy of the interface asset model that the applied-to model
+    /// also declares, paired with that model's own hierarchy.
+    pub hierarchy_mappings: Vec<HierarchyMapping>,
 }
 
 /// A stored asset. `properties` is materialised from the referenced model's
@@ -1872,6 +1937,34 @@ impl PipelineRecord {
 pub fn pipeline_key(workspace_name: &str, pipeline_name: &str) -> (String, String) {
     (workspace_name.to_string(), pipeline_name.to_string())
 }
+
+/// The key an interface relationship is stored under in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_relationships`]: the
+/// asset model the interface is applied to, then the interface asset model.
+/// Both are STORED ids, not labels.
+pub fn interface_relationship_key(
+    asset_model_id: &str,
+    interface_asset_model_id: &str,
+) -> (String, String) {
+    (
+        asset_model_id.to_string(),
+        interface_asset_model_id.to_string(),
+    )
+}
+
+/// The ceiling on how many interface relationships this store holds.
+///
+/// The same reasoning as [`MAX_ASSET_MODELS`]: applying an interface is the only
+/// thing that adds one and nothing evicts one, so the map needs a maximum entry
+/// count. The emulator's own bound, not a published AWS quota; the operation
+/// that would exceed it is refused with the modelled `LimitExceededException`.
+pub const MAX_INTERFACE_RELATIONSHIPS: usize = 1_000;
+
+/// The `AssetModelType` value an asset model must carry to be applied to another
+/// asset model as an interface: the `AssetModelType` enum's third value, which
+/// `CreateAssetModel` documents as "INTERFACE - An interface is a type of model
+/// that defines a standard structure".
+pub const MODEL_TYPE_INTERFACE: &str = "INTERFACE";
 
 /// The canonical ARN of a pipeline in `region`.
 ///
@@ -2853,9 +2946,26 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Written beside the source itself, and bounded by it: at most one entry per
     /// source that carries an alias.
     pub capture_source_aliases: HashMap<String, HashMap<String, String>>,
+    /// The interface relationships, by [`interface_relationship_key`] — the asset
+    /// model the interface is applied to and the interface asset model — because
+    /// one asset model may implement several interfaces and one interface may be
+    /// applied to several asset models. Bounded by
+    /// [`MAX_INTERFACE_RELATIONSHIPS`].
+    pub interface_relationships: HashMap<(String, String), InterfaceRelationshipRecord>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The interface relationship between two STORED asset model ids, if one was
+    /// applied. Resolve both labels with [`Self::resolve_asset_model_id`] first.
+    pub fn interface_relationship(
+        &self,
+        asset_model_id: &str,
+        interface_asset_model_id: &str,
+    ) -> Option<&InterfaceRelationshipRecord> {
+        self.interface_relationships
+            .get(&interface_relationship_key(asset_model_id, interface_asset_model_id))
+    }
+
     /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to a
     /// stored `assetModelId`.
     pub fn resolve_asset_model_id(&self, label: &str) -> Option<String> {
@@ -3198,6 +3308,27 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 .disassociated_time_series
                 .get(alias)
                 .map_or(&[][..], |series| series.values.as_slice()),
+        }
+    }
+
+    /// The `PropertyDataType` of the stream `key` names: the declared type of the
+    /// asset property that owns it, or the type the disassociated record kept.
+    /// `None` when the store holds no such stream.
+    ///
+    /// The counterpart of [`Self::series`] for a reader that needs the stream's
+    /// TYPE rather than its samples: one data stream reports one data type whether
+    /// an asset property is associated with it or not, so every reader takes it
+    /// from here instead of reaching only into [`Self::assets`].
+    pub fn series_data_type(&self, key: &SeriesKey) -> Option<&str> {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .assets
+                .get(asset_id)
+                .and_then(|asset| asset.property(property_id))
+                .map(|property| property.data_type.as_str()),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_stream_type(alias)
+                .map(|(data_type, _)| data_type),
         }
     }
 
@@ -3612,12 +3743,22 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
-    /// Forget an asset model and its external-id entry.
+    /// Forget an asset model, its external-id entry and every interface
+    /// relationship it stood on either side of.
+    ///
+    /// A relationship names two models, so a model that is gone leaves no
+    /// relationship behind: the entries are dropped here rather than left to
+    /// consume the [`MAX_INTERFACE_RELATIONSHIPS`] budget for a pair nothing can
+    /// address any more.
     pub fn forget_asset_model(&mut self, asset_model_id: &str) -> Option<AssetModelRecord> {
         let record = self.asset_models.remove(asset_model_id)?;
         if let Some(external) = record.external_id.as_deref() {
             self.asset_model_external_ids.remove(external);
         }
+        self.interface_relationships
+            .retain(|(applied_to, interface), _| {
+                applied_to != asset_model_id && interface != asset_model_id
+            });
         Some(record)
     }
 

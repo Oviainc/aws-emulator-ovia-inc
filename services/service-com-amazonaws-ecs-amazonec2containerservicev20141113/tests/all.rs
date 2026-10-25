@@ -35,6 +35,8 @@ mod error_messages;
 mod list_service_deployments;
 #[path = "all/list_services.rs"]
 mod list_services;
+#[path = "all/list_task_definition_families.rs"]
+mod list_task_definition_families;
 #[path = "all/list_task_definitions.rs"]
 mod list_task_definitions;
 #[path = "all/load_balancer_target_groups.rs"]
@@ -61,3 +63,5 @@ mod task_definition_projection;
 mod task_definition_rendering;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;
+#[path = "all/task_provisioning.rs"]
+mod task_provisioning;

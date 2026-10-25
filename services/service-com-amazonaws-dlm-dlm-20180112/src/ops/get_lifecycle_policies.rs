@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLifecyclePoliciesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -158,15 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A pure read: every answer is built by iterating the store, and nothing
-        // is written back.
+        // is written back. The policies it reports are the ones of the region
+        // this request was signed for — "all ... data lifecycle policies" is all
+        // of them in the region the call is made in, since a policy exists only
+        // in the region it was created in.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
+        let in_region = store.policies_in(&region);
 
         // `policyIds` names the policies to report, so an id that names none is
         // a request about a resource that does not exist.
         if let Some(requested) = input.policy_ids.as_ref() {
             let missing: Vec<String> = requested
                 .iter()
-                .filter(|id| !store.policies.contains_key(id.as_str()))
+                .filter(|id| {
+                    in_region.is_none_or(|policies| !policies.contains_key(id.as_str()))
+                })
                 .cloned()
                 .collect();
             if !missing.is_empty() {
@@ -179,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let policies: Vec<LifecyclePolicySummary> = store
-            .policies
-            .values()
+        let policies: Vec<LifecyclePolicySummary> = in_region
+            .into_iter()
+            .flat_map(crate::state::RegionalPolicies::values)
             .filter(|policy| {
                 input
                     .policy_ids

@@ -43,6 +43,10 @@ mod published_document_bytes;
 mod registry_schema_lifecycle;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/schema_name_collation.rs"]
 mod schema_name_collation;
 #[path = "all/schema_version_deletion.rs"]

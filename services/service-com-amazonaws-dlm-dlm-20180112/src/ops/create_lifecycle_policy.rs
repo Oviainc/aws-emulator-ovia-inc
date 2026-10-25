@@ -338,7 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is bounded: past its bound a create is refused rather than
         // adding another record. `LimitExceededException` is the modelled refusal.
-        if store.policies.len() >= crate::state::POLICY_QUOTA {
+        if store.policy_count() >= crate::state::POLICY_QUOTA {
             return Err(CreateLifecyclePolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -404,7 +404,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             exclusions: configuration.exclusions,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
         };
-        store.policies.insert(policy_id.clone(), record);
+        // The policy belongs to the region this request was signed for, so that
+        // is the region's store it goes into: no request signed for another
+        // region reaches it.
+        store.insert_policy(&region, record);
 
         Ok(CreateLifecyclePolicyOutput {
             policy_id: Some(policy_id),

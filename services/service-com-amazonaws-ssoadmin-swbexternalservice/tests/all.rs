@@ -55,6 +55,8 @@ mod instance_create;
 mod instance_delete;
 #[path = "all/instance_describe.rs"]
 mod instance_describe;
+#[path = "all/instance_encryption_default.rs"]
+mod instance_encryption_default;
 #[path = "all/instance_region_removal.rs"]
 mod instance_region_removal;
 #[path = "all/instance_region_status.rs"]
@@ -81,6 +83,8 @@ mod resource_tags;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags_from_creates.rs"]
+mod tags_from_creates;
 #[path = "all/trusted_token_issuers.rs"]
 mod trusted_token_issuers;
 #[path = "all/validation_message_wording.rs"]

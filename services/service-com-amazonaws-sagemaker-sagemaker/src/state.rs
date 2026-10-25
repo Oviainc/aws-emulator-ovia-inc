@@ -75,6 +75,15 @@ use crate::ops::types::{
     UserContext, VpcConfig,
 };
 
+/// The model-customization job slice: the record `CreateJob` persists, the lookup every
+/// job operation performs and the constants that bound and word it. Re-exported below,
+/// so a handler names them as `crate::state::…` like every other slice.
+pub mod job;
+pub use job::{
+    Job, JOB_ARN_KIND, JOB_KIND_LABEL, JOB_QUOTA, JOB_SECONDARY_STATUS_STARTING,
+    JOB_STATUS_IN_PROGRESS,
+};
+
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
 /// on them, with their own records, quota, status span and id mint. Reached through the
 /// single [`ComAmazonawsSagemakerSagemakerState::cluster_policies`] field.
@@ -2330,6 +2339,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub algorithms: BTreeMap<String, Algorithm>,
     /// AutoML jobs V2, keyed by [`entity_key`] of their `AutoMLJobName`.
     pub auto_ml_jobs_v2: BTreeMap<String, AutoMLJobV2>,
+    /// Model-customization jobs, keyed by `JobName`, which AWS documents unique "within
+    /// your account and Amazon Web Services Region". See [`Job`], whose slice holds the
+    /// record, the lookup and the constants.
+    pub jobs: BTreeMap<String, Job>,
     /// Lineage contexts, keyed by `ContextArn`: `ContextName` is documented unique to an
     /// account in a Region, so the ARN — which carries the Region beside the name — is
     /// what identifies one context. See [`context_key`].
@@ -2705,6 +2718,35 @@ pub fn feature_group_directory<Eng: Send + Sync + 'static>(
                 ::service_common::feature_store_groups::FeatureGroupDirectory,
             >,
         )
+}
+
+/// The SHARED job directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A job of a reinforcement-fine-tuning category is CREATED here (`CreateJob`) and its
+/// rollouts are SERVED by the AgenticRFT job runtime data plane, whose own API carries no
+/// job definition and binds no call that creates one: a sampling request names a job ARN
+/// in a header and nothing else. So that data plane can resolve the ARN only because this
+/// service RECORDED the job, in ONE directory under one shared type
+/// ([`::service_common::agentic_rft_jobs::JobDirectory`]). The engine keys state by TYPE,
+/// so a copy of its own inside [`ComAmazonawsSagemakerSagemakerState`] would be invisible
+/// to that reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// `JobDirectory::forget` belongs to `DeleteJob`, which is still a scaffold stub
+/// answering 501 (its own issue): nothing in this emulator deletes a job yet, so nothing
+/// calls it yet.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to another
+/// service, never part of this operation's own answer.
+pub fn job_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::agentic_rft_jobs::JobDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::agentic_rft_jobs::JobDirectory>)
 }
 
 /// The message a handler refuses with when the service is mounted on an engine that

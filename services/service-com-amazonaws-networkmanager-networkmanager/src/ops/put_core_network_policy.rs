@@ -215,17 +215,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `LatestVersionId` is what the caller believes the newest version of this policy
-        // is. A version is immutable and a put appends to the history, so naming a version
-        // that is no longer the newest means the caller wrote against a history that has
-        // moved on: the put is refused with the modelled `ConflictException` (HTTP 409)
-        // and appends nothing. Omitting the member appends unconditionally.
+        // `LatestVersionId` is what the caller asserts the newest version of this policy
+        // is — the request's own optimistic-lock guard. A version is immutable and a put
+        // appends to the history, so a value that is not the version id this core network's
+        // history currently ends at fails the guard: the put appends nothing and is refused
+        // as a failure of THAT INPUT MEMBER, with the modelled `ValidationException`
+        // (HTTP 400) naming it in `Fields`, not as a 409 conflict over the resource. Any
+        // other value fails it the same way — a version that was superseded while the
+        // request was in flight, one that was deleted, one that was never minted — because
+        // the guard is an equality against the stored latest, not a lookup. Omitting the
+        // member asserts nothing and appends unconditionally.
         if let Some(named) = input.latest_version_id {
             let latest = core_network.latest_policy_version();
             if latest != Some(named) {
-                return Err(PutCoreNetworkPolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: match latest {
+                return Err(PutCoreNetworkPolicyErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        crate::state::FIELD_LATEST_VERSION_ID,
+                        crate::state::REASON_FIELD_VALIDATION_FAILED,
+                        match latest {
                             Some(latest) => format!(
                                 "policy version {named} is not the latest version of core network {}; its latest version is {latest}",
                                 input.core_network_id
@@ -235,12 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 input.core_network_id
                             ),
                         },
-                        resource_id: crate::state::policy_version_resource_id(
-                            &input.core_network_id,
-                            named,
-                        ),
-                        resource_type: crate::state::CORE_NETWORK_POLICY_KIND.to_string(),
-                    },
+                    ),
                 )
                 .into());
             }

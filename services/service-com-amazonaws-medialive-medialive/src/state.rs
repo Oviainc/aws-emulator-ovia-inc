@@ -401,6 +401,7 @@ pub mod channel_state {
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
     pub const DELETED: &str = "DELETED";
+    pub const UPDATING: &str = "UPDATING";
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
 }
 
@@ -424,9 +425,14 @@ pub mod sdi_source_state {
 /// the clock owes it `ACTIVE`, the one state the enum names for a network that
 /// exists, has not failed and nothing has deleted. The rest belong to operations
 /// no handler implements yet: `UPDATING` to `UpdateNetwork`, `DELETING` and
-/// `DELETED` to `DeleteNetwork`, `IDLE` and `IN_USE` to the cluster attachments
-/// this store has none of (`CreateCluster` is still a scaffold), and the two
-/// `*_FAILED` states to failures this emulator does not inject.
+/// `DELETED` to `DeleteNetwork`, and the two `*_FAILED` states to failures this
+/// emulator does not inject. `IDLE` and `IN_USE` are the two the model documents
+/// nothing about for a network (`State` carries the one sentence above and no
+/// member says what puts a network in either), so this emulator never claims
+/// one: a network's attachments are reported through its
+/// `AssociatedClusterIds`
+/// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]) rather than
+/// guessed at through its state.
 pub mod network_state {
     pub const CREATING: &str = "CREATING";
     pub const ACTIVE: &str = "ACTIVE";
@@ -777,11 +783,11 @@ pub const MAX_INPUT_ATTACHMENTS: usize = 32;
 /// keeps that per-request work a function of the emulator's own ceilings rather
 /// than of one caller's request body. `CreateChannel` refuses a longer list with
 /// its own modelled `BadRequestException`, because the request is what is out of
-/// bounds. Enforced where a caller's destinations are STORED, which today is
-/// `CreateChannel` alone (`UpdateChannel` is still a scaffold and writes none):
-/// a handler that starts storing them has to apply this bound too, or the
-/// per-request cost the multiplex slice's feeder index pays stops being bounded
-/// by this constant.
+/// bounds. Enforced where a caller's destinations are STORED — `CreateChannel`
+/// and `UpdateChannel` — because a handler that stores them without applying
+/// this bound would stop the per-request cost the multiplex slice's feeder index
+/// pays being bounded by this constant. Both word the refusal with
+/// [`too_many_channel_entries_message`].
 pub const MAX_CHANNEL_DESTINATIONS: usize = 32;
 
 /// The most inputs this emulator stores for one account.
@@ -872,7 +878,7 @@ pub const MAX_BATCH_DELETE_IDS: usize = 100;
 /// The state a channel's in-flight transition settles into once it comes due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
-    /// `CREATING` and `STOPPING` settle into `IDLE`.
+    /// `CREATING`, `STOPPING` and `UPDATING` settle into `IDLE`.
     Idle,
     /// `STARTING` and `RECOVERING` settle into `RUNNING`.
     Running,
@@ -919,6 +925,11 @@ pub struct ChannelRecord {
     pub inference_settings: Option<InferenceSettings>,
     pub vpc: Option<VpcOutputSettings>,
     pub channel_engine_version: Option<String>,
+    /// The MediaConnect Router handoff settings a request supplied but the
+    /// `Channel` response shape reports no member for — stored rather than
+    /// dropped, exactly as [`InputRecord::special_router_settings`] is for an
+    /// input, so the member a caller wrote is the member the store holds.
+    pub special_router_settings: Option<SpecialRouterSettings>,
     /// The pipelines that are restarting right now, as
     /// [`PipelineDetail`]`$PipelineId` numbers them (0 for `PIPELINE_0`), while
     /// the channel is `RECOVERING`. Empty in every other state: a pipeline is
@@ -3942,6 +3953,17 @@ pub fn is_resource_arn(arn: &str) -> bool {
     !partition.is_empty() && !service.is_empty() && !resource.is_empty()
 }
 
+/// The message a request carrying more entries in one of a channel's
+/// caller-chosen lists than this emulator stores is refused with: the member as
+/// the wire spells it, how many entries the request carried, and the ceiling.
+///
+/// One helper, so `CreateChannel` and `UpdateChannel` — which store the same
+/// two lists under the same two ceilings ([`MAX_INPUT_ATTACHMENTS`],
+/// [`MAX_CHANNEL_DESTINATIONS`]) — cannot word that bound two ways.
+pub fn too_many_channel_entries_message(member: &str, count: usize, limit: usize) -> String {
+    format!("{member} carries {count} entries; this emulator accepts at most {limit}")
+}
+
 /// The message a not-found refusal carries: the resource type, the identifier
 /// the request named, then `not found` — the phrasing the real service composes
 /// from the request. One helper, so no two operations word it two ways.
@@ -4615,6 +4637,7 @@ pub fn new_channel(
         inference_settings: None,
         vpc: None,
         channel_engine_version: None,
+        special_router_settings: None,
         restarting_pipelines: Vec::new(),
         schedule: ChannelSchedule::default(),
         alerts: ChannelAlerts::default(),
@@ -4628,6 +4651,15 @@ pub fn new_channel(
 /// Move a channel from `IDLE` into `STARTING`, owing `RUNNING`.
 pub fn begin_start(channel: &mut ChannelRecord, now: SystemTime) {
     channel.begin_transition(channel_state::STARTING, Settled::Running, now);
+}
+
+/// Move a stopped channel into `UPDATING`, owing `IDLE` again.
+///
+/// `UPDATING` is the `ChannelState` value for a channel whose configuration is
+/// being applied, and applying it leaves the channel stopped, so the state the
+/// clock owes is the `IDLE` the update started from.
+pub fn begin_update(channel: &mut ChannelRecord, now: SystemTime) {
+    channel.begin_transition(channel_state::UPDATING, Settled::Idle, now);
 }
 
 /// Move a running channel into `STOPPING`, owing `IDLE`.

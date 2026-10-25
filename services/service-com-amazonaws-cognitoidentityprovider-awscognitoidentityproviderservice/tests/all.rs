@@ -47,12 +47,16 @@ mod list_user_pools;
 mod resource_server_lifecycle;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
+#[path = "all/sign_up_client_secret.rs"]
+mod sign_up_client_secret;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]
 mod token_signing;
 #[path = "all/update_group.rs"]
 mod update_group;
+#[path = "all/update_user_attributes.rs"]
+mod update_user_attributes;
 #[path = "all/update_user_pool.rs"]
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]

@@ -14,15 +14,27 @@
 //! `IAM_ALLOWED_PRINCIPALS` on a table, granted twice and revoked — is one row among
 //! them.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lakeformation_awslakeformation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The one copy of the harness every permission suite shares: the Glue+LakeFormation
+// emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
+use crate::glue_catalog::{
+    account_catalog, create_database, emulator, error_code, lake_formation as call,
+};
+
 /// One row of the repeated-grant table: the case name, the permissions each successive
-/// `GrantPermissions` call names, and the permissions the one record holds afterwards.
-type RepeatedGrantCase = (&'static str, Vec<Vec<&'static str>>, Vec<&'static str>);
+/// `GrantPermissions` call names, the permissions the records hold afterwards, and how
+/// many records that is — one per SCOPE the permissions apply at (a table's own record,
+/// its "table w columns" record, or both).
+type RepeatedGrantCase = (
+    &'static str,
+    Vec<Vec<&'static str>>,
+    Vec<&'static str>,
+    usize,
+);
 
 /// One row of the absent-revoke table: the case name, what was granted first (if
 /// anything), and the principal, resource and permissions the revoke names.
@@ -45,61 +57,10 @@ type PartialRevokeCase = (
     Option<Vec<&'static str>>,
 );
 
-/// The account id every emulated service presents, and therefore the Data Catalog a
-/// request without `CatalogId` addresses ("The identifier for the Data Catalog. By
-/// default, the account ID." — `CatalogIdString`'s documentation).
-fn account_catalog() -> String {
-    engine::emulator_account_id().to_string()
-}
-
-/// One emulator over one shared engine, reached exactly as the production router reaches
-/// it: `MultiServiceRouter::dispatch` of a buffered HTTP request.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// `POST /<operation>` with `body` as the JSON payload, answering `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!(
-            "https://lakeformation.us-east-1.amazonaws.com/{operation}"
-        ))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20260101/us-east-1/lakeformation/aws4_request, \
-             SignedHeaders=host, Signature=0000",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("serialize the request body"),
-        ))
-        .expect("a valid request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, payload)
-}
-
-/// The wire error code (`__type`) of an error envelope, or `""` for a success body.
-fn error_code(payload: &Value) -> String {
-    payload
-        .get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// The Data Catalog this suite's rows grant on: the `sales` database with its `orders`
+/// and `returns` tables, seeded through the shared harness.
+async fn emulator_with_catalog() -> MultiServiceRouter {
+    crate::glue_catalog::emulator_with_catalog(&[("sales", &["orders", "returns"])]).await
 }
 
 /// `GrantPermissions`, asserting it was accepted.
@@ -231,7 +192,7 @@ async fn a_grant_is_read_back_on_every_resource_kind_the_model_carries() {
                     "ColumnWildcard": { "ExcludedColumnNames": ["ssn"] },
                 }
             }),
-            vec!["SELECT", "DESCRIBE"],
+            vec!["SELECT"],
             json!({
                 "TableWithColumns": {
                     "CatalogId": catalog,
@@ -309,7 +270,7 @@ async fn a_grant_is_read_back_on_every_resource_kind_the_model_carries() {
 
     for (case, resource, permissions, expected_resource) in cases {
         // A fresh emulator per row, so a listing's single entry can only be this grant.
-        let router = emulator();
+        let router = emulator_with_catalog().await;
         let principal = format!("arn:aws:iam::{}:role/analyst", account_catalog());
         grant(&router, case, &principal, &resource, &permissions).await;
 
@@ -350,31 +311,35 @@ async fn granting_again_updates_the_one_record_instead_of_adding_a_second() {
     let resource = json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } });
     let cases: Vec<RepeatedGrantCase> = vec![
         // The issue's own case: the same grant twice is exactly one entry.
-        ("repeated", vec![vec!["ALL"], vec!["ALL"]], vec!["ALL"]),
+        ("repeated", vec![vec!["ALL"], vec!["ALL"]], vec!["ALL"], 1),
         (
             "disjoint",
             vec![vec!["SELECT"], vec!["ALTER"]],
-            vec!["SELECT", "ALTER"],
+            vec!["ALTER", "SELECT"],
+            2,
         ),
         (
             "overlapping",
             vec![vec!["SELECT", "DESCRIBE"], vec!["DESCRIBE", "DROP"]],
-            vec!["SELECT", "DESCRIBE", "DROP"],
+            vec!["DESCRIBE", "DROP", "SELECT"],
+            2,
         ),
         (
             "three calls",
             vec![vec!["SELECT"], vec!["SELECT"], vec!["INSERT"]],
-            vec!["SELECT", "INSERT"],
+            vec!["INSERT", "SELECT"],
+            2,
         ),
         (
             "repeated within one call",
             vec![vec!["SELECT", "SELECT"]],
             vec!["SELECT"],
+            1,
         ),
     ];
 
-    for (case, grants, expected) in cases {
-        let router = emulator();
+    for (case, grants, expected, scopes_expected) in cases {
+        let router = emulator_with_catalog().await;
         for permissions in &grants {
             grant(
                 &router,
@@ -387,17 +352,35 @@ async fn granting_again_updates_the_one_record_instead_of_adding_a_second() {
         }
 
         let entries = list(&router, case, &json!({ "Resource": resource })).await;
+        // A table grant is recorded at the SCOPE each permission applies at, so a
+        // column-scoped `SELECT` is its own "table w columns" entry beside the table's
+        // own (see `crate::state::scoped_grant_records`). What repeating a grant must not
+        // do is open another entry at a scope: there is EXACTLY one entry per scope the
+        // permissions apply at, and together they hold exactly the union granted.
         assert_eq!(
             entries.len(),
-            1,
-            "case {case:?}: {} grants on one resource are one entry, got {entries:?}",
+            scopes_expected,
+            "case {case:?}: {} grants leave {scopes_expected} record(s), got {entries:?}",
             grants.len()
         );
+        let scopes: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| entry["Resource"].to_string())
+            .collect();
         assert_eq!(
-            permissions_of(&entries[0]),
-            expected,
-            "case {case:?}: expected the union {expected:?}, got {:?}",
-            entries[0]
+            scopes.len(),
+            entries.len(),
+            "case {case:?}: no scope may carry two records, got {entries:?}"
+        );
+        let mut held: Vec<String> = entries.iter().flat_map(permissions_of).collect();
+        held.sort();
+        let want: Vec<String> = expected
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        assert_eq!(
+            held, want,
+            "case {case:?}: expected the union {want:?}, got {entries:?}"
         );
     }
 }
@@ -448,7 +431,7 @@ async fn revoking_what_was_never_granted_is_refused_and_changes_nothing() {
     ];
 
     for (case, granted, principal, revoked_resource, revoked) in cases {
-        let router = emulator();
+        let router = emulator_with_catalog().await;
         if let Some(permissions) = &granted {
             grant(
                 &router,
@@ -564,7 +547,7 @@ async fn a_revoke_takes_away_only_what_it_names() {
     ];
 
     for (case, granted, with_grant_option, revoked, remaining) in cases {
-        let router = emulator();
+        let router = emulator_with_catalog().await;
         let (status, payload) = call(
             &router,
             "GrantPermissions",
@@ -622,7 +605,7 @@ async fn a_revoke_takes_away_only_what_it_names() {
 
 #[tokio::test]
 async fn the_filters_select_by_principal_resource_and_resource_type() {
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     let catalog = account_catalog();
     let analyst = format!("arn:aws:iam::{catalog}:role/analyst");
     let auditor = format!("arn:aws:iam::{catalog}:role/auditor");
@@ -715,7 +698,7 @@ async fn a_table_listing_also_reports_the_column_level_grant_on_that_table() {
     // `ListPermissions$Resource`: "This operation does not support getting privileges on a
     // table with columns. Instead, call this operation on the table, and the operation
     // returns the table and the table w columns."
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     let principal = "IAM_ALLOWED_PRINCIPALS";
     let table = json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } });
     let with_columns = json!({
@@ -834,13 +817,17 @@ async fn a_table_listing_also_reports_the_column_level_grant_on_that_table() {
 async fn a_listing_pages_through_every_grant_exactly_once() {
     let router = emulator();
     let principal = "IAM_ALLOWED_PRINCIPALS";
-    let tables: Vec<String> = (0..7).map(|index| format!("table-{index}")).collect();
-    for table in &tables {
+    let databases: Vec<String> = (0..7).map(|index| format!("database-{index}")).collect();
+    // Each grant is on a database the catalog holds, so each is accepted.
+    for database in &databases {
+        create_database(&router, database).await;
+    }
+    for database in &databases {
         grant(
             &router,
             "seed",
             principal,
-            &json!({ "Database": { "Name": table } }),
+            &json!({ "Database": { "Name": database } }),
             &["DESCRIBE"],
         )
         .await;
@@ -893,7 +880,7 @@ async fn a_listing_pages_through_every_grant_exactly_once() {
         sorted.sort();
         sorted.dedup();
         assert_eq!(
-            sorted, tables,
+            sorted, databases,
             "case {case:?}: expected every grant exactly once, saw {seen:?}"
         );
     }
@@ -933,7 +920,7 @@ async fn a_listing_pages_through_every_grant_exactly_once() {
 
 #[tokio::test]
 async fn a_resource_that_names_no_single_target_is_refused() {
-    let router = emulator();
+    let router = emulator_with_catalog().await;
     // Rows differ along HOW the `Resource` fails to name exactly one target: none, two,
     // a table named both ways, a table named neither way, columns named both ways and an
     // empty column list.
@@ -1014,3 +1001,198 @@ async fn a_resource_that_names_no_single_target_is_refused() {
         "case \"after the refusals\": a refused grant records nothing, got {entries:?}"
     );
 }
+
+/// A permission value the `Permission` enum does not carry is refused on BOTH write
+/// paths, and nothing is recorded for it.
+///
+/// `Permission` is modelled as an enum, and a value it does not carry is refused at the
+/// boundary with `ValidationException` (HTTP 400) naming the member path and the admitted
+/// value set, which is how the real service answers one: it never reaches the grant store,
+/// so no later `ListPermissions` can report it. This pins that for both write paths, so a
+/// handler can never start recording an unmodelled value.
+///
+/// The rows differ along WHERE the unmodelled value sits (alone, beside a modelled one, in
+/// `PermissionsWithGrantOption`) and along its form (an invented name, a lower-cased
+/// modelled value, a modelled value with trailing whitespace, the empty string); the last
+/// row is the control, naming only values the enum carries, which must still be accepted
+/// and recorded.
+#[tokio::test]
+async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() {
+    // One row per class of unmodelled value, plus the accepted control. `Permissions`,
+    // `PermissionsWithGrantOption`, and whether the request is expected to be accepted.
+    let cases: Vec<(&str, Vec<&str>, Vec<&str>, bool)> = vec![
+        ("an invented value alone", vec!["NOT_A_PERMISSION"], vec![], false),
+        ("an invented value beside a modelled one", vec!["SELECT", "SUPER"], vec![], false),
+        // `Permission`'s values are upper-case (`PERMISSION_VALUES`), so a lower-cased
+        // spelling is a different string and not a member of the enum.
+        ("a lower-cased modelled value", vec!["select"], vec![], false),
+        ("a modelled value with trailing whitespace", vec!["SELECT "], vec![], false),
+        ("the empty string", vec![""], vec![], false),
+        (
+            "an invented value in PermissionsWithGrantOption",
+            vec!["SELECT"],
+            vec!["SELECT", "NOT_A_PERMISSION"],
+            false,
+        ),
+        // The control: every value here IS a member of the enum, so this one is recorded.
+        ("only modelled values", vec!["SELECT"], vec!["SELECT"], true),
+    ];
+
+    let router = emulator_with_catalog().await;
+    for (index, (case, permissions, with_grant_option, accepted)) in
+        cases.into_iter().enumerate()
+    {
+        // One principal per row, so no row can read another's record.
+        let principal = format!("arn:aws:iam::000000000000:role/enum-{index}");
+        let resource = json!({ "Database": { "Name": "sales" } });
+        let mut body = json!({
+            "Principal": { "DataLakePrincipalIdentifier": principal },
+            "Resource": resource,
+            "Permissions": permissions,
+        });
+        if !with_grant_option.is_empty() {
+            body["PermissionsWithGrantOption"] = json!(with_grant_option);
+        }
+
+        for operation in ["GrantPermissions", "RevokePermissions"] {
+            // The revoke row for the accepted control runs after its grant below, so it
+            // is the only one that may answer 200 here; every other row must be refused
+            // by both paths for the same reason.
+            if accepted && operation == "RevokePermissions" {
+                continue;
+            }
+            let (status, payload) = call(&router, operation, &body).await;
+            let expected = if accepted { 200 } else { 400 };
+            assert_eq!(
+                status, expected,
+                "case {case:?}: expected {operation} to answer {expected}, got {status} {payload:?}"
+            );
+            if !accepted {
+                let code = error_code(&payload);
+                assert_eq!(
+                    code, "ValidationException",
+                    "case {case:?}: expected {operation} to refuse with ValidationException, \
+                     got {code:?} {payload:?}"
+                );
+            }
+        }
+
+        let entries = list(
+            &router,
+            case,
+            &json!({
+                "Principal": { "DataLakePrincipalIdentifier": principal },
+                "Resource": resource,
+            }),
+        )
+        .await;
+        let stored: Vec<String> = entries.iter().flat_map(permissions_of).collect();
+        let expected: Vec<String> = if accepted {
+            vec!["SELECT".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            stored, expected,
+            "case {case:?}: expected the stored permissions to be {expected:?}, got {stored:?}"
+        );
+    }
+}
+
+/// One grant may name every `Permission` the model admits, and what it records is the SET
+/// of the values it named — so the ceiling on how many DISTINCT permissions one grant can
+/// push into a record is the `Permission` enum's own size, which a request naming only
+/// modelled values can reach but never pass.
+///
+/// `PermissionList` carries no length constraint of its own, so the bound is inherent
+/// rather than enforced: the boundary validator admits only values the `Permission` enum
+/// carries, and the handler de-duplicates, so a stored record can hold at most
+/// `state::MAX_PERMISSIONS_PER_GRANT` of them. The rows differ along how many times each
+/// value is named: once, many times over, and every value twice — all three collapse to
+/// the same stored set.
+#[tokio::test]
+async fn a_grant_records_the_set_of_the_permissions_it_names_up_to_the_modelled_ceiling() {
+    use service_com_amazonaws_lakeformation_awslakeformation::state::MAX_PERMISSIONS_PER_GRANT;
+
+    /// Every value of `Permission`
+    /// (`smithy_query(query="shape",shape="Permission")`, rendered in this crate as
+    /// `ops::types::PERMISSION_VALUES`).
+    const MODELLED: [&str; 16] = [
+        "ALL",
+        "ALTER",
+        "ASSOCIATE",
+        "CREATE_CATALOG",
+        "CREATE_DATABASE",
+        "CREATE_LF_TAG",
+        "CREATE_LF_TAG_EXPRESSION",
+        "CREATE_TABLE",
+        "DATA_LOCATION_ACCESS",
+        "DELETE",
+        "DESCRIBE",
+        "DROP",
+        "GRANT_WITH_LF_TAG_EXPRESSION",
+        "INSERT",
+        "SELECT",
+        "SUPER_USER",
+    ];
+
+    // The ceiling IS the enum's size, so naming every modelled permission at once is
+    // exactly at the bound and no request of modelled values can exceed it.
+    assert_eq!(
+        MODELLED.len(),
+        MAX_PERMISSIONS_PER_GRANT,
+        "case \"the ceiling\": expected the distinct-permission ceiling to be the size of \
+         Permission ({}), got {MAX_PERMISSIONS_PER_GRANT}",
+        MODELLED.len()
+    );
+
+    let every_twice: Vec<&str> = MODELLED.iter().chain(MODELLED.iter()).copied().collect();
+    let repeated: Vec<&str> = std::iter::repeat_n("SELECT", 64).collect();
+    let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        (
+            "every modelled permission once",
+            MODELLED.to_vec(),
+            MODELLED.to_vec(),
+        ),
+        (
+            "one permission named 64 times",
+            repeated,
+            vec!["SELECT"],
+        ),
+        (
+            "every modelled permission twice",
+            every_twice,
+            MODELLED.to_vec(),
+        ),
+    ];
+
+    let router = emulator_with_catalog().await;
+    for (index, (case, granted, held)) in cases.into_iter().enumerate() {
+        // One principal per row, so the rows cannot merge into one another's record.
+        let principal = format!("arn:aws:iam::000000000000:role/ceiling-{index}");
+        let resource = json!({ "Database": { "Name": "sales" } });
+        grant(&router, case, &principal, &resource, &granted).await;
+
+        let entries = list(
+            &router,
+            case,
+            &json!({
+                "Principal": { "DataLakePrincipalIdentifier": principal },
+                "Resource": resource,
+            }),
+        )
+        .await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {case:?}: expected exactly one record, got {entries:?}"
+        );
+        let actual: BTreeSet<String> = permissions_of(&entries[0]).into_iter().collect();
+        let expected: BTreeSet<String> = held.iter().map(|value| value.to_string()).collect();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the stored permissions to be {expected:?}, got {actual:?}"
+        );
+    }
+}
+

@@ -148,9 +148,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // The request context carries no value this operation needs: the resource is
-        // named by the ARN in the request itself, not by the caller's credential scope.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The resource is named by the ARN in the request; the context carries the region
+        // the request is signed for, which is where that ARN is resolved.
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -175,12 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Mutating, but it materialises what the clock already owed first, so the record
         // this call edits is the settled one rather than a stale copy of it.
         state.settle();
 
-        let Some(tags) = state.resource_tags_mut(&resource, &input.resource_arn) else {
+        // Resolved in the region this request is signed for: an ARN that names a resource
+        // of another region is not this endpoint's to tag.
+        let Some(tags) = state.resource_tags_mut(&region, &resource, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Resource {} was not found", input.resource_arn)),

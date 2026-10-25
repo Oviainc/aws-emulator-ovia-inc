@@ -51,6 +51,8 @@ mod disk_delete;
 mod disk_detach;
 #[path = "all/disk_restore_from_snapshot.rs"]
 mod disk_restore_from_snapshot;
+#[path = "all/disk_restore_snapshot_completeness.rs"]
+mod disk_restore_snapshot_completeness;
 #[path = "all/disk_snapshot.rs"]
 mod disk_snapshot;
 #[path = "all/disk_snapshot_delete.rs"]
@@ -133,6 +135,8 @@ mod relational_database_snapshot_read;
 mod relational_database_start_stop;
 #[path = "all/relational_database_update.rs"]
 mod relational_database_update;
+#[path = "all/resource_add_ons.rs"]
+mod resource_add_ons;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/setup_history_reporting.rs"]

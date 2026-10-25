@@ -224,6 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        // "Each extension name in your account must be unique"
+        // (`smithy_query(query="doc",shape="CreateExtensionRequest",member="Name")`), and
+        // the names of AppConfig's AWS-authored extensions are already taken in every
+        // account: `ListExtensions` and `GetExtension` report them without any account
+        // having created them, so no create may take one over or append a version to one.
+        if crate::state::aws_authored_extension_named(&input.name).is_some() {
+            return Err(bad_request(format!(
+                "Extension name {} is an Amazon Web Services authored AppConfig extension \
+                 and cannot be created.",
+                input.name
+            )));
+        }
+
         // `LatestVersionNumber` is an optimistic lock on the extension this name
         // addresses: "When you create a new version, specify the most recent current
         // version number." A name nobody has created is at version 0, so one uniform

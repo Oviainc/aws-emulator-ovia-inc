@@ -99,6 +99,23 @@ pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRo
     router
 }
 
+/// A router over an account that holds NO instance — the account state `CreateInstance`
+/// is documented for, and the only state in which an instance can be enabled with tags.
+///
+/// That is the account state a completed `DeleteInstance` leaves behind: the account's
+/// ambient instance has been enabled once and is now gone, so no later request enables
+/// another. The delete path itself is driven over the wire in `instance_delete.rs`; this
+/// helper sets the same two fields directly so a create can be tested without waiting a
+/// deletion out, and everything a test then asserts goes over the wire.
+pub(crate) fn empty_account_router() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    with_store(&engine, |store| {
+        store.instances.clear();
+        store.ambient_instance_enabled = true;
+    });
+    router_over(engine)
+}
+
 /// The instance id the organization instance below is held under: `ssoins-` + 16 of
 /// `[a-zA-Z0-9-.]`, as the model's `InstanceArn` pattern requires.
 const ORGANIZATION_INSTANCE_ID: &str = "ssoins-0a1b2c3d4e5f6071";

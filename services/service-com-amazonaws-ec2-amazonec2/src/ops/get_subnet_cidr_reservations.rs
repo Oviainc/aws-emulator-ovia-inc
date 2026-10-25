@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSubnetCidrReservations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSubnetCidrReservations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the subnet CIDR reservations of ONE subnet out of
+//! [`crate::state`] (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_cidr_reservations`]) — the subnet's
+//! whole set by default, or the subset the request's `Filters` select, one `MaxResults`-sized
+//! page at a time, split into the IPv4 and the IPv6 reservations by the family of each
+//! reserved range. A reporting operation only — it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSubnetCidrReservations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,264 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSubnetCidrReservations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSubnetCidrReservationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            AddressFamily, CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES,
+            MAX_FILTER_VALUES, MAX_FILTERS, MAX_PAGE_SIZE, MatchBudget, decode_page_token,
+            encode_page_token, invalid_pagination_token, invalid_subnet_id_not_found,
+            matches_every_filter, require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. Every value
+        // it reports was decided when the reservation was stored, and the store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // Matching cost is filters x values x held values x stored reservations and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // reservation would have matched it, so an unsupported filter can never read as "no
+        // results". "Filter names are case-sensitive" (`Filter$Name`), so every comparison is
+        // exact.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !filter_name_documented(name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token for the next page of results" (`$NextToken`) — anything else is refused
+        // rather than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // A pure read: a reservation is created and deleted by an action, not by the passage
+        // of time, so there is no clock-owed transition to materialise here and nothing this
+        // call writes.
+
+        // "The ID of the subnet" (`$SubnetId`) is required, and a subnet id this account
+        // holds no subnet for is an error rather than an empty report — the same answer
+        // `DescribeSubnets` gives for an unknown `SubnetId`.
+        if !store.subnets.contains_key(&input.subnet_id) {
+            return Err(invalid_subnet_id_not_found(&input.subnet_id));
+        }
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request … If you have the required permissions, the error response is
+        // DryRunOperation" (`$DryRun`). Every caller of this emulator is permitted, so a dry
+        // run reports that outcome and reads nothing further. It sits AFTER the parameter
+        // checks and after the subnet is resolved — the flag asks whether the request WOULD
+        // have succeeded, so one that would have been refused, for its own parameters or for
+        // naming a subnet this account does not hold, is refused with that reason instead,
+        // the same order the create answers it in.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The subnet narrows the store to its own reservations, and every filter must then
+        // hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSubnetCidrReservations"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored reservations,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SubnetCidrReservation> = Vec::new();
+        for reservation in store.subnet_cidr_reservations.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if reservation.subnet_id.as_deref() != Some(input.subnet_id.as_str()) {
+                continue;
+            }
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(reservation, name)
+            }) {
+                selected.push(reservation.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `SubnetCidrReservationId` order, which the cursor below names a position
+        // in. The store is an ordered map keyed by that id, so its iteration order already
+        // satisfies this sort; doing it here establishes the invariant the cursor depends on
+        // at the point of use rather than inheriting it from the container `crate::state`
+        // happens to hold.
+        selected.sort_by(|left, right| {
+            left.subnet_cidr_reservation_id
+                .cmp(&right.subnet_cidr_reservation_id)
+        });
+
+        // That order is both the stable paging order and the cursor, so a token naming the id
+        // the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|reservation| {
+                reservation
+                    .subnet_cidr_reservation_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call" (`$MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 5..1000` (`GetSubnetCidrReservationsMaxResults`) has already
+        // refused anything outside it, so the `clamp` only keeps this expression total — it is
+        // never what decides the page size of a request that got here.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return" (`$NextToken`): a
+        // token only when a reservation follows this page. The page is cut BEFORE the two
+        // output sets are split, so one page of this operation is one page of reservations
+        // however they divide between the families.
+        let next_token = page
+            .get(limit)
+            .and_then(|reservation| reservation.subnet_cidr_reservation_id.as_deref())
+            .map(encode_page_token);
+
+        // "Information about the IPv4 subnet CIDR reservations" and "… the IPv6 subnet CIDR
+        // reservations" (`$SubnetIpv4CidrReservations` / `$SubnetIpv6CidrReservations`): one
+        // reservation reserves a range of ONE family, so the family of its range is which of
+        // the two sets reports it. Both sets are reported, the one with no reservation of its
+        // family as the empty set it is.
+        let (ipv4, ipv6): (Vec<SubnetCidrReservation>, Vec<SubnetCidrReservation>) = page
+            .iter()
+            .take(limit)
+            .cloned()
+            .partition(|reservation| {
+                AddressFamily::of_cidr(reservation.cidr.as_deref().unwrap_or_default())
+                    == AddressFamily::Ipv4
+            });
+
+        Ok(GetSubnetCidrReservationsOutput {
+            subnet_ipv4_cidr_reservations: Some(ipv4),
+            subnet_ipv6_cidr_reservations: Some(ipv6),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `GetSubnetCidrReservationsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="GetSubnetCidrReservationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `reservationType` is spelled exactly as that member documents it, camelCase and all;
+/// `tag:<key>` is the one name with a variable part, so it is matched by the crate's shared
+/// prefix ([`crate::state::TAG_FILTER_PREFIX`]) rather than listed here. Every entry must be
+/// answered by [`filter_values`].
+const SUBNET_CIDR_RESERVATION_FILTERS: [&str; 3] = ["reservationType", "subnet-id", "tag-key"];
+
+/// Does this operation document a filter called `name`?
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling.
+fn filter_name_documented(name: &str) -> bool {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return true;
+    }
+    SUBNET_CIDR_RESERVATION_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this reservation.
+///
+/// A filter naming an attribute this reservation does not carry compares against NO values,
+/// so it selects nothing — the same answer AWS gives for a tag key a resource does not have.
+/// `name` is one [`filter_name_documented`] accepted.
+fn filter_values<'a>(
+    reservation: &'a SubnetCidrReservation,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return reservation
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "reservationType" => text(reservation.reservation_type.as_deref()),
+        "subnet-id" => text(reservation.subnet_id.as_deref()),
+        "tag-key" => reservation
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `filter_name_documented` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

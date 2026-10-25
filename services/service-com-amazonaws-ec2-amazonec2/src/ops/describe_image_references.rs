@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeImageReferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeImageReferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeImageReferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources of [`crate::state`] that reference the images the request names:
+//! one [`ImageReference`] per (image id, referencing resource) pair, carrying the
+//! resource's type and ARN, one `MaxResults`-sized page at a time.
+//!
+//! The resource types this service's store holds are `ec2:Instance` — an instance whose
+//! `ImageId` is one of the named images, narrowed by the `state-name` option — and
+//! `ec2:LaunchTemplate` — a template one of whose `version-depth` most recent versions
+//! names one of them. The other three types `ImageReferenceResourceType` models
+//! (`ssm:Parameter`, `imagebuilder:ImageRecipe`, `imagebuilder:ContainerRecipe`) belong to
+//! other services' stores, which this service cannot enumerate, so a request that checks
+//! them is answered rather than refused and contributes no reference of its own.
+//!
+//! A reporting operation: the only state it writes is
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`], the move
+//! the clock already owed an instance at this instant — which is also the state the
+//! `state-name` option selects on.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +95,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    InstanceStateName, MAX_PAGE_SIZE, decode_page_token, dry_run_operation, encode_page_token,
+    image_id_is_well_formed, invalid_ami_id_malformed, invalid_pagination_token,
+    invalid_parameter_value, missing_parameter, request_region, require_service_state,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +168,408 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeImageReferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeImageReferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every ARN this operation reports names the Region the request was signed for;
+        // nothing else of `ctx` is read.
+        let region = request_region(ctx.parts());
+
+        // "The IDs of the images to check for resource references"
+        // (`DescribeImageReferencesRequest$ImageIds`) is `@required` with
+        // `@length(min: 1, max: 10)`, and `MaxResults` carries `@range(min: 5)`: the
+        // request walk refuses a violation of either before this handler runs, so what
+        // reaches here satisfies both.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeImageReferences"))
+        // An id that is not an image id at all is malformed. A well-formed one no stored
+        // image has is NOT refused: this operation asks which resources reference an
+        // image, which is exactly the question asked about an image that is being
+        // deprecated or has already been deregistered, and about one owned by another
+        // account — so an unknown id simply has no references to report.
+        for image_id in &input.image_ids {
+            if !image_id_is_well_formed(image_id) {
+                return Err(invalid_ami_id_malformed(image_id));
+            }
+        }
+
+        // "The maximum number of items to return for this request" carries a modelled
+        // minimum but no maximum, so the handler is the only place the page size can be
+        // bounded; one above the service's ceiling is refused rather than silently cut
+        // down.
+        if let Some(max_results) = input.max_results {
+            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_PAGE_SIZE {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. \
+                     It must be at most {MAX_PAGE_SIZE}"
+                )));
+            }
+        }
+
+        let scope = resolve_scope(
+            input.include_all_resource_types.unwrap_or(false),
+            input.resource_types.as_deref().unwrap_or_default(),
+        )?;
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as a cursor.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        // `DryRun` sits after every member has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused
+        // with that reason instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The one write this reporting operation makes: the transitions the clock already
+        // owed at this instant, which no caller had to ask for. An instance's state is
+        // what the `state-name` option selects on, so it is materialised before the scan.
+        store.materialize_due_transitions();
+
+        let wanted: ::std::collections::HashSet<&str> =
+            input.image_ids.iter().map(String::as_str).collect();
+        let mut references: Vec<ImageReference> = Vec::new();
+
+        // "ec2:Instance": an instance references the image it was launched from. "Default:
+        // All states" (`ResourceTypeOption$OptionValues`), so an empty state set reports
+        // an instance whatever state it is in.
+        if let Some(states) = &scope.instance_states {
+            for instance in store.instances.values() {
+                let Some(image_id) = instance.image_id.as_deref() else {
+                    continue;
+                };
+                if !wanted.contains(image_id) {
+                    continue;
+                }
+                if !states.is_empty() && !states.contains(&instance.state) {
+                    continue;
+                }
+                references.push(ImageReference {
+                    image_id: Some(image_id.to_string()),
+                    resource_type: Some(RESOURCE_TYPE_INSTANCE.to_string()),
+                    arn: Some(::engine::emulator_arn(
+                        "ec2",
+                        &region,
+                        &format!("instance/{}", instance.instance_id),
+                    )),
+                });
+            }
+        }
+
+        // "ec2:LaunchTemplate": a template references the image any of its versions names,
+        // over "the number of launch template versions to check, starting from the most
+        // recent version" (`ResourceTypeOption$OptionName`). The store keys versions by
+        // their number, so the reverse iteration order IS newest first. Two versions
+        // within that depth naming the same image are one reference of that template.
+        if let Some(depth) = scope.launch_template_depth {
+            for record in store.launch_templates.values() {
+                let mut referenced: ::std::collections::BTreeSet<&str> =
+                    ::std::collections::BTreeSet::new();
+                for version in record.versions.values().rev().take(depth) {
+                    if let Some(image_id) = version.data.image_id.as_deref() {
+                        if wanted.contains(image_id) {
+                            referenced.insert(image_id);
+                        }
+                    }
+                }
+                let arn = ::engine::emulator_arn(
+                    "ec2",
+                    &region,
+                    &format!("launch-template/{}", record.launch_template_id()),
+                );
+                for image_id in referenced {
+                    references.push(ImageReference {
+                        image_id: Some(image_id.to_string()),
+                        resource_type: Some(RESOURCE_TYPE_LAUNCH_TEMPLATE.to_string()),
+                        arn: Some(arn.clone()),
+                    });
+                }
+            }
+        }
+
+        // Page in (image id, ARN) order, which [`page_cursor`] names a position in: the
+        // instance store is unordered, so the order a page is cut at is established here
+        // rather than taken from an iteration order.
+        references.sort_by_cached_key(page_cursor);
+        references.dedup_by(|left, right| page_cursor(left) == page_cursor(right));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                references.partition_point(|reference| page_cursor(reference).as_str() < cursor)
+            }
+        };
+        let page = references.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not one was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeImageReferencesResult$NextToken`): a token only when a reference
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|reference| encode_page_token(&page_cursor(reference)));
+
+        Ok(DescribeImageReferencesOutput {
+            image_references: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// `ImageReferenceResourceType`'s `ec2:Instance`
+/// (`smithy_query(query="shape",shape="ImageReferenceResourceType")`), one of the five
+/// values [`IMAGE_REFERENCE_RESOURCE_TYPE_VALUES`] — the list the crate generates from
+/// that enum — holds. The other three name resources of OTHER services, which this
+/// service's store does not hold, so only these two have a scan below.
+const RESOURCE_TYPE_INSTANCE: &str = "ec2:Instance";
+
+/// `ImageReferenceResourceType`'s `ec2:LaunchTemplate`.
+const RESOURCE_TYPE_LAUNCH_TEMPLATE: &str = "ec2:LaunchTemplate";
+
+/// `ImageReferenceOptionName`'s `state-name`, the one option `ec2:Instance` documents:
+/// "The current state of the EC2 instance" (`ResourceTypeOption$OptionName`). The two
+/// values that enum carries are [`IMAGE_REFERENCE_OPTION_NAME_VALUES`]; WHICH of them a
+/// resource type documents is what this constant and the next one name.
+const OPTION_STATE_NAME: &str = "state-name";
+
+/// `ImageReferenceOptionName`'s `version-depth`, the one option `ec2:LaunchTemplate`
+/// documents: "The number of launch template versions to check, starting from the most
+/// recent version" (`ResourceTypeOption$OptionName`).
+const OPTION_VERSION_DEPTH: &str = "version-depth";
+
+/// The smallest `version-depth`: "Valid values: Integers between 1 and 10000"
+/// (`ResourceTypeOption$OptionValues`).
+const MIN_VERSION_DEPTH: usize = 1;
+
+/// The largest `version-depth`, from the same sentence.
+const MAX_VERSION_DEPTH: usize = 10_000;
+
+/// The `version-depth` a request that names none gets: "Default: 10"
+/// (`ResourceTypeOption$OptionValues`).
+const DEFAULT_VERSION_DEPTH: usize = 10;
+
+/// Which resource types this call checks, and with which options.
+///
+/// A `None` field is a type this call does not check at all, which is not the same as one
+/// it checks and finds nothing for.
+#[derive(Debug, Default)]
+struct Scope {
+    /// The instance states to report, or an EMPTY set for "Default: All states".
+    instance_states: Option<Vec<InstanceStateName>>,
+    /// How many of a launch template's most recent versions to check.
+    launch_template_depth: Option<usize>,
+}
+
+/// The resource types and options this call checks.
+///
+/// "Either IncludeAllResourceTypes or ResourceTypes must be specified" — so a request that
+/// selects no type at all is refused rather than answered with an empty set, which would
+/// read as "nothing references these images". "When specified, default values are applied
+/// for ResourceTypeOptions … If you also specify ResourceTypes with ResourceTypeOptions,
+/// your specified values override the default values"
+/// (`DescribeImageReferencesRequest$IncludeAllResourceTypes`): `IncludeAllResourceTypes`
+/// puts every type in scope with its documented defaults, and a `ResourceTypes` entry then
+/// replaces the options of the type it names.
+fn resolve_scope(
+    include_all: bool,
+    resource_types: &[ResourceTypeRequest],
+) -> Result<Scope, DescribeImageReferencesError> {
+    if !include_all && resource_types.is_empty() {
+        return Err(missing_parameter(
+            "Either IncludeAllResourceTypes or ResourceTypes must be specified",
+        ));
+    }
+
+    let mut scope = Scope::default();
+    if include_all {
+        scope.instance_states = Some(Vec::new());
+        scope.launch_template_depth = Some(DEFAULT_VERSION_DEPTH);
+    }
+
+    let mut named: Vec<&str> = Vec::new();
+    for request in resource_types {
+        let resource_type = request.resource_type.as_deref().unwrap_or_default();
+        if resource_type.is_empty() {
+            return Err(missing_parameter(
+                "Every ResourceTypes entry must carry a ResourceType",
+            ));
+        }
+        // "Supported resource types: ec2:Instance | ec2:LaunchTemplate | ssm:Parameter |
+        // imagebuilder:ImageRecipe | imagebuilder:ContainerRecipe"
+        // (`DescribeImageReferencesRequest$IncludeAllResourceTypes`) — checked against the
+        // list the crate generates from `ImageReferenceResourceType` itself, so the
+        // accepted set cannot drift from the model.
+        if !IMAGE_REFERENCE_RESOURCE_TYPE_VALUES.contains(&resource_type) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({resource_type}) for parameter ResourceType is invalid"
+            )));
+        }
+        // One type carries one set of options, so naming it twice asks two questions of
+        // one type instead of overriding the defaults once.
+        if named.contains(&resource_type) {
+            return Err(invalid_parameter_value(format!(
+                "Value ({resource_type}) for parameter ResourceType is invalid. \
+                 It is named more than once"
+            )));
+        }
+        named.push(resource_type);
+
+        let options = request.resource_type_options.as_deref().unwrap_or_default();
+        match resource_type {
+            RESOURCE_TYPE_INSTANCE => scope.instance_states = Some(instance_states(options)?),
+            RESOURCE_TYPE_LAUNCH_TEMPLATE => {
+                scope.launch_template_depth = Some(version_depth(options)?);
+            }
+            // The model documents an option for the two EC2 types only, so an option on
+            // any other type names no option of that type.
+            other => {
+                if let Some(option) = options.first() {
+                    return Err(invalid_parameter_value(format!(
+                        "Value ({}) for parameter OptionName is invalid. \
+                         {other} documents no option",
+                        option.option_name.as_deref().unwrap_or_default()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(scope)
+}
+
+/// The instance states an `ec2:Instance` entry's options select.
+///
+/// "Valid values: pending | running | shutting-down | terminated | stopping | stopped" —
+/// the `InstanceStateName` the store keeps an instance's state as — and "Default: All
+/// states", which is the EMPTY set here: an option that carries no value narrows nothing.
+/// One option is named once, so a second entry for it is refused rather than merged into
+/// the first — the same reasoning that refuses a resource type named twice.
+fn instance_states(
+    options: &[ResourceTypeOption],
+) -> Result<Vec<InstanceStateName>, DescribeImageReferencesError> {
+    // `ec2:Instance` documents ONE option, so a second entry can only be a repeat of it.
+    if options.len() > 1 {
+        return Err(invalid_parameter_value(format!(
+            "Value ({OPTION_STATE_NAME}) for parameter OptionName is invalid. \
+             It is named more than once"
+        )));
+    }
+    let mut states: Vec<InstanceStateName> = Vec::new();
+    for option in options {
+        let name = option.option_name.as_deref().unwrap_or_default();
+        if name != OPTION_STATE_NAME {
+            return Err(invalid_parameter_value(format!(
+                "Value ({name}) for parameter OptionName is invalid. \
+                 {RESOURCE_TYPE_INSTANCE} documents only {OPTION_STATE_NAME}"
+            )));
+        }
+        for value in option.option_values.iter().flatten() {
+            let state = instance_state_from_wire(value).ok_or_else(|| {
+                invalid_parameter_value(format!(
+                    "Value ({value}) for parameter {OPTION_STATE_NAME} is invalid"
+                ))
+            })?;
+            if !states.contains(&state) {
+                states.push(state);
+            }
+        }
+    }
+    Ok(states)
+}
+
+/// How many of a launch template's most recent versions an `ec2:LaunchTemplate` entry's
+/// options ask for — [`DEFAULT_VERSION_DEPTH`] when its options name none.
+///
+/// "A value for the specified option" is one value, so a depth given as several is refused
+/// rather than one of them being chosen — and so is a depth given as a second entry for the
+/// same option, which would otherwise silently discard the first.
+fn version_depth(
+    options: &[ResourceTypeOption],
+) -> Result<usize, DescribeImageReferencesError> {
+    // `ec2:LaunchTemplate` documents ONE option, so a second entry can only be a repeat.
+    if options.len() > 1 {
+        return Err(invalid_parameter_value(format!(
+            "Value ({OPTION_VERSION_DEPTH}) for parameter OptionName is invalid. \
+             It is named more than once"
+        )));
+    }
+    let mut depth = DEFAULT_VERSION_DEPTH;
+    for option in options {
+        let name = option.option_name.as_deref().unwrap_or_default();
+        if name != OPTION_VERSION_DEPTH {
+            return Err(invalid_parameter_value(format!(
+                "Value ({name}) for parameter OptionName is invalid. \
+                 {RESOURCE_TYPE_LAUNCH_TEMPLATE} documents only {OPTION_VERSION_DEPTH}"
+            )));
+        }
+        let values = option.option_values.as_deref().unwrap_or_default();
+        if values.len() > 1 {
+            return Err(invalid_parameter_value(format!(
+                "Value for parameter {OPTION_VERSION_DEPTH} is invalid. \
+                 It takes one value, and the request carries {}",
+                values.len()
+            )));
+        }
+        if let Some(value) = values.first() {
+            depth = value
+                .parse::<usize>()
+                .ok()
+                .filter(|depth| (MIN_VERSION_DEPTH..=MAX_VERSION_DEPTH).contains(depth))
+                .ok_or_else(|| {
+                    invalid_parameter_value(format!(
+                        "Value ({value}) for parameter {OPTION_VERSION_DEPTH} is invalid. \
+                         It must be an integer between {MIN_VERSION_DEPTH} and \
+                         {MAX_VERSION_DEPTH}"
+                    ))
+                })?;
+        }
+    }
+    Ok(depth)
+}
+
+/// The instance state a `state-name` value names, or `None` when it names none.
+///
+/// The candidate words are the crate's generated [`INSTANCE_STATE_NAME_VALUES`] — the
+/// model's own list for `InstanceStateName`, which is also what `ResourceTypeOption`
+/// documents this option's values as — so a word outside the model is refused by that list
+/// rather than by a hand-kept copy of it. Each word is then resolved to the state the
+/// store keeps an instance's state as; a value the model grew but this mapping does not
+/// cover answers `None`, which is a refusal rather than a silently wider selection.
+fn instance_state_from_wire(value: &str) -> Option<InstanceStateName> {
+    if !INSTANCE_STATE_NAME_VALUES.contains(&value) {
+        return None;
+    }
+    [
+        InstanceStateName::Pending,
+        InstanceStateName::Running,
+        InstanceStateName::ShuttingDown,
+        InstanceStateName::Terminated,
+        InstanceStateName::Stopping,
+        InstanceStateName::Stopped,
+    ]
+    .into_iter()
+    .find(|state| state.as_str() == value)
+}
+
+/// The position of one reference in the order this operation pages in: its image id, then
+/// the ARN of the resource referencing it.
+///
+/// The separator sorts ahead of every character an image id or an ARN can carry, so one
+/// image id being a prefix of another cannot reorder two references — which is what lets a
+/// cursor be compared against this string directly.
+fn page_cursor(reference: &ImageReference) -> String {
+    format!(
+        "{} {}",
+        reference.image_id.as_deref().unwrap_or_default(),
+        reference.arn.as_deref().unwrap_or_default()
+    )
 }

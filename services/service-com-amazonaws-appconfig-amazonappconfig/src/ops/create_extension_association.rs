@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExtensionAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateExtensionAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates one version of one extension with an application, environment
+//! or configuration profile, and persists the association.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateExtensionAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The association is what makes an extension part of a resource's workflow, so what this
+//! writes is the binding itself — the extension version, the resource, and the values for
+//! the parameters that extension version declares — checked against both ends before
+//! anything is stored. `GetExtensionAssociation` reports the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +179,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateExtensionAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateExtensionAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateExtensionAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateExtensionAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "AppConfig state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Every tag key this request would store is checked through the same function
+        // `TagResource` refuses through, and before anything is written.
+        if let Some(reason) = input
+            .tags
+            .as_ref()
+            .and_then(crate::state::first_tag_key_rejection)
+        {
+            return Err(bad_request(reason));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "The name, the ID, or the Amazon Resource Name (ARN) of the extension",
+        // resolved over the whole catalogue the account can see, so an AWS-authored
+        // extension associates exactly as one this account created does.
+        let Some((extension, pinned_version)) =
+            store.resolve_extension(&input.extension_identifier, &region)
+        else {
+            return Err(not_found(crate::state::extension_not_found()));
+        };
+        // "The version number of the extension. If not specified, AppConfig uses the
+        // maximum version of the extension." An ARN addresses one version, so it pins the
+        // version it names unless the request states one.
+        let version = match input.extension_version_number.or(pinned_version) {
+            Some(number) => extension.versions.get(&number).ok_or_else(|| {
+                not_found(crate::state::extension_version_not_found(
+                    &input.extension_identifier,
+                    number,
+                ))
+            })?,
+            None => extension
+                .latest_version()
+                .ok_or_else(|| not_found(crate::state::extension_not_found()))?,
+        };
+
+        // "The ARN of an application, configuration profile, or environment" — resolved
+        // against the tree, so an association cannot bind a resource that does not exist.
+        let Some(resource_arn) =
+            store.resolve_association_resource(&input.resource_identifier, &region)
+        else {
+            return Err(not_found(crate::state::resource_arn_not_found(
+                &input.resource_identifier,
+            )));
+        };
+
+        // "The parameter names and values defined in the extensions. Extension parameters
+        // marked Required must be entered for this field." Both halves are checked
+        // against the version's own declaration: a name it does not declare is not a
+        // parameter of this extension, and a required one it declares must be given.
+        let parameters = input.parameters.unwrap_or_default();
+        let mut supplied: Vec<&String> = parameters.keys().collect();
+        supplied.sort();
+        if let Some(unknown) = supplied
+            .into_iter()
+            .find(|name| !version.parameters.contains_key(name.as_str()))
+        {
+            return Err(bad_request(format!(
+                "Extension {} version {} declares no parameter named {unknown}.",
+                extension.name, version.version_number
+            )));
+        }
+        let mut declared: Vec<(&String, &Parameter)> = version.parameters.iter().collect();
+        declared.sort_by(|left, right| left.0.cmp(right.0));
+        if let Some((missing, _)) = declared
+            .into_iter()
+            .find(|(name, parameter)| parameter.required && !parameters.contains_key(name.as_str()))
+        {
+            return Err(bad_request(format!(
+                "Parameter {missing} is required by extension {} version {}.",
+                extension.name, version.version_number
+            )));
+        }
+
+        let extension_id = extension.id.clone();
+        let extension_arn = version.arn.clone();
+        let extension_version_number = version.version_number;
+        let tags = input.tags.unwrap_or_default();
+
+        let id = store.mint_id();
+        let association = crate::state::ExtensionAssociation {
+            arn: crate::state::extension_association_arn(&region, &id),
+            id: id.clone(),
+            extension_id,
+            extension_arn,
+            extension_version_number,
+            resource_arn,
+            parameters,
+            tags,
+        };
+        if !store.try_insert_extension_association(association) {
+            return Err(
+                CreateExtensionAssociationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Cannot create another extension association: this account already \
+                             holds the maximum of {} associations.",
+                            crate::state::MAX_EXTENSION_ASSOCIATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Answered from the stored record, so a later `GetExtensionAssociation` reports
+        // exactly what this call persisted.
+        let stored = store.extension_association(&id).ok_or_else(|| {
+            CreateExtensionAssociationError::from(
+                CreateExtensionAssociationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The extension association this call stored is not readable"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        Ok(CreateExtensionAssociationOutput {
+            id: Some(stored.id.clone()),
+            arn: Some(stored.arn.clone()),
+            extension_arn: Some(stored.extension_arn.clone()),
+            resource_arn: Some(stored.resource_arn.clone()),
+            extension_version_number: stored.extension_version_number,
+            // `ParameterValueMap` is bounded `len 0..10`, so an association that supplied
+            // no value reports an empty map rather than omitting the member.
+            parameters: Some(stored.parameters.clone()),
+        })
     }
+}
+
+/// The `BadRequestException` (HTTP 400) this operation answers a request it will not store
+/// with: "The input fails to satisfy the constraints specified by an Amazon Web Services
+/// service."
+fn bad_request(message: String) -> CreateExtensionAssociationError {
+    CreateExtensionAssociationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The `ResourceNotFoundException` (HTTP 404) this operation answers an identifier that
+/// addresses no resource this service holds with.
+fn not_found(message: String) -> CreateExtensionAssociationError {
+    CreateExtensionAssociationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: None,
+    })
+    .into()
 }

@@ -186,11 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle();
 
         // A managed endpoint is a gateway INTO a virtual cluster, so the cluster is
-        // resolved out of state first: one that was never created, or one that is no
-        // longer RUNNING because it was deleted, cannot host an endpoint.
+        // resolved out of state first, in the region this request is signed for: one that
+        // was never created here, or one that is no longer RUNNING because it was deleted,
+        // cannot host an endpoint.
         let cluster_running = state
-            .virtual_clusters
-            .get(&input.virtual_cluster_id)
+            .virtual_cluster(&region, &input.virtual_cluster_id)
             .is_some_and(|cluster| cluster.state == crate::state::CLUSTER_RUNNING);
         if !cluster_running {
             return Err(CreateManagedEndpointErrorModeled::ResourceNotFoundException(
@@ -207,9 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken` is `@idempotencyToken`: the same token replayed names the endpoint
         // the first call minted rather than provisioning a second gateway.
         let replayed = state
-            .replayed_idempotency(&scope, &input.client_token)
+            .replayed_idempotency(&region, &scope, &input.client_token)
             .cloned();
-        if let Some(existing) = replayed.and_then(|id| state.managed_endpoints.get(&id)) {
+        if let Some(existing) =
+            replayed.and_then(|id| state.managed_endpoint(&region, &input.virtual_cluster_id, &id))
+        {
             return Ok(CreateManagedEndpointOutput {
                 id: Some(existing.id.clone()),
                 name: Some(existing.name.clone()),
@@ -241,6 +243,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::managed_endpoint_arn(&region, &input.virtual_cluster_id, &id);
         let record = crate::state::ManagedEndpointRecord {
             id: id.clone(),
+            // The region this request was signed for — the region of the cluster resolved
+            // above — so the endpoint exists at that endpoint and nowhere else.
+            region: region.clone(),
             name: input.name.clone(),
             virtual_cluster_id: input.virtual_cluster_id.clone(),
             arn: arn.clone(),

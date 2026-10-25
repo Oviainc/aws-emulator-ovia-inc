@@ -166,6 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in is refused before either half of the addressed
+        // `(taskId, managedDeviceId)` pair is resolved.
+        if !store.has_devices_in(&region) {
+            return Err(DescribeExecutionErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         // "The ID of the task that the action is describing": a task of another
         // Region is not this Region's to report.
         if store.task_in(&region, &input.task_id).is_none() {
