@@ -2,8 +2,8 @@
 
 //! @op ListObjectsV2
 //! IMPLEMENTED: enumerates the keys actually stored in the bucket, in ascending UTF-8
-//! byte order, honouring Prefix, StartAfter, Delimiter, MaxKeys, ContinuationToken and
-//! EncodingType.
+//! byte order, honouring Prefix, StartAfter, Delimiter, MaxKeys, ContinuationToken,
+//! FetchOwner and EncodingType.
 //!
 //! A read: it reports the stored objects and changes nothing.
 //!
@@ -290,16 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `fetch-owner` adds an Owner to every entry and `OptionalObjectAttributes` adds
-        // restore state: neither is served yet, and answering as if they had been asked
-        // for would be a different response than the one requested. `encoding-type` IS
-        // served (below): it decides how the key-name elements of this response are
-        // written, which is a rendering of the same listing rather than a different one.
-        if input.fetch_owner == Some(true) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "ListObjectsV2 with fetch-owner=true",
-            ));
-        }
+        // `OptionalObjectAttributes` asks for restore state, which is an archive tier this
+        // store does not model at all, so it keeps the scaffold's 501: there is no stored
+        // fact for it to report. `fetch-owner` (below) and `encoding-type` (below) both ask
+        // for something this store already holds — the account that owns what it holds, and
+        // how the key-name elements of this response are written — so each is served rather
+        // than refused.
         if input
             .optional_object_attributes
             .as_ref()
@@ -367,6 +363,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let prefix = input.prefix.clone().unwrap_or_default();
         let delimiter = input.delimiter.clone().unwrap_or_default();
+        // "The owner field is not present in ListObjectsV2 by default": absent and `false`
+        // are the same request — no `Owner` on any entry. The id is read ONCE here rather
+        // than per entry, because every entry of a listing carries the same owner.
+        let owner_id = input
+            .fetch_owner
+            .unwrap_or(false)
+            .then(crate::state::canonical_user_id);
 
         let mut contents: Vec<Object> = Vec::new();
         let mut common_prefixes: Vec<String> = Vec::new();
@@ -422,6 +425,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(rolled_up) => common_prefixes.push(rolled_up),
                     None => contents.push(Object {
                         key: Some(key.to_string()),
+                        // "The owner field is not present in ListObjectsV2 by default. If
+                        // you want to return the owner field with each key in the result,
+                        // then set the FetchOwner field to true" (`FetchOwner`) — "the
+                        // owner of the object" (`Object$Owner`) is the account that wrote
+                        // it, and this emulator serves one account, whose canonical user id
+                        // the store names once (`state::canonical_user_id`), the same id
+                        // every other owner this service reports carries. No `DisplayName`:
+                        // that is an account's friendly name, which nothing here records.
+                        owner: owner_id.clone().map(|id| Owner {
+                            id: Some(id),
+                            display_name: None,
+                        }),
                         // The instant the store recorded for the write, rendered the way
                         // `GetObject` and `HeadObject` render it.
                         last_modified: Some(::aws_smithy_types::DateTime::from(

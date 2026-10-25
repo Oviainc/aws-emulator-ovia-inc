@@ -27,9 +27,10 @@
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
 //! `UpgradeProfileVersion` moves to the one that profile is at. The shares of a profile
-//! (`CreateProfileShare`, `ListProfileShares`) are held like a workload's, keyed by the
-//! `ProfileArn` they share then by the share's own `ShareId`, and each raises the
-//! invitation `ListShareInvitations` reports to the principal it was offered to. The agent profiles
+//! (`CreateProfileShare`, `ListProfileShares`, `DeleteProfileShare`) are held like a
+//! workload's, keyed by the `ProfileArn` they share then by the share's own `ShareId`, and
+//! each raises the invitation `ListShareInvitations` reports to the principal it was
+//! offered to. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `UpdateAgentGoal`,
 //! `DeleteAgentGoal`) are backed the same way,
@@ -901,7 +902,8 @@ pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 /// KIND, so the two are spelled apart for the same reason.
 pub const LENS_SHARE_RESOURCE_TYPE: &str = "LENS_SHARE";
 
-/// `ConflictException$ResourceType` for a share of a PROFILE — the counterpart of
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// share of a PROFILE — the counterpart of
 /// [`WORKLOAD_SHARE_RESOURCE_TYPE`] for the Well-Architected Tool profile. The share is
 /// a resource of its own (its own `ShareId`), while [`PROFILE_RESOURCE_TYPE`] is the
 /// `ShareResourceType` member naming the shared resource KIND, so the two are spelled
@@ -4995,6 +4997,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateProfileShare`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_profile_share_tokens: TokenLedger<CreateProfileShareToken>,
+    /// `DeleteProfileShare`'s `ClientRequestToken` -> the delete the original request
+    /// completed ([`delete_replay`]), held exactly as [`Self::delete_lens_share_tokens`]
+    /// is and for the same reason: the revoked share cannot serve the replay, so the
+    /// completed delete does, and a retry carrying the token answers that success rather
+    /// than the not-found the original request's own work produced.
+    pub delete_profile_share_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -6072,6 +6080,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // it goes with the associations dropped just above.
         self.upgrade_profile_version_tokens
             .retain(|token| token.profile_arn != profile_arn);
+        // A share shares THIS profile, so it cannot outlive it either — the same rule
+        // [`Self::remove_workload`] applies to a workload's shares.
+        self.profile_shares.remove(profile_arn);
+        self.create_profile_share_tokens
+            .retain(|token| token.profile_arn != profile_arn);
         Some(record)
     }
 
@@ -6310,18 +6323,31 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `None` when the lens holds no such share, which is what tells a delete that the
     /// share it was asked to remove does not exist.
     ///
-    /// This is the first share removal in this store; a workload or PROFILE share is
-    /// removed the same way — drop the record, forget the create token that resolved to
-    /// it, prune the resource's map once it is empty — so whichever operation needs that
-    /// next should generalise this one over the share maps rather than write a second copy.
+    /// The record and the empty map are taken by [`take_share`], which every share kind
+    /// in this store shares; only the create ledger that resolves to a share of THIS kind
+    /// is this method's own.
     pub fn remove_lens_share(&mut self, lens_id: &str, share_id: &str) -> Option<LensShareRecord> {
-        let shares = self.lens_shares.get_mut(lens_id)?;
-        let record = shares.remove(share_id)?;
-        if shares.is_empty() {
-            self.lens_shares.remove(lens_id);
-        }
+        let record = take_share(&mut self.lens_shares, lens_id, share_id)?;
         self.create_lens_share_tokens
             .retain(|token| !(token.lens_id == lens_id && token.share_id == share_id));
+        Some(record)
+    }
+
+    /// Drop one share of a profile and everything keyed to it — the profile counterpart
+    /// of [`Self::remove_lens_share`], sharing its removal through [`take_share`]: the
+    /// create token that resolved to the share goes with it, so the next request carrying
+    /// that token shares afresh rather than replaying a share that is gone.
+    ///
+    /// `None` when the profile holds no such share, which is what tells a delete that the
+    /// share it was asked to remove does not exist.
+    pub fn remove_profile_share(
+        &mut self,
+        profile_arn: &str,
+        share_id: &str,
+    ) -> Option<ProfileShareRecord> {
+        let record = take_share(&mut self.profile_shares, profile_arn, share_id)?;
+        self.create_profile_share_tokens
+            .retain(|token| !(token.profile_arn == profile_arn && token.share_id == share_id));
         Some(record)
     }
 
@@ -6346,6 +6372,28 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     && share.shared_with == principal
             })
     }
+}
+
+/// Take one share out of a share map keyed by the shared resource then by `ShareId`,
+/// pruning the resource's map once its last share is gone so a resource nobody shares
+/// leaves nothing behind. `None` when that resource holds no such share, which is what
+/// tells a delete that the share it was asked to remove does not exist.
+///
+/// Generic over the share record, so every resource kind whose shares are held that way
+/// removes one the same way; what is keyed to a share BESIDES the record — the create
+/// token that resolved to it — belongs to the kind, so each `remove_*_share` forgets its
+/// own.
+fn take_share<R>(
+    shares_by_resource: &mut HashMap<String, BTreeMap<String, R>>,
+    resource_key: &str,
+    share_id: &str,
+) -> Option<R> {
+    let shares = shares_by_resource.get_mut(resource_key)?;
+    let record = shares.remove(share_id)?;
+    if shares.is_empty() {
+        shares_by_resource.remove(resource_key);
+    }
+    Some(record)
 }
 
 /// The form a name whose uniqueness this service decides LOOSELY is compared in:
@@ -7799,6 +7847,21 @@ pub fn lens_share_not_found(alias: &str, share_id: &str) -> ResourceNotFoundExce
         LENS_SHARE_RESOURCE_TYPE,
         share_id.to_string(),
         &format!("share with ID {share_id} of a lens with alias {alias}"),
+    )
+}
+
+/// [`resource_not_found`] for a share id that names no share of the profile.
+///
+/// A `ShareId` identifies a share on its own — the id space is unique across every
+/// share this store holds — so the `ResourceId` is that id AS SENT, and the message names
+/// the profile the share was looked for in, so a caller can tell a share of another
+/// profile from a share that was deleted. Shared by every operation that resolves a
+/// profile `ShareId`, so they cannot word it differently.
+pub fn profile_share_not_found(profile_arn: &str, share_id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        PROFILE_SHARE_RESOURCE_TYPE,
+        share_id.to_string(),
+        &format!("share with ID {share_id} of a profile with ARN {profile_arn}"),
     )
 }
 

@@ -53,6 +53,10 @@ pub mod alarm_actions;
 /// A metric alarm's `StateValue`, computed from the datapoints this store holds.
 pub mod alarm_evaluation;
 
+/// The metric math expression language a `MetricDataQuery$Expression` carries, parsed and
+/// evaluated over the series this store holds.
+pub mod metric_math;
+
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
 pub type DimensionSet = BTreeMap<String, String>;
@@ -256,6 +260,49 @@ pub fn window_start(start: f64, index: i64, period: f64) -> f64 {
     start + offset * period
 }
 
+/// How long "start time less than 15 days ago" lasts, in seconds — the first of the three
+/// spans a requested start time is rounded by.
+const FIFTEEN_DAYS_SECS: f64 = 15.0 * 24.0 * 60.0 * 60.0;
+
+/// How long "start time between 15 and 63 days ago" lasts, in seconds.
+const SIXTY_THREE_DAYS_SECS: f64 = 63.0 * 24.0 * 60.0 * 60.0;
+
+/// The sub-minute `Period` values a request that names one of them rounds its start time to:
+/// "If you set Period to 5, 10, 20, or 30, the start time of your request is rounded down to
+/// the nearest time that corresponds to even 5-, 10-, 20-, or 30-second divisions of a
+/// minute." (`GetMetricDataInput$StartTime`) — four of the five sub-minute periods
+/// [`SUB_MINUTE_PERIODS`] admits.
+const START_TIME_ROUNDING_PERIODS: [i32; 4] = [5, 10, 20, 30];
+
+/// The start of the first window a read searches: the requested start time rounded DOWN to the
+/// boundary its age and its period put it on.
+///
+/// "CloudWatch rounds the specified time stamp as follows: Start time less than 15 days ago -
+/// Round down to the nearest whole minute. […] Start time between 15 and 63 days ago - Round
+/// down to the nearest 5-minute clock interval. […] Start time greater than 63 days ago -
+/// Round down to the nearest 1-hour clock interval. […] If you set Period to 5, 10, 20, or 30,
+/// the start time of your request is rounded down to the nearest time that corresponds to even
+/// 5-, 10-, 20-, or 30-second divisions of a minute." (`GetMetricDataInput$StartTime`, in the
+/// same words as `GetMetricStatisticsInput$StartTime`)
+///
+/// Shared by every read that lays period windows over a range, so the windows of one instant
+/// are the same whichever operation reads them.
+pub fn rounded_start(requested_start: f64, period: i32, now: f64) -> f64 {
+    let interval = if START_TIME_ROUNDING_PERIODS.contains(&period) {
+        f64::from(period)
+    } else {
+        let age = now - requested_start;
+        if age < FIFTEEN_DAYS_SECS {
+            60.0
+        } else if age < SIXTY_THREE_DAYS_SECS {
+            5.0 * 60.0
+        } else {
+            60.0 * 60.0
+        }
+    };
+    (requested_start / interval).floor() * interval
+}
+
 /// The percentile a `pNN` / `pNN.NN` extended statistic names, in percent, or `None` for a
 /// name that is not one. The `p` is matched without regard to ASCII case, and the number is
 /// a plain decimal in `0..=100`, so `f64`'s sign and exponent forms (`p+9`, `p1e2`) cannot
@@ -277,13 +324,9 @@ const CLOUDWATCH_BASIC_STATISTICS: &[&str] =
 /// trimmed sum and Winsorized mean.
 const TRIMMED_FAMILIES: &[&str] = &["tm", "tc", "ts", "wm"];
 
-/// The percentile-rank family from the same page, which takes a span of metric VALUES rather
-/// than a percentile ("and `PR(:300)`").
-const RANK_FAMILIES: &[&str] = &["pr"];
-
-/// The five basic statistics this store FOLDS out of its datapoints
-/// ([`BasicStatistics::named`]) — `IQM` and the bounded families are statistics CloudWatch
-/// supports that nothing here computes.
+/// The five basic statistics this store folds out of the four aggregates every datapoint
+/// carries ([`BasicStatistics::named`]); every other statistic is computed from the window's
+/// own distribution instead ([`BoundedStatistic::of`], [`weighted_percentile`]).
 const FOLDED_STATISTICS: &[&str] = &["SampleCount", "Average", "Sum", "Minimum", "Maximum"];
 
 /// Whether `statistic` is one CloudWatch supports at all: a basic statistic, a percentile, or
@@ -295,62 +338,246 @@ pub fn is_cloudwatch_statistic(statistic: &str) -> bool {
         .iter()
         .any(|known| known.eq_ignore_ascii_case(statistic))
         || parse_percentile(statistic).is_some()
-        || bounded_statistic(statistic)
+        || bounded_statistic(statistic).is_some()
 }
 
-/// Whether this store FOLDS `statistic` out of the datapoints it keeps: one of the five
-/// basic statistics, or a percentile over the published values. A statistic CloudWatch
-/// supports but this answers `false` for is one no reader here can compute, which its caller
-/// reports as not implemented rather than as an empty series.
-pub fn computes_statistic(statistic: &str) -> bool {
-    FOLDED_STATISTICS
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(statistic))
-        || parse_percentile(statistic).is_some()
-}
+/// The interquartile mean, which is the trimmed mean of the middle half of the distribution:
+/// "Interquartile mean. The trimmed mean of the interquartile range" — the same statistic as
+/// `TM(25%:75%)`.
+const INTERQUARTILE_SPAN: (f64, f64) = (25.0, 75.0);
 
 /// A statistic of one of the bounded families, in either documented form:
 /// `<family><percentile>` (`tm98`) or `<family>(<low>:<high>)` (`TM(10%:90%)`, `PR(:300)`),
-/// where one side of a span may be omitted but not both.
-fn bounded_statistic(statistic: &str) -> bool {
+/// where one side of a span may be omitted but not both — and the interquartile mean, which
+/// is one of them under its own name.
+fn bounded_statistic(statistic: &str) -> Option<BoundedStatistic> {
+    if statistic.eq_ignore_ascii_case("IQM") {
+        return Some(BoundedStatistic {
+            family: BoundedFamily::TrimmedMean,
+            low: Some(Bound::Percentile(INTERQUARTILE_SPAN.0)),
+            high: Some(Bound::Percentile(INTERQUARTILE_SPAN.1)),
+        });
+    }
     if let Some(open) = statistic.find('(') {
         let (family, span) = statistic.split_at(open);
-        return TRIMMED_FAMILIES
-            .iter()
-            .chain(RANK_FAMILIES)
-            .any(|known| known.eq_ignore_ascii_case(family))
-            && is_span(span);
+        let family = BoundedFamily::named(family)?;
+        let (low, high) = parse_span(span)?;
+        return Some(BoundedStatistic { family, low, high });
     }
-    TRIMMED_FAMILIES.iter().any(|family| {
-        strip_prefix_ignore_ascii_case(statistic, family)
-            .and_then(percentage)
-            .is_some()
-    })
+    // The bare form names a percentile only, and only for the families that take one: "this
+    // includes tm98, wm90" — the lower bound of such a span is the bottom of the
+    // distribution.
+    for name in TRIMMED_FAMILIES {
+        if let Some(percentile) = strip_prefix_ignore_ascii_case(statistic, name).and_then(percentage)
+        {
+            return Some(BoundedStatistic {
+                family: BoundedFamily::named(name)?,
+                low: Some(Bound::Percentile(0.0)),
+                high: Some(Bound::Percentile(percentile)),
+            });
+        }
+    }
+    None
 }
 
-/// Whether `span` is a `(<low>:<high>)` bound pair with at least one bound given.
-fn is_span(span: &str) -> bool {
-    let Some(inner) = span
+/// A `(<low>:<high>)` bound pair with at least one bound given; `None` for anything else.
+fn parse_span(span: &str) -> Option<(Option<Bound>, Option<Bound>)> {
+    let inner = span
         .strip_prefix('(')
-        .and_then(|rest| rest.strip_suffix(')'))
-    else {
-        return false;
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let (low, high) = inner.split_once(':')?;
+    if low.is_empty() && high.is_empty() {
+        return None;
+    }
+    let bound = |text: &str| -> Option<Option<Bound>> {
+        if text.is_empty() {
+            return Some(None);
+        }
+        bound_value(text).map(Some)
     };
-    let Some((low, high)) = inner.split_once(':') else {
-        return false;
-    };
-    !(low.is_empty() && high.is_empty())
-        && [low, high]
-            .iter()
-            .all(|bound| bound.is_empty() || bound_value(bound).is_some())
+    Some((bound(low)?, bound(high)?))
 }
 
 /// One bound of a span: a percentage when it carries a `%`, otherwise a plain metric value.
-fn bound_value(bound: &str) -> Option<f64> {
+fn bound_value(bound: &str) -> Option<Bound> {
     match bound.strip_suffix('%') {
-        Some(percent) => percentage(percent),
-        None => decimal(bound),
+        Some(percent) => percentage(percent).map(Bound::Percentile),
+        None => decimal(bound).map(Bound::Value),
     }
+}
+
+/// One bound of a bounded statistic's span.
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    /// A place in the window's own distribution, in percent.
+    Percentile(f64),
+    /// A metric value.
+    Value(f64),
+}
+
+/// The statistic families CloudWatch defines over a span of the window's distribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedFamily {
+    /// "Trimmed mean. The mean of all values that are between two specified boundaries, but
+    /// ignores outliers above and below these boundaries."
+    TrimmedMean,
+    /// "Trimmed count. The number of data points in the chosen range."
+    TrimmedCount,
+    /// "Trimmed sum. The sum of the values of data points in a chosen range."
+    TrimmedSum,
+    /// "Winsorized mean. ... values outside of the boundaries are replaced with the values of
+    /// the boundaries, then the mean is computed."
+    WinsorizedMean,
+    /// "Percentile rank. The percentage of values that fall within the specified range."
+    PercentileRank,
+}
+
+impl BoundedFamily {
+    /// The family a statistic's prefix names.
+    fn named(prefix: &str) -> Option<Self> {
+        match () {
+            () if prefix.eq_ignore_ascii_case("tm") => Some(Self::TrimmedMean),
+            () if prefix.eq_ignore_ascii_case("tc") => Some(Self::TrimmedCount),
+            () if prefix.eq_ignore_ascii_case("ts") => Some(Self::TrimmedSum),
+            () if prefix.eq_ignore_ascii_case("wm") => Some(Self::WinsorizedMean),
+            () if prefix.eq_ignore_ascii_case("pr") => Some(Self::PercentileRank),
+            () => None,
+        }
+    }
+}
+
+/// A statistic over a span of one window's own distribution: which statistic, and the span.
+#[derive(Debug, Clone, Copy)]
+struct BoundedStatistic {
+    /// Which of the families it is.
+    family: BoundedFamily,
+    /// The low end of the span, when the statistic names one.
+    low: Option<Bound>,
+    /// The high end of the span, when the statistic names one.
+    high: Option<Bound>,
+}
+
+impl BoundedStatistic {
+    /// This statistic over a window's distribution: the published values with their weights,
+    /// ascending. `None` when the span is empty of values, so the statistic is undefined
+    /// there.
+    fn of(&self, values: &[(f64, f64)]) -> Option<f64> {
+        let total: f64 = values.iter().map(|(_, weight)| weight).sum();
+        if total <= 0.0 {
+            return None;
+        }
+        // A percentile bound is a place in this window's distribution; a plain bound is a
+        // metric value, and the same number whatever the window holds.
+        let edge = |bound: Option<Bound>, fallback: f64| -> f64 {
+            match bound {
+                None => fallback,
+                Some(Bound::Value(value)) => value,
+                Some(Bound::Percentile(percentile)) => {
+                    percentile_of(values, percentile, total).unwrap_or(fallback)
+                }
+            }
+        };
+        match self.family {
+            // "The percentage of values that fall within the specified range": the weight
+            // inside the span over the weight of the whole window. The span's own bounds are
+            // inside it, so a rank and a trimmed count over the same bounds agree.
+            BoundedFamily::PercentileRank => {
+                let low = edge(self.low, f64::NEG_INFINITY);
+                let high = edge(self.high, f64::INFINITY);
+                let inside: f64 = values
+                    .iter()
+                    .filter(|(value, _)| *value >= low && *value <= high)
+                    .map(|(_, weight)| weight)
+                    .sum();
+                Some(inside / total * 100.0)
+            }
+            // "Values outside of the boundaries are replaced with the values of the
+            // boundaries": every observation still counts, held inside the span. The span's
+            // own ends are ordered here rather than assumed, and the fold is `max`/`min`
+            // rather than a clamp, which has no answer for ends that are not ordered.
+            BoundedFamily::WinsorizedMean => {
+                let (low, high) = {
+                    let (first, second) = (edge(self.low, f64::NEG_INFINITY), edge(self.high, f64::INFINITY));
+                    if first <= second {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    }
+                };
+                let sum: f64 = values
+                    .iter()
+                    .map(|(value, weight)| value.max(low).min(high) * weight)
+                    .sum();
+                Some(sum / total)
+            }
+            family => {
+                let kept = trim(values, self.low, self.high, total);
+                let weight: f64 = kept.iter().map(|(_, weight)| weight).sum();
+                let sum: f64 = kept.iter().map(|(value, weight)| value * weight).sum();
+                match family {
+                    BoundedFamily::TrimmedCount => Some(weight),
+                    BoundedFamily::TrimmedSum => Some(sum),
+                    _ => (weight > 0.0).then(|| sum / weight),
+                }
+            }
+        }
+    }
+}
+
+/// The observations of a window that fall inside a span, with their weights.
+///
+/// A percentile bound trims by WEIGHT — "`TM(10%:90%)` calculates the average after removing
+/// the 10% lowest and 10% highest data points" — so an observation standing for several
+/// samples may be trimmed in part; a plain value bound keeps the observations inside it.
+fn trim(
+    values: &[(f64, f64)],
+    low: Option<Bound>,
+    high: Option<Bound>,
+    total: f64,
+) -> Vec<(f64, f64)> {
+    let mut trim_low = match low {
+        Some(Bound::Percentile(percentile)) => total * percentile / 100.0,
+        _ => 0.0,
+    };
+    let mut trim_high = match high {
+        Some(Bound::Percentile(percentile)) => total * (100.0 - percentile) / 100.0,
+        _ => 0.0,
+    };
+    let mut kept: Vec<(f64, f64)> = Vec::with_capacity(values.len());
+    for (value, weight) in values {
+        let mut weight = *weight;
+        let trimmed = trim_low.min(weight);
+        trim_low -= trimmed;
+        weight -= trimmed;
+        if weight > 0.0 {
+            kept.push((*value, weight));
+        }
+    }
+    for index in (0..kept.len()).rev() {
+        if trim_high <= 0.0 {
+            break;
+        }
+        let Some((_, weight)) = kept.get_mut(index) else {
+            break;
+        };
+        let trimmed = trim_high.min(*weight);
+        trim_high -= trimmed;
+        *weight -= trimmed;
+    }
+    let low_value = match low {
+        Some(Bound::Value(value)) => Some(value),
+        _ => None,
+    };
+    let high_value = match high {
+        Some(Bound::Value(value)) => Some(value),
+        _ => None,
+    };
+    kept.retain(|(value, weight)| {
+        *weight > 0.0
+            && low_value.is_none_or(|low| *value >= low)
+            && high_value.is_none_or(|high| *value <= high)
+    });
+    kept
 }
 
 /// A percentage: a decimal in `0..=100`.
@@ -378,29 +605,27 @@ fn strip_prefix_ignore_ascii_case<'text>(text: &'text str, prefix: &str) -> Opti
         .then(|| &text[prefix.len()..])
 }
 
-/// The `percentile`-th percentile of a span's published values, by nearest rank.
+/// The published values of a span with the number of observations each stands for, ascending
+/// by value — the window's own distribution, which is what every statistic outside the
+/// folded five is computed from.
 ///
-/// `None` when the span holds a datapoint whose individual values were never published, or
-/// any negative value: "Percentile statistics are not available for metrics when any of the
-/// metric values are negative numbers." (`GetMetricStatistics`)
-pub fn weighted_percentile(data: &[&StoredDatum], percentile: f64) -> Option<f64> {
+/// `None` when the span holds a datapoint whose individual values were never published: an
+/// opaque aggregate defines no distribution, so no statistic over one can be computed rather
+/// than invented.
+fn distribution(data: &[&StoredDatum]) -> Option<Vec<(f64, f64)>> {
     let mut values: Vec<(f64, f64)> = Vec::with_capacity(data.len());
     for datum in data {
-        let value = datum.single_value()?;
-        if value < 0.0 {
-            return None;
-        }
-        values.push((value, datum.sample_count));
+        values.push((datum.single_value()?, datum.sample_count));
     }
     values.sort_by(|left, right| left.0.total_cmp(&right.0));
+    Some(values)
+}
 
-    let total: f64 = values.iter().map(|(_, weight)| weight).sum();
-    if total <= 0.0 {
-        return None;
-    }
+/// The `percentile`-th value of a distribution whose weights sum to `total`, by nearest rank.
+fn percentile_of(values: &[(f64, f64)], percentile: f64, total: f64) -> Option<f64> {
     let target = percentile / 100.0 * total;
     let mut seen = 0.0;
-    for (value, weight) in &values {
+    for (value, weight) in values {
         seen += weight;
         if seen >= target {
             return Some(*value);
@@ -409,11 +634,30 @@ pub fn weighted_percentile(data: &[&StoredDatum], percentile: f64) -> Option<f64
     values.last().map(|(value, _)| *value)
 }
 
-/// One statistic of a span of datapoints by the name a request gives it: one of the basic
-/// five the model names (matched without regard to ASCII case, as the statistic grammar
-/// matches them), or a `pNN` percentile — "It can include any CloudWatch statistic or
-/// extended statistic." (`MetricStat$Stat`). `None` for a name outside both, and for a
-/// statistic the span does not define.
+/// The `percentile`-th percentile of a span's published values, by nearest rank.
+///
+/// `None` when the span holds a datapoint whose individual values were never published, or
+/// any negative value: "Percentile statistics are not available for metrics when any of the
+/// metric values are negative numbers." (`GetMetricStatistics`)
+pub fn weighted_percentile(data: &[&StoredDatum], percentile: f64) -> Option<f64> {
+    let values = distribution(data)?;
+    if values.iter().any(|(value, _)| *value < 0.0) {
+        return None;
+    }
+    let total: f64 = values.iter().map(|(_, weight)| weight).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    percentile_of(&values, percentile, total)
+}
+
+/// One statistic of a span of datapoints by the name a request gives it — "It can include any
+/// CloudWatch statistic or extended statistic." (`MetricStat$Stat`): one of the basic five the
+/// model names (matched without regard to ASCII case, as the statistic grammar matches them),
+/// a `pNN` percentile, or a statistic over a span of the window's own distribution (the
+/// interquartile mean and the trimmed / Winsorized / percentile-rank families).
+///
+/// `None` for a name outside the grammar, and for a statistic the span does not define.
 pub fn statistic_value(data: &[&StoredDatum], statistic: &str) -> Option<f64> {
     if let Some(canonical) = FOLDED_STATISTICS
         .iter()
@@ -421,7 +665,26 @@ pub fn statistic_value(data: &[&StoredDatum], statistic: &str) -> Option<f64> {
     {
         return BasicStatistics::of(data.iter().copied()).named(canonical);
     }
-    weighted_percentile(data, parse_percentile(statistic)?)
+    if let Some(percentile) = parse_percentile(statistic) {
+        return weighted_percentile(data, percentile);
+    }
+    bounded_statistic(statistic)?.of(&distribution(data)?)
+}
+
+/// One EXTENDED statistic of a span by the name a request gives it: a `pNN` percentile or one
+/// of the bounded families. `None` for a name that is not an extended statistic at all, which
+/// is how a caller tells the two statistic members apart.
+pub fn extended_statistic_value(data: &[&StoredDatum], statistic: &str) -> Option<f64> {
+    is_extended_statistic(statistic)
+        .then(|| statistic_value(data, statistic))
+        .flatten()
+}
+
+/// Whether `statistic` names an EXTENDED statistic: a percentile, or one of the statistics
+/// computed over a span of the window's distribution. The basic five are not extended
+/// statistics, which is what makes the two statistic members of a read not interchangeable.
+pub fn is_extended_statistic(statistic: &str) -> bool {
+    parse_percentile(statistic).is_some() || bounded_statistic(statistic).is_some()
 }
 
 /// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags

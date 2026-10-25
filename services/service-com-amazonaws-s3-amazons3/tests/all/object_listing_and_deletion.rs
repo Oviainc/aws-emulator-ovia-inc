@@ -620,7 +620,9 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
     // (see `listing_encoding_type`), because it decides how this listing's key names are
     // written rather than which entries it reports. A value the model's enum does not
     // declare IS refused, because the response would otherwise echo an encoding the keys
-    // do not carry.
+    // do not carry. `fetch-owner=true` is not here either: it is served (see
+    // `listing_optional_members`) from the account this store already names as the owner
+    // of what it holds.
     let rows: &[(&str, &str, u16, &str)] = &[
         ("negative max-keys", "&max-keys=-1", 400, "InvalidArgument"),
         (
@@ -641,12 +643,6 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
             400,
             "InvalidArgument",
         ),
-        (
-            "fetch-owner, which adds an Owner to every entry",
-            "&fetch-owner=true",
-            501,
-            "NotImplemented",
-        ),
     ];
 
     for (case, query, status, code) in rows {
@@ -665,7 +661,7 @@ async fn a_listing_parameter_this_emulator_cannot_serve_is_refused_not_guessed()
         );
     }
 
-    // The other unsupported parameter is a HEADER rather than a query parameter:
+    // The one unsupported parameter is a HEADER rather than a query parameter:
     // `x-amz-optional-object-attributes` asks for an attribute (restore status) no stored
     // object here has, so it keeps the 501 too.
     let with_attributes = send(

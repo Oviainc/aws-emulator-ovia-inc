@@ -5,7 +5,9 @@
 //! Merges the supplied tags into the tag store of the tunnel `resourceArn` names,
 //! overwriting a tag that already carries that key. A key in the reserved
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace is refused with HTTP 400
-//! `ValidationException` and stores nothing.
+//! `ValidationException` and stores nothing; a request that would take the tunnel
+//! past [`crate::state::MAX_TAGS_PER_TUNNEL`] tags is refused with the modelled
+//! `LimitExceededException` (HTTP 403) and also stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +58,9 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — Thrown when an operation is attempted on a
 //!   resource that does not exist.
+//! * `LimitExceededException` (HTTP 403) — "Thrown when a tunnel limit is exceeded";
+//!   widened in through `extra_errors` (see below), since the model binds the shape to
+//!   `OpenTunnel` without listing it on this operation.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -71,10 +76,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotsecuretunneling-iots
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotsecuretunneling#TagResource")]
+// `LimitExceededException` — "Thrown when a tunnel limit is exceeded" (HTTP 403) — is a
+// shape the SERVICE models that this operation does not list, widened in through
+// `extra_errors` so the per-tunnel tag limit is refused with the one error this service
+// models for an exhausted limit rather than with a code it never emits.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotsecuretunneling#TagResource",
+    extra_errors = ["LimitExceededException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    LimitExceededException(LimitExceededException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -162,14 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags. The modelled list
         // length bounds one request, not the set a resource accumulates over
         // repeated calls, so the merged key count is checked here — and the store
-        // is left untouched when the request would take it past the limit. The
-        // service models no "too many tags" error, so this is a 400.
+        // is left untouched when the request would take it past the limit. An
+        // exhausted limit is what this service's `LimitExceededException` (HTTP
+        // 403) reports, so the refusal goes out as that modelled error, the same
+        // one `OpenTunnel` answers for this limit and for the tunnel count.
         let merged = store.merged_tag_count(&input.resource_arn, &input.tags);
         if merged > crate::state::MAX_TAGS_PER_TUNNEL {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "tags would take this resource to {merged} tags; a tunnel carries at most {}",
-                crate::state::MAX_TAGS_PER_TUNNEL
-            )));
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::tag_limit_message(merged)),
+                },
+            )
+            .into());
         }
 
         let stored = store.tags.entry(input.resource_arn.clone()).or_default();

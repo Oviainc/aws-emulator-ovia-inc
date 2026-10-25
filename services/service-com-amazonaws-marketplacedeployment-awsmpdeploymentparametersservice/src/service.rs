@@ -105,6 +105,18 @@
 //!
 //! Nothing else about a response changes: the status, the other headers and every byte of
 //! the body stay as the renderer wrote them.
+//!
+//! ## The body a refused request is answered with
+//!
+//! The model marks BOTH members of `ValidationException` `@required`, so every refusal
+//! answered as that shape names the member it is about as well as stating a sentence. The
+//! framework's pre-dispatch renderer cannot: `Service::override_refusal`, its only seam,
+//! carries a code and a message and nothing else. So every modelled operation is served
+//! through [`ServedOperation`], which states that refusal itself — from the framework's
+//! own deserializer and constraint walk, in the SAME envelope `override_refusal` words —
+//! in the modelled shape. [`modelled_refusal`] owns it.
+
+use std::marker::PhantomData;
 
 use aws_smithy_schema::serde::SerializableStruct;
 use aws_smithy_schema::Schema;
@@ -120,6 +132,9 @@ use std::sync::Arc;
 
 use crate::ops::types;
 use crate::scaffolded::FrontDoorRefusal;
+
+/// The modelled body a refused request is answered with — see the module docs.
+mod modelled_refusal;
 
 /// The error code this service answers an input-constraint violation with: the
 /// modelled `ValidationException`, which every operation of this service declares
@@ -193,6 +208,57 @@ impl ErasedOperation for FrontDoorAnswer {
                     .unwrap_or_else(|e| svc.definition().framework_error_response(e)),
             )
         })
+    }
+}
+
+/// One modelled operation of this service, served with the refusal it owes stated in the
+/// model's own `ValidationException` body.
+///
+/// NOT a re-route and not an operation of its own: the operation served is the one this
+/// service's routing table names for the request, reached through the shared
+/// [`RequestIdHeaderOperation`] so every response still names the request it answers. What
+/// this wrapper adds is the one answer that layer cannot give: a request the modelled walk
+/// refuses before any handler runs is refused with BOTH members the modelled shape marks
+/// `@required` — the sentence and the member it blames — rather than with the sentence
+/// alone, which is all the framework's refusal seam can carry. See [`modelled_refusal`].
+struct ServedOperation<Eng> {
+    /// The shared wrapper every response of this service passes through.
+    request_id: RequestIdHeaderOperation,
+    /// The engine type this service was built with, carried as a type alone: the refusal
+    /// below reads each request through the modelled input schema of the operation the
+    /// routing key names, and those operations are generic over it. No engine value is
+    /// held here — the operations hold the one shared engine.
+    engine: PhantomData<fn() -> Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for ServedOperation<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // Scoped so the borrowed `&dyn ErasedServiceDefinition` — which is not `Sync`,
+            // while this future is — is dropped before the await below.
+            let refusal = {
+                let protocol = svc.definition().protocol();
+                modelled_refusal::refusal_response::<Eng>(protocol, req)
+            };
+            match refusal {
+                // Rendered here, so it names the request it answers here (see the module
+                // docs); everything else about it is the protocol renderer's.
+                Some(response) => with_request_id_header(response),
+                None => self.request_id.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names", which is the
+        // operation this wrapper serves — so wrapping cannot weaken the schemes the model
+        // declares for it.
+        None
     }
 }
 
@@ -306,9 +372,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
     /// Answers a request the front door will not forward: HTTP 403 `ForbiddenException`.
     forbidden: FrontDoorAnswer,
-    /// Serves every modelled operation, so each response names the request it answers.
+    /// Serves every modelled operation, so each response names the request it answers and
+    /// a request refused before any handler runs is refused in the modelled shape.
     /// Held, not built per request: `override_operation` returns a reference to it.
-    request_id: RequestIdHeaderOperation,
+    served: ServedOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -319,7 +386,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
             forbidden: FrontDoorAnswer(FrontDoorRefusal::forbidden()),
-            request_id: RequestIdHeaderOperation,
+            served: ServedOperation {
+                request_id: RequestIdHeaderOperation,
+                engine: PhantomData,
+            },
         }
     }
 
@@ -446,7 +516,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // unchanged.
         self.entry
             .routes(req)
-            .then_some(&self.request_id as &dyn ErasedOperation)
+            .then_some(&self.served as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -460,6 +530,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // echoed at all. The code stays the modelled `ValidationException` (HTTP
         // 400), which is what the framework would have answered — only the wording
         // changes.
+        //
+        // `ServedOperation` answers a refusal it can state in the modelled shape's whole
+        // BODY, so what still reaches here is what that path declines: a violation naming
+        // no member, and the fallback when the modelled error cannot be serialized.
+        // Worded from the same envelope, so the two cannot disagree.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
