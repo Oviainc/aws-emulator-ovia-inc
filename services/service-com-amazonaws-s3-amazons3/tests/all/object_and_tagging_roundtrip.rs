@@ -71,6 +71,8 @@ fn sized_object(length: usize) -> Object {
         version_id: None,
         // A write places no Object Lock retention; `PutObjectRetention` is what does.
         retention: None,
+        // A write initiates no restore either; `RestoreObject` is what does.
+        restore: None,
         body,
     }
 }
