@@ -812,6 +812,27 @@ impl Secret {
         self.purge_at = Some(purge_at);
     }
 
+    /// Whether a scheduled deletion of this secret can still be cancelled.
+    ///
+    /// `DeletionDate` is "the date and time after which this secret Secrets
+    /// Manager can permanently delete this secret, and it can no longer be
+    /// restored" (`DeleteSecretResponse$DeletionDate`, this service's Smithy
+    /// model), so a deletion is cancellable exactly while that instant is still
+    /// ahead. A deletion that skipped the recovery window stamps that instant at
+    /// the call itself, so there is no span in which it can be cancelled.
+    pub fn deletion_cancellable(&self, now: SystemTime) -> bool {
+        self.deleted_date.is_some_and(|at| at > now)
+    }
+
+    /// Cancel a scheduled deletion: drop the `DeletionDate` stamp and with it
+    /// the permanent removal the store owed, leaving the secret's versions,
+    /// staging labels and every other attribute as they were.
+    pub fn cancel_deletion(&mut self, at: SystemTime) {
+        self.deleted_date = None;
+        self.purge_at = None;
+        self.last_changed_date = at;
+    }
+
     /// The version with this id, deprecated ones included.
     pub fn version(&self, version_id: &str) -> Option<&SecretVersion> {
         self.versions.iter().find(|v| v.version_id == version_id)

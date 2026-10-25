@@ -10,8 +10,8 @@
 //! are included in the returned list. Use 'all' to return connected clusters, or
 //! blank to return only Amazon EKS clusters. 'all' must be in lowercase otherwise
 //! an error occurs" (`ListClustersRequest$include`). So a cluster `RegisterCluster`
-//! connected is listed only for a caller that asked for it, and any other value —
-//! including `all` in another case — is refused.
+//! connected is listed only for a caller that asked for it, and any other token —
+//! `all` in another case included — is refused rather than case-folded.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -69,6 +69,9 @@
 //!   is not valid.
 //! * `InvalidParameterException` (HTTP 400) — The specified parameter is invalid. Review the
 //!   available parameters for the API request.
+//! * `InvalidRequestException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   the request is invalid given the state of the cluster. Check the state of the cluster
+//!   and the associated operations.
 //! * `ServerException` (HTTP 500) — These errors are usually caused by a server-side issue.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unavailable. Back off and
 //!   retry the operation.
@@ -76,6 +79,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{self, DEFAULT_LIST_PAGE_SIZE, LIST_INCLUDE_ALL};
+
+/// The sentence an `include` token set this listing cannot project is refused with.
+///
+/// The member documents one token and one casing of it, so every value outside that
+/// set — an unknown token, or `all` in another case — is the same refusal, and it says
+/// which parameter is at fault without echoing what the caller sent.
+const INVALID_INCLUDE_MESSAGE: &str = "One or more values in the 'include' parameter is not valid";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -88,11 +98,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `ListClustersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#ListClusters")]
+//
+// `InvalidRequestException` is widened in through `extra_errors`: this SERVICE models
+// that shape ("The request is invalid...") and most of its operations declare it, but
+// `ListClusters` does not list it — and it is the class the real service refuses a bad
+// `include` projection with, so the handler needs it to answer that refusal.
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#ListClusters",
+    extra_errors = ["InvalidRequestException"]
+)]
 #[derive(Debug)]
 pub enum ListClustersErrorModeled {
     ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
+    InvalidRequestException(InvalidRequestException),
     ServerException(ServerException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -174,10 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Use 'all' to return connected clusters, or blank to return only Amazon EKS
-        // clusters. 'all' must be in lowercase otherwise an error occurs" — so the one
-        // value this member takes is `all`, and anything else (a case variant included)
-        // is a bad parameter rather than a value to ignore. No value at all, or an empty
-        // list, is "blank": only Amazon EKS clusters.
+        // clusters. 'all' must be in lowercase otherwise an error occurs" — so the token
+        // set is matched as an exact set membership test and is never case-folded: `all`
+        // in another case is refused exactly like a token the member does not document
+        // at all. No value at all, or an empty list, is "blank": only Amazon EKS
+        // clusters.
         let include_connected = match input.include.as_deref() {
             None => false,
             Some(values) => {
@@ -188,14 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(String::as_str)
                     .filter(|value| !value.is_empty())
                     .collect();
-                if let Some(unknown) = named.iter().find(|value| **value != LIST_INCLUDE_ALL) {
+                if named.iter().any(|value| *value != LIST_INCLUDE_ALL) {
+                    // The projection a caller asked for cannot be served, which is a
+                    // refusal of the REQUEST rather than a complaint about the shape of
+                    // a parameter — and it is permanent, so the sentence names no value
+                    // from the request: every unacceptable token set gets this one
+                    // refusal, as the real service's does.
                     return Err(ListClustersError::from(
-                        ListClustersErrorModeled::InvalidParameterException(
-                            InvalidParameterException {
-                                message: Some(format!(
-                                    "include must be '{LIST_INCLUDE_ALL}' in lowercase, got \
-                                     {unknown}"
-                                )),
+                        ListClustersErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(INVALID_INCLUDE_MESSAGE.to_string()),
                                 ..Default::default()
                             },
                         ),

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplicationAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplicationAssignment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes one direct application assignment from this service's state
+//! (`crate::state`), and answers an empty 200. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplicationAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Revoke application access to an application by deleting application assignments for a
+//! user or group": the assignment's identity is the (application, principal type,
+//! principal id) tuple, so this removes exactly the row
+//! ([`crate::state::ApplicationAssignmentRecord`]) that tuple names and leaves every other
+//! assignment standing. The removal is what makes the assignment stop resolving, for
+//! `DescribeApplicationAssignment` and for a second delete alike: an `ApplicationArn` this
+//! account holds no application for, and a principal that holds no direct assignment to a
+//! known application, are both a `ResourceNotFoundException`, told apart by its message.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +162,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplicationAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplicationAssignment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationAssignmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A WRITE, so it first materialises what the CLOCK already owes (an instance whose
+        // deletion instant has passed is gone, and the applications it held — with the
+        // assignments to them — with it) before looking the assignment up.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // (application, principal type, principal id) is the assignment's identity, and a
+        // delete is not idempotent on a resource that is not there: an access that was
+        // never granted has nothing to revoke, so it earns the same 404 a second delete of
+        // the same tuple gets, never a 200 claiming an access was withdrawn. An
+        // `ApplicationArn` nothing holds carries no assignment either, so both are this one
+        // refusal, told apart by its message — as the describe of the same tuple tells
+        // them apart.
+        let Some(position) = store.application_assignment_position(
+            &input.application_arn,
+            &input.principal_type,
+            &input.principal_id,
+        ) else {
+            let message = if store.application(&input.application_arn).is_none() {
+                crate::state::application_not_found_message(&input.application_arn)
+            } else {
+                crate::state::application_assignment_not_found_message(
+                    &input.application_arn,
+                    &input.principal_type,
+                    &input.principal_id,
+                )
+            };
+            return Err(
+                DeleteApplicationAssignmentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // KMS key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Removing the row is what makes the assignment stop resolving, for
+        // `DescribeApplicationAssignment` and for a second delete alike. Only the row with
+        // this identity tuple goes: every other assignment of the same application, and
+        // every assignment of this principal to another application, keeps standing, and
+        // revoking an access to an application does not change the application itself.
+        store.application_assignments.remove(position);
+        // The model declares an EMPTY output for this operation, so the revocation itself
+        // is the whole answer.
+        Ok(DeleteApplicationAssignmentOutput {})
     }
 }

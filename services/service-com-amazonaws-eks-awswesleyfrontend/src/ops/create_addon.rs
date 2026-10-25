@@ -253,7 +253,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // LAYER 2 — the cluster's state. `InvalidRequestException` is "The request is
+        // LAYER 2 — whether this cluster has an Amazon EKS-managed plane at all. An
+        // add-on is a piece of software Amazon EKS installs and manages in the cluster's
+        // control plane, and a cluster `RegisterCluster` connected has none of that
+        // plane: the operation does not apply to it, which the connected-cluster gate
+        // reports permanently. It precedes the STATUS check below because no wait makes a
+        // connected cluster take this call.
+        if cluster.is_connected() {
+            return Err(CreateAddonErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
+
+        // LAYER 3 — the cluster's state. `InvalidRequestException` is "The request is
         // invalid given the state of the cluster. Check the state of the cluster and
         // the associated operations": an add-on is installed into a running control
         // plane, so a cluster that is still `CREATING` (or deleting, updating, failed)
@@ -274,14 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // The cluster's own Kubernetes version, which the add-on's default version is
-        // taken from. A cluster `RegisterCluster` connected reports none (its control
-        // plane is not EKS's), so the emulator's default Kubernetes version stands in.
+        // taken from. Every cluster this far into the handler is an Amazon EKS cluster
+        // and reports one; the service's default Kubernetes version stands in for a
+        // record that somehow carries none.
         let cluster_version = cluster
             .version
             .clone()
             .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string());
 
-        // LAYER 3 — the body's own members. Each is a rule the model cannot express,
+        // LAYER 4 — the body's own members. Each is a rule the model cannot express,
         // so the boundary validator passed the request and this is where it is caught.
         if !state::is_addon_name_shaped(&input.addon_name) {
             return Err(invalid_parameter(format!(
@@ -412,7 +426,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|config| config.namespace.clone())
             .unwrap_or_else(|| ADDON_DEFAULT_NAMESPACE.to_string());
 
-        // LAYER 4 — the add-on itself. One add-on name installs at most once per
+        // LAYER 5 — the add-on itself. One add-on name installs at most once per
         // cluster. This layer runs BEFORE the checks on the child associations below:
         // those exist to stop a request that cannot be carried out in full from
         // writing anything, which says nothing about a call whose write ALREADY
@@ -485,7 +499,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // LAYER 5 — the child resources this add-on would create. The associations
+        // LAYER 6 — the child resources this add-on would create. The associations
         // count against the cluster's association ceiling like any others, so a
         // request that would push the cluster past it is refused BEFORE the store is
         // walked for the pairs below: the ceiling bounds both the stored side and the

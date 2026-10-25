@@ -591,10 +591,10 @@ async fn only_a_cluster_whose_state_can_take_a_version_update_takes_one() {
             "InvalidRequestException",
         ),
         (
-            "a connected cluster, which has no control plane version",
+            "a connected cluster, which EKS does not manage a control plane for",
             "state-connected",
             400,
-            "InvalidRequestException",
+            "ClientException",
         ),
         (
             "a cluster that already has an update in flight",

@@ -82,9 +82,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `StartInsightsRefreshError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#StartInsightsRefresh")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#StartInsightsRefresh",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum StartInsightsRefreshErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -184,6 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Cluster insights are an analysis Amazon EKS runs against the control plane it
+        // manages, and a cluster `RegisterCluster` connected has none: this operation
+        // does not apply to it. That is PERMANENT, so it precedes the status check below
+        // — a connected cluster never reaches a status that would let this call through.
+        if cluster.is_connected() {
+            return Err(StartInsightsRefreshErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
 
         // "[Getting] the latest analysis" needs a control plane to analyse, so a
         // cluster that is still coming up, updating or going away cannot start one.

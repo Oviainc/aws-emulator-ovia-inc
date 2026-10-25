@@ -172,6 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // An identity-provider configuration authenticates users to an Amazon EKS
+        // control plane's API server, and a cluster `RegisterCluster` connected has no
+        // such control plane: the operation does not apply to it. The gate is a fact
+        // about the CLUSTER, so it precedes judging the configuration the body names.
+        if cluster.is_connected() {
+            return Err(
+                DescribeIdentityProviderConfigErrorModeled::ClientException(
+                    crate::state::connected_cluster_refusal(&input.cluster_name),
+                )
+                .into(),
+            );
+        }
+
         // "The only type available is `oidc`" (`IdentityProviderConfig$type`), so any
         // other type is not a configuration this API could hold.
         if !requested

@@ -99,9 +99,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `ListAccessEntriesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#ListAccessEntries")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#ListAccessEntries",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum ListAccessEntriesErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -215,6 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Access entries are part of the Amazon EKS-managed plane, which a cluster
+        // `RegisterCluster` connected has none of: EKS grants no Kubernetes access on
+        // it, so this operation does not apply to it — which is a refusal, not an empty
+        // listing, because the listing itself is not something EKS keeps for that
+        // cluster.
+        if cluster.is_connected() {
+            return Err(ListAccessEntriesErrorModeled::ClientException(
+                state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
+        }
 
         let associated_policy_arn = input.associated_policy_arn.as_deref();
         // The entries hang off the cluster record, keyed by principal ARN, so this
