@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectInstanceIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectInstanceIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one integration of an onboarded Connect instance from the integration
+//! store `PutConnectInstanceIntegration` writes, so
+//! `ListConnectInstanceIntegrations` no longer carries it. The integration removed is
+//! the one stored under the identity the request's `IntegrationIdentifier` member
+//! carries — its kind and the ARN of the resource it integrates — which is the
+//! identity a put stores under, so the delete reaches exactly the record a put of
+//! that identity wrote and leaves every other integration of the instance in place.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectInstanceIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An instance with no finished onboarding job holds no integration at all, and an
+//! onboarded instance that holds none under that identity has nothing to remove:
+//! either is the modelled `ResourceNotFoundException` (HTTP 404) and removes nothing —
+//! the same gate, over the same store, that `PutConnectInstanceIntegration` and
+//! `ListConnectInstanceIntegrations` ask.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +172,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectInstanceIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectInstanceIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectInstanceIntegration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance integration store is unavailable"
+                            .to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Which integration the request names, read off the identifier the same way a
+        // put reads it off a config, so the two cannot resolve to different records.
+        let kind = crate::state::integration_identifier_key(&input.integration_identifier).0;
+
+        let now = ::std::time::SystemTime::now();
+        // One guard spans the onboarding check and the removal, so a concurrent change
+        // to the instance cannot leave this delete applied to a store the instance is
+        // no longer in.
+        let mut store = state.lock();
+
+        // An integration belongs to a Connect instance onboarded to Campaigns: the
+        // instance-onboarding store is the one record of which instances those are, so
+        // an instance whose onboarding job has not finished holds nothing to delete.
+        if !store.is_onboarded(&input.connect_instance_id, now) {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ResourceNotFoundException",
+            );
+            return Err(
+                DeleteConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole of the operation's effect: the instance no longer holds the
+        // integration stored under that identity, so the list stops carrying it while
+        // every other integration of the instance stays as it was. An identity the
+        // instance holds no integration under names no resource, so there is nothing to
+        // remove and the call is not found rather than a silent success — this
+        // operation, unlike this service's config deletes, is not modelled
+        // `@idempotent`.
+        let removed = store
+            .delete_instance_integration(&input.connect_instance_id, &input.integration_identifier);
+        if !removed {
+            crate::state::audit_onboarding_change(
+                ctx.parts(),
+                Self::NAME,
+                &input.connect_instance_id,
+                "ResourceNotFoundException",
+            );
+            return Err(
+                DeleteConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Connect instance {} has no {} integration under the \
+                             integrationIdentifier provided",
+                            input.connect_instance_id,
+                            kind.member_name()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The call changed what this service holds for the instance, so it leaves an
+        // audit record naming the caller, the instance and the outcome.
+        crate::state::audit_onboarding_change(
+            ctx.parts(),
+            Self::NAME,
+            &input.connect_instance_id,
+            "accepted",
+        );
+
+        Ok(DeleteConnectInstanceIntegrationOutput)
     }
 }

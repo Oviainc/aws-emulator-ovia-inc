@@ -267,14 +267,18 @@ pub const AUTHORIZER_TYPE_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
 ///   COGNITO_USER_POOLS authorizer": the pools whose tokens are accepted, so that type
 ///   cannot authorize without at least one.
 ///
-/// `ttl` is the STORED TTL from [`authorizer_result_ttl`], not the requested one, because
-/// a request that sets no TTL still enables caching at the default.
-fn require_members_of_type(input: &CreateAuthorizerInput, ttl: i32) -> Result<(), String> {
-    let authorizer_type = input.r#type.as_str();
+/// The check reads the STORED record rather than one request's members, because the same
+/// rule has to hold however the record came to look that way: the TTL it is judged
+/// against is the stored one from [`authorizer_result_ttl`], not the requested one, since
+/// a request that sets no TTL still enables caching at the default. `UpdateAuthorizer`
+/// applies it to the PATCHED record for exactly that reason.
+pub fn require_members_of_type(entry: &AuthorizerEntry) -> Result<(), String> {
+    let ttl = entry.authorizer_result_ttl_in_seconds;
+    let authorizer_type = entry.r#type.as_str();
     if matches!(
         authorizer_type,
         AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_REQUEST
-    ) && !supplied(&input.authorizer_uri)
+    ) && !supplied(&entry.authorizer_uri)
     {
         return Err(format!(
             "authorizerUri is required for an authorizer of type {authorizer_type}"
@@ -286,7 +290,7 @@ fn require_members_of_type(input: &CreateAuthorizerInput, ttl: i32) -> Result<()
         AUTHORIZER_TYPE_REQUEST => caching_enabled,
         _ => false,
     };
-    if identity_source_required && !supplied(&input.identity_source) {
+    if identity_source_required && !supplied(&entry.identity_source) {
         return Err(if authorizer_type == AUTHORIZER_TYPE_REQUEST {
             format!(
                 "identitySource is required for an authorizer of type {authorizer_type} \
@@ -296,12 +300,7 @@ fn require_members_of_type(input: &CreateAuthorizerInput, ttl: i32) -> Result<()
             format!("identitySource is required for an authorizer of type {authorizer_type}")
         });
     }
-    if authorizer_type == AUTHORIZER_TYPE_COGNITO_USER_POOLS
-        && input
-            .provider_ar_ns
-            .as_ref()
-            .is_none_or(|arns| arns.is_empty())
-    {
+    if authorizer_type == AUTHORIZER_TYPE_COGNITO_USER_POOLS && entry.provider_arns.is_empty() {
         return Err(format!(
             "providerARNs is required for an authorizer of type {authorizer_type}"
         ));
@@ -402,7 +401,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         bound_input(&input).map_err(bad_request)?;
         let ttl =
             authorizer_result_ttl(input.authorizer_result_ttl_in_seconds).map_err(bad_request)?;
-        require_members_of_type(&input, ttl).map_err(bad_request)?;
+        // The record is assembled BEFORE the type-coherence rule is applied, so the rule
+        // judges the authorizer as it will be stored — the same way `UpdateAuthorizer`
+        // judges the patched record. The id and the creation rank are minted under the
+        // store lock below, so they are filled in there.
+        let mut entry = AuthorizerEntry {
+            id: String::new(),
+            name: input.name,
+            r#type: input.r#type,
+            provider_arns: input.provider_ar_ns.unwrap_or_default(),
+            auth_type: input.auth_type,
+            authorizer_uri: input.authorizer_uri,
+            authorizer_credentials: input.authorizer_credentials,
+            identity_source: input.identity_source,
+            identity_validation_expression: input.identity_validation_expression,
+            authorizer_result_ttl_in_seconds: ttl,
+            sequence: 0,
+        };
+        require_members_of_type(&entry).map_err(bad_request)?;
 
         let mut store = state.lock();
         {
@@ -436,22 +452,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // A name does not identify an authorizer: two authorizers of one API may carry
         // the same configuration, and each is its own record under its own minted id.
-        api.authorizers.insert(
-            id.clone(),
-            AuthorizerEntry {
-                id: id.clone(),
-                name: input.name,
-                r#type: input.r#type,
-                provider_arns: input.provider_ar_ns.unwrap_or_default(),
-                auth_type: input.auth_type,
-                authorizer_uri: input.authorizer_uri,
-                authorizer_credentials: input.authorizer_credentials,
-                identity_source: input.identity_source,
-                identity_validation_expression: input.identity_validation_expression,
-                authorizer_result_ttl_in_seconds: ttl,
-                sequence,
-            },
-        );
+        entry.id = id.clone();
+        entry.sequence = sequence;
+        api.authorizers.insert(id.clone(), entry);
         let stored = api.authorizers.get(&id).ok_or_else(|| {
             CreateAuthorizerErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_AUTHORIZER.to_string()),
