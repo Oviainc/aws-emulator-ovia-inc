@@ -9,9 +9,10 @@
 //! service can place a cluster in publishes the VPC platform alone — and the rule under
 //! test follows from that one published fact:
 //!
-//! * a call that would mint a cluster security group is refused for EVERY request, with
-//!   HTTP 400 and the `InvalidParameterValue` code Amazon Redshift answers a parameter
-//!   it cannot honour with, whatever name, description or tags the request carries;
+//! * EVERY operation of the family — the create, the describe, the two ingress
+//!   operations and the delete — is refused for EVERY request, with HTTP 400 and the
+//!   `InvalidParameterValue` code Amazon Redshift answers a parameter it cannot honour
+//!   with, whatever name, description, rule or tags the request carries;
 //! * the refusal stores nothing, so a repeated identical call is refused the SAME way
 //!   and never with `ClusterSecurityGroupAlreadyExists`, which a persisted group would
 //!   have to produce;
@@ -216,6 +217,117 @@ async fn a_refused_create_stores_nothing() {
                 answer.body
             );
         }
+    }
+}
+
+/// One call to an operation of the cluster-security-group family: the case name, the
+/// awsQuery action, and the parameters it carries.
+type FamilyCase = (&'static str, &'static str, Vec<(&'static str, &'static str)>);
+
+/// Every operation of the family, each with requests that differ in the members the
+/// operation takes, so the rule is asserted over the whole family rather than over the
+/// one operation whose refusal was already written.
+///
+/// The operation list is the family the model declares around `ClusterSecurityGroup`:
+/// `smithy_query(query="digest")` binds exactly `CreateClusterSecurityGroup`,
+/// `DescribeClusterSecurityGroups`, `AuthorizeClusterSecurityGroupIngress`,
+/// `RevokeClusterSecurityGroupIngress` and `DeleteClusterSecurityGroup` to that shape.
+fn family_cases() -> Vec<FamilyCase> {
+    vec![
+        (
+            "a create with a fresh name",
+            "CreateClusterSecurityGroup",
+            vec![
+                ("ClusterSecurityGroupName", "probe-group"),
+                ("Description", "a security group"),
+            ],
+        ),
+        (
+            "a describe naming no group at all",
+            "DescribeClusterSecurityGroups",
+            vec![],
+        ),
+        (
+            "a describe naming a group that does not exist",
+            "DescribeClusterSecurityGroups",
+            vec![("ClusterSecurityGroupName", "no-such-group")],
+        ),
+        (
+            "a describe naming a page size inside the documented window",
+            "DescribeClusterSecurityGroups",
+            vec![("MaxRecords", "20")],
+        ),
+        (
+            "a describe filtering on a tag key",
+            "DescribeClusterSecurityGroups",
+            vec![("TagKeys.TagKey.1", "owner")],
+        ),
+        (
+            "an ingress authorization for a CIDR range",
+            "AuthorizeClusterSecurityGroupIngress",
+            vec![
+                ("ClusterSecurityGroupName", "no-such-group"),
+                ("CIDRIP", "10.0.0.0/24"),
+            ],
+        ),
+        (
+            "an ingress authorization for an EC2 security group",
+            "AuthorizeClusterSecurityGroupIngress",
+            vec![
+                ("ClusterSecurityGroupName", "no-such-group"),
+                ("EC2SecurityGroupName", "ec2-group"),
+                ("EC2SecurityGroupOwnerId", "123456789012"),
+            ],
+        ),
+        (
+            "an ingress revocation for a CIDR range",
+            "RevokeClusterSecurityGroupIngress",
+            vec![
+                ("ClusterSecurityGroupName", "no-such-group"),
+                ("CIDRIP", "10.0.0.0/24"),
+            ],
+        ),
+        (
+            "an ingress revocation for an EC2 security group",
+            "RevokeClusterSecurityGroupIngress",
+            vec![
+                ("ClusterSecurityGroupName", "no-such-group"),
+                ("EC2SecurityGroupName", "ec2-group"),
+                ("EC2SecurityGroupOwnerId", "123456789012"),
+            ],
+        ),
+        (
+            "a delete naming a group that does not exist",
+            "DeleteClusterSecurityGroup",
+            vec![("ClusterSecurityGroupName", "no-such-group")],
+        ),
+        (
+            "a delete naming the reserved group",
+            "DeleteClusterSecurityGroup",
+            vec![("ClusterSecurityGroupName", "Default")],
+        ),
+    ]
+}
+
+/// EVERY operation of the family is refused the same way — not only the create.
+///
+/// A read refused rather than served as an empty page is the point: an empty page would
+/// claim such groups can exist and that this account merely holds none, and a 501 would
+/// claim the behaviour is unwritten. Both are answers no real account can present, so
+/// each of the five operations answers the one status/code pair.
+#[tokio::test]
+async fn every_operation_of_the_family_is_refused_as_an_invalid_parameter_value() {
+    let emulator = Emulator::new();
+
+    for (case, action, params) in family_cases() {
+        let answer = emulator.call(action, &params).await;
+        assert_refused(&format!("{action}: {case}"), &answer);
+        assert_ne!(
+            answer.error_code().as_deref(),
+            Some("NotImplemented"),
+            "case {action}: {case}: the family is refused, not unwritten, got {:?}",
+            answer.body
+        );
     }
 }
 
