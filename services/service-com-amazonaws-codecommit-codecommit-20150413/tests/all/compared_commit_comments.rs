@@ -95,7 +95,10 @@ async fn comparison(
 
 /// The modeled error code of a failed call, with the status asserted, named for
 /// the case under test.
-async fn refused(
+///
+/// `pub(crate)` so the sibling pull-request comment suite drives refusals through
+/// this one helper rather than a second copy of it.
+pub(crate) async fn refused(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -223,7 +226,10 @@ fn comment_cases() -> Vec<CommentCase> {
 
 /// The `location` object the service reported, normalised to the members the model
 /// declares so a row's expectation can be compared against it.
-fn reported_location(entry: &Value) -> Option<Value> {
+///
+/// `pub(crate)` for the same reason [`refused`] is: one comparison of a reported
+/// location, shared by every comment suite.
+pub(crate) fn reported_location(entry: &Value) -> Option<Value> {
     entry.get("location").filter(|value| !value.is_null()).map(
         |location| {
             let mut normalised = json!({});
