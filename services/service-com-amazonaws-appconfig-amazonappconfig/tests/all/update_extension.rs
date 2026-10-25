@@ -40,7 +40,7 @@ use service_com_amazonaws_appconfig_amazonappconfig::state::{
 };
 
 use crate::appconfig_workflow::{json_call, router, Answer};
-use crate::extensions::{actions, create_extension, get_extension, minted_id};
+use crate::extensions::{actions, create_extension, extension_facts, get_extension, minted_id};
 use crate::resource_tags::{arn, pct};
 
 /// The most parameters one extension declares (`ParameterMap, len 1..10`).
@@ -52,8 +52,9 @@ const RACERS: usize = 6;
 
 /// `PATCH /extensions/{ExtensionIdentifier}`. The identifier is bound to a NON-greedy
 /// `@httpLabel`, so an ARN travels percent-encoded; every other member of
-/// `UpdateExtensionRequest`, `VersionNumber` included, travels in the body.
-async fn update_extension(
+/// `UpdateExtensionRequest`, `VersionNumber` included, travels in the body. `pub(crate)`
+/// because more than one suite writes an extension through the same front door.
+pub(crate) async fn update_extension(
     router: &MultiServiceRouter,
     identifier: &str,
     body: &Value,
@@ -91,24 +92,6 @@ fn parameters(names: &[String], flags: impl Fn(usize) -> (bool, bool)) -> Value 
 /// `count` parameter names, `P1`..`P<count>`.
 fn names(count: usize) -> Vec<String> {
     (1..=count).map(|index| format!("P{index}")).collect()
-}
-
-/// The `Extension` members a reader must report, as one comparable value: absent and
-/// present are both represented, so two answers are compared whole rather than member by
-/// member.
-fn extension_facts(body: &Value) -> BTreeMap<&'static str, Value> {
-    [
-        "Id",
-        "Name",
-        "VersionNumber",
-        "Arn",
-        "Description",
-        "Actions",
-        "Parameters",
-    ]
-    .into_iter()
-    .map(|member| (member, body.get(member).cloned().unwrap_or(Value::Null)))
-    .collect()
 }
 
 /// The error code of a refusal, which a client matches the modeled error by.
