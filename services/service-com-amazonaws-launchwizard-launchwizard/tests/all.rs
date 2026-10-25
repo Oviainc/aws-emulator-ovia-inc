@@ -33,6 +33,8 @@ mod deployment_update_in_flight;
 mod dry_run_preflight;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/list_deployments_filter_pairs.rs"]
+mod list_deployments_filter_pairs;
 #[path = "all/not_found_contract.rs"]
 mod not_found_contract;
 #[path = "all/pattern_specification_schemas.rs"]

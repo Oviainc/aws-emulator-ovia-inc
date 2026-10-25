@@ -2044,6 +2044,76 @@ pub fn constraint_refusal(
     (!violations.is_empty()).then(|| validation_report(&violations))
 }
 
+/// How many clauses one filter-pair refusal states at most.
+///
+/// `DeploymentFilterList` declares a floor and no ceiling, so HOW MANY filters a
+/// request carries is the caller's choice: the report is capped here so neither the
+/// work nor the response it is rendered into grows with that count. Ten is well past
+/// the two filter keys a request can usefully combine, so a real caller never reaches
+/// it.
+pub const MAX_FILTER_PAIR_CLAUSES: usize = 10;
+/// The refusal message for a filter that is not the name-and-values pair a filter is,
+/// or `None` when every filter carries both halves.
+///
+/// A filter is "a filter name and value pair that is used to return more specific
+/// results", and this service's other filter shape marks BOTH halves `@required`
+/// (`smithy_query(query="shape",
+/// shape="DeploymentFilter,DeploymentPatternVersionFilter")`), so a filter that names
+/// no key, or carries no value to match, narrows nothing. Such a filter is refused:
+/// dropping it would answer a BROADER result set than the caller asked for, with
+/// nothing on the wire to say the constraint was ignored.
+///
+/// `member` is the input member the filter list arrived on, and each pair is one
+/// filter's `name` together with HOW MANY values its `values` member carries (`None`
+/// when that member is absent) — so the one rule serves either filter shape. The
+/// wording is [`validation_report`]'s, the same renderer a member requirement refused
+/// at the boundary is worded by, and the path is the one the boundary walk spells for
+/// an element of a list (`filters.1.member.name`). At most
+/// [`MAX_FILTER_PAIR_CLAUSES`] clauses are collected, so a request naming many filters
+/// is still answered by a report of bounded size.
+pub fn filter_pair_refusal<'a>(
+    member: &str,
+    filters: impl IntoIterator<Item = (Option<&'a str>, Option<usize>)>,
+) -> Option<String> {
+    let mut violations: Vec<Violation> = Vec::with_capacity(MAX_FILTER_PAIR_CLAUSES);
+    for (index, (name, value_count)) in filters.into_iter().enumerate() {
+        // Capped before anything is formatted or pushed, so what this call allocates
+        // and renders does not follow the number of filters the request carried.
+        if violations.len() >= MAX_FILTER_PAIR_CLAUSES {
+            break;
+        }
+        // The walk spells a list element `<1-based position>.member`.
+        let element = format!("{member}.{}.member", index + 1);
+        if name.is_none() {
+            violations.push(Violation {
+                path: format!("{element}.name"),
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+            });
+        }
+        match value_count {
+            // No `values` member at all: the half is null.
+            None => violations.push(Violation {
+                path: format!("{element}.values"),
+                kind: ViolationKind::MissingRequiredMember,
+                value: None,
+            }),
+            // Present, and so not null, but naming no value to match. The value a
+            // violation carries only decides whether the clause says `null`; no
+            // caller-supplied value is ever echoed (see [`validation_report`]).
+            Some(0) => violations.push(Violation {
+                path: format!("{element}.values"),
+                kind: ViolationKind::MinLength(1),
+                value: Some(String::new()),
+            }),
+            Some(_) => {}
+        }
+    }
+    // Exact, where one filter contributed both of its halves on the last pass.
+    violations.truncate(MAX_FILTER_PAIR_CLAUSES);
+    (!violations.is_empty()).then(|| validation_report(&violations))
+}
+
 /// The validation warnings a submitted `specifications` map raises against the
 /// specification schema of the deployment pattern it is submitted for — the SAME
 /// schema `GetWorkloadDeploymentPattern` reports for that pattern.
