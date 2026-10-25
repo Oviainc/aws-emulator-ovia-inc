@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeclineInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeclineInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeclineInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers, out of stored state, the invitation each named account sent the current
+//! account: an invited account "can either accept or decline the invitation"
+//! (`smithy_query(query="doc",shape="InviteMembers")`), so declining ENDS the pending
+//! invitation — it leaves the inbox, exactly as accepting it does — while establishing
+//! no administrator relationship, which only an acceptance does.
+//!
+//! An account the inbox holds no invitation from identifies nothing to decline and is
+//! REPORTED in `UnprocessedAccounts`, so the call answers what it did rather than
+//! refusing.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeclineInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeclineInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeclineInvitations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeclineInvitationsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // A parameter failure first, before anything is looked up or written: the
+        // model constrains an `AccountIds` entry to its LENGTH only
+        // (`smithy_query(shape="AccountIds")`), so a 12-character value that is not
+        // an account id at all reaches this handler. It is refused whole rather than
+        // reported, because `UnprocessedAccounts` reports accounts that were not
+        // PROCESSED, never a request that was not understood.
+        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
+        // The operation names no detector (`POST /invitation/decline` —
+        // `smithy_query(operation="DeclineInvitations")`), so the inbox it answers
+        // from is the one the Region the request was signed for serves — the same
+        // inbox `ListInvitations` reports and `GetInvitationsCount` counts.
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // The same write `DeleteInvitations` drives, through the same state helper: a
+        // declined invitation is no longer pending, so it leaves the inbox and cannot
+        // be accepted afterwards. Nothing else is persisted — the relationship an
+        // acceptance would establish is exactly what declining refuses — so no clock
+        // is read either.
+        let unprocessed = state.take_received_invitations_in(&region, &input.account_ids);
+
+        Ok(DeclineInvitationsOutput {
+            // Present and empty when every named account had an invitation to
+            // decline: an empty list is the answer, and a client reads it the same way
+            // as a full one.
+            unprocessed_accounts: unprocessed,
+        })
     }
 }

@@ -15,6 +15,15 @@
 //! operation models no authorization error, and `AccessDeniedException` is not
 //! in its error union.
 //!
+//! So the answer does not move with the STATE of that association either: no
+//! association held, an active one, a tear-down still pending and a tear-down
+//! the clock has completed all answer the same thing for the same `ResourceArn`
+//! — the state the slot is in is what the organisation-scoped operations, which
+//! name no resource of their own, are decided by (see
+//! [`crate::state::require_administrator`], which this handler does not take).
+//! The `list_tags_across_administrator_states` and `tagging_administrator_gate`
+//! suites assert both halves of that split.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

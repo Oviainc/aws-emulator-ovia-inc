@@ -159,12 +159,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service shares: at most `MaxResults` definitions, with a `NextToken` only
         // while further ones remain, and a token this service did not issue refused as
         // the `ValidationException` this operation models rather than resumed from.
-        let page = crate::state::page(definitions, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
-                ListConfigurationCheckDefinitionsErrorModeled::ValidationException(
-                    crate::state::page_validation_exception(&error),
-                )
-            })?;
+        let page = crate::state::page(
+            definitions,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::ConfigurationCheckDefinitions,
+        )
+        .map_err(|error| {
+            ListConfigurationCheckDefinitionsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
 
         Ok(ListConfigurationCheckDefinitionsOutput {
             configuration_checks: Some(page.items),

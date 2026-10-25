@@ -2405,6 +2405,41 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         })
     }
 
+    /// The position of the HSM configuration with this
+    /// `HsmConfigurationIdentifier`, if any.
+    ///
+    /// The identifier is compared exactly as [`Self::hsm_configuration`]
+    /// compares it. A position rather than a reference, because the delete needs
+    /// to REMOVE the record it finds, and `remove` keeps the insertion order the
+    /// `Marker` cursor pages over.
+    pub fn hsm_configuration_position(&self, identifier: &str) -> Option<usize> {
+        self.hsm_configurations.iter().position(|stored| {
+            stored.configuration.hsm_configuration_identifier.as_deref() == Some(identifier)
+        })
+    }
+
+    /// The identifier of every cluster this store holds that is configured to
+    /// store its database encryption keys in the HSM configuration `identifier`
+    /// names, in creation order.
+    ///
+    /// A cluster records the configuration it uses on its `HsmStatus`, so that
+    /// membership is the whole of what "still in use by one or more Amazon
+    /// Redshift clusters" can mean for this store.
+    pub fn clusters_using_hsm_configuration(&self, identifier: &str) -> Vec<String> {
+        self.clusters
+            .iter()
+            .filter(|stored| {
+                stored
+                    .cluster
+                    .hsm_status
+                    .as_ref()
+                    .and_then(|status| status.hsm_configuration_identifier.as_deref())
+                    == Some(identifier)
+            })
+            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+            .collect()
+    }
+
     /// The stored snapshot copy grant with this `SnapshotCopyGrantName`, if any.
     ///
     /// The name is compared exactly as the create that minted the grant spelled

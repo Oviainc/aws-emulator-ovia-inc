@@ -355,7 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // api of the other protocol cannot carry it. Checked BEFORE anything is written,
         // so a refused create leaves the api's integrations exactly as they were. A map
         // the request sent empty configures nothing.
-        let mut restricted = vec![
+        let restricted = [
             crate::state::ProtocolRestrictedMember::websocket_only(
                 "ContentHandlingStrategy",
                 input.content_handling_strategy.is_some(),
@@ -406,18 +406,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ];
         // The restricted VALUES of a member the model documents value by value: the
         // member itself is accepted by either protocol, so what is gated is the value
-        // this request selected (see `WEBSOCKET_ONLY_INTEGRATION_TYPES`). The refusal
-        // names the member AND the value, which is what the caller has to change.
-        let integration_type_member = format!("IntegrationType {}", input.integration_type);
-        if crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(&input.integration_type.as_str())
-        {
-            restricted.insert(
-                0,
-                crate::state::ProtocolRestrictedMember::websocket_only(
-                    &integration_type_member,
-                    true,
-                ),
-            );
+        // this request selected. The refusal names the integration types the api MAY be
+        // associated with, so it has its own sentence rather than the member one
+        // (`crate::state::validate_integration_type_for_protocol`).
+        if let Err(message) = crate::state::validate_integration_type_for_protocol(
+            &api.protocol_type,
+            &input.integration_type,
+        ) {
+            return Err(bad_request(&message));
         }
         if let Err(message) =
             crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)

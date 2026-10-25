@@ -17,6 +17,8 @@ mod account_settings;
 mod alias_listing;
 #[path = "all/alias_name_constraint.rs"]
 mod alias_name_constraint;
+#[path = "all/alias_not_found_sentence.rs"]
+mod alias_not_found_sentence;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]

@@ -168,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVocabularyErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -181,6 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the vocabularies created through
+        // this Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The clock-owed transition is materialised FIRST, so a vocabulary whose
@@ -188,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left. The stored state is copied out of the lookup so the removal below does
         // not hold the borrow the lookup took.
         let stored_state = store
-            .vocabulary_mut(&input.vocabulary_name, now)
+            .vocabulary_mut(&region, &input.vocabulary_name, now)
             .map(|record| record.state.clone());
 
         match stored_state {
@@ -213,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             Some(_) => {
-                store.vocabularies.remove(&input.vocabulary_name);
+                store.vocabularies.remove(&region, &input.vocabulary_name);
                 ::tracing::info!(
                     operation = "DeleteVocabulary",
                     vocabulary = %input.vocabulary_name,
@@ -223,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
             // `BadRequestException` sentence covers it — "This can occur when the
             // entity you're trying to delete doesn't exist OR if it's in a non-terminal
-            // state" — so a name this account holds no vocabulary under is refused with
+            // state" — so a name this Region holds no vocabulary under is refused with
             // this service's own absent-resource text
             // (`crate::state::not_found_message`), exactly as every reader of the
             // family answers it, and nothing is stored or removed.

@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the modelled `NotFoundException` — and nothing is minted for it.
         let Some(meeting) = store.meetings.get(&input.meeting_id) else {
             return Err(CreateAttendeeErrorModeled::NotFoundException(
-                crate::state::meeting_not_found(&input.meeting_id),
+                store.meeting_absent(&input.meeting_id),
             )
             .into());
         };
@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(meeting) = store.meetings.get_mut(&input.meeting_id) else {
             return Err(CreateAttendeeErrorModeled::NotFoundException(
-                crate::state::meeting_not_found(&input.meeting_id),
+                store.meeting_absent(&input.meeting_id),
             )
             .into());
         };

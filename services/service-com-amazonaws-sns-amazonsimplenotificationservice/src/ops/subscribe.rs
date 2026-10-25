@@ -142,12 +142,6 @@ const PROTOCOLS: &[&str] = &[
 /// addresses an AWS resource the caller already owns, so it is confirmed at once.
 const PROTOCOLS_NEEDING_CONFIRMATION: &[&str] = &["http", "https", "email", "email-json"];
 
-/// The prefix the resource part of a platform endpoint's ARN carries
-/// (`arn:aws:sns:<region>:<account>:endpoint/<platform>/<application>/<id>`, from the
-/// `CreatePlatformEndpointResponse$EndpointArn` doc) — what tells an `application`
-/// protocol's endpoint from a topic or platform-application ARN of the same service.
-const PLATFORM_ENDPOINT_PREFIX: &str = "endpoint/";
-
 /// The prefix the resource part of a Lambda function's ARN carries
 /// (`arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]`).
 const LAMBDA_FUNCTION_PREFIX: &str = "function:";
@@ -232,7 +226,10 @@ fn endpoint_matches_protocol(protocol: &str, endpoint: &str) -> bool {
         "email" | "email-json" => is_email_address(endpoint),
         "sms" => is_phone_number(endpoint),
         "sqs" => state::arn_resource(endpoint, "sqs").is_some(),
-        "application" => names(endpoint, "sns", PLATFORM_ENDPOINT_PREFIX),
+        // What tells an `application` protocol's endpoint from a topic or
+        // platform-application ARN of the same service is the endpoint resource the
+        // shared prefix names.
+        "application" => names(endpoint, "sns", state::PLATFORM_ENDPOINT_PREFIX),
         "lambda" => names(endpoint, "lambda", LAMBDA_FUNCTION_PREFIX),
         "firehose" => names(endpoint, "firehose", FIREHOSE_STREAM_PREFIX),
         _ => false,

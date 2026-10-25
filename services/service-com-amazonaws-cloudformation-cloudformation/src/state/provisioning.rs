@@ -173,7 +173,7 @@
 //! `core/router/tests/all/cloudformation_provisions_stack_resources.rs` and by
 //! `tests/all/stack_resource_provisioning.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use serde_json::Value;
@@ -287,6 +287,79 @@ impl StackProvenance {
     }
 }
 
+/// One transition a stack operation made ONE of its resources go through, as
+/// CloudFormation records a `StackEvent` for it.
+///
+/// A stack operation is not one transition but a walk over the template's resources, and
+/// CloudFormation records the walk: an `*_IN_PROGRESS` event when it starts acting on a
+/// resource and a `*_COMPLETE` or `*_FAILED` event when the owning service has answered.
+/// That is what names the resource a deployment failed on, and what carries the owning
+/// service's own refusal ([`Self::reason`]) — neither of which the STACK's own events can
+/// say, since they describe the operation as a whole.
+///
+/// Collected here rather than written straight to the store because the calls that make a
+/// resource exist run with the store UNLOCKED: the operation that drove them records them
+/// on the stack ([`super::StoredStack::record_resource_events`]) when it takes the lock
+/// again.
+#[derive(Debug, Clone)]
+pub struct ResourceTransition {
+    /// `StackEvent$LogicalResourceId`: the name the template gives the resource.
+    pub logical_id: String,
+    /// `StackEvent$ResourceType`.
+    pub resource_type: String,
+    /// `StackEvent$PhysicalResourceId`, which a resource nothing has created yet — and one
+    /// whose create was refused — does not have.
+    pub physical_resource_id: Option<String>,
+    /// `StackEvent$ResourceStatus`, from the model's `ResourceStatus` enum
+    /// ([`super::resource_status`]).
+    pub status: String,
+    /// `StackEvent$ResourceStatusReason`: "Success/failure message associated with the
+    /// resource" — the owning service's refusal for a failed transition, and nothing for
+    /// one that succeeded.
+    pub reason: Option<String>,
+    /// When the transition happened, which is the event's `Timestamp` ("Time the status was
+    /// updated").
+    pub at: SystemTime,
+}
+
+impl ResourceTransition {
+    /// The transition a resource is STARTING: `*_IN_PROGRESS`, with no identifier yet —
+    /// the owning service has not answered, so there is nothing to report as the physical
+    /// id.
+    fn starting(resource: &StoredResource, status: &str) -> Self {
+        Self {
+            logical_id: resource.logical_id.clone(),
+            resource_type: resource.resource_type.clone(),
+            physical_resource_id: None,
+            status: status.to_string(),
+            reason: None,
+            at: SystemTime::now(),
+        }
+    }
+
+    /// The transition a resource FINISHED: the status it reached, the identifier it carries
+    /// now, and the reason a failure came with.
+    fn finished(resource: &StoredResource, status: &str, reason: Option<String>) -> Self {
+        Self {
+            logical_id: resource.logical_id.clone(),
+            resource_type: resource.resource_type.clone(),
+            physical_resource_id: super::physical_resource_id(resource),
+            status: status.to_string(),
+            reason,
+            at: SystemTime::now(),
+        }
+    }
+
+    /// The transition a resource failed: as [`Self::finished`], with no identifier —
+    /// nothing was created, so there is no physical id to report.
+    fn failed(resource: &StoredResource, status: &str, reason: String) -> Self {
+        Self {
+            physical_resource_id: None,
+            ..Self::finished(resource, status, Some(reason))
+        }
+    }
+}
+
 /// What deploying a stack's template left its resources as.
 #[derive(Debug, Clone, Default)]
 pub struct Materialised {
@@ -298,6 +371,9 @@ pub struct Materialised {
     /// to create one of the resources, or to delete one the deployment replaced. `None`
     /// when every resource this emulator provisions was created.
     pub failure: Option<String>,
+    /// Every resource transition this deployment made, oldest first — the stack's
+    /// per-resource event records.
+    pub transitions: Vec<ResourceTransition>,
 }
 
 /// Reconcile what a stack's newly deployed template declares with what the stack already
@@ -330,6 +406,13 @@ pub struct Materialised {
 /// owning service's own tag read on the handle the stack publishes answers with the stack's
 /// tags and the `aws:cloudformation:*` ones. A resource the deployment carries forward keeps
 /// the tags it was created with: nothing is re-tagged for a resource nothing changed about.
+///
+/// Every resource the walk ACTS ON is recorded as a pair of transitions
+/// ([`Materialised::transitions`]) — the one that opens it and the one that ends it — which
+/// is what lets the stack's event stream name the resource a deployment failed on and carry
+/// the owning service's own refusal. A resource the deployment leaves exactly as it found it
+/// transitions through nothing and is recorded nowhere, and neither is one the walk never
+/// reached.
 pub async fn reconcile(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -360,6 +443,10 @@ pub async fn reconcile(
                 // path there has nothing asked of its service, and the change is reported
                 // as NOT applied rather than as a success that dropped the caller's
                 // change.
+                outcome.transitions.push(ResourceTransition::starting(
+                    &resource,
+                    super::resource_status::UPDATE_IN_PROGRESS,
+                ));
                 let applied = match provisioner_for(&resource.resource_type) {
                     Some(provisioner) => {
                         provisioner
@@ -375,13 +462,26 @@ pub async fn reconcile(
                     Ok(Some(updated)) => {
                         resource.attributes.extend(updated.attributes);
                         resource.properties = declared_properties;
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_COMPLETE,
+                            None,
+                        ));
                     }
                     Ok(None) => {
+                        let unsupported = format!(
+                            "NotImplemented: this emulator does not change the properties of \
+                             an existing {} in place; the resource was left as it is.",
+                            resource.resource_type
+                        );
                         outcome.failure = Some(format!(
-                            "The following resource(s) failed to update: [{}]. NotImplemented: \
-                             this emulator does not change the properties of an existing {} in \
-                             place; the resource was left as it is.",
-                            resource.logical_id, resource.resource_type
+                            "The following resource(s) failed to update: [{}]. {unsupported}",
+                            resource.logical_id
+                        ));
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_FAILED,
+                            Some(unsupported),
                         ));
                         outcome.resources.push(resource);
                         break;
@@ -394,6 +494,11 @@ pub async fn reconcile(
                             "The following resource(s) failed to update: [{}]. {refusal}",
                             resource.logical_id
                         ));
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_FAILED,
+                            Some(handler_failure_reason(&refusal)),
+                        ));
                         outcome.resources.push(resource);
                         break;
                     }
@@ -402,6 +507,13 @@ pub async fn reconcile(
             outcome.resources.push(resource);
             continue;
         }
+        // The deployment is CREATING this resource: the stack records it as one it created
+        // once this is through, whether the create reaches an owning service or not, so the
+        // transition that opens it is recorded here.
+        outcome.transitions.push(ResourceTransition::starting(
+            &resource,
+            super::resource_status::CREATE_IN_PROGRESS,
+        ));
         let created = match provisioner_for(&resource.resource_type) {
             // The resource is created WITH the tags CloudFormation gives it: the stack's
             // own, plus the three that name the stack and this resource's place in it.
@@ -410,8 +522,15 @@ pub async fn reconcile(
                 provisioner.create(ctx, region, &resource, &tags).await
             }
             // No provisioner for this type: nothing is asked of any service, and the
-            // resource stays DECLARED-ONLY.
+            // resource stays DECLARED-ONLY — which the stack still records as a resource it
+            // created, under the identifier the naming rules computed, so the completion of
+            // that record is recorded too.
             None => {
+                outcome.transitions.push(ResourceTransition::finished(
+                    &resource,
+                    super::resource_status::CREATE_COMPLETE,
+                    None,
+                ));
                 outcome.resources.push(resource);
                 continue;
             }
@@ -425,11 +544,21 @@ pub async fn reconcile(
                 adopt_minted_identity(&mut resource, created.physical_resource_id);
                 resource.attributes.extend(created.attributes);
                 resource.materialised = true;
+                outcome.transitions.push(ResourceTransition::finished(
+                    &resource,
+                    super::resource_status::CREATE_COMPLETE,
+                    None,
+                ));
             }
             Err(refusal) => {
                 outcome.failure = Some(format!(
                     "The following resource(s) failed to create: [{}]. {refusal}",
                     resource.logical_id
+                ));
+                outcome.transitions.push(ResourceTransition::failed(
+                    &resource,
+                    super::resource_status::CREATE_FAILED,
+                    handler_failure_reason(&refusal),
                 ));
                 outcome.resources.push(resource);
                 break;
@@ -488,6 +617,9 @@ pub async fn reconcile(
             .filter(|resource| resource.materialised),
     );
     outcome.failure = deleted.failure;
+    // The removals happened after the creates above, which is the order they are reported
+    // in.
+    outcome.transitions.extend(deleted.transitions);
     outcome
 }
 
@@ -568,6 +700,10 @@ pub struct Deleted {
     /// The reason the stack's deletion cannot be reported as complete: an owning service
     /// refused to delete one of the resources.
     pub failure: Option<String>,
+    /// Every resource transition this deletion made, oldest first — the stack's
+    /// per-resource event records, exactly as [`Materialised::transitions`] carries a
+    /// deployment's.
+    pub transitions: Vec<ResourceTransition>,
 }
 
 /// Delete the resources a stack created, newest first — the reverse of the order they were
@@ -578,14 +714,39 @@ pub struct Deleted {
 /// already deleted are reported as deleted so a retry does not ask for them again. A
 /// resource the service no longer has is a success: the request asks for a state the
 /// service is already in.
+///
+/// Each resource this really deletes is recorded as the pair of transitions it went through
+/// ([`Deleted::transitions`]), which is what names the resource a deletion failed on. A
+/// record NO owning service holds a resource for — one of a type this emulator provisions
+/// nowhere, one whose create was refused, one a failed deployment never reached — has no
+/// deletion to go through: nothing is asked of anybody and the stack simply drops the
+/// record, so nothing is recorded for it either.
 pub async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
 ) -> Deleted {
+    delete_pass(ctx, region, resources, &mut BTreeSet::new()).await
+}
+
+/// One pass of [`delete`] over the set, recording what it transitioned.
+///
+/// `opened` is the logical ids whose deletion has already been OPENED, which this pass adds
+/// to: each resource's `DELETE_IN_PROGRESS` is recorded the first time a pass reaches it,
+/// and a RE-ASK of one an owning service has not carried out yet ([`unwind`]) is the same
+/// deletion still in progress rather than a second one. A resource an earlier pass never
+/// reached — one after the refusal that stopped it — is opened by the pass that does reach
+/// it.
+async fn delete_pass(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resources: &[StoredResource],
+    opened: &mut BTreeSet<String>,
+) -> Deleted {
     let mut outcome = Deleted {
         resources: resources.to_vec(),
         failure: None,
+        transitions: Vec::new(),
     };
     // Newest first, over the indices of the set being reported back, so each resource's
     // record is updated in place as its deletion succeeds.
@@ -596,16 +757,37 @@ pub async fn delete(
             continue;
         }
         let resource = &outcome.resources[index];
+        if opened.insert(resource.logical_id.clone()) {
+            outcome.transitions.push(ResourceTransition::starting(
+                resource,
+                super::resource_status::DELETE_IN_PROGRESS,
+            ));
+        }
         let deleted = match provisioner_for(&resource.resource_type) {
             Some(provisioner) => provisioner.delete(ctx, region, resource).await,
             None => Ok(()),
         };
         match deleted {
-            Ok(()) => outcome.resources[index].materialised = false,
+            Ok(()) => {
+                outcome.resources[index].materialised = false;
+                let resource = &outcome.resources[index];
+                outcome.transitions.push(ResourceTransition::finished(
+                    resource,
+                    super::resource_status::DELETE_COMPLETE,
+                    None,
+                ));
+            }
             Err(refusal) => {
                 outcome.failure = Some(format!(
                     "The following resource(s) failed to delete: [{}]. {refusal}",
                     outcome.resources[index].logical_id
+                ));
+                let reason = handler_failure_reason(&refusal);
+                let resource = &outcome.resources[index];
+                outcome.transitions.push(ResourceTransition::finished(
+                    resource,
+                    super::resource_status::DELETE_FAILED,
+                    Some(reason),
                 ));
                 return outcome;
             }
@@ -644,14 +826,32 @@ pub async fn unwind(
     region: &str,
     resources: &[StoredResource],
 ) -> Deleted {
-    let mut outcome = delete(ctx, region, resources).await;
+    // The deletions already opened, carried across the attempts: a re-ask of one still in
+    // flight does not open it again, and one a stopped pass never reached is opened by the
+    // pass that does reach it.
+    let mut opened = BTreeSet::new();
+    let mut outcome = delete_pass(ctx, region, resources, &mut opened).await;
     for _ in 1..UNWIND_ATTEMPTS {
         if outcome.failure.is_none() {
             break;
         }
         ::tokio::time::sleep(UNWIND_RETRY_DELAY).await;
         let remaining = ::std::mem::take(&mut outcome.resources);
-        outcome = delete(ctx, region, &remaining).await;
+        // What the earlier attempts transitioned happened BEFORE what this one does. The
+        // refusal this attempt is about to retry was not that resource's OUTCOME — its
+        // deletion is still in progress, which is the whole point of the re-ask — so the
+        // failed terminal the last pass recorded is dropped, and only the terminal of the
+        // attempt nothing follows stands.
+        let mut transitioned: Vec<ResourceTransition> =
+            ::std::mem::take(&mut outcome.transitions)
+                .into_iter()
+                .filter(|transition| {
+                    transition.status != super::resource_status::DELETE_FAILED
+                })
+                .collect();
+        outcome = delete_pass(ctx, region, &remaining, &mut opened).await;
+        transitioned.append(&mut outcome.transitions);
+        outcome.transitions = transitioned;
     }
     outcome
 }
@@ -680,6 +880,108 @@ impl ::std::fmt::Display for Refusal {
 /// answers, so it can never collide with one. An answer that identifies nothing is still
 /// a failed create — the status it came back with is what the stack's reason reports.
 const UNNAMED_CODE_PREFIX: &str = "HTTP ";
+
+/// Each `HandlerErrorCode` a provider's refusal is reported under, with the fragments an
+/// owning service's own error CODE carries when the refusal falls in that class.
+///
+/// The classes are the model's own `HandlerErrorCode` values
+/// ([`crate::ops::types::HANDLER_ERROR_CODE_VALUES`], which the tests below hold every
+/// class here to), and that is what a client reads to decide whether a failed resource is
+/// worth retrying — a throttled create is, a malformed declaration never is. The class is
+/// decided by the error CODE the owning service answered, the value a client of that
+/// service branches on, and never by message text a request can influence.
+///
+/// Walked in order, so a code carrying more than one fragment takes the first: the narrower
+/// class comes before the wider one it reads like (`RequestLimitExceeded` is throttling, not
+/// an exhausted quota).
+const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
+    (
+        "AccessDenied",
+        &["AccessDenied", "Forbidden", "Unauthorized", "AuthorizationError"],
+    ),
+    (
+        "InvalidCredentials",
+        &["InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken"],
+    ),
+    (
+        "Throttling",
+        &["Throttl", "TooManyRequests", "RequestLimitExceeded", "SlowDown"],
+    ),
+    (
+        "ServiceLimitExceeded",
+        &["LimitExceeded", "QuotaExceeded", "TooManyEntries"],
+    ),
+    ("AlreadyExists", &["AlreadyExists", "AlreadyOwnedBy", "Duplicate"]),
+    ("NotFound", &["NotFound", "NoSuch", "DoesNotExist"]),
+    (
+        "ResourceConflict",
+        &["Conflict", "InUse", "InvalidState", "Concurrent"],
+    ),
+    (
+        "InternalFailure",
+        &["InternalFailure", "SerializationException"],
+    ),
+    (
+        "GeneralServiceException",
+        &["InternalError", "InternalServerError", "ServiceUnavailable", "ServiceFailure"],
+    ),
+];
+
+/// The class a refusal falls in when nothing above matches: the owning service refused the
+/// request the declaration asked for, which is what every validation refusal is.
+const HANDLER_ERROR_DEFAULT: &str = "InvalidRequest";
+
+/// The lowest HTTP status that is the owning SERVICE failing rather than the request being
+/// wrong, for an answer that carried no error code at all ([`UNNAMED_CODE_PREFIX`]).
+const SERVER_ERROR_STATUS: u16 = 500;
+
+/// The class an answer that named no error at all falls in when its status says the owning
+/// service failed rather than that the request was wrong.
+const HANDLER_ERROR_SERVICE_FAILED: &str = "GeneralServiceException";
+
+/// The `HandlerErrorCode` an owning service's refusal is reported under — see
+/// [`HANDLER_ERROR_CLASSES`].
+fn handler_error_code(code: &str) -> &'static str {
+    if let Some(status) = code.strip_prefix(UNNAMED_CODE_PREFIX) {
+        // An answer that named no error at all: only the status it came back with says
+        // whether the service failed or the request was refused.
+        return match status.parse::<u16>() {
+            Ok(status) if status >= SERVER_ERROR_STATUS => HANDLER_ERROR_SERVICE_FAILED,
+            _ => HANDLER_ERROR_DEFAULT,
+        };
+    }
+    HANDLER_ERROR_CLASSES
+        .iter()
+        .find(|(_, fragments)| fragments.iter().any(|fragment| code.contains(fragment)))
+        .map_or(HANDLER_ERROR_DEFAULT, |(class, _)| *class)
+}
+
+/// The `ResourceStatusReason` the event for a resource its provider refused to act on
+/// carries: "Success/failure message associated with the resource".
+///
+/// CloudFormation does not report its own words for such a failure — it reports the
+/// provider's, quoted, beside the token of the resource request it answered and the
+/// `HandlerErrorCode` class that refusal falls in ([`handler_error_code`]), so a client
+/// reads WHY the resource failed and whether the failure is of a kind worth retrying.
+///
+/// The token is this resource request's own, minted per request as every identifier this
+/// service hands out is.
+fn handler_failure_reason(refusal: &Refusal) -> String {
+    // A service that worded no message at all still named the error, and the code is then
+    // all there is to report.
+    let message = if refusal.message.is_empty() {
+        refusal.code.as_str()
+    } else {
+        refusal.message.as_str()
+    };
+    format!(
+        "Resource handler returned message: \"{message}\" (RequestToken: {}, \
+         HandlerErrorCode: {})",
+        super::new_request_id(),
+        handler_error_code(&refusal.code)
+    )
+}
+
 
 /// Call one awsJson operation of another emulated service in-process and read its
 /// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
@@ -1187,4 +1489,58 @@ async fn callback_credentials(
         credentials.access_key_id().to_string(),
         credentials.secret_access_key().to_string(),
     ))
+}
+
+#[cfg(test)]
+mod handler_error_class_tests {
+    use super::{
+        handler_error_code, HANDLER_ERROR_CLASSES, HANDLER_ERROR_DEFAULT,
+        HANDLER_ERROR_SERVICE_FAILED,
+    };
+    use crate::ops::types::HANDLER_ERROR_CODE_VALUES;
+
+    /// Every class this module reports is one the MODEL declares: the classification is a
+    /// mapping onto `HandlerErrorCode`, so a class spelled any other way would put a value
+    /// on the wire that enum does not have.
+    #[test]
+    fn every_reported_class_is_one_the_model_declares() {
+        for class in HANDLER_ERROR_CLASSES
+            .iter()
+            .map(|(class, _)| *class)
+            .chain([HANDLER_ERROR_DEFAULT, HANDLER_ERROR_SERVICE_FAILED])
+        {
+            assert!(
+                HANDLER_ERROR_CODE_VALUES.contains(&class),
+                "case {class:?}: not a HandlerErrorCode the model declares, which are \
+                 {HANDLER_ERROR_CODE_VALUES:?}"
+            );
+        }
+    }
+
+    /// And so is whatever the classification answers for an arbitrary code, including one
+    /// no class matches and an answer that named no error at all.
+    #[test]
+    fn every_answer_is_one_the_model_declares() {
+        for code in [
+            "DBSubnetGroupNotFoundFault",
+            "InvalidParameterValue",
+            "ThrottlingException",
+            "BucketAlreadyOwnedByYou",
+            "ResourceInUseException",
+            "LimitExceededException",
+            "AccessDeniedException",
+            "a-code-no-service-answers",
+            "",
+            "HTTP 501",
+            "HTTP 400",
+            "HTTP not-a-status",
+        ] {
+            let class = handler_error_code(code);
+            assert!(
+                HANDLER_ERROR_CODE_VALUES.contains(&class),
+                "case {code:?}: answered {class:?}, which is not a HandlerErrorCode the \
+                 model declares"
+            );
+        }
+    }
 }

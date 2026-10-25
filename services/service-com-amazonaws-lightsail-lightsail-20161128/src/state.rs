@@ -11507,6 +11507,28 @@ pub fn tags_without(record: &dyn TaggedRecord, keys: &BTreeSet<String>) -> Vec<T
         .collect()
 }
 
+/// The tags of `record` with `added` merged into them.
+///
+/// Merging is BY KEY, the other half of [`tags_without`]'s rule: "tag keys must
+/// be unique per resource" (the modelled `TagResource` documentation), so a key
+/// the resource already carries keeps its place in the set and takes the new
+/// value, and a key it does not carry is appended in the order the request named
+/// it. A key the request names twice is therefore held once, carrying the last
+/// value that request gave it.
+///
+/// Answers the set rather than applying it, so a caller can refuse a request that
+/// would take the resource past [`MAX_TAGS`] before anything is written.
+pub fn tags_merged_with(record: &dyn TaggedRecord, added: &[Tag]) -> Vec<Tag> {
+    let mut merged = record.tags().to_vec();
+    for tag in added {
+        match merged.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => merged.push(tag.clone()),
+        }
+    }
+    merged
+}
+
 // ---------------------------------------------------------------------------
 // Input conversion and bounds
 // ---------------------------------------------------------------------------

@@ -72,10 +72,9 @@
 //! * `InternalServerErrorException` (HTTP 500)
 //! * `ServiceUnavailableException` (HTTP 503)
 //!
-//! Beyond the model: `NotFoundException` (HTTP 404), for a registry nothing created.
-//! See the `extra_errors` note below. A name the registry already holds is NOT beyond
-//! the model: it is refused with the `BadRequestException` above, since this
-//! operation's error set declares no conflict shape.
+//! Beyond the model: `NotFoundException` (HTTP 404), for a registry nothing created,
+//! and `ConflictException` (HTTP 409), for a schema name the registry already holds.
+//! See the `extra_errors` note below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -98,19 +97,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
 // here declares for that case, and what this service answers for a resource it does
 // not hold whichever operation named it).
 //
-// The name collision is NOT widened to `ConflictException`. The service declares
-// that shape on `CreateRegistry` (409) and leaves it off `CreateSchema`, so the only
-// client-refusal class this operation's error set offers for a duplicate name is the
-// 400 `BadRequestException` below — which is what a duplicate `CreateSchema` answers
-// (`crate::state::schema_already_exists`), with the already-exists condition code and
-// sentence unchanged.
+// `ConflictException` (409) is widened in the same way: asking to create a resource
+// whose name is already taken conflicts with the stored resource rather than being a
+// malformed request, and 409 is the class this SERVICE refuses every duplicate create
+// with (`CreateRegistry` and `CreateDiscoverer` both declare the shape for exactly
+// that condition). This operation's `errors` list omits it, which says nothing about
+// which class a name collision takes — the list carries no conflict condition at all —
+// so the shape the service already uses for the condition is the one this handler
+// answers with (`crate::state::schema_already_exists`).
 #[smithy_macros::operation_error(
     "com.amazonaws.schemas#CreateSchema",
-    extra_errors = ["NotFoundException"]
+    extra_errors = ["ConflictException", "NotFoundException"]
 )]
 #[derive(Debug)]
 pub enum CreateSchemaErrorModeled {
     BadRequestException(BadRequestException),
+    ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     NotFoundException(NotFoundException),
@@ -218,14 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under the same name is refused, not taken as a new version. Versions come
         // from UpdateSchema.
         //
-        // The refusal class is the one this operation MODELS for a client refusal:
-        // 400 `BadRequestException`. `CreateRegistry` declares `ConflictException`
-        // for its own name collision and this operation's error set does not, so a
-        // duplicate schema is not answered with that shape — a client branching on
-        // the error type, and an SDK whose modelled set for this operation has no
-        // conflict shape, would both take the wrong branch.
+        // The refusal is the service's conflict class (409): the request is
+        // well-formed and what stops it is the resource already being there, which is
+        // what lets a caller's create-if-not-exists loop absorb it and carry on
+        // instead of reading it as a request it must fix. Every create this service
+        // serves refuses a taken name the same way.
         if registry.schemas.contains_key(&input.schema_name) {
-            return Err(CreateSchemaErrorModeled::BadRequestException(
+            return Err(CreateSchemaErrorModeled::ConflictException(
                 crate::state::schema_already_exists(&input.schema_name),
             )
             .into());

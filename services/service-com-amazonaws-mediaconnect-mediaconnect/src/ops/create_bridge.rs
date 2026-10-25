@@ -224,14 +224,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Creates a new bridge. The request must include one source."
-        if input.sources.is_empty() || input.sources.len() > crate::state::MAX_BRIDGE_SOURCES {
-            return Err(bad_request(format!(
-                "A create bridge request must include at least one source and at most {}; \
-                 this one has {}.",
-                crate::state::MAX_BRIDGE_SOURCES,
-                input.sources.len()
-            )));
+        if input.sources.is_empty() {
+            return Err(bad_request(
+                "A create bridge request must include at least one source.",
+            ));
         }
+
+        // A bridge ingests the kind of source the direction it carries content in decides,
+        // read off the bridge-type member this request names (see
+        // `crate::state::bridge_source_kind_rejection`).
+        let bridge_type = if input.egress_gateway_bridge.is_some() {
+            crate::state::BRIDGE_TYPE_EGRESS
+        } else {
+            crate::state::BRIDGE_TYPE_INGRESS
+        };
 
         // Each entry configures ONE kind of source, and a source is addressed by its name:
         // `AddBridgeNetworkSourceRequest$Name` / `AddBridgeFlowSourceRequest$Name` "is used
@@ -259,7 +265,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      appears more than once."
                 )));
             }
+            if let Some(detail) = crate::state::bridge_source_kind_rejection(bridge_type, &source) {
+                return Err(bad_request(detail));
+            }
             sources.push(source);
+        }
+
+        // How many sources the new bridge may hold is its OWN failover state's rule, not a
+        // generic collection bound: "if the state is inactive, [it] can have only one
+        // source. If the state is active, [it] can have one or two sources"
+        // (`FailoverConfig$State`, the shape `SourceFailoverConfig` targets). A new bridge
+        // holds nothing yet, so this request's sources are all of them (see
+        // `crate::state::max_bridge_sources`).
+        if let Some(detail) = crate::state::bridge_source_bound_rejection(
+            input.source_failover_config.as_ref(),
+            0,
+            sources.len(),
+        ) {
+            return Err(bad_request(detail));
         }
 
         // The same two rules for the outputs the request optionally carries

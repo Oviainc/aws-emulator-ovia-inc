@@ -160,24 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
-        let mut unprocessed = Vec::new();
-        let mut seen = ::std::collections::BTreeSet::new();
-        for account_id in &input.account_ids {
-            // `AccountIds` names a SET of accounts: one account's invitation is
-            // deleted once, so a repeated id cannot be reported twice either.
-            if !seen.insert(account_id.as_str()) {
-                continue;
-            }
-            if !state.delete_received_invitation_in(&region, account_id) {
-                // Nothing to delete: this account has sent the current one no
-                // invitation, or the one it sent has already been answered or
-                // deleted. Reported, and nothing is persisted for it.
-                unprocessed.push(UnprocessedAccount {
-                    account_id: account_id.clone(),
-                    result: crate::state::NO_INVITATION_FROM_ACCOUNT_MESSAGE.to_string(),
-                });
-            }
-        }
+        // The same write `DeclineInvitations` drives, through the same state helper:
+        // both take the named accounts' invitations out of the inbox and report the
+        // accounts the inbox held none from, so neither can act on an invitation the
+        // other would report. A repeated account id is one account, so its invitation
+        // is taken once and reported at most once.
+        let unprocessed = state.take_received_invitations_in(&region, &input.account_ids);
 
         Ok(DeleteInvitationsOutput {
             // Present and empty when every named account's invitation was deleted:

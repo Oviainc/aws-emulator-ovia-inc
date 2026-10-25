@@ -229,9 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetAliasErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "Alias not found: {}",
-                        record.versioned_arn(&input.name)
+                    message: Some(crate::state::alias_not_found_message(
+                        &record.versioned_arn(&input.name),
                     )),
                 },
             )

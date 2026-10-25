@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutStorageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutStorageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutStorageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The storage configuration is an account-wide SETTING, not a resource: this
+//! operation replaces it whole, and `DescribeStorageConfiguration` reads that
+//! same setting back. Both reach it through `crate::state`'s
+//! `storage_configuration` / `set_storage_configuration`, so neither keeps a
+//! copy of its own. The selection is read against `crate::state`'s
+//! `check_storage_selection` — the one statement this crate has of the rules
+//! over those members — and the configuration a put accepts is in force from
+//! the instant the put records, so a read taken straight after it still
+//! observes the state the service reports while the change is applied.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +211,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutStorageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutStorageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutStorageConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutStorageConfigurationError::Modeled(
+                PutStorageConfigurationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        // The configuration is account-wide, so nothing in the request's
+        // metadata selects what it applies to.
+        let _ = ctx;
+
+        // The members are read TOGETHER, against the one statement this crate
+        // has of the rules over them: which tier is selected decides whether a
+        // cold-tier destination belongs with it, and each retention period and
+        // each state member is read against the shape that carries it.
+        let selection = crate::state::StorageConfigurationSelection {
+            storage_type: input.storage_type,
+            multi_layer_storage: input.multi_layer_storage,
+            disassociated_data_storage: input.disassociated_data_storage,
+            retention_period: input.retention_period,
+            warm_tier: input.warm_tier,
+            warm_tier_retention_period: input.warm_tier_retention_period,
+            disallow_ingest_null_na_n: input.disallow_ingest_null_na_n,
+        };
+        crate::state::check_storage_selection(&selection).map_err(invalid_request)?;
+
+        // The whole setting is replaced — a put is the last word on the
+        // account's storage — except that the store refuses a selection the
+        // configuration in force does not admit. The configuration the put
+        // accepts falls due at the span `set_storage_configuration` records, so
+        // this answer reports the state it is in at the instant of the call.
+        let configuration = state
+            .lock()
+            .set_storage_configuration(selection, ::std::time::SystemTime::now())
+            .map_err(invalid_request)?;
+        let reported = configuration.selection;
+        Ok(PutStorageConfigurationOutput {
+            storage_type: reported.storage_type,
+            multi_layer_storage: reported.multi_layer_storage,
+            disassociated_data_storage: reported.disassociated_data_storage,
+            retention_period: reported.retention_period,
+            warm_tier: reported.warm_tier,
+            warm_tier_retention_period: reported.warm_tier_retention_period,
+            disallow_ingest_null_na_n: reported.disallow_ingest_null_na_n,
+            configuration_status: configuration.status,
+        })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> PutStorageConfigurationError {
+    PutStorageConfigurationError::Modeled(
+        PutStorageConfigurationErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
 }

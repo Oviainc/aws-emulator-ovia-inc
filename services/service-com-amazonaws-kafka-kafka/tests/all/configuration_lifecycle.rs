@@ -83,82 +83,11 @@ async fn create_ok(emulator: &Emulator, request: &ConfigurationRequest) -> Strin
         .to_string()
 }
 
-/// One `CreateConfiguration` request, as a row of a table.
-#[derive(Debug, Clone)]
-struct ConfigurationRequest {
-    name: String,
-    description: Option<String>,
-    kafka_versions: Vec<String>,
-    /// The `server.properties` body, as raw bytes: the member is a blob, so it
-    /// is base64 on the wire and may hold bytes that are not UTF-8 at all.
-    server_properties: Vec<u8>,
-}
-
-impl ConfigurationRequest {
-    fn named(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            description: None,
-            kafka_versions: Vec::new(),
-            server_properties: b"auto.create.topics.enable=true\n".to_vec(),
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let mut body = json!({
-            "name": self.name,
-            // A blob member travels base64-encoded in a restJson1 payload.
-            "serverProperties": ::aws_smithy_types::base64::encode(&self.server_properties),
-        });
-        if let Some(description) = &self.description {
-            body["description"] = json!(description);
-        }
-        if !self.kafka_versions.is_empty() {
-            body["kafkaVersions"] = json!(self.kafka_versions);
-        }
-        body
-    }
-
-    /// What `Configuration$Description` must report: the description as given,
-    /// and the empty string when the request named none.
-    fn expected_description(&self) -> String {
-        self.description.clone().unwrap_or_default()
-    }
-}
-
-/// The table every round-trip suite below walks. The rows differ along what the
-/// rules generalise over: whether a description was given (and whether it is
-/// empty or carries non-ASCII text), how many Kafka versions were named, and the
-/// size and byte content of the `server.properties` blob.
-fn rows() -> Vec<ConfigurationRequest> {
-    vec![
-        ConfigurationRequest::named("no-description"),
-        ConfigurationRequest {
-            description: Some("a described configuration".to_string()),
-            kafka_versions: vec!["2.8.1".to_string()],
-            ..ConfigurationRequest::named("one-version")
-        },
-        ConfigurationRequest {
-            description: Some(String::new()),
-            kafka_versions: vec!["3.4.0".to_string(), "3.5.1".to_string(), "3.6.0".to_string()],
-            server_properties: Vec::new(),
-            ..ConfigurationRequest::named("three-versions-empty-properties")
-        },
-        ConfigurationRequest {
-            description: Some("héllo — ünicode".to_string()),
-            kafka_versions: vec!["3.6.0".to_string()],
-            // Bytes that are not valid UTF-8: a blob is a byte string, so the
-            // round trip must not go through a string conversion.
-            server_properties: vec![0x00, 0xff, 0xfe, 0x10, 0x80],
-            ..ConfigurationRequest::named("binary_properties-1")
-        },
-        ConfigurationRequest {
-            description: Some("a large properties file".to_string()),
-            server_properties: b"num.partitions=1\n".repeat(512),
-            ..ConfigurationRequest::named("large-properties")
-        },
-    ]
-}
+// One `CreateConfiguration` request, as a row of a table, and the table every
+// round-trip suite below walks: both shared with the crate's other
+// configuration suites through the harness, so one builder and one table
+// describe what a configuration request can be.
+use super::kafka_harness::{configuration_rows as rows, ConfigurationRequest};
 
 /// `arn:aws:kafka:<region>:<account>:configuration/<name>/<uuid>-<n>` — the form
 /// the real service mints a configuration ARN in.

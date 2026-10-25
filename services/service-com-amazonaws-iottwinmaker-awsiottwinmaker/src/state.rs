@@ -130,6 +130,103 @@ pub const MAX_PAGE_SIZE: usize = 200;
 /// See [`MAX_PAGE_SIZE`].
 pub const DEFAULT_PAGE_SIZE: usize = 25;
 
+/// What ONE paginated operation's `maxResults` member documents, and so the two
+/// parameters the shared page-size rule ([`page_size`]) is applied with.
+///
+/// The rule is the same for every paginated operation of this service; only
+/// these two numbers differ between them, so they are parameters rather than
+/// part of the rule: `ListSyncJobs` documents a default of 50 where the other
+/// listings document [`DEFAULT_PAGE_SIZE`], and a member documenting a minimum
+/// of 1 refuses the zero a member documenting a minimum of 0 serves as a page of
+/// no rows. A rule is built with [`PageSizeRule::minimum_one`] or
+/// [`PageSizeRule::minimum_zero`], so its minimum is never negative.
+#[derive(Debug, Clone, Copy)]
+pub struct PageSizeRule {
+    /// The page size served for a request that names no `maxResults`, from the
+    /// member's documented default.
+    default: usize,
+    /// The smallest `maxResults` the member's documentation admits.
+    minimum: i32,
+}
+
+impl PageSizeRule {
+    /// The rule for a `maxResults` documenting a minimum of 1 — an explicit zero
+    /// is refused — served `default` when a request names none.
+    pub const fn minimum_one(default: usize) -> Self {
+        Self {
+            default,
+            minimum: 1,
+        }
+    }
+
+    /// The rule for a `maxResults` documenting a minimum of 0 — a zero is the
+    /// maximum number of results to return at one time, literally, so it is
+    /// served as a page of no rows rather than refused — served `default` when a
+    /// request names none.
+    pub const fn minimum_zero(default: usize) -> Self {
+        Self {
+            default,
+            minimum: 0,
+        }
+    }
+
+    /// The refusal message for a `maxResults` of `requested`, which this rule's
+    /// minimum does not admit.
+    ///
+    /// A member documenting a POSITIVE minimum is asked for a smaller value by a
+    /// caller that paged at zero, so the message names the minimum and the
+    /// default the member can be omitted for. A member documenting a minimum of
+    /// 0 admits every value its published range carries, so a value below it
+    /// arrives only from a caller that got past that range, and the message names
+    /// the range and the value instead.
+    fn refusal(self, requested: i32) -> String {
+        if self.minimum > 0 {
+            format!(
+                "maxResults must be at least {}; omit it for the default of {}",
+                self.minimum, self.default
+            )
+        } else {
+            format!(
+                "maxResults must be between {} and {MAX_PAGE_SIZE}, got {requested}",
+                self.minimum
+            )
+        }
+    }
+}
+
+/// The page size a paginated operation serves for a request's `maxResults` under
+/// `rule`, or the message refusing a value the rule does not admit.
+///
+/// ONE rule, shared by every paginated operation of this service so the page a
+/// caller is served means the same thing wherever it is read: a request naming
+/// no `maxResults` is served the operation's documented default — never every
+/// row it could report — a value below the member's documented minimum is
+/// refused, and anything else is served as asked for, capped at
+/// [`MAX_PAGE_SIZE`], the most this service ever serves. The page a handler
+/// BUILDS is therefore bounded by this code and not only by the boundary
+/// validator.
+///
+/// The refusal is a message rather than an error: every operation models its own
+/// `ValidationException` (HTTP 400), so the caller wraps the message in its own.
+pub fn page_size(max_results: Option<i32>, rule: PageSizeRule) -> Result<usize, String> {
+    match max_results {
+        None => Ok(rule.default),
+        Some(requested) if requested < rule.minimum => Err(rule.refusal(requested)),
+        // A value below the rule's minimum is already refused above and no rule
+        // has a negative minimum, so the ceiling is applied in the type the
+        // member arrived in: there is no conversion fallback left for two copies
+        // of this rule to disagree about. The CEILING is what decides the answer
+        // here; the lower bound is unreachable belt-and-braces, kept only so a
+        // value that somehow got past the arm above cannot become an enormous
+        // page.
+        Some(requested) => Ok(requested.clamp(0, MAX_PAGE_SIZE_I32) as usize),
+    }
+}
+
+/// [`MAX_PAGE_SIZE`] as the modelled `maxResults` carries it, so a requested page
+/// size is capped while it is still the integer the request named.
+const MAX_PAGE_SIZE_I32: i32 = MAX_PAGE_SIZE as i32;
+
 /// The most components `GetEntity` reports for one entity, and the most
 /// properties it reports for one component.
 ///

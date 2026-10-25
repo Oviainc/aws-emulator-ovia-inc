@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the tags a request carries to the Lightsail resource its name addresses,
+//! and logs the operation. A tag key the resource already holds takes the new
+//! value rather than being held twice, and every other tag it carries is left
+//! alone — so a later read of that resource reports the merged set. The resource
+//! is resolved, and the change logged, exactly as `UntagResource` resolves and
+//! logs the other half of the same job.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +168,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A tag change is a regional call: a bucket, a container service and a
+        // load balancer are identified by the Region they were created in
+        // together with their name, so the Region of the request's SigV4
+        // credential scope is what `resourceName` is resolved in — the same
+        // resolution `UntagResource` makes, through the same store helper.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        // `resourceName` and `tags` are modelled `@required` members and the name
+        // carries the modelled `ResourceName` pattern, so the centralized walk
+        // refused anything outside them before this body ran. What is left is
+        // what the model cannot express: the list's length, the name being one
+        // this account holds, and an ARN the request carries as well being that
+        // same resource's.
+        let name = input.resource_name;
+        let added = input.tags;
+        let requested_arn = input.resource_arn;
+
+        // The request's tag list BECOMES tags the resource holds, and the
+        // modelled `TagList` carries no `@length`, so it is bounded HERE —
+        // before the store is reached and before a single key is compared, so no
+        // caller-sized walk runs for a request this service refuses anyway. The
+        // same check, at the same bound, as every operation of this crate that
+        // accepts `tags` (see `create_disk.rs`). `UntagResource` bounds nothing,
+        // and correctly: a key list only ever REMOVES.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Bounding the LIST is deliberately stricter than bounding the merged
+        // set: a list of more than this many entries is refused even where its
+        // repeated keys, or keys the resource already carries, would have
+        // collapsed into a set within the bound. That is the price of refusing a
+        // caller-sized list before any work is done on it; the exact rule — what
+        // the RESOURCE ends up carrying — is the check inside the resolution
+        // below.
+        if added.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                added.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        crate::state::with_state(&*self.engine, |store| {
+            let resolved = store.with_tagged_record(&region, &name, |record, resource_type| {
+                // `resourceArn` is the ARN of the resource "to which you want to
+                // add a tag" — the SAME resource `resourceName` names — so a
+                // request carrying both is served only when they agree, rather
+                // than one of the two being silently ignored.
+                if let Some(arn) = requested_arn.as_deref() {
+                    if arn != record.arn() {
+                        return Err(invalid(format!(
+                            "resourceArn '{arn}' is not the ARN of the resource named '{name}'"
+                        )));
+                    }
+                }
+                // The RESULTING set is what the exact bound is on — "each
+                // resource can have a maximum of 50 tags" — so a request whose
+                // own list is within the bound but whose new keys would take the
+                // resource past it is refused before anything is written and
+                // leaves the tags the resource already carries alone.
+                let merged = crate::state::tags_merged_with(record, &added);
+                if merged.len() > crate::state::MAX_TAGS {
+                    return Err(invalid(format!(
+                        "tags would leave {} tags on the resource, more than the {} this \
+                         service accepts (it carries {} already)",
+                        merged.len(),
+                        crate::state::MAX_TAGS,
+                        record.tags().len()
+                    )));
+                }
+                record.set_tags(merged);
+                Ok((resource_type, record.location().clone()))
+            });
+            // A name this account holds no resource of is Lightsail's
+            // `DoesNotExist` rejection, the same envelope every other not-found
+            // path in this crate answers with.
+            let Some(resolved) = resolved else {
+                return Err(not_found(&name, &region));
+            };
+            let (resource_type, location) = resolved?;
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; this one changes the tags of exactly the one
+            // resource it names, so it answers exactly one entry.
+            let operation = store.record_untyped_operation(now, resource_type, &name, &location);
+            Ok(TagResourceOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No resource of this account is stored under that name: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist`, and a message built from the request.
+///
+/// The message names the request's own members rather than one resource type,
+/// because the request names a resource without saying what kind it is; the
+/// Region is in it because the resources whose identity includes one are resolved
+/// in the Region the call was made in. The wording `UntagResource` answers with,
+/// because it is the same lookup failing.
+fn not_found(name: &str, region: &str) -> TagResourceError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "resourceName '{name}' does not name a resource of this account in {region}"
+    ))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> TagResourceError {
+    TagResourceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
