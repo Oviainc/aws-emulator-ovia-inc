@@ -12,18 +12,95 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 use smithy_server_runtime::MultiServiceRouter;
 use sts::state::{ComAmazonawsStsAwssecuritytokenservicev20110615State as StsState, Identity, Session, SessionKind};
 
 /// The account every long-term key of this emulator lives in.
-fn emulator_account() -> String {
+pub(crate) fn emulator_account() -> String {
     engine::emulator_account_id().to_string()
+}
+
+/// A role trust policy that lets this account's own principals perform `actions` on the
+/// role it is attached to, written as `iam:CreateRole` stores one.
+pub(crate) fn trust_policy(actions: &[&str]) -> String {
+    let actions = actions
+        .iter()
+        .map(|action| format!("\"{action}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Principal\":{{\"AWS\":\"arn:aws:iam::{}:root\"}},\"Action\":[{actions}]}}]}}",
+        emulator_account()
+    )
+}
+
+/// A role recorded in the IAM store of the SAME shared engine, as `iam:CreateRole`
+/// records one: its ARN, and the `RoleId` IAM issued for it.
+///
+/// The seeded `RoleId` is deliberately NOT derivable from the ARN, so a test asserting
+/// `AssumedRoleUser.AssumedRoleId` is built from it cannot pass against a handler that
+/// derives an id of its own.
+pub(crate) fn seed_role(
+    engine: &engine::InMemoryEngine,
+    role_id: &str,
+    role_name: &str,
+    path: &str,
+    trust: Option<&str>,
+    max_session_duration: Option<i32>,
+) -> (String, String) {
+    let arn = format!(
+        "arn:aws:iam::{}:role{path}{role_name}",
+        emulator_account()
+    );
+    let role = iam::ops::types::Role {
+        path: path.to_string(),
+        role_name: role_name.to_string(),
+        role_id: role_id.to_string(),
+        arn: arn.clone(),
+        create_date: aws_smithy_types::DateTime::from_secs(now_secs()),
+        assume_role_policy_document: trust.map(str::to_string),
+        description: None,
+        max_session_duration,
+        permissions_boundary: None,
+        tags: None,
+        role_last_used: None,
+        source_role_template: None,
+    };
+    engine
+        .state::<iam::ComAmazonawsIamAwsidentitymanagementv20100508State>()
+        .lock()
+        .roles
+        .insert(iam::state::name_key(role_name), role);
+    (arn, role_id.to_string())
+}
+
+/// The role every suite below assumes unless it needs its own: assumable by this
+/// account, and allowed to carry session tags and a source identity.
+pub(crate) fn seed_demo_role(engine: &engine::InMemoryEngine) -> (String, String) {
+    seed_role(
+        engine,
+        "AROASEEDEDDEMOROLE001",
+        "demo",
+        "/",
+        Some(&trust_policy(&[
+            "sts:AssumeRole",
+            "sts:TagSession",
+            "sts:SetSourceIdentity",
+        ])),
+        Some(43_200),
+    )
 }
 
 /// The emulator the tests drive: one shared engine, the STS service mounted on it,
 /// request authentication off (these tests sign nothing — they only carry the
 /// `Credential=` scope the service reads the caller from).
+///
+/// The IAM service is not MOUNTED here, because these suites drive STS over the wire and
+/// seed IAM's records directly in the one shared engine STS reads them from; the
+/// cross-service suite in `core/router/tests/` mounts both.
 pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -100,13 +177,13 @@ pub(crate) fn member(case: &str, body: &str, name: &str) -> String {
 
 /// Seconds since the Unix epoch in an awsQuery ISO-8601 timestamp
 /// (`2026-10-21T21:53:16Z`), via the SDK's own parser.
-fn timestamp_secs(case: &str, rendered: &str) -> i64 {
+pub(crate) fn timestamp_secs(case: &str, rendered: &str) -> i64 {
     aws_smithy_types::DateTime::from_str(rendered, aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|e| panic!("case {case:?}: {rendered:?} is not an ISO-8601 instant: {e}"))
         .secs()
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -178,49 +255,57 @@ async fn get_caller_identity_reports_the_ambient_identity_for_a_key_with_no_sess
 // ---------------------------------------------------------------------------
 
 /// `AssumeRole` mints a NEW, unique session credential per call, derives the
-/// assumed-role identity from the role ARN and session name, and persists the session
-/// so the credential resolves afterwards: `GetCallerIdentity` signed with it answers
-/// the assumed-role identity, and `GetAccessKeyInfo` answers the role's account.
+/// assumed-role identity from the role IAM holds and the session name, and persists the
+/// session so the credential resolves afterwards: `GetCallerIdentity` signed with it
+/// answers the assumed-role identity, and `GetAccessKeyInfo` answers the role's account.
 ///
-/// The rows differ along what the rule generalises over: the account in the role ARN,
-/// the partition, a role path, the character set of the role and session names, and
-/// the requested duration (absent, the 900-second floor, the 43,200-second ceiling).
+/// The rows differ along what the rule generalises over: the role path, the character
+/// set of the role and session names, the role id IAM issued, and the requested duration
+/// (absent, the 900-second floor, the role's own ceiling).
 #[tokio::test]
 async fn assume_role_mints_a_persisted_session_for_the_role_it_names() {
-    let (router, _engine) = emulator();
-    let cases: [(&str, &str, &str, Option<i32>); 4] = [
+    let (router, engine) = emulator();
+    let account = emulator_account();
+    // (role id IAM issued, role name, path, session name, requested duration)
+    let cases: [(&str, &str, &str, &str, Option<i32>); 4] = [
+        ("AROASEEDED0000000001", "demo", "/", "s1", Some(900)),
         (
-            "arn:aws:iam::000000000000:role/demo",
-            "demo",
-            "s1",
-            Some(900),
-        ),
-        (
-            "arn:aws:iam::123456789012:role/app/team/reader",
+            "AROASEEDED0000000002",
             "reader",
+            "/app/team/",
             "session-2",
             None,
         ),
         (
-            "arn:aws-us-gov:iam::210987654321:role/Admin_Role",
+            "AROASEEDED0000000003",
             "Admin_Role",
+            "/",
             "user@example.com",
             Some(43200),
         ),
         (
-            "arn:aws-cn:iam::999999999999:role/path/with/many/segments/Role+Name=1",
+            "AROASEEDED0000000004",
             "Role+Name=1",
+            "/path/with/many/segments/",
             "a.b-c_d",
             Some(3601),
         ),
     ];
+    let trust = trust_policy(&["sts:AssumeRole"]);
 
     let mut minted_keys: Vec<String> = Vec::new();
-    for (role_arn, role_name, session_name, duration) in cases {
+    for (role_id, role_name, path, session_name, duration) in cases {
+        let (role_arn, role_id) = seed_role(
+            &engine,
+            role_id,
+            role_name,
+            path,
+            Some(&trust),
+            Some(43_200),
+        );
         let case = format!("{role_arn} as {session_name} for {duration:?}");
-        let account = role_arn.split(':').nth(4).expect("an account segment");
         let mut params = vec![
-            ("RoleArn", role_arn.to_string()),
+            ("RoleArn", role_arn.clone()),
             ("RoleSessionName", session_name.to_string()),
         ];
         if let Some(duration) = duration {
@@ -238,11 +323,11 @@ async fn assume_role_mints_a_persisted_session_for_the_role_it_names() {
             "case {case:?}: wrong assumed-role ARN in {body}"
         );
         let assumed_role_id = member(&case, &body, "AssumedRoleId");
-        assert!(
-            assumed_role_id.starts_with("AROA")
-                && assumed_role_id.ends_with(&format!(":{session_name}"))
-                && assumed_role_id.len() == 21 + 1 + session_name.len(),
-            "case {case:?}: expected '<21-char AROA… role id>:{session_name}', got {assumed_role_id:?}"
+        assert_eq!(
+            assumed_role_id,
+            format!("{role_id}:{session_name}"),
+            "case {case:?}: expected the role id IAM issued joined to the session name, got \
+             {assumed_role_id:?} in {body}"
         );
 
         // The credential itself: a modelled access key id, a secret, a session token,
@@ -283,7 +368,7 @@ async fn assume_role_mints_a_persisted_session_for_the_role_it_names() {
                 member(&case, &identity, "Account"),
                 member(&case, &identity, "Arn"),
             ),
-            (assumed_role_id.clone(), account.to_string(), expected_arn),
+            (assumed_role_id.clone(), account.clone(), expected_arn),
             "case {case:?}: the minted credential must report the assumed-role identity, got \
              {identity}"
         );
@@ -304,11 +389,22 @@ async fn assume_role_mints_a_persisted_session_for_the_role_it_names() {
     }
 }
 
-/// A role keeps ONE id: assuming the same role twice reports the same `AROA…` id, and
-/// two different roles never share one.
+/// A role keeps ONE id — the one IAM issued for it: assuming the same role twice reports
+/// the same `AROA…` id, and two different roles never share one.
 #[tokio::test]
 async fn a_role_keeps_one_role_id_across_sessions() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let trust = trust_policy(&["sts:AssumeRole"]);
+    let (demo_arn, demo_id) =
+        seed_role(&engine, "AROASEEDEDONEROLE0001", "demo", "/", Some(&trust), None);
+    let (other_arn, other_id) = seed_role(
+        &engine,
+        "AROASEEDEDONEROLE0002",
+        "other",
+        "/",
+        Some(&trust),
+        None,
+    );
     let role_id = |body: &str| {
         element(body, "AssumedRoleId")
             .expect("an AssumedRoleId")
@@ -318,7 +414,7 @@ async fn a_role_keeps_one_role_id_across_sessions() {
             .to_string()
     };
 
-    let assume = |role_arn: &'static str, session: &'static str| {
+    let assume = |role_arn: String, session: &'static str| {
         let router = &router;
         async move {
             let (status, body) = call(
@@ -326,7 +422,7 @@ async fn a_role_keeps_one_role_id_across_sessions() {
                 LONG_TERM_KEY,
                 "AssumeRole",
                 &[
-                    ("RoleArn", role_arn.to_string()),
+                    ("RoleArn", role_arn.clone()),
                     ("RoleSessionName", session.to_string()),
                 ],
             )
@@ -336,16 +432,18 @@ async fn a_role_keeps_one_role_id_across_sessions() {
         }
     };
 
-    let first = assume("arn:aws:iam::000000000000:role/demo", "one").await;
-    let again = assume("arn:aws:iam::000000000000:role/demo", "two").await;
-    let other = assume("arn:aws:iam::000000000000:role/other", "one").await;
+    let first = assume(demo_arn.clone(), "one").await;
+    let again = assume(demo_arn, "two").await;
+    let other = assume(other_arn, "one").await;
     assert_eq!(
-        first, again,
-        "case 'same role twice': expected one stable role id, got {first} then {again}"
+        (first.clone(), again.clone()),
+        (demo_id.clone(), demo_id),
+        "case 'same role twice': expected the role id IAM issued both times, got {first} then \
+         {again}"
     );
-    assert_ne!(
-        first, other,
-        "case 'two roles': expected distinct role ids, both were {first}"
+    assert_eq!(
+        other, other_id,
+        "case 'another role': expected that role's own id, got {other}"
     );
 }
 
@@ -382,8 +480,8 @@ async fn assume_role_refuses_a_role_arn_that_is_not_one() {
         );
         assert_eq!(
             element(&body, "Code").as_deref(),
-            Some("ValidationException"),
-            "case {role_arn:?}: expected a ValidationException, got {body}"
+            Some("ValidationError"),
+            "case {role_arn:?}: expected a ValidationError, got {body}"
         );
     }
 }
@@ -399,7 +497,8 @@ async fn assume_role_refuses_a_role_arn_that_is_not_one() {
 /// `MalformedPolicyDocument`.
 #[tokio::test]
 async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let (_role_arn, _role_id) = seed_demo_role(&engine);
     let small_policy = r#"{"Version":"2012-10-17","Statement":[]}"#.to_string();
     // 2,048 characters is the documented plaintext budget, so a policy well past it
     // packs to more than 100 percent.
@@ -503,7 +602,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
                 ("Tags.member.2.Value", "payments".to_string()),
             ],
             400,
-            Some("ValidationException"),
+            Some("InvalidParameterValue"),
             None,
         ),
         (
@@ -726,6 +825,7 @@ async fn an_expired_session_credential_is_refused_and_a_live_one_is_served() {
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
                 external_id: None,
+                role_arn: None,
                 revoked: false,
             })
             .unwrap_or_else(|e| panic!("case {case:?}: recording the session: {}", e.message()));
@@ -810,6 +910,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
 
     for (case, offset, live, expected_status) in cases {
         let (router, engine) = emulator();
+        let (_role_arn, _role_id) = seed_demo_role(&engine);
         let now = SystemTime::now();
         let expires_at = if live { now + offset } else { now - offset };
         for index in 0..MAX_SESSIONS {
@@ -829,6 +930,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
                 transitive_tag_keys: Vec::new(),
                 packed_policy_size: None,
                 external_id: None,
+                role_arn: None,
                 revoked: false,
             };
             engine
@@ -854,6 +956,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
             external_id: None,
+            role_arn: None,
             revoked: false,
         });
         assert!(
@@ -904,6 +1007,7 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
             transitive_tag_keys: Vec::new(),
             packed_policy_size: None,
             external_id: None,
+            role_arn: None,
             revoked: false,
         })
         .expect("recording a long-expired session");
@@ -924,22 +1028,59 @@ async fn the_session_registry_is_bounded_and_prunes_what_the_clock_retired() {
 /// session here was minted under.
 #[tokio::test]
 async fn get_access_key_info_answers_from_the_session_registry() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let (role_arn, _role_id) = seed_demo_role(&engine);
     let mut expected: Vec<(String, String)> = Vec::new();
-    for account in ["000000000000", "123456789012", "210987654321"] {
-        let (status, body) = call(
-            &router,
-            LONG_TERM_KEY,
-            "AssumeRole",
-            &[
-                ("RoleArn", format!("arn:aws:iam::{account}:role/demo")),
-                ("RoleSessionName", "s1".to_string()),
-            ],
-        )
-        .await;
-        assert_eq!(status, 200, "case {account:?}: {body}");
-        expected.push((member(account, &body, "AccessKeyId"), account.to_string()));
+
+    // A session this service minted: its account is the account of the role IAM holds.
+    let (status, body) = call(
+        &router,
+        LONG_TERM_KEY,
+        "AssumeRole",
+        &[
+            ("RoleArn", role_arn),
+            ("RoleSessionName", "s1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "case 'a minted session': {body}");
+    expected.push((
+        member("a minted session", &body, "AccessKeyId"),
+        emulator_account(),
+    ));
+
+    // Records whose identity lives in another account, written straight into the
+    // registry: the answer is read from the record, so it is that account and not the
+    // emulator's own.
+    for (index, account) in ["123456789012", "210987654321"].into_iter().enumerate() {
+        let access_key_id = format!("EMULATORASFOREIGN{index:03}");
+        let now = SystemTime::now();
+        engine
+            .state::<StsState>()
+            .lock()
+            .insert(Session {
+                access_key_id: access_key_id.clone(),
+                created_at: now,
+                expires_at: now + Duration::from_secs(900),
+                duration_seconds: 900,
+                identity: Identity {
+                    user_id: format!("AROASEEDEDFOREIGN{index:04}:s1"),
+                    account: account.to_string(),
+                    arn: format!("arn:aws:sts::{account}:assumed-role/demo/s1"),
+                },
+                kind: SessionKind::AssumedRole,
+                source_identity: None,
+                tags: Vec::new(),
+                transitive_tag_keys: Vec::new(),
+                packed_policy_size: None,
+                external_id: None,
+                role_arn: None,
+                revoked: false,
+            })
+            .unwrap_or_else(|e| panic!("case {account:?}: recording the session: {}", e.message()));
+        expected.push((access_key_id, account.to_string()));
     }
+
     // A key this service never minted: the only account its long-term keys live in.
     expected.push((LONG_TERM_KEY.to_string(), emulator_account()));
 
@@ -970,7 +1111,8 @@ async fn get_access_key_info_answers_from_the_session_registry() {
 /// `SessionTokenSize` is the size of the token actually returned.
 #[tokio::test]
 async fn a_minimum_session_token_size_is_honoured_or_refused_never_ignored() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let (_role_arn, _role_id) = seed_demo_role(&engine);
     let minting: [(&str, Vec<(&str, String)>); 3] = [
         (
             "AssumeRole",
@@ -1055,7 +1197,8 @@ async fn assume_role_refuses_a_trusted_context_assertion_it_did_not_issue() {
 /// `SourceIdentity` appears exactly when the request supplies it.
 #[tokio::test]
 async fn assume_role_echoes_source_identity_only_when_it_is_supplied() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    let (_role_arn, _role_id) = seed_demo_role(&engine);
     for source_identity in [None, Some("alice"), Some("bob@example.com")] {
         let case = format!("source identity {source_identity:?}");
         let mut params = vec![

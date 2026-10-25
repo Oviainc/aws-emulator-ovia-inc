@@ -151,6 +151,15 @@ pub const VERSIONING_ENABLED_STATUS: &str = "Enabled";
 /// never versioned at all.
 pub const VERSIONING_SUSPENDED_STATUS: &str = "Suspended";
 
+/// Who pays for downloads from a bucket whose request payment configuration has never
+/// been set.
+///
+/// "By default, the bucket owner pays for downloads from the bucket"
+/// (`PutBucketRequestPayment`'s own documentation), and `BucketOwner` is one of the two
+/// values `Payer` takes (`PAYER_VALUES`) — so a never-configured bucket reports this
+/// rather than reporting no payer at all.
+pub const DEFAULT_PAYER: &str = "BucketOwner";
+
 /// The most user-defined metadata one stored object may carry, in UTF-8 bytes summed
 /// over every `x-amz-meta-` key and value.
 ///
@@ -3230,6 +3239,17 @@ pub struct Bucket {
     /// while the bucket has no versioning state — the state a bucket is created in, and
     /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
     pub versioning: Option<BucketVersioning>,
+    /// The `Payer` the last `PutBucketRequestPayment` set on the bucket, or `None` while
+    /// its request payment configuration has never been set.
+    ///
+    /// `None` is NOT "nobody pays": a bucket that has never been configured is one the
+    /// bucket owner pays for ([`DEFAULT_PAYER`]), which is what a read of it reports.
+    /// Keeping that case as `None` rather than as a stored copy of the default is what
+    /// lets `GetBucketRequestPayment` report it without writing — the same distinction
+    /// [`Self::encryption`] keeps for a never-configured bucket.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    request_payment: Option<String>,
     /// The attribute-based access control (ABAC) status `PutBucketAbac` last set on the
     /// bucket, or `None` while no put has set one.
     ///
@@ -3509,6 +3529,27 @@ impl Bucket {
         self.versioning
             .as_ref()
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
+    /// Who pays for downloads from the bucket: the `Payer` its request payment
+    /// configuration was last set to, or [`DEFAULT_PAYER`] while it has never been set.
+    ///
+    /// Derived rather than stored for a never-configured bucket, so a read reports the
+    /// default without writing one — the way [`Self::acl_grants`] reports the canned ACL
+    /// a bucket starts with.
+    pub fn payer(&self) -> &str {
+        self.request_payment.as_deref().unwrap_or(DEFAULT_PAYER)
+    }
+
+    /// Associate `payer` with the bucket as its whole request payment configuration.
+    ///
+    /// A replacement, not a merge: `RequestPaymentConfiguration` is the "Container for
+    /// Payer" a `PutBucketRequestPayment` carries as its payload, and it holds that one
+    /// REQUIRED member (`smithy_query(query="shape",shape="RequestPaymentConfiguration")`),
+    /// so what the request names becomes the bucket's configuration in full — the way
+    /// [`Bucket::set_versioning`] replaces the versioning state.
+    pub fn set_payer(&mut self, payer: &str) {
+        self.request_payment = Some(payer.to_string());
     }
 
     /// The ABAC status the bucket carries: the one `PutBucketAbac` last set, or

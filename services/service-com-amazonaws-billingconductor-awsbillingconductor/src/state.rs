@@ -917,6 +917,49 @@ fn membership_in<'a>(
         .map(|membership| membership.billing_group_arn.as_str())
 }
 
+/// Why a resource is not one a percentage custom line item's charge can be computed
+/// over — the fault
+/// [`ComAmazonawsBillingconductorAwsbillingconductorState::out_of_scope_association`]
+/// reports, and the modelled reason every operation that associates a resource
+/// refuses it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfScopeAssociation {
+    /// A billing group OTHER than the one the custom line item applies to.
+    OtherBillingGroup,
+    /// A custom line item of another billing group.
+    OtherGroupsCustomLineItem,
+}
+
+impl OutOfScopeAssociation {
+    /// The `ValidationExceptionReason` the model enumerates for this fault: a billing
+    /// group that is not the item's own is a mismatched billing group ARN, and an item
+    /// of another group is an illegal resource to associate as a child
+    /// (`smithy_query(query="shape",shape="ValidationExceptionReason")`).
+    pub fn validation_reason(self) -> &'static str {
+        match self {
+            Self::OtherBillingGroup => "MISMATCHED_BILLINGGROUP_ARN",
+            Self::OtherGroupsCustomLineItem => "ILLEGAL_CHILD_ASSOCIATE_RESOURCE",
+        }
+    }
+
+    /// Which resource is out of scope and why, for the billing group the custom line
+    /// item applies to. The arguments are in the order
+    /// [`ComAmazonawsBillingconductorAwsbillingconductorState::out_of_scope_association`]
+    /// takes them, so neither call site can transpose them.
+    pub fn message(self, billing_group_arn: &str, resource_arn: &str) -> String {
+        match self {
+            Self::OtherBillingGroup => format!(
+                "the billing group {resource_arn} is not the billing group \
+                 {billing_group_arn} the custom line item applies to"
+            ),
+            Self::OtherGroupsCustomLineItem => format!(
+                "the custom line item {resource_arn} does not belong to the billing group \
+                 {billing_group_arn} the custom line item applies to"
+            ),
+        }
+    }
+}
+
 /// A custom line item as `CreateCustomLineItem` persisted it. `AssociationSize` and
 /// the percentage/flat distinction are DERIVED from this record (see the methods
 /// below), never stored twice.
@@ -1788,6 +1831,40 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         }
         let group_arn = billing_group_arn(value);
         self.billing_groups.contains_key(&group_arn).then_some(group_arn)
+    }
+
+    /// Why `resource_arn` cannot be an associated resource of a percentage custom
+    /// line item that applies to the billing group `billing_group_arn`, or `None`
+    /// when it can.
+    ///
+    /// A percentage value "is multiplied against the combined value of its associated
+    /// resources", and the only charges the item's own billing group carries are that
+    /// group's own and those of the custom line items of that same group — so a
+    /// resource belonging to any other billing group is a charge this item cannot be
+    /// a percentage of. `resource_arn` is a FULL ARN, as
+    /// [`Self::resolve_association_element`] resolved it, so a resource that is not a
+    /// stored custom line item is a billing group.
+    pub fn out_of_scope_association(
+        &self,
+        billing_group_arn: &str,
+        resource_arn: &str,
+    ) -> Option<OutOfScopeAssociation> {
+        match self.custom_line_items.get(resource_arn) {
+            Some(item) => (item.billing_group_arn != billing_group_arn)
+                .then_some(OutOfScopeAssociation::OtherGroupsCustomLineItem),
+            None => (resource_arn != billing_group_arn)
+                .then_some(OutOfScopeAssociation::OtherBillingGroup),
+        }
+    }
+
+    /// Whether the billing group `group_arn` bills `account_id` right now.
+    ///
+    /// Decided from the account's LIVE membership
+    /// ([`Self::account_billing_group`]) — the same index `AssociateAccounts` and
+    /// `DisassociateAccounts` maintain — so there is one answer to which group an
+    /// account is billed in.
+    pub fn billing_group_bills_account(&self, group_arn: &str, account_id: &str) -> bool {
+        self.account_billing_group(account_id) == Some(group_arn)
     }
 
     /// The pricing rules associated with the plan `plan_arn` names IN
