@@ -17,15 +17,16 @@
 //!   reward-received status".
 //!
 //! The job itself is NOT a resource of this store. This service is the data plane
-//! of a job that is already running: the `JobArn` every operation carries is the
-//! one the caller's own job execution was handed, and this model binds no
-//! operation that creates, lists or deletes a job. So the runtime keeps no
-//! registry of jobs to resolve a call against — every `JobArn` the member's own
-//! modelled constraints admit (`@length` 1..256 and the ARN `@pattern`, which
-//! allow any partition, region, account and job name) names the job the call is
-//! served for, and a trajectory is keyed by it. What a sampling call IS refused
-//! on is state this service owns: a trajectory `CompleteRollout` has sealed, and
-//! the emulator bounds below.
+//! of a job the SageMaker control plane created: its model binds no operation that
+//! creates, lists or deletes a job, so the job a call names is resolved against the
+//! SHARED job directory ([`::service_common::agentic_rft_jobs::JobDirectory`]) that
+//! the control plane writes when it mints one — see [`job_directory`] and
+//! [`job_not_found_message`]. A `JobArn` the member's own modelled constraints admit
+//! (`@length` 1..256 and the ARN `@pattern`, which allow any partition, region,
+//! account and job name) but that no create ever minted names no job, and a sampling
+//! call for it is refused rather than served. Beside that, a sampling call is refused
+//! on state this service owns: a trajectory `CompleteRollout` has sealed, and the
+//! emulator bounds below.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -301,10 +302,11 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
     where
         F: FnOnce(usize) -> (Vec<u8>, String),
     {
-        // The job a call names is the job its caller is running under, and this service
-        // holds no job registry to resolve it against (see the module docs): the
-        // trajectory is keyed by the `(JobArn, TrajectoryId)` pair the request carries,
-        // and created on that pair's first turn.
+        // The job a call names is the job its caller is running under, created in the
+        // SageMaker control plane and resolved by the handler against the shared job
+        // directory before it gets here (`crate::state::job_exists`): the trajectory is
+        // keyed by the `(JobArn, TrajectoryId)` pair the request carries, and created on
+        // that pair's first turn.
         let key = (
             request.job_arn.to_string(),
             request.trajectory_id.to_string(),
@@ -493,6 +495,47 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState>)
+}
+
+/// The SHARED job directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A job is created in the SageMaker control plane and this is its data plane: a request
+/// here names a job by ARN in a header and carries no job definition, and this model
+/// binds no operation that creates one. So the directory the control plane writes when it
+/// mints a job ([`::service_common::agentic_rft_jobs::JobDirectory`]) is the only place a
+/// `JobArn` can be resolved against. The engine keys state by TYPE, so a copy of its own
+/// inside this service's state would be invisible to the writer.
+///
+/// `None` only when this service is mounted on an engine that holds no state at all,
+/// which is the same condition [`service_state`] answers `None` for: a handler answers it
+/// with a modelled server error, never with a fresh engine.
+pub fn job_directory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::agentic_rft_jobs::JobDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::agentic_rft_jobs::JobDirectory>)
+}
+
+/// Whether `job_arn` names a job the SageMaker control plane created.
+///
+/// This is the ONE job resolution this data plane performs, so no two of its operations
+/// can disagree about whether an ARN denotes a job: a job exists only because a create
+/// minted one, and this API has no call that creates one. An engine holding no directory
+/// at all holds no job either, so nothing resolves.
+pub fn job_exists<Eng: Send + Sync + 'static>(engine: &Eng, job_arn: &str) -> bool {
+    job_directory(engine)
+        .is_some_and(|directory| directory.lock().get_by_arn(job_arn).is_some())
+}
+
+/// How this service reports a `JobArn` that names no job of this account.
+///
+/// Built from the request's own `JobArn`: the ARN the caller asked to be routed to is
+/// what the sentence names, so the refusal says which value could not be resolved.
+#[must_use]
+pub fn job_not_found_message(job_arn: &str) -> String {
+    format!("Could not find job with jobArn {job_arn}")
 }
 
 // ---------------------------------------------------------------------------

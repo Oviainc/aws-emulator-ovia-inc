@@ -121,9 +121,21 @@ impl Reply {
     }
 }
 
-/// A router carrying exactly this service over one shared engine.
+/// A router carrying exactly this service over one shared engine, with the job
+/// [`well_formed_job`] names already created.
 fn mounted_service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The registration the SageMaker control plane's `CreateJob` writes: this data plane
+    // resolves the `JobArn` a call carries against it, so the job every row addresses
+    // exists and a refusal is about the member under test.
+    engine
+        .state::<::service_common::agentic_rft_jobs::JobDirectory>()
+        .lock()
+        .register(::service_common::agentic_rft_jobs::JobRecord {
+            name: JOB_NAME.to_string(),
+            category: JOB_CATEGORY.to_string(),
+            arn: well_formed_job(),
+        });
     let mut router = MultiServiceRouter::new();
     router
         .set_request_authentication(false)
@@ -131,12 +143,15 @@ fn mounted_service() -> MultiServiceRouter {
     router
 }
 
-/// A `JobArn` satisfying every modelled constraint, so a refusal is about the member
-/// under test and not about the job ARN. The runtime holds no job registry — a job is
-/// created in the SageMaker control plane and this data plane serves the ARN its caller
-/// was handed — so nothing has to be registered for this ARN to name a job.
+/// The `JobCategory` and `JobName` of the job every row of this suite addresses.
+const JOB_CATEGORY: &str = "AgentRFT";
+const JOB_NAME: &str = "echo-run-1";
+
+/// A `JobArn` satisfying every modelled constraint and naming a job the control plane
+/// created ([`mounted_service`]), so a refusal is about the member under test and not
+/// about the job ARN.
 fn well_formed_job() -> String {
-    "arn:aws:sagemaker:us-east-1:123456789012:job/AgentRFT/echo-run-1".to_string()
+    format!("arn:aws:sagemaker:us-east-1:123456789012:job/{JOB_CATEGORY}/{JOB_NAME}")
 }
 
 /// An OpenAI-compatible chat-completions request body.
