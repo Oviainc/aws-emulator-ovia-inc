@@ -2338,6 +2338,21 @@ pub fn decode_base62_page_token(token: &str) -> Option<String> {
     is_base62_id.then_some(decoded)
 }
 
+/// Decode a URI-keyed `PaginationToken` produced by [`encode_key_token`], for
+/// the paginated operation whose store key is a member resource's URI. `None`
+/// when the token was not produced by this service for such a page.
+///
+/// The decoded value must still be an ARN ([`parse_arn`]), which every resource
+/// a set holds is — an item that is not one never becomes a member
+/// ([`resource_set_item_failure_reason`] refuses it as `NOT_VALID_ARN`) — so a
+/// token minted for a policy, account or resource-set page, or any foreign token
+/// that happens to be valid hex, is refused rather than resumed from as an
+/// arbitrary key.
+pub fn decode_uri_page_token(token: &str) -> Option<String> {
+    let decoded = decode_key_token(token)?;
+    parse_arn(&decoded).is_some().then_some(decoded)
+}
+
 /// Decode an account-keyed `PaginationToken` produced by
 /// [`encode_page_token`]. `None` when the token was not produced by this
 /// service.

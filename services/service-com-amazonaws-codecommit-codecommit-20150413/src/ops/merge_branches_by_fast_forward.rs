@@ -204,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
 
         // Both specifiers are required, so the boundary already refused an absent
         // one; a blank one names no commit either.
@@ -426,17 +425,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
                 })?;
-            repository.branches.insert(
-                target.clone(),
-                crate::state::Branch {
-                    name: target,
-                    commit_id: merged_commit_id.clone(),
-                },
+            // The reference moves through the one place a branch tip moves, so
+            // every OPEN pull request reading from it follows the new tip.
+            let now = std::time::SystemTime::now();
+            repository.set_branch_tip(
+                &target,
+                &merged_commit_id,
+                now,
+                Some(&crate::state::caller_identity_arn(ctx.parts())),
             );
             // Moving a reference modifies the repository, so `lastModifiedDate`
             // moves with it, exactly as it does for a write through `PutFile` or a
             // reference added by `CreateBranch`.
-            repository.last_modified_date = std::time::SystemTime::now();
+            repository.last_modified_date = now;
         }
 
         // A fast-forward writes no commit: the merge IS one of the two tips, and the

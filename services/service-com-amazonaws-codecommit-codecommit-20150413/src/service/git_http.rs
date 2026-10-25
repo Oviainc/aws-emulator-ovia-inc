@@ -75,8 +75,7 @@ use std::time::SystemTime;
 use super::git_pack;
 use crate::state::git_object::{self, Kind, Object};
 use crate::state::{
-    Branch, ComAmazonawsCodecommitCodecommit20150413State as Store, Repository, HEADS_PREFIX,
-    TAGS_PREFIX,
+    ComAmazonawsCodecommitCodecommit20150413State as Store, Repository, HEADS_PREFIX, TAGS_PREFIX,
 };
 
 /// The path prefix every CodeCommit git URL carries.
@@ -616,6 +615,10 @@ fn receive_pack(repository: &mut Repository, body: &[u8]) -> Response {
     let mut verified: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut report: Vec<(String, Result<(), String>)> = Vec::new();
     let mut accepted = 0usize;
+    // ONE instant for the whole push: every ref this request moves moved at the
+    // same time, so the events a multi-ref push records are stamped together
+    // rather than a few microseconds apart.
+    let pushed_at = SystemTime::now();
     for command in commands {
         let verdict = match &unpacked {
             // git's own wording: the detail is on the `unpack` line above.
@@ -624,7 +627,7 @@ fn receive_pack(repository: &mut Repository, body: &[u8]) -> Response {
                 .and_then(|()| project(repository, &command, &mut projection)),
         };
         if verdict.is_ok() {
-            apply(repository, &command);
+            apply(repository, &command, pushed_at);
             accepted += 1;
         }
         report.push((command.name, verdict));
@@ -632,7 +635,7 @@ fn receive_pack(repository: &mut Repository, body: &[u8]) -> Response {
 
     if accepted > 0 {
         choose_default_branch(repository);
-        repository.last_modified_date = SystemTime::now();
+        repository.last_modified_date = pushed_at;
     }
     // Always: a push whose refs were all refused still stored its pack's objects,
     // and nothing points at them, so this is where they are released.
@@ -825,7 +828,14 @@ fn project(
 }
 
 /// Apply an accepted ref update.
-fn apply(repository: &mut Repository, command: &Command) {
+///
+/// A branch moves through [`Repository::set_branch_tip`], the one place a branch
+/// tip is set, so a push updates every OPEN pull request reading from that branch
+/// exactly as a commit written through the control plane does. A push carries no
+/// caller identity for the update to be attributed to — a git client
+/// authenticates with git credentials, which this emulator does not mint — so the
+/// event it records names no actor.
+fn apply(repository: &mut Repository, command: &Command, at: SystemTime) {
     let Some((namespace, short)) = ref_namespace(&command.name) else {
         return;
     };
@@ -836,13 +846,7 @@ fn apply(repository: &mut Repository, command: &Command) {
             repository.branches.remove(&name);
         }
         Namespace::Branch => {
-            repository.branches.insert(
-                name.clone(),
-                Branch {
-                    name,
-                    commit_id: command.new.clone(),
-                },
-            );
+            repository.set_branch_tip(&name, &command.new, at, None);
         }
         Namespace::Tag if deleting => {
             repository.git_tags.remove(&name);

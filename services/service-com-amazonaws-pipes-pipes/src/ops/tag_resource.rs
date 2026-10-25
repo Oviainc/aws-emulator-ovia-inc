@@ -4,12 +4,14 @@
 //! IMPLEMENTED: merges the request's tags into the ones persisted on the pipe the
 //! `resourceArn` names — a new key is added, a key already present has its value replaced,
 //! and every tag the request does not name (like every other member of the record) is left
-//! exactly as it was. An ARN no stored pipe carries is `NotFoundException` (404); a tag
-//! whose key or value breaks `TagKey`/`TagValue`'s published length bounds, a key using the
-//! prefix AWS reserves for its own tags, and a merge that would push the pipe past 50 tags
-//! are each `ValidationException` (400). This is the ONLY file to touch for this operation.
+//! exactly as it was. An ARN no stored pipe carries is `NotFoundException` (404) carrying
+//! the tagging layer's constant sentence; a tag breaking a published tag rule — the
+//! `TagKey`/`TagValue` length bounds, the documented tag character set, or the prefix AWS
+//! reserves for its own tags — is `BadRequestException` (400), the code that layer answers
+//! with; and a merge that would push the pipe past 50 tags is the modelled
+//! `ValidationException` (400). This is the ONLY file to touch for this operation.
 //!
-//! The key-content rules live in [`crate::state::tag_violation`], so the create path that
+//! The tag-content rules live in [`crate::state::tag_violation`], so the create path that
 //! also installs tags refuses exactly what this one refuses.
 //!
 //! ## Shape of an operation
@@ -166,23 +168,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested: ::std::collections::BTreeMap<&String, &String> =
             input.tags.iter().collect();
 
-        // `TagKey`'s and `TagValue`'s `@length` bounds, plus the tag-key prefix AWS
-        // reserves for itself. The boundary validator walks a map's own entry count and
-        // its values' shapes but not its KEYS, so the rule is enforced here — with the
-        // `ValidationException` the model declares, never a 501.
+        // `TagKey`'s and `TagValue`'s `@length` bounds, the documented tag character set,
+        // and the tag-key prefix AWS reserves for itself. The boundary validator walks a
+        // map's own entry count and its values' shapes but not its KEYS, and neither the
+        // character set nor the reservation is modelled at all, so the rules are enforced
+        // here — with the `BadRequestException` the tagging layer answers a broken tag
+        // rule with, never a 501.
         for (&key, &value) in &requested {
             if let Some(violation) = crate::state::tag_violation(key, value) {
-                return Err(TagResourceErrorModeled::ValidationException(
-                    crate::state::tag_violation_error("tags", violation),
-                )
-                .into());
+                // What request validation echoes is the member's value: every tag the
+                // request carried, in the one deterministic order above.
+                let shown = crate::state::echoed_tags(
+                    requested
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
+                return Err(TagResourceError::bad_request(crate::state::tag_refusal(
+                    crate::state::ADDED_TAGS_MEMBER,
+                    violation,
+                    key,
+                    &shown,
+                )));
             }
         }
 
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
-                crate::state::pipe_name_in_arn(&input.resource_arn),
-            ))
+            TagResourceErrorModeled::NotFoundException(crate::state::resource_not_found())
         })?;
 
         // The documented cap is on the tags a pipe CARRIES, so it is the merged set that

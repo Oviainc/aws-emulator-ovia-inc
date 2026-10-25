@@ -43,18 +43,27 @@
 //! refused because another record already carries the value it asks for.
 //!
 //! The third resource this store owns is the **virtual machine**
-//! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by
-//! this API — no operation of this model creates one; it is part of the INVENTORY of the
-//! hypervisor it runs on, which reaches the service out of band when the hypervisor's
-//! metadata is synced (the same out-of-band channel an activation key reaches the
-//! service through). So
-//! [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`] is
-//! the one way a record gets here, it records a machine only on a hypervisor this store
-//! holds, and `ListVirtualMachines` reports exactly those records — a hypervisor whose
-//! inventory has never been synced has none. `GetVirtualMachine` resolves ONE of those
-//! records by its own ARN and reports it in full
+//! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by a
+//! request — no operation of this model creates one; it is part of the INVENTORY of the
+//! hypervisor it runs on, and the service event that materialises that inventory is a
+//! METADATA SYNC of the hypervisor
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
+//! which records every machine the hypervisor reports through
+//! [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`] —
+//! the one way a record gets here, and only for a hypervisor this store holds. A read
+//! reports a machine once the sync that discovered it has fallen due
+//! ([`StoredVirtualMachine::discovered_as_of`]), so `ListVirtualMachines` lists nothing
+//! for a hypervisor whose metadata has never been synced, and nothing more than its
+//! previous inventory while a sync is still in flight. `GetVirtualMachine` resolves ONE of
+//! those records by its own ARN and reports it in full
 //! ([`StoredVirtualMachine::details`]), including the VMware tags the inventory attached
 //! to it, which no listing carries.
+//!
+//! WHICH machines an inventory holds is this emulator's own answer ([`synced_inventory`]):
+//! it stands in for the on-premises hypervisor as much as for the service, and has no
+//! VMware host to enumerate, so a sync reports a bounded set of machines derived from the
+//! identity of the hypervisor record itself. Every sync of one record reports the same
+//! machines — which is what makes a re-sync idempotent — and no two records share one.
 //!
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
@@ -81,7 +90,10 @@
 //! `SyncMetadataStatus` and times a read reports are derived from that instant and the
 //! clock ([`StoredHypervisor::latest_metadata_sync_status_as_of`]) the way the
 //! hypervisor's own state is, so a read never moves a sync along and every reader agrees
-//! on where it has got to.
+//! on where it has got to. That one sync is also what records the hypervisor's
+//! virtual-machine inventory, dated at the instant the sync falls due — so the machines a
+//! listing reports and the `SUCCEEDED` a read of the hypervisor reports become true
+//! together.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -384,6 +396,26 @@ pub const MAX_STORED_HYPERVISORS: usize = 1_000;
 /// [`MAX_STORED_GATEWAYS`]: the inventory a hypervisor reports grows resident memory one
 /// record per machine, so the store is bounded and a record past the ceiling is not kept.
 pub const MAX_STORED_VIRTUAL_MACHINES: usize = 10_000;
+
+/// How many virtual machines a hypervisor reports in the inventory a metadata sync reads.
+///
+/// A CHOSEN count, as [`METADATA_SYNC_SUCCEEDS_AFTER`] is a chosen span: AWS states no
+/// number — an inventory holds whatever the on-premises hypervisor holds. It is more than
+/// one, so a listing over one hypervisor's inventory really has to page and filter, and
+/// small, so syncing every hypervisor the store can hold stays well inside
+/// [`MAX_STORED_VIRTUAL_MACHINES`]. See [`synced_inventory`].
+pub const SYNCED_VIRTUAL_MACHINES: usize = 3;
+
+/// The longest `VirtualMachine$Name` the model accepts — `@length(min: 1, max: 100)`
+/// (`smithy_query(query="shape",shape="VirtualMachine")`) — which the name
+/// [`synced_inventory`] reports for a machine is kept inside.
+pub const MAX_VIRTUAL_MACHINE_NAME: usize = 100;
+
+/// The inventory folder the `VirtualMachine$Path` of a discovered machine sits in: a path
+/// "is the path of the virtual machine" in its hypervisor's inventory
+/// (`smithy_query(query="shape",shape="VirtualMachine",member="Path")`), which on a VMware
+/// hypervisor is a datacenter and a folder under it.
+const SYNCED_INVENTORY_FOLDER: &str = "/Datacenter/vm";
 
 /// The page size a list operation of this service uses when a request names no
 /// `MaxResults`, and the largest page it will return whatever `MaxResults` asks for.
@@ -710,16 +742,30 @@ pub struct StoredVirtualMachine {
     /// MODELLED [`VmwareTag`] shape so a member cannot drift between what is stored and
     /// what is serialised. Empty for a machine whose inventory reported none.
     pub vmware_tags: Vec<VmwareTag>,
-    /// When this record first entered the store — the instant the sync that discovered
-    /// the machine reported it. Kept across a re-sync of the same machine, so
-    /// re-reporting an unchanged inventory is visible as the one record it is. No member
-    /// of the modelled `VirtualMachine` carries it: it is the record's own provenance,
-    /// which a metadata-sync status reads to tell a machine discovered by the latest sync
-    /// from one carried over.
+    /// When the sync that discovered this machine REPORTED it — the instant that sync
+    /// fell due, which is also the instant it is reported as having succeeded at. Kept
+    /// across a re-sync of the same machine, so re-reporting an unchanged inventory is
+    /// visible as the one record it is. No member of the modelled `VirtualMachine` carries
+    /// it: it is the record's own provenance, and what a read compares the clock against
+    /// to decide whether the machine is part of the inventory yet
+    /// ([`Self::discovered_as_of`]).
     pub discovered_time: SystemTime,
 }
 
 impl StoredVirtualMachine {
+    /// Whether a read AT `now` reports this machine as part of its hypervisor's inventory.
+    ///
+    /// A sync has read the inventory once it falls due, so a machine it reported is part
+    /// of that inventory from [`Self::discovered_time`] on — the same instant the
+    /// hypervisor's own [`StoredHypervisor::latest_metadata_sync_status_as_of`] turns
+    /// [`SYNC_METADATA_SUCCEEDED`]. What a listing reports is therefore a function of the
+    /// records and the clock, exactly as a hypervisor's state is: no read moves a sync
+    /// along, and a caller listing straight after starting the first sync of a hypervisor
+    /// still sees the inventory it had before — none.
+    pub fn discovered_as_of(&self, now: SystemTime) -> bool {
+        now >= self.discovered_time
+    }
+
     /// This record as the `VirtualMachine` shape `ListVirtualMachines` returns.
     ///
     /// `HypervisorId` is read off the stored hypervisor ARN
@@ -764,7 +810,8 @@ impl StoredVirtualMachine {
 ///
 /// Not a request shape — no operation of this model carries one. It is the argument of
 /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`],
-/// the out-of-band channel a hypervisor's inventory reaches this service through.
+/// the channel a hypervisor's inventory reaches this service through when its metadata is
+/// synced ([`synced_inventory`]).
 #[derive(Debug, Clone, Default)]
 pub struct VirtualMachineInventory {
     /// `VirtualMachine$Name`.
@@ -778,6 +825,62 @@ pub struct VirtualMachineInventory {
     /// `VirtualMachineDetails$VmwareTags` — the VMware tags attached to the machine on
     /// its hypervisor, empty for a machine that carries none.
     pub vmware_tags: Vec<VmwareTag>,
+}
+
+/// The inventory the hypervisor stored under `hypervisor_arn` reports when its metadata is
+/// synced, in the order the sync reads it.
+///
+/// This emulator stands in for the on-premises hypervisor as much as for the service, and
+/// it has no VMware host to enumerate — so the inventory is derived from the IDENTITY of
+/// the hypervisor record itself: the resource id of the ARN this store minted for it,
+/// which no request chose. Two consequences, both of them the point: every sync of one
+/// hypervisor reports exactly the machines the previous sync did, so a re-sync re-finds
+/// each machine by its [`StoredVirtualMachine::path`] and updates the record it already
+/// has rather than minting a second one; and no two hypervisors report the same machine.
+///
+/// `LastBackupDate` is absent on every machine: a virtual machine is backed up by a backup
+/// plan outside this model, and no operation here records one, so a machine this service
+/// has only just discovered has never been backed up as far as it knows.
+/// `VmwareTags` is empty for the same kind of reason — a VMware tag is attached to a
+/// machine ON the hypervisor, and the hypervisor this emulator stands in for attaches
+/// none.
+pub fn synced_inventory(hypervisor_arn: &str) -> Vec<VirtualMachineInventory> {
+    // A record of this store is always keyed by an ARN minted here, so it always has a
+    // resource id; the resource type stands in for anything else, keeping the reported
+    // name inside the modelled pattern whatever the ARN spells.
+    let hypervisor_id = arn_resource_id(hypervisor_arn).unwrap_or(HYPERVISOR_RESOURCE_TYPE);
+    (1..=SYNCED_VIRTUAL_MACHINES)
+        .map(|ordinal| {
+            let name = synced_machine_name(hypervisor_id, ordinal);
+            VirtualMachineInventory {
+                path: format!("{SYNCED_INVENTORY_FOLDER}/{name}"),
+                // `VirtualMachine$HostName` targets the same `Name` shape as the machine's
+                // own name, whose pattern `^[a-zA-Z0-9-]*$` admits no dots — so no
+                // qualified DNS name can be spelled there, and the emulated guest answers
+                // to its own name.
+                host_name: name.clone(),
+                name,
+                last_backup_date: None,
+                vmware_tags: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// The `VirtualMachine$Name` a sync reports for the `ordinal`-th machine of the hypervisor
+/// whose ARN resource id is `hypervisor_id`.
+///
+/// Every character comes from that resource id, which an ARN segment restricts to
+/// `[a-zA-Z-0-9]`, or from the ordinal — exactly what the member's `^[a-zA-Z0-9-]*$`
+/// pattern accepts — and the id is clipped so the name stays inside
+/// [`MAX_VIRTUAL_MACHINE_NAME`] however long the ARN is.
+fn synced_machine_name(hypervisor_id: &str, ordinal: usize) -> String {
+    let suffix = format!("-vm-{ordinal}");
+    let head: String = hypervisor_id
+        .chars()
+        .take(MAX_VIRTUAL_MACHINE_NAME.saturating_sub(suffix.len()))
+        .collect();
+    format!("{head}{suffix}")
 }
 
 /// The property mappings SET for one hypervisor.
@@ -1291,9 +1394,15 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// succeeded; every later report of the new sync's progress is derived from that
     /// instant and the clock
     /// ([`StoredHypervisor::latest_metadata_sync_status_as_of`]), so no reader moves it.
-    /// The sync itself discovers nothing here: a hypervisor's inventory reaches this
-    /// service out of band ([`Self::record_virtual_machine`]), so a sync records the
-    /// machines that channel has reported and never invents one.
+    ///
+    /// A sync is also what MATERIALISES the hypervisor's virtual-machine inventory: it
+    /// records every machine the hypervisor reports ([`synced_inventory`]) through
+    /// [`Self::record_virtual_machine`], dated at the instant the sync falls due — so the
+    /// machines a listing reports and the [`SYNC_METADATA_SUCCEEDED`] a read of the
+    /// hypervisor reports become true at the same instant, and a client that only has this
+    /// API can reach a non-empty `ListVirtualMachines`. A machine the previous sync already
+    /// reported keeps the record and the ARN it has, so a re-sync neither re-dates it nor
+    /// mints a second machine for it.
     pub fn start_metadata_sync(&mut self, arn: &str, now: SystemTime) -> Option<StoredHypervisor> {
         let record = self.hypervisors.get_mut(arn)?;
         // A sync the clock had already finished is MATERIALISED before the new one
@@ -1305,6 +1414,16 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         let (status, message) = sync_status_as_of(now, now);
         record.latest_metadata_sync_status = Some(status.to_string());
         record.latest_metadata_sync_status_message = Some(message.to_string());
+        // The machines are minted in the hypervisor's OWN region, read off the ARN this
+        // store holds it under, so a machine and the hypervisor it runs on are regional
+        // resources of one region.
+        let region = arn_parts(arn)
+            .map(|parts| parts.region.to_string())
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        let discovered = now + METADATA_SYNC_SUCCEEDS_AFTER;
+        for machine in synced_inventory(arn) {
+            self.record_virtual_machine(&region, arn, machine, discovered);
+        }
         self.hypervisors.get(arn).cloned()
     }
 
@@ -1312,9 +1431,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// record as it is now STORED — read out of the map after the insert, so the ARN that
     /// comes back is the key the store holds.
     ///
-    /// This is the out-of-band channel described on `virtual_machines`: a machine is
-    /// discovered on the hypervisor it runs on, and no operation of this model creates
-    /// one, so nothing a client sends over the wire reaches here.
+    /// The ONE way a machine gets into this store: a machine is discovered on the
+    /// hypervisor it runs on when that hypervisor's metadata is synced
+    /// ([`Self::start_metadata_sync`], the only caller), and no operation of this model
+    /// creates one, so nothing a client sends over the wire describes a machine. `now` is
+    /// the instant the discovering sync REPORTS it, which a read compares the clock against
+    /// ([`StoredVirtualMachine::discovered_as_of`]).
     ///
     /// A machine is identified on its hypervisor by its [`StoredVirtualMachine::path`] —
     /// where it sits in that hypervisor's inventory — so reporting the same path again
@@ -1372,9 +1494,27 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.virtual_machines.get(&arn).cloned()
     }
 
-    /// The virtual machine stored under `arn`, if any.
+    /// The virtual machine stored under `arn`, if any — the record, whatever the clock has
+    /// reached.
     pub fn virtual_machine(&self, arn: &str) -> Option<&StoredVirtualMachine> {
         self.virtual_machines.get(arn)
+    }
+
+    /// The virtual machine a read AT `now` resolves `arn` to: the record stored under it,
+    /// once the sync that discovered it has reported it
+    /// ([`StoredVirtualMachine::discovered_as_of`]).
+    ///
+    /// `None` — so `GetVirtualMachine` refuses the ARN — both for an ARN no machine is
+    /// stored under and for a machine whose discovering sync has not fallen due yet: until
+    /// then the machine is not part of any inventory this service holds, and the listing
+    /// that would hand a client its ARN does not report it either.
+    pub fn virtual_machine_as_of(
+        &self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&StoredVirtualMachine> {
+        self.virtual_machine(arn)
+            .filter(|machine| machine.discovered_as_of(now))
     }
 
     /// How many virtual machines are stored.
@@ -1382,21 +1522,27 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.virtual_machines.len()
     }
 
-    /// One page of virtual machines in ARN order — the order `ListVirtualMachines`
-    /// reports them in — holding only the machines of `hypervisor_arn` when one is named.
+    /// One page of the virtual machines a read AT `now` reports, in ARN order — the order
+    /// `ListVirtualMachines` reports them in — holding only the machines of
+    /// `hypervisor_arn` when one is named.
     ///
-    /// The filter is applied BEFORE the page is cut, so a page holds up to `limit`
-    /// MATCHING machines and carries a token only while a matching machine remains past
-    /// its boundary: a filtered listing pages exactly like an unfiltered one. Same
-    /// boundary contract as [`Self::page_of_gateways`], whose implementation it shares.
+    /// A machine whose discovering sync has not fallen due yet is not part of the listing
+    /// at all ([`StoredVirtualMachine::discovered_as_of`]), exactly as a machine of another
+    /// hypervisor is not: the filter is applied BEFORE the page is cut, so a page holds up
+    /// to `limit` MATCHING machines and carries a token only while a matching machine
+    /// remains past its boundary, and a filtered listing pages exactly like an unfiltered
+    /// one. Same boundary contract as [`Self::page_of_gateways`], whose implementation it
+    /// shares.
     pub fn page_of_virtual_machines(
         &self,
         hypervisor_arn: Option<&str>,
         after: Option<&str>,
         limit: usize,
+        now: SystemTime,
     ) -> Page<StoredVirtualMachine> {
         page_of_where(&self.virtual_machines, after, limit, |machine| {
-            hypervisor_arn.is_none_or(|arn| machine.hypervisor_arn == arn)
+            machine.discovered_as_of(now)
+                && hypervisor_arn.is_none_or(|arn| machine.hypervisor_arn == arn)
         })
     }
 

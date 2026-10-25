@@ -220,6 +220,8 @@ mod describe_pipeline_reads;
 mod describe_search_reads;
 #[path = "all/describe_storage_configuration_reads.rs"]
 mod describe_storage_configuration_reads;
+#[path = "all/describe_task_reads.rs"]
+mod describe_task_reads;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 #[path = "all/execute_query_follows_the_store.rs"]

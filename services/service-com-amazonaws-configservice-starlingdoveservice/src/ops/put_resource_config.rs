@@ -3,8 +3,9 @@
 //! @op PutResourceConfig
 //! Records the configuration state of one custom resource into the discovered-resource
 //! inventory in [`crate::state`], which is what `GetDiscoveredResourceCounts` counts.
-//! A re-record of the same resource type and id replaces the configuration it holds
-//! and keeps the instant Config first recorded it.
+//! Every call records a configuration item: a re-record of the same resource type and
+//! id keeps the instant Config first recorded it and leaves the state the resource is
+//! in behind it, so the states it went through are what its history holds.
 //!
 //! ## Shape of an operation
 //!
@@ -114,10 +115,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingd
 /// bounds what the inventory can hold.
 ///
 /// The quota counts ACTIVE resources, as AWS words it, so an entry carrying a
-/// recorded deletion does not occupy one. Nothing records a deletion yet
-/// (`DeleteResourceConfig` is still a scaffold); whoever implements it has to keep
-/// the inventory itself bounded — by dropping the entry, or by bounding how many
-/// deleted ones are retained.
+/// recorded deletion does not occupy one. `DeleteResourceConfig` is what records a
+/// deletion, and the inventory itself stays bounded whatever either of them writes:
+/// both write it through
+/// [`crate::state::ComAmazonawsConfigserviceStarlingdoveserviceState::record_discovered_resource`],
+/// which holds [`crate::state::DISCOVERED_RESOURCES_KEPT`] entries and gives up a
+/// deleted one first.
 pub const ACTIVE_CUSTOM_RESOURCES_QUOTA: usize = 100_000;
 
 /// The largest `Configuration` document this operation records
@@ -147,7 +150,11 @@ pub const RESOURCE_TYPE_SEGMENTS: usize = 3;
 /// `Organization::Service::Resource` — whose organization is none of the reserved
 /// [`RESERVED_RESOURCE_TYPE_ORGANIZATIONS`]. The message is BUILT FROM THE REQUEST:
 /// it names the member, quotes the value sent and states the constraint it failed.
-fn custom_resource_type_refusal(resource_type: &str) -> Option<String> {
+///
+/// `DeleteResourceConfig` records the deletion of a resource recorded through this
+/// operation, so it decides what a custom resource type is HERE rather than stating
+/// the same rule twice.
+pub(crate) fn custom_resource_type_refusal(resource_type: &str) -> Option<String> {
     let segments: Vec<&str> = resource_type.split("::").collect();
     if segments.len() != RESOURCE_TYPE_SEGMENTS || segments.iter().any(|segment| segment.is_empty())
     {
@@ -297,10 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 PutResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
                     NoRunningConfigurationRecorderException {
                         message: Some(
-                            "there is no configuration recorder running; use \
-                             StartConfigurationRecorder to turn one on before recording a \
-                             resource configuration"
-                                .to_string(),
+                            crate::state::no_running_configuration_recorder_message(Self::NAME),
                         ),
                     },
                 )
@@ -309,45 +313,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let key = (input.resource_type.clone(), input.resource_id.clone());
-        if let Some(existing) = store.discovered_resources.get_mut(&key) {
-            // Re-recording a resource replaces its configuration state; the instant
-            // Config first discovered it is part of its identity and does not move.
-            existing.resource_name = input.resource_name.clone();
-            existing.schema_version_id = Some(input.schema_version_id.clone());
-            existing.configuration = Some(input.configuration.clone());
-            existing.tags = input.tags.clone().unwrap_or_default().into_iter().collect();
-            existing.first_recorded_at = existing.first_recorded_at.or(Some(now));
-            existing.last_recorded_at = Some(now);
-            // Recording the configuration of a resource Config had recorded the
-            // deletion of discovers it again.
-            existing.deleted_at = None;
-            return Ok(PutResourceConfigOutput);
-        }
-
-        // A new resource has to fit under the account's ACTIVE custom resources limit,
-        // which an entry Config recorded the deletion of does not occupy.
-        let active = store
+        // Recording a resource Config already holds an ACTIVE configuration item for is
+        // not a new resource, so it meets no limit. Everything else is: a resource the
+        // inventory does not hold, and one whose deletion it recorded — which occupies
+        // no active quota, so recording its configuration again makes it an active
+        // resource that has to fit under the account's limit.
+        let already_active = store
             .discovered_resources
-            .values()
-            .filter(|entry| entry.deleted_at.is_none())
-            .count();
-        if active >= ACTIVE_CUSTOM_RESOURCES_QUOTA {
-            return Err(
-                PutResourceConfigErrorModeled::MaxActiveResourcesExceededException(
-                    MaxActiveResourcesExceededException {
-                        message: Some(format!(
-                            "this account already holds the maximum of \
-                             {ACTIVE_CUSTOM_RESOURCES_QUOTA} active custom resources; delete \
-                             unused resources with DeleteResourceConfig"
-                        )),
-                    },
-                )
-                .into(),
-            );
+            .get(&key)
+            .is_some_and(|entry| entry.deleted_at.is_none());
+        if !already_active {
+            let active = store
+                .discovered_resources
+                .values()
+                .filter(|entry| entry.deleted_at.is_none())
+                .count();
+            if active >= ACTIVE_CUSTOM_RESOURCES_QUOTA {
+                return Err(
+                    PutResourceConfigErrorModeled::MaxActiveResourcesExceededException(
+                        MaxActiveResourcesExceededException {
+                            message: Some(format!(
+                                "this account already holds the maximum of \
+                                 {ACTIVE_CUSTOM_RESOURCES_QUOTA} active custom resources; \
+                                 delete unused resources with DeleteResourceConfig"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
-        // The inventory is written through the store's one accessor, which keeps it
-        // bounded (`DISCOVERED_RESOURCES_KEPT`) whatever a caller records.
+        // Every call records a configuration item, and the inventory is written through
+        // the store's one accessor for it: that is what keeps the instant Config FIRST
+        // recorded the resource, moves the state the resource is leaving into the states
+        // it has left — so re-recording a resource with another configuration records a
+        // NEW item rather than overwriting the one before it — and keeps the inventory
+        // bounded (`DISCOVERED_RESOURCES_KEPT`) whatever a caller records. Recording the
+        // configuration of a resource Config had recorded the deletion of discovers it
+        // again, which is why this item carries no deletion instant.
         store.record_discovered_resource(crate::state::DiscoveredResourceEntry {
             resource_type: input.resource_type.clone(),
             resource_id: input.resource_id.clone(),

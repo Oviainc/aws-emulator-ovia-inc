@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInsightDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInsightDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInsightDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the detailed view of ONE insight: the fields persisted on the insight the
+//! request addresses ([`crate::state::InsightDetailField`]), in the order they are
+//! stored, each rendered with its markup or as plain content according to the
+//! request's `ShowHtmlContent`. The entity is resolved exactly as a listing resolves
+//! it, and an id that entity holds no insight under names no insight to detail, so it
+//! is refused rather than answered with an empty view. It only REPORTS: an insight and
+//! its fields are raised by the service observing a domain, never by a read of them.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +85,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::InsightEntityRefusal;
+
+/// Whether a request that names no `ShowHtmlContent` is answered with the marked-up
+/// rendering of a field's content.
+///
+/// The member "specifies whether to show response with HTML content in response or
+/// not" and the model gives it no default, so this is the emulator's own: a caller
+/// that has not asked for markup gets content it can display as it stands.
+const SHOW_HTML_CONTENT_DEFAULT: bool = false;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +168,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInsightDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInsightDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInsightDetails"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+
+        // An insight is addressed by the entity that holds it and its own id
+        // together, and resolving that pair is the store's one decision
+        // ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insight_of_entity`]),
+        // so an entity this account does not hold, and an id that entity holds no
+        // insight under, are refused here exactly as they are for a listing: this
+        // operation describes "an existing insight", and the model declares
+        // `ResourceNotFoundException` for one that does not exist.
+        let insight = store
+            .insight_of_entity(&input.entity, &input.insight_id)
+            .map_err(|refusal| match refusal {
+                InsightEntityRefusal::NotFound(payload) => {
+                    DescribeInsightDetailsErrorModeled::ResourceNotFoundException(payload)
+                }
+                InsightEntityRefusal::Validation(payload) => {
+                    DescribeInsightDetailsErrorModeled::ValidationException(payload)
+                }
+            })?;
+
+        // "Specifies whether to show response with HTML content in response or not":
+        // it picks the rendering each field's content is reported in, so the fields a
+        // detail read answers with are the stored ones either way.
+        let show_html = input
+            .show_html_content
+            .unwrap_or(SHOW_HTML_CONTENT_DEFAULT);
+
+        Ok(DescribeInsightDetailsOutput {
+            // "The list of fields that contain detailed information about the
+            // insight", in the order the insight holds them. The member is required, so
+            // an insight the service has raised no detail field for is reported with an
+            // EMPTY list rather than without the member — an insight that exists and
+            // details nothing, which is not the same answer as one that does not exist.
+            fields: insight
+                .details
+                .iter()
+                .map(|field| field.to_insight_field(show_html))
+                .collect(),
+        })
     }
 }

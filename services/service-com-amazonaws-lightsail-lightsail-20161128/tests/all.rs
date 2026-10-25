@@ -179,6 +179,8 @@ mod relational_database_start_stop;
 mod relational_database_update;
 #[path = "all/resource_add_ons.rs"]
 mod resource_add_ons;
+#[path = "all/resource_ip_address_type.rs"]
+mod resource_ip_address_type;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]

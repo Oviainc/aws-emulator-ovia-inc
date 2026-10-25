@@ -69,6 +69,17 @@ impl Reply {
     pub(crate) fn number(&self, name: &str) -> f64 {
         self.member(name).as_f64().unwrap_or_default()
     }
+
+    /// The exception message a refusal carries, however this protocol's error body spells
+    /// the modelled `message` member.
+    pub(crate) fn message(&self) -> String {
+        for member in ["message", "Message"] {
+            if let Some(text) = self.member(member).as_str() {
+                return text.to_string();
+            }
+        }
+        String::new()
+    }
 }
 
 /// Dispatch one signed restJson1 request and read the reply.

@@ -501,9 +501,11 @@ fn invalid_table_property_value(
 /// INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY and BILLING_VIEW_ARN change the DATA the table
 /// reports (which reservations are covered, how discounts are expressed, which billing
 /// view the data is scoped to) rather than the set of columns, and the recorded AWS
-/// schema carries the same columns at either value of each. INCLUDE_RESOURCES and
-/// INCLUDE_SPLIT_COST_ALLOCATION_DATA do gate columns, and TIME_GRANULARITY changes the
-/// granularity of the rows.
+/// schema carries the same columns at either value of each. INCLUDE_RESOURCES,
+/// INCLUDE_SPLIT_COST_ALLOCATION_DATA and INCLUDE_IAM_PRINCIPAL_DATA do gate columns —
+/// each the columns its published description says it includes, which for the last is the
+/// line item's IAM principal column — and TIME_GRANULARITY changes the granularity of the
+/// rows.
 const COST_AND_USAGE_REPORT_PROPERTIES: &[TablePropertySpec] = &[
     TIME_GRANULARITY_PROPERTY,
     TablePropertySpec {
@@ -930,10 +932,17 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The usage details of the line item.",
     ),
-    col(
+    // The IAM PRINCIPAL column of the line item, which the table carries only while
+    // INCLUDE_IAM_PRINCIPAL_DATA is TRUE: the property's published description is "Whether
+    // IAM principal columns should be included or not", so it selects a column set exactly
+    // as INCLUDE_RESOURCES and INCLUDE_SPLIT_COST_ALLOCATION_DATA do, and the table
+    // publishes no other column the dictionary describes as the IAM principal's.
+    col_when(
         "line_item_user_identifier",
         STRING,
         "The unique identifier of the IAM principal that made the request that generated this line item.",
+        PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA,
+        PROPERTY_TRUE,
     ),
     col(
         "pricing_currency",
