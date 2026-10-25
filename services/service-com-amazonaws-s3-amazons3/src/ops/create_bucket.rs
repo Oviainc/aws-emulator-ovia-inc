@@ -320,6 +320,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             crate::state::BucketCreation::NameTaken => {
+                // A name a bucket AWS publishes holds is not available to anybody: that
+                // bucket is AWS's, not this account's, and S3's namespace "is shared by
+                // all users of the system" — so the create is `BucketAlreadyExists` (409),
+                // the error for a name another owner holds, and NOT the
+                // already-owned-by-you pair below, which would say the caller owns a
+                // bucket it does not and (in us-east-1) answer 200 and reset the ACLs of
+                // a bucket it may not touch.
+                if store
+                    .bucket(&input.bucket)
+                    .is_some_and(crate::state::Bucket::is_aws_published)
+                {
+                    return Err(CreateBucketErrorModeled::BucketAlreadyExists(
+                        BucketAlreadyExists {},
+                    )
+                    .into());
+                }
                 // Every caller of this emulator is the one emulated account
                 // (`engine::emulator_account_id()`), so a taken name is always a bucket
                 // the caller already owns — which is `BucketAlreadyOwnedByYou`, except in
