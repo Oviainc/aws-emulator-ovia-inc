@@ -481,6 +481,9 @@ async fn the_exclusion_list_and_the_page_it_serves_are_bounded() {
     );
 
     // A page is never larger than the documented maximum, however much is asked for.
+    // The whole list cannot be larger than that maximum either — the cap is
+    // `PullTimeUpdateExclusionList`'s modelled `@length(max: 100)` — so a full list is
+    // served in one page and that page carries no token.
     let (listed, token) = page(
         &router,
         "a page larger than the maximum",
@@ -489,13 +492,13 @@ async fn the_exclusion_list_and_the_page_it_serves_are_bounded() {
     .await;
     assert_eq!(
         listed.len(),
-        DEFAULT_PAGE_SIZE,
+        MAX_PULL_TIME_UPDATE_EXCLUSIONS.min(DEFAULT_PAGE_SIZE),
         "a page holds at most {DEFAULT_PAGE_SIZE} entries, got {}",
         listed.len()
     );
     assert!(
-        token.is_some(),
-        "a truncated page carries the token for the next one, got {token:?}"
+        token.is_none(),
+        "a list that fits in one page carries no nextToken, got {token:?}"
     );
 
     // And paging through the filled list still walks every record exactly once.
