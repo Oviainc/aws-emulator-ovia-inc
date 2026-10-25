@@ -187,12 +187,13 @@ use super::provisioning::{
     xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, COGNITO_USER_POOL_GROUP,
-    DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE,
-    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR,
-    S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX, S3VECTORS_VECTOR_BUCKET,
-    SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE, SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC,
-    SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
+    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
+    EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
+    GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
+    S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
+    SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
+    WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -251,6 +252,7 @@ pub(super) enum Provisioner {
     SchedulerScheduleGroup,
     SchedulerSchedule,
     CognitoUserPoolGroup,
+    AcmAcmeEndpoint,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -284,6 +286,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SCHEDULER_SCHEDULE_GROUP => Some(Provisioner::SchedulerScheduleGroup),
         SCHEDULER_SCHEDULE => Some(Provisioner::SchedulerSchedule),
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
+        ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
         _ => None,
     }
 }
@@ -383,6 +386,7 @@ impl Provisioner {
             // `Precedence`, `RoleArn` and `UserPoolId` and no `Tags`: the type is not
             // taggable, so no tags are propagated to a group.
             Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
+            Self::AcmAcmeEndpoint => create_acme_endpoint(ctx, region, resource, propagated).await,
         }
     }
 
@@ -400,7 +404,8 @@ impl Provisioner {
     /// emulator has no privileged channel for, so for such a type those three are left off
     /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
-    /// way.
+    /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
+    /// half of a pair.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -409,6 +414,7 @@ impl Provisioner {
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
+                | Self::AcmAcmeEndpoint
         );
         propagated
             .iter()
@@ -556,6 +562,7 @@ impl Provisioner {
             // The delete addresses the group by the PAIR that identifies it, and the pool
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
+            Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
         }
     }
 
@@ -638,6 +645,9 @@ impl Provisioner {
             // The read is addressed by the group's name AND the pool that holds it, which
             // only the resource's own record carries.
             Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
+            Self::AcmAcmeEndpoint => {
+                describe_acme_endpoint(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -6666,6 +6676,138 @@ fn epoch_seconds(declared: &str) -> Option<Value> {
     )
     .ok()?;
     ::serde_json::Number::from_f64(instant.as_secs_f64()).map(Value::Number)
+}
+
+// ---------------------------------------------------------------------------
+// AWS Certificate Manager: AWS::CertificateManager::AcmeEndpoint
+// ---------------------------------------------------------------------------
+
+/// ACM's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name: acm`,
+/// service shape `CertificateManager`), which speaks `awsJson1_1`.
+const ACM_SIGNING_NAME: &str = "acm";
+const ACM_TARGET_PREFIX: &str = "CertificateManager";
+
+/// Create the ACME endpoint an `AWS::CertificateManager::AcmeEndpoint` declares.
+///
+/// The type's properties ARE `CreateAcmeEndpoint`'s own members, spelled identically on
+/// both sides — `AuthorizationBehavior`, `Contact`, `CertificateAuthority`,
+/// `CertificateTags` and `Tags` (`smithy_query(operation="CreateAcmeEndpoint")`) — so the
+/// evaluated property document IS the request. There is no member for a name or an
+/// identifier, so nothing CloudFormation computed is sent with it.
+///
+/// `Tags` is the one member not carried verbatim: the endpoint carries the tags
+/// CloudFormation gives it beside the declared ones ([`tags_of`]), as the `[{Key, Value}]`
+/// list ACM's own `Tag` shape spells.
+///
+/// The endpoint's identifier is ACM's OWN to mint — the create takes no identifier and
+/// answers with `AcmeEndpointArn` — so that answer is reported back as the resource's
+/// physical id, which is what a client then passes to `DescribeAcmeEndpoint`, and as the
+/// ARN attributes read off the resource, so neither reports a value the naming rules
+/// computed instead.
+async fn create_acme_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.CreateAcmeEndpoint"),
+        &Value::Object(request),
+    )
+    .await?;
+    let Some(arn) = reported.get("AcmeEndpointArn").and_then(Value::as_str) else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses an
+        // ACME endpoint without one, so this is reported as a failure rather than recorded
+        // as a resource with an identifier nothing minted.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "CreateAcmeEndpoint answered no AcmeEndpointArn".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.to_string());
+    attributes.insert("AcmeEndpointArn".to_string(), arn.to_string());
+    Ok(Created {
+        physical_resource_id: Some(arn.to_string()),
+        attributes,
+    })
+}
+
+/// Delete the ACME endpoint a stack created.
+///
+/// `DeleteAcmeEndpoint` is `@idempotent` and its model declares no not-found error: an ARN
+/// ACM holds no endpoint for is already in the state the delete asks for, and ACM answers
+/// that call successfully, so there is no not-found code to read here.
+async fn delete_acme_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "AcmeEndpointArn": physical_resource_id });
+    call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.DeleteAcmeEndpoint"),
+        &request,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The endpoint's configuration as ACM reports it, for drift detection. An ARN ACM no
+/// longer holds an endpoint for (`ResourceNotFoundException`) was deleted.
+///
+/// Only the members `DescribeAcmeEndpoint` reports in the SAME shape the type declares
+/// them in are reported, because a property the actual document does not carry is not
+/// evidence of anything (`super::drift::differs`): `AuthorizationBehavior`, `Contact` and
+/// `CertificateAuthority`, each the identical member on both sides. `Tags` is not reported
+/// at all — the describe answers none, and `CertificateTags` comes back as a tag LIST
+/// whose order ACM decides, so comparing it would read an ordering as drift.
+async fn describe_acme_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "AcmeEndpointArn": physical_resource_id });
+    let reported = match call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.DescribeAcmeEndpoint"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(endpoint) = reported.get("AcmeEndpoint") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        endpoint,
+        &[
+            ("AuthorizationBehavior", "AuthorizationBehavior"),
+            ("Contact", "Contact"),
+            ("CertificateAuthority", "CertificateAuthority"),
+        ],
+    )))
 }
 
 #[cfg(test)]

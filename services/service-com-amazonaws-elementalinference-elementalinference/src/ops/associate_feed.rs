@@ -19,9 +19,15 @@
 //!   `crate::state::FEED_NOT_ASSOCIABLE_MESSAGE`): the message interpolates no value
 //!   read out of state — not the feed's status and not the resource that holds it;
 //! * PATCH semantics — "You can add more outputs to the existing outputs. New outputs
-//!   will be appended", and an output that would modify an existing one (same name) is
-//!   refused with the modelled `ConflictException` ("conflicting outputs", per the
-//!   `dryRun` documentation);
+//!   will be appended", and an output that would modify an existing one (same name
+//!   carrying a different definition) is refused with the modelled `ConflictException`
+//!   ("conflicting outputs", per the `dryRun` documentation);
+//! * a REPEAT of a request this feed has already served is that one request once more,
+//!   not a second append — the operation is `@idempotent` and `associatedResourceName`
+//!   is its `@idempotencyToken` — so an output the feed already holds exactly as the
+//!   request describes it is in place already (`crate::state::Feed::outputs_to_append`):
+//!   the call answers success and the effect is applied once, leaving ONE copy of each
+//!   output;
 //! * "This name must not resemble an ARN" — the member's own pattern admits `:` and
 //!   `/`, so the boundary validator cannot enforce that one;
 //! * `dryRun` runs every check above and persists NOTHING.
@@ -309,31 +315,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An appended output may not collide with one the feed already holds: that
-        // would MODIFY an existing output, which AssociateFeed cannot do.
-        if let Some(existing) = input
+        // The request's outputs as the service STORES them: an output that enters a feed
+        // this way reports `fromAssociation: true` (`GetOutput$fromAssociation`) and its
+        // configuration is kept with this service's defaults materialised
+        // (`crate::state::Output::new`), so a requested output and a stored one are
+        // comparable member by member.
+        let requested: Vec<crate::state::Output> = input
             .outputs
-            .iter()
-            .find(|candidate| feed.outputs.iter().any(|held| held.name == candidate.name))
-        {
-            return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Feed {} already has an output named {}. AssociateFeed can only append \
-                     new outputs; use UpdateFeed to modify an existing one.",
-                    feed.id, existing.name
-                ),
+            .into_iter()
+            .map(|requested| {
+                crate::state::Output::new(
+                    requested.name,
+                    requested.output_config,
+                    requested.status,
+                    requested.description,
+                    true,
+                )
             })
-            .into());
-        }
+            .collect();
+
+        // What this call would really append. An output the feed ALREADY holds exactly
+        // as the request describes it is in place already, so it is neither appended a
+        // second time nor refused: the operation is `@idempotent` and
+        // `associatedResourceName` is its `@idempotencyToken`, so the request an SDK
+        // repeats when it never saw the first response is that one request once more and
+        // its effect is applied ONCE — a caller whose response was lost must not be told
+        // the association it asked for conflicts with itself, and must not be left with a
+        // second copy of every output it sent.
+        //
+        // An output of that name that DIFFERS from the one the feed holds is refused
+        // still: appending it would MODIFY an existing output, which AssociateFeed
+        // cannot do.
+        let to_append = match feed.outputs_to_append(requested) {
+            Ok(to_append) => to_append,
+            Err(name) => {
+                return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "Feed {} already has an output named {}. AssociateFeed can only append \
+                         new outputs; use UpdateFeed to modify an existing one.",
+                        feed.id, name
+                    ),
+                })
+                .into());
+            }
+        };
 
         // A feed's output list is BOUNDED: an append that would carry it past the
         // quota is refused rather than grown, which is also what the real service
         // answers once a quota is exhausted. A call that appends NOTHING grows nothing,
         // so it is never refused for the quota — a feed already AT the bound can still
-        // be claimed. Every operation that sets a feed's output list holds the same
-        // bound (`CreateFeed`, `UpdateFeed`), so the stored list is never past it.
-        if !input.outputs.is_empty()
-            && feed.outputs.len() + input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED
+        // be claimed, and so can a repeat of a request whose outputs are all in place.
+        // Every operation that sets a feed's output list holds the same bound
+        // (`CreateFeed`, `UpdateFeed`), so the stored list is never past it.
+        if !to_append.is_empty()
+            && feed.outputs.len() + to_append.len() > crate::state::MAX_OUTPUTS_PER_FEED
         {
             // The quota is the rule, so the message states the quota: the number of
             // outputs the stored feed currently holds is state the refusal does not
@@ -365,18 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(output);
         }
 
-        // "New outputs will be appended" — and an output that entered the feed this way
-        // reports `fromAssociation: true` (`GetOutput$fromAssociation`).
-        feed.outputs
-            .extend(input.outputs.into_iter().map(|output| {
-                crate::state::Output::new(
-                    output.name,
-                    output.output_config,
-                    output.status,
-                    output.description,
-                    true,
-                )
-            }));
+        // "New outputs will be appended" — the ones this call really adds, each already
+        // marked `fromAssociation: true`; an output the feed holds exactly as asked is
+        // in place already and is not appended again.
+        feed.outputs.extend(to_append);
         feed.association = Some(FeedAssociation {
             associated_resource_name: input.associated_resource_name,
         });

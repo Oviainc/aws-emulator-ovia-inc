@@ -273,13 +273,12 @@ async fn an_absent_rule_answers_the_not_exist_message_composed_from_the_request(
                 "case {case:?}: expected the message {expected:?}, got {:?}",
                 message_of(&body)
             );
-            // `Reason` is deliberately UNSET on this path (see
-            // `crate::state::rule_not_found`): Recycle Bin does not populate the modelled
-            // `ResourceNotFoundExceptionReason` for a rule that does not exist, and
-            // sending it would have a client branch on a field it never gets.
-            assert!(
-                body.get("Reason").is_none_or(serde_json::Value::is_null),
-                "case {case:?}: expected no Reason on the not-found body, got {:?}",
+            // `Reason` is the fault class the model names for an addressed rule that
+            // does not exist (see `crate::state::rule_not_found`).
+            assert_eq!(
+                body["Reason"].as_str(),
+                Some("RULE_NOT_FOUND"),
+                "case {case:?}: expected Reason RULE_NOT_FOUND on the not-found body, got {:?}",
                 body["Reason"]
             );
         }

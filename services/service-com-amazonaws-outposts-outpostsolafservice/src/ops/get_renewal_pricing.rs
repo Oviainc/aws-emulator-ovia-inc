@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRenewalPricing
-//! IMPLEMENTED: reports the renewal pricing recorded for the Outpost the
+//! IMPLEMENTED: prices a renewal of the subscription behind the Outpost the
 //! `OutpostIdentifier` names, resolved from either the bare id or the full ARN the
-//! modelled label pattern accepts — the priced subscription options a renewal of its
-//! contract can be bought under, and whether the request could be priced at all.
+//! modelled label pattern accepts — one option per payment option and payment term a
+//! renewal can be bought under, and whether the request could be priced at all.
 //!
-//! A read, and one that writes NOTHING: it answers from
-//! [`crate::state::OutpostRecord::renewal_pricing`], so a caller that asks for an
-//! Outpost's renewal pricing sees exactly what the next caller does. A price is a
-//! figure from AWS's own price list, which this emulator does not hold, so it reports
-//! the options recorded for the Outpost and never a number it made up; an Outpost with
-//! none recorded is answered `UNABLE_TO_PRICE`, the modelled value for a pricing
-//! request the service could not price.
+//! A read, and one that writes NOTHING: it answers from the hardware the Outpost's
+//! own orders subscribe to
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::renewal_pricing`]),
+//! so a caller that asks for an Outpost's renewal pricing sees exactly what the next
+//! caller does. An Outpost with no subscribed hardware has no subscription to renew
+//! and is answered `UNABLE_TO_PRICE`, the modelled value for a pricing request the
+//! service could not price.
 //!
 //! ## Shape of an operation
 //!
@@ -169,27 +169,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read, so the guard is taken immutably: nothing this operation reports
         // depends on a transition the clock owes — the lifecycle status is the
-        // Outpost's own projection, which `GetOutpost` reports — so there is nothing
-        // for it to materialise and nothing for it to write.
+        // Outpost's own projection, which `GetOutpost` reports, and an order's
+        // progress through being prepared and built changes neither the hardware it
+        // subscribes nor its price — so there is nothing for it to materialise and
+        // nothing for it to write.
         let store = state.lock();
-        let options = store
-            .outpost(&region, &outpost_id)
-            .map(|record| record.renewal_pricing.clone())
-            .ok_or_else(|| {
-                GetRenewalPricingErrorModeled::NotFoundException(NotFoundException {
+        // An Outpost the store holds none of is the not-found error this operation
+        // models: there is no subscription of it to price.
+        if store.outpost(&region, &outpost_id).is_none() {
+            return Err(GetRenewalPricingErrorModeled::NotFoundException(
+                NotFoundException {
                     // The identifier echo, of the value AS SUPPLIED — not of
                     // `outpost_id`, which is the bare id an ARN resolved to.
                     message: Some(crate::state::identifier_not_found(
                         crate::state::OUTPOST_IDENTIFIER_MEMBER,
                         &input.outpost_identifier,
                     )),
-                })
-            })?;
+                },
+            )
+            .into());
+        }
+        // Every payment option and term the subscription on this Outpost's own
+        // hardware can be renewed under, priced from that hardware.
+        let options = store.renewal_pricing(&region, &outpost_id);
 
         // The result is the outcome of the pricing request this call IS: priced when
-        // there is at least one priced option to answer with, and `UNABLE_TO_PRICE`
-        // when there is none — the emulator does not price an Outpost that no
-        // recorded subscription option prices.
+        // the service found at least one priced option to answer with, and
+        // `UNABLE_TO_PRICE` when there is none — an Outpost with no subscribed
+        // hardware has no subscription a renewal of could be priced.
         let pricing_result = if options.is_empty() {
             crate::state::PRICING_RESULT_UNABLE_TO_PRICE
         } else {
@@ -197,8 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(GetRenewalPricingOutput {
             pricing_result: Some(pricing_result.to_string()),
-            // "The pricing options for the specified Outpost": the ones recorded for
-            // it, which the modelled `length(min: 0)` lets be none at all.
+            // "The pricing options for the specified Outpost": every one a renewal
+            // of its subscription can be bought under, which the modelled
+            // `length(min: 0)` lets be none at all.
             pricing_options: Some(options),
         })
     }
