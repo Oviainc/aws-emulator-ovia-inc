@@ -227,7 +227,7 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
             &ConverseStreamMetadataEvent {
                 usage: turn.usage(),
                 metrics: ConverseStreamMetrics {
-                    latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                    latency_ms: crate::state::latency_ms(started.elapsed()),
                 },
                 trace: None,
                 performance_config: input.performance_config.clone(),

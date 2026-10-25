@@ -199,7 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             component_type_id = input.component_type_id.as_deref().unwrap_or(""),
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so it holds no property value to report.
+        let region = crate::state::request_region(ctx.parts());
         // The page size served, under the rule every paginated operation of this
         // service shares (`crate::state::page_size`): THIS member documents a
         // minimum of 1 and the service's default of 25, so an explicit zero is
@@ -226,6 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
             let state = state.lock();
+            let state = state.region(&region);
 
             let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
                 return Err(not_found(crate::state::workspace_not_found_message(

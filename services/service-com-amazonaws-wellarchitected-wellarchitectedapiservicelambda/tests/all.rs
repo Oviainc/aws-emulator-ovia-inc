@@ -131,6 +131,9 @@ mod profile_listing;
 #[path = "all/profile_reads.rs"]
 mod profile_reads;
 
+#[path = "all/profile_shares.rs"]
+mod profile_shares;
+
 #[path = "all/question_choice_catalog.rs"]
 mod question_choice_catalog;
 

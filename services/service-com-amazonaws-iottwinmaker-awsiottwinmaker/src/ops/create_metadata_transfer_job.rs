@@ -195,6 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination_type = %input.destination.r#type,
             "serving a request"
         );
+        // The Region this request is signed for picks the store it writes to,
+        // and the Region the job's ARN carries: a job accepted here is not one
+        // another Region's endpoint reports.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateMetadataTransferJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -203,6 +207,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut state = state.lock();
+        // Nothing is created in a further Region once this store holds
+        // resources for as many as it may: the Region is the caller's own
+        // credential scope, so without a ceiling a caller could repeat a create
+        // under fresh Region names until the process ran out of memory.
+        if state.region_ceiling_reached(&region) {
+            return Err(
+                CreateMetadataTransferJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::region_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        let state = state.region_mut(&region);
 
         // A configuration that does not match the `type` beside it describes no
         // transfer the service could run, so it is refused rather than stored:
@@ -288,7 +307,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::metadata_transfer_job_arn(&region, &metadata_transfer_job_id);
         let now = ::std::time::SystemTime::now();
         let job = crate::state::MetadataTransferJob::accepted(

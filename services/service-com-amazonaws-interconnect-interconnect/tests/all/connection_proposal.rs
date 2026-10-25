@@ -11,99 +11,31 @@
 //! key that resolves to no stored proposal is refused with the operation's modelled
 //! 404. Every assertion here is checked over a TABLE built from the live seeded
 //! catalog, whose rows differ in the environment, the provider kind, the bandwidth,
-//! the attach-point union member and the region the request is signed for; the
-//! refusal table's rows differ in the SHAPE of the unresolvable key, including both
-//! published `ActivationKey` length bounds and one character past the upper one.
+//! the attach point the connection is created on and the region the request is signed
+//! for; the refusal table's rows differ in the SHAPE of the unresolvable key, including
+//! both published `ActivationKey` length bounds and one character past the upper one.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The signing name the model gives this service; also its ARN namespace.
-const SIGNING_NAME: &str = "interconnect";
-/// The account id every emulator ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT_ID: &str = "000000000000";
+use crate::emulator::{remote_account_for, Emulator};
 
-/// One emulator: a router with only this service mounted, over one shared engine.
-struct Emulator {
-    router: MultiServiceRouter,
-}
+/// The gateways the rows below attach their connections to: an attach point IS a
+/// Direct Connect gateway of the account, so the suite creates its own and the rows
+/// differ in which one they use, in its name and in its `amazonSideAsn`.
+const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
+    ("ic-proposal-a", None),
+    ("ic-proposal-b", Some(64_512)),
+];
 
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Pinned off so the suite does not depend on the process-wide default; the
-        // Authorization header below is still what carries the credential scope.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call `operation` with `body`, signed for `region`. Returns the status and the
-    /// decoded JSON body.
-    async fn call_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{SIGNING_NAME}/aws4_request, \
-             SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", "interconnect.localhost")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("Interconnect.{operation}"))
-            .header("authorization", authorization)
-            .body(Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let decoded = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, decoded)
-    }
-
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.call_in("us-east-1", operation, body).await
-    }
-
-    /// Call `operation` and require a 200, reporting the body when it is not.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
-        let (status, decoded) = self.call(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
-        );
-        decoded
-    }
-
-    /// Every seeded Environment, as `ListEnvironments` reports it.
-    async fn environments(&self) -> Vec<Value> {
-        let listed = self.ok("ListEnvironments", json!({})).await;
-        listed["environments"]
-            .as_array()
-            .expect("environments is a list")
-            .clone()
-    }
-
-    /// Every stored connection, as `ListConnections` reports it.
-    async fn connections(&self) -> Vec<Value> {
-        let listed = self.ok("ListConnections", json!({})).await;
-        listed["connections"]
-            .as_array()
-            .expect("connections is a list")
-            .clone()
-    }
+/// Every stored connection, as `ListConnections` reports it.
+async fn connections(emulator: &Emulator) -> Vec<Value> {
+    let listed = emulator.ic_ok("ListConnections", json!({})).await;
+    listed["connections"]
+        .as_array()
+        .expect("connections is a list")
+        .clone()
 }
 
 fn text(value: &Value, member: &str) -> String {
@@ -144,20 +76,6 @@ fn is_bandwidth(value: &str) -> bool {
         && digits.chars().all(|c| c.is_ascii_digit())
 }
 
-/// An attach point naming a Direct Connect gateway by UUID.
-fn dxgw_attach_point(seed: u8) -> Value {
-    json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee{seed:02}") })
-}
-
-/// An attach point naming another connection by full ARN.
-fn arn_attach_point(seed: u8) -> Value {
-    json!({
-        "arn": format!(
-            "arn:aws:interconnect:us-east-1:{ACCOUNT_ID}:connection/mcc-aaaaaa{seed:02}"
-        )
-    })
-}
-
 /// One row of the proposal table: a connection to create, and therefore a proposal
 /// whose activation key `DescribeConnectionProposal` must resolve.
 #[derive(Debug, Clone)]
@@ -182,16 +100,20 @@ impl ProposalCase {
         if let Some(description) = &self.description {
             request.insert("description".to_string(), json!(description));
         }
+        // The identifying information this Environment asks every create on it for.
+        if let Some(remote_account) = remote_account_for(&self.environment) {
+            request.insert("remoteAccount".to_string(), remote_account);
+        }
         Value::Object(request)
     }
 }
 
 /// The proposal table: every bandwidth of every environment that can take a
-/// connection, alternating the attach-point union member, the presence of the
-/// optional description, and the region the request is signed for.
-fn proposal_table(catalog: &[Value]) -> Vec<ProposalCase> {
+/// connection, alternating the gateway the connection is attached to, the presence of
+/// the optional description, and the region the request is signed for.
+fn proposal_table(catalog: &[Value], gateways: &[String]) -> Vec<ProposalCase> {
     let mut rows = Vec::new();
-    let mut seed = 0u8;
+    let mut seed = 0usize;
     for environment in catalog {
         if text(environment, "state") == "unavailable" {
             continue;
@@ -206,11 +128,9 @@ fn proposal_table(catalog: &[Value]) -> Vec<ProposalCase> {
                 } else {
                     "us-east-1"
                 },
-                attach_point: if seed.is_multiple_of(2) {
-                    arn_attach_point(seed)
-                } else {
-                    dxgw_attach_point(seed)
-                },
+                attach_point: json!({
+                    "directConnectGateway": gateways[seed % gateways.len()]
+                }),
                 description: if seed.is_multiple_of(3) {
                     None
                 } else {
@@ -281,7 +201,8 @@ fn assert_proposal_matches(case: &str, proposal: &Value, environment: &Value, ba
 async fn describe_connection_proposal_reports_the_proposal_each_activation_key_names() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let table = proposal_table(&catalog);
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = proposal_table(&catalog, &gateways);
     assert!(
         table.len() >= 4,
         "the proposal table must span several environments and bandwidths, got {} rows",
@@ -293,7 +214,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
     let mut minted: BTreeMap<String, (ProposalCase, String)> = BTreeMap::new();
     for case in table {
         let (status, body) = emulator
-            .call_in(case.region, "CreateConnection", case.request())
+            .ic_in(case.region, "CreateConnection", case.request())
             .await;
         assert_eq!(
             status, 200,
@@ -319,7 +240,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         let label = format!("{} / {}", case.environment_id(), case.bandwidth);
 
         let proposal = emulator
-            .ok(
+            .ic_ok(
                 "DescribeConnectionProposal",
                 json!({ "activationKey": activation_key }),
             )
@@ -329,7 +250,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         // The proposal and the connection are one record read two ways: the three
         // members both views carry agree.
         let fetched = emulator
-            .ok("GetConnection", json!({ "identifier": connection_id }))
+            .ic_ok("GetConnection", json!({ "identifier": connection_id }))
             .await;
         let connection = &fetched["connection"];
         for member in ["bandwidth", "environmentId", "provider", "location"] {
@@ -343,7 +264,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         // Describing is a READ: a second call answers identically and the connection
         // it names is untouched.
         let again = emulator
-            .ok(
+            .ic_ok(
                 "DescribeConnectionProposal",
                 json!({ "activationKey": activation_key }),
             )
@@ -353,7 +274,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
             "case {label:?}: expected a repeated describe to answer identically, got {again:?}"
         );
         let refetched = emulator
-            .ok("GetConnection", json!({ "identifier": connection_id }))
+            .ic_ok("GetConnection", json!({ "identifier": connection_id }))
             .await;
         assert_eq!(
             refetched, fetched,
@@ -363,7 +284,7 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
 
     // And nothing was created by the reads: the store still holds exactly the
     // connections the creates made.
-    let stored = emulator.connections().await;
+    let stored = connections(&emulator).await;
     assert_eq!(
         stored.len(),
         minted.len(),
@@ -382,17 +303,18 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
 
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let case = proposal_table(&catalog)
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let case = proposal_table(&catalog, &gateways)
         .into_iter()
         .next()
         .expect("the proposal table has rows");
 
     // One real proposal, so what is refused below is the key and not the store being
     // empty.
-    let created = emulator.ok("CreateConnection", case.request()).await;
+    let created = emulator.ic_ok("CreateConnection", case.request()).await;
     let known = text(&created["connection"], "activationKey");
     emulator
-        .ok(
+        .ic_ok(
             "DescribeConnectionProposal",
             json!({ "activationKey": known }),
         )
@@ -413,7 +335,7 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
 
     for key in &absent {
         let (status, body) = emulator
-            .call(
+            .ic(
                 "DescribeConnectionProposal",
                 json!({ "activationKey": key }),
             )
@@ -448,7 +370,7 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
         ("one short of the 1-character minimum", String::new()),
     ] {
         let (status, body) = emulator
-            .call(
+            .ic(
                 "DescribeConnectionProposal",
                 json!({ "activationKey": key }),
             )
@@ -460,7 +382,7 @@ async fn describe_connection_proposal_refuses_a_key_that_names_no_proposal() {
     }
 
     // A missing required member is likewise a 400, not a 404.
-    let (status, body) = emulator.call("DescribeConnectionProposal", json!({})).await;
+    let (status, body) = emulator.ic("DescribeConnectionProposal", json!({})).await;
     assert_eq!(
         status, 400,
         "case \"no activationKey at all\": expected HTTP 400 for a missing required member, got {status} with {body:?}"
