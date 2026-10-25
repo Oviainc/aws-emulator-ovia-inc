@@ -255,6 +255,18 @@ async fn a_resource_keeps_the_region_it_was_created_in() {
 async fn a_new_acl_settles_from_creating_to_active() {
     let router = router();
     let case = "acl settle";
+    // The ACL's member has to be a user that exists: a membership names users.
+    ok(
+        &router,
+        "CreateUser",
+        &json!({
+            "UserName": "app-user",
+            "AccessString": "on ~* &* +@all",
+            "AuthenticationMode": { "Type": "password", "Passwords": ["Aa1!Aa1!Aa1!Aa1!"] },
+        }),
+        case,
+    )
+    .await;
     let created = ok(
         &router,
         "CreateACL",

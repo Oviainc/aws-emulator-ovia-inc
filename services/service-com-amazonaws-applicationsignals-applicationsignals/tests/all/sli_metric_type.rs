@@ -38,7 +38,10 @@ const METRIC_TYPES: [&str; 2] = ["LATENCY", "AVAILABILITY"];
 
 /// The Application Signals entity a standard-metric SLO is related to: the `Type`, `Name`
 /// and `Environment` attributes the `KeyAttributes` doc requires.
-fn key_attributes(service: &str) -> Value {
+///
+/// `pub(crate)` so the other suites in this target relate a config to an entity through the
+/// same helper rather than a second copy of it.
+pub(crate) fn key_attributes(service: &str) -> Value {
     json!({ "Type": "Service", "Name": service, "Environment": "prod" })
 }
 

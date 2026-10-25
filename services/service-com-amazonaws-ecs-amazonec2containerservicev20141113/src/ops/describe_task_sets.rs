@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTaskSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTaskSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTaskSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the task sets of one service of one cluster, as they are stored: the request
+//! narrows them to the ids or ARNs it names, and a reference that names none of them is
+//! reported as a `MISSING` failure rather than refusing the batch. A REPORTING operation
+//! — nothing here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTaskSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTaskSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTaskSets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeTaskSetsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let references = input.task_sets.clone().unwrap_or_default();
+        // The reference list is caller-supplied and every entry costs a lookup, so it is
+        // bounded HERE, before any per-entry work and before the store is locked, at this
+        // service's describe-batch limit.
+        if references.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(DescribeTaskSetsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "taskSets must name at most {} task sets; got {}",
+                        crate::state::MAX_DESCRIBE_BATCH,
+                        references.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A service ARN carries the cluster that hosts it, so it names the cluster as
+        // well as the service; a short name takes the `cluster` member's.
+        let (arn_cluster, service_name) =
+            crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = arn_cluster
+            .unwrap_or_else(|| crate::state::cluster_name_from_reference(Some(&input.cluster)));
+        let region = crate::state::request_region(ctx);
+        let fields = crate::state::TaskSetFields::from_include(input.include.as_ref());
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(DescribeTaskSetsErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let Some(service) = guard
+            .services
+            .get(&(cluster_name.clone(), service_name.clone()))
+        else {
+            return Err(DescribeTaskSetsErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // "The specified service isn't active": a service the caller has deleted holds no
+        // task set to describe.
+        if !service.is_active() {
+            let status = service.status.clone();
+            return Err(DescribeTaskSetsErrorModeled::ServiceNotActiveException(
+                ServiceNotActiveException {
+                    message: Some(format!(
+                        "service {service_name:?} is {status} and its task sets cannot be \
+                         described"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut task_sets = Vec::new();
+        let mut failures = Vec::new();
+        if references.is_empty() {
+            // "The ID or full Amazon Resource Name (ARN) of task sets to describe" — an
+            // optional member, so a request that names none describes every task set the
+            // service holds.
+            task_sets = guard
+                .service_task_sets(&cluster_name, &service_name)
+                .into_iter()
+                .map(|task_set| guard.task_set_view(task_set, fields))
+                .collect();
+        } else {
+            // A task set is reported once however many times the request names it.
+            let mut seen = ::std::collections::HashSet::new();
+            for reference in &references {
+                match guard.resolve_task_set(&cluster_name, &service_name, reference) {
+                    Some(task_set) => {
+                        if seen.insert(task_set.id.clone()) {
+                            task_sets.push(guard.task_set_view(task_set, fields));
+                        }
+                    }
+                    None => {
+                        // The failure names the task set the reference MEANT, so an ARN
+                        // reference is resolved to its id first and the ARN rebuilt from
+                        // it rather than wrapped in another one.
+                        let id = crate::state::task_set_id_from_reference(reference);
+                        if seen.insert(id.clone()) {
+                            failures.push(crate::state::missing_failure(
+                                &crate::state::task_set_arn(
+                                    &region,
+                                    &cluster_name,
+                                    &service_name,
+                                    &id,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(DescribeTaskSetsOutput {
+            task_sets: Some(task_sets),
+            failures: Some(failures),
+        })
     }
 }

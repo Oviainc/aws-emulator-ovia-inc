@@ -234,13 +234,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can reserve concurrency for as many functions as you like, as long as you
         // leave at least 100 simultaneous executions unreserved for functions that aren't
-        // configured with a per-function limit." This call REPLACES whatever this
-        // function reserves, so only the other functions' reservations stand beside the
-        // requested one.
+        // configured with a per-function limit." What the account has already committed
+        // to its OTHER functions is what stands beside the requested reservation: their
+        // reservations, and the provisioned concurrency of those of them that reserve
+        // nothing. This call REPLACES whatever this function commits — once it reserves,
+        // its own provisioned concurrency is allocated out of that reservation — so none
+        // of this function's own allocations are counted twice.
         let requested = input.reserved_concurrent_executions;
-        let reserved_elsewhere = store.reserved_concurrency_except(Some(&reference.name));
+        let committed_elsewhere = store
+            .reserved_concurrency_except(Some(&reference.name))
+            .saturating_add(
+                store.unreserved_provisioned_concurrency_except(Some((&reference.name, None))),
+            );
         let unreserved = crate::state::CONCURRENT_EXECUTIONS_LIMIT
-            .saturating_sub(reserved_elsewhere.saturating_add(requested));
+            .saturating_sub(committed_elsewhere.saturating_add(requested));
         if unreserved < crate::state::MIN_UNRESERVED_CONCURRENT_EXECUTIONS {
             return Err(invalid_parameter(format!(
                 "Specified ReservedConcurrentExecutions for function decreases account's \

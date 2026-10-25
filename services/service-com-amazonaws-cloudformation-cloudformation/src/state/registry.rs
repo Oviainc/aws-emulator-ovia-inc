@@ -22,12 +22,22 @@
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
 //! `SetTypeDefaultVersion` (`DefaultVersionId`), `DeprecateType`/`DeregisterType`
-//! (`DeprecatedStatus`) and `TestType` (`TypeTestsStatus`). Each is still a scaffold stub
-//! with its own issue, so nothing in `src/` grows the stored side of this registry yet:
-//! that is why it carries no growth bound of its own (the writer that adds a version is
-//! where RegisterType's documented "maximum of 50 resource extension versions registered
-//! at a time" belongs). The record shape below is what those writers fill in and what
-//! every registry READ is served from.
+//! (`DeprecatedStatus`) and `TestType` (`TypeTestsStatus`). `TestType` is implemented; the
+//! others are still scaffold stubs with their own issues, so nothing in `src/` ADDS a
+//! record or a version to this registry yet: that is why it carries no growth bound of its
+//! own (the writer that adds a version is where RegisterType's documented "maximum of 50
+//! resource extension versions registered at a time" belongs). The record shape below is
+//! what those writers fill in and what every registry READ is served from.
+//!
+//! ## The one status transition the clock owes here
+//!
+//! Contract testing is the registry's own asynchronous operation: `TestType` answers while
+//! the tests are still running, and "an extension must have a test status of PASSED before
+//! it can be published", so a tested version carries `IN_PROGRESS` and the conclusion
+//! [`type_tests_outcome`] computed over what the registry holds for it
+//! ([`PendingTypeTests`]) until the due instant passes. [`StoredExtension::settle`] is what
+//! installs it, from the same `settle` walk every operation makes first, so a caller that
+//! reads straight after the call still sees `IN_PROGRESS` and nothing sleeps.
 //!
 //! ## Visibility is what gates a reported member
 //!
@@ -39,7 +49,7 @@
 //! `IsActivated` are "only public third-party extensions". [`StoredExtension::is_private`]
 //! and [`StoredExtension::is_public_third_party`] are the two predicates that gating reads.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// The extension kinds the model's `RegistryType` enum admits
 /// (`smithy_query(query="shape", shape="RegistryType")`: `HOOK | MODULE | RESOURCE`).
@@ -154,6 +164,24 @@ pub fn split_version_arn(arn: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// What contract testing concluded about one extension version, held until the clock makes
+/// reporting the conclusion due.
+///
+/// `TestType` is answered while the tests are still running — the status it leaves on the
+/// version is `IN_PROGRESS` — so the conclusion it computed waits here until [`Self::due_at`]
+/// and [`StoredTypeVersion::settle`] is what installs it. No read invents a conclusion the
+/// clock had not already made due, and nothing sleeps for one.
+#[derive(Debug, Clone)]
+pub struct PendingTypeTests {
+    /// [`type_tests_status`]: the `PASSED` or `FAILED` the tests reached.
+    pub status: String,
+    /// `TypeTestsStatusDescription`, "the description of the test status", where the
+    /// conclusion has something to describe.
+    pub status_description: Option<String>,
+    /// The instant reporting the conclusion becomes due.
+    pub due_at: SystemTime,
+}
+
 /// `LoggingConfig` as the registry persists it: "logging configuration information for
 /// private extensions".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +244,9 @@ pub struct StoredTypeVersion {
     /// `LastUpdated`: "when the specified extension version was registered". Filled in on
     /// the same records, and from the same instant, as [`Self::time_created`].
     pub last_updated: Option<SystemTime>,
+    /// The contract-test conclusion the clock owes this version, once `TestType` has
+    /// started testing it and until the conclusion is due (see [`PendingTypeTests`]).
+    pub pending_tests: Option<PendingTypeTests>,
 }
 
 impl StoredTypeVersion {
@@ -239,7 +270,100 @@ impl StoredTypeVersion {
             required_activated_types: Vec::new(),
             time_created: Some(registered_at),
             last_updated: Some(registered_at),
+            pending_tests: None,
         }
+    }
+
+    /// Start contract testing this version of the extension `type_name`, which is what
+    /// `TestType` does: the version's test status becomes `IN_PROGRESS` now, and the
+    /// conclusion the tests reach over what the registry holds for the version
+    /// ([`type_tests_outcome`]) becomes due `after` from `now`.
+    ///
+    /// Testing again restarts it: the operation is `@idempotent`, and "once you've
+    /// initiated testing on an extension using TestType, you can pass the returned
+    /// TypeVersionArn into DescribeType to monitor the current test status" — so what a
+    /// second call leaves behind is the same in-progress test, concluding from the instant
+    /// of that call.
+    pub fn start_type_tests(&mut self, type_name: &str, now: SystemTime, after: Duration) {
+        let (status, status_description) = type_tests_outcome(type_name, self);
+        self.type_tests_status = Some(type_tests_status::IN_PROGRESS.to_string());
+        // "The description of the test status" is the description of the status being
+        // reported, so the conclusion's own arrives with the conclusion.
+        self.type_tests_status_description = None;
+        self.pending_tests = Some(PendingTypeTests {
+            status,
+            status_description,
+            due_at: now + after,
+        });
+    }
+
+    /// Materialise the contract-test conclusion the clock has already made due, if any.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self
+            .pending_tests
+            .as_ref()
+            .is_none_or(|pending| pending.due_at > now)
+        {
+            return;
+        }
+        if let Some(concluded) = self.pending_tests.take() {
+            self.type_tests_status = Some(concluded.status);
+            self.type_tests_status_description = concluded.status_description;
+        }
+    }
+}
+
+/// What contract testing concludes about one version of the extension `type_name`, computed
+/// from what the registry holds for that version.
+///
+/// Testing an extension is "determining if the ... model meets all necessary requirements",
+/// and the model is the version's `Schema`, "the schema that defines the extension". What
+/// the registry requires of that document is that it is a JSON object declaring the
+/// extension it defines, under the `typeName` member the provider definition meta-schema
+/// fixes (see [`crate::state::resource_schema`]). A version the registry holds no schema
+/// for, one whose schema is not such a document, and one whose schema declares a DIFFERENT
+/// extension each fail that requirement, and `FAILED` says which; anything else is
+/// `PASSED`, the status "an extension must have ... before it can be published".
+///
+/// `PASSED` here therefore states exactly that: the model this registry HOLDS for the
+/// version meets the requirements that can be checked against a stored schema. It is not
+/// the verdict of a run of the extension's handlers against the contract-test suite — this
+/// registry holds no handler package to run one over, so the conclusion is computed from
+/// the record rather than from an execution.
+pub fn type_tests_outcome(
+    type_name: &str,
+    version: &StoredTypeVersion,
+) -> (String, Option<String>) {
+    let version_id = &version.version_id;
+    let failed = |reason: String| (type_tests_status::FAILED.to_string(), Some(reason));
+
+    let Some(schema) = version.schema.as_deref() else {
+        return failed(format!(
+            "No schema is registered for version {version_id} of {type_name}, so its model \
+             could not be tested"
+        ));
+    };
+    let document = match ::serde_json::from_str::<::serde_json::Value>(schema) {
+        Ok(::serde_json::Value::Object(document)) => document,
+        _ => {
+            return failed(format!(
+                "The schema registered for version {version_id} of {type_name} is not a JSON \
+                 object"
+            ))
+        }
+    };
+    match document
+        .get("typeName")
+        .and_then(::serde_json::Value::as_str)
+    {
+        Some(declared) if declared == type_name => (type_tests_status::PASSED.to_string(), None),
+        Some(declared) => failed(format!(
+            "The schema registered for version {version_id} of {type_name} declares typeName \
+             {declared}"
+        )),
+        None => failed(format!(
+            "The schema registered for version {version_id} of {type_name} declares no typeName"
+        )),
     }
 }
 
@@ -329,6 +453,31 @@ impl StoredExtension {
         self.versions
             .iter()
             .find(|version| version.version_id == version_id)
+    }
+
+    /// [`Self::version`], for a writer that records something on the version.
+    pub fn version_mut(&mut self, version_id: &str) -> Option<&mut StoredTypeVersion> {
+        self.versions
+            .iter_mut()
+            .find(|version| version.version_id == version_id)
+    }
+
+    /// The version a request selects: the one its `VersionId` names, or — where it names
+    /// none — the record's default version, "the default version of the extension in your
+    /// account and Region". `None` where the record holds no such version.
+    pub fn selected_version(&self, version_id: Option<&str>) -> Option<&StoredTypeVersion> {
+        match version_id {
+            Some(version_id) => self.version(version_id),
+            None => self.default_version(),
+        }
+    }
+
+    /// Materialise every contract-test conclusion the clock has made due, over every
+    /// version this record holds.
+    pub fn settle(&mut self, now: SystemTime) {
+        for version in &mut self.versions {
+            version.settle(now);
+        }
     }
 
     /// The version a publisher published under this `PublicVersionNumber`, if the registry
@@ -516,6 +665,8 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         // one nobody registered that is [`REGISTRY_GENESIS`].
         time_created: Some(*REGISTRY_GENESIS),
         last_updated: Some(*REGISTRY_GENESIS),
+        // Nobody can test a public extension, so no conclusion is ever owed on one.
+        pending_tests: None,
     };
     StoredExtension {
         type_kind: registry_type::RESOURCE.to_string(),

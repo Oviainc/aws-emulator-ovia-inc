@@ -588,8 +588,11 @@ impl EnabledBaselineDriftStatus {
 ///
 /// Everything `ListEnabledControls` and `GetEnabledControl` report about a control is
 /// read from here, so the two agree by construction. `parameters` keeps the caller's
-/// `EnabledControlParameter` documents in the order they were supplied, and
-/// `target_regions` the regions the control was deployed into at enablement time.
+/// `EnabledControlParameter` documents in the order they were supplied. The regions a
+/// control is deployed into are NOT stored here: they follow the landing zone's current
+/// governance, so they are derived on every read by [`target_regions_of`].
+///
+/// [`target_regions_of`]: ComAmazonawsControltowerAwscontroltowerapisState::target_regions_of
 #[derive(Debug, Clone)]
 pub struct EnabledControl {
     pub arn: String,
@@ -603,9 +606,13 @@ pub struct EnabledControl {
     pub parent_identifier: Option<String>,
     /// `EnabledControlParameter`s as supplied, in order.
     pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
-    /// The regions this control was deployed into: the landing zone's governed regions
-    /// when one is deployed, else the region the enabling request was signed for.
-    pub target_regions: Vec<String>,
+    /// The region the request that enabled this control was signed for. Only the
+    /// FALLBACK for the regions a caller is told about, used while the account governs no
+    /// region at all; the governed set, when there is one, is what
+    /// [`target_regions_of`] reports.
+    ///
+    /// [`target_regions_of`]: ComAmazonawsControltowerAwscontroltowerapisState::target_regions_of
+    pub enablement_region: String,
     pub status: EnablementStatus,
     /// `EnablementStatusSummary$lastOperationIdentifier`: the identifier of the most
     /// recent control operation against this control.
@@ -1201,6 +1208,31 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The regions an enabled control is expected to be deployed into — the value
+    /// `EnabledControlDetails$targetRegions` reports.
+    ///
+    /// A control is deployed into the regions the landing zone governs (`Region`: "the
+    /// expected Regions are based on the Regions that are governed by the landing zone"),
+    /// so this is DERIVED from the deployed manifest on every read rather than captured
+    /// when the control was enabled: extending governance extends every existing
+    /// enablement into the added regions, and withdrawing a region withdraws them from it.
+    /// Call [`settle`] first, so a governance change an `UPDATE` queued counts from the
+    /// instant its deployment became due.
+    ///
+    /// With no landing zone deployed, or one whose manifest governs no region, there is no
+    /// governed set to read and the only region the enablement names is the one its own
+    /// request was signed for.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn target_regions_of(&self, control: &EnabledControl) -> Vec<String> {
+        let governed = self.governed_regions();
+        if governed.is_empty() {
+            vec![control.enablement_region.clone()]
+        } else {
+            governed
+        }
     }
 
     /// The identifier of the earliest-started operation still `IN_PROGRESS` against ANY
