@@ -19,6 +19,8 @@ mod cancel_task_dispatch_window;
 mod create_task_in_flight_quota;
 #[path = "all/create_task_tag_validation.rs"]
 mod create_task_tag_validation;
+#[path = "all/device_ec2_instance_cache.rs"]
+mod device_ec2_instance_cache;
 #[path = "all/device_ec2_instances.rs"]
 mod device_ec2_instances;
 #[path = "all/device_region_gate.rs"]
