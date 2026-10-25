@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `RunJobFlow` resolves `JobFlowRole` to an EC2
+# instance profile with `GetInstanceProfile` before launching a cluster. Only the
+# generated client is needed — the emulator supplies the transport, so the SDK's
+# own HTTPS stack and runtime are left out.
+aws-sdk-iam = { version = "1", default-features = false }
+# The tree's one ARN parse, for reading a `JobFlowRole` given as an ARN.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

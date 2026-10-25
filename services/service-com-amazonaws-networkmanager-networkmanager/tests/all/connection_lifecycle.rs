@@ -23,7 +23,9 @@
 use serde_json::{json, Value};
 
 use crate::device_lifecycle::create_device_ok;
-use crate::global_network_lifecycle::{error_code, expected_arn, is_minted_id, Emulator, PAST_SETTLE};
+use crate::global_network_lifecycle::{
+    error_code, expected_scoped_arn, is_minted_id, Emulator, PAST_SETTLE,
+};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 
 /// The `Description` every seeded connection starts with, so a row that supplies no
@@ -278,7 +280,7 @@ async fn create_connection_stores_every_member_and_get_connections_answers_from_
         );
         assert_eq!(
             connection["ConnectionArn"],
-            json!(expected_arn(CONNECTION, &connection_id)),
+            json!(expected_scoped_arn(CONNECTION, &seed.network, &connection_id)),
             "case {}: wrong ARN in {connection}",
             row.case
         );
@@ -626,7 +628,7 @@ async fn update_connection_writes_only_the_supplied_members_and_round_trips_thro
         );
         assert_eq!(
             connection["ConnectionArn"],
-            json!(expected_arn(CONNECTION, connection_id)),
+            json!(expected_scoped_arn(CONNECTION, &seed.network, connection_id)),
             "case {}: the ARN must not be rewritten, got {connection}",
             row.case
         );

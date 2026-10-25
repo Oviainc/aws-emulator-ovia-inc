@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAssetCompositeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAssetCompositeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAssetCompositeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one composite model of an ASSET. An asset composite model is an
+//! instance of a composite model of the asset's model, so this reads the asset's
+//! stored record for the model it was created from and that model's stored
+//! composite model, and materialises the asset-side view from them — a read, so
+//! it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -183,20 +180,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAssetCompositeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAssetCompositeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAssetCompositeModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+
+        let store = state.lock();
+        // Both id members are `CustomID` labels: a raw UUID or `externalId:<id>`.
+        let asset_id = store
+            .resolve_asset_id(&input.asset_id)
+            .ok_or_else(|| asset_not_found(&input.asset_id))?;
+        let asset = store
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| asset_not_found(&input.asset_id))?;
+
+        // An asset composite model is an INSTANCE of a composite model of the
+        // asset's model, so the definition it reports is the one stored on that
+        // model's record. An asset cannot exist without the model it was created
+        // from, so a model that is not there is a server-side failure rather
+        // than a refusal of this request.
+        let model = store
+            .asset_models
+            .get(&asset.asset_model_id)
+            .ok_or_else(internal_failure)?;
+        let composite_model_id = model
+            .resolve_composite_model_id(&input.asset_composite_model_id)
+            .ok_or_else(|| composite_not_found(&input.asset_composite_model_id))?;
+        let composite = model
+            .composite_model(&composite_model_id)
+            .ok_or_else(|| composite_not_found(&input.asset_composite_model_id))?;
+
+        let path = model.asset_composite_model_path(&composite_model_id);
+        // This asset's properties for the composite model are materialised from
+        // the composite model's property definitions exactly as `CreateAsset`
+        // materialises the model's top-level ones — through the one shared rule,
+        // so an asset property carries the id of the definition it came from.
+        let properties = store
+            .composite_model_properties(model, &composite_model_id)
+            .iter()
+            .filter_map(|definition| {
+                let mut property = crate::state::asset_property_from_model(definition)?;
+                // `path` is the structured path to the property from the root of
+                // the asset: the composite models it sits inside, outermost
+                // first, then the property itself.
+                let mut property_path: Vec<AssetPropertyPathSegment> = path
+                    .iter()
+                    .map(|segment| AssetPropertyPathSegment {
+                        id: segment.id.clone(),
+                        name: segment.name.clone(),
+                    })
+                    .collect();
+                property_path.push(AssetPropertyPathSegment {
+                    id: Some(property.id.clone()),
+                    name: Some(property.name.clone()),
+                });
+                property.path = Some(property_path);
+                Some(property)
+            })
+            .collect();
+
+        Ok(DescribeAssetCompositeModelOutput {
+            asset_id: asset.id.clone(),
+            asset_composite_model_id: composite_model_id.clone(),
+            asset_composite_model_external_id: composite.external_id.clone(),
+            asset_composite_model_path: path,
+            asset_composite_model_name: composite.name.clone(),
+            // `assetCompositeModelDescription` is a REQUIRED output member, so a
+            // composite model stored without a description reports the empty
+            // string rather than omitting the member — the same answer the asset
+            // model's own view of that composite model gives.
+            asset_composite_model_description: composite.description.clone().unwrap_or_default(),
+            asset_composite_model_type: composite.r#type.clone(),
+            asset_composite_model_properties: properties,
+            // The summaries are the composite models nested DIRECTLY inside this
+            // one, as this asset reports them — the same derivation the asset
+            // model's own view of them uses, one level down.
+            asset_composite_model_summaries: model
+                .composite_model_children(&composite_model_id)
+                .iter()
+                .filter_map(|child| model.asset_composite_model_summary(child))
+                .collect(),
+            // No action is stored against a composite model, so none is reported:
+            // `ExecuteAction` and `ListActions` are not implemented yet.
+            action_definitions: None,
+        })
     }
 }
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> DescribeAssetCompositeModelError {
+    DescribeAssetCompositeModelErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset label that resolved to
+/// nothing.
+fn asset_not_found(label: &str) -> DescribeAssetCompositeModelError {
+    DescribeAssetCompositeModelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(crate::state::RESOURCE_ASSET, label),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the composite model label that
+/// resolved to nothing on this asset.
+fn composite_not_found(label: &str) -> DescribeAssetCompositeModelError {
+    DescribeAssetCompositeModelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(
+            crate::state::RESOURCE_ASSET_COMPOSITE_MODEL,
+            label,
+        ),
+    })
+    .into()
+}
+

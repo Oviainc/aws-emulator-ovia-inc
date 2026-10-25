@@ -511,6 +511,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only an integration API Gateway created on the caller's behalf is managed;
             // one the caller asked for is its own.
             api_gateway_managed: false,
+            // An integration response is a child resource of its own
+            // (`CreateIntegrationResponse`), so a freshly created integration holds none.
+            integration_responses: ::std::collections::BTreeMap::new(),
+            integration_response_id_seed: 0,
         };
 
         // Read the response back out of the STORE, so what the caller gets is what a

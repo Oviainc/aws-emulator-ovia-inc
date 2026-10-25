@@ -245,9 +245,10 @@ pub const STORAGE_LENS_GROUP_QUOTA: usize = 1_000;
 // S3 Batch Operations jobs
 //
 // `CreateJob` records a job here and every job operation reads the one record
-// it stored: `DescribeJob` reports it, the job tagging operations read and
-// replace its tag set, and `UpdateJobPriority` / `UpdateJobStatus` move its
-// members (those four are still scaffolds with their own gap issues).
+// it stored: `DescribeJob` reports it, `UpdateJobPriority` replaces its
+// priority, the job tagging operations read and replace its tag set, and
+// `UpdateJobStatus` moves its status (those three are still scaffolds with
+// their own gap issues).
 // ---------------------------------------------------------------------------
 
 /// `JobStatus` of a job the service has accepted and not yet prepared — the
@@ -907,6 +908,15 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
     pub fn job(&self, account_id: &str, job_id: &str) -> Option<&JobRecord> {
         self.jobs
             .get(&(account_id.to_string(), job_id.to_string()))
+    }
+
+    /// The job `job_id` names under `account_id`, for an operation that CHANGES
+    /// it (`UpdateJobPriority` moves its priority), or `None` when that account
+    /// owns no such job — the same lookup [`Self::job`] reports from, so a
+    /// writer and a reader cannot disagree about which record a job id names.
+    pub fn job_mut(&mut self, account_id: &str, job_id: &str) -> Option<&mut JobRecord> {
+        self.jobs
+            .get_mut(&(account_id.to_string(), job_id.to_string()))
     }
 
     /// The job this account already created with `client_request_token`, if

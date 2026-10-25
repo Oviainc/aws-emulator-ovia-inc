@@ -155,51 +155,6 @@ const MAX_PAGE_SIZE: usize = 1000;
 /// `SortOrder` — oldest first, which is the order an absent `sortOrder` takes.
 const SORT_ASCENDING: &str = "Ascending";
 
-/// The number of decimal digits a cursor's instant half carries.
-///
-/// Fixed-width so BYTE order over cursors IS the listing's order: nanoseconds since the
-/// epoch need 19 digits for any instant this emulator can mint, and 20 leaves the width
-/// stable past them.
-const CURSOR_INSTANT_DIGITS: usize = 20;
-
-/// The listing's cursor for one Provisioned Throughput: the instant it was created, then
-/// its ARN.
-///
-/// Rendered so byte order over cursors is the `(creationTime, provisionedModelArn)` order
-/// the listing is sorted by — the instant half is fixed-width and `:` sorts below every
-/// character the rest of an ARN can carry after it — which is what lets a page resume at
-/// "the first row at or after this cursor" even when the row the previous page ended on has
-/// since been deleted. It carries no whitespace, as `PaginationToken` (`^\S*$`) requires.
-fn cursor_of(record: &crate::state::ProvisionedModelThroughputRecord) -> String {
-    let nanos = record
-        .created_at
-        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    format!(
-        "{nanos:0width$}:{arn}",
-        width = CURSOR_INSTANT_DIGITS,
-        arn = record.arn
-    )
-}
-
-/// Whether `token` is a cursor THIS listing issued, so a token from somewhere else is
-/// refused rather than silently read as an empty or wrong page.
-fn cursor_belongs(token: &str) -> bool {
-    let Some((instant, arn)) = token.split_once(':') else {
-        return false;
-    };
-    instant.len() == CURSOR_INSTANT_DIGITS
-        && instant.bytes().all(|byte| byte.is_ascii_digit())
-        && !arn.is_empty()
-}
-
-/// `at` as epoch seconds, the scale the two `creationTime` filters carry on the wire
-/// (`@timestampFormat("date-time")`), so a filter and a record are compared on one scale.
-fn epoch_seconds(at: ::std::time::SystemTime) -> f64 {
-    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0.0, |since| since.as_secs_f64())
-}
-
 /// Whether every filter `input` carries holds for `record`.
 ///
 /// The time bounds are STRICT, as the members word them: "created after the specified
@@ -208,7 +163,7 @@ fn matches(
     input: &ListProvisionedModelThroughputsInput,
     record: &crate::state::ProvisionedModelThroughputRecord,
 ) -> bool {
-    let created = epoch_seconds(record.created_at);
+    let created = crate::state::epoch_seconds(record.created_at);
     if let Some(after) = input.creation_time_after.as_ref() {
         if created <= after.as_secs_f64() {
             return false;
@@ -293,7 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // another account-region's resource and is not listed here.
             .filter(|record| record.region == region)
             .filter(|record| matches(&input, record))
-            .map(|record| (cursor_of(record), crate::state::provisioned_model_summary(record)))
+            .map(|record| {
+                (
+                    crate::state::listing_cursor(record.created_at, &record.arn),
+                    crate::state::provisioned_model_summary(record),
+                )
+            })
             .collect();
         // `sortBy` admits only `CreationTime`, which the cursor's leading half IS; its
         // trailing half breaks a tie by ARN, so the order is total either way round.
@@ -303,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(token) = input.next_token.as_deref() {
-            if !cursor_belongs(token) {
+            if !crate::state::cursor_belongs(token) {
                 return Err(
                     ListProvisionedModelThroughputsErrorModeled::ValidationException(
                         ValidationException {

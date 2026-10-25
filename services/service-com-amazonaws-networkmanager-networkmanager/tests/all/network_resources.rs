@@ -20,7 +20,9 @@
 use serde_json::{json, Value};
 
 use crate::core_network_lifecycle::create_core_network;
-use crate::global_network_lifecycle::{error_code, expected_arn, Emulator, PAST_SETTLE};
+use crate::global_network_lifecycle::{
+    error_code, expected_arn, expected_scoped_arn, Emulator, PAST_SETTLE,
+};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 use crate::network_resource_counts::SUPPORTED_TYPES;
 use crate::resource_tagging::escape;
@@ -96,6 +98,20 @@ fn minted(body: &Value, outer: &str, member: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("expected a {outer}.{member} in {body}"))
         .to_string()
+}
+
+/// The ARN a resource of `resource_type` carries inside the global network `network`.
+///
+/// A kind that exists only inside a global network is NAMED under it
+/// (`<kind>/<globalNetworkId>/<id>`); a core network and an attachment are identified
+/// account-wide and carry no such segment — the rule `crate::arn_scoping` pins.
+fn arn_of(resource_type: &str, network: &str, id: &str) -> String {
+    match resource_type {
+        "site" | "link" | "device" | "connection" => {
+            expected_scoped_arn(resource_type, network, id)
+        }
+        _ => expected_arn(resource_type, id),
+    }
 }
 
 /// A policy document a core network accepts, so the fixture's core network has a topology
@@ -408,7 +424,7 @@ async fn every_stored_resource_is_reported_with_its_identity_account_tags_and_de
         let case = resource.key();
         assert_eq!(
             entry["ResourceArn"],
-            json!(expected_arn(resource.resource_type, &resource.id)),
+            json!(arn_of(resource.resource_type, &network, &resource.id)),
             "case {case}: expected the resource's own ARN, got {entry}"
         );
         assert_eq!(
@@ -499,24 +515,37 @@ async fn each_filter_narrows_the_inventory_to_the_resources_that_carry_its_value
         ("no filter at all".to_string(), String::new(), all.clone()),
         (
             "resourceArn of a stored site".to_string(),
-            format!("resourceArn={}", escape(&expected_arn("site", &site.id))),
+            format!(
+                "resourceArn={}",
+                escape(&arn_of("site", &network, &site.id))
+            ),
             vec![site.key()],
         ),
         (
             "resourceArn of a stored device".to_string(),
-            format!("resourceArn={}", escape(&expected_arn("device", &device.id))),
+            format!(
+                "resourceArn={}",
+                escape(&arn_of("device", &network, &device.id))
+            ),
             vec![device.key()],
         ),
         (
             "resourceArn of another global network's site".to_string(),
-            format!("resourceArn={}", escape(&expected_arn("site", &other_site))),
+            format!(
+                "resourceArn={}",
+                escape(&arn_of("site", &other_network, &other_site))
+            ),
             Vec::new(),
         ),
         (
             "resourceArn naming nothing stored".to_string(),
             format!(
                 "resourceArn={}",
-                escape("arn:aws:networkmanager::000000000000:site/site-000000000000000ff")
+                escape(&arn_of(
+                    "site",
+                    "global-network-000000000000000ff",
+                    "site-000000000000000ff"
+                ))
             ),
             Vec::new(),
         ),

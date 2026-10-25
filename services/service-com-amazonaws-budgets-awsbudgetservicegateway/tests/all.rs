@@ -21,6 +21,8 @@ mod budget_action_execution;
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
 mod budget_action_lifecycle;
+#[path = "all/budget_action_lock.rs"]
+mod budget_action_lock;
 #[path = "all/budget_action_read_purity.rs"]
 mod budget_action_read_purity;
 #[path = "all/budget_action_settle_history.rs"]
