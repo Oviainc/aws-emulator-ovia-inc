@@ -211,7 +211,11 @@ const IMPORTED_AUTHORIZATION_TYPE: &str = "NONE";
 
 /// The document key API Gateway's OpenAPI extensions use for an API's binary media
 /// types — the `binaryMediaTypes` member's counterpart in an imported definition.
-const BINARY_MEDIA_TYPES_EXTENSION: &str = "x-amazon-apigateway-binary-media-types";
+///
+/// `pub` because the EXPORT side of a definition (`super::get_export`) renders the same
+/// member under the same key, so a definition exported from an API and imported again
+/// carries its binary media types either way.
+pub const BINARY_MEDIA_TYPES_EXTENSION: &str = "x-amazon-apigateway-binary-media-types";
 
 /// The keys of an OpenAPI Path Item Object that name an operation API Gateway imports as
 /// a `Method`, mapped to the HTTP verb the method is stored under.
@@ -219,7 +223,11 @@ const BINARY_MEDIA_TYPES_EXTENSION: &str = "x-amazon-apigateway-binary-media-typ
 /// The keys are the OpenAPI Path Item Object's operation fields, plus API Gateway's own
 /// `x-amazon-apigateway-any-method` extension for the `ANY` catch-all; the verbs are
 /// `super::put_method::HTTP_METHODS`, which is the catalog a `Method` may carry.
-const OPERATION_KEYS: &[(&str, &str)] = &[
+///
+/// `pub` because the EXPORT side (`super::get_export`) keys a method's Operation Object
+/// by reading the same table backwards, so the two directions cannot disagree on which
+/// document key names which verb.
+pub const OPERATION_KEYS: &[(&str, &str)] = &[
     ("get", "GET"),
     ("put", "PUT"),
     ("post", "POST"),
