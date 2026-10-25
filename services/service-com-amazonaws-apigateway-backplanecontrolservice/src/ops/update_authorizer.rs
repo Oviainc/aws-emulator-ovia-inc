@@ -123,34 +123,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use super::create_authorizer::require_members_of_type;
+use super::create_authorizer::{authorizer_result_ttl, require_members_of_type};
 use crate::state::{
-    patch_i32, patch_optional_string, patch_required_string, patch_string_set, AuthorizerEntry,
-    Patch, PatchFailure, PatchOpKind, MAX_AUTHORIZER_RESULT_TTL_SECONDS, MAX_COLLECTION_ENTRIES,
-    MAX_STRING_CHARS, MIN_AUTHORIZER_RESULT_TTL_SECONDS,
+    patch_i32_checked, patch_optional_string, patch_required_string, patch_string_set,
+    AuthorizerEntry, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateAuthorizer` accepts: one per updateable member of the
-/// `Authorizer` shape. `id` is the authorizer's identity — the URI label that addresses
-/// this very record — so it is reported but not patchable, exactly as `UpdateApiKey`
-/// treats a key's `id`.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/authType",
-    "/authorizerCredentials",
-    "/authorizerResultTtlInSeconds",
-    "/authorizerUri",
-    "/identitySource",
-    "/identityValidationExpression",
-    "/name",
-    "/providerARNs/<user-pool-arn>",
-    "/type",
-];
-
-/// The window `authorizerResultTtlInSeconds` takes, from the member's own documentation
-/// — the same one `CreateAuthorizer` enforces through
-/// [`crate::ops::create_authorizer::authorizer_result_ttl`].
-const AUTHORIZER_RESULT_TTL_RANGE: ::std::ops::RangeInclusive<i32> =
-    MIN_AUTHORIZER_RESULT_TTL_SECONDS..=MAX_AUTHORIZER_RESULT_TTL_SECONDS;
+// The `path` values `UpdateAuthorizer` accepts are the ones `apply_patch` below has an arm
+// for: one per updateable member of the `Authorizer` shape. `id` is the authorizer's
+// identity — the URI label that addresses this very record — so it is reported but not
+// patchable, exactly as `UpdateApiKey` treats a key's `id`.
+//
+// `authorizerResultTtlInSeconds` is checked through the SAME checker `CreateAuthorizer`
+// runs ([`authorizer_result_ttl`]), so one TTL is refused with one sentence whichever
+// operation set it.
 
 /// Apply one patch to a COPY of a stored authorizer.
 fn apply_patch(entry: &mut AuthorizerEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -193,10 +179,10 @@ fn apply_patch(entry: &mut AuthorizerEntry, patch: &Patch) -> Result<(), PatchFa
         // A stored authorizer always carries a TTL — the member documents the value the
         // service picks for a request that sets none — so it is replaced inside its
         // published window and never cleared.
-        "authorizerResultTtlInSeconds" => patch_i32(
+        "authorizerResultTtlInSeconds" => patch_i32_checked(
             &mut entry.authorizer_result_ttl_in_seconds,
             patch,
-            AUTHORIZER_RESULT_TTL_RANGE,
+            |requested| authorizer_result_ttl(Some(requested)),
         ),
         // The path names ONE pool ARN of the list, or the op's own `value` does: a
         // collection member has elements added and removed rather than being replaced
@@ -207,7 +193,7 @@ fn apply_patch(entry: &mut AuthorizerEntry, patch: &Patch) -> Result<(), PatchFa
                 .map_err(PatchFailure::BadRequest)?;
             patch_string_set(&mut entry.provider_arns, patch, &arn, MAX_COLLECTION_ENTRIES)
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

@@ -161,48 +161,28 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use super::put_integration::{
-    validate_integration, MAX_TEMPLATE_CHARS, MAX_TIMEOUT_IN_MILLIS, MIN_TIMEOUT_IN_MILLIS,
-    PASSTHROUGH_BEHAVIORS,
-};
+use super::put_integration::{validate_integration, MAX_TEMPLATE_CHARS, PASSTHROUGH_BEHAVIORS};
 use super::put_method::method_key;
 use crate::state::{
-    patch_bool, patch_enum_string, patch_i32, patch_optional_string, patch_required_string,
-    patch_string_map, patch_string_set, Patch, PatchFailure, PatchOpKind, MAX_COLLECTION_ENTRIES,
-    MAX_STRING_CHARS,
+    patch_bool, patch_enum_string, patch_i32_checked, patch_optional_string,
+    patch_required_string, patch_string_map, patch_string_set, Patch, PatchFailure, PatchOpKind,
+    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The `path` values `UpdateIntegration` accepts: one per updateable member of the
-/// `Integration` shape, the `tlsConfig` sub-member included.
-///
-/// `type` is NOT among them: an integration's type decides which of the other members it
-/// takes at all (the `uri` form, whether an integration method is required), so it is
-/// fixed when the record is created and changed only by replacing the record through
-/// `PutIntegration`. `integrationResponses` is not patchable either — an integration
-/// response is its own resource, written by `PutIntegrationResponse`.
-const SUPPORTED_PATHS: &[&str] = &[
-    "/cacheKeyParameters/<parameter>",
-    "/cacheNamespace",
-    "/connectionId",
-    "/connectionType",
-    "/contentHandling",
-    "/credentials",
-    "/httpMethod",
-    "/integrationTarget",
-    "/passthroughBehavior",
-    "/requestParameters/<parameter-name>",
-    "/requestTemplates/<content-type>",
-    "/responseTransferMode",
-    "/timeoutInMillis",
-    "/tlsConfig/insecureSkipVerification",
-    "/uri",
-];
+// The `path` values `UpdateIntegration` accepts are the ones `apply_patch` below has an
+// arm for: one per updateable member of the `Integration` shape, the `tlsConfig`
+// sub-member included.
+//
+// `type` is NOT among them: an integration's type decides which of the other members it
+// takes at all (the `uri` form, whether an integration method is required), so it is
+// fixed when the record is created and changed only by replacing the record through
+// `PutIntegration`. `integrationResponses` is not patchable either — an integration
+// response is its own resource, written by `PutIntegrationResponse`.
 
-/// The documented range of `timeoutInMillis`: "Custom timeout between 50 and 29,000
-/// milliseconds" (`Integration$timeoutInMillis`), the same range `PutIntegration`
-/// enforces.
-const TIMEOUT_RANGE: ::std::ops::RangeInclusive<i32> =
-    MIN_TIMEOUT_IN_MILLIS..=MAX_TIMEOUT_IN_MILLIS;
+// `timeoutInMillis` is checked through the SAME checker `PutIntegration` runs — the
+// member's documented range, "Custom timeout between 50 and 29,000 milliseconds"
+// (`Integration$timeoutInMillis`) — so one timeout is refused with one sentence whichever
+// operation set it.
 
 /// Apply one patch to a COPY of a stored integration.
 ///
@@ -292,7 +272,11 @@ fn apply_patch(entry: &mut GetIntegrationOutput, patch: &Patch) -> Result<(), Pa
             entry.passthrough_behavior = Some(behavior);
             Ok(())
         }
-        "timeoutInMillis" => patch_i32(&mut entry.timeout_in_millis, patch, TIMEOUT_RANGE),
+        "timeoutInMillis" => patch_i32_checked(
+            &mut entry.timeout_in_millis,
+            patch,
+            super::put_integration::accepted_timeout,
+        ),
         // The path names ONE entry of the collection, or the op's own `value` does; that
         // the entry must also be a request parameter of the owning method is checked with
         // the rest of the record.
@@ -345,12 +329,12 @@ fn apply_patch(entry: &mut GetIntegrationOutput, patch: &Patch) -> Result<(), Pa
                 "insecureSkipVerification" => {
                     patch_bool(&mut config.insecure_skip_verification, &nested)?;
                 }
-                _ => return Err(patch.unsupported_path(SUPPORTED_PATHS)),
+                _ => return Err(patch.unsupported_path()),
             }
             entry.tls_config = Some(config);
             Ok(())
         }
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

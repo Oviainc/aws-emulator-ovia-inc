@@ -158,6 +158,31 @@ const MIN_COMPRESSION_SIZE: i32 = 0;
 /// [`MIN_COMPRESSION_SIZE`].
 const MAX_COMPRESSION_SIZE: i32 = 10_485_760;
 
+/// The window `minimumCompressionSize` takes, from the two bounds the member publishes.
+/// Shared with `UpdateRestApi`, which patches the same member.
+pub const COMPRESSION_SIZE_RANGE: ::std::ops::RangeInclusive<i32> =
+    MIN_COMPRESSION_SIZE..=MAX_COMPRESSION_SIZE;
+
+/// The refusal for a `minimumCompressionSize` outside that window: a fixed sentence that
+/// names the member's published bounds and quotes the rejected size back nowhere. Shared
+/// with `UpdateRestApi`, so the same size is refused the same way whichever operation set
+/// it.
+pub fn invalid_compression_size() -> String {
+    format!(
+        "Invalid minimum compression size, must be between {MIN_COMPRESSION_SIZE} and \
+         {MAX_COMPRESSION_SIZE}"
+    )
+}
+
+/// The `minimumCompressionSize` an API may be stored with, or the reason the requested
+/// one is refused. Shared with `UpdateRestApi`, which patches the same member.
+pub fn accepted_compression_size(requested: i32) -> Result<i32, String> {
+    if !COMPRESSION_SIZE_RANGE.contains(&requested) {
+        return Err(invalid_compression_size());
+    }
+    Ok(requested)
+}
+
 /// The `apiStatus` a freshly created API is in: it is immediately usable, so it is
 /// created in the terminal `AVAILABLE` state and no later call moves it.
 pub const API_STATUS_AVAILABLE: &str = "AVAILABLE";
@@ -362,18 +387,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model declares no range on `minimumCompressionSize`, so the boundary
         // validator passes any integer; the member's documented bounds are enforced
-        // here, and the message names the member and the bound it broke.
+        // here, with the fixed sentence the service answers an out-of-range size with:
+        // it names the member and its published window and quotes no value back.
         if let Some(size) = input.minimum_compression_size {
-            if !(MIN_COMPRESSION_SIZE..=MAX_COMPRESSION_SIZE).contains(&size) {
-                return Err(CreateRestApiErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(format!(
-                            "minimumCompressionSize must be between {MIN_COMPRESSION_SIZE} and {MAX_COMPRESSION_SIZE}, inclusive: {size}"
-                        )),
-                    },
-                )
-                .into());
-            }
+            accepted_compression_size(size).map_err(|message| {
+                CreateRestApiErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
         }
 
         // FIRST critical section: refuse past the API quota, resolve `cloneFrom`, take
@@ -388,10 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateRestApiErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(format!(
-                            "Maximum number of REST APIs exceeded: {}",
-                            crate::state::MAX_REST_APIS
-                        )),
+                        message: Some(crate::state::quota_reached("REST APIs", "account")),
                     },
                 )
                 .into());
@@ -416,10 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(CreateRestApiErrorModeled::LimitExceededException(
                             LimitExceededException {
                                 retry_after_seconds: None,
-                                message: Some(format!(
-                                    "Maximum number of resources exceeded for this API: {}",
-                                    crate::state::MAX_RESOURCES_PER_API
-                                )),
+                                message: Some(crate::state::quota_reached("Resources", "API")),
                             },
                         )
                         .into());
@@ -569,10 +584,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateRestApiErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of REST APIs exceeded: {}",
-                        crate::state::MAX_REST_APIS
-                    )),
+                    message: Some(crate::state::quota_reached("REST APIs", "account")),
                 },
             )
             .into());
