@@ -436,6 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get_mut(&asset_model_id)
             .ok_or_else(internal_failure)?;
+        // The definition this call supersedes, read before its writes land: it
+        // stays the model's ACTIVE version until the new one settles.
+        let superseded = record.definition();
         record.composite_models.push(AssetModelCompositeModel {
             id: Some(composite_model_id.clone()),
             external_id: input.asset_model_composite_model_external_id.clone(),
@@ -456,7 +459,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The asset model's definition changed, so it carries a new version and
         // owes a transition back to ACTIVE — the rule every mutating call on a
         // record follows, kept on the record itself.
-        record.begin_update(now);
+        record.begin_update(superseded, now);
 
         Ok(CreateAssetModelCompositeModelOutput {
             asset_model_composite_model_id: composite_model_id.clone(),

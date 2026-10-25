@@ -33,6 +33,8 @@ mod health_checks;
 mod hosted_zone_config;
 #[path = "all/hosted_zone_count.rs"]
 mod hosted_zone_count;
+#[path = "all/hosted_zone_features.rs"]
+mod hosted_zone_features;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
 #[path = "all/hosted_zones_by_name.rs"]
@@ -61,3 +63,5 @@ mod vpc_associations;
 mod vpc_authorization_deletion;
 #[path = "all/vpc_disassociation.rs"]
 mod vpc_disassociation;
+#[path = "all/zone_refusal_messages.rs"]
+mod zone_refusal_messages;

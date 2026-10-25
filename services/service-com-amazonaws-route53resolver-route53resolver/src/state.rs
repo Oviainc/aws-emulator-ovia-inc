@@ -16,9 +16,9 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse, OutpostResolver,
-    ResolverEndpoint, ResolverRule, ResolverRuleAssociation, ResourceNotFoundException, Tag,
-    TargetAddress, ValidationException,
+    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse,
+    OutpostResolver, ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
+    ResourceNotFoundException, Tag, TargetAddress, ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -302,6 +302,25 @@ pub const RESOURCE_TYPE_FIREWALL_DOMAIN_LIST: &str = "FirewallDomainList";
 /// `CreatorRequestId` already stored stays allowed, because it allocates no new
 /// record.
 pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
+
+/// The most VPC firewall configurations this store holds records for.
+///
+/// `UpdateFirewallConfig` admits any `ResourceId`, so without a bound a caller
+/// looping updates over fresh VPC ids would grow one emulator process without
+/// limit — the same reasoning as [`MAX_STORED_ENDPOINTS`]. An update that would
+/// need a record past this count is refused; one for a VPC the store already
+/// holds a record for allocates nothing and stays allowed, and so does a read of
+/// any VPC, which stores nothing at all.
+pub const MAX_STORED_FIREWALL_CONFIGS: usize = 1_000;
+
+/// The `FirewallFailOpenStatus` a VPC's firewall configuration carries until an
+/// update names another value.
+///
+/// `FirewallConfig$FirewallFailOpen`'s doc states it: "By default, fail open is
+/// disabled, which means the failure mode is closed." It is a member of the
+/// model's `FirewallFailOpenStatus` enum, re-exported as
+/// [`crate::ops::types::FIREWALL_FAIL_OPEN_STATUS_VALUES`].
+pub const FIREWALL_FAIL_OPEN_DISABLED: &str = "DISABLED";
 
 /// The most `TargetIps` one Resolver rule may be created with.
 ///
@@ -739,6 +758,48 @@ impl FirewallDomainListRecord {
     }
 }
 
+/// The DNS Firewall configuration of ONE VPC, as stored.
+///
+/// A VPC's firewall configuration is a singleton the service maintains itself —
+/// there is no operation that creates or deletes one — so a record exists only
+/// for a VPC whose configuration was moved off its default; every other VPC
+/// reports the default one [`ComAmazonawsRoute53resolverRoute53resolverState::firewall_config`]
+/// derives. `Id` and `OwnerId` are therefore the same whether the record exists
+/// or not, so a VPC's configuration does not change identity when it is updated.
+#[derive(Debug, Clone)]
+pub struct FirewallConfigRecord {
+    /// Creation order, for the list operation's pages (the same role as
+    /// [`FirewallDomainListRecord::seq`]).
+    ///
+    /// `0` on the default configuration
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::firewall_config`]
+    /// derives for a VPC the store holds no record for: the id sequence starts
+    /// at 1, so a stored record never carries it.
+    pub seq: u64,
+    /// The `Id` of this configuration, [`firewall_config_id`] of its VPC.
+    pub id: String,
+    /// The `ResourceId`: "The ID of the VPC that this firewall configuration
+    /// applies to."
+    pub resource_id: String,
+    /// "The Amazon Web Services account ID of the owner of the VPC."
+    pub owner_id: String,
+    /// One of [`crate::ops::types::FIREWALL_FAIL_OPEN_STATUS_VALUES`].
+    pub firewall_fail_open: String,
+}
+
+impl FirewallConfigRecord {
+    /// The record as the modelled `FirewallConfig` shape the firewall
+    /// configuration operations report.
+    pub fn to_firewall_config(&self) -> FirewallConfig {
+        FirewallConfig {
+            id: Some(self.id.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            firewall_fail_open: Some(self.firewall_fail_open.clone()),
+        }
+    }
+}
+
 /// One IP address of a Resolver endpoint, as stored.
 #[derive(Debug, Clone)]
 pub struct IpAddressRecord {
@@ -1104,6 +1165,144 @@ impl ResolverRuleAssociationRecord {
     }
 }
 
+/// `Validation` values, the model's whole enum
+/// (`smithy_query(query="shape",shape="Validation")`, re-exported as
+/// [`crate::ops::types::VALIDATION_VALUES`]): the new DNSSEC validation setting
+/// a request asks a VPC's configuration to take.
+pub const VALIDATION_ENABLE: &str = "ENABLE";
+pub const VALIDATION_DISABLE: &str = "DISABLE";
+pub const VALIDATION_USE_LOCAL_RESOURCE_SETTING: &str = "USE_LOCAL_RESOURCE_SETTING";
+
+/// `ResolverDNSSECValidationStatus` values the DNSSEC validation slice reports,
+/// the model's whole enum
+/// (`smithy_query(query="shape",shape="ResolverDNSSECValidationStatus")`,
+/// re-exported as
+/// [`crate::ops::types::RESOLVER_D_N_S_S_E_C_VALIDATION_STATUS_VALUES`]).
+///
+/// `ValidationStatus`' doc pairs each settled value with the transient one that
+/// precedes it: "ENABLING: DNSSEC validation is being enabled but is not
+/// complete", "ENABLED: DNSSEC validation is enabled", "DISABLING: DNSSEC
+/// validation is being disabled but is not complete", "DISABLED: DNSSEC
+/// validation is disabled".
+pub const DNSSEC_STATUS_ENABLING: &str = "ENABLING";
+pub const DNSSEC_STATUS_ENABLED: &str = "ENABLED";
+pub const DNSSEC_STATUS_DISABLING: &str = "DISABLING";
+pub const DNSSEC_STATUS_DISABLED: &str = "DISABLED";
+pub const DNSSEC_STATUS_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING: &str =
+    "UPDATING_TO_USE_LOCAL_RESOURCE_SETTING";
+pub const DNSSEC_STATUS_USE_LOCAL_RESOURCE_SETTING: &str = "USE_LOCAL_RESOURCE_SETTING";
+
+/// `ResourceNotFoundException$ResourceType` for a configuration for DNSSEC
+/// validation: the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_RESOLVER_DNSSEC_CONFIG: &str = "ResolverDnssecConfig";
+
+/// The most configurations for DNSSEC validation this store holds, for the same
+/// reason as [`MAX_STORED_ENDPOINTS`]: every write operation of this service is
+/// reachable by any caller, so the store must not grow without a bound. One
+/// configuration is allocated per distinct `ResourceId`, and an update of a
+/// `ResourceId` already stored stays allowed, because it allocates nothing.
+pub const MAX_STORED_DNSSEC_CONFIGS: usize = 1_000;
+
+/// The pair of `ResolverDNSSECValidationStatus` values one requested
+/// `Validation` moves a VPC's configuration through: the transient status it
+/// reports while the change is in flight, and the settled status it reports
+/// once the clock owes the move.
+///
+/// `Validation`'s doc — "Be aware that it can take time for a validation status
+/// change to be completed" — is why the transient status exists, and
+/// `ValidationStatus`' doc is what pairs each settled value with it.
+/// `USE_LOCAL_RESOURCE_SETTING` takes the enum's own
+/// `UPDATING_TO_USE_LOCAL_RESOURCE_SETTING` as its in-flight value. `None` for
+/// a value the model's `Validation` enum does not declare: a handler refuses
+/// that rather than treating it as one of these.
+pub fn dnssec_validation_transition(validation: &str) -> Option<(&'static str, &'static str)> {
+    match validation {
+        VALIDATION_ENABLE => Some((DNSSEC_STATUS_ENABLING, DNSSEC_STATUS_ENABLED)),
+        VALIDATION_DISABLE => Some((DNSSEC_STATUS_DISABLING, DNSSEC_STATUS_DISABLED)),
+        VALIDATION_USE_LOCAL_RESOURCE_SETTING => Some((
+            DNSSEC_STATUS_UPDATING_TO_USE_LOCAL_RESOURCE_SETTING,
+            DNSSEC_STATUS_USE_LOCAL_RESOURCE_SETTING,
+        )),
+        _ => None,
+    }
+}
+
+/// Mint the `Id` of a configuration for DNSSEC validation from the id sequence.
+///
+/// AWS names one `rdsc-<hex>`, and the model constrains `ResourceId` only to
+/// length 1..64, so the id is recognisable as this resource's and fits the
+/// member, exactly as [`mint_endpoint_id`]'s is.
+pub fn mint_dnssec_config_id(seq: u64) -> String {
+    format!("rdsc-{:016x}", scramble(seq))
+}
+
+/// The `ResourceNotFoundException` `GetResolverDnssecConfig` answers for a VPC
+/// the store holds no configuration for DNSSEC validation under.
+///
+/// See [`resolver_rule_not_found`] on the absent `RSLVR-nnnnn` service error
+/// code: the wire error code clients match on is the shape name, and the
+/// modelled `ResourceType` says which resource was missing.
+pub fn resolver_dnssec_config_not_found(resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver DNSSEC configuration for resource with ID "{resource_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_DNSSEC_CONFIG.to_string()),
+    }
+}
+
+/// One configuration for DNSSEC validation, as stored.
+///
+/// The reported `ValidationStatus` is computed from the stored status pair and
+/// the due instant, so a read never has to write to settle one — the same shape
+/// as [`ResolverEndpointRecord`].
+#[derive(Debug, Clone)]
+pub struct ResolverDnssecConfigRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// order the configurations are reported in, independent of the hash order
+    /// of the map that holds them; `ListResolverDnssecConfigs`, still a
+    /// scaffold, is what will read it.
+    pub seq: u64,
+    /// The emulator-minted `Id` (`rdsc-<hex>`), stable for the life of the
+    /// configuration: a later update of the same VPC keeps it.
+    pub id: String,
+    /// `OwnerId`: "The owner account ID of the virtual private cloud (VPC)".
+    pub owner_id: String,
+    /// `ResourceId`: the VPC this configuration is for.
+    pub resource_id: String,
+    /// The `ValidationStatus` reported while the requested change is in flight.
+    pub status: String,
+    /// The `ValidationStatus` reported once the move the clock owes falls due.
+    pub settled_status: String,
+    /// When that move falls due.
+    pub settled_at: Instant,
+}
+
+impl ResolverDnssecConfigRecord {
+    /// This configuration's `ValidationStatus` as of `now`: the transient
+    /// status until the move the clock owes falls due, the settled one after
+    /// it.
+    pub fn validation_status_at(&self, now: Instant) -> &str {
+        if now < self.settled_at {
+            &self.status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// Project the record onto the modelled `ResolverDnssecConfig`.
+    pub fn to_dnssec_config(&self, now: Instant) -> ResolverDnssecConfig {
+        ResolverDnssecConfig {
+            id: Some(self.id.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            validation_status: Some(self.validation_status_at(now).to_string()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-route53resolver-route53resolver. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRoute53resolverRoute53resolverState {
@@ -1136,9 +1335,24 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` identifies a request to ONE operation, so this map is
     /// kept apart from theirs.
     pub firewall_domain_list_creator_request_ids: HashMap<String, String>,
+    /// Every stored configuration for DNSSEC validation, keyed by the
+    /// `ResourceId` (the VPC) it configures: `UpdateResolverDnssecConfig`
+    /// updates "an existing DNSSEC validation configuration" or creates one, so
+    /// a VPC has at most one, and that id is also what
+    /// `GetResolverDnssecConfig` resolves.
+    pub resolver_dnssec_configs: HashMap<String, ResolverDnssecConfigRecord>,
+    /// The DNS Firewall configuration of every VPC whose configuration was
+    /// moved off its default, keyed by that VPC's id (`FirewallConfig$ResourceId`).
+    ///
+    /// A firewall configuration is a per-VPC singleton the service maintains
+    /// itself, so this map is an override table and not an inventory: a VPC it
+    /// holds no entry for still HAS a configuration, the default one
+    /// [`Self::firewall_config`] derives.
+    pub firewall_configs: HashMap<String, FirewallConfigRecord>,
     /// Monotonic counter behind every minted id (endpoint, IP, Resolver on an
-    /// Outpost, rule, association), so ids are reproducible within a run and
-    /// never collide — across resources as well as within one.
+    /// Outpost, rule, association, DNSSEC configuration), so ids are
+    /// reproducible within a run and never collide — across resources as well
+    /// as within one.
     pub id_seq: u64,
 }
 
@@ -1213,6 +1427,41 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         let mut all: Vec<&OutpostResolverRecord> = self.outpost_resolvers.values().collect();
         all.sort_by_key(|record| record.seq);
         all
+    }
+
+    /// Whether one more configuration for DNSSEC validation may be stored,
+    /// i.e. the store is still below [`MAX_STORED_DNSSEC_CONFIGS`]. An update
+    /// that this refuses writes nothing.
+    pub fn can_store_another_dnssec_config(&self) -> bool {
+        self.resolver_dnssec_configs.len() < MAX_STORED_DNSSEC_CONFIGS
+    }
+
+    /// The DNS Firewall configuration of the VPC `resource_id`, which every VPC
+    /// has: the stored record when one was written for it, and otherwise the
+    /// default configuration that VPC reports — identical identity
+    /// ([`firewall_config_id`] of the VPC, owned by this account) with
+    /// `FirewallFailOpen` at its documented default.
+    ///
+    /// A pure read: a VPC with no record is NOT given one here, so reporting a
+    /// configuration never changes what a later caller sees.
+    pub fn firewall_config(&self, resource_id: &str) -> FirewallConfigRecord {
+        self.firewall_configs
+            .get(resource_id)
+            .cloned()
+            .unwrap_or_else(|| FirewallConfigRecord {
+                seq: 0,
+                id: firewall_config_id(resource_id),
+                resource_id: resource_id.to_string(),
+                owner_id: ::engine::emulator_account_id().to_string(),
+                firewall_fail_open: FIREWALL_FAIL_OPEN_DISABLED.to_string(),
+            })
+    }
+
+    /// Whether one more VPC's firewall configuration may be stored, i.e. the
+    /// store is still below [`MAX_STORED_FIREWALL_CONFIGS`]. Asked only for a
+    /// VPC [`Self::firewall_configs`] holds no record for yet.
+    pub fn can_store_another_firewall_config(&self) -> bool {
+        self.firewall_configs.len() < MAX_STORED_FIREWALL_CONFIGS
     }
 
     /// Every stored firewall domain list in creation order — the order
@@ -1312,6 +1561,21 @@ pub fn mint_rule_association_id(seq: u64) -> String {
 /// (length 1..64).
 pub fn mint_firewall_domain_list_id(seq: u64) -> String {
     format!("rslvr-fdl-{:016x}", scramble(seq))
+}
+
+/// The `Id` of a VPC's DNS Firewall configuration. AWS names one
+/// `rslvr-fc-<hex>`; every result fits `ResourceId` (length 1..64).
+///
+/// Derived from the VPC id rather than taken from the id sequence, because no
+/// operation creates a firewall configuration: one exists for a VPC whether or
+/// not anything has ever written to it, so its id has to be a function of the
+/// VPC it belongs to. The same VPC therefore reports the same `Id` from every
+/// call, before and after an update.
+pub fn firewall_config_id(resource_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"route53resolver/firewall-config/v1");
+    feed_field(&mut hasher, resource_id.as_bytes());
+    format!("rslvr-fc-{}", hex::encode(&hasher.finalize()[..8]))
 }
 
 /// The `HostVPCId` of an endpoint placed in `subnet_ids`.

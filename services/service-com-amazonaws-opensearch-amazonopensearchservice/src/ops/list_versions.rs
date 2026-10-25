@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the engine-version catalog this emulator publishes as supported:
+//! [`crate::state::SUPPORTED_ENGINE_VERSIONS`], the ONE statement of that set, in the
+//! upgrade order it is written in — the same set and order `GetCompatibleVersions`
+//! builds its table from, so a caller cannot read two different catalogs.
+//!
+//! Which versions the service supports is published BY the service, never created by a
+//! caller, so this is a pure read: it reaches no account state, writes nothing, and the
+//! same request answers the same way on every call.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +82,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +156,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVersions"))
+        // The catalog is published by the service, so no account state is read: `ctx`
+        // and the engine carry nothing this answer depends on.
+        let _ = (ctx, &self.engine);
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size
+        // at all — so it is refused rather than reinterpreted, while `@default(0)` (no
+        // page size sent) stays the unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(ListVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "MaxResults must be between 0 and {MAX_PAGE_SIZE}: {}",
+                        input.max_results
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let versions = crate::state::SUPPORTED_ENGINE_VERSIONS;
+
+        // The token names the first version of the page to answer with, so a caller
+        // resumes exactly where the previous page stopped. It is only ever a value this
+        // operation handed out, so one that names no published version is a malformed
+        // request rather than an empty page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => versions
+                .iter()
+                .position(|version| *version == token)
+                .ok_or_else(|| {
+                    ListVersionsErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return." `MaxResults` is `@default(0)`, so a request that sends no page size
+        // reaches here as zero: nothing bounds the page but the catalog itself, which is
+        // finite. Every other value reaching here is in `1..=MAX_PAGE_SIZE`.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(versions.len());
+        let end = start.saturating_add(page_size).min(versions.len());
+        let page: Vec<String> = versions[start..end]
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+
+        // "When nextToken is returned, there are more results available" — so the
+        // member is present only while the catalog holds a version this page did not
+        // report, and the last page carries none.
+        let next_token = versions.get(end).map(|version| (*version).to_string());
+
+        Ok(ListVersionsOutput {
+            versions: Some(page),
+            next_token,
+        })
     }
 }

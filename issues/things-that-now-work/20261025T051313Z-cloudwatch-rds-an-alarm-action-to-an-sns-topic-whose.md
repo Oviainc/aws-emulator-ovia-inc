@@ -42,3 +42,29 @@ Actual: the denied topic's item is actionState 'Succeeded' with no error member;
 3. On the second topic, SetTopicAttributes(AttributeName='Policy') with the default policy plus an explicit Deny of sns:Publish for Principal {Service: cloudwatch.amazonaws.com} on that topic; confirm with GetTopicAttributes.
 4. cloudwatch:PutMetricAlarm over Namespace='AWS/RDS', MetricName='DatabaseConnections', Dimensions=[{DBInstanceIdentifier, <nonexistent instance id>}], Period=60, EvaluationPeriods=1, Threshold=1.0, ComparisonOperator='GreaterThanOrEqualToThreshold', TreatMissingData='breaching', AlarmActions=[allowed topic, denied topic].
 5. Poll cloudwatch:DescribeAlarmHistory(AlarmName=..., HistoryItemType='Action', AlarmTypes=['MetricAlarm']) until an item exists for each topic ARN, and parse HistoryData. The denied topic's item reports actionState 'Succeeded'; sqs:ReceiveMessage also shows the denied topic's notification delivered.
+
+## Resolution
+
+The cause this report names is fixed: `settle_alarms` now decides each alarm action on the
+target topic's own access policy (read through the in-process callback and evaluated with the
+shared IAM policy evaluation for the service principal the action is executed as, with the
+firing alarm's ARN and account in the request context). An explicit deny of the publish
+suppresses it, and the action is recorded with actionState 'Failed', an error naming the
+SNS:Publish authorization failure and the topic, and no publishedMessage. The rule is pinned by
+`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/tests/all/sns_action_topic_policy.rs`
+(a table over the forms a topic policy takes, the two actions of one transition, the deny
+removed) and `tests/all/replay_probe.rs` (the same over a transition the evaluation clock made
+due, and two alarms firing one topic).
+
+Replay note, so the move is not read as a green replay: the recorded check now clears both of
+its assertions about the denied action (verified by staged runs — with the decision recorded but
+the notification still delivered, the check's next assertion, "the denied topic must deliver
+nothing", is the one it reaches, and a diagnostic build confirmed the decision this emulator
+takes for the recorded topic is an explicit deny) and then times out on a later barrier of its
+own, which waits for a whole second alarm cycle (the deny removed, a fresh alarm, its evaluation,
+its publish and its delivery) inside the harness's 60-second cap, after the first cycle's polling
+has already consumed much of it. The emulator does produce that cycle: with the alarm clock on
+mainline, a fresh breaching alarm's notification reaches the subscribed queue with no further
+CloudWatch call, and the formerly denied topic publishes once the deny is gone — both asserted in
+`tests/all/replay_probe.rs`. The remaining timeout could not be placed on any cause this report
+names.

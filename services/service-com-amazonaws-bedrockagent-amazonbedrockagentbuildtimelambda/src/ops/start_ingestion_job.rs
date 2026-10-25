@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartIngestionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartIngestionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartIngestionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Begins a data ingestion job for one data source of one knowledge base: it
+//! mints an `ingestionJobId`, persists the job in
+//! [`crate::state::IngestionJobRecord`] in the `STARTING` status the model
+//! declares, and answers with that stored record. The job's progression to
+//! `IN_PROGRESS` and then `COMPLETE` is owed by the CLOCK alone, so
+//! `GetIngestionJob` reports whatever status the stored record has reached.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartIngestionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartIngestionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartIngestionJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartIngestionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // A job ingests one data source of one knowledge base, so both have to
+        // exist: a data source is identified by the pair, which makes an id of
+        // another knowledge base's data source as absent here as one nothing
+        // holds.
+        if !state.knowledge_bases.contains_key(&input.knowledge_base_id) {
+            return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "could not find knowledge base with identifier {}",
+                        input.knowledge_base_id
+                    )),
+                },
+            )
+            .into());
+        }
+        if state
+            .data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            .is_none()
+        {
+            return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "could not find data source with identifier {} in knowledge base {}",
+                        input.data_source_id, input.knowledge_base_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request
+        // returns the job it already started rather than starting a second one.
+        // The index is keyed by the whole request scope, so the same token used
+        // for another data source names its own job instead of displacing this
+        // one.
+        let token_key = input.client_token.as_ref().map(|token| {
+            (
+                input.knowledge_base_id.clone(),
+                input.data_source_id.clone(),
+                token.clone(),
+            )
+        });
+        let replayed = token_key
+            .as_ref()
+            .and_then(|key| state.ingestion_job_client_tokens.get(key))
+            .cloned();
+        if let Some(existing) = replayed.as_deref().and_then(|ingestion_job_id| {
+            state.ingestion_job_of(
+                &input.knowledge_base_id,
+                &input.data_source_id,
+                ingestion_job_id,
+            )
+        }) {
+            return Ok(StartIngestionJobOutput {
+                ingestion_job: existing.to_ingestion_job(),
+            });
+        }
+
+        // A data source is ingested by one job at a time: while a job of this
+        // data source has not reached a terminal status, starting another is
+        // the conflict this operation models. Checked AFTER the idempotency
+        // replay above, so a retry of the accepted start is still served.
+        if let Some(running) =
+            state.running_ingestion_job(&input.knowledge_base_id, &input.data_source_id)
+        {
+            return Err(StartIngestionJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Ingestion job {} is already in progress for data source {} in \
+                         knowledge base {}",
+                        running.ingestion_job_id,
+                        input.data_source_id,
+                        input.knowledge_base_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its quota a start is refused rather than
+        // adding another record, and `ServiceQuotaExceededException` is the
+        // modelled refusal for exactly that.
+        if state.ingestion_job_count(&input.knowledge_base_id, &input.data_source_id)
+            >= crate::state::INGESTION_JOB_QUOTA
+        {
+            return Err(
+                StartIngestionJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "data source {} of knowledge base {} has already run the maximum \
+                             of {} ingestion jobs",
+                            input.data_source_id,
+                            input.knowledge_base_id,
+                            crate::state::INGESTION_JOB_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(ingestion_job_id) = state.mint_ingestion_job_id(now) else {
+            return Err(StartIngestionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint an unused ingestionJobId".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::IngestionJobRecord::starting(
+            input.knowledge_base_id,
+            input.data_source_id,
+            ingestion_job_id.clone(),
+            input.description,
+            input.client_token,
+            now,
+        );
+
+        let ingestion_job = record.to_ingestion_job();
+        if let Some(key) = token_key {
+            state
+                .ingestion_job_client_tokens
+                .insert(key, ingestion_job_id.clone());
+        }
+        state.ingestion_jobs.insert(ingestion_job_id, record);
+
+        Ok(StartIngestionJobOutput { ingestion_job })
     }
 }

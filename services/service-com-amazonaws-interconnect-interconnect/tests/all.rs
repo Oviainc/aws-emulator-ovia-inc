@@ -15,6 +15,8 @@
 mod arn_scope_refusals;
 #[path = "all/attach_points.rs"]
 mod attach_points;
+#[path = "all/billing_tier.rs"]
+mod billing_tier;
 #[path = "all/caller_created_gateways_are_attach_points.rs"]
 mod caller_created_gateways_are_attach_points;
 #[path = "all/connection_lifecycle.rs"]

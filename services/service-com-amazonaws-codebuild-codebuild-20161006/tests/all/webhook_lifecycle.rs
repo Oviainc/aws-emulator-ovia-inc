@@ -927,7 +927,10 @@ async fn an_update_refuses_what_it_cannot_apply() {
     );
 
     // A configuration no webhook event can ever satisfy, and a build type the project's
-    // source does not take. Each row names the input member its refusal is about.
+    // source does not take. Each row states what its refusal must say: a filter-group
+    // refusal names the input member it is about, while a build-type refusal is
+    // CodeBuild's own fixed sentence for the build-type/source-type pairing, which names
+    // only the project's stored source type.
     let refused: &[(&str, Value, &str)] = &[
         (
             "a lone HEAD_REF group",
@@ -946,10 +949,10 @@ async fn an_update_refuses_what_it_cannot_apply() {
         (
             "a runner build type on a repository source",
             json!({"buildType": "RUNNER_BUILDKITE_BUILD"}),
-            "buildType",
+            "Invalid build type provided for GITHUB type webhook",
         ),
     ];
-    for (index, (case, request, member)) in refused.iter().enumerate() {
+    for (index, (case, request, stated)) in refused.iter().enumerate() {
         let router = emulator();
         let project = format!("uw-bad-{index}");
         let created =
@@ -964,8 +967,8 @@ async fn an_update_refuses_what_it_cannot_apply() {
             "{case}: expected InvalidInputException, got {body}"
         );
         assert!(
-            body["message"].as_str().unwrap_or_default().contains(member),
-            "{case}: the refusal must name the member it is about, got {body}"
+            body["message"].as_str().unwrap_or_default().contains(stated),
+            "{case}: the refusal must state {stated:?}, got {body}"
         );
         assert_same_configuration(
             &format!("{case}: after the refusal"),

@@ -178,17 +178,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An array of tag keys to delete": every key named goes, and a key the
         // resource does not carry is already in the state the caller asked for, so
-        // naming it is not a refusal. Keys the request does not name stay. An ARN
-        // naming no existing resource is the operation's modelled 404.
+        // naming it is not a refusal. Keys the request does not name stay. A key
+        // in the reserved namespace is not the caller's to remove, which is a bad
+        // request; an ARN naming no existing resource is the operation's
+        // modelled 404.
         state
             .remove_resource_tags(&input.resource_arn, &input.tag_keys)
-            .map_err(|_| {
-                DeleteTagsErrorModeled::NotFoundException(NotFoundException {
+            .map_err(|refusal| match refusal {
+                crate::state::TagRefusal::ReservedKeyPrefix { key } => {
+                    DeleteTagsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(crate::state::reserved_tag_key_message(&key)),
+                    })
+                }
+                // A removal only ever shrinks a tag map, so the count and length
+                // refusals of the write path cannot arise here: what is left is
+                // an ARN naming no live resource.
+                _ => DeleteTagsErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::not_found_message(
                         "Resource",
                         &input.resource_arn,
                     )),
-                })
+                }),
             })?;
 
         Ok(DeleteTagsOutput)

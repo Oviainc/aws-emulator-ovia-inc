@@ -216,6 +216,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `AccessString` is the user's permissions as a rule list of the engine's ACL
+        // syntax, so it is PARSED before it is canonicalised and stored: a string
+        // carrying a rule the engine does not define names no permission at all. The
+        // shared rule is the one `UpdateUser` reads, so both write paths of a user's
+        // access string refuse the same values.
+        if let Some(message) = crate::state::access_string_rejection(&input.access_string) {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let user_name = crate::state::fold_name(&input.user_name);
         let now = std::time::Instant::now();
         let mut state = state.lock();

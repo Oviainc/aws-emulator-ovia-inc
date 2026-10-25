@@ -63,6 +63,8 @@ mod resource_tags;
 mod service_dependency_metrics;
 #[path = "all/service_groups.rs"]
 mod service_groups;
+#[path = "all/sli_metric_query.rs"]
+mod sli_metric_query;
 #[path = "all/sli_metric_type.rs"]
 mod sli_metric_type;
 #[path = "all/slo_evaluation_kind.rs"]

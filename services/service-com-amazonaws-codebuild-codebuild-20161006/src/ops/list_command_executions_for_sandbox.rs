@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCommandExecutionsForSandbox
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCommandExecutionsForSandbox`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCommandExecutionsForSandbox::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the command executions a sandbox holds: this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +138,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCommandExecutionsForSandbox` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCommandExecutionsForSandboxErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCommandExecutionsForSandbox"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListCommandExecutionsForSandbox (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form names
+        // the same record — the rewrite every sandbox-addressing operation shares.
+        let sandbox_id = crate::state::sandbox_store_id(&input.sandbox_id).to_string();
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+        // The ids this sandbox's executions were submitted under, oldest first (the
+        // order `insert_command_execution` keeps them in). An id the account holds no
+        // execution for lists nothing rather than refusing: this operation reports the
+        // executions recorded against the id, and the store retires a sandbox's record
+        // before the executions it ran.
+        let mut ids: Vec<String> = guard
+            .command_executions_by_sandbox
+            .get(&sandbox_id)
+            .cloned()
+            .unwrap_or_default();
+        if input.sort_order.as_deref() != Some(ASCENDING_SORT_ORDER) {
+            ids.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&ids, input.next_token.as_deref(), input.max_results)
+        else {
+            drop(guard);
+            return Err(
+                ListCommandExecutionsForSandboxErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut command_executions = Vec::with_capacity(page.len());
+        for id in &page {
+            // Read through `settled_command_execution`, so the transition the clock has
+            // owed each execution since it was submitted is materialised before it is
+            // reported — the same record `BatchGetCommandExecutions` hands back.
+            if let Some(stored) = guard.settled_command_execution(&sandbox_id, id, now) {
+                command_executions.push(stored.command_execution.clone());
+            }
+        }
+        drop(guard);
+
+        Ok(ListCommandExecutionsForSandboxOutput {
+            // `CommandExecutions` carries no `@length`, so an empty page is
+            // representable and is serialized as `[]` — the same answer
+            // `BatchGetCommandExecutions` gives for a list of its own that came out
+            // empty.
+            command_executions: Some(command_executions),
+            next_token,
+        })
     }
 }
+
+/// The one `SortOrderType` value that asks for the oldest execution first.
+///
+/// `ListCommandExecutionsForSandboxInput$sortOrder` documents no default ("The order in
+/// which sandbox records should be retrieved."), so the default here is the one
+/// CodeBuild documents for the sibling member it does describe,
+/// `ListBuildsForProjectInput$sortOrder`: "If this is not specified, the results are
+/// sorted in descending order." Anything that is not `ASCENDING` therefore reports the
+/// most recently submitted execution first.
+const ASCENDING_SORT_ORDER: &str = "ASCENDING";

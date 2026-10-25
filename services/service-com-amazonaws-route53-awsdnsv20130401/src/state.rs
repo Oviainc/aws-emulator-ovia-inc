@@ -29,11 +29,13 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
-    KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy,
-    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    HostedZoneFeatures, KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone,
+    NoSuchTrafficPolicy, ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES,
+    V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -51,6 +53,32 @@ pub const CHANGE_PROPAGATION: Duration = Duration::from_millis(500);
 pub const STATUS_PENDING: &str = "PENDING";
 /// The `Status` of a change that has propagated (`ChangeStatus` enum).
 pub const STATUS_INSYNC: &str = "INSYNC";
+
+/// How long after an accepted features update a hosted zone's accelerated
+/// recovery reaches the setting that update asked for.
+///
+/// `AcceleratedRecoveryStatus` carries `ENABLING` and `DISABLING` beside
+/// `ENABLED` and `DISABLED`, so the zone is reported MOVING to a setting before
+/// it is reported holding it. Nothing in the model documents how long that move
+/// takes, so the span is this emulator's own: short, but never zero, so a caller
+/// that reads the zone straight back still observes the transition it started.
+pub const ACCELERATED_RECOVERY_PROPAGATION: Duration = Duration::from_millis(500);
+
+/// The status of a zone whose accelerated recovery is moving to on
+/// (`AcceleratedRecoveryStatus$ENABLING`).
+pub const ACCELERATED_RECOVERY_ENABLING: &str = "ENABLING";
+
+/// The status of a zone whose accelerated recovery is on
+/// (`AcceleratedRecoveryStatus$ENABLED`).
+pub const ACCELERATED_RECOVERY_ENABLED: &str = "ENABLED";
+
+/// The status of a zone whose accelerated recovery is moving to off
+/// (`AcceleratedRecoveryStatus$DISABLING`).
+pub const ACCELERATED_RECOVERY_DISABLING: &str = "DISABLING";
+
+/// The status of a zone whose accelerated recovery is off
+/// (`AcceleratedRecoveryStatus$DISABLED`).
+pub const ACCELERATED_RECOVERY_DISABLED: &str = "DISABLED";
 
 /// The signing status of a hosted zone Route 53 signs.
 ///
@@ -306,6 +334,17 @@ pub const HOSTED_ZONE_NOT_EMPTY_MESSAGE: &str =
     "The specified hosted zone contains resource record sets other than the default SOA and NS \
      records and so cannot be deleted. Delete all non-default records and try again.";
 
+/// The refusal text `DisassociateVPCFromHostedZone` answers a request that would
+/// take the LAST VPC out of a private hosted zone's association set with
+/// (`LastVPCAssociation`, HTTP 400).
+///
+/// A CONSTANT, like [`HOSTED_ZONE_NOT_EMPTY_MESSAGE`] beside it: it names
+/// neither the VPC the request asked to remove nor the zone it asked about, so a
+/// caller telling this boundary apart from the other 4xx refusals of the same
+/// operation matches one fixed sentence rather than a per-request one.
+pub const LAST_VPC_ASSOCIATION_MESSAGE: &str =
+    "Cannot remove last VPC association for private zone";
+
 /// The version number a traffic policy's first version carries.
 ///
 /// `TrafficPolicy$Version`'s own documentation: "For a new traffic policy, the
@@ -463,6 +502,40 @@ impl StoredChange {
     }
 }
 
+/// A hosted zone's accelerated recovery setting, as one accepted
+/// `UpdateHostedZoneFeatures` left it.
+///
+/// Holds the setting the caller asked for plus the instant the zone finishes
+/// moving to it, so the status a read reports is DERIVED from the clock (see
+/// [`AcceleratedRecovery::status`]) rather than advanced by whoever reads it.
+#[derive(Debug, Clone)]
+pub struct AcceleratedRecovery {
+    /// Whether the last accepted update asked for accelerated recovery ON.
+    pub enabled: bool,
+    /// The instant the zone finishes moving to that setting; see
+    /// [`ACCELERATED_RECOVERY_PROPAGATION`].
+    pub settles_at: Instant,
+}
+
+impl AcceleratedRecovery {
+    /// The `AcceleratedRecoveryStatus` a hosted-zone read reports: the moving
+    /// status until [`AcceleratedRecovery::settles_at`], the settled one from
+    /// then on.
+    pub fn status(&self) -> &'static str {
+        match (self.enabled, self.settled()) {
+            (true, false) => ACCELERATED_RECOVERY_ENABLING,
+            (true, true) => ACCELERATED_RECOVERY_ENABLED,
+            (false, false) => ACCELERATED_RECOVERY_DISABLING,
+            (false, true) => ACCELERATED_RECOVERY_DISABLED,
+        }
+    }
+
+    /// Whether the move this setting started has completed.
+    pub fn settled(&self) -> bool {
+        Instant::now() >= self.settles_at
+    }
+}
+
 /// The identity of a resource record set within a zone.
 ///
 /// Route 53 keys a record set by (name, type, set identifier), and
@@ -584,6 +657,16 @@ pub struct StoredZone {
     /// records cannot disagree about them. `None` for a zone Route 53 minted
     /// name servers of its own for.
     pub delegation_set_id: Option<String>,
+    /// The zone's accelerated recovery setting, once `UpdateHostedZoneFeatures`
+    /// has configured it — the state a hosted-zone read reports as `Features`.
+    ///
+    /// `None` for a zone nobody has configured the feature on, which is how
+    /// every zone is created: `CreateHostedZone` carries no features input, so a
+    /// new zone has no features configuration to report and accelerated
+    /// recovery is OFF for it. Held ON the zone, like the signing flag and the
+    /// tags beside it, so deleting the zone takes its features with it and no
+    /// second record can disagree about them.
+    pub accelerated_recovery: Option<AcceleratedRecovery>,
 }
 
 impl StoredZone {
@@ -609,8 +692,35 @@ impl StoredZone {
             config,
             resource_record_set_count: Some(self.records.len() as i64),
             linked_service: None,
-            features: None,
+            // Read off the zone, so what the last accepted features update left
+            // is what every hosted-zone read reports.
+            features: self.to_hosted_zone_features(),
         }
+    }
+
+    /// The `Features` a hosted-zone read reports for this zone.
+    ///
+    /// Present once `UpdateHostedZoneFeatures` has configured the zone, and
+    /// absent while nothing has: `HostedZone$Features` has no default, so a zone
+    /// with no features configuration reports the container absent rather than
+    /// an invented status. `FailureReasons` stays absent because no features
+    /// change this store accepts fails.
+    pub fn to_hosted_zone_features(&self) -> Option<HostedZoneFeatures> {
+        self.accelerated_recovery
+            .as_ref()
+            .map(|feature| HostedZoneFeatures {
+                accelerated_recovery_status: Some(feature.status().to_string()),
+                failure_reasons: None,
+            })
+    }
+
+    /// Whether accelerated recovery is the setting the zone holds or is moving
+    /// to: `true` from an accepted enable until a disable is accepted. A zone
+    /// whose features were never configured has it off.
+    pub fn accelerated_recovery_enabled(&self) -> bool {
+        self.accelerated_recovery
+            .as_ref()
+            .is_some_and(|feature| feature.enabled)
     }
 
     /// The zone's own name servers as a `DelegationSet`.
@@ -1786,13 +1896,38 @@ pub fn resource_location(
 ///
 /// The ONE place this service words that refusal, so every zone-addressed
 /// operation answers a missing zone identically. The message is
-/// REQUEST-DERIVED — it names the id the request asked about, as the request
-/// wrote it — which is what lets a caller tell which of a batch of ids was the
-/// missing one: `No hosted zone found with ID: <the requested id>`.
+/// REQUEST-DERIVED — it names the zone id the request asked about — which is
+/// what lets a caller tell which of a batch of ids was the missing one:
+/// `No hosted zone found with ID: <the requested id>`. The id is reported BARE,
+/// as [`normalize_zone_id`] resolves it, because the bare id and the
+/// `/hostedzone/`-prefixed form a response hands back name the same zone and the
+/// refusal reports the zone that was looked for, not the spelling it arrived in.
 pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
     NoSuchHostedZone {
-        message: Some(format!("No hosted zone found with ID: {requested_id}")),
+        message: Some(missing_hosted_zone_message(requested_id)),
     }
+}
+
+/// The modelled `HostedZoneNotFound` (HTTP 400) for a zone id that names no
+/// zone in this store.
+///
+/// A DIFFERENT shape from [`no_such_hosted_zone`] — the one
+/// `CreateReusableDelegationSet` declares for the zone its `HostedZoneId` names
+/// — reporting the same thing, so it is worded by the same rule and through the
+/// same sentence: request-derived, naming the bare zone id that was looked for.
+pub fn hosted_zone_not_found(requested_id: &str) -> HostedZoneNotFound {
+    HostedZoneNotFound {
+        message: Some(missing_hosted_zone_message(requested_id)),
+    }
+}
+
+/// The one sentence this service reports a zone id that names no zone with,
+/// whichever modelled shape carries it.
+fn missing_hosted_zone_message(requested_id: &str) -> String {
+    format!(
+        "No hosted zone found with ID: {}",
+        normalize_zone_id(requested_id)
+    )
 }
 
 /// The modelled `NoSuchDelegationSet` for an id that names no reusable

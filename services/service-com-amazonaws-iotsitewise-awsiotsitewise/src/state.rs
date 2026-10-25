@@ -70,6 +70,7 @@
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
@@ -734,6 +735,11 @@ pub struct CaptureSourceRecord {
 
 /// A stored asset model: everything `DescribeAssetModel` reports, plus the
 /// bookkeeping (`version`, `tags`, `active_at`) the other operations read.
+///
+/// The members below carry the model's LATEST version, and
+/// [`Self::superseded_active`] the definition of its ACTIVE one for as long as
+/// those are two different definitions — which is exactly while a write the
+/// model already accepted is still settling.
 #[derive(Debug, Clone)]
 pub struct AssetModelRecord {
     pub id: String,
@@ -762,7 +768,45 @@ pub struct AssetModelRecord {
     /// while a mutating call it already accepted settles.
     pub settling_state: String,
     pub version: u32,
+    /// The definition of the model's ACTIVE version while the members above are
+    /// NOT it: the one the write that is still settling superseded.
+    ///
+    /// Recorded by [`Self::begin_update`] and consulted only while the
+    /// transition that write owes is still pending — from then on the stored
+    /// definition IS the active one. `None` for a model no version of which has
+    /// ever been active, which is one still being created.
+    ///
+    /// Exactly ONE definition, replaced rather than appended to, so no number
+    /// of writes grows the record: a model carries its latest definition and at
+    /// most its active one. Past the due instant the value kept here is stale
+    /// and INERT — [`Self::version_view`] consults it only while the stored
+    /// definition is not the active one — so nothing clears it on a read.
+    pub superseded_active: Option<AssetModelDefinition>,
     pub tags: HashMap<String, String>,
+}
+
+/// One version of an asset model's definition: the members a write to the model
+/// replaces, as of the write that replaced them.
+///
+/// An asset model is VERSIONED — the reads carry an `assetModelVersion`
+/// selecting `LATEST` or `ACTIVE`, and the writes a `matchForVersionType`
+/// targeting one of the same two — so an accepted write KEEPS the definition it
+/// superseded for as long as that definition is still the active version,
+/// rather than leaving the two selectors naming one definition.
+#[derive(Debug, Clone)]
+pub struct AssetModelDefinition {
+    /// This version's number, as `assetModelVersion` reports it.
+    pub version: u32,
+    pub external_id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub properties: Vec<AssetModelProperty>,
+    pub hierarchies: Vec<AssetModelHierarchy>,
+    pub composite_models: Vec<AssetModelCompositeModel>,
+    pub composite_model_links: HashMap<String, CompositeModelLink>,
+    /// When the call that wrote this version landed: what
+    /// `assetModelLastUpdateDate` reports for it.
+    pub last_update_date: SystemTime,
 }
 
 /// What a composite model is attached to, beside the asset model that holds it.
@@ -792,15 +836,110 @@ impl AssetModelRecord {
         state_at(&self.settling_state, self.active_at, now)
     }
 
+    /// The definition this record carries as it stands — its LATEST version.
+    ///
+    /// Read BEFORE a mutating call applies its writes, so the definition that
+    /// call supersedes can be handed to [`Self::begin_update`].
+    pub fn definition(&self) -> AssetModelDefinition {
+        AssetModelDefinition {
+            version: self.version,
+            external_id: self.external_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            properties: self.properties.clone(),
+            hierarchies: self.hierarchies.clone(),
+            composite_models: self.composite_models.clone(),
+            composite_model_links: self.composite_model_links.clone(),
+            last_update_date: self.last_update_date,
+        }
+    }
+
+    /// This model as it read while it carried `definition`: the same resource —
+    /// its id, ARN, type, creation date and tags — reporting that version's
+    /// definition, number and last update date, in the `ACTIVE` state that
+    /// version had reached.
+    ///
+    /// A superseded definition is only ever kept while it is the ACTIVE version
+    /// (see [`Self::begin_update`]), so the view's own owed transition has long
+    /// fallen due: its `active_at` is the instant the call that wrote it landed.
+    ///
+    /// Every member is listed, so only the members the version does not carry
+    /// are cloned off `self` and the definition's own lists are cloned once.
+    fn as_of(&self, definition: &AssetModelDefinition) -> Self {
+        Self {
+            version: definition.version,
+            external_id: definition.external_id.clone(),
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            properties: definition.properties.clone(),
+            hierarchies: definition.hierarchies.clone(),
+            composite_models: definition.composite_models.clone(),
+            composite_model_links: definition.composite_model_links.clone(),
+            last_update_date: definition.last_update_date,
+            settling_state: STATE_ACTIVE.to_string(),
+            active_at: definition.last_update_date,
+            superseded_active: None,
+            // The members a version of the definition does not carry: this is
+            // the same resource, read as an earlier version of itself.
+            id: self.id.clone(),
+            arn: self.arn.clone(),
+            model_type: self.model_type.clone(),
+            creation_date: self.creation_date,
+            tags: self.tags.clone(),
+        }
+    }
+
+    /// This model as the version the selector `version_type` names it as of
+    /// `now` (`LATEST | ACTIVE`, defaulting to `LATEST`), or `None` when the
+    /// model has no such version.
+    ///
+    /// `LATEST` is the stored definition. `ACTIVE` is that same definition once
+    /// the transition the clock owes has fallen due, and the definition the
+    /// still-settling write superseded until then; a model no version of which
+    /// has ever been active — one still being created — has no active version
+    /// at all. ONE place, so every operation carrying the selector, whether as
+    /// `assetModelVersion` on a read or as `matchForVersionType` on a write's
+    /// precondition, resolves it identically.
+    ///
+    /// Anything that is not `ACTIVE` is the latest version: the modelled
+    /// `^(LATEST|ACTIVE)$` pattern, which the runtime refuses a request against
+    /// before a handler runs, leaves `LATEST` and an absent selector as the
+    /// only other values that reach here.
+    pub fn version_view(
+        &self,
+        version_type: Option<&str>,
+        now: SystemTime,
+    ) -> Option<Cow<'_, Self>> {
+        match version_type.unwrap_or(VERSION_TYPE_LATEST) {
+            VERSION_TYPE_ACTIVE if self.state(now) != STATE_ACTIVE => self
+                .superseded_active
+                .as_ref()
+                .map(|definition| Cow::Owned(self.as_of(definition))),
+            _ => Some(Cow::Borrowed(self)),
+        }
+    }
+
     /// Record that a mutating call — a composite model added to this model, say
-    /// — landed at `now`: the definition carries a new version, and the model
-    /// reports `UPDATING` until the transition that call owes falls due.
+    /// — landed at `now`, superseding the definition `superseded`: the
+    /// definition now stored carries a new version, and the model reports
+    /// `UPDATING` until the transition that call owes falls due.
+    ///
+    /// `superseded` is the definition as it stood BEFORE this call's writes,
+    /// taken with [`Self::definition`]. It becomes what a read scoped to the
+    /// ACTIVE version is answered from until the new definition settles, since
+    /// the version this call wrote is not active yet. A call that lands while an
+    /// earlier one is STILL settling supersedes that pending version, so the
+    /// active version is left where it is — and a model that has never been
+    /// active still has none.
     ///
     /// The due instant is STORED, never slept on, exactly as
     /// [`AssetRecord::begin_update`] does it for an asset. A model that had not
     /// finished being created keeps reporting `CREATING`: the pending transition
     /// it already owed is the one that settles, and it is the same one.
-    pub fn begin_update(&mut self, now: SystemTime) {
+    pub fn begin_update(&mut self, superseded: AssetModelDefinition, now: SystemTime) {
+        if self.state(now) == STATE_ACTIVE {
+            self.superseded_active = Some(superseded);
+        }
         self.last_update_date = now;
         self.version += 1;
         if self.state(now) != STATE_CREATING {
@@ -4741,23 +4880,34 @@ pub const DATA_TYPE_STRUCT: &str = "STRUCT";
 /// `version_type` names does not exist.
 ///
 /// `matchForVersionType` targets the modelled `AssetModelVersionType` enum
-/// (`LATEST | ACTIVE`) and [`VERSION_TYPE_LATEST`] is its documented default.
-/// This emulator keeps ONE version of an asset model, so that version is always
-/// its latest one and is also its ACTIVE one once the transition the clock owes
-/// has fallen due; while one is still pending the model has no active version at
-/// all, which is the `None` here. Shared by every operation that carries those
-/// headers, so `CreateAssetModelCompositeModel`, `UpdateAssetModel` and
-/// `DeleteAssetModel` cannot disagree about which tag a precondition targets.
+/// (`LATEST | ACTIVE`) and [`VERSION_TYPE_LATEST`] is its documented default, so
+/// the version it names is resolved by [`AssetModelRecord::version_view`] — the
+/// same resolution a read's `assetModelVersion` goes through — and the tag is
+/// the one of THAT version's definition. The `None` is a model that has no such
+/// version, which a precondition can only evaluate to false. Shared by every
+/// operation that carries those headers, so `CreateAssetModelCompositeModel`,
+/// `UpdateAssetModel` and `DeleteAssetModel` cannot disagree about which tag a
+/// precondition targets.
 pub fn asset_model_target_etag(
     record: &AssetModelRecord,
     version_type: Option<&str>,
     now: SystemTime,
 ) -> Option<String> {
-    let version_type = version_type.unwrap_or(VERSION_TYPE_LATEST);
-    if version_type == VERSION_TYPE_ACTIVE && record.state(now) != STATE_ACTIVE {
-        return None;
-    }
-    Some(asset_model_etag(record))
+    record
+        .version_view(version_type, now)
+        .map(|view| asset_model_etag(&view))
+}
+
+/// The message a read or a precondition carries when the asset model has no
+/// ACTIVE version: the model has never finished settling, so the only
+/// definition it holds is one no version alias but `LATEST` names.
+///
+/// One wording for every operation that resolves the selector, so the reads of
+/// a model, of its properties and of one of its composite models cannot word
+/// the same absence three ways. `state` is the `AssetModelState` the model does
+/// report, which is what tells the caller to wait rather than to look elsewhere.
+pub fn no_active_version_message(asset_model_id: &str, state: &str) -> String {
+    format!("The asset model {asset_model_id} has no ACTIVE version yet; it is {state}.")
 }
 
 /// The entity tag of an asset model's stored definition.
@@ -4778,9 +4928,10 @@ pub fn asset_model_target_etag(
 /// one failure mode a precondition cannot tolerate. The exact bytes are not a
 /// contract: a caller reads a tag and writes it back within one process.
 ///
-/// This emulator keeps ONE version of each asset model, so its latest and its
-/// active version share this tag; while an owed transition is still pending the
-/// model has no active version at all (see [`AssetModelRecord::state`]).
+/// The version's own NUMBER is part of the fingerprint, so the latest and the
+/// active version of a model mid-update — two different definitions — report
+/// two different tags, and a caller that read one writes back a precondition
+/// targeting that one (see [`AssetModelRecord::version_view`]).
 pub fn asset_model_etag(record: &AssetModelRecord) -> String {
     // The links are a map, so they go into the fingerprint in key order: two
     // models with the same definition must hash to the same tag whatever order
@@ -6017,8 +6168,8 @@ impl ComputationModelRecord {
     /// is always its latest one — which is what an absent filter and `LATEST`
     /// ask for — and is also its ACTIVE one once the transition the clock owes
     /// has fallen due; while one is still pending the model has no active
-    /// version at all, exactly as [`asset_model_target_etag`] holds it for an
-    /// asset model. An explicit number therefore names a version this store
+    /// version at all, since nothing here keeps a definition a write replaced.
+    /// An explicit number therefore names a version this store
     /// holds only when it is that one version's own number.
     pub fn serves_version(&self, filter: Option<&str>, now: SystemTime) -> bool {
         match filter {

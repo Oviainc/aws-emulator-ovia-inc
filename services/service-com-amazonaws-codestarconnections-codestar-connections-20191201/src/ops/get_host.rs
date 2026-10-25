@@ -113,19 +113,6 @@ impl From<GetHostErrorModeled> for GetHostError {
     }
 }
 
-/// The status the LIVE service answers a host lookup whose `HostArn` names no host
-/// with.
-///
-/// The model puts `@httpError 404` on `ResourceNotFoundException`, but the recorded wire
-/// response for this exact call (corpus `simparity-wire-aws-v1`, fixture
-/// `codestar-connections-host-error-paths#task#1`: "status: expected 400", `__type`
-/// `com.amazonaws.codestar.connections#ResourceNotFoundException`, `Message` "No host
-/// exists with the ARN: …") is HTTP 400 — so the shape, its wire code and its message
-/// stay the model's while the STATUS is the one a client of the real service branches
-/// on. `DeleteHost` answers an absent host the same way, from the sibling step of the
-/// same fixture. See [`crate::scaffolded::Scaffolded::ModeledWithStatus`].
-const HOST_NOT_FOUND_STATUS: u16 = 400;
-
 /// The `GetHost` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetHostErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(crate::state::host_not_found_message(&input.host_arn)),
                 }),
-                HOST_NOT_FOUND_STATUS,
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
             ));
         };
 

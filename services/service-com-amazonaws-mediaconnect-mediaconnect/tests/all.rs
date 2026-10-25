@@ -73,6 +73,8 @@ mod global_resource_tag_listing;
 mod global_resource_tags;
 #[path = "all/lifecycle_preconditions.rs"]
 mod lifecycle_preconditions;
+#[path = "all/offering_listing.rs"]
+mod offering_listing;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
 #[path = "all/remove_flow_media_stream.rs"]

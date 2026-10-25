@@ -212,6 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // `Description` is free text this group will carry and every describe of it will
+        // report, so its length is bounded before anything is persisted — through the
+        // one rule every write path that takes a description reads.
+        if let Some(message) = crate::state::description_rejection(input.description.as_deref())
+        {
+            return Err(
+                CreateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let mut state = state.lock();
         // Besides this create's own insert, the only writes: the status transitions the
         // clock already owed the stored clusters and ACLs at this instant, and the

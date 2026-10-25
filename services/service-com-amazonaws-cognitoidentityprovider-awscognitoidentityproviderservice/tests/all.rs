@@ -19,6 +19,8 @@ mod admin_group_listing;
 mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
+#[path = "all/admin_user_enabled_state.rs"]
+mod admin_user_enabled_state;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
@@ -59,6 +61,8 @@ mod resend_confirmation_code;
 mod resource_server_lifecycle;
 #[path = "all/self_service_sign_up.rs"]
 mod self_service_sign_up;
+#[path = "all/set_user_settings.rs"]
+mod set_user_settings;
 #[path = "all/sign_up_client_secret.rs"]
 mod sign_up_client_secret;
 #[path = "all/state_roundtrip.rs"]

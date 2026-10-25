@@ -936,6 +936,10 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "ListTagsForResource",
             serde_json::json!({"ResourceArn": arn.clone()}),
         ),
+        (
+            "UntagResource",
+            serde_json::json!({"ResourceArn": arn.clone(), "TagKeys": ["team"]}),
+        ),
         // A run of a workflow this endpoint does not hold is a lookup miss too: the
         // stop resolves the run, and a workflow that is absent holds none.
         (
@@ -992,16 +996,10 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
     }
 
     // Still-scaffolded operations keep their 501 for a well-formed request.
-    let stub_cases: Vec<(&str, serde_json::Value)> = vec![
-        (
-            "TagResource",
-            serde_json::json!({"ResourceArn": arn.clone(), "Tags": {"team": "data"}}),
-        ),
-        (
-            "UntagResource",
-            serde_json::json!({"ResourceArn": arn.clone(), "TagKeys": ["team"]}),
-        ),
-    ];
+    let stub_cases: Vec<(&str, serde_json::Value)> = vec![(
+        "TagResource",
+        serde_json::json!({"ResourceArn": arn.clone(), "Tags": {"team": "data"}}),
+    )];
     for (operation, body) in stub_cases {
         let (status, answered) = harness.call(operation, body).await;
         assert_eq!(

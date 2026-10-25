@@ -182,10 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ListStoredQueriesErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
                                 message: Some(
-                                    "The specified NextToken is not valid. Please use the \
-                                     NextToken a previous ListStoredQueries response \
-                                     returned."
-                                        .to_string(),
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                                 ),
                             },
                         )

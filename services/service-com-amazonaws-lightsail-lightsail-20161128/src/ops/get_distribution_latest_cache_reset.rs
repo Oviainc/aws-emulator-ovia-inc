@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDistributionLatestCacheReset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDistributionLatestCacheReset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDistributionLatestCacheReset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDistributionLatestCacheReset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDistributionLatestCacheResetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDistributionLatestCacheReset"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE: the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together and says to set the Region to
+        // us-east-1 "to create, VIEW, or edit these resources", so a read is as
+        // restricted as a create. Checked through the crate's one owner of that
+        // rule, before anything is read.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // This operation REPORTS: it reads the reset `ResetDistributionCache`
+        // recorded on the distribution and writes nothing of its own, so two
+        // reads of an unchanged store answer the same thing.
+        crate::state::with_state(&*self.engine, |store| {
+            // A named distribution is that one distribution's last reset, or a
+            // refusal — the caller asked about that distribution, and a name
+            // this account holds none under is Lightsail's `DoesNotExist`
+            // rejection, the same one every other reader of a distribution
+            // answers.
+            let latest = match &input.distribution_name {
+                Some(name) => store
+                    .distribution(name)
+                    .ok_or_else(|| not_found(name))?
+                    .latest_cache_reset,
+                // "When omitted, the response includes the latest cache reset
+                // timestamp of all your distributions", and the result carries
+                // ONE timestamp and ONE status — so it is the latest of them,
+                // resolved by the store's one owner of that rule. Every
+                // distribution of the account is in reach: a distribution is a
+                // global resource held by name alone, so the Region a served
+                // request was signed for selects no records.
+                None => store.latest_cache_reset(),
+            };
+            // A distribution whose cache has never been reset has no timestamp
+            // and no status of a reset to report, and the service models no
+            // error for the absence — `NotFoundException` is its envelope for a
+            // resource the account does not hold, which this one does. Both
+            // result members are optional, so the honest report of "no reset
+            // yet" leaves each out rather than inventing an instant or a status
+            // for work nobody asked for.
+            Ok(GetDistributionLatestCacheResetOutput {
+                create_time: latest.map(|reset| crate::state::timestamp(reset.created_at_ms)),
+                status: latest.map(|reset| reset.status.to_string()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message states the
+/// rule the request broke.
+fn invalid(message: String) -> GetDistributionLatestCacheResetError {
+    GetDistributionLatestCacheResetErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No distribution of that name is stored: Lightsail's `DoesNotExist` rejection
+/// — wire error `NotFoundException`, body `code` `DoesNotExist` and a message
+/// naming the resource type and the requested name.
+fn not_found(name: &str) -> GetDistributionLatestCacheResetError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_DISTRIBUTION,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetDistributionLatestCacheResetError {
+    GetDistributionLatestCacheResetErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

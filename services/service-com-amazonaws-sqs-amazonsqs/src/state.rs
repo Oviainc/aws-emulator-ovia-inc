@@ -41,6 +41,12 @@
 //! wire entry from the record and the clock exactly as
 //! [`Queue::reported_attributes`] projects a queue's attributes.
 //!
+//! `CancelMessageMoveTask` stops such a task through
+//! [`ComAmazonawsSqsAmazonsqsState::cancel_message_move_task`]: the messages whose
+//! delivery slot is still ahead go back to the source queue and the cancellation instant
+//! is recorded on the task, which is all every later reader needs to report its status
+//! and its progress.
+//!
 //! Everything a caller can make this in-memory store hold is bounded — see the
 //! "Store bounds" section — and a bound is REFUSED rather than enforced by eviction,
 //! because dropping a message a client was told had been accepted would lose it.
@@ -514,6 +520,13 @@ pub struct StoredMessage {
     pub receive_count: u32,
     /// When it was first handed to a consumer.
     pub first_received_at: Option<SystemTime>,
+    /// The handle of the message movement task that still owes this message's delivery
+    /// into the queue holding it: set while the task has not reached its
+    /// [`available_at`](Self::available_at) slot, and cleared by
+    /// [`Queue::materialise_due`] once the clock has. A cancelled task takes back
+    /// exactly the messages still carrying its handle, and leaves the ones it has
+    /// already delivered where they are.
+    pub moved_by_task: Option<String>,
 }
 
 impl StoredMessage {
@@ -800,6 +813,12 @@ impl Queue {
             if message.invisible_until.is_some_and(|until| now >= until) {
                 message.invisible_until = None;
             }
+            // A message whose delivery slot has passed has been moved: the delivery was
+            // owed at that instant whether or not anybody called, so no movement task
+            // still owes it and no cancellation can take it back.
+            if now >= message.available_at {
+                message.moved_by_task = None;
+            }
         }
         // A token suppresses a resend only "during the 5-minute deduplication
         // interval"; past it, "Amazon SQS can't detect duplicate messages".
@@ -951,6 +970,70 @@ impl ComAmazonawsSqsAmazonsqsState {
         })
     }
 
+    /// The message movement task the handle a start call returned names, if this store
+    /// still holds its record.
+    pub fn message_move_task(&self, task_handle: &str) -> Option<&MessageMoveTask> {
+        self.message_move_tasks
+            .iter()
+            .find(|task| task.task_handle == task_handle)
+    }
+
+    /// Stop the message movement task called `task_handle` at `now`, and answer how many
+    /// of its messages had been moved by then.
+    ///
+    /// Cancelling stops the messages the task has not moved yet and leaves the ones it
+    /// has already moved where they are: the messages still owed a delivery slot go back
+    /// to the task's source queue, so the pair of queues holds every message it held
+    /// before the task started, and the ones already handed to the destination queue stay
+    /// its own. The cancellation is recorded on the task record, which is what every
+    /// later reader projects the task's status and progress from.
+    ///
+    /// `None` when no task answers to the handle.
+    pub fn cancel_message_move_task(&mut self, task_handle: &str, now: SystemTime) -> Option<u64> {
+        let task = self
+            .message_move_tasks
+            .iter_mut()
+            .find(|task| task.task_handle == task_handle)?;
+        task.cancelled_at = Some(now);
+        let moved = task.messages_moved(now);
+        let source_queue_name = task.source_queue_name.clone();
+        let destination_queue_name = task.destination_queue_name.clone();
+
+        // What the task has not moved yet is exactly what still carries its handle and
+        // whose delivery slot is still ahead; a message not yet deliverable has never
+        // been handed to a consumer, so no receipt handle refers to it.
+        let mut stopped: Vec<StoredMessage> = Vec::new();
+        if let Some(destination) = self.queues.get_mut(&destination_queue_name) {
+            let mut staying: VecDeque<StoredMessage> = VecDeque::new();
+            for message in std::mem::take(&mut destination.messages) {
+                if message.moved_by_task.as_deref() == Some(task_handle) && now < message.available_at
+                {
+                    stopped.push(message);
+                } else {
+                    staying.push_back(message);
+                }
+            }
+            destination.messages = staying;
+        }
+
+        // They go back in front of whatever the source queue took while the task ran,
+        // keeping the order it held them in: their sends preceded all of those. Retention
+        // runs from the return, which is when that queue took the message back, exactly as
+        // it runs from the move for a message the task delivers.
+        if let Some(source) = self.queues.get_mut(&source_queue_name) {
+            for message in stopped.into_iter().rev() {
+                source.messages.push_front(StoredMessage {
+                    sent_at: now,
+                    available_at: now,
+                    invisible_until: None,
+                    moved_by_task: None,
+                    ..message
+                });
+            }
+        }
+        Some(moved)
+    }
+
     /// Record a started message movement task, keeping at most
     /// [`MAX_MESSAGE_MOVE_TASKS_PER_QUEUE`] records per source queue and
     /// [`MAX_MESSAGE_MOVE_TASKS`] in all.
@@ -1096,6 +1179,22 @@ pub const MESSAGE_MOVE_RUNNING: &str = "RUNNING";
 /// A message movement task's status once every message it took has been delivered.
 pub const MESSAGE_MOVE_COMPLETED: &str = "COMPLETED";
 
+/// A message movement task's status while its cancellation is being applied.
+pub const MESSAGE_MOVE_CANCELLING: &str = "CANCELLING";
+
+/// A message movement task's status once its cancellation has been applied.
+pub const MESSAGE_MOVE_CANCELLED: &str = "CANCELLED";
+
+/// How long a cancelled task reports [`MESSAGE_MOVE_CANCELLING`] before it reports
+/// [`MESSAGE_MOVE_CANCELLED`].
+///
+/// `CancelMessageMoveTask` answers while the task is still winding down — the status set
+/// has a distinct `CANCELLING` state before `CANCELLED`
+/// (`ListMessageMoveTasksResultEntry$Status`) — so a caller listing the task straight
+/// after the cancel call sees it cancelling and only later sees it cancelled. The span
+/// itself is this emulator's choice, not a documented duration.
+pub const MESSAGE_MOVE_CANCELLATION_SPAN: Duration = Duration::from_millis(500);
+
 /// One message movement task `StartMessageMoveTask` started.
 ///
 /// The record holds only what the start call RESOLVED — the queues it found, the rate and
@@ -1121,6 +1220,9 @@ pub struct MessageMoveTask {
     pub started_at: SystemTime,
     /// How many messages the task took from the source queue.
     pub message_count: u64,
+    /// When `CancelMessageMoveTask` stopped the task, if it was cancelled: from that
+    /// instant the task delivers nothing more, so its progress stops there too.
+    pub cancelled_at: Option<SystemTime>,
 }
 
 impl MessageMoveTask {
@@ -1154,7 +1256,14 @@ impl MessageMoveTask {
     }
 
     /// How many of this task's messages have been delivered by `now`.
+    ///
+    /// A cancelled task moved nothing after it was stopped, so its progress is measured
+    /// at the instant of the cancellation rather than at `now`.
     pub fn messages_moved(&self, now: SystemTime) -> u64 {
+        let now = match self.cancelled_at {
+            Some(cancelled_at) if cancelled_at < now => cancelled_at,
+            _ => now,
+        };
         let Ok(elapsed) = now.duration_since(self.delivery_instant(0)) else {
             return 0;
         };
@@ -1177,8 +1286,20 @@ impl MessageMoveTask {
     }
 
     /// This task's status at `now`: it runs until the last message it took is
-    /// deliverable, and is completed from that instant on.
+    /// deliverable, and is completed from that instant on. A cancelled task is
+    /// cancelling for [`MESSAGE_MOVE_CANCELLATION_SPAN`] after the cancel call and
+    /// cancelled from then on, whatever it had still to deliver.
     pub fn status(&self, now: SystemTime) -> &'static str {
+        if let Some(cancelled_at) = self.cancelled_at {
+            let settled = cancelled_at
+                .checked_add(MESSAGE_MOVE_CANCELLATION_SPAN)
+                .unwrap_or(cancelled_at);
+            return if now >= settled {
+                MESSAGE_MOVE_CANCELLED
+            } else {
+                MESSAGE_MOVE_CANCELLING
+            };
+        }
         if now >= self.completes_at() {
             MESSAGE_MOVE_COMPLETED
         } else {
@@ -1309,6 +1430,17 @@ pub fn resource_not_found(member: &str) -> ResourceNotFoundException {
         message: Some(format!(
             "The resource that you specified for the {member} parameter doesn't exist."
         )),
+    }
+}
+
+/// The modelled refusal for a `TaskHandle` no recorded message movement task answers to
+/// (`ResourceNotFoundException`: "One or more specified resources don't exist.").
+///
+/// The service words this one for the task rather than for the parameter, and carries no
+/// value the request supplied.
+pub fn unknown_message_move_task() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("Task does not exist.".to_string()),
     }
 }
 

@@ -48,7 +48,7 @@ use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// An access point ARN, as `MetricsFilter$AccessPointArn` takes one.
-const ACCESS_POINT_ARN: &str = "arn:aws:s3:us-east-1:000000000000:accesspoint/reports";
+pub(crate) const ACCESS_POINT_ARN: &str = "arn:aws:s3:us-east-1:000000000000:accesspoint/reports";
 
 /// One `MetricsFilter`, as a request carries it and as a report brings it back.
 ///
@@ -56,8 +56,12 @@ const ACCESS_POINT_ARN: &str = "arn:aws:s3:us-east-1:000000000000:accesspoint/re
 /// for that union; the same type on both sides, so a round-trip assertion compares the
 /// filter that was sent with the filter that was reported rather than with a hand-spelled
 /// expectation.
+///
+/// `pub(crate)`, like the harness in [`super::bucket_lifecycle`]: the listing suite beside
+/// this one puts and compares configurations through this same type instead of spelling a
+/// second XML writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Filter {
+pub(crate) enum Filter {
     Prefix(String),
     Tag(String, String),
     AccessPointArn(String),
@@ -101,7 +105,7 @@ impl Filter {
 
     /// An `And` of `prefix` and `tags`, the conjunction form a request uses when one
     /// predicate is not enough.
-    fn and(prefix: Option<&str>, tags: &[(&str, &str)], access_point_arn: Option<&str>) -> Self {
+    pub(crate) fn and(prefix: Option<&str>, tags: &[(&str, &str)], access_point_arn: Option<&str>) -> Self {
         Self::And {
             prefix: prefix.map(str::to_string),
             tags: tags
@@ -130,7 +134,7 @@ fn configuration_payload(id: &str, filter: Option<&Filter>) -> String {
 }
 
 /// `PUT /<bucket>?metrics&id=<id>` — `PutBucketMetricsConfiguration`.
-async fn put_metrics(
+pub(crate) async fn put_metrics(
     router: &MultiServiceRouter,
     bucket: &str,
     id: &str,
@@ -159,7 +163,7 @@ async fn put_metrics_payload(
 }
 
 /// `GET /<bucket>?metrics&id=<id>` — `GetBucketMetricsConfiguration`.
-async fn get_metrics(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
+pub(crate) async fn get_metrics(router: &MultiServiceRouter, bucket: &str, id: &str) -> Answer {
     get_metrics_with_headers(router, bucket, id, &[]).await
 }
 
@@ -180,18 +184,31 @@ async fn get_metrics_with_headers(
     .await
 }
 
-/// The `Id` and the `Filter` a `GetBucketMetricsConfiguration` body reports.
+/// The `Id` and the `Filter` of the one configuration a `GetBucketMetricsConfiguration`
+/// body reports.
+fn reported_configuration(answer: &Answer) -> (String, Option<Filter>) {
+    reported_configurations(answer).into_iter().next().unwrap_or_default()
+}
+
+/// The `Id` and the `Filter` of EVERY `MetricsConfiguration` a body reports, in document
+/// order: one for a `GetBucketMetricsConfiguration` body, as many as the page carries for a
+/// `ListBucketMetricsConfigurations` body (which the listing suite beside this one reads
+/// through this same parser rather than a second one).
 ///
 /// Parsed with `quick-xml` (already a dependency of this workspace), the way the
 /// replication suite beside this one reads a container, rather than by slicing the body.
 /// The member a value belongs to is its PATH, not its tag: `Prefix`, `AccessPointArn` and
 /// `Tag` each sit directly on a `Filter` and inside its `And`.
-fn reported_configuration(answer: &Answer) -> (String, Option<Filter>) {
+pub(crate) fn reported_configurations(answer: &Answer) -> Vec<(String, Option<Filter>)> {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
+    let mut reported: Vec<(String, Option<Filter>)> = Vec::new();
+    // The configuration being read: a `MetricsConfiguration` opening starts a new one, so
+    // the previous one is complete and is pushed then.
     let mut id = String::new();
     let mut filter: Option<Filter> = None;
+    let mut reading = false;
     let mut path: Vec<String> = Vec::new();
     // An element OPENING is what declares which member is present, so a member whose value
     // is the empty string (`<Prefix></Prefix>`, which carries no text event at all) is
@@ -241,6 +258,12 @@ fn reported_configuration(answer: &Answer) -> (String, Option<Filter>) {
             }
             Event::Start(start) => {
                 let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                if name == "MetricsConfiguration" {
+                    if reading {
+                        reported.push((std::mem::take(&mut id), filter.take()));
+                    }
+                    reading = true;
+                }
                 begin(&name, &path, &mut filter);
                 path.push(name);
             }
@@ -298,11 +321,14 @@ fn reported_configuration(answer: &Answer) -> (String, Option<Filter>) {
             _ => {}
         }
     }
-    (id, filter)
+    if reading {
+        reported.push((id, filter));
+    }
+    reported
 }
 
 /// Stand up a bucket named `name`, which is what a metrics configuration is put on.
-async fn bucket(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn bucket(router: &MultiServiceRouter, name: &str) {
     let created = create_bucket(router, name, None, None).await;
     assert_eq!(
         created.status, 200,

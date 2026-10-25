@@ -20,7 +20,7 @@
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    FunctionConfig, FunctionMetadata, FunctionSummary, NoSuchFunctionExists,
+    DistributionConfig, FunctionConfig, FunctionMetadata, FunctionSummary, NoSuchFunctionExists,
 };
 
 use super::{
@@ -293,6 +293,83 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.development.etag = etag;
         Some(stored)
     }
+
+    /// Whether any distribution this store holds attaches the function `arn`.
+    ///
+    /// A function is attached to a distribution by a cache behaviour's
+    /// `FunctionAssociation$FunctionARN`, so the question is answered against the STORED
+    /// distribution configurations rather than against any request: it is what decides
+    /// whether a published stage reports [`FUNCTION_STATUS_ASSOCIATED`] or
+    /// [`FUNCTION_STATUS_UNASSOCIATED`].
+    pub fn function_is_associated(&self, arn: &str) -> bool {
+        self.distributions
+            .values()
+            .any(|distribution| associated_function_arns(&distribution.config).any(|it| it == arn))
+    }
+
+    /// Copy the `DEVELOPMENT` stage of the function `name` names into its `LIVE` stage, and
+    /// report the summary of the stage that was written — or `None` when this store holds no
+    /// function under that name, checked BEFORE the mint so a version token is never spent
+    /// on a resource that is not there.
+    ///
+    /// A publish is a COPY — "copying the function code from the DEVELOPMENT stage to LIVE":
+    /// the stage it writes carries the code and the configuration the `DEVELOPMENT` stage
+    /// holds at this instant, keeps the created time of the function the copy was taken from,
+    /// is last modified now, and gets a FRESH version token of its own, so an `If-Match`
+    /// against the `LIVE` stage from before the publish no longer matches. The `DEVELOPMENT`
+    /// stage is left exactly as it was — a publish does not edit the stage it reads, and the
+    /// operation hands back no new token for it.
+    ///
+    /// The status the written stage reports is computed from the stored distributions
+    /// ([`Self::function_is_associated`]): republishing a function a distribution already
+    /// names reports it as associated, publishing one nothing names reports it as
+    /// unassociated.
+    pub fn publish_function(&mut self, name: &str, now: SystemTime) -> Option<FunctionSummary> {
+        let arn = self.functions.get(name)?.arn.clone();
+        let status = if self.function_is_associated(&arn) {
+            FUNCTION_STATUS_ASSOCIATED
+        } else {
+            FUNCTION_STATUS_UNASSOCIATED
+        };
+        let etag = self.next_etag();
+        let function = self.functions.get_mut(name)?;
+        let published = StoredFunctionStage {
+            stage: FUNCTION_STAGE_LIVE.to_string(),
+            config: function.development.config.clone(),
+            code: function.development.code.clone(),
+            status: status.to_string(),
+            etag,
+            created_time: function.development.created_time,
+            last_modified_time: now,
+        };
+        let summary = published.to_summary(&function.name, &function.arn);
+        function.live = Some(published);
+        Some(summary)
+    }
+}
+
+/// Every function ARN the cache behaviours of `config` attach — the default cache behaviour
+/// first, then each ordered one.
+///
+/// A behaviour carries its functions in a LIST wrapper (`FunctionAssociations`), so each
+/// behaviour contributes zero or more ARNs rather than the single value
+/// [`super::behavior_attachments`] walks; `DefaultCacheBehavior` and `CacheBehavior` are
+/// different shapes declaring the same member, so each is read by its own accessor and the
+/// walk over them is stated once here.
+fn associated_function_arns(config: &DistributionConfig) -> impl Iterator<Item = &str> + '_ {
+    std::iter::once(config.default_cache_behavior.function_associations.as_ref())
+        .chain(
+            config
+                .cache_behaviors
+                .as_ref()
+                .and_then(|behaviors| behaviors.items.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .map(|behavior| behavior.function_associations.as_ref()),
+        )
+        .flatten()
+        .flat_map(|associations| associations.items.as_deref().unwrap_or_default())
+        .map(|association| association.function_arn.as_str())
 }
 
 /// The ARN of a CloudFront function. CloudFront is a GLOBAL service, so the ARN's region
