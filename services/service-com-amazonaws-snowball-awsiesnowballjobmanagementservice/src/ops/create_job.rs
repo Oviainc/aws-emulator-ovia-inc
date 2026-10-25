@@ -14,7 +14,8 @@
 //! A request that names a `ClusterId` creates a node of that cluster instead: a job
 //! attribute the request leaves out is the cluster's ("the other job attributes are
 //! inherited from the cluster"), while one the request supplies is this job's own, and the
-//! create is refused once the cluster holds the five nodes a cluster supports.
+//! create is refused once the cluster holds the five nodes a cluster supports — or once the
+//! cluster has left the lifecycle window in which its node set still grows at all.
 //!
 //! ## Shape of an operation
 //!
@@ -358,6 +359,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+            // A cluster takes the node jobs it ships with only while node creation is still
+            // what it is waiting on: "The cluster does not ship until these five node jobs
+            // have been created" (`CreateCluster`). A cluster that has shipped, finished, or
+            // been terminated — which is what a cancelled cluster is, since `CancelCluster`
+            // stops a cluster that had not shipped ("You can only cancel a cluster job
+            // while it's in the AwaitingQuorum status") — is past that window, and its node
+            // set does not grow again
+            // (`crate::state::ClusterState::accepts_node_jobs`). A `ClusterId` naming such a
+            // cluster is therefore an input a create cannot be built from: "Job or cluster
+            // creation failed. One or more inputs were invalid"
+            // (`InvalidInputCombinationException`), which is the refusal this operation
+            // declares for inputs that cannot hold together —
+            // `InvalidJobStateException` is not among its modelled errors
+            // (`smithy_query(query="operation", operation="CreateJob")`).
+            if !cluster.cluster_state.accepts_node_jobs() {
+                return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                    InvalidInputCombinationException {
+                        message: Some(format!(
+                            "Job creation failed. One or more inputs were invalid: the cluster \
+                             {cluster_id} is in state {}, so no further node job can be created \
+                             for it.",
+                            cluster.cluster_state.as_wire()
+                        )),
+                    },
+                )
+                .into());
+            }
+
             // "Currently, clusters support five nodes. If you have fewer than five nodes
             // for your cluster and you have more nodes to create for this cluster, try
             // again and create jobs until your cluster has exactly five nodes"
