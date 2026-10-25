@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPortalProductSharingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPortalProductSharingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPortalProductSharingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the sharing policy the [`crate::state::PortalProduct`] the URI
+//! addresses holds — the stored `PolicyDocument` beside the product's own
+//! `PortalProductId`, and an EMPTY policy document for a product that holds no policy,
+//! since every product has a sharing policy to report and an unshared product's is
+//! empty; 404 `NotFoundException` when no product carries that id. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +142,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPortalProductSharingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPortalProductSharingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPortalProductSharingPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetPortalProductSharingPolicy",
+            ));
+        };
+        // A reporting operation: the guard is taken for READING only, so this leaves the
+        // store exactly as the next caller will find it.
+        let store = state.lock();
+
+        // The policy is a sub-resource addressed UNDER the product
+        // (`/v2/portalproducts/{PortalProductId}/sharingpolicy`), so the product is the
+        // resource that has to exist: no product, no policy of it to report.
+        let Some(record) = store.portal_products.get(&input.portal_product_id) else {
+            return Err(
+                GetPortalProductSharingPolicyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "PortalProduct",
+                        &input.portal_product_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                })
+                .into(),
+            );
+        };
+
+        // The stored document, verbatim, beside the product's own stored id. Every
+        // product HAS a sharing policy to report, so a product nothing has shared — and
+        // one whose policy `DeletePortalProductSharingPolicy` reset — reports the empty
+        // policy document (`crate::state::EMPTY_SHARING_POLICY`) rather than no document
+        // at all: a product shared with nobody has a policy that grants nothing.
+        Ok(GetPortalProductSharingPolicyOutput {
+            policy_document: Some(record.sharing_policy_document()),
+            portal_product_id: Some(record.portal_product_id.clone()),
+        })
     }
 }

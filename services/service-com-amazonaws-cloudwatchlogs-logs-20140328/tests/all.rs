@@ -43,6 +43,8 @@ mod delivery_sources;
 mod destination_policies;
 #[path = "all/destinations.rs"]
 mod destinations;
+#[path = "all/field_indexes.rs"]
+mod field_indexes;
 #[path = "all/fixed_text_refusals.rs"]
 mod fixed_text_refusals;
 #[path = "all/harness.rs"]

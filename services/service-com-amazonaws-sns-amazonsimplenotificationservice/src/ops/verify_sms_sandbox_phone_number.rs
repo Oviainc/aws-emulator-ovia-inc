@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifySMSSandboxPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifySMSSandboxPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifySMSSandboxPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Checks the caller's `OneTimePassword` against the code
+//! `CreateSMSSandboxPhoneNumber` delivered TO the destination number
+//! ([`crate::state::SandboxPhoneNumberRecord::one_time_password`]), and on a match
+//! moves that number's verification status to
+//! [`crate::state::SANDBOX_NUMBER_VERIFIED`] — the status a listing then reports and
+//! the one an SMS to that destination is allowed on.
+//!
+//! The two refusals are different conditions and are never swapped: a number this
+//! account's sandbox does not hold is a lookup miss (`ResourceNotFoundException`,
+//! HTTP 404, resolved BEFORE the code is looked at), while a number it does hold
+//! presented with a code that is not the one delivered is a verification failure
+//! (`VerificationException`, HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -151,23 +155,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::VERIFY_SMS_SANDBOX_PHONE_NUMBER_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Verify the destination number `PhoneNumber` with the one-time password that
+    /// was delivered to it.
+    ///
+    /// Idempotent: the operation models no "already verified" error and its output
+    /// carries no state, so re-presenting the delivered code for a number that is
+    /// already verified leaves it verified. A code that has been SUPERSEDED — by a
+    /// later `CreateSMSSandboxPhoneNumber` on the same number, which delivers a fresh
+    /// one — is no longer the delivered code and is refused like any other.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifySMSSandboxPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifySMSSandboxPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifySMSSandboxPhoneNumber"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(VerifySMSSandboxPhoneNumberErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(record) = store.sandbox_phone_numbers.get_mut(&input.phone_number) else {
+            // The refusal states the condition WITHOUT the number: the model marks
+            // that member `@sensitive`.
+            return Err(VerifySMSSandboxPhoneNumberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        if input.one_time_password != record.one_time_password {
+            return Err(VerifySMSSandboxPhoneNumberErrorModeled::VerificationException(
+                VerificationException {
+                    message: crate::state::INVALID_OTP_MESSAGE.to_string(),
+                    status: crate::state::INVALID_OTP_STATUS.to_string(),
+                },
+            )
+            .into());
+        }
+
+        record.status = crate::state::SANDBOX_NUMBER_VERIFIED.to_string();
+
+        Ok(VerifySMSSandboxPhoneNumberOutput {})
     }
 }

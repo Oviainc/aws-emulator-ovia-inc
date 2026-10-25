@@ -316,17 +316,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(reject)?;
         // Every named key has to be one the resource carries. The check runs over the
         // WHOLE key list before the first removal, so a request naming one tag the
-        // resource does not have removes none of the others either.
-        if let Some(missing) = input
+        // resource does not have removes none of the others either, and the refusal
+        // reports EVERY key that is absent: the set a caller has to correct is what
+        // the message is built from.
+        let missing: Vec<&str> = input
             .tag_keys
             .iter()
-            .find(|key| !stored.iter().any(|(held, _)| held == *key))
-        {
+            .filter(|key| !stored.iter().any(|(held, _)| held == *key))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
             return Err(RemoveTagsFromResourceErrorModeled::TagNotFoundFault(
                 TagNotFoundFault {
                     message: Some(format!(
-                        "The tag {missing} was not found on resource {}.",
-                        input.resource_name
+                        "Failing request. These tags are not present : {}",
+                        missing.join(",")
                     )),
                 },
             )

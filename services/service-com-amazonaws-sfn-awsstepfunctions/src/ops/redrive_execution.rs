@@ -322,20 +322,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // step and uses the same input. Step Functions preserves the results and
         // execution history of the successful steps, and doesn't rerun these steps" — so
         // the walk begins at the step the last attempt stopped at, with the data that
-        // step saw, and the steps before it are not run a second time. The walk has no
-        // side effects, and its outcome is owed to the clock, so the execution reports
+        // step saw, and the steps before it are not run a second time. That step's own
+        // work IS done again: a `Task` state there makes its service-integration call,
+        // which is what a redrive of a workflow that calls another service does. The
+        // outcome is owed to the clock, so the execution reports
         // `RUNNING` until then.
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            tokio::task::spawn_blocking(move || {
+            // The re-run's integration calls go out in the state machine's own
+            // Region, exactly as the first attempt's did.
+            let region = crate::state::arn_region(&context.state_machine_arn);
+            crate::state::integration::interpret(ctx, &region, move |tasks| {
                 crate::state::plan_redrive(
-                    &definition,
-                    &execution_input,
-                    now,
-                    &context,
+                    &crate::state::RunAttempt {
+                        definition: &definition,
+                        input: &execution_input,
+                        start: now,
+                        context: &context,
+                        opening: crate::state::EVENT_EXECUTION_REDRIVEN,
+                        previous_event_id,
+                    },
                     redrive_step.as_ref(),
-                    previous_event_id,
+                    tasks,
                 )
             })
             .await

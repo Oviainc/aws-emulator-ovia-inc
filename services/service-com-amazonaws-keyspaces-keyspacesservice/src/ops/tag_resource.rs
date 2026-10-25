@@ -164,10 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call, so an ARN that names one resolves here.
-        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // The status transitions the clock already owed at this instant, so a table whose
         // deletion has completed is no longer a resource this call can tag.
         store.settle(::std::time::SystemTime::now());
@@ -186,8 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Tags attach to the resource the ARN names, so the ARN — not a name — is what is
-        // resolved; one that names no stored resource is the 404 the model declares.
-        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
+        // resolved, in the Region the request was signed for: an ARN that names no resource
+        // of THAT Region is the 404 the model declares, whatever another Region holds.
+        let Some(tags) = store.resource_tags_mut(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::arn_not_found(&input.resource_arn),
             )

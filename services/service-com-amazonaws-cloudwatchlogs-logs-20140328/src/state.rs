@@ -3198,8 +3198,30 @@ fn check_subscription_filter_policy_document(document: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// One field index a field index policy document names: the field whose log event values
+/// are indexed, and the type the document gives it.
+///
+/// From `PutIndexPolicy$policyDocument`: "You can use FieldsV2 to specify the type for each
+/// field. Supported types are FIELD_INDEX and FACET." A name listed in the plain `Fields`
+/// array carries no type of its own, and that array is "The array of field indexes to
+/// create", so such a name is a field index ([`FIELDS_ARRAY_INDEX_TYPE`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedField {
+    /// The field whose values are indexed — what `FieldIndex$fieldIndexName` reports as
+    /// "the string that this field index matches".
+    pub name: String,
+    /// The field index's type, one of [`crate::ops::types::INDEX_TYPE_VALUES`].
+    pub index_type: String,
+}
+
+/// The `IndexType` of a field index named in a document's plain `Fields` array, which
+/// gives no type: that array is "The array of field indexes to create", so the index it
+/// creates is a field index rather than a facet. Spelled as the model's `IndexType` spells
+/// it ([`crate::ops::types::INDEX_TYPE_VALUES`]).
+pub const FIELDS_ARRAY_INDEX_TYPE: &str = "FIELD_INDEX";
+
 /// Judge a field index policy document, answering the message to refuse it with, or the
-/// field names it indexes — `Fields` in the order the array lists them, then the
+/// field indexes it creates — `Fields` in the order the array lists them, then the
 /// `FieldsV2` names.
 ///
 /// From `PutAccountPolicy$policyDocument`, which states the same document's rules as
@@ -3211,7 +3233,7 @@ fn check_subscription_filter_policy_document(document: &str) -> Result<(), Strin
 ///
 /// The per-policy field quotas are NOT judged here, because they are a log-group-level
 /// policy's own ([`check_index_policy_quotas`]).
-pub fn check_field_index_policy_document(document: &str) -> Result<Vec<String>, String> {
+pub fn check_field_index_policy_document(document: &str) -> Result<Vec<IndexedField>, String> {
     let members = policy_object(document)?;
     let fields = match members.get("Fields") {
         Some(fields) => fields
@@ -3236,6 +3258,7 @@ pub fn check_field_index_policy_document(document: &str) -> Result<Vec<String>, 
             .clone(),
         None => serde_json::Map::new(),
     };
+    let mut typed: Vec<IndexedField> = Vec::new();
     for (name, configuration) in &fields_v2 {
         let index_type = configuration
             .get("type")
@@ -3247,6 +3270,10 @@ pub fn check_field_index_policy_document(document: &str) -> Result<Vec<String>, 
                 crate::ops::types::INDEX_TYPE_VALUES.iter().copied(),
             ));
         }
+        typed.push(IndexedField {
+            name: name.clone(),
+            index_type: index_type.to_string(),
+        });
     }
     if fields.is_empty() && fields_v2.is_empty() {
         return Err(
@@ -3259,8 +3286,14 @@ pub fn check_field_index_policy_document(document: &str) -> Result<Vec<String>, 
             "the field '{name}' is listed in both Fields and FieldsV2 in policyDocument; field names within Fields and FieldsV2 must be mutually exclusive"
         ));
     }
-    let mut indexed = fields;
-    indexed.extend(fields_v2.keys().cloned());
+    let mut indexed: Vec<IndexedField> = fields
+        .into_iter()
+        .map(|name| IndexedField {
+            name,
+            index_type: FIELDS_ARRAY_INDEX_TYPE.to_string(),
+        })
+        .collect();
+    indexed.extend(typed);
     Ok(indexed)
 }
 
@@ -3282,10 +3315,10 @@ pub enum IndexPolicyQuotaBreach {
 /// `PutIndexPolicy` states for "each index policy": [`MAX_INDEX_POLICY_FIELDS`] fields in
 /// the policy, and [`MAX_INDEX_FIELD_NAME_CHARS`] characters in each field name. The names
 /// are the ones [`check_field_index_policy_document`] read out of the document.
-pub fn check_index_policy_quotas(fields: &[String]) -> Result<(), IndexPolicyQuotaBreach> {
+pub fn check_index_policy_quotas(fields: &[IndexedField]) -> Result<(), IndexPolicyQuotaBreach> {
     if let Some(length) = fields
         .iter()
-        .map(|name| name.chars().count())
+        .map(|field| field.name.chars().count())
         .find(|length| *length > MAX_INDEX_FIELD_NAME_CHARS)
     {
         return Err(IndexPolicyQuotaBreach::FieldNameTooLong(format!(
@@ -3822,6 +3855,35 @@ pub fn account_policy_selects_log_group(
         // again one at a time here.
         .filter(|clause| pair.is_none() || !is_data_source_selection_field(&clause.field))
         .all(|clause| selection_clause_selects_log_group(clause, group))
+}
+
+/// The account-level policy of one type that applies to one log group, or `None` when none
+/// of the account's does.
+///
+/// An account-level policy applies to a log group when its `selectionCriteria` select that
+/// group, and a policy put without criteria is the one "that applies to all log groups in
+/// the account" ([`account_policy_selects_log_group`]). A group can therefore be selected by
+/// both a scoped policy and that account-wide one — `PutAccountPolicy`'s quota sentence
+/// admits "either one account-level policy that applies to all log groups in the account, or
+/// up to 20 policies that are each scoped to a subset", and its overlap rule ("no two of them
+/// can use the same or overlapping log group name prefixes") leaves at most one SCOPED policy
+/// selecting any one group. So the policy that applies to the group is the scoped one when it
+/// has one, and the account-wide one otherwise.
+pub fn applicable_account_policy<'a>(
+    account_policies: &'a BTreeMap<(String, String), AccountPolicyRecord>,
+    policy_type: &str,
+    group: &LogGroupRecord,
+) -> Option<&'a AccountPolicyRecord> {
+    let applying: Vec<&AccountPolicyRecord> = account_policies
+        .values()
+        .filter(|policy| policy.policy_type == policy_type)
+        .filter(|policy| account_policy_selects_log_group(policy, group))
+        .collect();
+    applying
+        .iter()
+        .find(|policy| policy.selection_criteria.is_some())
+        .or_else(|| applying.first())
+        .copied()
 }
 
 /// Whether a log group carries one data source satisfying BOTH filters of a

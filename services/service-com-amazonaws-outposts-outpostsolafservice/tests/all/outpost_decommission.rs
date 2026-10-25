@@ -51,7 +51,7 @@ fn decommission_route(identifier: &str) -> String {
 
 /// `StartOutpostDecommission` on `identifier` with `body` as the payload, requiring
 /// HTTP 200 and returning the whole output.
-async fn decommission(outposts: &Outposts, identifier: &str, body: &Value) -> Value {
+pub(crate) async fn decommission(outposts: &Outposts, identifier: &str, body: &Value) -> Value {
     outposts
         .ok("POST", &decommission_route(identifier), Some(body))
         .await

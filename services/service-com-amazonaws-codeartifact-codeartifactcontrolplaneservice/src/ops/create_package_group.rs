@@ -251,12 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(CreatePackageGroupErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: format!(
-                        "Cannot create package group '{pattern}': tags carries {} distinct keys, \
-                         more than the maximum of {} tags per resource.",
-                        tags.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    ),
+                    message: crate::state::tag_quota_exceeded_message(),
                     resource_id: Some(pattern.clone()),
                     resource_type: None,
                 },

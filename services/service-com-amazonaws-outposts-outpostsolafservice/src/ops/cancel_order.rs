@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelOrder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelOrder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: cancels the stored order the `OrderId` names: the order settles in
+//! the `CANCELLED` status, every line item of it settles in the item-level status of
+//! the same name, and the transition the clock still owed the order is dropped, so
+//! every later read of it ([`crate::ops::get_order`]) reports a cancelled order and
+//! the Outpost it was placed on no longer has it outstanding. An `OrderId` this store
+//! holds no order for is the not-found error this operation models, and an order that
+//! has already finished is the conflict it models: there is nothing left to cancel.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelOrder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelOrder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelOrderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelOrder"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelOrderErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: an order is part of its own
+        // region's inventory and of no other's, so that is where the id is resolved —
+        // the same rule `GetOrder` reads one by.
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Whether there is anything left to cancel depends on the status the order
+        // holds NOW, and an order moves on on the clock, so the transition that was
+        // already due at this instant is materialised before the status is read.
+        store.settle_orders();
+        // An `OrderId` is a bare id — the modelled `@httpLabel` pattern
+        // (`^oo-[a-f0-9]{17}$`) admits no ARN form — so it names a stored order
+        // directly. One the store holds none for is the not-found error this
+        // operation models, worded as the identifier echo of the value as supplied.
+        let record = store.order_mut(&region, &input.order_id).ok_or_else(|| {
+            CancelOrderErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::ORDER_ID_MEMBER,
+                    &input.order_id,
+                )),
+            })
+        })?;
+        // An order is cancelled while the service still has work to carry out on it.
+        // One that has already finished — cancelled, or run to its end — has nothing
+        // left to cancel, which is the conflict this operation models: the order is
+        // the resource causing it, so it is what `ResourceId` / `ResourceType` name.
+        if !record.is_outstanding() {
+            let status = record.order.status.clone().unwrap_or_default();
+            return Err(CancelOrderErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::order_status_conflict(
+                    &input.order_id,
+                    &status,
+                )),
+                resource_id: Some(input.order_id.clone()),
+                resource_type: Some(crate::state::RESOURCE_TYPE_ORDER.to_string()),
+            })
+            .into());
+        }
+        // What cancelling leaves behind is stated once, on the record, so an order and
+        // its line items can never disagree about having been cancelled.
+        record.cancel();
+
+        // The modelled output carries no members: what the call did is observable
+        // through the order itself.
+        Ok(CancelOrderOutput {})
     }
 }

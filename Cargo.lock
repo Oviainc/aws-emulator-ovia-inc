@@ -13882,6 +13882,7 @@ dependencies = [
 name = "service-com-amazonaws-sfn-awsstepfunctions"
 version = "0.1.0"
 dependencies = [
+ "aws-credential-types",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -13889,6 +13890,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -13897,6 +13899,7 @@ dependencies = [
  "http",
  "serde_json",
  "serde_json_path",
+ "service-com-amazonaws-dynamodb-dynamodb-20120810",
  "sha2 0.10.9",
  "tokio",
  "tracing",

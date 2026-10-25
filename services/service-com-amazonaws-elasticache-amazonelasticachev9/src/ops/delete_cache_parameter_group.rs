@@ -171,6 +171,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CacheParameterGroupName` "is stored as a lowercase string", so the name
         // this request resolves against the store is its lowercased form.
         let name = input.cache_parameter_group_name.to_ascii_lowercase();
+        // The FORM of the name is checked before it is resolved against
+        // anything: a value the service's identifier grammar does not admit
+        // names no group it could ever hold, so it is reported as the bad
+        // parameter it is rather than as a group that does not exist. Worded by
+        // the one helper every identifier refusal of this service goes through
+        // (`crate::state::identifier_refusal`), which names this member and the
+        // constraint it broke.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Cache Parameter Group Name",
+            "CacheParameterGroupName",
+            &name,
+            crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
+        ) {
+            return Err(
+                DeleteCacheParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
         // One lock spans the checks and the removal, so of two concurrent deletes of
         // the same name exactly one can be the one that found it present.
@@ -183,7 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
                     CacheParameterGroupNotFoundFault {
-                        message: Some(format!("CacheParameterGroup {name} not found.")),
+                        message: Some(crate::state::cache_parameter_group_not_found_message(
+                            &name,
+                        )),
                     },
                 )
                 .into(),
@@ -193,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot delete the default cache parameter groups in your account":
         // the groups in the `default.` namespace are the service's, one per
         // published family, and they outlive every call. The name a request may
-        // not take is what the modelled parameter-value error refuses.
+        // not take is what the modelled parameter-value error refuses. Only a
+        // name the identifier rule above admits reaches here, so this is the
+        // refusal of a legal identifier that falls in the reserved namespace.
         if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
             return Err(
                 DeleteCacheParameterGroupErrorModeled::InvalidParameterValueException(

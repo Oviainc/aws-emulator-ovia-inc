@@ -44,11 +44,18 @@
 //! "a transcript is fetchable from that URI". Nothing invents transcript content: no
 //! word, sentiment or summary of a call appears anywhere, because no engine produced
 //! one. A member the service itself DETERMINES is reported where the request states
-//! what it is determined from and withheld where it does not — the transcription
-//! family's per-language breakdown (`LanguageCodes`) stays absent for that reason,
-//! while the Call Analytics family's language, media format and sample rate are
-//! determined from the request and this family's own constants (see
-//! [`CallAnalyticsJobRecord`]).
+//! what it is determined from, and withheld where only the media could say. The
+//! language a job asked the service to IDENTIFY is of the first kind: `LanguageOptions`
+//! restricts what identification may answer with, so a finished job reports the
+//! identification it asked for — the single `LanguageCode` with its
+//! `IdentifiedLanguageScore` ([`identified_language`]), or the per-language
+//! `LanguageCodes` breakdown of a multi-language request, which is every code the
+//! options allowed, because narrowing them to a subset would take the audio
+//! ([`identified_languages`]) — and the Call Analytics family determines its language,
+//! media format and sample rate the same way, from the request and this family's own
+//! constants (see [`CallAnalyticsJobRecord`]). `LanguageCodeItem.DurationInSeconds` is
+//! of the second kind and stays absent: how long each language is SPOKEN is a
+//! measurement of media nothing reads.
 //! A custom vocabulary is the same: its terms are held in this state, where a
 //! `StartTranscriptionJob` that names the vocabulary would read them from, while the
 //! `DownloadUri` it reports is a location nothing serves (see
@@ -105,14 +112,12 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AbsoluteTimeRange, CallAnalyticsJob, CallAnalyticsJobSettings, CallAnalyticsJobSummary,
     CategoryProperties, ChannelDefinition, ContentRedaction, EncryptionConfiguration,
-    InputDataConfig, JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
-    MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeJobSummary,
-    MedicalScribeOutput,
-    MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
+    InputDataConfig, JobExecutionSettings, LanguageCodeItem, LanguageIdSettings, LanguageModel,
+    Media, MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeJobSummary,
+    MedicalScribeOutput, MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
     MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, RelativeTimeRange,
-    Rule, Settings, SubtitlesOutput, Tag,
-    ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
-    VocabularyFilterInfo, VocabularyInfo, MEDIA_FORMAT_VALUES,
+    Rule, Settings, SubtitlesOutput, Tag, ToxicityDetectionSettings, Transcript, TranscriptionJob,
+    TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo, MEDIA_FORMAT_VALUES,
     MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES, REDACTION_OUTPUT_VALUES,
 };
 
@@ -2512,6 +2517,16 @@ pub struct TranscriptionJobRecord {
     pub identify_language: Option<bool>,
     pub identify_multiple_languages: Option<bool>,
     pub language_options: Option<Vec<String>>,
+    /// `IdentifiedLanguageScore`, the confidence the single language this job
+    /// identified was reported with; `None` until a job that asked for
+    /// single-language identification completes, and for a job that named its own
+    /// language, which the service identified nothing for
+    /// ([`Self::materialise_identified_languages`]).
+    pub identified_language_score: Option<f32>,
+    /// `LanguageCodes`, one entry per language a MULTI-language identification job
+    /// identified; `None` until such a job completes, and for every job that did not
+    /// ask for it ([`identified_languages`]).
+    pub language_codes: Option<Vec<LanguageCodeItem>>,
     pub language_id_settings: Option<std::collections::HashMap<String, LanguageIdSettings>>,
     pub toxicity_detection: Option<Vec<ToxicityDetectionSettings>>,
     /// The subtitle request, echoed back as `SubtitlesOutput`; its
@@ -2553,6 +2568,7 @@ impl TranscriptionJobRecord {
         if self.status == STATUS_IN_PROGRESS && now >= self.completion_due {
             self.status = STATUS_COMPLETED.to_string();
             self.completion_time = Some(self.completion_due);
+            self.materialise_identified_languages();
             let transcript_uri = self.output_uri("json");
             // Which transcripts the request asked the service to produce decides
             // which of the two locations the job reports ([`transcript_outputs`]).
@@ -2580,6 +2596,37 @@ impl TranscriptionJobRecord {
             if let (Some(subtitles), Some(uris)) = (self.subtitles.as_mut(), subtitle_uris) {
                 subtitles.subtitle_file_uris = Some(uris);
             }
+        }
+    }
+
+    /// Record what the automatic language identification this job asked for
+    /// determined, as part of completing it.
+    ///
+    /// Identifying the language is part of processing the media, so a job reports the
+    /// result only once it has finished, and only when the request asked the service
+    /// to identify the language instead of naming one: a job started with an explicit
+    /// `LanguageCode` had nothing identified for it and reports neither a score nor a
+    /// per-language breakdown.
+    ///
+    /// WHICH members a finished job carries follows from which of the two
+    /// identifications it asked for: `LanguageCode` "is used with single-language
+    /// identification. For multi-language identification requests, refer to the plural
+    /// version of this parameter, `LanguageCodes`", and `IdentifiedLanguageScore` is
+    /// "the confidence score associated with the language identified in your media
+    /// file" — one language, so it accompanies the singular member
+    /// (`smithy_query(query="shape", shape="TranscriptionJob")`).
+    ///
+    /// Both determinations are made from the request rather than from audio (see
+    /// [`identified_language`] and [`identified_languages`]), so they are a function
+    /// of the stored record and every later read of the job reports the same ones.
+    fn materialise_identified_languages(&mut self) {
+        if self.identify_multiple_languages == Some(true) {
+            let codes = identified_languages(self.language_options.as_deref());
+            self.language_codes = Some(codes);
+        } else if self.identify_language == Some(true) {
+            let code = identified_language(self.language_options.as_deref());
+            self.language_code = Some(code);
+            self.identified_language_score = Some(IDENTIFIED_LANGUAGE_SCORE);
         }
     }
 
@@ -2615,11 +2662,8 @@ impl TranscriptionJobRecord {
             identify_language: self.identify_language,
             identify_multiple_languages: self.identify_multiple_languages,
             language_options: self.language_options.clone(),
-            // Language identification is not performed by this emulator, so the
-            // score and the per-language breakdown it would produce stay absent
-            // rather than being invented.
-            identified_language_score: None,
-            language_codes: None,
+            identified_language_score: self.identified_language_score,
+            language_codes: self.language_codes.clone(),
             tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
             subtitles: self.subtitles.clone(),
             language_id_settings: self.language_id_settings.clone(),
@@ -2642,8 +2686,8 @@ impl TranscriptionJobRecord {
             model_settings: self.model_settings.clone(),
             identify_language: self.identify_language,
             identify_multiple_languages: self.identify_multiple_languages,
-            identified_language_score: None,
-            language_codes: None,
+            identified_language_score: self.identified_language_score,
+            language_codes: self.language_codes.clone(),
             toxicity_detection: self.toxicity_detection.clone(),
         }
     }
@@ -3045,12 +3089,14 @@ pub const CALL_AUDIO_SAMPLE_RATE_HERTZ: i32 = 8_000;
 ///
 /// A CHOSEN value of the modelled `LanguageCode` enum
 /// ([`crate::ops::types::LANGUAGE_CODE_VALUES`]), used only where
-/// [`identified_language`] has no option list to read.
+/// [`identified_language`] and [`identified_languages`] have no option list to read.
 pub const DEFAULT_IDENTIFIED_LANGUAGE: &str = "en-US";
 
 /// The `IdentifiedLanguageScore` that accompanies an identified language:
 /// "Confidence scores are values between 0 and 1; a larger value indicates a higher
-/// probability" (`smithy_query(query="doc", shape="CallAnalyticsJob", member="IdentifiedLanguageScore")`).
+/// probability" — the same sentence on both shapes that report one
+/// (`smithy_query(query="doc", shape="CallAnalyticsJob", member="IdentifiedLanguageScore")`,
+/// `smithy_query(query="doc", shape="TranscriptionJob", member="IdentifiedLanguageScore")`).
 ///
 /// This emulator's identification is not probabilistic — it reads the language off the
 /// request rather than weighing audio (see [`identified_language`]) — so what it
@@ -3058,8 +3104,16 @@ pub const DEFAULT_IDENTIFIED_LANGUAGE: &str = "en-US";
 /// had nothing to weigh, rather than an invented probability.
 pub const IDENTIFIED_LANGUAGE_SCORE: f32 = 1.0;
 
-/// The language a Call Analytics job was transcribed in, narrowed to the options the
-/// request allowed.
+/// The single language a job whose language the service IDENTIFIED was transcribed
+/// in, narrowed to the options the request allowed.
+///
+/// Two families ask the service to identify one language: a Call Analytics job, which
+/// has no language member to name one with, and a transcription job started with
+/// `IdentifyLanguage` (`IdentifyMultipleLanguages` asks for the plural determination
+/// [`identified_languages`] makes instead). Both narrow the choice with a
+/// `LanguageOptions` list and both report the result as the finished job's
+/// `LanguageCode`, so one determination answers for both rather than each family
+/// making its own.
 ///
 /// `StartCallAnalyticsJob` carries NO language member
 /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`): Amazon
@@ -3083,6 +3137,47 @@ pub fn identified_language(language_options: Option<&[String]>) -> String {
         .and_then(<[String]>::first)
         .cloned()
         .unwrap_or_else(|| DEFAULT_IDENTIFIED_LANGUAGE.to_string())
+}
+
+/// Every language a MULTI-language identification job identified, narrowed to the
+/// options the request allowed.
+///
+/// `IdentifyMultipleLanguages` "enables automatic multi-language identification in
+/// your transcription job request ... you can optionally include a list of language
+/// codes, using LanguageOptions ... Including LanguageOptions restricts
+/// [identification] to only the language options that you specify"
+/// (`smithy_query(query="operation", operation="StartTranscriptionJob")`), and the
+/// finished job reports one `LanguageCodeItem` per language identified in the media
+/// (`smithy_query(query="shape", shape="LanguageCodeItem")`).
+///
+/// This emulator weighs no audio, so the determination is made from the request, as
+/// the single-language one [`identified_language`] makes is: every code the options
+/// allowed, in the order the request listed them, since identification may answer
+/// with no other and the options are the caller's own statement of the "language
+/// codes that represent the languages you think may be present in your media" —
+/// reporting a SUBSET of them, which is what the real service's answer usually is,
+/// would take the audio that says which of them is actually spoken. Where the request
+/// narrowed the choice to nothing, the one [`DEFAULT_IDENTIFIED_LANGUAGE`] is the
+/// whole answer. It is a function of the request alone, so every read of a job reports
+/// the same languages in the same order.
+///
+/// `DurationInSeconds` is "the total time, in seconds, each identified language is
+/// spoken in your media" — a measurement of the media itself, which nothing here
+/// reads (see the module header: nothing is transcribed) — so each entry leaves that
+/// optional member ABSENT rather than reporting a duration nothing timed.
+pub fn identified_languages(language_options: Option<&[String]>) -> Vec<LanguageCodeItem> {
+    let default = [DEFAULT_IDENTIFIED_LANGUAGE.to_string()];
+    let codes = match language_options {
+        Some(options) if !options.is_empty() => options,
+        _ => default.as_slice(),
+    };
+    codes
+        .iter()
+        .map(|code| LanguageCodeItem {
+            language_code: Some(code.clone()),
+            duration_in_seconds: None,
+        })
+        .collect()
 }
 
 /// One stored Call Analytics job: exactly what the request asked for, plus the

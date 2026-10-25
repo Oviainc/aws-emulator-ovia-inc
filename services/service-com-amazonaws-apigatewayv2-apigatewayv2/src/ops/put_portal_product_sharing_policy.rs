@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPortalProductSharingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPortalProductSharingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPortalProductSharingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the request's `PolicyDocument` onto the sharing policy of the
+//! [`crate::state::PortalProduct`] the URI addresses, replacing whatever policy that
+//! product held, and answers 200 with the modelled empty response; 404
+//! `NotFoundException` when no product carries that id, and 400 `BadRequestException`
+//! for a policy document that is not a JSON policy document. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +138,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPortalProductSharingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPortalProductSharingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPortalProductSharingPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutPortalProductSharingPolicy",
+            ));
+        };
+
+        // `PolicyDocument` carries the modelled length bound (len 1..307200), which the
+        // boundary validator refuses before this handler runs. Beyond it this refuses a
+        // document that is not a JSON policy document at all: "the product sharing
+        // policy" (`PutPortalProductSharingPolicy$PolicyDocument`) is a resource policy,
+        // and a policy the service could never evaluate is not stored and then reported
+        // back as if it were one. Checked BEFORE the store is touched, so a refused call
+        // leaves the product's policy exactly as it was.
+        if !is_policy_document(&input.policy_document) {
+            return Err(bad_request(
+                "Invalid value for PolicyDocument: the product sharing policy must be a \
+                 JSON policy document.",
+            ));
+        }
+
+        let mut store = state.lock();
+
+        // The sharing policy is a sub-resource of the product the URI names
+        // (`/v2/portalproducts/{PortalProductId}/sharingpolicy`), so the product is the
+        // resource that has to exist: no product, nothing to hold a policy.
+        let Some(record) = store.portal_products.get_mut(&input.portal_product_id) else {
+            return Err(
+                PutPortalProductSharingPolicyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "PortalProduct",
+                        &input.portal_product_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                })
+                .into(),
+            );
+        };
+
+        // A PUT of the sub-resource REPLACES it: the document the request carried is the
+        // product's whole sharing policy afterwards, whether it held one before or not,
+        // so repeating the call leaves the same policy stored. Nothing else on the record
+        // is touched — the policy is its own sub-resource, so writing it does not restate
+        // when the PRODUCT (`PortalProduct$LastModified`) was last modified.
+        record.sharing_policy = Some(input.policy_document);
+
+        Ok(PutPortalProductSharingPolicyOutput {})
     }
+}
+
+/// Whether a `PolicyDocument` is a policy document this service can store: a
+/// well-formed JSON object.
+///
+/// A resource policy is a JSON object (its `Version` and its `Statement`s), so a
+/// document that is not even well-formed JSON, or is JSON that is not an object,
+/// describes no policy. This checks the FORM only — which statements a policy carries is
+/// not something the model constrains, so nothing beyond "a JSON object" is required.
+fn is_policy_document(document: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(document).is_ok_and(|parsed| parsed.is_object())
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint. Takes
+/// the same `&str` the sibling helper in `create_portal_product` does.
+fn bad_request(message: &str) -> PutPortalProductSharingPolicyError {
+    PutPortalProductSharingPolicyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

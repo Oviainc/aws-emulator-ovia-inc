@@ -169,6 +169,8 @@ mod images;
 mod import_image_tasks;
 #[path = "all/import_snapshot_tasks.rs"]
 mod import_snapshot_tasks;
+#[path = "all/instance_connect_endpoints.rs"]
+mod instance_connect_endpoints;
 #[path = "all/instance_event_notification_attributes.rs"]
 mod instance_event_notification_attributes;
 #[path = "all/instance_event_windows.rs"]
@@ -376,3 +378,10 @@ mod image_recycle_bin;
 // copy computes from the stored source, and what it refuses.
 #[path = "all/copy_fpga_image.rs"]
 mod copy_fpga_image;
+// Declared LAST for the reason the header gives: what a stored network interface blocks
+// (the group, subnet and VPC deletes it is a dependency of), and the public Systems Manager
+// parameter catalog a `resolve:ssm:` launch-template `ImageId` resolves through.
+#[path = "all/network_interface_dependencies.rs"]
+mod network_interface_dependencies;
+#[path = "all/launch_template_ssm_alias_catalog.rs"]
+mod launch_template_ssm_alias_catalog;

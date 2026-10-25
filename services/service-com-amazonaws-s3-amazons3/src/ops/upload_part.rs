@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UploadPart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UploadPart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UploadPart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the part-write of the multipart upload loop — it records the
+//! request's bytes as the part its `PartNumber` addresses on the upload
+//! `CreateMultipartUpload` initiated ([`crate::state::MultipartUpload`]), answers the
+//! part's own entity tag, and refuses an upload this emulator does not have in progress
+//! with `NoSuchUpload`. `ListParts` reads the recorded parts back.
 //!
 //! ## Shape of an operation
 //!
@@ -249,14 +246,22 @@ use super::types::*;
 // `UploadPartError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UploadPartError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#UploadPart")]
+// The operation's MODELED errors — this operation declares NONE
+// (`smithy_query(query="operation",operation="UploadPart")` reports an empty error list),
+// so the enum is widened with `extra_errors` by the two shapes this SERVICE models for the
+// addresses a part upload can miss: the bucket (`NoSuchBucket`, HTTP 404) and the upload
+// itself (`NoSuchUpload`, "The specified multipart upload does not exist", HTTP 404).
+// Without them a part uploaded against an upload nothing initiated would have to be
+// answered as a success — a part no later `ListParts` could read back. `ListParts` is
+// widened by the same two shapes, so one address is refused one way.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#UploadPart",
+    extra_errors = ["NoSuchBucket", "NoSuchUpload"]
+)]
 #[derive(Debug)]
 pub enum UploadPartErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchUpload(NoSuchUpload),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -310,18 +315,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UploadPart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UploadPartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A part write needs nothing from the request beyond its deserialized input: the
+        // bytes arrive as the `@httpPayload` member `Body`.
+        let _ = ctx;
+
+        // What this emulator cannot carry out faithfully, refused rather than answered
+        // with an entity tag that would claim it. The SSE-C members carry a
+        // customer-provided KEY that S3 itself does not store and that every later read of
+        // the object would have to carry again, so no upload here is addressed by one
+        // (`CreateMultipartUpload` refuses an initiation that names one for the same
+        // reason), and `RequestPayer` asks to be charged for the request, which nothing
+        // here does — `ListParts` refuses both identically.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UploadPart"))
+        // The checksum members are NOT in this list: a checksum this handler neither
+        // computes nor verifies is simply not reported back, so nothing is claimed about
+        // it, exactly as `PutObject` leaves its own alone — refusing them would break
+        // every SDK that sends one by default.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "UploadPart with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `UploadPartRequest$ExpectedBucketOwner`, judged the way every other
+        // operation here judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "Part number of part being uploaded. This is a positive integer between 1 and
+        // 10,000" (`UploadPartRequest$PartNumber`). The model constrains the member not at
+        // all, so nothing refuses a number outside that range before this: a part number
+        // S3 does not address a part by is a parameter whose value is not valid, which is
+        // `InvalidArgument` (400) — the code `ListParts` answers an out-of-range
+        // `max-parts` with.
+        if !(crate::state::MIN_PART_NUMBER..=crate::state::MAX_PART_NUMBER)
+            .contains(&input.part_number)
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "Part number must be an integer between {} and {}, inclusive: {}",
+                    crate::state::MIN_PART_NUMBER,
+                    crate::state::MAX_PART_NUMBER,
+                    input.part_number
+                ),
+            ));
+        }
+
+        // `ContentMD5` is "the Base64 encoded 128-bit MD5 digest of the part data", so
+        // when the request carries it, it is CHECKED against the payload actually
+        // received: a mismatch means the bytes are not the bytes the client hashed, which
+        // S3 answers with `BadDigest` (400) rather than recording a part the client did
+        // not intend. The same check `PutObject` performs on its own body.
+        if let Some(declared) = input.content_md5.as_deref() {
+            let actual = crate::state::content_md5(&input.body);
+            if declared != actual {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::BAD_DIGEST_CODE,
+                    crate::state::BAD_DIGEST_STATUS,
+                    crate::state::BAD_DIGEST_MESSAGE,
+                ));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the part cannot be recorded at all, and no modelled error
+            // says that, so the documented code for a request this emulator could not
+            // carry out goes out rather than a 501, which would claim this operation is
+            // unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The part as the store records it: the bytes the request carried, the instant
+        // they were accepted, and the entity tag over those bytes — "Entity tag for the
+        // uploaded object" (`UploadPartOutput$ETag`), which for a one-part payload in a
+        // general purpose bucket is the MD5 of the data, the same tag `PutObject` renders
+        // for an object it stores whole.
+        let etag = crate::state::object_etag(&input.body);
+        let part = crate::state::UploadedPart {
+            part_number: input.part_number,
+            etag: etag.clone(),
+            uploaded_at: ::std::time::SystemTime::now(),
+            body: input.body,
+        };
+
+        // The store reports what the write did, because it may refuse: a bucket this
+        // emulator does not hold, an upload it has none of in progress under that id and
+        // key, and the two byte budgets that keep what it holds bounded whatever a caller
+        // does. Each is answered as a refusal, so nothing is recorded and the caller is
+        // told.
+        let (outcome, encryption) = {
+            let mut store = state.lock();
+            let outcome = store.upload_part(&input.bucket, &input.upload_id, &input.key, part);
+            // The encryption configuration the UPLOAD was initiated under, read off the
+            // recorded upload so the answer is what the initiation settled rather than
+            // anything this request named — "The server-side encryption algorithm used
+            // when you store this object in Amazon S3"
+            // (`UploadPartOutput$ServerSideEncryption`).
+            let encryption = store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.multipart_upload(&input.upload_id))
+                .map(|upload| upload.encryption.clone())
+                .unwrap_or_default();
+            (outcome, encryption)
+        };
+        let Some(outcome) = outcome else {
+            return Err(UploadPartErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::PartUpload::Stored { .. } => {}
+            // "The specified multipart upload does not exist. The upload ID might be
+            // invalid, or the multipart upload might have been aborted or completed" —
+            // which is also what an id named under another key reports, because an upload
+            // is addressed by both.
+            crate::state::PartUpload::NoSuchUpload => {
+                return Err(UploadPartErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+            }
+            // The emulator's own ceilings, not AWS quotas (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 `ValidationException` channel, the same
+            // channel `PutObject` answers its own byte budgets through.
+            crate::state::PartUpload::ByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "recording part {} would leave the bucket {:?} holding {would_hold} \
+                     bytes, past the {} bytes this emulator keeps per bucket",
+                    input.part_number,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            crate::state::PartUpload::TotalByteBudgetReached { would_hold } => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "recording part {} would leave this emulator holding {would_hold} \
+                     bytes across every bucket, past the {} bytes it keeps in total",
+                    input.part_number,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(UploadPartOutput {
+            // "Entity tag for the uploaded object" — the tag the store recorded for THIS
+            // part, which is what a later `CompleteMultipartUpload` names the part by.
+            e_tag: Some(etag),
+            // The encryption the upload was initiated under, reported back the way
+            // `PutObject` reports a stored object's: these are the recorded values, so an
+            // upload initiated with no encryption reports none rather than a configuration
+            // nothing applied.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+            // Everything else this output can carry describes something no recorded part
+            // has: the `Checksum*` members would each need a checksum this handler does
+            // not compute, the SSE-C members are refused above, and `RequestCharged`
+            // reports a Requester Pays charge nothing here makes.
+            ..UploadPartOutput::default()
+        })
     }
+}
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `ListParts` names its own.
+fn unserved_feature(input: &UploadPartInput) -> Option<&'static str> {
+    [
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        (input.request_payer.is_some(), "RequestPayer"),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
 }

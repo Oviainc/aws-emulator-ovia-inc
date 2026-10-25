@@ -212,6 +212,18 @@
 //! [`ComAmazonawsEc2Amazonec2State::launch_template_id_for_name`] because the API lets a
 //! caller name either.
 //!
+//! ## EC2 Instance Connect Endpoints
+//!
+//! [`ComAmazonawsEc2Amazonec2State::instance_connect_endpoints`] holds the account's EC2
+//! Instance Connect Endpoints as [`InstanceConnectEndpointRecord`]s, on exactly the terms
+//! the volume store holds a volume: the modelled `Ec2InstanceConnectEndpoint` every
+//! operation that reports one answers with, plus the instant the clock owes the endpoint
+//! its `create-in-progress` -> `create-complete` move, which is a fact of the endpoint's
+//! age rather than of the request and so is derived on read
+//! ([`InstanceConnectEndpointRecord::view_at`]) instead of stored. Keyed by
+//! `InstanceConnectEndpointId` in a [`BTreeMap`], so a pagination token can name the id
+//! the next page starts at.
+//!
 //! ## EBS volumes
 //!
 //! [`ComAmazonawsEc2Amazonec2State::volumes`] holds the account's EBS volumes as
@@ -2844,6 +2856,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`MAX_STORED_BYTES`] ([`Self::id_format_principal_bytes`]) so the number of
     /// principals a run can store is bounded by that budget.
     pub id_format_overrides: BTreeMap<String, BTreeMap<&'static str, bool>>,
+    /// Every EC2 Instance Connect Endpoint the account holds, by `InstanceConnectEndpointId`
+    /// — see the module docs. Ordered by id, which is the order
+    /// `DescribeInstanceConnectEndpoints` reports and pages over.
+    pub instance_connect_endpoints: BTreeMap<String, InstanceConnectEndpointRecord>,
+    /// A `CreateInstanceConnectEndpoint` `ClientToken` and the endpoint id it minted, so a
+    /// repeat of the same request answers with that endpoint instead of creating a second
+    /// one.
+    pub instance_connect_endpoint_client_tokens: HashMap<String, String>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -3011,6 +3031,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // No principal has overridden its ID format settings yet, so every one of
             // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
             id_format_overrides: BTreeMap::new(),
+            // A fresh account holds no EC2 Instance Connect Endpoint until
+            // `CreateInstanceConnectEndpoint` mints one, and no token names one.
+            instance_connect_endpoints: BTreeMap::new(),
+            instance_connect_endpoint_client_tokens: HashMap::new(),
         };
         // The ambient default network of [`DEFAULT_REGION`], so a request signed for the
         // emulator's own Region finds it without this store ever writing on a read. Every
@@ -12876,6 +12900,38 @@ impl ComAmazonawsEc2Amazonec2State {
         inserted
     }
 
+    /// Every public Systems Manager parameter name this account can resolve, and the id of
+    /// the AMI it resolves to.
+    ///
+    /// `Image$PublicSsmParameterName` is "the name of the public Systems Manager parameter
+    /// that resolves to this AMI, under the `aws/service/` namespace", so the stored images
+    /// are what a `resolve:ssm:` value is resolved against — the one place this emulator
+    /// records which AMI a parameter names, rather than a second table of ids that could
+    /// disagree with the catalog. The member holds ONE name per image while AWS publishes
+    /// some images under more than one name, so the names that share an image's entry
+    /// ([`PUBLIC_SSM_PARAMETER_ALIASES`]) are resolved to the same id here.
+    ///
+    /// Only an image `account` can see resolves: a parameter whose image has been
+    /// deregistered or recycled names no AMI, the same way the describe reports none.
+    pub fn public_ssm_parameter_image_ids(&self, account: &str) -> BTreeMap<String, String> {
+        let mut resolved: BTreeMap<String, String> = self
+            .images
+            .values()
+            .filter(|image| image_is_visible(image, account))
+            .filter_map(|image| {
+                Some((
+                    image.public_ssm_parameter_name.clone()?,
+                    image.image_id.clone()?,
+                ))
+            })
+            .collect();
+        for (alias, published_as) in PUBLIC_SSM_PARAMETER_ALIASES {
+            if let Some(image_id) = resolved.get(*published_as).cloned() {
+                resolved.insert((*alias).to_string(), image_id);
+            }
+        }
+        resolved
+    }
 }
 
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
@@ -13050,6 +13106,43 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
         },
     ]
 }
+
+/// The public Systems Manager parameter names AWS publishes as a SECOND name for an image
+/// [`published_image_specs`] already publishes under one: `(the other name, the published
+/// name that names the same AMI)`.
+///
+/// Amazon publishes the latest Amazon Linux image both under a KERNEL-VERSION-PINNED name
+/// and under a `kernel-default` name, and while that kernel is the distribution's default
+/// the two resolve to the same AMI (Amazon Linux 2023 User Guide, "Find an AMI" and Amazon
+/// EC2 User Guide, "Use a Systems Manager parameter instead of an AMI ID", which list the
+/// `/aws/service/ami-amazon-linux-latest/` names): kernel 6.1 is the default for Amazon
+/// Linux 2023 and kernel 5.10 for Amazon Linux 2. `Image$PublicSsmParameterName` carries
+/// one name per image, so the second name of an image is recorded here and resolved to the
+/// same id by
+/// [`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`] — rather than as a
+/// second image record, which would make one AMI resolve to two ids.
+pub const PUBLIC_SSM_PARAMETER_ALIASES: &[(&str, &str)] = &[
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-x86_64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-arm64",
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64",
+    ),
+    (
+        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-default-hvm-x86_64-gp2",
+        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Application status: what `DescribeApplicationStatus` aggregates
@@ -14842,14 +14935,58 @@ impl ComAmazonawsEc2Amazonec2State {
         found
     }
 
+    /// The network interfaces that still name the security group `group_id` among their
+    /// `NetworkInterface$Groups`.
+    ///
+    /// The ONE definition of "an interface still holds that group", so every path that asks
+    /// what a group is held by reads the same set.
+    pub fn network_interfaces_with_security_group(&self, group_id: &str) -> Vec<String> {
+        self.network_interfaces
+            .iter()
+            .filter(|(_, interface)| {
+                interface
+                    .groups
+                    .iter()
+                    .flatten()
+                    .any(|group| group.group_id.as_deref() == Some(group_id))
+            })
+            .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect()
+    }
+
+    /// The network interfaces that still hold a place in `subnet_id`.
+    ///
+    /// An interface is created in a subnet and names it for as long as it is stored, so it
+    /// occupies that subnet — and the private addresses it took — until it is deleted.
+    pub fn network_interfaces_in_subnet(&self, subnet_id: &str) -> Vec<String> {
+        self.network_interfaces
+            .iter()
+            .filter(|(_, interface)| interface.subnet_id.as_deref() == Some(subnet_id))
+            .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect()
+    }
+
+    /// What still depends on the subnet `subnet_id`, as the ids of the depending resources.
+    ///
+    /// "You must terminate all running instances in the subnet before you can delete the
+    /// subnet" (`DeleteSubnet`), and an interface created in the subnet holds a place in it
+    /// the same way an instance does — the delete is refused while either is still stored,
+    /// rather than leaving a stored record naming a subnet that no longer exists.
+    pub fn subnet_dependencies(&self, subnet_id: &str) -> Vec<String> {
+        let mut found = self.instances_in_subnet(subnet_id);
+        found.extend(self.network_interfaces_in_subnet(subnet_id));
+        found.sort();
+        found
+    }
+
     /// What still depends on the security group `group_id`, as the ids of the depending
     /// resources.
     ///
     /// "If you attempt to delete a security group that is associated with an instance or
     /// network interface, is referenced by another security group in the same VPC, or has a
     /// VPC association, the operation fails with `DependencyViolation`"
-    /// (`DeleteSecurityGroup`): an instance that holds the group, and another group of the
-    /// same VPC whose rules name it.
+    /// (`DeleteSecurityGroup`): an instance that holds the group, a network interface that
+    /// holds it, and another group of the same VPC whose rules name it.
     pub fn security_group_dependencies(&self, group_id: &str) -> Vec<String> {
         let vpc_id = self
             .security_groups
@@ -14867,6 +15004,12 @@ impl ComAmazonawsEc2Amazonec2State {
             })
             .map(|instance| instance.instance_id.clone())
             .collect();
+        // A network interface holds the groups it names for as long as the interface is
+        // stored, attached to an instance or not: a stored interface is a reference to the
+        // group, and there is no interface state that stops being one — so unlike an
+        // instance, which lets go of its groups once it has reached `terminated`, an
+        // interface is a dependency until it is deleted.
+        found.extend(self.network_interfaces_with_security_group(group_id));
         for (other_id, other) in &self.security_groups {
             if other_id == group_id || other.vpc_id != vpc_id {
                 continue;
@@ -14893,10 +15036,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// in the VPC, delete all security groups associated with the VPC (except the default
     /// one) … When you delete the VPC, it deletes the default security group, network ACL,
     /// and route table for the VPC" (`DeleteVpc`). So the dependencies are this VPC's
-    /// subnets, its security groups other than the default one, and the instances still
-    /// running in it; the default group is NOT one, because the delete removes it. A
-    /// carrier gateway of the VPC is one too: it is a gateway "associated with the VPC",
-    /// and `DeleteVpc` does not remove it.
+    /// subnets, its security groups other than the default one, the network interfaces
+    /// created in it and the instances still running in it; the default group is NOT one,
+    /// because the delete removes it. A carrier gateway of the VPC is one too: it is a
+    /// gateway "associated with the VPC", and `DeleteVpc` does not remove it.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for (subnet_id, subnet) in &self.subnets {
@@ -14914,6 +15057,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 && group.group_name.as_deref() != Some(DEFAULT_SECURITY_GROUP_NAME)
             {
                 found.push(group_id.clone());
+            }
+        }
+        for (network_interface_id, interface) in &self.network_interfaces {
+            if interface.vpc_id.as_deref() == Some(vpc_id) {
+                found.push(network_interface_id.clone());
             }
         }
         for instance in self.instances.values() {
@@ -16339,6 +16487,280 @@ pub fn require_known_capacity_block<E>(
         return Ok(());
     }
     Err(invalid_capacity_block_id_not_found(capacity_block_id))
+}
+
+// =============================================================================
+// EC2 Instance Connect Endpoints
+// =============================================================================
+
+/// The prefix of an EC2 Instance Connect Endpoint id, as AWS writes one
+/// (`eice-0123456789abcdef0`).
+pub const INSTANCE_CONNECT_ENDPOINT_ID_PREFIX: &str = "eice-";
+
+/// An endpoint AWS is still creating: the `Ec2InstanceConnectEndpointState` enum's
+/// `create-in-progress` member
+/// (`smithy_query(query="shape",shape="Ec2InstanceConnectEndpointState")`), which is what
+/// `CreateInstanceConnectEndpoint` answers with until [`TRANSITION_DELAY`] has passed.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// An endpoint AWS has finished creating: that same enum's `create-complete` member.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// The `ResourceType` a `CreateInstanceConnectEndpoint` tag specification may name: the
+/// endpoint it creates — "The tags to apply to the EC2 Instance Connect Endpoint during
+/// creation" (`CreateInstanceConnectEndpointRequest$TagSpecifications`), which is the
+/// `ResourceType` enum's `instance-connect-endpoint` member.
+pub const RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT: &str = "instance-connect-endpoint";
+
+/// An endpoint reached over IPv4 only: the `IpAddressType` enum's `ipv4` member
+/// ([`crate::ops::types::IP_ADDRESS_TYPE_VALUES`]).
+pub const IP_ADDRESS_TYPE_IPV4: &str = "ipv4";
+
+/// An endpoint reached over both IPv4 and IPv6: that enum's `dualstack` member.
+pub const IP_ADDRESS_TYPE_DUALSTACK: &str = "dualstack";
+
+/// An endpoint reached over IPv6 only: that enum's `ipv6` member.
+pub const IP_ADDRESS_TYPE_IPV6: &str = "ipv6";
+
+/// How many EC2 Instance Connect Endpoints this emulator stores before
+/// `CreateInstanceConnectEndpoint` is refused.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`] and [`MAX_STORED_VOLUMES`], not an
+/// AWS quota: nothing in this emulator reclaims a stored endpoint, so the number a caller
+/// can create has to be finite. A count ceiling is not a memory bound on its own — see
+/// [`MAX_STORED_BYTES`] — so the caller-chosen bytes of each endpoint are charged against
+/// that budget too ([`instance_connect_endpoint_payload_bytes`]).
+pub const MAX_INSTANCE_CONNECT_ENDPOINTS: usize = 1_000;
+
+/// EC2's error code for an id that is not shaped like an EC2 Instance Connect Endpoint id
+/// at all, so there is nothing to look up. EC2 names a malformed resource id
+/// `Invalid<Resource>Id.Malformed`, the same convention as
+/// [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`].
+pub const INVALID_INSTANCE_CONNECT_ENDPOINT_ID_MALFORMED: &str =
+    "InvalidInstanceConnectEndpointId.Malformed";
+
+/// EC2's error code for an EC2 Instance Connect Endpoint id this account holds no endpoint
+/// for, in the same `Invalid<Resource>Id.NotFound` family.
+pub const INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND: &str =
+    "InvalidInstanceConnectEndpointId.NotFound";
+
+/// EC2's error code for a create that would take the store past
+/// [`MAX_INSTANCE_CONNECT_ENDPOINTS`], in the `<Resource>LimitExceeded` family EC2 uses for
+/// a resource ceiling ([`SUBNET_LIMIT_EXCEEDED`], [`SECURITY_GROUP_LIMIT_EXCEEDED`],
+/// [`VOLUME_LIMIT_EXCEEDED`]).
+pub const INSTANCE_CONNECT_ENDPOINT_LIMIT_EXCEEDED: &str = "InstanceConnectEndpointLimitExceeded";
+
+/// The DNS label EC2 Instance Connect Endpoint names sit under.
+pub const INSTANCE_CONNECT_ENDPOINT_DNS_LABEL: &str = "ec2-instance-connect-endpoint";
+
+/// The DNS label the FIPS-compliant endpoint names sit under — "The Federal Information
+/// Processing Standards (FIPS) compliant DNS name"
+/// (`Ec2InstanceConnectEndpoint$FipsDnsName`), which AWS publishes under a `-fips` sibling
+/// of the service's own label.
+pub const INSTANCE_CONNECT_ENDPOINT_FIPS_DNS_LABEL: &str = "ec2-instance-connect-endpoint-fips";
+
+/// One stored EC2 Instance Connect Endpoint: the modelled `Ec2InstanceConnectEndpoint`
+/// every operation that reports one answers with, plus the instant the clock owes it its
+/// `create-in-progress` -> `create-complete` move.
+///
+/// The view holds no `State`: the state is a fact of the endpoint's age, so
+/// [`InstanceConnectEndpointRecord::view_at`] derives it rather than letting two writers
+/// store two different words for it — exactly how [`VolumeRecord`] holds a volume.
+#[derive(Debug, Clone)]
+pub struct InstanceConnectEndpointRecord {
+    /// The endpoint as the model shapes it, with `State` left for `view_at` to fill.
+    pub view: crate::ops::types::Ec2InstanceConnectEndpoint,
+    /// The instant from which this endpoint's `create-in-progress` -> `create-complete`
+    /// move is due. Monotonic ([`Instant`]), because it is only ever compared against the
+    /// clock and never reported, so a wall-clock adjustment cannot move an endpoint back to
+    /// `create-in-progress`.
+    pub create_complete_at: Instant,
+}
+
+impl InstanceConnectEndpointRecord {
+    /// This endpoint as of `now`: the stored view with the `State` the clock has reached. A
+    /// read observes the transition the clock already owed without writing anything.
+    pub fn view_at(&self, now: Instant) -> crate::ops::types::Ec2InstanceConnectEndpoint {
+        let mut view = self.view.clone();
+        view.state = Some(self.state_at(now).to_string());
+        view
+    }
+
+    /// The endpoint's `Ec2InstanceConnectEndpointState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.create_complete_at {
+            INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS
+        } else {
+            INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another EC2 Instance Connect Endpoint fits inside the store's ceiling
+    /// ([`MAX_INSTANCE_CONNECT_ENDPOINTS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks this first and
+    /// refuses with [`instance_connect_endpoint_limit_exceeded`] when it answers `false`.
+    pub fn has_instance_connect_endpoint_capacity(&self) -> bool {
+        self.instance_connect_endpoints.len() < MAX_INSTANCE_CONNECT_ENDPOINTS
+    }
+}
+
+/// The caller-chosen bytes one stored EC2 Instance Connect Endpoint holds: its tags and the
+/// `ClientToken` the token map keeps for it. Everything else on the record — the id, the
+/// ARN, the account, the DNS names, the subnet, the VPC, the zone and the security group
+/// ids, each of which is an id this store minted — is derived by this module or bounded by
+/// the model, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateInstanceConnectEndpoint` asks it before the
+/// write and charges exactly it, and a removal path must give back the same number.
+pub fn instance_connect_endpoint_payload_bytes(tags: &[Tag], client_token: Option<&str>) -> usize {
+    tag_list_bytes(tags).saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed EC2 Instance Connect Endpoint id.
+///
+/// The model declares no `@pattern` on `InstanceConnectEndpointId`
+/// (`smithy_query(query="shape",shape="InstanceConnectEndpointId")`), so the id form is
+/// EC2's own: `eice-` followed by 8 or 17 lowercase hexadecimal digits — the short and the
+/// long id form every other EC2 resource id takes, as [`volume_id_is_well_formed`] reads a
+/// volume id.
+pub fn instance_connect_endpoint_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(INSTANCE_CONNECT_ENDPOINT_ID_PREFIX) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse an EC2 Instance Connect Endpoint id the request named that this service cannot
+/// resolve: a malformed one before an unknown one, the way the service orders the two.
+pub fn require_known_instance_connect_endpoint<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    endpoint_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if !instance_connect_endpoint_id_is_well_formed(endpoint_id) {
+        return Err(crate::scaffolded::Scaffolded::service_error(
+            INVALID_INSTANCE_CONNECT_ENDPOINT_ID_MALFORMED,
+            400,
+            format!("Invalid id: '{endpoint_id}'"),
+        ));
+    }
+    if !store.instance_connect_endpoints.contains_key(endpoint_id) {
+        return Err(invalid_instance_connect_endpoint_id_not_found(endpoint_id));
+    }
+    Ok(())
+}
+
+/// Refuse a request that named an EC2 Instance Connect Endpoint id no endpoint of the
+/// account has: HTTP 400 `InvalidInstanceConnectEndpointId.NotFound`.
+pub fn invalid_instance_connect_endpoint_id_not_found<E>(
+    endpoint_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND,
+        400,
+        format!("The EC2 Instance Connect Endpoint '{endpoint_id}' does not exist."),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_INSTANCE_CONNECT_ENDPOINTS`]: HTTP
+/// 400 `InstanceConnectEndpointLimitExceeded`.
+pub fn instance_connect_endpoint_limit_exceeded<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INSTANCE_CONNECT_ENDPOINT_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of EC2 Instance Connect Endpoints has been reached \
+             ({MAX_INSTANCE_CONNECT_ENDPOINTS})"
+        ),
+    )
+}
+
+/// The DNS name this service reports for the EC2 Instance Connect Endpoint `endpoint_id`
+/// created in `region`.
+///
+/// AWS gives every endpoint a name under the service's own DNS label
+/// (`Ec2InstanceConnectEndpoint$DnsName`) and publishes no rule for the labels it builds
+/// one from, so this derives the name from the two facts it identifies: the endpoint's id
+/// and the Region the endpoint was created in. DERIVED on creation and never taken from a
+/// request, so two reads of one endpoint report the same name and two endpoints never share
+/// one. The suffix is the one [`partition_dns_suffix`] gives the Region's partition — the
+/// same lookup every other endpoint name in this module uses — so an endpoint created in a
+/// non-commercial Region does not report a commercial DNS name.
+pub fn instance_connect_endpoint_dns_name(endpoint_id: &str, region: &str) -> String {
+    format!(
+        "{endpoint_id}.{INSTANCE_CONNECT_ENDPOINT_DNS_LABEL}.{region}.{}",
+        partition_dns_suffix(region)
+    )
+}
+
+/// The FIPS-compliant counterpart of [`instance_connect_endpoint_dns_name`], under the
+/// `-fips` label.
+pub fn instance_connect_endpoint_fips_dns_name(endpoint_id: &str, region: &str) -> String {
+    format!(
+        "{endpoint_id}.{INSTANCE_CONNECT_ENDPOINT_FIPS_DNS_LABEL}.{region}.{}",
+        partition_dns_suffix(region)
+    )
+}
+
+/// Which address families `subnet` has a CIDR block for, as `(ipv4, ipv6)`.
+///
+/// A subnet's address families are what the `IpAddressType` of an endpoint created in it is
+/// determined by, so they are read off the stored [`Subnet`] rather than guessed from the
+/// request.
+pub fn subnet_cidr_families(subnet: &Subnet) -> (bool, bool) {
+    let ipv4 = subnet
+        .cidr_block
+        .as_deref()
+        .is_some_and(|cidr| !cidr.is_empty());
+    let ipv6 = subnet
+        .ipv6_cidr_block_association_set
+        .iter()
+        .flatten()
+        .any(|association| {
+            association
+                .ipv6_cidr_block
+                .as_deref()
+                .is_some_and(|cidr| !cidr.is_empty())
+        });
+    (ipv4, ipv6)
+}
+
+/// The `IpAddressType` an EC2 Instance Connect Endpoint created in `subnet` gets when the
+/// request names none, or `None` for a subnet with no CIDR block at all.
+///
+/// "If no value is specified, the default value is determined by the IP address type of the
+/// subnet: `dualstack` - If the subnet has both IPv4 and IPv6 CIDRs; `ipv4` - If the subnet
+/// has only IPv4 CIDRs; `ipv6` - If the subnet has only IPv6 CIDRs"
+/// (`CreateInstanceConnectEndpointRequest$IpAddressType`).
+pub fn default_ip_address_type(subnet: &Subnet) -> Option<&'static str> {
+    match subnet_cidr_families(subnet) {
+        (true, true) => Some(IP_ADDRESS_TYPE_DUALSTACK),
+        (true, false) => Some(IP_ADDRESS_TYPE_IPV4),
+        (false, true) => Some(IP_ADDRESS_TYPE_IPV6),
+        (false, false) => None,
+    }
+}
+
+/// Whether `subnet` has the CIDR blocks an endpoint of `ip_address_type` is reached over.
+///
+/// The same sentence that makes the subnet's CIDRs the DEFAULT address type
+/// ([`default_ip_address_type`]) is what makes a type the subnet carries no CIDR for
+/// unservable: a `dualstack` endpoint needs both families, an `ipv6` one an IPv6 CIDR, an
+/// `ipv4` one an IPv4 CIDR. A value outside the modelled `IpAddressType` enum names no
+/// family at all, so no subnet serves it.
+pub fn subnet_serves_ip_address_type(subnet: &Subnet, ip_address_type: &str) -> bool {
+    let (ipv4, ipv6) = subnet_cidr_families(subnet);
+    match ip_address_type {
+        IP_ADDRESS_TYPE_IPV4 => ipv4,
+        IP_ADDRESS_TYPE_IPV6 => ipv6,
+        IP_ADDRESS_TYPE_DUALSTACK => ipv4 && ipv6,
+        _ => false,
+    }
 }
 
 // =============================================================================

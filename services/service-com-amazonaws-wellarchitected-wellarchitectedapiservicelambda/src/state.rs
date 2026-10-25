@@ -5292,15 +5292,23 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         }
     }
 
-    /// The recommendation `arn` names, if this store holds one, for a caller that is about
-    /// to write to it — `UpdateAgentRecommendationStatus` is the one operation that does.
+    /// The recommendation `arn` names, if this store holds one.
     ///
-    /// A `RecommendationArn` identifies the recommendation on its own, so the lookup spans
-    /// every profile's recommendations: one map lookup per profile, bounded by
-    /// [`MAX_AGENT_PROFILES`], and exact — the inner maps are keyed by the ARN itself, so
-    /// no ARN suffix can be mistaken for another. A listing reaches a profile's
-    /// recommendations through [`Self::agent_recommendations`] directly, because it is
-    /// enumerating them rather than resolving one.
+    /// A `RecommendationArn` identifies the recommendation on its own —
+    /// `GetAgentRecommendation` carries no profile in its path — so the lookup spans every
+    /// profile's recommendations: one map lookup per profile, bounded by
+    /// [`MAX_AGENT_PROFILES`], and exact, because the inner maps are keyed by the ARN
+    /// itself. A listing reaches a profile's recommendations through
+    /// [`Self::agent_recommendations`] directly, because it is enumerating them rather
+    /// than resolving one.
+    pub fn agent_recommendation(&self, arn: &str) -> Option<&AgentRecommendationRecord> {
+        self.agent_recommendations
+            .values()
+            .find_map(|recommendations| recommendations.get(arn))
+    }
+
+    /// [`Self::agent_recommendation`] for a caller that is about to write to the
+    /// recommendation — `UpdateAgentRecommendationStatus` is the one operation that does.
     pub fn agent_recommendation_mut(
         &mut self,
         arn: &str,

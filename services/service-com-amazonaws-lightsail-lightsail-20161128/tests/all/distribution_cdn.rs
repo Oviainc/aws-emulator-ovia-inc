@@ -37,7 +37,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::ops::types::REGION_NAME_VALUES;
 
+use crate::distribution_certificate_attachment::{create_certificate, wait_for_issued_certificate};
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
+use crate::paging::{names, walk_pages};
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN and
 /// support code carries.
@@ -514,6 +516,25 @@ const ROWS: &[Row] = &[
     },
 ];
 
+/// Request every certificate the rows name and wait until the certificate
+/// authority has issued each one.
+///
+/// A distribution's `certificateName` names an SSL/TLS certificate of the
+/// account that has been ISSUED, so a row that names one needs that certificate
+/// to exist and be issued before its create is made. The names come from the
+/// rows themselves, so this cannot drift from the table, and the stand-up and
+/// the issuance wait are this test target's own, shared with the suites that
+/// pin the attachment.
+async fn create_row_certificates(emulator: &Emulator) {
+    let names: BTreeSet<&str> = ROWS.iter().filter_map(|row| row.certificate_name).collect();
+    for name in &names {
+        create_certificate(emulator, name, &format!("{name}.example.com"), &[]).await;
+    }
+    for name in &names {
+        wait_for_issued_certificate(emulator, name).await;
+    }
+}
+
 /// Every tag the record reports, as `(key, value)` pairs in the store's order.
 fn reported_tags(distribution: &Value) -> Vec<(String, String)> {
     distribution["tags"]
@@ -807,6 +828,7 @@ async fn read(emulator: &Emulator, name: &str) -> Value {
 async fn create_distribution_stores_the_requested_record() {
     let emulator = Emulator::new();
     let balancer_dns = create_origins(&emulator).await;
+    create_row_certificates(&emulator).await;
 
     // Nothing has been created yet, so a listing is an empty list rather than an
     // absent member.
@@ -1071,41 +1093,20 @@ async fn get_distributions_pages_every_stored_distribution() {
         created.push(name);
     }
 
-    let mut walked = Vec::new();
-    let mut page_sizes = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let body = match &token {
-            Some(token) => {
-                emulator
-                    .ok("GetDistributions", json!({"pageToken": token}))
-                    .await
-            }
-            None => emulator.ok("GetDistributions", json!({})).await,
-        };
-        let page = body["distributions"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case paging: expected a distributions array, got {body:?}"))
-            .clone();
-        page_sizes.push(page.len());
-        for distribution in page {
-            walked.push(
-                distribution["name"]
-                    .as_str()
-                    .expect("every listed distribution carries a name")
-                    .to_string(),
-            );
-        }
-        match body["nextPageToken"].as_str() {
-            Some(next) => token = Some(next.to_string()),
-            None => break,
-        }
-        assert!(
-            page_sizes.len() < 100,
-            "case paging: the walk did not terminate after {} pages",
-            page_sizes.len()
-        );
-    }
+    // The paging contract itself — a page no fuller than the page size, a token
+    // naming the first record of the page after it, a full page before every
+    // token and none on the last page — is checked by the one shared walk every
+    // listing suite in this target drives (`crate::paging::walk_pages`).
+    let (records, page_sizes) = walk_pages(
+        &emulator,
+        "paging",
+        None,
+        "GetDistributions",
+        "distributions",
+        PAGE_SIZE,
+    )
+    .await;
+    let walked = names(&records);
 
     let mut expected = created.clone();
     expected.sort();

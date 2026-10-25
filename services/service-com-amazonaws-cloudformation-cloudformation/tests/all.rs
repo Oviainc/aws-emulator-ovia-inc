@@ -53,6 +53,8 @@ mod generated_templates;
 mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
+#[path = "all/include_transform.rs"]
+mod include_transform;
 #[path = "all/list_change_sets.rs"]
 mod list_change_sets;
 #[path = "all/list_stack_resources.rs"]
@@ -123,3 +125,5 @@ mod unrecognized_resource_types;
 mod validate_template;
 #[path = "all/waf_regional_ip_set_resources.rs"]
 mod waf_regional_ip_set_resources;
+#[path = "all/wait_conditions.rs"]
+mod wait_conditions;

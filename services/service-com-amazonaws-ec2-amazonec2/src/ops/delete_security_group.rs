@@ -203,13 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you attempt to delete a security group that is associated with an instance or
         // network interface, is referenced by another security group in the same VPC, or has
         // a VPC association, the operation fails with `DependencyViolation`"
-        // (`DeleteSecurityGroup`).
-        let dependencies = store.security_group_dependencies(&group_id);
-        if !dependencies.is_empty() {
+        // (`DeleteSecurityGroup`) — what holds it being
+        // `crate::state::ComAmazonawsEc2Amazonec2State::security_group_dependencies`.
+        //
+        // The refusal names the GROUP THE REQUEST NAMED and nothing else: the resource that
+        // holds it is not the caller's to learn from this answer, and it is not part of the
+        // message AWS builds for this error class.
+        if !store.security_group_dependencies(&group_id).is_empty() {
             return Err(state::dependency_violation(format!(
-                "The security group '{group_id}' has dependencies and cannot be deleted: \
-                 {held}",
-                held = dependencies.join(", "),
+                "resource {group_id} has a dependent object"
             )));
         }
 

@@ -131,7 +131,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteConnectionErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -141,12 +140,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
 
         let mut store = state.lock();
         store.materialise_due_transitions(now);
 
-        let Some(stored) = store.connections.get_mut(&input.identifier) else {
+        // Scoped to the Region this request was signed for: a connection created
+        // through another Region's endpoint is not one this endpoint can delete,
+        // and is refused the way an identifier that names nothing is.
+        let Some(stored) = store.connection_in_mut(&region, &input.identifier) else {
             return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::connection_not_retrievable_message(

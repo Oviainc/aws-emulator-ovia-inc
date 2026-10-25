@@ -86,6 +86,23 @@ impl Answer {
     }
 }
 
+/// The `name`s a refusal's `fieldList` carries — the parameters the refusal is
+/// about. One reader for every suite that asserts on a refused parameter, so
+/// they cannot read the member two different ways.
+pub(crate) fn field_list(answer: &Answer) -> Vec<String> {
+    answer
+        .get("fieldList")
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field.get("name").and_then(Value::as_str))
+                .map(std::string::ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Call one operation. The SigV4 credential scope names `tax`, this service's
 /// signing name, which is how the router picks the service that claims it.
 pub(crate) async fn call(
@@ -980,8 +997,12 @@ async fn values_outside_the_model_are_refused_and_values_inside_it_are_served() 
             error_code: "ValidationException",
             modelled_error_code: "",
         },
-        // `legalName` / `legalAddress` are @required on every shape that reports
-        // a registration, so a record missing either cannot be stored.
+        // `legalName` / `legalAddress` are omittable only where the service fills
+        // the member in from the tax registration number (Brazil, Mexico, and the
+        // types whose address AWS derives); a German VAT entry is in neither
+        // carve-out, and an entry carrying no address at all identifies no
+        // jurisdiction to read one from — see
+        // `tests/all/derived_registration_members.rs`.
         Refusal {
             name: "legalName omitted",
             operation: "PutTaxRegistration",

@@ -30,8 +30,9 @@
 //!
 //! Every ARN this service reports (`Outpost$OutpostArn`, `Outpost$S3OutpostArn`,
 //! `Endpoint$EndpointArn`, `CreateEndpointResult$EndpointArn`) is built from the
-//! record's ids and owner account plus the Region the request was signed for, so
-//! all the ARNs in one answer name one Region — the Region the caller is talking
+//! record's ids and owner account plus the Region the request was signed for —
+//! and that Region's own partition ([`arn_partition`]) — so all the ARNs in one
+//! answer name one Region, in one partition: the Region the caller is talking
 //! to. The store holds one set of resources rather than one per Region, so
 //! storing a Region on the record would let an endpoint's ARN name a different
 //! Region from its own parent Outpost's ARN.
@@ -162,21 +163,26 @@ impl OutpostRecord {
             })
     }
 
-    /// `arn:aws:outposts:<region>:<owner>:outpost/<id>`, as
-    /// `OutpostArn`'s pattern spells it.
+    /// `arn:<partition>:outposts:<region>:<owner>:outpost/<id>`, as
+    /// `OutpostArn`'s pattern spells it, in the partition `region` belongs to
+    /// ([`arn_partition`]).
     pub fn outpost_arn(&self, region: &str) -> String {
         format!(
-            "arn:aws:outposts:{region}:{}:outpost/{}",
-            self.owner_id, self.outpost_id
+            "arn:{}:outposts:{region}:{}:outpost/{}",
+            arn_partition(region),
+            self.owner_id,
+            self.outpost_id
         )
     }
 
-    /// `arn:aws:s3-outposts:<region>:<owner>:outpost/<id>/s3`, as
+    /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<id>/s3`, as
     /// `S3OutpostArn`'s pattern spells it: the name RAM shares.
     pub fn s3_outpost_arn(&self, region: &str) -> String {
         format!(
-            "arn:aws:s3-outposts:{region}:{}:outpost/{}/s3",
-            self.owner_id, self.outpost_id
+            "arn:{}:s3-outposts:{region}:{}:outpost/{}/s3",
+            arn_partition(region),
+            self.owner_id,
+            self.outpost_id
         )
     }
 
@@ -221,12 +227,16 @@ pub struct EndpointRecord {
 }
 
 impl EndpointRecord {
-    /// `arn:aws:s3-outposts:<region>:<owner>:outpost/<outpost>/endpoint/<id>`,
-    /// as `EndpointArn`'s pattern spells it.
+    /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<outpost>/endpoint/<id>`,
+    /// as `EndpointArn`'s pattern spells it, in the partition `region` belongs
+    /// to ([`arn_partition`]).
     pub fn endpoint_arn(&self, region: &str) -> String {
         format!(
-            "arn:aws:s3-outposts:{region}:{}:outpost/{}/endpoint/{}",
-            self.owner_account, self.outpost_id, self.endpoint_id
+            "arn:{}:s3-outposts:{region}:{}:outpost/{}/endpoint/{}",
+            arn_partition(region),
+            self.owner_account,
+            self.outpost_id,
+            self.endpoint_id
         )
     }
 
@@ -463,6 +473,39 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The partition field of every ARN this service builds for `region`: the
+/// partition that Region belongs to, read off its region code.
+///
+/// An ARN names its resource in full, so its partition field and its Region
+/// field describe the same place: a Region of the China partition can only be
+/// named by an `aws-cn` ARN, a GovCloud Region only by an `aws-us-gov` one, and
+/// so on. `OutpostArn`, `S3OutpostArn` and `EndpointArn` each spell the
+/// alternation out (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):…`) beside a
+/// Region field their pattern leaves open, so the partition is a function of the
+/// Region and never a constant.
+///
+/// The prefixes and partition names are AWS's own. The isolated Regions AWS
+/// added after this service's patterns were published get their own partition
+/// too — the Region decides, and naming the commercial partition for a Region
+/// outside it is the very disagreement this function exists to prevent. The
+/// longer `us-isob-` / `us-isof-` prefixes are matched before `us-iso-` so each
+/// lands in its own partition.
+#[must_use]
+pub fn arn_partition(region: &str) -> &'static str {
+    const PARTITION_PREFIXES: &[(&str, &str)] = &[
+        ("cn-", "aws-cn"),
+        ("us-gov-", "aws-us-gov"),
+        ("us-isob-", "aws-iso-b"),
+        ("us-isof-", "aws-iso-f"),
+        ("eu-isoe-", "aws-iso-e"),
+        ("us-iso-", "aws-iso"),
+    ];
+    PARTITION_PREFIXES
+        .iter()
+        .find(|(prefix, _)| region.starts_with(prefix))
+        .map_or("aws", |(_, partition)| *partition)
 }
 
 /// The page a list operation serves for `max_results`.
