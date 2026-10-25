@@ -2,9 +2,16 @@
 
 //! @op DeleteProbe
 //!
-//! Detaches the probe from the stored monitor in [`crate::state`], so a later
-//! `GetMonitor` no longer lists it. An unknown monitor, or a probe that monitor
-//! does not hold, is `ResourceNotFoundException`.
+//! Accepts the TEARDOWN of the probe the stored monitor in [`crate::state`]
+//! holds: tearing a probe down is asynchronous, so the record stays in place
+//! and moves into the teardown half of the modelled `ProbeState` lifecycle
+//! (`DELETING`, then `DELETED` once the clock makes that due), and only when
+//! the clock has carried the teardown through does a read of the probe report
+//! `ResourceNotFoundException` and `GetMonitor` stop listing it
+//! ([`crate::state::Probe::start_teardown`],
+//! [`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::settle_monitor`]).
+//! An unknown monitor, or a probe that monitor does not hold, is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // The transitions the clock already owed this monitor and its probes,
+        // materialised before this request is answered — among them the removal
+        // of a probe whose own teardown has run its course, so a delete of such
+        // a probe is not-found rather than a second teardown of a record only
+        // this call still sees.
+        store.settle_monitor(&region, &input.monitor_name, now);
         let monitor = store
             .monitor_mut(&region, &input.monitor_name)
             .ok_or_else(|| {
@@ -164,23 +177,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
                 })
             })?;
-        if monitor.probes.remove(&input.probe_id).is_none() {
-            return Err(DeleteProbeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::probe_not_found_message(
-                        &input.probe_id,
-                        &input.monitor_name,
-                    )),
-                },
-            )
-            .into());
-        }
-        monitor.modified_at = now;
-        // A monitor with no probes left has nothing to aggregate, so it goes
-        // back to `INACTIVE` with no activation due — the same state a monitor
-        // created without probes is in.
-        if monitor.probes.is_empty() {
-            monitor.clear_activation();
+        let probe = monitor.probes.get_mut(&input.probe_id).ok_or_else(|| {
+            DeleteProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::probe_not_found_message(
+                    &input.probe_id,
+                    &input.monitor_name,
+                )),
+            })
+        })?;
+        // Accepted, not performed: the probe keeps its configuration and stays
+        // readable while its path is released, and the clock carries it the rest
+        // of the way. The model marks this operation `@idempotent`, and the
+        // teardown is too — a repeat keeps the instants the first accepted
+        // delete set, so it neither postpones nor restarts the teardown, and
+        // leaves `modifiedAt` where that delete put it.
+        let already_tearing_down = probe.is_being_torn_down();
+        probe.start_teardown(now);
+        if !already_tearing_down {
+            monitor.modified_at = now;
         }
         Ok(DeleteProbeOutput {})
     }

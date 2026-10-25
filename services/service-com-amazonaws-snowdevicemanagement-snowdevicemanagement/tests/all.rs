@@ -15,6 +15,8 @@
 mod account_device_gate;
 #[path = "all/cancel_task_dispatch_window.rs"]
 mod cancel_task_dispatch_window;
+#[path = "all/create_task_in_flight_quota.rs"]
+mod create_task_in_flight_quota;
 #[path = "all/create_task_tag_validation.rs"]
 mod create_task_tag_validation;
 #[path = "all/device_ec2_instances.rs"]

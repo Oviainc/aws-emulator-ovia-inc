@@ -475,6 +475,41 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
         invitations
     }
 
+    /// Drop the invitation the inbox `region`'s endpoint serves holds from
+    /// `administrator_account_id`, reporting whether there was one to drop.
+    ///
+    /// The inbox is resolved the way [`Self::received_invitations_in`] resolves it
+    /// and for the same reason: the operations that answer an invitation by the
+    /// account that sent it name no detector, so the inbox a request addresses is
+    /// the one the Region it was signed for serves. An account the inbox holds
+    /// nothing from is not an error here — the caller reports it as unprocessed —
+    /// so this is a lookup that answers `false` and writes NOTHING.
+    ///
+    /// No instant is read: an invitation carries only the instant it was SENT
+    /// ([`ReceivedInvitationRecord::invited_at_millis`], the one member of
+    /// `Invitation` that is a time — `smithy_query(shape="Invitation")`), and the
+    /// record that held it is gone, so there is nothing left for a clock to
+    /// stamp.
+    ///
+    /// One inbox per Region, for the reason [`Self::received_invitations_in`]
+    /// gives: a Region holds at most one detector, so the walk stops at the first
+    /// inbox the invitation was in.
+    pub fn delete_received_invitation_in(
+        &mut self,
+        region: &str,
+        administrator_account_id: &str,
+    ) -> bool {
+        self.detectors
+            .values_mut()
+            .filter(|detector| detector.region == region)
+            .find_map(|detector| {
+                detector
+                    .received_invitations
+                    .remove(administrator_account_id)
+            })
+            .is_some()
+    }
+
     /// The Malware Protection plan `region`'s endpoint serves for `id`, if any.
     ///
     /// Regional for the same reason a detector is: a plan is created through one
@@ -1441,6 +1476,17 @@ pub const NOT_ASSOCIATED_MESSAGE: &str = "The request is rejected because the cu
 pub const SELF_AS_MEMBER_MESSAGE: &str =
     "The request is rejected because the current account cannot be used as a member account.";
 
+/// `UnprocessedAccount.Result` for an account id the current account's inbox holds
+/// no invitation from.
+///
+/// The operations that answer an invitation by the account that SENT it name the
+/// invitation by that account alone, so an account that has not invited this one
+/// identifies nothing to answer. It is reported rather than refusing the whole
+/// request, like every other per-account failure this service reports: the result
+/// states the condition, which is what "a reason why the account hasn't been
+/// processed" (`smithy_query(shape="UnprocessedAccount")`) is for.
+pub const NO_INVITATION_FROM_ACCOUNT_MESSAGE: &str = "The request is rejected because the current account has not received an invitation from the given account ID.";
+
 /// How many member accounts one administrator's detector holds.
 ///
 /// GuardDuty's own quota is 5,000 member accounts per administrator account per
@@ -2110,9 +2156,10 @@ pub struct Detector {
     /// report are a lookup: an invitation this store holds is accepted by one and
     /// reported by the other, read through [`Self::received_invitations_in`] and
     /// projected through [`invitation_view`]. `GetInvitationsCount` reports the
-    /// SIZE of that same inbox, through the same reader. The operations that DROP
-    /// one (`DeclineInvitations`, `DeleteInvitations`) are scaffolds with issues of
-    /// their own.
+    /// SIZE of that same inbox, through the same reader. `DeleteInvitations` DROPS
+    /// one through [`Self::delete_received_invitation_in`], so an invitation this
+    /// store holds leaves the inbox either answered or deleted;
+    /// `DeclineInvitations` is a scaffold with an issue of its own.
     ///
     /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
     /// grow it without limit: the key is an account id, which is request-chosen.

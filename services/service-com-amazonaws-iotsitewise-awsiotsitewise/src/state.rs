@@ -254,6 +254,8 @@ pub const ASSET_MODEL_RESOURCE_TYPE: &str = "asset-model";
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 /// The ARN resource-type segment of a portal ARN, as [`portal_arn`] builds it.
 pub const PORTAL_RESOURCE_TYPE: &str = "portal";
+/// The ARN resource-type segment of a project ARN, as [`project_arn`] builds it.
+pub const PROJECT_RESOURCE_TYPE: &str = "project";
 /// The ARN resource-type segment of a pipeline ARN, as [`pipeline_arn`] builds it.
 pub const PIPELINE_RESOURCE_TYPE: &str = "pipeline";
 
@@ -354,6 +356,12 @@ pub const MAX_ACCESS_POLICIES: usize = 1_000;
 /// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
 /// cap. The emulator's own bound, not a published AWS default.
 pub const MAX_PORTALS: usize = 1_000;
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the project map. `CreateProject`
+/// is the only thing that adds a project and it declares the modelled
+/// `LimitExceededException` (HTTP 410), so that is how this store refuses past the
+/// cap. The emulator's own bound, not a published AWS default.
+pub const MAX_PROJECTS: usize = 1_000;
 
 /// The `AuthMode` value of a portal that authenticates its users through IAM
 /// Identity Center, as `AuthMode` spells it (smithy_query query="shape"
@@ -1847,6 +1855,43 @@ impl PortalRecord {
     }
 }
 
+/// A stored IoT SiteWise Monitor project: everything `DescribeProject` reports,
+/// plus the `tags` the tagging operations read.
+///
+/// A project has no lifecycle state of its own — no operation on one answers a
+/// status member — so, unlike a portal, nothing here is owed a later transition;
+/// the two dates are what a read derives from. The portal the project was created
+/// in is stored on the record because every reader reports it and no operation
+/// moves a project between portals.
+#[derive(Debug, Clone)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub arn: String,
+    /// The portal the project lives in, as the create named it.
+    pub portal_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+impl ProjectRecord {
+    /// Replace the caller-owned members with what an update stated, and record
+    /// that instant as the project's last update.
+    ///
+    /// The request states the project's new name and description rather than
+    /// patching selected members, so an omitted optional description clears the
+    /// stored one; the project's identity and provenance — its id, its ARN, the
+    /// portal it lives in, its tags and its creation date — are not that call's to
+    /// change, and no member of its input carries them.
+    pub fn apply_update(&mut self, name: String, description: Option<String>, now: SystemTime) {
+        self.name = name;
+        self.description = description;
+        self.last_update_date = now;
+    }
+}
+
 /// One IoT SiteWise Monitor access policy: which identity may reach which Monitor
 /// resource, and with which permission.
 ///
@@ -3085,6 +3130,7 @@ tagged_record!(AssetRecord);
 tagged_record!(AssetModelRecord);
 tagged_record!(GatewayRecord);
 tagged_record!(PortalRecord);
+tagged_record!(ProjectRecord);
 tagged_record!(PipelineRecord);
 tagged_record!(TaskRecord);
 tagged_record!(DatasetRecord);
@@ -3160,6 +3206,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub gateway_devices: HashMap<String, String>,
     /// IoT SiteWise Monitor portals by `portalId`.
     pub portals: HashMap<String, PortalRecord>,
+    /// IoT SiteWise Monitor projects by `projectId`. The id alone identifies one
+    /// — every operation on a project addresses it by that id — and the record
+    /// names the portal the project lives in, so the listing form filters on the
+    /// record rather than on a second index.
+    pub projects: HashMap<String, ProjectRecord>,
     /// IoT SiteWise Monitor access policies by `accessPolicyId`. The id alone
     /// identifies one, and the record names the identity and the Monitor
     /// resource the policy is about, so the listing forms filter on the record
@@ -3956,6 +4007,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_MODEL_RESOURCE_TYPE => tags_of(self.asset_models.get(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of(self.gateways.get(id), arn),
             PORTAL_RESOURCE_TYPE => tags_of(self.portals.get(id), arn),
+            PROJECT_RESOURCE_TYPE => tags_of(self.projects.get(id), arn),
             PIPELINE_RESOURCE_TYPE => {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of(self.pipelines.get(&pipeline_key(workspace, name)), arn)
@@ -3981,6 +4033,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_MODEL_RESOURCE_TYPE => tags_of_mut(self.asset_models.get_mut(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of_mut(self.gateways.get_mut(id), arn),
             PORTAL_RESOURCE_TYPE => tags_of_mut(self.portals.get_mut(id), arn),
+            PROJECT_RESOURCE_TYPE => tags_of_mut(self.projects.get_mut(id), arn),
             PIPELINE_RESOURCE_TYPE => {
                 let (workspace, name) = id.split_once('/')?;
                 tags_of_mut(self.pipelines.get_mut(&pipeline_key(workspace, name)), arn)
@@ -4475,6 +4528,9 @@ pub const RESOURCE_TIME_SERIES: &str = "Time Series";
 
 /// The resource kind those errors name for an IoT SiteWise Monitor portal.
 pub const RESOURCE_PORTAL: &str = "Portal";
+
+/// The resource kind those errors name for an IoT SiteWise Monitor project.
+pub const RESOURCE_PROJECT: &str = "Project";
 
 /// The resource kind those errors name for an IoT SiteWise Monitor access policy.
 pub const RESOURCE_ACCESS_POLICY: &str = "Access Policy";
@@ -5067,6 +5123,16 @@ pub fn portal_arn(region: &str, portal_id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{PORTAL_RESOURCE_TYPE}/{portal_id}"),
+    )
+}
+
+/// The canonical ARN of a project in `region`, in the form `CreateProject`
+/// documents: `arn:${Partition}:iotsitewise:${Region}:${Account}:project/${ProjectId}`.
+pub fn project_arn(region: &str, project_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{PROJECT_RESOURCE_TYPE}/{project_id}"),
     )
 }
 

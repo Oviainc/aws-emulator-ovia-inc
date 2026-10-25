@@ -69,3 +69,5 @@ mod update_user_pool_client;
 mod user_attribute_verification_code;
 #[path = "all/user_pool_domain.rs"]
 mod user_pool_domain;
+#[path = "all/verification_code_pipeline.rs"]
+mod verification_code_pipeline;

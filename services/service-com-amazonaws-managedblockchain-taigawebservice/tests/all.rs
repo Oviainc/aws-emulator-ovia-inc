@@ -29,6 +29,8 @@ mod list_members;
 mod list_proposal_votes;
 #[path = "all/modelled_error_payloads.rs"]
 mod modelled_error_payloads;
+#[path = "all/modelled_error_sets.rs"]
+mod modelled_error_sets;
 #[path = "all/network_and_node_lifecycle.rs"]
 mod network_and_node_lifecycle;
 #[path = "all/node_configuration_validation.rs"]

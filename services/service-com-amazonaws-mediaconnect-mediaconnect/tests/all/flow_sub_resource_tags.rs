@@ -50,7 +50,12 @@ const SUBSCRIBER: &str = "111122223333";
 type Reply = (u16, Option<String>, Value);
 
 /// `POST /tags/{ResourceArn}` with the pairs in `tags`.
-async fn tag(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
+///
+/// `pub(crate)` — like `reported_tags`, `assert_tagging_is_not_found`, `stored`, `Resource`
+/// and `fixture` below — because `tests/all/flow_sub_resource_tag_retention.rs` asserts what
+/// MOVES these same maps, and so drives the same bindings and the same hierarchy rather
+/// than spelling either out a second time.
+pub(crate) async fn tag(emulator: &Emulator, resource_arn: &str, tags: Value) -> Reply {
     emulator
         .send(
             "POST",
@@ -85,7 +90,7 @@ async fn untag(emulator: &Emulator, resource_arn: &str, keys: &[&str]) -> Reply 
 }
 
 /// The tags `ListTagsForResource` reports for `resource_arn`, asserted to be a 200.
-async fn reported_tags(
+pub(crate) async fn reported_tags(
     emulator: &Emulator,
     case: &str,
     resource_arn: &str,
@@ -106,7 +111,7 @@ async fn reported_tags(
 }
 
 /// A tag map as the service stores it, from `(key, value)` pairs.
-fn stored(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn stored(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -115,10 +120,10 @@ fn stored(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// One resource under test: how the case is named, the ARN this emulator minted for it,
 /// and the tag map its create request left on it.
-struct Resource {
-    case: String,
-    arn: String,
-    tags: BTreeMap<String, String>,
+pub(crate) struct Resource {
+    pub(crate) case: String,
+    pub(crate) arn: String,
+    pub(crate) tags: BTreeMap<String, String>,
 }
 
 /// A deterministic string of `length` ASCII characters, for exercising a documented length
@@ -137,7 +142,10 @@ fn filler(length: usize, seed: u8) -> String {
 /// `GrantFlowEntitlements` add one more of each, so the table covers a sub-resource minted
 /// by the create AND one minted by the operation that adds it to a live flow. Source
 /// failover is ENABLED because the add gives the flow a second source.
-async fn fixture(emulator: &Emulator) -> (String, Vec<Resource>) {
+///
+/// `pub(crate)` because `tests/all/flow_sub_resource_tag_retention.rs` asserts what MOVES
+/// these same maps, and so needs the same hierarchy rather than a second copy of it.
+pub(crate) async fn fixture(emulator: &Emulator) -> (String, Vec<Resource>) {
     let (status, code, created) = emulator
         .create_flow(json!({
             "name": "sub-resource-tags",
@@ -473,7 +481,7 @@ async fn a_removed_sub_resource_takes_its_tags_with_it() {
 
 /// All three tagging operations refuse `arn` with the modelled `NotFoundException` (404) —
 /// never a 501 and never a success.
-async fn assert_tagging_is_not_found(emulator: &Emulator, case: &str, arn: &str) {
+pub(crate) async fn assert_tagging_is_not_found(emulator: &Emulator, case: &str, arn: &str) {
     let calls: Vec<(&str, Reply)> = vec![
         ("TagResource", tag(emulator, arn, json!({ "k": "v" })).await),
         ("ListTagsForResource", list_tags(emulator, arn).await),

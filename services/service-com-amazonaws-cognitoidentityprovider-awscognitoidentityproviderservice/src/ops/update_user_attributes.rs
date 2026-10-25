@@ -312,10 +312,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user.user_last_modified_date = now;
         }
 
+        // A reported delivery is a code that was SENT, so each one is minted and
+        // recorded against the attribute it was sent for — which is the code
+        // `VerifyUserAttribute` accepts for it, and which supersedes any code
+        // outstanding for that attribute before. The destination is the value the
+        // message went to: the pending one where the pool holds the update until the
+        // user confirms it.
+        let mut deliveries = Vec::new();
+        for (attribute, value) in &plan.verifications {
+            let code = crate::state::VerificationCode::issued(attribute, value, now);
+            let stored = user.issue_code(
+                crate::state::CodePurpose::AttributeVerification(attribute.clone()),
+                code,
+            );
+            deliveries.extend(stored.delivery_details());
+        }
+
         // The member is PRESENT and empty when nothing was sent, which is what
         // a client reading the list sees.
         Ok(UpdateUserAttributesOutput {
-            code_delivery_details_list: Some(plan.deliveries),
+            code_delivery_details_list: Some(deliveries),
         })
     }
 }
@@ -338,13 +354,16 @@ struct AttributeUpdate {
 }
 
 /// The whole update: which stored user it applies to, what it does to that
-/// user's attributes and the delivery details it answers.
+/// user's attributes and the verification messages it sends.
 #[derive(Debug)]
 struct Plan {
     user_pool_id: String,
     username: String,
     updates: Vec<AttributeUpdate>,
-    deliveries: Vec<CodeDeliveryDetailsType>,
+    /// One `(attribute, value)` per verification message this update sends: the
+    /// attribute the message is addressed to and the value it goes to, which is
+    /// what the code issued for it is recorded against.
+    verifications: Vec<(String, String)>,
 }
 
 /// Decide what `requested` does to `user` of `pool`, or the refusal it earns.
@@ -401,7 +420,7 @@ fn plan_update(
     }
 
     let mut updates = Vec::new();
-    let mut deliveries = Vec::new();
+    let mut verifications = Vec::new();
     for (name, value) in &submitted {
         let name = (*name).to_string();
         // A verified flag whose attribute this same request DELETES has
@@ -479,10 +498,11 @@ fn plan_update(
         // the pool verifies itself, and to one it holds pending until the user
         // confirms it. One entry per attribute at most, since the attributes
         // are the distinct ones submitted.
-        if !unchanged && (deferred || pool.auto_verifies(&name)) {
-            if let Some(details) = crate::state::code_delivery_details(&name, &value) {
-                deliveries.push(details);
-            }
+        if !unchanged
+            && (deferred || pool.auto_verifies(&name))
+            && crate::state::delivery_medium(&name).is_some()
+        {
+            verifications.push((name.clone(), value.clone()));
         }
 
         updates.push(AttributeUpdate {
@@ -497,7 +517,7 @@ fn plan_update(
         user_pool_id: pool.id.clone(),
         username: user.username.clone(),
         updates,
-        deliveries,
+        verifications,
     })
 }
 

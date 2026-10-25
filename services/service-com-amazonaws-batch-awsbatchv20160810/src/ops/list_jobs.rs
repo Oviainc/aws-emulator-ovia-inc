@@ -153,23 +153,6 @@ impl From<ListJobsErrorModeled> for ListJobsError {
     }
 }
 
-/// Whether `candidate` matches a filter `value` the way the model documents `JOB_NAME`:
-/// case-insensitively, and matching any candidate that begins with the text before a
-/// trailing `*`.
-fn matches_ignoring_case(candidate: &str, value: &str) -> bool {
-    match value.strip_suffix('*') {
-        // Compared byte-wise rather than through two lowercased copies: a job name is
-        // ASCII (`^[A-Za-z0-9][A-Za-z0-9_-]*$`), and `is_char_boundary` keeps the slice
-        // valid for anything else.
-        Some(prefix) => {
-            candidate.len() >= prefix.len()
-                && candidate.is_char_boundary(prefix.len())
-                && candidate[..prefix.len()].eq_ignore_ascii_case(prefix)
-        }
-        None => candidate.eq_ignore_ascii_case(value),
-    }
-}
-
 /// Whether the job definition `arn` a job ran matches a `JOB_DEFINITION` filter value,
 /// the way the model documents it: an ARN matches that exact revision (no `*`), while a
 /// name matches every revision of it, case-sensitively, with a trailing `*` matching any
@@ -314,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     jobs.retain(|job| {
                         values
                             .iter()
-                            .any(|value| matches_ignoring_case(&job.job_name, value))
+                            .any(|value| batch::matches_name_filter(&job.job_name, value))
                     });
                     status_filter_applies = false;
                 }
@@ -327,23 +310,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status_filter_applies = false;
                 }
                 "BEFORE_CREATED_AT" | "AFTER_CREATED_AT" => {
-                    let mut bounds = Vec::with_capacity(values.len());
-                    for value in &values {
-                        let Ok(bound) = value.parse::<i64>() else {
-                            return Err(ListJobsErrorModeled::ClientException(
-                                batch::client_exception(format!(
-                                    "The {name} filter value {value} is not a number of milliseconds since the epoch"
-                                )),
-                            )
-                            .into());
-                        };
-                        bounds.push(bound);
-                    }
-                    if name == "BEFORE_CREATED_AT" {
-                        jobs.retain(|job| bounds.iter().any(|bound| job.created_at <= *bound));
-                    } else {
-                        jobs.retain(|job| bounds.iter().any(|bound| job.created_at >= *bound));
-                    }
+                    let bounds = batch::created_at_filter_bounds(name, &values).map_err(
+                        |message| {
+                            ListJobsError::from(ListJobsErrorModeled::ClientException(
+                                batch::client_exception(message),
+                            ))
+                        },
+                    )?;
+                    jobs.retain(|job| {
+                        batch::matches_created_at_filter(name, job.created_at, &bounds)
+                    });
                     status_filter_applies = false;
                 }
                 // The one filter the model documents as usable together with `jobStatus`.
