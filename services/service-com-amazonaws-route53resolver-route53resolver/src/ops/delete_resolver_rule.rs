@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResolverRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResolverRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResolverRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The rule a delete takes out of [`crate::state`]
+//! is the one it answers with, and a rule a VPC still uses is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +145,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResolverRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResolverRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResolverRule"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResolverRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // Nothing is stored under that id — including a second delete of the same
+        // rule, which the first one already removed.
+        let Some(record) = store.resolver_rules.get(&input.resolver_rule_id) else {
+            return Err(DeleteResolverRuleErrorModeled::ResourceNotFoundException(
+                crate::state::resolver_rule_not_found(&input.resolver_rule_id),
+            )
+            .into());
+        };
+        // Read off the stored rule before anything is removed: the answer is the
+        // rule this call took out, and the `CreatorRequestId` released with it is
+        // the one that rule was created under.
+        let creator_request_id = record.creator_request_id.clone();
+        let mut rule = record.to_rule();
+
+        // "Before you can delete a Resolver rule, you must disassociate it from
+        // all the VPCs that you associated the Resolver rule with": a rule a VPC
+        // still uses is the resource "that you tried to update or delete [and
+        // that] is currently in use", so the delete is refused and the rule stays.
+        let associations = store.rule_association_count(&input.resolver_rule_id);
+        if associations > 0 {
+            return Err(DeleteResolverRuleErrorModeled::ResourceInUseException(
+                crate::state::resolver_rule_in_use(&input.resolver_rule_id, associations),
+            )
+            .into());
+        }
+
+        store.resolver_rules.remove(&input.resolver_rule_id);
+        // The `CreatorRequestId` is released with the rule, so a create that
+        // reuses it makes a new rule rather than resolving to the deleted one —
+        // the same rule `DeleteResolverEndpoint` follows for an endpoint's.
+        store
+            .rule_creator_request_id_index
+            .remove(&creator_request_id);
+
+        // "Information about the DeleteResolverRule request, including the status
+        // of the request": the rule is on its way out, so it reports `DELETING`.
+        rule.status = Some(crate::state::RULE_STATUS_DELETING.to_string());
+        rule.modification_time = Some(crate::state::now_rfc3339());
+
+        Ok(DeleteResolverRuleOutput {
+            resolver_rule: Some(rule),
+        })
     }
 }

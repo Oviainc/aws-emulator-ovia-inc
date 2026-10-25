@@ -3593,6 +3593,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// name or identifier property either, and each kind of Amazon MSK cluster's is the
 /// `ClusterArn` its create answers with ("Ref returns the ARN of the cluster"), whose
 /// resource path carries an identifier Amazon MSK mints beside the declared cluster name.
+///
+/// The three Route 53 Resolver types are in the same position: that service mints a
+/// `rslvr-`-prefixed id for an endpoint, a rule and a rule association, none of its creates
+/// takes one, and each type's `Ref` returns that id — the `Name` such a type declares is
+/// only "a friendly name that lets you easily find [it] in the Resolver dashboard".
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
@@ -3603,6 +3608,9 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ACM_ACME_ENDPOINT
         || resource_type == MSK_CLUSTER
         || resource_type == MSK_SERVERLESS_CLUSTER
+        || resource_type == ROUTE53RESOLVER_ENDPOINT
+        || resource_type == ROUTE53RESOLVER_RULE
+        || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3788,6 +3796,20 @@ pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
 /// identifier and MINTS one — so the id a stack's output reports for it is the one that
 /// service answered with.
 pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// The three Route 53 Resolver resource types a stack creates in that service (the
+/// Route 53 Resolver model: `cloudFormationName: Route53Resolver`).
+///
+/// Each one's identifier is Route 53 Resolver's OWN to mint — `Ref` of an endpoint returns
+/// its `rslvr-out-…`/`rslvr-in-…` id, of a rule its `rslvr-rr-…` id and of a rule
+/// association its `rslvr-rrassoc-…` id, and none of the three creates takes an identifier
+/// — so the id a stack's output reports for one is the id that service answered with, which
+/// is what `GetResolverEndpoint`, `GetResolverRule` and `GetResolverRuleAssociation`
+/// resolve.
+pub const ROUTE53RESOLVER_ENDPOINT: &str = "AWS::Route53Resolver::ResolverEndpoint";
+pub const ROUTE53RESOLVER_RULE: &str = "AWS::Route53Resolver::ResolverRule";
+pub const ROUTE53RESOLVER_RULE_ASSOCIATION: &str =
+    "AWS::Route53Resolver::ResolverRuleAssociation";
 
 /// An AWS Certificate Manager ACME endpoint's resource type (the ACM model:
 /// `cloudFormationName: CertificateManager`). This is a type `super::provisioning`

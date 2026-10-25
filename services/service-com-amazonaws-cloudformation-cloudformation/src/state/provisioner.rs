@@ -167,6 +167,17 @@
 //!   stack reports for the resource, and the delete and the drift read address the cluster
 //!   by it.
 //!
+//! * the three `AWS::Route53Resolver::*` types' properties ARE their creates' own members,
+//!   spelled identically on both sides all the way down, so each arm carries the evaluated
+//!   document through ([`resolver_request`]) with the one member CloudFormation decides
+//!   added: the `CreatorRequestId` every one of those creates requires and no such type
+//!   publishes ([`resolver_creator_request_id`]). Each type's identity is Route 53
+//!   Resolver's OWN — `Ref` returns the `rslvr-out-…` endpoint id, the `rslvr-rr-…` rule id
+//!   and the `rslvr-rrassoc-…` association id, and none of the creates takes an identifier —
+//!   so what the stack reports for the resource is the id that create answered with, and an
+//!   association is removed by the rule/VPC PAIR its declaration carries rather than by its
+//!   own id.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -209,7 +220,8 @@ use super::template::{
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER,
+    MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
+    ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
     SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY,
@@ -287,6 +299,9 @@ pub(super) enum Provisioner {
     SchedulerSchedule,
     CognitoUserPoolGroup,
     AcmAcmeEndpoint,
+    Route53ResolverEndpoint,
+    Route53ResolverRule,
+    Route53ResolverRuleAssociation,
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
     ElasticBeanstalkEnvironment,
@@ -328,6 +343,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SCHEDULER_SCHEDULE => Some(Provisioner::SchedulerSchedule),
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
+        ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
+        ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
+        ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
         ELASTIC_BEANSTALK_APPLICATION => Some(Provisioner::ElasticBeanstalkApplication),
         ELASTIC_BEANSTALK_APPLICATION_VERSION => {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
@@ -457,6 +475,18 @@ impl Provisioner {
             // taggable, so no tags are propagated to a group.
             Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => create_acme_endpoint(ctx, region, resource, propagated).await,
+            Self::Route53ResolverEndpoint => {
+                create_resolver_endpoint(ctx, region, resource, propagated).await
+            }
+            Self::Route53ResolverRule => {
+                create_resolver_rule(ctx, region, resource, propagated).await
+            }
+            // `AWS::Route53Resolver::ResolverRuleAssociation` publishes `Name`,
+            // `ResolverRuleId` and `VPCId` and no `Tags`: the type is not taggable, so no
+            // tags are propagated to an association.
+            Self::Route53ResolverRuleAssociation => {
+                associate_resolver_rule(ctx, region, resource).await
+            }
             // `AWS::ElasticBeanstalk::Application` publishes `ApplicationName`,
             // `Description` and `ResourceLifecycleConfig` and no `Tags`: the type is not
             // taggable, so no tags are propagated to it. The same goes for
@@ -672,6 +702,17 @@ impl Provisioner {
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
+            Self::Route53ResolverEndpoint => {
+                delete_resolver_endpoint(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverRule => {
+                delete_resolver_rule(ctx, region, physical_resource_id).await
+            }
+            // The disassociate addresses the association by the PAIR that identifies it,
+            // which only the resource's own record carries.
+            Self::Route53ResolverRuleAssociation => {
+                disassociate_resolver_rule(ctx, region, resource).await
+            }
             Self::ElasticBeanstalkApplication => {
                 delete_eb_application(ctx, region, physical_resource_id).await
             }
@@ -789,6 +830,15 @@ impl Provisioner {
             Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => {
                 describe_acme_endpoint(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverEndpoint => {
+                describe_resolver_endpoint(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverRule => {
+                describe_resolver_rule(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverRuleAssociation => {
+                describe_resolver_rule_association(ctx, region, physical_resource_id).await
             }
             Self::ElasticBeanstalkApplication => {
                 describe_eb_application(ctx, region, physical_resource_id).await
@@ -7606,6 +7656,406 @@ async fn describe_acme_endpoint(
             ("AuthorizationBehavior", "AuthorizationBehavior"),
             ("Contact", "Contact"),
             ("CertificateAuthority", "CertificateAuthority"),
+        ],
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Route 53 Resolver: AWS::Route53Resolver::ResolverEndpoint / ::ResolverRule /
+// ::ResolverRuleAssociation
+// ---------------------------------------------------------------------------
+
+/// Route 53 Resolver's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: route53resolver`, service shape `Route53Resolver`), which speaks
+/// `awsJson1_1`.
+const ROUTE53RESOLVER_SIGNING_NAME: &str = "route53resolver";
+const ROUTE53RESOLVER_TARGET_PREFIX: &str = "Route53Resolver";
+
+/// The `CreatorRequestId` CloudFormation sends with a Route 53 Resolver create.
+///
+/// Each of the three creates REQUIRES one ("a unique string that identifies the request
+/// and that allows failed requests to be retried without the risk of running the operation
+/// twice"), and no `AWS::Route53Resolver::*` type publishes a property for it, so it is
+/// CloudFormation's to supply. The resource's computed physical id is what it is built from:
+/// unique per stack and logical id, and the SAME string if this deployment is attempted
+/// again — which is exactly the retry that member exists for, so a re-ask resolves to the
+/// resource the first attempt made instead of a second one.
+fn resolver_creator_request_id(resource: &StoredResource) -> String {
+    resource.physical_resource_id.clone()
+}
+
+/// One required property of a Route 53 Resolver resource, or the refusal a declaration
+/// missing it gets — the create could not identify what to make without it.
+fn required_property(resource: &StoredResource, name: &str) -> Result<String, Refusal> {
+    property(resource, name).ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no {name}", resource.resource_type),
+    })
+}
+
+/// Call one Route 53 Resolver operation in process.
+async fn call_route53resolver(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        ROUTE53RESOLVER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ROUTE53RESOLVER_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
+}
+
+/// The evaluated property document as the create's request MEMBERS, with the
+/// `CreatorRequestId` CloudFormation decides and — for a taggable type — the tags it gives
+/// the resource.
+///
+/// All three types' properties ARE their creates' own members, spelled identically on both
+/// sides, so the document is carried through rather than mapped member by member:
+/// `Direction`, `IpAddresses`, `SecurityGroupIds`, `Protocols`, `ResolverEndpointType`,
+/// `OutpostArn` and `PreferredInstanceType` for an endpoint; `RuleType`, `DomainName`,
+/// `TargetIps`, `ResolverEndpointId` and `DelegationRecord` for a rule; `ResolverRuleId`
+/// and `VPCId` for an association — each beside the `Name` all three publish
+/// (`smithy_query(operation="CreateResolverEndpoint,CreateResolverRule,\
+/// AssociateResolverRule")`).
+///
+/// `tags` is `None` for the one type that is not taggable, whose call takes no tags at all.
+/// The `CreatorRequestId` is added by the two creates that MODEL one, since
+/// `AssociateResolverRule` has no such member.
+fn resolver_request(
+    resource: &StoredResource,
+    tags: Option<Vec<(String, String)>>,
+) -> Map<String, Value> {
+    let mut request = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    match tags {
+        Some(tags) if !tags.is_empty() => {
+            request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+        }
+        Some(_) => {
+            request.remove("Tags");
+        }
+        None => {}
+    }
+    request
+}
+
+/// What one Route 53 Resolver create answered: the id that service minted for the
+/// resource, and the attributes read off its own answer.
+///
+/// `member` is the output member carrying the created resource (`ResolverEndpoint`,
+/// `ResolverRule`, `ResolverRuleAssociation`), and `attributes` pairs each member of it
+/// with the `Fn::GetAtt` attribute that type publishes for it. An answer carrying no `Id`
+/// is reported as a failure: nothing addresses a Resolver resource without one, so it is
+/// never recorded as created under an identifier nothing minted.
+fn resolver_created(
+    reported: &Value,
+    operation: &str,
+    member: &str,
+    attributes: &[(&str, &str)],
+) -> Result<Created, Refusal> {
+    let detail = reported.get(member).cloned().unwrap_or(Value::Null);
+    let id = detail
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: format!("{operation} answered no {member}.Id"),
+        })?
+        .to_string();
+    let mut reported_attributes = BTreeMap::new();
+    for (reported_member, attribute) in attributes {
+        if let Some(value) = detail.get(*reported_member) {
+            reported_attributes.insert((*attribute).to_string(), attribute_text(value));
+        }
+    }
+    Ok(Created {
+        physical_resource_id: Some(id),
+        attributes: reported_attributes,
+    })
+}
+
+/// Create the Resolver endpoint an `AWS::Route53Resolver::ResolverEndpoint` declares.
+///
+/// `Ref` on this resource returns the endpoint's ID — the `rslvr-out-…`/`rslvr-in-…` value
+/// `CreateResolverEndpoint` MINTS, which is what `GetResolverEndpoint` takes and what a
+/// Resolver rule's `ResolverEndpointId` names — so the create's own answer replaces the
+/// computed physical id, and the attributes the type publishes are read off that answer
+/// rather than rebuilt here.
+async fn create_resolver_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = resolver_request(resource, Some(tags_of(&resource.properties, propagated)));
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(resolver_creator_request_id(resource)),
+    );
+    // Required by the type and by the create alike, so a declaration missing either is
+    // refused here rather than with a request the owning service would have to reject.
+    required_property(resource, "Direction")?;
+    let reported = call_route53resolver(
+        ctx,
+        region,
+        "CreateResolverEndpoint",
+        &Value::Object(request),
+    )
+    .await?;
+    resolver_created(
+        &reported,
+        "CreateResolverEndpoint",
+        "ResolverEndpoint",
+        &[
+            ("Arn", "Arn"),
+            ("Direction", "Direction"),
+            ("HostVPCId", "HostVPCId"),
+            ("IpAddressCount", "IpAddressCount"),
+            ("Name", "Name"),
+            ("OutpostArn", "OutpostArn"),
+            ("PreferredInstanceType", "PreferredInstanceType"),
+            ("ResolverEndpointType", "ResolverEndpointType"),
+        ],
+    )
+}
+
+/// Delete the Resolver endpoint a stack created, by the id its create minted. An endpoint
+/// Route 53 Resolver no longer holds (`ResourceNotFoundException`) is already in the state
+/// the delete asks for.
+async fn delete_resolver_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "ResolverEndpointId": physical_resource_id });
+    match call_route53resolver(ctx, region, "DeleteResolverEndpoint", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The endpoint's configuration as Route 53 Resolver reports it, for drift detection. An
+/// id it no longer holds an endpoint for (`ResourceNotFoundException`) was deleted.
+///
+/// Only the members `GetResolverEndpoint` reports in the SAME shape the type declares them
+/// in are compared, because a property the actual document does not carry is not evidence
+/// of anything ([`super::drift::differs`]): the declared `IpAddresses` and
+/// `SecurityGroupIds` are not members of the reported endpoint at all.
+async fn describe_resolver_endpoint(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ResolverEndpointId": physical_resource_id });
+    let reported = match call_route53resolver(ctx, region, "GetResolverEndpoint", &request).await {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(endpoint) = reported.get("ResolverEndpoint") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        endpoint,
+        &[
+            ("Direction", "Direction"),
+            ("Name", "Name"),
+            ("OutpostArn", "OutpostArn"),
+            ("PreferredInstanceType", "PreferredInstanceType"),
+            ("ResolverEndpointType", "ResolverEndpointType"),
+        ],
+    )))
+}
+
+/// Create the Resolver rule an `AWS::Route53Resolver::ResolverRule` declares.
+///
+/// `Ref` on this resource returns the rule's ID — the `rslvr-rr-…` value
+/// `CreateResolverRule` MINTS — so that answer replaces the computed physical id, exactly
+/// as it does for the endpoint above.
+async fn create_resolver_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = resolver_request(resource, Some(tags_of(&resource.properties, propagated)));
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(resolver_creator_request_id(resource)),
+    );
+    required_property(resource, "RuleType")?;
+    // `TargetAddress$Port` is the one INTEGER member among these types' properties, and a
+    // template may write a number as a quoted scalar (`Port: "53"`), which the declaration
+    // carries through as text. The create takes the integer the model declares, so each
+    // declared port is read as the whole number it is ([`whole_number`]) — a value that is
+    // not one is left exactly as written, for the owning service to refuse.
+    if let Some(Value::Array(targets)) = request.get_mut("TargetIps") {
+        for target in targets.iter_mut() {
+            let Value::Object(address) = target else {
+                continue;
+            };
+            if let Some(port) = whole_number(address.get("Port")) {
+                address.insert("Port".to_string(), Value::from(port));
+            }
+        }
+    }
+    let reported =
+        call_route53resolver(ctx, region, "CreateResolverRule", &Value::Object(request)).await?;
+    resolver_created(
+        &reported,
+        "CreateResolverRule",
+        "ResolverRule",
+        &[
+            ("Arn", "Arn"),
+            ("DomainName", "DomainName"),
+            ("Name", "Name"),
+            ("ResolverEndpointId", "ResolverEndpointId"),
+        ],
+    )
+}
+
+/// Delete the Resolver rule a stack created, by the id its create minted. A rule
+/// Route 53 Resolver no longer holds is already in the state the delete asks for.
+///
+/// "Before you can delete a Resolver rule, you must disassociate it from all the VPCs that
+/// you associated the Resolver rule with": a stack that declares both deletes its
+/// association FIRST, because [`super::provisioning::delete`] deletes a stack's resources
+/// in the reverse of the order they were created in, and the association depends on the
+/// rule.
+async fn delete_resolver_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "ResolverRuleId": physical_resource_id });
+    match call_route53resolver(ctx, region, "DeleteResolverRule", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The rule's configuration as Route 53 Resolver reports it, for drift detection.
+///
+/// `DomainName` is deliberately not compared: Resolver reports a rule's domain name as the
+/// fully-qualified name whatever form the declaration wrote it in, so comparing it would
+/// read that canonicalisation as drift. `TargetIps` is not compared either — the reported
+/// addresses carry the port and protocol the service filled in, which the declaration
+/// leaves out.
+async fn describe_resolver_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ResolverRuleId": physical_resource_id });
+    let reported = match call_route53resolver(ctx, region, "GetResolverRule", &request).await {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(rule) = reported.get("ResolverRule") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        rule,
+        &[
+            ("Name", "Name"),
+            ("RuleType", "RuleType"),
+            ("ResolverEndpointId", "ResolverEndpointId"),
+            ("DelegationRecord", "DelegationRecord"),
+        ],
+    )))
+}
+
+/// Associate the rule an `AWS::Route53Resolver::ResolverRuleAssociation` declares with the
+/// VPC it names.
+///
+/// `Ref` on this resource returns the association's ID — the `rslvr-rrassoc-…` value
+/// `AssociateResolverRule` MINTS, which is what `GetResolverRuleAssociation` takes — so
+/// that answer replaces the computed physical id. The type publishes no `Tags` property and
+/// the call takes none, so the association carries no propagated tag.
+async fn associate_resolver_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let request = resolver_request(resource, None);
+    required_property(resource, "ResolverRuleId")?;
+    required_property(resource, "VPCId")?;
+    let reported = call_route53resolver(
+        ctx,
+        region,
+        "AssociateResolverRule",
+        &Value::Object(request),
+    )
+    .await?;
+    resolver_created(
+        &reported,
+        "AssociateResolverRule",
+        "ResolverRuleAssociation",
+        &[
+            ("Name", "Name"),
+            ("ResolverRuleId", "ResolverRuleId"),
+            ("VPCId", "VPCId"),
+        ],
+    )
+}
+
+/// Remove the association a stack created.
+///
+/// `DisassociateResolverRule` addresses an association by the PAIR it was made from rather
+/// than by its own id, so this takes the resource's record: the rule id and the VPC id its
+/// declaration carries — the rule id being the one Route 53 Resolver minted, since that is
+/// what the declaration's reference to the rule resolved to. A pair that service holds no
+/// association for is already in the state the delete asks for.
+async fn disassociate_resolver_rule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "ResolverRuleId": required_property(resource, "ResolverRuleId")?,
+        "VPCId": required_property(resource, "VPCId")?,
+    });
+    match call_route53resolver(ctx, region, "DisassociateResolverRule", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The association's configuration as Route 53 Resolver reports it, for drift detection.
+/// An id it no longer holds an association for (`ResourceNotFoundException`) was deleted.
+async fn describe_resolver_rule_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ResolverRuleAssociationId": physical_resource_id });
+    let reported =
+        match call_route53resolver(ctx, region, "GetResolverRuleAssociation", &request).await {
+            Ok(reported) => reported,
+            Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    let Some(association) = reported.get("ResolverRuleAssociation") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        association,
+        &[
+            ("Name", "Name"),
+            ("ResolverRuleId", "ResolverRuleId"),
+            ("VPCId", "VPCId"),
         ],
     )))
 }

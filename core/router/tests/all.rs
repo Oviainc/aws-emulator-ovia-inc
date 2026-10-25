@@ -228,6 +228,12 @@ mod mediaconvert_input_probe;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+// Declared HERE, in this quiet span of the sorted list, rather than appended at the end of
+// this file or beside the other `cloudformation_provisions_*` suites in the `c` span: both
+// of those are where every concurrently landing suite puts its line, so a declaration there
+// conflicts with all of them.
+#[path = "all/cloudformation_provisions_route53resolver_rules.rs"]
+mod cloudformation_provisions_route53resolver_rules;
 // `query_wire` and `rds_query_front_door` are declared HERE, in the sorted list,
 // rather than appended at the end: the end of this file is where every new router
 // suite lands, so a line added there collides with every other suite landing in the
