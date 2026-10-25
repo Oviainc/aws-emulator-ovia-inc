@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScraper
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScraper`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints one scraper, persists it in this service's store and reports it
+//! from that record — `CREATING` until the clock settles it to `ACTIVE`
+//! ([`crate::state::TRANSITION_DELAY`]), after which `DescribeScraper` and `ListScrapers`
+//! read back exactly what this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScraper::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +191,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScraper` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScraperErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScraper"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScraperErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
+        // its own tag keys, so it holds for the tags a scraper is created with too.
+        // Stated in the one form every aps refusal takes, which names the member and the
+        // requirement it failed and never echoes the value the caller sent.
+        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
+        {
+            return Err(CreateScraperErrorModeled::ValidationException(
+                crate::state::member_validation_failed(
+                    "tags",
+                    &crate::state::reserved_tag_key_requirement(),
+                ),
+            )
+            .into());
+        }
+
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`).
+        crate::state::check_map_keys(
+            "tags",
+            input.tags.iter().flat_map(|tags| tags.keys()),
+            &crate::state::TAG_KEY,
+        )
+        .map_err(CreateScraperErrorModeled::ValidationException)?;
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `clientToken` carries `@idempotencyToken`: replaying a token that already
+        // created a scraper answers with THAT scraper instead of a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.scraper_tokens.get(token))
+            .and_then(|scraper_id| store.scrapers.get(scraper_id))
+        {
+            return Ok(response_for(existing));
+        }
+
+        // A scraper's destination is a REFERENCE to another resource, and
+        // `ResourceNotFoundException` is modelled here for exactly that: "The request
+        // references a resources that doesn't exist." The reference this service can
+        // resolve is a workspace of its own in the account the emulator serves, so one
+        // that names no workspace this store holds is refused rather than persisted —
+        // answered the way every other unresolved workspace is, with the constant
+        // sentence in `message`, the id in `resourceId` and the parent's AWS type in
+        // `resourceType`. A destination in another account (which `roleConfiguration`
+        // exists to enable) or in another service names a resource no local state speaks
+        // for, so it is taken as given.
+        if let Some(workspace_arn) = destination_workspace_arn(&input.destination) {
+            if crate::state::names_this_account(workspace_arn)
+                && !matches!(
+                    store.taggable_of_arn(workspace_arn),
+                    Some(crate::state::TaggedResource::Workspace(_))
+                )
+            {
+                return Err(CreateScraperErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: crate::state::workspace_id_of_arn(workspace_arn)
+                            .to_string(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store is BOUNDED: past its quota a create is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this, and `SCRAPERS_PER_ACCOUNT_QUOTA` is what stops the scraper and
+        // create-token maps growing without end.
+        if store.scrapers.len() >= crate::state::SCRAPERS_PER_ACCOUNT_QUOTA {
+            return Err(CreateScraperErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} scrapers",
+                        crate::state::SCRAPERS_PER_ACCOUNT_QUOTA
+                    ),
+                    // The bound is per account, so the account is the resource that
+                    // reached it.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
+                    service_code: ctx.identity().signing_name().to_string(),
+                    // Named for what it bounds, and emulator-local: a real quota code is
+                    // an identifier Service Quotas issues, which this emulator does not
+                    // model and so must not claim one of. It names the bound
+                    // `crate::state::SCRAPERS_PER_ACCOUNT_QUOTA` documents.
+                    quota_code: "ScrapersPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let scraper_id = crate::state::mint_scraper_id(&mut store.next_id);
+        let scraper = crate::state::Scraper {
+            arn: crate::state::scraper_arn(&region, &scraper_id),
+            // "An IAM role will be created for you that Amazon Managed Service for
+            // Prometheus uses to access the metrics in your source" — the role the
+            // `@required` `roleArn` reports, one per scraper.
+            role_arn: crate::state::scraper_role_arn(&scraper_id),
+            alias: input.alias,
+            // A scraper is not collecting yet when the call is accepted (modelled 202),
+            // and the clock owes its move to ACTIVE at `transition_due`.
+            status_code: crate::state::STATUS_CREATING.to_string(),
+            // "If there is a failure, the reason for the failure" — nothing has failed.
+            status_reason: None,
+            created_at: now,
+            last_modified_at: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            source: input.source,
+            destination: input.destination,
+            role_configuration: input.role_configuration,
+            // "If you don't specify a value, the scraper is created without an exporter
+            // configuration."
+            exporters: input.exporters.unwrap_or_default(),
+            scrape_configuration: input.scrape_configuration,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            // Nothing is pending on the record this call writes beyond its own creation:
+            // `DeleteScraper` and `UpdateScraper` record their own tokens.
+            delete_token: None,
+            update_token: None,
+            scraper_id: scraper_id.clone(),
+        };
+
+        let response = response_for(&scraper);
+        if let Some(token) = input.client_token {
+            store.scraper_tokens.insert(token, scraper_id.clone());
+        }
+        store.scrapers.insert(scraper_id, scraper);
+        drop(store);
+        // Recorded because this call CHANGED this service's state: the operation, the
+        // resource and the access-key id the request presented — see
+        // `crate::state::record_state_change`.
+        crate::state::record_state_change(Self::NAME, &response.arn, ctx.parts());
+        Ok(response)
+    }
+}
+
+/// The workspace ARN a destination names, when it names one.
+///
+/// `Destination` is a union: `ampConfiguration` sends the metrics to an Amazon Managed
+/// Service for Prometheus workspace, named by ARN, while `cloudWatchConfiguration` names a
+/// CloudWatch dataset — a resource of another service, which this store holds nothing
+/// about.
+fn destination_workspace_arn(destination: &Destination) -> Option<&str> {
+    match destination {
+        Destination::ampConfiguration(amp) => Some(amp.workspace_arn.as_str()),
+        Destination::cloudWatchConfiguration(_) => None,
+    }
+}
+
+/// The response for a stored scraper.
+///
+/// Every member is read back off the persisted record — so `status` and `tags` report what
+/// the scraper HOLDS, which is what makes a replayed `clientToken` answer with the record
+/// the first call wrote rather than with a second one.
+fn response_for(scraper: &crate::state::Scraper) -> CreateScraperOutput {
+    CreateScraperOutput {
+        scraper_id: scraper.scraper_id.clone(),
+        arn: scraper.arn.clone(),
+        status: ScraperStatus {
+            status_code: scraper.status_code.clone(),
+        },
+        tags: crate::state::tag_map(&scraper.tags),
     }
 }
