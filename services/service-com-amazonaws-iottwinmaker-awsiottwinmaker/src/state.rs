@@ -1905,28 +1905,37 @@ pub fn extends_from_violation(
     None
 }
 
-/// Why these `compositeComponentTypes` cannot be stored, as the message a
-/// `ValidationException` carries — `None` when they can.
+/// Why these `compositeComponentTypes` cannot be stored on the component type
+/// `component_type_id`, as the message a `ValidationException` carries — `None`
+/// when they can.
 ///
 /// A composite component type IS the component type its `componentTypeId`
 /// refers to, so the service has to hold that one for the composition to mean
 /// anything; an entry that names none declares no reference to resolve.
 /// Shared by every writer of a component type's `compositeComponentTypes`.
+///
+/// An entry naming `component_type_id` itself RESOLVES: the write that carries
+/// it is the write that leaves the workspace holding that component type, so
+/// the reference is not a dangling one — and this way a create and an update
+/// carrying the same entry agree, instead of the create refusing what an
+/// update of the stored record would accept.
 pub fn composite_component_types_violation(
     workspace: &Workspace,
+    component_type_id: &str,
     composite_component_types: &BTreeMap<String, crate::ops::types::CompositeComponentTypeRequest>,
 ) -> Option<String> {
     for (composite_name, composite) in composite_component_types {
         let Some(referenced) = composite.component_type_id.as_deref() else {
             continue;
         };
-        if !workspace.resolves_component_type(referenced) {
-            return Some(format!(
-                "compositeComponentTypes.{composite_name}.componentTypeId names component type \
-                 {referenced}, which does not exist in workspace {}",
-                workspace.workspace_id
-            ));
+        if referenced == component_type_id || workspace.resolves_component_type(referenced) {
+            continue;
         }
+        return Some(format!(
+            "compositeComponentTypes.{composite_name}.componentTypeId names component type \
+             {referenced}, which does not exist in workspace {}",
+            workspace.workspace_id
+        ));
     }
     None
 }

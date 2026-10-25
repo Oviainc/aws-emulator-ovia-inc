@@ -137,10 +137,16 @@ async fn a_component_type_reads_back_exactly_what_was_created() {
         (
             "com.example.derived",
             json!({
-                "extendsFrom": ["com.amazonaws.iottwinmaker.alarm.basic", "com.example.base"],
+                // The ids this row declares have to resolve: the first parent
+                // is one of the service's built-in component types, the second
+                // and the composite entry are rows created above.
+                "extendsFrom": [
+                    "com.amazon.iottwinmaker.alarm.basic",
+                    "com.example.withProperties",
+                ],
                 "componentTypeName": "Derived",
                 "compositeComponentTypes": {
-                    "inner": {"componentTypeId": "com.example.inner"},
+                    "inner": {"componentTypeId": "com.example.withGroupsAndFunctions"},
                 },
             }),
         ),
