@@ -3116,10 +3116,10 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// discovered-resource read can be asked to include deleted resources.
     ///
     /// `PutResourceConfig` is what WRITES the inventory, recording the configuration
-    /// state of one custom resource; `DeleteResourceConfig`, which records a
-    /// resource's deletion, is still a scaffold with a stub issue of its own, so an
-    /// account that has recorded nothing has discovered nothing and a
-    /// discovered-resource read reports an empty page for every type.
+    /// state of one custom resource, and `DeleteResourceConfig` records that
+    /// resource's deletion onto the same entry, so an account that has recorded
+    /// nothing has discovered nothing and a discovered-resource read reports an empty
+    /// page for every type.
     ///
     /// BOUNDED at [`DISCOVERED_RESOURCES_KEPT`] entries: write it through
     /// [`Self::record_discovered_resource`], which drops the oldest configuration item
@@ -4752,6 +4752,22 @@ pub fn decode_resource_evaluation_token(token: &str) -> Option<ResourceEvaluatio
 pub const NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE: &str =
     "there are no customer managed configuration recorders available; use \
      PutConfigurationRecorder to create one";
+
+/// How Config words `NoRunningConfigurationRecorderException` for the operation `api`
+/// that records a resource's configuration state.
+///
+/// ONE template for the two operations that record the configuration state of a
+/// custom resource — `PutResourceConfig` and `DeleteResourceConfig` — so the two
+/// halves of that lifecycle cannot report the one precondition two ways. The sentence
+/// is what AWS answers each of them with: it states the precondition and names the API
+/// the caller reached for, which is the only part that differs between them. The
+/// shape's own doc ("There is no configuration recorder running") states the CONDITION
+/// rather than the message, so it is not the text to emit here. `DeliverConfigSnapshot`
+/// keeps its own wording: AWS publishes no text for that operation's refusal, so there
+/// the requirement is only the status and the error code.
+pub fn no_running_configuration_recorder_message(api: &str) -> String {
+    format!("You must create and start a configuration recorder before you call the {api} API.")
+}
 
 /// The separator between the two fields of the key a pending aggregation request page
 /// resumes at. An `AccountId` is twelve digits (`PendingAggregationRequest$

@@ -2813,6 +2813,18 @@ pub fn no_such_rest_api(rest_api_id: &str) -> String {
     )
 }
 
+/// The `BadRequestException` message for a `restApiId` that resolves to no stored API on
+/// an operation that reads the identifier while VALIDATING the submitted request, rather
+/// than while resolving the record the request addresses.
+///
+/// Unlike [`no_such_rest_api`], this is a SENTENCE OF ITS OWN: nothing is interpolated
+/// from the request, so the rejected identifier is not quoted back and the account is not
+/// named. Which operations classify an unresolvable API this way is each operation's own
+/// contract — a read or a write of a record under the API answers the identifier-naming
+/// [`no_such_rest_api`] as a `NotFoundException` instead — so this sentence is shared by
+/// the operations whose contract says a bad API identifier is a bad request.
+pub const INVALID_REST_API_IDENTIFIER: &str = "Invalid REST API identifier specified";
+
 /// The `NotFoundException` message for a `resourceId` that names no stored resource.
 pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 

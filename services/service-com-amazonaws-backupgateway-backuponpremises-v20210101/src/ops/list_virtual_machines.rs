@@ -4,10 +4,12 @@
 //! Lists the virtual machines persisted in [`crate::state`], ordered by their ARNs, one
 //! `MaxResults`-sized page at a time, holding only the machines of the hypervisor the
 //! request names when it names one. @readonly: it writes nothing — a machine reaches the
-//! store as part of a hypervisor's inventory
-//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`]),
-//! never through a listing, so a hypervisor whose inventory has never been synced lists
-//! none. This is the ONLY file to touch for this operation.
+//! store as part of a hypervisor's inventory, which the hypervisor's METADATA SYNC records
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
+//! never a listing, so a hypervisor whose metadata has never been synced lists none and
+//! one whose first sync is still in flight lists none either
+//! ([`crate::state::StoredVirtualMachine::discovered_as_of`]). This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -191,10 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an ARN the store holds no hypervisor for selects no machine and the listing is
         // empty rather than refused. The member's length and pattern are refused by the
         // boundary validator before `handle` runs.
+        //
+        // The clock decides which machines are part of an inventory yet: a sync reports
+        // the machines it discovered at the instant it falls due, so the listing is a
+        // function of the records and the current time and this read moves nothing.
         let page = state.lock().page_of_virtual_machines(
             input.hypervisor_arn.as_deref(),
             after.as_deref(),
             limit,
+            ::std::time::SystemTime::now(),
         );
 
         Ok(ListVirtualMachinesOutput {

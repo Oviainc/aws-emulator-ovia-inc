@@ -2272,6 +2272,28 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             .get(&(policy_arn.to_string(), test_case_id.to_string()))
     }
 
+    /// Every test stored under the policy `policy_arn` names, in `testCaseId` order.
+    ///
+    /// Keyed by the PAIR like [`Self::automated_reasoning_policy_test_case`], so a listing
+    /// reports exactly the tests a read of each one reports and none of another policy's.
+    /// The order is the id's, which is a TOTAL order over
+    /// `AutomatedReasoningPolicyTestCaseId` (`^[0-9A-Z]{12}$`): a listing needs one so its
+    /// pages partition the tests whatever is created or deleted between two calls.
+    #[must_use]
+    pub fn automated_reasoning_policy_test_cases_of(
+        &self,
+        policy_arn: &str,
+    ) -> Vec<&AutomatedReasoningPolicyTestCaseRecord> {
+        let mut records: Vec<&AutomatedReasoningPolicyTestCaseRecord> = self
+            .automated_reasoning_policy_test_cases
+            .iter()
+            .filter(|((arn, _), _)| arn == policy_arn)
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        records
+    }
+
     /// How many tests the policy `policy_arn` names holds — what
     /// [`MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY`] bounds.
     #[must_use]

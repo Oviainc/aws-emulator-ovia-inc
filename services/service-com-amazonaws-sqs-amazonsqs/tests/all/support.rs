@@ -207,6 +207,32 @@ pub async fn attribute_count(router: &MultiServiceRouter, url: &str, attribute: 
         .unwrap_or_else(|| panic!("case {attribute} of {url}: not an integer in {attributes:?}"))
 }
 
+/// The three message counts the queue at `url` reports, as
+/// `(available, delayed, in flight)` — the `ApproximateNumberOfMessages`,
+/// `ApproximateNumberOfMessagesDelayed` and `ApproximateNumberOfMessagesNotVisible`
+/// attributes. One reading for every suite that asks what a queue holds.
+pub async fn message_counts(router: &MultiServiceRouter, url: &str) -> (i64, i64, i64) {
+    let attributes = all_attributes(router, url).await;
+    let read = |name: &str| {
+        attributes
+            .get(name)
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_else(|| panic!("case the message counts of {url}: no {name} in {attributes:?}"))
+    };
+    (
+        read("ApproximateNumberOfMessages"),
+        read("ApproximateNumberOfMessagesDelayed"),
+        read("ApproximateNumberOfMessagesNotVisible"),
+    )
+}
+
+/// The tags `ListQueueTags` reports for the queue at `url`, as a sorted map. A queue with
+/// no tag reports no `Tags` member at all, which is the empty map here.
+pub async fn list_tags(router: &MultiServiceRouter, url: &str) -> BTreeMap<String, String> {
+    let reported = ok(router, "ListQueueTags", json!({"QueueUrl": url})).await;
+    as_map(reported.get("Tags").unwrap_or(&Value::Null))
+}
+
 /// Create a queue called `name` and a queue called `<name>-source` whose `RedrivePolicy`
 /// drives its messages to it, which is what makes the first queue a dead-letter queue —
 /// the only kind of source a message movement task supports.

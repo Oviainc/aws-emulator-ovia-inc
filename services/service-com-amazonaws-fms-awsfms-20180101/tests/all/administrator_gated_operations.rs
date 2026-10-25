@@ -286,6 +286,12 @@ fn gated_calls() -> Vec<Gated> {
             operation: "ListResourceSets",
             body: json!({ "MaxResults": 5 }),
         },
+        Gated {
+            // The membership report, named by an identifier that names no set:
+            // the gate must answer before that lookup.
+            operation: "ListResourceSetResources",
+            body: json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID, "MaxResults": 5 }),
+        },
         // The organisation-scoped policy operations: a create (no `PolicyId`),
         // an update of an id that names nothing, and the unbounded list. The
         // id-keyed `GetPolicy` and `DeletePolicy` are NOT here: they are decided

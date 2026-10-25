@@ -185,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Every member is `@required` and carries the model's own constraints, so an
         // absent member is already refused at the boundary (as the matching
         // `*RequiredException`) and so is a length or pattern violation (as
@@ -279,12 +278,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        repository.branches.insert(
-            input.branch_name.clone(),
-            crate::state::Branch {
-                name: input.branch_name.clone(),
-                commit_id: input.commit_id.clone(),
-            },
+        // The reference is added through the one place a branch tip moves: a name
+        // a pull request reads from can be created again after it was deleted, and
+        // such a pull request follows the tip the new reference points at.
+        repository.set_branch_tip(
+            &input.branch_name,
+            &input.commit_id,
+            std::time::SystemTime::now(),
+            Some(&crate::state::caller_identity_arn(ctx.parts())),
         );
         // Adding a reference modifies the repository, and `lastModifiedDate` is "the
         // date and time the repository was last modified"

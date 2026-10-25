@@ -517,8 +517,10 @@ impl Provisioner {
     /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
     /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
-    /// half of a pair, and so do Amazon ECS's `CreateCluster` and Amazon MSK's two cluster
-    /// creates.
+    /// half of a pair, and so do Amazon ECS's `CreateCluster`, Amazon MSK's two cluster
+    /// creates and Amazon SQS's `CreateQueue` — the last of which refuses it in its own
+    /// crate's `state::tag_refusal`, the one check both `CreateQueue`'s `tags` map and
+    /// `TagQueue` run.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -531,6 +533,7 @@ impl Provisioner {
                 | Self::AcmAcmeEndpoint
                 | Self::MskCluster
                 | Self::MskServerlessCluster
+                | Self::SqsQueue
         );
         propagated
             .iter()
@@ -2936,7 +2939,9 @@ const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
 /// reaches SQS.
 ///
 /// The queue carries the tags the declaration asks for plus the ones CloudFormation gives
-/// the resource ([`tags_of`]), as `CreateQueue`'s own `tags` map.
+/// the resource ([`tags_of`]), as `CreateQueue`'s own `tags` map — less the
+/// `aws:cloudformation:*` ones, which `CreateQueue` refuses to a caller like the other
+/// reserved-namespace APIs ([`Provisioner::applicable_tags`]).
 async fn create_queue(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,

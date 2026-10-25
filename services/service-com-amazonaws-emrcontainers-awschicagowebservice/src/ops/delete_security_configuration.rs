@@ -4,9 +4,9 @@
 //! Removes the stored security configuration one id names and answers with the id it
 //! deleted, so a later `DescribeSecurityConfiguration` for that id misses and is refused
 //! with the modelled `ResourceNotFoundException`. An id that names no stored
-//! configuration is refused with the modelled `ValidationException` (this operation
-//! models no not-found error), because the output reports the id that WAS deleted and
-//! there was none.
+//! configuration, and one a live virtual cluster still references, are both refused with
+//! the modelled `ValidationException` (this operation models no not-found error), because
+//! the output reports the id that WAS deleted and nothing was.
 //!
 //! ## The rule this operation implements
 //!
@@ -23,10 +23,21 @@
 //!    ([`crate::state::MAX_SECURITY_CONFIGURATIONS`]) is free again — exactly one slot, so
 //!    a full store admits exactly one more create per delete.
 //!
+//! Because the record really leaves the store, a delete can only be honoured while no
+//! live resource of this service still references it: a virtual cluster holds the
+//! `securityConfigurationId` it was created with for as long as it is registered and
+//! reports it on every read, so a delete while that reference is held is refused
+//! ([`crate::state::ServiceState::cluster_referencing_security_configuration`] resolves
+//! the holder) rather than leaving the cluster reporting a reference that resolves to
+//! nothing — the state `CreateVirtualCluster` refuses to persist, at the other end of the
+//! resource's life.
+//!
 //! `tests/all/security_configuration.rs` pins the wire contract (what the delete answers,
-//! and the refusals), and `tests/all/security_configuration_delete.rs` pins the rules that
+//! and the refusals), `tests/all/security_configuration_delete.rs` pins the rules that
 //! take several calls to observe: the repeated poll of a deleted id, the records a delete
-//! must leave alone, and the one freed slot at the retention bound.
+//! must leave alone, and the one freed slot at the retention bound, and
+//! `tests/all/security_configuration_in_use.rs` pins the referential rule across the
+//! resource's whole life.
 //!
 //! ## Shape of an operation
 //!
@@ -170,15 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle();
 
-        // The delete must actually take effect: the record leaves the store here, so the
-        // next `DescribeSecurityConfiguration` of this id finds nothing and answers the
-        // modelled `ResourceNotFoundException` instead of serving a deleted resource.
-        //
-        // This operation models no not-found error, so an id that names no stored
-        // configuration in this region is refused as an invalid request rather than
-        // answered as a no-op: the output reports the id that WAS deleted, and there was
-        // none.
-        let Some(record) = state.remove_security_configuration(&region, &input.id) else {
+        // The configuration is resolved out of state before anything is removed. This
+        // operation models no not-found error, so an id that names no stored configuration
+        // in this region is refused as an invalid request rather than answered as a no-op:
+        // the output reports the id that WAS deleted, and there was none.
+        let Some(id) = state
+            .security_configuration(&region, &input.id)
+            .map(|record| record.id.clone())
+        else {
             return Err(DeleteSecurityConfigurationErrorModeled::ValidationException(
                 ValidationException {
                     // The not-found message form the recorded refusals of this service
@@ -193,8 +203,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(DeleteSecurityConfigurationOutput {
-            id: Some(record.id),
-        })
+        // A resource another live resource of this service still REFERENCES cannot be
+        // removed: a virtual cluster holds its `securityConfigurationId` for as long as it
+        // is registered and reports it on every read, so deleting the configuration it
+        // names would leave that cluster reporting a reference that resolves to nothing —
+        // the very state `CreateVirtualCluster` refuses to persist. The holder is resolved
+        // out of the stored clusters of this region, and a cluster the clock has already
+        // torn down holds nothing.
+        if let Some(holder) = state
+            .cluster_referencing_security_configuration(&region, &id)
+            .map(|record| record.id.clone())
+        {
+            return Err(DeleteSecurityConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Security Configuration {id} is in use by virtual cluster {holder} and \
+                         cannot be deleted."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The delete must actually take effect: the record leaves the store here, so the
+        // next `DescribeSecurityConfiguration` of this id finds nothing and answers the
+        // modelled `ResourceNotFoundException` instead of serving a deleted resource.
+        state.remove_security_configuration(&region, &id);
+
+        Ok(DeleteSecurityConfigurationOutput { id: Some(id) })
     }
 }
