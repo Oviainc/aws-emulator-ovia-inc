@@ -172,10 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if requested.len() > crate::state::MAX_DESCRIBE_BATCH {
             return Err(DescribeClustersErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "clusters must name at most {} clusters; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "clusters",
                         crate::state::MAX_DESCRIBE_BATCH,
-                        requested.len()
                     )),
                 },
             )

@@ -172,10 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeContainerInstancesErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "containerInstances must name at most {} container instances; got {}",
+                        message: Some(crate::state::at_most_items_message(
+                            "container instances",
                             crate::state::MAX_DESCRIBE_BATCH,
-                            input.container_instances.len()
                         )),
                     },
                 )

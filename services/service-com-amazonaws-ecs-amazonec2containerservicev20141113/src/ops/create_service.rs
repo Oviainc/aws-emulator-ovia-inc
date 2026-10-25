@@ -393,10 +393,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bound, `MAX_CONTAINER_DEFINITIONS` in `register_task_definition`.
         if load_balancers.len() > crate::state::MAX_LOAD_BALANCERS {
             return Err(CreateServiceErrorModeled::ClientException(ClientException {
-                message: Some(format!(
-                    "loadBalancers must name at most {} load balancers; got {}",
+                message: Some(crate::state::at_most_items_message(
+                    "load balancers",
                     crate::state::MAX_LOAD_BALANCERS,
-                    load_balancers.len()
                 )),
             })
             .into());
@@ -465,10 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.desired_count.is_some_and(|count| count < 0) {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "desiredCount must not be negative; got {:?}",
-                        input.desired_count
-                    )),
+                    message: Some(crate::state::DESIRED_COUNT_NEGATIVE_MESSAGE.to_string()),
                 },
             )
             .into());

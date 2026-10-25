@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContainerAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContainerAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the Amazon ECS container agent on a specified container instance.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContainerAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update is owed by the CLOCK: this call accepts it, records the instant it falls
+//! due and reports the instance in the first `AgentUpdateStatus` stage (`PENDING`); the
+//! state's clock pass materialises `UPDATED` and the agent version the instance then
+//! reports. Everything this handler answers — which stage the instance is in, whether an
+//! update is available at all, whether one is already under way — is read from the stored
+//! container instance.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +184,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContainerAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContainerAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContainerAgent"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateContainerAgentErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The agent is addressed by the ID of the instance it runs on: "The container
+        // instance ID or full ARN entries for the container instance". The id is checked
+        // for FORM first — before any cluster or instance is resolved — because a value
+        // that is not an id names no instance in any cluster, and the refusal states the
+        // form an id takes rather than the value it was given.
+        let instance_id =
+            crate::state::container_instance_id_from_reference(&input.container_instance);
+        if !crate::state::is_container_instance_id(instance_id) {
+            return Err(UpdateContainerAgentErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::container_instance_id_pattern_message()),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // A cluster that does not exist is `ClusterNotFoundException` with the fixed
+        // sentence every cluster-resolving operation answers it with. It is checked AFTER
+        // the id's form: a value that is not a container-instance id names no instance in
+        // any cluster, so the form is what the caller has to fix first.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(UpdateContainerAgentErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The container instance ID or full ARN entries for the container instance where
+        // you would like to update the Amazon ECS container agent", scoped by the cluster
+        // the request named.
+        let Some(instance) =
+            guard.resolve_container_instance(&region, &cluster_name, &input.container_instance)
+        else {
+            return Err(UpdateContainerAgentErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::container_instance_not_found_message(
+                        &input.container_instance,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If the container agent becomes disconnected while it's in a transitional
+        // stage, such as PENDING or STAGING, the update process can get stuck in that
+        // state": an update that has not finished is not restarted by a second call.
+        if instance.agent_update_in_flight() {
+            return Err(UpdateContainerAgentErrorModeled::UpdateInProgressException(
+                UpdateInProgressException {
+                    message: Some(crate::state::AGENT_UPDATE_IN_PROGRESS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The version to update FROM is the one the agent reported when it registered
+        // (`RegisterContainerInstance$versionInfo`). An instance that reported none is the
+        // `MissingVersionException` condition exactly.
+        let Some(reported) = instance.reported_agent_version() else {
+            return Err(UpdateContainerAgentErrorModeled::MissingVersionException(
+                MissingVersionException {
+                    message: Some(crate::state::MISSING_AGENT_VERSION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        if reported == crate::state::LATEST_CONTAINER_AGENT_VERSION {
+            return Err(
+                UpdateContainerAgentErrorModeled::NoUpdateAvailableException(
+                    NoUpdateAvailableException {
+                        message: Some(
+                            crate::state::NO_AGENT_UPDATE_AVAILABLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let arn = instance.arn.clone();
+        let instance = guard
+            .container_instances
+            .get_mut(&arn)
+            .expect("the instance was just resolved under this lock");
+        // The update is accepted here and lands on the clock: the instance reports the
+        // first stage of it now, and the stage it reaches is not this call's to report.
+        instance.agent_update_status = Some(crate::state::AGENT_UPDATE_PENDING.to_string());
+        instance.agent_update_due_at = Some(now + crate::state::TRANSITION_SPAN);
+        // "Every time a container instance experiences a change ... the version counter is
+        // incremented."
+        instance.version += 1;
+
+        // `UpdateContainerAgent` has no `include` member to narrow the response with, so
+        // the instance it just changed is reported with its tags.
+        Ok(UpdateContainerAgentOutput {
+            container_instance: Some(
+                instance.view(crate::state::ContainerInstanceFields::all()),
+            ),
+        })
     }
 }
