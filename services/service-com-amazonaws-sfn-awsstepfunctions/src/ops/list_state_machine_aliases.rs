@@ -281,12 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .aliases_newest_first(&state_machine_arn)
             .into_iter()
             .filter(|alias| {
-                version_arn.as_deref().is_none_or(|version_arn| {
-                    alias
-                        .routing_configuration
-                        .iter()
-                        .any(|item| item.state_machine_version_arn == version_arn)
-                })
+                version_arn
+                    .as_deref()
+                    .is_none_or(|version_arn| alias.routes_to(version_arn))
             })
             .collect();
         let total = aliases.len();
