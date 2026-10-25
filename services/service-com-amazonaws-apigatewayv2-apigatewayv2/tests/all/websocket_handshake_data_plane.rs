@@ -45,7 +45,10 @@ use crate::api_lifecycle::{as_str, call, emulator};
 
 /// A `Sec-WebSocket-Key`: "a base64-encoded value that, when decoded, is 16 bytes in
 /// length" (RFC 6455 §4.1) — the example key the RFC itself uses.
-const CLIENT_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+///
+/// Shared with `websocket_connect_authorization`, which drives the same handshake against
+/// a `$connect` route that carries an authorizer.
+pub(crate) const CLIENT_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 
 /// The status a successful upgrade would carry. Asserted ABSENT: see the module docs.
 const SWITCHING_PROTOCOLS: u16 = 101;
@@ -199,17 +202,17 @@ async fn deploy_api(
 
 /// The answer to one request: its status, its `x-amzn-errortype`, the `sec-websocket-accept`
 /// header it carries (or `None`), and its parsed body.
-struct Answer {
-    status: u16,
-    error_type: Option<String>,
-    accept: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) accept: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The `message` member of an `execute-api` body, or the `__type` of a front-door
     /// envelope — whichever the answer carries — for an assertion message.
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         format!(
             "{} {} (x-amzn-errortype: {:?})",
             self.status, self.body, self.error_type
@@ -219,7 +222,7 @@ impl Answer {
 
 /// Send one request with arbitrary host, path and headers, and no credential — which is
 /// what a WebSocket client's opening handshake is.
-async fn send(
+pub(crate) async fn send(
     emulator: &MultiServiceRouter,
     host: &str,
     method: &str,
@@ -295,7 +298,7 @@ fn route_key(protocol_type: &str) -> &'static str {
 }
 
 /// The `message` member an `execute-api` body carries.
-fn message(answer: &Answer) -> String {
+pub(crate) fn message(answer: &Answer) -> String {
     answer
         .body
         .get("message")

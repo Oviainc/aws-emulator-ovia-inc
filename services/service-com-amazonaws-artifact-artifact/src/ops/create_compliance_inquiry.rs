@@ -38,6 +38,14 @@
 //!   `ListComplianceInquiryQueries` reports what was submitted for processing whatever
 //!   form it took, and `supportMode` selects the review each of them carries
 //!   ([`crate::state::review_type_for`]).
+//! * A request member the model restricts to one FORM of the submitted content is refused
+//!   when the content takes another: `supportMode` is "[o]nly supported for file upload
+//!   mode", so the mode that adds human expert review cannot be asked for of a submission
+//!   that is not an upload, and such a request is answered with the modelled 400
+//!   `ValidationException` naming the member
+//!   ([`crate::state::support_mode_available_for`]). The inquiry therefore only ever
+//!   stores — and every read only ever reports — a support mode its queries really were
+//!   reviewed under.
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
 //!   runs in this emulator. Nothing is synthesised to look generated: no query ever
 //!   carries a `response`, and that absence is the signal — a query is reported under the
@@ -201,11 +209,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
-        // "Defaults to AI_ONLY if not specified" (`CreateComplianceInquiryRequest$supportMode`).
-        let support_mode = input
-            .support_mode
-            .unwrap_or_else(|| crate::state::SUPPORT_MODE_AI_ONLY.to_string());
         let content = content_record(input.inquiry_content);
+        // `supportMode` is "[o]nly supported for file upload mode. Defaults to AI_ONLY if
+        // not specified." (`CreateComplianceInquiryRequest$supportMode`), so BOTH
+        // sentences apply: a mode the submitted content cannot be processed under is
+        // refused as a field validation failure naming the member
+        // ([`crate::state::support_mode_available_for`]), rather than stored and reported
+        // back on an inquiry that was processed under another one; and a request naming no
+        // mode is processed under the documented default.
+        let support_mode = match input.support_mode {
+            Some(mode) if !crate::state::support_mode_available_for(&mode, &content) => {
+                return Err(CreateComplianceInquiryErrorModeled::ValidationException(
+                    crate::state::unsupported_support_mode(),
+                )
+                .into());
+            }
+            Some(mode) => mode,
+            None => crate::state::SUPPORT_MODE_AI_ONLY.to_string(),
+        };
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
         let fingerprint = request_fingerprint(&input.name, &support_mode, &content, &tags);
@@ -321,9 +342,10 @@ fn content_record(content: InquiryContent) -> crate::state::InquiryContentRecord
 /// carries ([`crate::state::InquiryContentRecord::work_units`]), numbered from 1 in the
 /// order they are processed ("[s]equential identifier of the query within the inquiry").
 ///
-/// Every query starts non-terminal, like the inquiry itself, and carries the review
-/// `supportMode` asks for ([`crate::state::review_type_for`]); the clock moves them on
-/// (see [`crate::state::ComplianceInquiry::materialise`]).
+/// Every query starts non-terminal, like the inquiry itself, and carries the review the
+/// inquiry's support mode selects ([`crate::state::review_type_for`]) — which is the mode
+/// the submission can be processed under, the others having been refused above; the clock
+/// moves them on (see [`crate::state::ComplianceInquiry::materialise`]).
 ///
 /// A unit whose handle cannot be reported inside the modelled bounds of
 /// `QuerySummary$query` ([`crate::state::reportable_query_text`]) yields no query, rather
@@ -336,7 +358,7 @@ fn enumerate_queries(
     content: &crate::state::InquiryContentRecord,
     now: ::std::time::SystemTime,
 ) -> Vec<crate::state::InquiryQuery> {
-    let review_type = crate::state::review_type_for(support_mode, content);
+    let review_type = crate::state::review_type_for(support_mode);
     let texts: Vec<String> = content
         .work_units(title)
         .iter()

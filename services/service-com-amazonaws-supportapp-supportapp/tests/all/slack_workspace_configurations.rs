@@ -20,7 +20,9 @@
 //! many.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
+use service_com_amazonaws_supportapp_supportapp::state::{
+    derived_slack_workspace_name, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+};
 
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
 
@@ -88,7 +90,10 @@ pub(crate) fn reported_team_ids(records: &[Value]) -> Vec<String> {
 /// The team ids the tables register: rows differ in form and length and cover both
 /// published `teamId` bounds. There are exactly as many as the documented workspace
 /// quota, so a table may register all of them.
-fn team_ids() -> Vec<String> {
+///
+/// `pub(crate)` so the sibling suites in this test target register the same spread of
+/// workspaces instead of each spelling its own.
+pub(crate) fn team_ids() -> Vec<String> {
     let ids = vec![
         // The recorded case: one row of many.
         "T012ABCDEFG".to_string(),
@@ -152,13 +157,13 @@ async fn a_registered_workspace_is_reported_by_list_exactly_as_stored() {
             "case {label:?}: expected allowOrganizationMemberAccount true, got {:?}",
             records[0]
         );
-        // The workspace's Slack name is not in the request and the emulator has no
-        // Slack to ask, so the optional member is absent rather than invented.
-        assert!(
-            records[0]
-                .get("teamName")
-                .is_none_or(|value| value.is_null()),
-            "case {label:?}: expected no teamName, got {:?}",
+        // A registered workspace has a name, recorded when it was registered, so the
+        // listing reports it from the stored record. The rule itself is covered in
+        // [`crate::slack_workspace_team_name`].
+        assert_eq!(
+            records[0].get("teamName").and_then(Value::as_str),
+            Some(derived_slack_workspace_name(&team_id).as_str()),
+            "case {label:?}: expected the recorded teamName, got {:?}",
             records[0]
         );
     }

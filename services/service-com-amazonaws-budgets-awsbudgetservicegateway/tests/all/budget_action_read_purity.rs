@@ -40,7 +40,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     PendingSettle, EVENT_TYPE_SYSTEM,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine, same};
 
 /// An `ExecutionRoleArn` satisfying `RoleArn`'s modelled `@pattern` and `@length(32, 618)`
 /// (`smithy_query(query="shape",shape="RoleArn")`).
@@ -282,7 +282,7 @@ fn same_but_status(left: &Value, right: &Value) -> bool {
 #[tokio::test]
 async fn a_read_reports_the_stored_action_and_changes_nothing() {
     let (router, engine) = router_with_engine();
-    let account_id = account(410_000_001);
+    let account_id = caller_account();
 
     for status in ACTION_STATUS_VALUES {
         let budget_name = row_budget_name("read-unchanged", status);
@@ -369,7 +369,7 @@ async fn a_read_reports_the_stored_action_and_changes_nothing() {
 #[tokio::test]
 async fn a_read_materialises_only_the_settle_the_clock_already_owed() {
     let (router, engine) = router_with_engine();
-    let account_id = account(410_000_002);
+    let account_id = caller_account();
 
     let in_progress: Vec<&&str> = ACTION_STATUS_VALUES
         .iter()
@@ -507,8 +507,9 @@ async fn a_read_materialises_only_the_settle_the_clock_already_owed() {
 /// holds on this budget.
 struct Miss {
     case: &'static str,
-    /// Offsets applied to the request that WOULD have located the action.
-    account_id: Option<String>,
+    /// Offsets applied to the request that WOULD have located the action. The account is
+    /// not one of them: every request names the one account this service serves, and one
+    /// that names another is refused before any lookup (`account_scoping.rs`).
     budget_name: Option<String>,
     action_id: Option<&'static str>,
 }
@@ -524,17 +525,13 @@ struct Miss {
 #[tokio::test]
 async fn a_read_that_locates_nothing_changes_nothing() {
     let (router, engine) = router_with_engine();
-    let account_id = account(410_000_003);
+    let account_id = caller_account();
     let budget_name = "read-misses";
     let action_id = seed_budget_with_action(&router, &account_id, budget_name).await;
     // A second budget of the same account, so a row can name a budget that EXISTS and
     // simply does not own this action.
     let other_budget = "read-misses-sibling";
     seed_budget_with_action(&router, &account_id, other_budget).await;
-    // A second account holding a budget of the same name, so a row can cross the account
-    // boundary without also crossing the name.
-    let other_account = account(410_000_004);
-    seed_budget_with_action(&router, &other_account, budget_name).await;
 
     let (http, baseline) = describe_action(&router, &account_id, budget_name, &action_id).await;
     assert_eq!(
@@ -546,32 +543,22 @@ async fn a_read_that_locates_nothing_changes_nothing() {
     let misses = vec![
         Miss {
             case: "an action id no action carries",
-            account_id: None,
             budget_name: None,
             action_id: Some(UNHELD_ACTION_ID),
         },
         Miss {
             case: "a budget of this account that does not own the action",
-            account_id: None,
             budget_name: Some(other_budget.to_string()),
             action_id: None,
         },
         Miss {
-            case: "a budget no account holds",
-            account_id: None,
+            case: "a budget the account holds nothing under",
             budget_name: Some("read-misses-absent".to_string()),
             action_id: None,
         },
         Miss {
-            case: "another account's budget of the same name",
-            account_id: Some(other_account.clone()),
-            budget_name: None,
-            action_id: None,
-        },
-        Miss {
-            case: "an account holding nothing at all",
-            account_id: Some(account(410_000_009)),
-            budget_name: None,
+            case: "the owning budget's name in another case",
+            budget_name: Some(budget_name.to_uppercase()),
             action_id: None,
         },
     ];
@@ -580,7 +567,7 @@ async fn a_read_that_locates_nothing_changes_nothing() {
         let case = miss.case;
         let (http, body) = describe_action(
             &router,
-            miss.account_id.as_deref().unwrap_or(&account_id),
+            &account_id,
             miss.budget_name.as_deref().unwrap_or(budget_name),
             miss.action_id.unwrap_or(&action_id),
         )

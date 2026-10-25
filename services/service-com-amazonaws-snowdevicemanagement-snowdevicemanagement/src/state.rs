@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice, ExecutionSummary, Instance,
     InstanceBlockDeviceMapping, InstanceState, InstanceSummary, PhysicalNetworkInterface,
-    ResourceNotFoundException, SecurityGroupIdentifier, SoftwareInformation, TaskSummary,
+    ResourceNotFoundException, ResourceSummary, SecurityGroupIdentifier, SoftwareInformation,
+    TaskSummary,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -68,6 +69,14 @@ pub const EXECUTION_FINISH_SPAN: Duration = Duration::from_millis(400);
 
 /// The `resourceType` segment a not-found message names for a managed device.
 pub const DEVICE_RESOURCE_TYPE: &str = "managed-device";
+
+/// The `ResourceSummary$resourceType` of an Amazon EC2 instance running on a
+/// device, which is the only resource type a device reports: "Returns a list of
+/// the Amazon Web Services resources available for a device. Currently, Amazon
+/// EC2 instances are the only supported resource type." The value is the
+/// AWS-wide type identifier of an EC2 instance, the same string the `type`
+/// filter of that operation takes.
+pub const EC2_INSTANCE_RESOURCE_TYPE: &str = "AWS::EC2::Instance";
 
 /// The `resourceType` segment a not-found message names for a task.
 pub const TASK_RESOURCE_TYPE: &str = "task";
@@ -278,6 +287,17 @@ impl Ec2Instance {
             // "When the instance summary was last updated": the cloud-side cache
             // holds what the device last pushed about this instance.
             last_updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+
+    /// The `ResourceSummary` projection `ListDeviceResources` returns: "a
+    /// structure defining the resource's type, Amazon Resource Name (ARN), and
+    /// ID".
+    pub fn to_resource_summary(&self, region: &str) -> ResourceSummary {
+        ResourceSummary {
+            resource_type: EC2_INSTANCE_RESOURCE_TYPE.to_string(),
+            arn: Some(instance_arn(&self.instance_id, region)),
+            id: Some(self.instance_id.clone()),
         }
     }
 }
@@ -808,6 +828,13 @@ fn fixture_instances(device_index: u64, now: SystemTime) -> BTreeMap<String, Ec2
         );
     }
     instances
+}
+
+/// The ARN of an Amazon EC2 instance: the EC2 service's own
+/// `…:instance/<instanceId>` form, since the resource an instance summary names
+/// is an EC2 instance and not a Snow Device Management resource.
+pub fn instance_arn(instance_id: &str, region: &str) -> String {
+    ::engine::emulator_arn("ec2", region, &format!("instance/{instance_id}"))
 }
 
 /// The ARN of a managed device: `…:managed-device/<managedDeviceId>`.

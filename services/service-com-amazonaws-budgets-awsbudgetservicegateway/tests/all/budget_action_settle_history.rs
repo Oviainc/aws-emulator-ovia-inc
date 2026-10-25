@@ -41,7 +41,7 @@ use super::budget_action_execution::{
     seed_status,
 };
 use super::budget_action_history::read_history;
-use super::budget_lifecycle::{account, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, router, router_with_engine, same};
 
 /// One row of the settle table: the status the action starts in, the execution run from
 /// it, the `*_IN_PROGRESS` status that execution takes immediately and the status the
@@ -162,7 +162,7 @@ async fn a_settle_appends_one_system_event_carrying_the_settled_status() {
     );
 
     let (router, engine) = router_with_engine();
-    let account_id = account(310_000_001);
+    let account_id = caller_account();
     for row in settle_rows() {
         let budget_name = format!("settle-{}", row.case.replace(' ', "-"));
         seed_budget(&router, &account_id, &budget_name).await;
@@ -281,7 +281,7 @@ async fn a_settle_appends_one_system_event_carrying_the_settled_status() {
 #[tokio::test]
 async fn the_clock_alone_appends_the_system_event() {
     let router = router();
-    let account_id = account(310_000_002);
+    let account_id = caller_account();
     let budget_name = "settles-on-the-clock";
     seed_budget(&router, &account_id, budget_name).await;
     let action_id = seed_action(&router, &account_id, budget_name).await;
@@ -351,7 +351,7 @@ async fn the_clock_alone_appends_the_system_event() {
 #[tokio::test]
 async fn each_execution_and_its_settle_are_recorded_in_order() {
     let (router, engine) = router_with_engine();
-    let account_id = account(310_000_003);
+    let account_id = caller_account();
     let budget_name = "settle-sequence";
     seed_budget(&router, &account_id, budget_name).await;
     let action_id = seed_action(&router, &account_id, budget_name).await;

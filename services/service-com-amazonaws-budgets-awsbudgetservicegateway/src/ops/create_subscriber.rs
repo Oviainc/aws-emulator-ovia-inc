@@ -157,6 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(CreateSubscriberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateSubscriberErrorModeled::InternalErrorException(InternalErrorException {
                 message: Some(

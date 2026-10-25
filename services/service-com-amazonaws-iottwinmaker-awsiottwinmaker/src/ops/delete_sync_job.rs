@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSyncJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSyncJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the sync job a workspace holds for the named sync source from
+//! [`crate::state`] — the very record `CreateSyncJob` wrote — and reports the
+//! `DELETING` state its response models for the removal it performed, the same
+//! answer `DeleteEntity` and `DeleteComponentType` give for theirs.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSyncJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both of this operation's labels address an EXISTING resource, so a workspace
+//! this service does not hold and a workspace that holds no job for the source
+//! are both the `ResourceNotFoundException` this operation models. A source the
+//! service does not support is held by no workspace, so it misses the same way
+//! rather than earning a refusal of its own: unlike `CreateSyncJob`, which has
+//! to decide whether a job against that source may exist and refuses an
+//! unsupported one with the `ValidationException` it models, this operation only
+//! addresses a job that is already stored — and no stored job names a source
+//! the create refused — so what answers it is the store's contents and nothing
+//! else. The job's ARN leaves the service's index with it, because a sync job
+//! carries tags and the tagging operations reach them only through that index.
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +157,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSyncJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSyncJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSyncJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one destroys tenant state.
+        ::tracing::info!(
+            operation = "DeleteSyncJob",
+            workspace_id = %input.workspace_id,
+            sync_source = %input.sync_source,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSyncJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Both labels address an EXISTING resource, so neither naming something
+        // the store does not hold is anything but a 404: a workspace this service
+        // does not hold holds no sync job either.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(DeleteSyncJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The removal IS the lookup: a sync job is identified inside its
+        // workspace by its sync source alone and nothing is built on top of one,
+        // so the record is taken out of the workspace that contains it whatever
+        // state it is in, and a miss is the 404 the labels earn. A source this
+        // service does not support is held by no workspace, so it misses here
+        // rather than needing a refusal of its own.
+        let Some(removed) = workspace.sync_jobs.remove(&input.sync_source) else {
+            return Err(DeleteSyncJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::sync_job_not_found_message(
+                        &input.workspace_id,
+                        &input.sync_source,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The record is gone, so the ARN it was indexed under stops resolving
+        // with it: the index must never name a sync job the store does not hold,
+        // and the job's tags are reachable only through that ARN.
+        state.arn_index.remove(&removed.arn);
+        ::tracing::info!(
+            operation = "DeleteSyncJob",
+            workspace_id = %input.workspace_id,
+            sync_source = %input.sync_source,
+            "removed a sync job"
+        );
+
+        Ok(DeleteSyncJobOutput {
+            state: crate::state::SYNC_JOB_STATE_DELETING.to_string(),
+        })
     }
 }

@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter,
-    Treatment, Validator, VendedMetricsSettings,
+    Treatment, TreatmentInput, Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -787,6 +787,20 @@ pub const CONTROL_TREATMENT_KEY: &str = "C";
 /// allows (`TreatmentInputList` holds at most 5), and is stable across every read.
 pub fn treatment_key(index: usize) -> String {
     format!("T{}", index + 1)
+}
+
+/// The treatment a request wrote, under the `key` this service minted for it. Every
+/// other member is the caller's, byte for byte.
+///
+/// Shared by every operation that stores a treatment list, so a definition's keys are
+/// minted one way whether the list was written by a create or replaced by an update.
+pub fn keyed_treatment(key: String, treatment: &TreatmentInput) -> Treatment {
+    Treatment {
+        key: Some(key),
+        weight: treatment.weight,
+        description: treatment.description.clone(),
+        flag_value: treatment.flag_value.clone(),
+    }
 }
 
 /// An experiment definition: the purpose, scope and treatments of an experiment over

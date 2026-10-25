@@ -29,7 +29,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     PERCENTAGE_LIMIT_UNIT,
 };
 
-use super::budget_lifecycle::{account, call, carries, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, carries, is_error, router, same};
 
 /// The `BudgetType` members `Budget$BudgetLimit` requires a limit of ("`BudgetLimit` is
 /// required for cost or usage budgets"), which is therefore the complement of the
@@ -296,10 +296,11 @@ fn derived_rows() -> Vec<Derived> {
 /// same shapes survive.
 #[tokio::test]
 async fn a_write_discards_the_members_the_service_derives_from_tracked_cost() {
-    let router = router();
-    // One account per row, so rows cannot see each other's budgets.
-    for (index, row) in derived_rows().into_iter().enumerate() {
-        let account_id = account(700_000_000 + index as u64);
+    // One store per row, so rows cannot see each other's budgets: every request names
+    // the one account this service serves.
+    for row in derived_rows() {
+        let router = router();
+        let account_id = caller_account();
         let read =
             write_and_read(&router, row.case, "CreateBudget", &account_id, &row.budget).await;
         for path in &row.dropped {
@@ -320,9 +321,9 @@ async fn a_write_discards_the_members_the_service_derives_from_tracked_cost() {
 /// resends values for them.
 #[tokio::test]
 async fn an_update_discards_them_too() {
-    let router = router();
-    for (index, row) in derived_rows().into_iter().enumerate() {
-        let account_id = account(710_000_000 + index as u64);
+    for row in derived_rows() {
+        let router = router();
+        let account_id = caller_account();
         let created =
             write_and_read(&router, row.case, "CreateBudget", &account_id, &row.budget).await;
         for path in &row.dropped {
@@ -583,9 +584,9 @@ fn without_write_instant(budget: &Value) -> Value {
 /// carried none of them.
 #[tokio::test]
 async fn a_modifying_update_applies_the_change_and_still_discards_the_derived_members() {
-    let router = router();
-    for (index, row) in modified_rows().into_iter().enumerate() {
-        let account_id = account(740_000_000 + index as u64);
+    for row in modified_rows() {
+        let router = router();
+        let account_id = caller_account();
         let created =
             write_and_read(&router, row.case, "CreateBudget", &account_id, &row.created).await;
         // The row's change is a real change: nothing asserted below is already true of
@@ -653,17 +654,17 @@ async fn a_modifying_update_applies_the_change_and_still_discards_the_derived_me
 /// not cite.
 #[tokio::test]
 async fn a_utilization_or_coverage_budget_defaults_to_the_documented_limit() {
-    let router = router();
     let expected_default = json!({
         "Amount": PERCENTAGE_LIMIT_AMOUNT,
         "Unit": PERCENTAGE_LIMIT_UNIT
     });
 
-    for (index, budget_type) in BUDGET_TYPE_VALUES.iter().enumerate() {
+    for budget_type in BUDGET_TYPE_VALUES.iter() {
         let defaults = PERCENTAGE_LIMIT_BUDGET_TYPES.contains(budget_type);
-        for (unit_index, time_unit) in TIME_UNIT_VALUES.iter().enumerate() {
+        for time_unit in TIME_UNIT_VALUES.iter() {
             let case = format!("{budget_type} / {time_unit} created without a BudgetLimit");
-            let account_id = account(720_000_000 + (index * 100 + unit_index) as u64);
+            let router = router();
+            let account_id = caller_account();
             let budget = json!({
                 "BudgetName": "no-limit",
                 "TimeUnit": time_unit,
@@ -719,7 +720,6 @@ async fn a_utilization_or_coverage_budget_defaults_to_the_documented_limit() {
 /// the budget type — the default fills an absent limit, it does not overwrite one.
 #[tokio::test]
 async fn a_supplied_budget_limit_is_never_replaced_by_the_default() {
-    let router = router();
     // Amounts spanning the `NumericValue` pattern `^([0-9]*\.)?[0-9]+$`: an integer, a
     // decimal, and one with no leading digit, each under a different `Spend$Unit`.
     let cost_or_usage_limits = [
@@ -736,15 +736,16 @@ async fn a_supplied_budget_limit_is_never_replaced_by_the_default() {
         json!({"Amount": PERCENTAGE_LIMIT_AMOUNT, "Unit": PERCENTAGE_LIMIT_UNIT}),
         json!({"Amount": PERCENTAGE_LIMIT_AMOUNT, "Unit": "PERCENT"}),
     ];
-    for (index, budget_type) in BUDGET_TYPE_VALUES.iter().enumerate() {
+    for budget_type in BUDGET_TYPE_VALUES.iter() {
         let limits: &[Value] = if PERCENTAGE_LIMIT_BUDGET_TYPES.contains(budget_type) {
             &percentage_limits
         } else {
             &cost_or_usage_limits
         };
-        for (limit_index, limit) in limits.iter().enumerate() {
+        for limit in limits.iter() {
             let case = format!("{budget_type} created with the limit {limit}");
-            let account_id = account(730_000_000 + (index * 100 + limit_index) as u64);
+            let router = router();
+            let account_id = caller_account();
             let read = write_and_read(
                 &router,
                 &case,

@@ -34,7 +34,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ComAmazonawsBudgetsAwsbudgetservicegatewayState, MAX_NOTIFICATIONS_PER_BUDGET,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// The notification set the tables below delete from.
 ///
@@ -246,7 +246,7 @@ async fn delete_notification(
 #[tokio::test]
 async fn deleting_a_notification_removes_only_it_and_its_subscribers() {
     let (router, engine) = router_with_engine();
-    let account_id = account(818_181_818);
+    let account_id = caller_account();
     let catalog = notification_catalog();
 
     for target in 0..catalog.len() {
@@ -317,7 +317,7 @@ async fn deleting_a_notification_removes_only_it_and_its_subscribers() {
 #[tokio::test]
 async fn the_alarm_state_is_not_part_of_a_notifications_identity() {
     let router = router();
-    let account_id = account(828_282_828);
+    let account_id = caller_account();
     let catalog = notification_catalog();
     let states: Vec<Option<&str>> = NOTIFICATION_STATE_VALUES
         .iter()
@@ -374,7 +374,7 @@ async fn the_alarm_state_is_not_part_of_a_notifications_identity() {
 #[tokio::test]
 async fn an_absent_threshold_type_means_percentage() {
     let router = router();
-    let account_id = account(838_383_838);
+    let account_id = caller_account();
     let forms: Vec<Option<&str>> = vec![None, Some("PERCENTAGE"), Some("ABSOLUTE_VALUE")];
 
     for created in &forms {
@@ -449,7 +449,7 @@ async fn an_absent_threshold_type_means_percentage() {
 #[tokio::test]
 async fn a_notification_that_differs_in_an_identity_member_is_not_found() {
     let router = router();
-    let account_id = account(848_484_848);
+    let account_id = caller_account();
     let stored = json!({
         "NotificationType": "ACTUAL",
         "ComparisonOperator": "GREATER_THAN",
@@ -509,15 +509,14 @@ async fn a_notification_that_differs_in_an_identity_member_is_not_found() {
 }
 
 /// RULE, the budget side: a notification is reached only through the budget that owns
-/// it, which is identified by `(AccountId, BudgetName)` — so a budget this account does
-/// not hold is `NotFoundException`, and another account's budget of the same name keeps
-/// its notifications. A `BudgetName` outside its modelled `@pattern` is the
+/// it, which the account identifies by `BudgetName` — so a name this account holds no
+/// budget under is `NotFoundException`, and the budget it does hold keeps its
+/// notifications. A `BudgetName` outside its modelled `@pattern` is the
 /// request-validation refusal it is, not a not-found.
 #[tokio::test]
 async fn a_notification_is_reached_only_through_the_budget_that_owns_it() {
     let router = router();
-    let owner = account(858_585_858);
-    let other = account(868_686_868);
+    let owner = caller_account();
     let notification = json!({
         "NotificationType": "ACTUAL",
         "ComparisonOperator": "GREATER_THAN",
@@ -526,17 +525,18 @@ async fn a_notification_is_reached_only_through_the_budget_that_owns_it() {
     create_with_notifications(
         &router,
         &owner,
-        "shared-name",
+        "stored-name",
         std::slice::from_ref(&notification),
     )
     .await;
 
-    for (case, account_id, budget_name) in [
-        ("a budget the account does not hold", &owner, "absent"),
-        ("another account's budget of the same name", &other, "shared-name"),
+    for (case, budget_name) in [
+        ("a name the account holds no budget under", "absent"),
+        ("the stored name with a suffix", "stored-name-2"),
+        ("the stored name in another case", "STORED-NAME"),
     ] {
         let (status, body) =
-            delete_notification(&router, account_id, budget_name, &notification).await;
+            delete_notification(&router, &owner, budget_name, &notification).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected the delete to be refused, got {status} {body}"
@@ -547,12 +547,12 @@ async fn a_notification_is_reached_only_through_the_budget_that_owns_it() {
         );
     }
 
-    // The owner's notification is untouched by either refusal.
-    let remaining = reported_notifications(&router, &owner, "shared-name").await;
+    // The stored notification is untouched by any of those refusals.
+    let remaining = reported_notifications(&router, &owner, "stored-name").await;
     assert_eq!(
         remaining.len(),
         1,
-        "expected the owner's notification to survive, got {remaining:?}"
+        "expected the stored notification to survive, got {remaining:?}"
     );
 
     // A name outside `BudgetName`'s pattern is a validation refusal, which the

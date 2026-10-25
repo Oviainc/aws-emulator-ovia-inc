@@ -35,7 +35,11 @@
 //! in [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_sources`], keyed by
 //! the workspace and the source's `timeSeriesId`, with
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_source_aliases`] the
-//! index the alias form of that lookup resolves through. Every
+//! index the alias form of that lookup resolves through. The Monitor access
+//! policies live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::access_policies`], keyed by the
+//! minted `accessPolicyId`, each record naming the identity, the Monitor
+//! resource and the permission the last write to it stated. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -49,10 +53,10 @@ use crate::ops::types::{
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions,
-    Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
-    PropertyType, ResolveTo, ResourceStatus, TargetResource, TaskConfiguration, TimeInNanos,
-    TrimSettings, Variant, WorkspaceEncryptionConfiguration,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, Identity, ImageLocation,
+    LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry,
+    ProcessingInput, PropertyType, ResolveTo, Resource, ResourceStatus, TargetResource,
+    TaskConfiguration, TimeInNanos, TrimSettings, Variant, WorkspaceEncryptionConfiguration,
     WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
     VIDEO_DATA_TYPE_VALUES,
 };
@@ -307,6 +311,16 @@ pub const DATASET_RESOURCE_TYPE: &str = "dataset";
 /// The ARN resource-type segment of a workspace ARN, as [`workspace_arn`] builds
 /// it.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "workspace";
+/// The ARN resource-type segment of an access policy's ARN, as
+/// [`access_policy_arn`] builds it.
+pub const ACCESS_POLICY_RESOURCE_TYPE: &str = "access-policy";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the access-policy map.
+/// `CreateAccessPolicy` is the only thing that adds an access policy and it
+/// declares the modelled `LimitExceededException` (HTTP 410), so that is how this
+/// store refuses past the cap. The emulator's own bound, not a published AWS
+/// default.
+pub const MAX_ACCESS_POLICIES: usize = 1_000;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the portal map. `CreatePortal`
 /// is the only thing that adds a portal and it declares the modelled
@@ -1565,6 +1579,102 @@ impl PortalRecord {
     }
 }
 
+/// One IoT SiteWise Monitor access policy: which identity may reach which Monitor
+/// resource, and with which permission.
+///
+/// An access policy has no lifecycle state of its own — no operation on one
+/// answers a status member — so, unlike a portal or a dataset, nothing here is
+/// owed a later transition; the two dates are what a read derives from.
+#[derive(Debug, Clone)]
+pub struct AccessPolicyRecord {
+    pub id: String,
+    pub arn: String,
+    /// The identity the policy grants access to, exactly as the call that last
+    /// wrote the policy stated it — see [`check_access_policy_identity`].
+    pub identity: Identity,
+    /// The Monitor resource the policy is about: a portal or a project.
+    pub resource: Resource,
+    /// A `Permission` value: `ADMINISTRATOR` or `VIEWER`.
+    pub permission: String,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+impl AccessPolicyRecord {
+    /// Replace the caller-owned members with what an update stated, and record
+    /// that instant as the policy's last update.
+    ///
+    /// Every member `UpdateAccessPolicy` carries is required, so the request
+    /// states the policy's new identity, resource and permission in full rather
+    /// than patching selected members; the policy's identity and provenance — its
+    /// id, its ARN, its tags and its creation date — are not that call's to
+    /// change, and no member of its input carries them.
+    pub fn apply_update(
+        &mut self,
+        identity: Identity,
+        resource: Resource,
+        permission: String,
+        now: SystemTime,
+    ) {
+        self.identity = identity;
+        self.resource = resource;
+        self.permission = permission;
+        self.last_update_date = now;
+    }
+}
+
+/// The members of the `Identity` shape, in the order it declares them. Source:
+/// `smithy_query(query="shape", shape="Identity")`.
+pub const IDENTITY_MEMBERS: [&str; 4] = ["user", "group", "iamUser", "iamRole"];
+
+/// The members of the `Resource` shape, in the order it declares them. Source:
+/// `smithy_query(query="shape", shape="Resource")`.
+pub const MONITOR_RESOURCE_MEMBERS: [&str; 2] = ["portal", "project"];
+
+/// How many of [`IDENTITY_MEMBERS`] an `Identity` names.
+fn identity_member_count(identity: &Identity) -> usize {
+    usize::from(identity.user.is_some())
+        + usize::from(identity.group.is_some())
+        + usize::from(identity.iam_user.is_some())
+        + usize::from(identity.iam_role.is_some())
+}
+
+/// Refuse an `Identity` that does not name EXACTLY ONE identity.
+///
+/// `Identity` is a choice spelled as a structure of optional members — "Contains
+/// an identity that can access an IoT SiteWise Monitor resource", whose own
+/// members are documented as the alternatives to "choose" between — so a request
+/// naming none of them, or more than one, names no single identity for the policy
+/// to be about. The `Err` carries the refusal message, which the calling
+/// operation lifts into its own modelled client error.
+pub fn check_access_policy_identity(identity: &Identity) -> Result<(), String> {
+    let named = identity_member_count(identity);
+    if named == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "accessPolicyIdentity must name exactly one of {}; this request named {named}.",
+        catalog_names(IDENTITY_MEMBERS.into_iter())
+    ))
+}
+
+/// Refuse a `Resource` that does not name EXACTLY ONE Monitor resource.
+///
+/// The same rule as [`check_access_policy_identity`], for the shape the policy's
+/// resource is stated in: "Contains an IoT SiteWise Monitor resource ID for a
+/// portal or project", one or the other.
+pub fn check_access_policy_resource(resource: &Resource) -> Result<(), String> {
+    let named = usize::from(resource.portal.is_some()) + usize::from(resource.project.is_some());
+    if named == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "accessPolicyResource must name exactly one of {}; this request named {named}.",
+        catalog_names(MONITOR_RESOURCE_MEMBERS.into_iter())
+    ))
+}
+
 /// One version of a pipeline: the caller-owned configuration as of the call that
 /// wrote it.
 ///
@@ -2393,6 +2503,7 @@ tagged_record!(PipelineRecord);
 tagged_record!(TaskRecord);
 tagged_record!(DatasetRecord);
 tagged_record!(WorkspaceRecord);
+tagged_record!(AccessPolicyRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
 /// same partition, account and region, not merely the same id.
@@ -2462,6 +2573,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub gateway_devices: HashMap<String, String>,
     /// IoT SiteWise Monitor portals by `portalId`.
     pub portals: HashMap<String, PortalRecord>,
+    /// IoT SiteWise Monitor access policies by `accessPolicyId`. The id alone
+    /// identifies one, and the record names the identity and the Monitor
+    /// resource the policy is about, so the listing forms filter on the record
+    /// rather than on a second index.
+    pub access_policies: HashMap<String, AccessPolicyRecord>,
     /// Pipelines by [`pipeline_key`] — the workspace they live in and their own
     /// name — because a pipeline name is unique only within its workspace.
     pub pipelines: HashMap<(String, String), PipelineRecord>,
@@ -3147,6 +3263,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
+            ACCESS_POLICY_RESOURCE_TYPE => tags_of(self.access_policies.get(id), arn),
             _ => None,
         }
     }
@@ -3169,6 +3286,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of_mut(self.workspaces.get_mut(id), arn),
+            ACCESS_POLICY_RESOURCE_TYPE => tags_of_mut(self.access_policies.get_mut(id), arn),
             _ => None,
         }
     }
@@ -3574,6 +3692,9 @@ pub const RESOURCE_TIME_SERIES: &str = "Time Series";
 
 /// The resource kind those errors name for an IoT SiteWise Monitor portal.
 pub const RESOURCE_PORTAL: &str = "Portal";
+
+/// The resource kind those errors name for an IoT SiteWise Monitor access policy.
+pub const RESOURCE_ACCESS_POLICY: &str = "Access Policy";
 
 /// The resource kind those errors name for a computation model.
 pub const RESOURCE_COMPUTATION_MODEL: &str = "Computation Model";
@@ -4164,6 +4285,17 @@ pub fn portal_start_url(portal_id: &str) -> String {
 /// owns the image rather than from any store this emulator does not run.
 pub fn portal_logo_image_url(portal_id: &str, image_id: &str) -> String {
     format!("{}/logo/{image_id}", portal_start_url(portal_id))
+}
+
+/// The canonical ARN of an access policy in `region`, in the form
+/// `CreateAccessPolicy` documents:
+/// `arn:${Partition}:iotsitewise:${Region}:${Account}:access-policy/${AccessPolicyId}`.
+pub fn access_policy_arn(region: &str, access_policy_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ACCESS_POLICY_RESOURCE_TYPE}/{access_policy_id}"),
+    )
 }
 
 /// The canonical ARN of a dataset in `region`, in the form `CreateDataset`

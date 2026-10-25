@@ -27,6 +27,8 @@ mod listing_page_bounds;
 mod missing_resource_errors;
 #[path = "all/pending_trn_conflict.rs"]
 mod pending_trn_conflict;
+#[path = "all/put_tax_exemption_state.rs"]
+mod put_tax_exemption_state;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supplemental_tax_registrations.rs"]

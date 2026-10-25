@@ -42,7 +42,13 @@ const PAGINATED: [(&str, &str); 4] = [
 ];
 
 /// The route `ListFilteredTransactionEvents` is bound to (`@http(uri:)`).
-const FILTERED_EVENTS: &str = "/list-filtered-transaction-events";
+///
+/// `pub(crate)` because the sibling suites drive the same operation.
+pub(crate) const FILTERED_EVENTS: &str = "/list-filtered-transaction-events";
+
+/// The route `ListTransactionEvents` is bound to (`@http(uri:)`); see
+/// [`FILTERED_EVENTS`].
+pub(crate) const TRANSACTION_EVENTS: &str = "/list-transaction-events";
 
 /// The top-level `message` this service's `ValidationException` carries for a request it
 /// refuses on a rule the MODEL cannot express (a combination of members, an ordering
@@ -92,11 +98,19 @@ fn is_bitcoin(network: &str) -> bool {
     network.starts_with("BITCOIN_")
 }
 
-/// A `ListFilteredTransactionEvents` request for the events sent to one address.
+/// A `ListFilteredTransactionEvents` request for EVERY event sent to one address.
+///
+/// It names both `ConfirmationStatus` values because
+/// `ConfirmationStatusFilter$include` is the opt-in to results that have not reached
+/// finality ("This filter is used to include transactions in the response that haven't
+/// reached finality"), so a request carrying no filter is the finality-only listing and
+/// not the whole one. The default itself is the subject of `finality_default.rs`; the
+/// suites here ask for the whole listing so their rows turn on the filter under test.
 fn filtered_events_body(network: &str, address: &str) -> Value {
     json!({
         "network": network,
         "addressIdentifierFilter": {"transactionEventToAddress": [address]},
+        "confirmationStatusFilter": {"include": ["FINAL", "NONFINAL"]},
     })
 }
 
@@ -1513,7 +1527,7 @@ async fn events_sent_to(emulator: &Emulator, network: &NetworkFixture, address: 
     for transaction in &network.transactions {
         let events = drain(
             emulator,
-            "/list-transaction-events",
+            TRANSACTION_EVENTS,
             "events",
             &json!({
                 "network": network.network,
@@ -1698,23 +1712,37 @@ async fn the_confirmation_filter_narrows_the_listing_to_the_statuses_it_names() 
         let address = network.busiest_address();
         let whole = events_sent_to(&emulator, &network, &address).await;
 
-        // Rows: each value of the model's `ConfirmationStatus` enum on its own, and both
-        // together.
+        // Rows: no filter at all, each value of the model's `ConfirmationStatus` enum on
+        // its own, and both together.
         // `ConfirmationStatusFilter$include`: "Transactions that have reached finality
-        // are always part of the response", so the filter only decides whether the
-        // events of the transactions that have NOT reached it come too.
-        let filter_status = |event: &Value, include: &[&str]| {
+        // are always part of the response", and the filter "is used to include
+        // transactions in the response that haven't reached finality" — so it only ever
+        // ADDS the events of the transactions that have not reached it, and an absent
+        // filter adds nothing.
+        let filter_status = |event: &Value, include: Option<&[&str]>| {
             let status = event["confirmationStatus"].as_str().unwrap_or_default();
-            status == "FINAL" || include.contains(&status)
+            status == "FINAL" || include.is_some_and(|include| include.contains(&status))
         };
-        for include in [vec!["FINAL"], vec!["NONFINAL"], vec!["FINAL", "NONFINAL"]] {
+        for include in [
+            None,
+            Some(vec!["FINAL"]),
+            Some(vec!["NONFINAL"]),
+            Some(vec!["FINAL", "NONFINAL"]),
+        ] {
             let want: Vec<Value> = whole
                 .iter()
-                .filter(|event| filter_status(event, &include))
+                .filter(|event| filter_status(event, include.as_deref()))
                 .cloned()
                 .collect();
             let mut body = filtered_events_body(&network.network, &address);
-            body["confirmationStatusFilter"] = json!({"include": include});
+            match &include {
+                Some(include) => body["confirmationStatusFilter"] = json!({"include": include}),
+                None => {
+                    body.as_object_mut()
+                        .expect("the request body is an object")
+                        .remove("confirmationStatusFilter");
+                }
+            }
             let got = drain(&emulator, FILTERED_EVENTS, "events", &body, None).await;
             assert_eq!(
                 got, want,

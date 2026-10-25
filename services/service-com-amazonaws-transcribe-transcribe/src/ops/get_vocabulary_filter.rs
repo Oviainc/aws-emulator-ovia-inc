@@ -193,10 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             language_code: Some(record.language_code.clone()),
             last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
             // Where the filter's file is reported to live. Nothing is served there —
-            // see the `crate::state` header. This answer carries no words:
-            // `GetVocabularyFilterResponse` has no member for them, so the filter's
-            // content is not reported by this operation at all.
-            download_uri: Some(record.download_uri()),
+            // see the `crate::state` header — and the member is ABSENT for a filter
+            // whose words would have come from a file nothing read, which has no file
+            // of its own (`crate::state::VocabularyFilterRecord::download_uri`). This
+            // answer carries no words: `GetVocabularyFilterResponse` has no member for
+            // them, so the filter's content is not reported by this operation at all.
+            download_uri: record.download_uri(),
             data_access_role_arn: record.data_access_role_arn.clone(),
             encryption_configuration: record.encryption_configuration.clone(),
         })

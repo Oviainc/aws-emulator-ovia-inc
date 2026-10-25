@@ -196,13 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Same pair of alternatives as the create, and the same refusals: "You can use
-        // Words or VocabularyFilterFileUri, but you can't use both."
-        let words = match crate::state::content_source(
+        // Same pair of alternatives as the create, and the same handling: "You can use
+        // Words or VocabularyFilterFileUri, but you can't use both." Either source is
+        // recorded; only the refusals for naming neither or both remain.
+        let (words, file_uri) = match crate::state::content_source(
             input.words.as_deref(),
             input.vocabulary_filter_file_uri.as_deref(),
         ) {
-            crate::state::ContentSource::Inline(words) => words.to_vec(),
+            crate::state::ContentSource::Inline(words) => (words.to_vec(), None),
+            // Recorded, not read, exactly as on the create: this emulator reads no
+            // object store and makes no outbound request, so no words are loaded and
+            // the rebuilt filter reports no file of its own to download.
+            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Words or VocabularyFilterFileUri. Add \
@@ -215,16 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      the words of your custom vocabulary filter one way or the other and \
                      try your request again.",
                 ))
-            }
-            // Unreachable to this emulator, exactly as on the create: it reads no
-            // object store and makes no outbound request, so it would have nothing to
-            // rebuild the filter from.
-            crate::state::ContentSource::File(uri) => {
-                return Err(bad_request(&format!(
-                    "The VocabularyFilterFileUri {uri} can't be read by this emulator: \
-                     it rebuilds a custom vocabulary filter only from the words a request \
-                     lists in Words. Send the words in Words and try your request again."
-                )))
             }
         };
 
@@ -258,6 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // new terms onto an existing custom vocabulary filter." The language code is
         // not an input of this operation, so the stored one is kept.
         record.words = words;
+        record.file_uri = file_uri;
         record.last_modified_time = now;
         record.region = region;
         record.data_access_role_arn = input.data_access_role_arn;
@@ -267,6 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "UpdateVocabularyFilter",
             filter = %record.name,
             words = record.words.len(),
+            from_file = record.file_uri.is_some(),
             "custom vocabulary filter updated"
         );
 

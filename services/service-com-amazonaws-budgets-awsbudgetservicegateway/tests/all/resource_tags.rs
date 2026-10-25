@@ -30,8 +30,9 @@
 //! several, the published maximum), and the key and value lengths at each published bound
 //! and one past it.
 //!
-//! The harness (`router`, `call`, `is_error`, `account`) and the budget/action setup are
-//! the sibling suites', so every suite in this target drives the service identically.
+//! The harness (`router`, `call`, `is_error`, `caller_account`) and the budget/action
+//! setup are the sibling suites', so every suite in this target drives the service
+//! identically.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -45,7 +46,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 use super::budget_action_execution::{
     create_body, email_subscriber, iam_definition, seed_action, seed_budget,
 };
-use super::budget_lifecycle::{account, call, is_error, router};
+use super::budget_lifecycle::{account, caller_account, call, is_error, router};
 
 /// The ARN of a budget. AWS names a budget
 /// `arn:{partition}:budgets::{account}:budget/{BudgetName}` — a global service, so the
@@ -196,7 +197,7 @@ fn tag_rows() -> Vec<Row> {
 #[tokio::test]
 async fn tagging_writes_the_supplied_set_and_a_read_reports_it() {
     let router = router();
-    let account_id = account(818_181_818);
+    let account_id = caller_account();
 
     for (name_case, form) in NAME_FORMS {
         for (index, row) in tag_rows().into_iter().enumerate() {
@@ -242,7 +243,7 @@ async fn tagging_writes_the_supplied_set_and_a_read_reports_it() {
 #[tokio::test]
 async fn a_key_the_resource_already_holds_is_revalued_in_place() {
     let router = router();
-    let account_id = account(828_282_828);
+    let account_id = caller_account();
     let budget_name = "merged";
 
     // A budget created WITH tags, and an action of it created without any.
@@ -345,7 +346,7 @@ async fn a_key_the_resource_already_holds_is_revalued_in_place() {
 #[tokio::test]
 async fn a_tag_set_naming_one_key_twice_is_refused_and_writes_nothing() {
     let router = router();
-    let account_id = account(838_383_838);
+    let account_id = caller_account();
     let budget_name = "duplicates";
     seed_budget(&router, &account_id, budget_name).await;
     let arn = budget_arn(&account_id, budget_name);
@@ -405,12 +406,10 @@ async fn a_tag_set_naming_one_key_twice_is_refused_and_writes_nothing() {
 #[tokio::test]
 async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
     let router = router();
-    let owner = account(848_484_848);
-    let other = account(858_585_858);
+    let owner = caller_account();
 
     seed_budget(&router, &owner, "owning").await;
     seed_budget(&router, &owner, "sibling").await;
-    seed_budget(&router, &other, "owning").await;
     let owned_action = seed_action(&router, &owner, "owning").await;
     let sibling_action = seed_action(&router, &owner, "sibling").await;
 
@@ -419,7 +418,6 @@ async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
     for arn in [
         budget_arn(&owner, "owning"),
         budget_arn(&owner, "sibling"),
-        budget_arn(&other, "owning"),
         action_arn(&owner, "owning", &owned_action),
         action_arn(&owner, "sibling", &sibling_action),
     ] {
@@ -432,9 +430,19 @@ async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
 
     let absent_action = "11111111-2222-3333-4444-555555555555";
     let not_found = [
-        ("an account that holds no budget", budget_arn(&account(868_686_868), "owning")),
+        // The account field is part of the identity too, and this service holds a budget
+        // under no account but the one it answers for — a request that names another
+        // account in an `AccountId` MEMBER is refused before any lookup
+        // (`account_scoping.rs`).
+        (
+            "an account that holds no budget",
+            budget_arn(&account(868_686_868), "owning"),
+        ),
         ("a budget name nobody created", budget_arn(&owner, "never-created")),
-        ("another account's budget name", budget_arn(&other, "sibling")),
+        (
+            "a stored budget name in another case",
+            budget_arn(&owner, "OWNING"),
+        ),
         ("an action id no action carries", action_arn(&owner, "owning", absent_action)),
         (
             "an action id that belongs to another budget",
@@ -526,7 +534,6 @@ async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
     for arn in [
         budget_arn(&owner, "owning"),
         budget_arn(&owner, "sibling"),
-        budget_arn(&other, "owning"),
         action_arn(&owner, "owning", &owned_action),
         action_arn(&owner, "sibling", &sibling_action),
     ] {
@@ -544,27 +551,20 @@ async fn an_arn_that_names_no_resource_of_this_service_is_refused() {
 }
 
 /// RULE 1, the isolation half: a resource's tags are its own. Tagging a budget leaves its
-/// own actions, its sibling budgets and the same-named budget of another account
-/// untouched.
+/// own actions and its sibling budgets untouched.
 #[tokio::test]
 async fn tags_belong_to_the_one_resource_the_arn_names() {
     let router = router();
-    let owner = account(878_787_878);
-    let other = account(888_888_888);
+    let owner = caller_account();
 
     seed_budget(&router, &owner, "owning").await;
     seed_budget(&router, &owner, "sibling").await;
-    seed_budget(&router, &other, "owning").await;
     let first = seed_action(&router, &owner, "owning").await;
     let second = seed_action(&router, &owner, "owning").await;
 
     let targets = [
         ("the budget", budget_arn(&owner, "owning")),
         ("its sibling budget", budget_arn(&owner, "sibling")),
-        (
-            "the same-named budget of another account",
-            budget_arn(&other, "owning"),
-        ),
         ("its first action", action_arn(&owner, "owning", &first)),
         ("its second action", action_arn(&owner, "owning", &second)),
     ];
@@ -602,7 +602,7 @@ async fn tags_belong_to_the_one_resource_the_arn_names() {
 #[tokio::test]
 async fn a_write_past_the_published_tag_maximum_is_refused() {
     let router = router();
-    let account_id = account(898_989_898);
+    let account_id = caller_account();
     let budget_name = "at-the-ceiling";
     seed_budget(&router, &account_id, budget_name).await;
     let arn = budget_arn(&account_id, budget_name);
@@ -672,7 +672,7 @@ async fn a_write_past_the_published_tag_maximum_is_refused() {
 #[tokio::test]
 async fn a_tag_outside_a_modelled_constraint_is_refused_at_validation() {
     let router = router();
-    let account_id = account(909_090_909);
+    let account_id = caller_account();
     let budget_name = "validated";
     seed_budget(&router, &account_id, budget_name).await;
     let arn = budget_arn(&account_id, budget_name);
@@ -721,7 +721,7 @@ async fn a_tag_outside_a_modelled_constraint_is_refused_at_validation() {
 #[tokio::test]
 async fn reading_tags_reports_the_empty_set_and_changes_nothing() {
     let router = router();
-    let account_id = account(919_292_919);
+    let account_id = caller_account();
     let budget_name = "untagged";
     seed_budget(&router, &account_id, budget_name).await;
     let action_id = seed_action(&router, &account_id, budget_name).await;
@@ -788,7 +788,7 @@ async fn reading_tags_reports_the_empty_set_and_changes_nothing() {
 #[tokio::test]
 async fn an_action_created_with_tags_reports_them() {
     let router = router();
-    let account_id = account(929_393_929);
+    let account_id = caller_account();
     let budget_name = "tagged-at-creation";
     seed_budget(&router, &account_id, budget_name).await;
 

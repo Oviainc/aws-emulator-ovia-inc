@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +112,14 @@ impl From<DisassociateWebACLErrorModeled> for DisassociateWebACLError {
     }
 }
 
+/// The `ParameterExceptionField` a `ResourceArn` this operation cannot use is reported
+/// under, from the model's generated `PARAMETER_EXCEPTION_FIELD_VALUES`.
+const FIELD_RESOURCE_ARN: &str = "RESOURCE_ARN";
+
+/// The `ParameterExceptionReason` for a member whose value the service cannot use, from
+/// the model's generated `PARAMETER_EXCEPTION_REASON_VALUES`.
+const REASON_ILLEGAL_ARGUMENT: &str = "ILLEGAL_ARGUMENT";
+
 /// The `DisassociateWebACL` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +156,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateWebACL"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateWebACLErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+
+        // The same ARN rule `AssociateWebACL` accepts an association under, so an ARN
+        // that call refuses as malformed or unassociable is refused here too.
+        if crate::state::associable_resource_type(&input.resource_arn).is_none() {
+            return Err(
+                DisassociateWebACLErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        field: Some(FIELD_RESOURCE_ARN.to_string()),
+                        parameter: Some(input.resource_arn.clone()),
+                        reason: Some(REASON_ILLEGAL_ARGUMENT.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A mutation: "Removes a web ACL from the specified resource" drops the
+        // association off the web ACL's own stored record.
+        let mut state = state.lock();
+
+        // Removing an association from a resource that has none is refused rather than
+        // answered: the recorded behaviour for a `DisassociateWebACL` naming a resource
+        // the account holds no association for is the nonexistent-item refusal. This
+        // service knows a protected resource only through the association it holds for it
+        // — an application load balancer and an API Gateway stage are resources of other
+        // services, not records this store keeps — so an ARN it holds none for leaves
+        // nothing to remove. (The READER differs, and says so positively: its output
+        // member documents a null `WebACLSummary` for a resource with no web ACL.)
+        if state.disassociate_resource(&input.resource_arn).is_none() {
+            return Err(
+                DisassociateWebACLErrorModeled::WAFNonexistentItemException(
+                    WAFNonexistentItemException {
+                        // One fixed sentence per refusal class, carrying nothing of the
+                        // request — as AWS WAF Classic's messages do.
+                        message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(DisassociateWebACLOutput {})
     }
 }

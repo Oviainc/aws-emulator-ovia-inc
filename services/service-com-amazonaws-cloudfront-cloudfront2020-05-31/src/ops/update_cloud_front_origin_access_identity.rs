@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCloudFrontOriginAccessIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCloudFrontOriginAccessIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCloudFrontOriginAccessIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces an origin access identity's stored configuration under an `If-Match`
+//! precondition: the submitted configuration becomes what a later
+//! `GetCloudFrontOriginAccessIdentity` and `GetCloudFrontOriginAccessIdentityConfig`
+//! answer with, and the mutation hands back a fresh version token.
+//!
+//! The identity itself is immutable: the id it was created under, the Amazon S3 canonical
+//! user id minted with it, and the `CallerReference` that names it for its whole life all
+//! stay as they were — an update that moves the reference is a modification this operation
+//! does not allow.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +83,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +161,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCloudFrontOriginAccessIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCloudFrontOriginAccessIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCloudFrontOriginAccessIdentity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.cloud_front_origin_access_identity_config;
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. An identity itself has no transition owed.
+        store.settle(::std::time::SystemTime::now());
+
+        // The identity being updated is looked up first: every refusal below is about the
+        // record this id names, and nothing is minted for an id the store does not hold.
+        let Some(current) = store
+            .origin_access_identity(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
+        else {
+            return Err(
+                UpdateCloudFrontOriginAccessIdentityErrorModeled::NoSuchCloudFrontOriginAccessIdentity(
+                    crate::state::no_such_origin_access_identity(),
+                )
+                .into(),
+            );
+        };
+        let (current_etag, current_caller_reference) = current;
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateCloudFrontOriginAccessIdentityErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    UpdateCloudFrontOriginAccessIdentityErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "A comment to describe the origin access identity. The comment cannot be longer
+        // than 128 characters." The documented bound holds on every payload that states a
+        // configuration, so an update cannot store one the create would have refused.
+        let comment_length = config.comment.chars().count();
+        if comment_length > crate::state::MAX_ORIGIN_ACCESS_IDENTITY_COMMENT {
+            return Err(
+                UpdateCloudFrontOriginAccessIdentityErrorModeled::InvalidArgument(
+                    crate::state::comment_too_long(comment_length),
+                )
+                .into(),
+            );
+        }
+
+        // An identity's caller reference identifies it for its whole life, so an update
+        // that moves it onto another value is not a modification CloudFront allows.
+        if config.caller_reference != current_caller_reference {
+            return Err(
+                UpdateCloudFrontOriginAccessIdentityErrorModeled::IllegalUpdate(IllegalUpdate {
+                    message: Some(format!(
+                        "The CallerReference of an origin access identity cannot be changed; \
+                         it is {current_caller_reference}"
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_origin_access_identity_config(&input.id, config) else {
+            return Err(
+                UpdateCloudFrontOriginAccessIdentityErrorModeled::NoSuchCloudFrontOriginAccessIdentity(
+                    crate::state::no_such_origin_access_identity(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateCloudFrontOriginAccessIdentityOutput {
+            // "The origin access identity's information." — read from the record just
+            // written, never from the request.
+            cloud_front_origin_access_identity: Some(stored.to_identity()),
+            // "The current version of the configuration" — a fresh token, so the version
+            // this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

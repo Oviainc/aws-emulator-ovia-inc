@@ -39,6 +39,9 @@ use crate::deployment_update::{
 };
 use crate::harness::{walk_pages, Harness};
 use crate::resource_tagging::{deployment_arn, encode_component, model, shape_traits};
+use service_com_amazonaws_launchwizard_launchwizard::state::{
+    DRY_RUN_OPERATION_CODE, DRY_RUN_OPERATION_STATUS,
+};
 
 /// The wire error code and HTTP status every refusal below carries
 /// (`smithy_query(query="shape",shape="ValidationException")`: `errorKind: client`,
@@ -188,9 +191,11 @@ async fn a_create_is_judged_against_the_specification_schema_the_pattern_publish
                 deployment["specifications"]
             );
 
-            // The same map as a dry run passes the same checks and stores nothing.
+            // The same map as a dry run passes the same checks and stores nothing: it
+            // is answered with the documented pre-flight error response rather than
+            // the schema refusal below (see `tests/all/dry_run_preflight.rs`).
             let dry = harness
-                .ok(
+                .refused(
                     &case,
                     "/createDeployment",
                     create_request(
@@ -200,6 +205,8 @@ async fn a_create_is_judged_against_the_specification_schema_the_pattern_publish
                         &specifications,
                         true,
                     ),
+                    DRY_RUN_OPERATION_STATUS,
+                    DRY_RUN_OPERATION_CODE,
                 )
                 .await;
             assert!(

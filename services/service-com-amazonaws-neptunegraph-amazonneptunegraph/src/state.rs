@@ -40,15 +40,16 @@ pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 /// it — the due instant is stored and compared on read.
 pub const DELETION_SPAN: Duration = Duration::from_millis(500);
 
-/// How long after the `CancelQuery` that starts it a query's cancellation is owed: the
-/// query answers `CANCELLING` until this span has passed, then the next read finds it
-/// terminated and no longer reports it.
+/// How long after the call that accepts it a cancellation is owed: the cancelled
+/// record answers `CANCELLING` until this span has passed, then the next read sees the
+/// cancellation through — a query is terminated and no longer reported, and an export
+/// task reports `CANCELLED`.
 ///
-/// The real service stops a query as soon as its engine notices the cancel; this
-/// emulator picks a span inside the emulator-wide 250ms..750ms band for a transition
-/// the clock owes, so a caller that reads the query straight after cancelling it still
-/// observes the transient `CANCELLING` state. No handler ever sleeps for it — the due
-/// instant is stored and compared on read.
+/// The real service stops the cancelled work as soon as its engine notices the cancel;
+/// this emulator picks a span inside the emulator-wide 250ms..750ms band for a
+/// transition the clock owes, so a caller that reads the record straight after
+/// cancelling it still observes the transient `CANCELLING` state. No handler ever sleeps
+/// for it — the due instant is stored and compared on read.
 pub const CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 
 /// How long after its admission a query is over on its own: the span after which an
@@ -681,17 +682,25 @@ pub const EXPORT_NOT_PERFORMED_REASON: &str =
     "this emulator does not export graph data: no data was read from the graph and nothing \
      was written to the destination";
 
+/// The `statusReason` of an export task that stopped because it was cancelled.
+pub const EXPORT_CANCELLED_REASON: &str =
+    "The export task was cancelled by a CancelExportTask request.";
+
 /// The statuses this slice of the emulator puts an export task into.
 ///
-/// Both variants' wire forms are modelled `ExportTaskStatus` values
+/// Every variant's wire form is a modelled `ExportTaskStatus` value
 /// (`crate::ops::types::EXPORT_TASK_STATUS_VALUES`). `EXPORTING` and `SUCCEEDED` are
 /// never produced here because no export run happens (see
-/// [`EXPORT_NOT_PERFORMED_REASON`]); `CANCELLING`, `CANCELLED` and `DELETED` belong to
-/// `CancelExportTask`, which is still scaffolded, and are added with it.
+/// [`EXPORT_NOT_PERFORMED_REASON`]), and `DELETED` joins this enum with an operation
+/// that would produce it — this service models none that deletes an export task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportTaskStatus {
     /// `StartExportTask` has accepted the task; no data has moved yet.
     Initializing,
+    /// `CancelExportTask` has accepted the cancellation; the task is winding down.
+    Cancelling,
+    /// The task stopped because it was cancelled ([`EXPORT_CANCELLED_REASON`]).
+    Cancelled,
     /// The task is over and nothing was exported ([`EXPORT_NOT_PERFORMED_REASON`]).
     Failed,
 }
@@ -701,7 +710,44 @@ impl ExportTaskStatus {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Initializing => "INITIALIZING",
+            Self::Cancelling => "CANCELLING",
+            Self::Cancelled => "CANCELLED",
             Self::Failed => "FAILED",
+        }
+    }
+
+    /// Whether this is a TERMINAL status: the task has stopped, so the clock owes it
+    /// nothing more and its outcome can no longer change.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Failed)
+    }
+
+    /// Whether a task in this status can still be cancelled: only one whose export is
+    /// in flight. A task that has stopped has no work left to stop, and one already
+    /// `CANCELLING` is stopping already — each is a conflict rather than a second
+    /// cancellation.
+    pub const fn is_cancellable(self) -> bool {
+        matches!(self, Self::Initializing)
+    }
+
+    /// The status the clock owes a task currently reported in this status, if any: an
+    /// accepted task stops without exporting, and an accepted cancellation completes.
+    /// A terminal status is owed nothing.
+    pub const fn settles_into(self) -> Option<Self> {
+        match self {
+            Self::Initializing => Some(Self::Failed),
+            Self::Cancelling => Some(Self::Cancelled),
+            Self::Cancelled | Self::Failed => None,
+        }
+    }
+
+    /// The `statusReason` this status carries — why the task stopped. It is a property
+    /// of the status itself, so the two can never be read apart.
+    pub const fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Failed => Some(EXPORT_NOT_PERFORMED_REASON),
+            Self::Cancelled => Some(EXPORT_CANCELLED_REASON),
+            Self::Initializing | Self::Cancelling => None,
         }
     }
 }
@@ -756,12 +802,30 @@ impl ExportTask {
     /// The same one write a reporting operation may make as [`Graph::settle`]: the task
     /// would have ended at `settles_at` whether or not anybody called, so applying it
     /// on read is bookkeeping rather than a state change caused by the read.
+    ///
+    /// Which status falls due is a property of the status the task is in
+    /// ([`ExportTaskStatus::settles_into`]), so an accepted task settles into the
+    /// failure no export run can avoid while an accepted cancellation settles into
+    /// `CANCELLED`.
     pub fn settle(&mut self, now: Instant) {
-        if self.settles_at.is_some_and(|due| now >= due) {
-            self.status = ExportTaskStatus::Failed;
-            self.status_reason = Some(EXPORT_NOT_PERFORMED_REASON.to_string());
-            self.settles_at = None;
+        if self.settles_at.is_none_or(|due| now < due) {
+            return;
         }
+        if let Some(settled) = self.status.settles_into() {
+            self.status = settled;
+            self.status_reason = settled.reason().map(str::to_string);
+        }
+        self.settles_at = None;
+    }
+
+    /// Accept a cancellation of this task: report the modelled `CANCELLING` status now
+    /// ("The status is CANCELLING when the export task is cancelled") and let the clock
+    /// owe the move to `CANCELLED` [`CANCELLATION_SPAN`] later, so a caller that reads
+    /// the task straight after cancelling it still sees it winding down.
+    pub fn begin_cancellation(&mut self, now: Instant) {
+        self.status = ExportTaskStatus::Cancelling;
+        self.status_reason = None;
+        self.settles_at = Some(now + CANCELLATION_SPAN);
     }
 
     /// How long the task has been running, in whole seconds: what
@@ -1216,6 +1280,16 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         region: &str,
         now: Instant,
     ) -> Option<&ExportTask> {
+        self.settled_export_task_mut(id, region, now).map(|t| &*t)
+    }
+
+    /// [`Self::settled_export_task`], mutably.
+    pub fn settled_export_task_mut(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&mut ExportTask> {
         let task = self.export_tasks.get_mut(id)?;
         if !task.is_in(region) {
             return None;
@@ -1379,6 +1453,32 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     ) -> Option<&mut PrivateGraphEndpoint> {
         self.materialise_private_endpoints(now);
         self.private_endpoints.get_mut(graph_id)?.get_mut(vpc_id)
+    }
+
+    /// The private endpoints of ONE graph, in VPC-id order, resuming after
+    /// `after_vpc_id` when a pagination token named a position: the listing
+    /// `ListPrivateGraphEndpoints` pages over.
+    ///
+    /// The same shape as [`Self::graphs_in`] and [`Self::snapshots_in`], for the same
+    /// reason: the endpoints of a graph are held in a `BTreeMap` keyed by the VPC id an
+    /// endpoint is addressed by, so one stable total order underlies every page and a
+    /// token can name a position in it. A graph holding no endpoint at all yields
+    /// nothing rather than being distinguished from one whose endpoints are all gone.
+    pub fn private_endpoints_of<'store>(
+        &'store self,
+        graph_id: &str,
+        after_vpc_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store PrivateGraphEndpoint> {
+        let lower = match after_vpc_id {
+            Some(vpc_id) => ::std::ops::Bound::Excluded(vpc_id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.private_endpoints
+            .get(graph_id)
+            .map(|endpoints| endpoints.range((lower, ::std::ops::Bound::Unbounded)))
+            .into_iter()
+            .flatten()
+            .map(|(_, endpoint)| endpoint)
     }
 
     /// Store a newly accepted query, under the graph it runs on.
@@ -1937,6 +2037,21 @@ pub fn is_snapshot_id(value: &str) -> bool {
     is_resource_id(value, "gs-")
 }
 
+/// Whether `value` matches the modelled `VpcId` pattern `^vpc-[a-z0-9]+$`
+/// (`smithy_query(query="shape",shape="VpcId")`).
+///
+/// Unlike this service's own resource ids, a VPC id is minted by another service, so
+/// the pattern bounds only its prefix and alphabet and not its length: anything from
+/// one character after the prefix upwards is a position in that id space.
+pub fn is_vpc_id(value: &str) -> bool {
+    value.strip_prefix("vpc-").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
+}
+
 /// Whether `value` matches the modelled `TaskId` pattern `^t-[a-z0-9]{10}$`.
 ///
 /// One predicate for the whole task-id space: the model spells the same pattern for
@@ -2470,32 +2585,52 @@ import_task_record_output!(
     },
 );
 
-/// `StartExportTask` reports the record it stored. The listing projection
-/// (`ExportTaskSummary`) and `CancelExportTaskOutput` join this rendering with the
-/// operations that produce them; `GetExportTaskOutput` is built by
-/// [`ExportTask::get_output`] instead, because it also carries the `exportTaskDetails`
-/// that are derived from the clock.
-impl From<&ExportTask> for crate::ops::types::StartExportTaskOutput {
-    fn from(task: &ExportTask) -> Self {
-        Self {
-            graph_id: task.source_graph_id.clone(),
-            role_arn: task.role_arn.clone(),
-            task_id: task.id.clone(),
-            status: task.status.as_wire().to_string(),
-            format: task.format.clone(),
-            destination: task.destination.clone(),
-            kms_key_identifier: task.kms_key_identifier.clone(),
-            parquet_type: task.parquet_type.clone(),
-            status_reason: task.status_reason.clone(),
-            export_filter: task.export_filter.clone(),
+/// The `*Output` shapes that carry a whole export-task record differ only in the
+/// members they add, so the members they SHARE are rendered by one macro rather than
+/// one hand-copied field list per operation, which could drift apart. The listing
+/// projection (`ExportTaskSummary`) joins this list with the operation that reports it;
+/// `GetExportTaskOutput` is built by [`ExportTask::get_output`] instead, because it also
+/// carries the `exportTaskDetails` that are derived from the clock.
+///
+/// Each entry names the binding the stored record is reached through, because macro
+/// hygiene puts a binding the macro itself introduces out of reach of the extra
+/// members an entry spells.
+macro_rules! export_task_record_output {
+    ($($ty:ident ($task:ident) { $($extra:tt)* }),+ $(,)?) => {$(
+        impl From<&ExportTask> for crate::ops::types::$ty {
+            fn from($task: &ExportTask) -> Self {
+                Self {
+                    graph_id: $task.source_graph_id.clone(),
+                    role_arn: $task.role_arn.clone(),
+                    task_id: $task.id.clone(),
+                    status: $task.status.as_wire().to_string(),
+                    format: $task.format.clone(),
+                    destination: $task.destination.clone(),
+                    kms_key_identifier: $task.kms_key_identifier.clone(),
+                    parquet_type: $task.parquet_type.clone(),
+                    status_reason: $task.status_reason.clone(),
+                    $($extra)*
+                }
+            }
         }
-    }
+    )+};
 }
 
-/// The three `*Output` shapes that carry a whole private-graph-endpoint record are
-/// structurally identical, so one macro renders the stored endpoint into each rather
-/// than one hand-copied field list per operation, which could drift apart.
-/// `PrivateGraphEndpointSummary` joins this list with `ListPrivateGraphEndpoints`.
+export_task_record_output!(
+    StartExportTaskOutput(task) {
+        export_filter: task.export_filter.clone(),
+    },
+    // `CancelExportTaskOutput` carries only the shared members: the model gives it no
+    // `exportFilter`.
+    CancelExportTaskOutput(task) {},
+);
+
+/// The shapes that carry a whole private-graph-endpoint record are structurally
+/// identical, so one macro renders the stored endpoint into each rather than one
+/// hand-copied field list per operation, which could drift apart. The three `*Output`
+/// shapes of the single-endpoint operations are joined here by
+/// `PrivateGraphEndpointSummary`, the entry `ListPrivateGraphEndpoints` reports, so a
+/// listed endpoint cannot differ from what a read of it answers.
 macro_rules! private_graph_endpoint_output {
     ($($ty:ident),+ $(,)?) => {$(
         impl From<&PrivateGraphEndpoint> for crate::ops::types::$ty {
@@ -2515,6 +2650,7 @@ private_graph_endpoint_output!(
     CreatePrivateGraphEndpointOutput,
     GetPrivateGraphEndpointOutput,
     DeletePrivateGraphEndpointOutput,
+    PrivateGraphEndpointSummary,
 );
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -2776,6 +2912,135 @@ mod tests {
                 "case {case:?}: a second settle must not change the status, expected \
                  {expected:?}, got {:?}",
                 task.status
+            );
+        }
+    }
+
+    /// Which status an export task is owed, whether it can still be cancelled and the
+    /// reason it carries are all decided by the status it is in — one row per status
+    /// this slice stores.
+    #[test]
+    fn an_export_task_status_decides_what_the_clock_still_owes_it() {
+        /// One row: a stored status and everything it decides.
+        struct Row {
+            status: ExportTaskStatus,
+            cancellable: bool,
+            terminal: bool,
+            settles_into: Option<ExportTaskStatus>,
+            reason: Option<&'static str>,
+        }
+
+        let cases = [
+            Row {
+                status: ExportTaskStatus::Initializing,
+                cancellable: true,
+                terminal: false,
+                settles_into: Some(ExportTaskStatus::Failed),
+                reason: None,
+            },
+            Row {
+                status: ExportTaskStatus::Cancelling,
+                cancellable: false,
+                terminal: false,
+                settles_into: Some(ExportTaskStatus::Cancelled),
+                reason: None,
+            },
+            Row {
+                status: ExportTaskStatus::Cancelled,
+                cancellable: false,
+                terminal: true,
+                settles_into: None,
+                reason: Some(EXPORT_CANCELLED_REASON),
+            },
+            Row {
+                status: ExportTaskStatus::Failed,
+                cancellable: false,
+                terminal: true,
+                settles_into: None,
+                reason: Some(EXPORT_NOT_PERFORMED_REASON),
+            },
+        ];
+        for row in cases {
+            let status = row.status;
+            let actual = status.is_cancellable();
+            assert_eq!(
+                actual, row.cancellable,
+                "case {status:?}: expected cancellable={}, got {actual}",
+                row.cancellable
+            );
+            let actual = status.is_terminal();
+            assert_eq!(
+                actual, row.terminal,
+                "case {status:?}: expected terminal={}, got {actual}",
+                row.terminal
+            );
+            let actual = status.settles_into();
+            assert_eq!(
+                actual, row.settles_into,
+                "case {status:?}: expected it to settle into {:?}, got {actual:?}",
+                row.settles_into
+            );
+            let actual = status.reason();
+            assert_eq!(
+                actual, row.reason,
+                "case {status:?}: expected the reason {:?}, got {actual:?}",
+                row.reason
+            );
+        }
+    }
+
+    /// A cancelled export task reports the modelled transient status until the clock
+    /// makes its end due, and then stops `CANCELLED` — not the `FAILED` outcome the
+    /// uncancelled task would have reached.
+    ///
+    /// The rows span the instants a read can fall on, including the span's own bound and
+    /// one tick short of it, so the transient status cannot be skipped.
+    #[test]
+    fn a_cancelled_export_task_settles_into_the_modelled_cancelled_state() {
+        let now = Instant::now();
+        let tick = Duration::from_millis(1);
+
+        // (case, when the task is read, whether the cancellation is through by then)
+        let cases: &[(&str, Duration, bool)] = &[
+            ("read at once", Duration::ZERO, false),
+            ("read one tick in", tick, false),
+            (
+                "read one tick before the span is out",
+                CANCELLATION_SPAN - tick,
+                false,
+            ),
+            ("read when the span is out", CANCELLATION_SPAN, true),
+            ("read a span later", CANCELLATION_SPAN * 2, true),
+        ];
+        for (case, after, through) in cases {
+            let mut task = sample_export_task("t-0123456789", "g-0000000000");
+            task.settles_at = Some(now + EXPORT_TASK_SPAN);
+            task.begin_cancellation(now);
+            assert_eq!(
+                task.status,
+                ExportTaskStatus::Cancelling,
+                "case {case:?}: an accepted cancellation reports CANCELLING, got {:?}",
+                task.status
+            );
+
+            task.settle(now + *after);
+            let (expected, expected_reason) = if *through {
+                (
+                    ExportTaskStatus::Cancelled,
+                    Some(EXPORT_CANCELLED_REASON.to_string()),
+                )
+            } else {
+                (ExportTaskStatus::Cancelling, None)
+            };
+            assert_eq!(
+                task.status, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                task.status
+            );
+            assert_eq!(
+                task.status_reason, expected_reason,
+                "case {case:?}: expected the reason {expected_reason:?}, got {:?}",
+                task.status_reason
             );
         }
     }
@@ -3730,7 +3995,12 @@ mod tests {
                 "case {status:?}: {wire:?} is not a modelled GraphStatus value"
             );
         }
-        for status in [ExportTaskStatus::Initializing, ExportTaskStatus::Failed] {
+        for status in [
+            ExportTaskStatus::Initializing,
+            ExportTaskStatus::Cancelling,
+            ExportTaskStatus::Cancelled,
+            ExportTaskStatus::Failed,
+        ] {
             let wire = status.as_wire();
             assert!(
                 crate::ops::types::EXPORT_TASK_STATUS_VALUES.contains(&wire),

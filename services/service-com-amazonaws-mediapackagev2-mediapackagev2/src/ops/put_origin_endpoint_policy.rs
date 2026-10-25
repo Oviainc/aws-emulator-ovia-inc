@@ -5,9 +5,10 @@
 //! Attaches a resource policy to an origin endpoint, replacing whatever policy the
 //! endpoint carried. The document is validated before anything is stored (a document that
 //! is not an IAM policy is a 400 `ValidationException` with `ValidationExceptionType`
-//! `INVALID_POLICY`), and the group -> channel -> endpoint address is then resolved level
-//! by level, each missing level answering its own fixed `ResourceNotFoundException` (404)
-//! sentence.
+//! `INVALID_POLICY`), as are the ARNs of the CDN authorization block submitted with it —
+//! the secrets MediaPackage would fetch and the role it would assume — and the group ->
+//! channel -> endpoint address is then resolved level by level, each missing level
+//! answering its own fixed `ResourceNotFoundException` (404) sentence.
 //!
 //! This policy is also what gates the endpoint's EGRESS data plane: see `crate::service`
 //! for how an anonymous manifest fetch is evaluated against it.
@@ -199,6 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The CDN authorization block travels with the document and is stored with it, so
+        // it is read in the same place and before the store is touched: the ARNs it carries
+        // are the secrets MediaPackage would fetch and the role it would assume, and a
+        // value that names neither cannot be stored as the endpoint's live CDN
+        // authorization. The rule is the crate's one reading of a caller-supplied ARN,
+        // shared with the key-provider role an endpoint's segment carries.
+        if let Some(configuration) = input.cdn_auth_configuration.as_ref() {
+            if let Some(rejection) = crate::state::cdn_auth_rejection(configuration, &region) {
+                return Err(
+                    PutOriginEndpointPolicyErrorModeled::ValidationException(rejection).into(),
+                );
+            }
+        }
+
         // Each level of the address is resolved on its own, because the service words a
         // not-found by the resource type that is missing. Every sentence comes from the
         // shared builders in `crate::state`, so the wording is decided in ONE place.
@@ -233,10 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy replaces any policy the endpoint already carried, together with the
         // CDN authorization settings submitted with it: the pair is one record, so a
         // request that omits `CdnAuthConfiguration` leaves none behind. One field on the
-        // endpoint, replaced rather than appended to, and every part of what it holds is
-        // bounded by the model and refused at the request boundary before this handler
-        // runs: `PolicyText` is `@length max 6144`, `CdnIdentifierSecretArns` is
-        // `@length 1..100`, and each ARN in it `@length 20..2048`.
+        // endpoint, replaced rather than appended to. How much it may hold is bounded by
+        // the model and refused at the request boundary before this handler runs
+        // (`PolicyText` is `@length max 6144`, `CdnIdentifierSecretArns` is `@length
+        // 1..100`, and each ARN in it `@length 20..2048`); WHAT its ARNs have to name is
+        // read above, so nothing the service could never read is stored here.
         endpoint.policy = Some(crate::state::EndpointPolicy {
             policy: input.policy,
             cdn_auth_configuration: input.cdn_auth_configuration,

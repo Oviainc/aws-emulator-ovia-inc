@@ -233,7 +233,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(crate::state::RoutingRejection::VersionNotFound(version_arn)) => {
                     return Err(CreateStateMachineAliasErrorModeled::ResourceNotFound(
                         ResourceNotFound {
-                            message: Some(crate::state::resource_not_found_message(&version_arn)),
+                            // The rule being enforced is the routing configuration's
+                            // own — every entry must reference a version that already
+                            // exists — so the refusal states that rule rather than
+                            // the generic resource-lookup sentence; `resourceName`
+                            // still names the entry that failed it.
+                            message: Some(
+                                crate::state::ROUTING_CONFIGURATION_VERSION_NOT_FOUND.to_string(),
+                            ),
                             resource_name: Some(version_arn),
                         },
                     )

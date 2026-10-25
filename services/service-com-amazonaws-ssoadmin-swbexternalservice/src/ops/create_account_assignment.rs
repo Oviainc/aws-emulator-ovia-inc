@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // updated together: no assignment row is left pointing at a status record that
         // was never created.
         let request_id = crate::state::mint_request_id();
-        if store.assignment_operations.contains_key(&request_id) {
+        if store.assignment_request_id_taken(&request_id) {
             return Err(CreateAccountAssignmentErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some("the minted RequestId collided with a stored one".to_string()),

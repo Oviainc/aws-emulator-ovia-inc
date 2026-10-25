@@ -89,6 +89,135 @@ pub const TAG_BAD_REQUEST_CODE: &str = "BadRequestException";
 /// 0..50 — a resource whose every tag can be removed in one call holds at most 50.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The shortest tag key this service accepts.
+///
+/// Source: the `@length` of `TagKey`, the shape every tag map's key and every tag-key
+/// list's member targets, whose minimum is 1.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// The longest tag key this service accepts, from the same `@length`, whose maximum
+/// is 128.
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// `TagKey`'s modelled `@pattern`, quoted exactly as the model states it so a refusal
+/// names the expression the key failed.
+pub const TAG_KEY_PATTERN: &str = "^(?!aws:)[a-zA-Z+-=._:/]+$";
+
+/// The key prefix [`TAG_KEY_PATTERN`]'s leading negative lookahead excludes: a
+/// namespace the service reserves for keys of its own, so a caller cannot supply one.
+const TAG_KEY_RESERVED_PREFIX: &str = "aws:";
+
+/// Whether every character of `key` is one [`TAG_KEY_PATTERN`]'s character class
+/// admits: an ASCII letter, `_`, or a character of the `+`..`=` range that class
+/// spells (`+ , - . / 0-9 : ; < =`).
+fn tag_key_characters_allowed(key: &str) -> bool {
+    key.chars()
+        .all(|c| matches!(c, 'a'..='z' | 'A'..='Z' | '_' | '+'..='='))
+}
+
+/// The longest caller-supplied text a refusal message echoes, pinned to the boundary
+/// validator's own ceiling (`MAX_ECHOED_VALUE` in
+/// `aws_smithy_schema_server::constraints`), so a huge request member cannot be
+/// amplified into a huge response.
+///
+/// The framework's own eliding helper is private and lives under the agent-immutable
+/// `vendor/` tree, so it cannot be called from here; the ceiling is pinned to the same
+/// figure instead.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// The most clauses one refusal message carries, pinned to the boundary validator's
+/// own ceiling (`MAX_VIOLATIONS`): a request may carry arbitrarily many tag keys, and
+/// a message that named every bad one would grow with the request.
+const MAX_REPORTED_VIOLATIONS: usize = 100;
+
+/// `text` as a refusal message may carry it: itself when short, a
+/// character-boundary-safe prefix with an elision when not.
+fn elided(text: &str) -> String {
+    if text.len() <= MAX_ECHOED_VALUE {
+        return text.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &text[..end], text.len())
+}
+
+/// Why the tag keys at `member` are a bad request, or `None` when every one of them is
+/// a key `TagKey` admits.
+///
+/// Tag keys reach a handler UNCHECKED, for two reasons that compound: the boundary
+/// walk captures a map's key as the path segment of that entry's value rather than
+/// validating it as a leaf of its own, and `TagKey`'s `@pattern` carries a leading
+/// negative lookahead the pattern engine cannot compile, which it then treats as
+/// matching. So this is the one place the key shape's `@length` and `@pattern` are
+/// enforced, shared by every operation that takes tag keys, and the sentence is built
+/// from the framework's own [`::smithy_server_runtime::Violation`] and rendered by
+/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// lives — so a handler refusal and a boundary refusal read identically.
+pub fn tag_keys_violation<'k>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'k str>,
+) -> Option<String> {
+    // Sorted and deduplicated: a `HashMap` iterates in an arbitrary order, and the
+    // same request must be refused with the same sentence every time.
+    let mut keys: Vec<&str> = keys.into_iter().collect();
+    keys.sort_unstable();
+    keys.dedup();
+
+    let violations: Vec<::smithy_server_runtime::Violation> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let length = key.chars().count();
+            let kind = if length < TAG_KEY_MIN_LENGTH {
+                ::smithy_server_runtime::ViolationKind::MinLength(TAG_KEY_MIN_LENGTH as i64)
+            } else if length > TAG_KEY_MAX_LENGTH {
+                ::smithy_server_runtime::ViolationKind::MaxLength(TAG_KEY_MAX_LENGTH as i64)
+            } else if key.starts_with(TAG_KEY_RESERVED_PREFIX) || !tag_key_characters_allowed(key) {
+                ::smithy_server_runtime::ViolationKind::Pattern(TAG_KEY_PATTERN.to_string())
+            } else {
+                return None;
+            };
+            Some(::smithy_server_runtime::Violation {
+                // The path names the offending key, which is what identifies it in a
+                // tag map as in a tag-key list. Elided like the value: it embeds
+                // caller-supplied text, so it is the same amplification vector.
+                path: elided(&format!(
+                    "{member}.{}",
+                    ::aws_smithy_schema_server::constraints::path::entry(key)
+                )),
+                kind,
+                // `Violation::value` must arrive ALREADY elided: the message
+                // interpolates it verbatim.
+                value: Some(elided(key)),
+            })
+        })
+        .take(MAX_REPORTED_VIOLATIONS)
+        .collect();
+
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// Why leaving the resource at `member` holding `count` tags is a bad request, or
+/// `None` when that many is within [`MAX_TAGS_PER_RESOURCE`].
+///
+/// The one place that ceiling is enforced, so every path that can leave a resource
+/// holding tags — the create that is born with a tag map, the merge that adds to one —
+/// refuses at the same count and with the same sentence, and no resource can come to
+/// hold a map no tag call could have produced.
+pub fn tag_count_violation(member: &str, count: usize) -> Option<String> {
+    if count <= MAX_TAGS_PER_RESOURCE {
+        return None;
+    }
+    let violation = ::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: ::smithy_server_runtime::ViolationKind::MaxLength(MAX_TAGS_PER_RESOURCE as i64),
+        // The `<n> entries` form the framework displays a map's own length with.
+        value: Some(format!("{count} entries")),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+}
+
 /// The campaign id an `/v2/tags/{arn}` ARN names, or `None` when `arn` does not name
 /// a connect-campaigns campaign at all.
 ///

@@ -40,7 +40,7 @@ fn the_services_own_status_constants_are_the_modelled_values() {
     );
 }
 
-use super::budget_lifecycle::{account, call, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, router, router_with_engine, same};
 
 /// `06/15/87 00:00 UTC` — the end date `TimePeriod$End` documents for a budget created
 /// without one ("If you didn't specify an end date, Amazon Web Services set your end
@@ -380,14 +380,15 @@ fn period_boundary(time_unit: &str, at: i64) -> String {
 /// defaulted to `06/15/87 00:00 UTC`.
 #[tokio::test]
 async fn a_read_reports_the_time_period_the_caller_sent_or_the_service_defaulted() {
-    let router = router();
-
     // Every `TimeUnit` the model enumerates — the catalog is the generated
     // `TIME_UNIT_VALUES`, so this covers entries the issue never cited (CUSTOM, DAILY,
     // ANNUALLY), not only the recorded MONTHLY one.
-    for (index, time_unit) in TIME_UNIT_VALUES.iter().enumerate() {
+    for time_unit in TIME_UNIT_VALUES.iter() {
         let case = format!("no TimePeriod, {time_unit}");
-        let account_id = account(300_000_000 + index as u64);
+        // One store per row, so rows cannot see each other's budgets: every request
+        // names the one account this service serves.
+        let router = router();
+        let account_id = caller_account();
         // The instants either side of the write, so an assertion cannot go off because
         // the create straddled a UTC day, month, quarter or year boundary.
         let before = now_secs();
@@ -462,8 +463,9 @@ async fn a_read_reports_the_time_period_the_caller_sent_or_the_service_defaulted
             Some(2_524_608_000),
         ),
     ];
-    for (index, (case, period, want_start, want_end)) in supplied.into_iter().enumerate() {
-        let account_id = account(310_000_000 + index as u64);
+    for (case, period, want_start, want_end) in supplied {
+        let router = router();
+        let account_id = caller_account();
         let read = create_and_read(
             &router,
             &account_id,
@@ -533,16 +535,16 @@ const COST_TYPE_DEFAULTS: &[(&str, bool)] = &[
 /// `CostTypes`"). Either way the read reports the `HealthStatus` the service stamped.
 #[tokio::test]
 async fn a_read_reports_the_cost_types_and_health_status_the_service_stamped() {
-    let router = router();
     // The partial map one row sends: one `Include*` member off and one rate member on,
     // so both halves of the default table are exercised against a caller's value.
     let partial = json!({"IncludeTax": false, "UseAmortized": true});
 
     // Every `BudgetType` the model enumerates, from the generated catalog.
-    for (index, budget_type) in BUDGET_TYPE_VALUES.iter().enumerate() {
+    for budget_type in BUDGET_TYPE_VALUES.iter() {
         for (variant, sent) in [("no CostTypes", None), ("partial CostTypes", Some(&partial))] {
             let case = format!("{budget_type}, {variant}");
-            let account_id = account(320_000_000 + (index as u64) * 10 + u64::from(sent.is_some()));
+            let router = router();
+            let account_id = caller_account();
             let mut budget = json!({
                 "BudgetName": format!("cost-types-{budget_type}"),
                 "BudgetLimit": {"Amount": "5", "Unit": "USD"},
@@ -618,9 +620,10 @@ async fn a_read_reports_the_cost_types_and_health_status_the_service_stamped() {
     // "Either FilterExpression and Metrics or CostFilters and CostTypes, not both"
     // (CreateBudget), so defaulting them here would store the forbidden combination.
     let case = "COST, FilterExpression/Metrics syntax";
+    let router = router();
     let read = create_and_read(
         &router,
-        &account(329_999_999),
+        &caller_account(),
         &json!({
             "BudgetName": "expression-syntax",
             "BudgetLimit": {"Amount": "5", "Unit": "USD"},
@@ -644,19 +647,16 @@ async fn a_read_reports_the_cost_types_and_health_status_the_service_stamped() {
 /// `HealthStatus` keeps the timestamp of the status it still reports.
 #[tokio::test]
 async fn last_updated_time_is_the_stored_write_time_not_the_time_of_the_read() {
-    let router = router();
     // Rows differing along time unit and type: the rule is about the write path, not
     // about any one budget shape.
-    for (index, (time_unit, budget_type)) in [
+    for (time_unit, budget_type) in [
         ("MONTHLY", "COST"),
         ("DAILY", "USAGE"),
         ("ANNUALLY", "RI_COVERAGE"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let case = format!("{time_unit}/{budget_type}");
-        let account_id = account(330_000_000 + index as u64);
+        let router = router();
+        let account_id = caller_account();
         let name = format!("stamped-{time_unit}");
         let budget = json!({
             "BudgetName": &name,
@@ -721,7 +721,6 @@ async fn last_updated_time_is_the_stored_write_time_not_the_time_of_the_read() {
 /// while the planned map itself is reported as stored.
 #[tokio::test]
 async fn a_planned_limit_budget_reports_the_limit_in_force() {
-    let (router, engine) = router_with_engine();
     // Rows differ along the number of planned periods, whether they are past or future,
     // and the order they are written in. Every key is the start of a month, which is
     // what `Budget$PlannedBudgetLimits` keys a monthly plan by ("The `key` is the start
@@ -770,8 +769,9 @@ async fn a_planned_limit_budget_reports_the_limit_in_force() {
         ),
     ];
 
-    for (index, (case, planned, expected_amount)) in rows.into_iter().enumerate() {
-        let account_id = account(340_000_000 + index as u64);
+    for (case, planned, expected_amount) in rows {
+        let (router, engine) = router_with_engine();
+        let account_id = caller_account();
         let name = "planned";
         let read = create_and_read(
             &router,
@@ -819,7 +819,8 @@ async fn a_planned_limit_budget_reports_the_limit_in_force() {
     }
 
     // A budget created with its own `BudgetLimit` keeps it: there is nothing to derive.
-    let account_id = account(349_999_999);
+    let router = router();
+    let account_id = caller_account();
     let read = create_and_read(
         &router,
         &account_id,
@@ -848,7 +849,6 @@ async fn a_planned_limit_budget_reports_the_limit_in_force() {
 /// placed in alarm.
 #[tokio::test]
 async fn a_notification_is_reported_with_the_state_it_was_created_in() {
-    let router = router();
     // The catalogs are the generated `NOTIFICATION_TYPE_VALUES` /
     // `COMPARISON_OPERATOR_VALUES` / `NOTIFICATION_STATE_VALUES` constants, and the
     // thresholds are both published bounds of `NotificationThreshold`
@@ -863,7 +863,8 @@ async fn a_notification_is_reported_with_the_state_it_was_created_in() {
                 let threshold = thresholds[(index as usize) % thresholds.len()];
                 let case =
                     format!("{notification_type}/{comparison}/{sent_state:?}/{threshold}");
-                let account_id = account(350_000_000 + index);
+                let account_id = caller_account();
+                let router = router();
                 index += 1;
                 let name = "notified";
                 let mut notification = json!({
@@ -945,11 +946,11 @@ async fn a_notification_is_reported_with_the_state_it_was_created_in() {
 /// however many there are — a budget created with none reports an empty list.
 #[tokio::test]
 async fn every_notification_a_budget_was_created_with_is_reported_in_order() {
-    let router = router();
     // Rows differ along count: none, one, several.
     for count in [0_usize, 1, 5] {
         let case = format!("{count} notifications");
-        let account_id = account(360_000_000 + count as u64);
+        let router = router();
+        let account_id = caller_account();
         let name = "ordered";
         let supplied: Vec<Value> = (0..count)
             .map(|position| {

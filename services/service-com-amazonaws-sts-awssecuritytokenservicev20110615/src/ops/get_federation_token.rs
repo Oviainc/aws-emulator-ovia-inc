@@ -253,7 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            duplicate_tag_key, is_policy_document, packed_policy_size, sts_arn, Identity,
+            duplicate_tag_key, packed_policy_size, policy_document_error, sts_arn, Identity,
             NewSession, SessionKind, VENDED_SESSION_DEFAULT_DURATION_SECONDS,
         };
 
@@ -268,18 +268,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = ctx.credential_store();
         let now = ::std::time::SystemTime::now();
 
-        // A session policy must be a JSON policy document.
-        if let Some(policy) = input.policy.as_deref() {
-            if !is_policy_document(policy) {
-                return Err(GetFederationTokenErrorModeled::MalformedPolicyDocumentException(
-                    MalformedPolicyDocumentException {
-                        message: Some(
-                            "The inline session policy must be a JSON policy document".to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
+        // A session policy must be a JSON policy document, and the refusal
+        // "describes the specific error" the submitted document has.
+        if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
+            return Err(GetFederationTokenErrorModeled::MalformedPolicyDocumentException(
+                MalformedPolicyDocumentException {
+                    message: Some(why),
+                },
+            )
+            .into());
         }
 
         if let Some(duplicate) = duplicate_tag_key(input.tags.as_deref()) {

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! Merges tags into a stored resource, resolved from the ARN in the path. The ARN's
-//! resource path is parsed FIRST: an ARN that is not a connect-campaigns campaign is
+//! Merges tags into a stored resource, resolved from the ARN in the path. The tag
+//! KEYS are checked first of all — they are an input constraint, and a request whose
+//! input is malformed is refused before any resource is resolved, so a bad key on an
+//! ARN that names nothing answers the modelled `ValidationException` (HTTP 400)
+//! rather than a not-found. The ARN's resource path is parsed next: an ARN that is
+//! not a connect-campaigns campaign is
 //! refused with the code the service answers for an unresolvable resource path
 //! (`BadRequestException`, HTTP 400) before anything is looked up; a campaign ARN that
 //! matches no stored campaign is `NotFoundException` (HTTP 404). Both codes are the
@@ -10,7 +14,11 @@
 //! `crate::state::TAG_NOT_FOUND_CODE` and `crate::scaffolded::WireCoded`.
 //!
 //! The tags land in the campaign record `ListTagsForResource` / `DescribeCampaign`
-//! read back, so there is one tag map per resource.
+//! read back, so there is one tag map per resource. Every key is checked against the
+//! key shape's modelled bounds and the merged map against the per-resource tag
+//! ceiling, both shared with `CreateCampaign` (`crate::state::tag_keys_violation` /
+//! `crate::state::tag_count_violation`), and both refused as the modelled
+//! `ValidationException` (HTTP 400) before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +177,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The keys are checked FIRST: they are an input constraint, and a request
+        // whose input is malformed is refused before any resource is resolved. The
+        // centralized walk reaches neither a tag key's `@length` (a map key is
+        // captured as a path segment, never validated as a leaf) nor its `@pattern`
+        // (whose negative lookahead the pattern engine cannot compile), so the key
+        // shape's bounds are enforced here.
+        if let Some(message) =
+            crate::state::tag_keys_violation("tags", input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -206,17 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (key, value) in &input.tags {
             merged.insert(key.clone(), value.clone());
         }
-        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "a resource holds at most {} tags; this request would leave it with {}",
-                        crate::state::MAX_TAGS_PER_RESOURCE,
-                        merged.len()
-                    ),
-                    x_amz_error_type: None,
-                },
-            )
+        if let Some(message) = crate::state::tag_count_violation("tags", merged.len()) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
             .into());
         }
         campaign.tags = merged;

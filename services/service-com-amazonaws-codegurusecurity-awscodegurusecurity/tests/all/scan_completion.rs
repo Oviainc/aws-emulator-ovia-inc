@@ -13,7 +13,9 @@
 //!   archive it was started with;
 //! * a run started on an artifact nothing was uploaded to had no resource at all, so it
 //!   is the one case that fails, and only that case reports an `errorMessage`;
-//! * every reader of the run agrees: `GetScan` (by latest run and by `runId`), `ListScans`
+//! * every reader of the run agrees: `GetScan` (by latest run and by `runId`), the
+//!   account's scan listing (for the scans it reports — `ListScans` "Does not return
+//!   `EXPRESS` scans", which `crate::list_scans_scan_type` asserts over the whole class)
 //!   and the findings reader, over every revision of the scan.
 //!
 //! Every request goes through the real router (`MultiServiceRouter::dispatch`), the same
@@ -80,8 +82,9 @@ async fn wait_for_every_settle() {
     tokio::time::sleep(Duration::from_millis(u64::try_from(span).unwrap_or(500) + 200)).await;
 }
 
-/// The `summaries` entry `ListScans` reports for `scan_name`.
-async fn listed_summary(router: &MultiServiceRouter, scan_name: &str) -> Value {
+/// The `summaries` entry `ListScans` reports for `scan_name`, or `None` when the listing
+/// does not report that scan at all.
+async fn listed_summary(router: &MultiServiceRouter, scan_name: &str) -> Option<Value> {
     let listed = call(router, "GET", "/scans?maxResults=100", None).await;
     assert_eq!(
         listed.status, 200,
@@ -95,7 +98,6 @@ async fn listed_summary(router: &MultiServiceRouter, scan_name: &str) -> Value {
         .unwrap_or_default()
         .into_iter()
         .find(|summary| summary["scanName"].as_str() == Some(scan_name))
-        .unwrap_or_else(|| panic!("ListScans reports no summary for {scan_name}: {}", listed.json))
 }
 
 /// Start the row's scan: the documented upload (where the row performs one) and then
@@ -267,13 +269,27 @@ async fn a_run_over_an_uploaded_resource_completes_and_only_a_failed_run_reports
             );
         }
 
-        // ListScans reports the state of the same run.
+        // The account's scan listing reports the state of the same run — for the scans
+        // it reports at all: "Does not return EXPRESS scans" (ListScans).
         let summary = listed_summary(&router, case.scan_name).await;
-        assert_eq!(
-            (summary["runId"].as_str(), summary["scanState"].as_str()),
-            (Some(run_id.as_str()), Some(case.expected_state())),
-            "case {label:?}: the ListScans summary must come from the same run, got {summary}"
-        );
+        if case.effective_scan_type() == SCAN_TYPE_STANDARD {
+            let summary = summary.unwrap_or_else(|| {
+                panic!(
+                    "case {label:?}: the listing reports no summary for the Standard scan {}",
+                    case.scan_name
+                )
+            });
+            assert_eq!(
+                (summary["runId"].as_str(), summary["scanState"].as_str()),
+                (Some(run_id.as_str()), Some(case.expected_state())),
+                "case {label:?}: the listed summary must come from the same run, got {summary}"
+            );
+        } else {
+            assert!(
+                summary.is_none(),
+                "case {label:?}: the listing does not return Express scans, got {summary:?}"
+            );
+        }
 
         // Reading a settled run must not change what the next caller sees.
         let again = get_scan(&router, case.scan_name, None).await;

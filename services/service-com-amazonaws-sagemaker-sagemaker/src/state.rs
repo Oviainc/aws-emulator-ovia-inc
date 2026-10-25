@@ -5115,7 +5115,8 @@ impl ComAmazonawsSagemakerSagemakerState {
 }
 
 // ---------------------------------------------------------------------------
-// The custom-image slice: `CreateImage` / `CreateImageVersion` and the two
+// The custom-image slice: `CreateImage` / `CreateImageVersion`, the `DeleteImage` that
+// releases an image with every version of it, and the two
 // `Describe*` readers. Kept together at the end of this module, the way the
 // lineage-action, model-card and notebook-instance slices are, so one slice's
 // records, constants and helpers read as one unit.
@@ -5160,6 +5161,16 @@ pub const IMAGE_STATUS_CREATED: &str = "CREATED";
 /// the model documents as "The maintainers did not provide a status for image version
 /// stability" — so it is what a version created without `VendorGuidance` reports.
 pub const VENDOR_GUIDANCE_NOT_PROVIDED: &str = "NOT_PROVIDED";
+
+/// The message a `ResourceNotFound` carries for an image no store holds: the image's ARN
+/// inside the service's sentence, built from the request's `ImageName`.
+///
+/// Stated once so every refusal that reports a MISSING IMAGE words it the same way —
+/// `DescribeImage`, `DeleteImage` and the `CreateImageVersion` / `DescribeImageVersion`
+/// that can only resolve a version of an image that exists.
+pub fn image_does_not_exist(image_arn: &str) -> String {
+    format!("Image with ARN {image_arn} does not exist")
+}
 
 /// A custom SageMaker AI image created by `CreateImage`, as `DescribeImage` replays it
 /// and `CreateImageVersion` reads it.
@@ -5288,6 +5299,47 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// alias.
     pub fn latest_version_of(&self, image_name: &str) -> Option<&ImageVersion> {
         self.versions_of(image_name).next_back()
+    }
+
+    /// Release every stored version of `image_name`, answering how many were released.
+    ///
+    /// `DeleteImage` deletes an image AND all versions of it (its own model doc), so the
+    /// image and its versions leave the store in one call: a version left behind would be
+    /// replayed by a later reader for an image no store holds any more, and a later
+    /// `CreateImage` under the same name would inherit it.
+    pub fn remove_versions_of(&mut self, image_name: &str) -> usize {
+        let keys: Vec<(String, i32)> = self
+            .versions_of(image_name)
+            .map(|version| (version.image_name.clone(), version.version))
+            .collect();
+        let removed = keys.len();
+        for key in keys {
+            self.image_versions.remove(&key);
+        }
+        removed
+    }
+
+    /// The ARN of a Studio app launched on the image `image_name` names — its
+    /// `ResourceSpec` names either the image itself or one of the image's versions — or
+    /// `None` when no stored app does.
+    ///
+    /// An app keeps the spec it launched with (`CreateApp` stores it verbatim), so an app
+    /// in the store is one still running on that image: releasing the image would leave
+    /// the app naming an image nothing holds.
+    pub fn app_running_on_image(&self, image_name: &str) -> Option<&str> {
+        let image_arn = self.images.get(image_name).map(|image| image.arn.as_str())?;
+        self.apps.values().find_map(|app| {
+            let spec = app.resource_spec.as_ref()?;
+            let names_image = spec.sage_maker_image_arn.as_deref() == Some(image_arn);
+            let names_version = spec
+                .sage_maker_image_version_arn
+                .as_deref()
+                .is_some_and(|version_arn| {
+                    self.versions_of(image_name)
+                        .any(|version| version.arn == version_arn)
+                });
+            (names_image || names_version).then_some(app.arn.as_str())
+        })
     }
 }
 

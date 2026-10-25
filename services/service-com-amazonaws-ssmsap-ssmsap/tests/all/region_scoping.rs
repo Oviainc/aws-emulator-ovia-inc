@@ -444,6 +444,9 @@ async fn a_foreign_region_neither_mutates_nor_hides_an_application() {
         reply.status, 200,
         "case {home:?}: expected 200 from DeregisterApplication, got {reply:?}"
     );
+    // Deregistration is asynchronous: the application is listed as DELETING at home until
+    // the removal the clock owes it falls due.
+    settle().await;
     let reply = emulator
         .send_in_region(home, "/list-applications", json!({}))
         .await;

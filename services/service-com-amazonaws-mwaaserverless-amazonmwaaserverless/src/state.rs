@@ -173,6 +173,15 @@ pub struct WorkflowVersionRecord {
     pub created_at: SystemTime,
     pub is_latest: bool,
     pub snapshot: WorkflowSnapshot,
+    /// Where this version falls in the order its workflow's versions were
+    /// appended: the value of the monotonic mint counter
+    /// ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::mint_seq`]) at the
+    /// moment the version was recorded. It only ever grows, and it is not reused
+    /// when a version is removed, so it is the POSITION a version listing pages
+    /// over ([`format_version_listing_key`]): a cursor carrying it still resolves
+    /// to the same place in the remaining history after any other version has
+    /// gone.
+    pub sequence: u64,
 }
 
 /// A run started under a workflow.
@@ -774,6 +783,31 @@ pub fn format_run_listing_key(key: RunListingKey) -> String {
 pub fn parse_run_listing_key(key: &str) -> Option<RunListingKey> {
     let (nanos, sequence) = key.split_once('.')?;
     Some((nanos.parse().ok()?, sequence.parse().ok()?))
+}
+
+/// What separates the two parts of a version-listing cursor key. Neither a
+/// decimal sequence nor a `WorkflowArn` (`^arn:…:workflow/[a-zA-Z0-9.\-_]+$`)
+/// can contain it, so the split is unambiguous.
+const VERSION_LISTING_KEY_SEPARATOR: char = '@';
+
+/// The cursor key for a position in ONE workflow's version listing: the
+/// [`WorkflowVersionRecord::sequence`] of the last version on the page,
+/// zero-padded so the key is fixed-width, and the workflow the walk is scoped to.
+///
+/// The POSITION rather than the version's identifier, so a cursor still resolves
+/// to the same place once the version it was issued at has been deleted; and the
+/// workflow, so a cursor issued while walking another workflow's versions is not
+/// honoured here.
+pub fn format_version_listing_key(workflow_arn: &str, sequence: u64) -> String {
+    format!("{sequence:020}{VERSION_LISTING_KEY_SEPARATOR}{workflow_arn}")
+}
+
+/// Read back a key [`format_version_listing_key`] wrote, as
+/// `(sequence, workflow_arn)`. `None` for anything else, which a listing refuses
+/// as a `ValidationException` just like a token it did not issue.
+pub fn parse_version_listing_key(key: &str) -> Option<(u64, &str)> {
+    let (sequence, workflow_arn) = key.split_once(VERSION_LISTING_KEY_SEPARATOR)?;
+    Some((sequence.parse().ok()?, workflow_arn))
 }
 
 /// The HTTP status this service answers a resource-lookup miss with.

@@ -86,6 +86,9 @@ mod state_roundtrip;
 #[path = "all/sync_job.rs"]
 mod sync_job;
 
+#[path = "all/sync_job_delete.rs"]
+mod sync_job_delete;
+
 #[path = "all/sync_job_listing.rs"]
 mod sync_job_listing;
 

@@ -49,7 +49,7 @@ use super::budget_action_execution::{
     create_body, definition_for, describe_action, email_subscriber, execute_action, is_action_id,
     seed_action, seed_budget, seed_status, sns_subscriber,
 };
-use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// An `ActionId` that is well-formed but names no action: inside `ActionId`'s modelled
 /// `@pattern`, so it reaches the handler instead of being refused at the boundary.
@@ -214,7 +214,7 @@ fn supplied_tags(create: &Value) -> Vec<(String, String)> {
 #[tokio::test]
 async fn deleting_an_action_reports_what_went_away_and_leaves_nothing_behind() {
     let (router, engine) = router_with_engine();
-    let account_id = account(919_191_919);
+    let account_id = caller_account();
 
     for (position, row) in action_rows(&account_id, "placeholder").iter().enumerate() {
         let budget_name = format!("deleted-{position}");
@@ -293,7 +293,7 @@ async fn deleting_an_action_reports_what_went_away_and_leaves_nothing_behind() {
 #[tokio::test]
 async fn deleting_an_action_removes_only_the_one_it_names() {
     let (router, engine) = router_with_engine();
-    let account_id = account(929_292_929);
+    let account_id = caller_account();
     let table = action_rows(&account_id, "placeholder");
 
     for target in 0..table.len() {
@@ -344,52 +344,32 @@ async fn deleting_an_action_removes_only_the_one_it_names() {
     }
 }
 
-/// RULE 3: an action is a resource OF one budget of one account, named by
-/// `(AccountId, BudgetName, ActionId)`. A request that gets any of the three wrong
-/// locates nothing: it is refused with `NotFoundException` and removes nothing. A
-/// `BudgetName` outside its modelled `@pattern` is the request-validation refusal it is.
+/// RULE 3: an action is a resource OF one budget of the account, named by its
+/// `BudgetName` and its `ActionId`. A request that gets either wrong locates nothing: it
+/// is refused with `NotFoundException` and removes nothing. A `BudgetName` outside its
+/// modelled `@pattern` is the request-validation refusal it is.
 #[tokio::test]
 async fn an_action_is_reached_only_through_its_budget_and_its_id() {
     let (router, engine) = router_with_engine();
-    let owner = account(939_393_939);
-    let other = account(949_494_949);
+    let owner = caller_account();
 
     seed_budget(&router, &owner, "owning").await;
     seed_budget(&router, &owner, "sibling").await;
-    seed_budget(&router, &other, "owning").await;
     let owned = seed_action(&router, &owner, "owning").await;
     let sibling = seed_action(&router, &owner, "sibling").await;
-    let foreign = seed_action(&router, &other, "owning").await;
 
-    for (case, account_id, budget_name, action_id) in [
-        (
-            "another account's budget of the same name",
-            &other,
-            "owning",
-            &owned,
-        ),
-        (
-            "a budget the account does not hold",
-            &owner,
-            "absent",
-            &owned,
-        ),
-        (
-            "another budget of the same account",
-            &owner,
-            "sibling",
-            &owned,
-        ),
+    for (case, budget_name, action_id) in [
+        ("a budget the account does not hold", "absent", &owned),
+        ("the owning budget's name in another case", "OWNING", &owned),
+        ("another budget of the same account", "sibling", &owned),
         (
             "an id no action carries",
-            &owner,
             "owning",
             &ABSENT_ACTION_ID.to_string(),
         ),
-        ("another account's action id", &owner, "owning", &foreign),
-        ("another budget's action id", &owner, "owning", &sibling),
+        ("another budget's action id", "owning", &sibling),
     ] {
-        let (status, body) = delete_action(&router, account_id, budget_name, action_id).await;
+        let (status, body) = delete_action(&router, &owner, budget_name, action_id).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected the delete to be refused, got {status} {body}"
@@ -401,16 +381,12 @@ async fn an_action_is_reached_only_through_its_budget_and_its_id() {
     }
 
     // Not one of those refusals removed anything.
-    for (account_id, budget_name, expected) in [
-        (&owner, "owning", &owned),
-        (&owner, "sibling", &sibling),
-        (&other, "owning", &foreign),
-    ] {
-        let held = stored_action_ids(&engine, account_id, budget_name);
+    for (budget_name, expected) in [("owning", &owned), ("sibling", &sibling)] {
+        let held = stored_action_ids(&engine, &owner, budget_name);
         assert_eq!(
             held,
             vec![expected.clone()],
-            "case {budget_name:?} of {account_id}: expected the refusals to remove nothing"
+            "case {budget_name:?}: expected the refusals to remove nothing"
         );
     }
 
@@ -462,7 +438,7 @@ async fn an_action_is_reached_only_through_its_budget_and_its_id() {
 #[tokio::test]
 async fn an_action_whose_work_is_in_flight_is_locked_against_deletion() {
     let (router, engine) = router_with_engine();
-    let account_id = account(959_595_959);
+    let account_id = caller_account();
 
     for (from_status, execution_type, in_progress) in [
         (
@@ -550,7 +526,7 @@ async fn an_action_whose_work_is_in_flight_is_locked_against_deletion() {
 #[tokio::test]
 async fn a_settled_action_is_never_locked_against_deletion() {
     let (router, engine) = router_with_engine();
-    let account_id = account(969_696_969);
+    let account_id = caller_account();
 
     let settled: Vec<&str> = ACTION_STATUS_VALUES
         .iter()
@@ -592,7 +568,7 @@ async fn a_settled_action_is_never_locked_against_deletion() {
 #[tokio::test]
 async fn deleting_from_a_budget_that_does_not_exist_is_not_found() {
     let router = router();
-    let account_id = account(979_797_979);
+    let account_id = caller_account();
 
     let (status, body) =
         delete_action(&router, &account_id, "never-created", ABSENT_ACTION_ID).await;

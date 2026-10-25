@@ -23,6 +23,8 @@ mod client_error_wrappers;
 mod definition_validation;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/execution_alias_routing.rs"]
+mod execution_alias_routing;
 #[path = "all/execution_interpreter.rs"]
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]

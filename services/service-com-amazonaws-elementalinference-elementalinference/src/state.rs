@@ -1384,22 +1384,66 @@ pub const DEFAULT_SUBTITLING_ASPECT_RATIO: AspectRatio = AspectRatio {
     height: 9,
 };
 
+/// The summary-generation mode a contextual-metadata output is configured with when
+/// the request carries none.
+///
+/// `ContextualMetadataConfig$summaryGeneration` documents its own default — "ENABLED
+/// (default) - Elemental Inference populates the summary, objects, and actions fields"
+/// (`smithy_query(query="shape",shape="ContextualMetadataConfig")`) — so an output
+/// that states nothing is configured with summary generation on.
+pub const DEFAULT_SUMMARY_GENERATION: &str = "ENABLED";
+
+/// The extended-analysis mode a contextual-metadata output is configured with when the
+/// request carries none.
+///
+/// `ContextualMetadataConfig$extendedAnalysis` documents "ENABLED (default) - Elemental
+/// Inference populates the people, environments, brands, and on-screen text fields"
+/// (`smithy_query(query="shape",shape="ContextualMetadataConfig")`), and the member is
+/// independent of [`DEFAULT_SUMMARY_GENERATION`]'s, so each resolves on its own.
+pub const DEFAULT_EXTENDED_ANALYSIS: &str = "ENABLED";
+
+/// The profanity handling a subtitling output is configured with when the request
+/// carries none.
+///
+/// `SubtitlingConfig$profanityFilter` documents "DISABLED (no filtering, default)"
+/// among its valid values (`smithy_query(query="shape",shape="SubtitlingConfig")`), so
+/// subtitles are generated unfiltered unless the request asks for CENSOR or DROP.
+pub const DEFAULT_PROFANITY_FILTER: &str = "DISABLED";
+
 /// An output config as the service STORES it: every optional member the service fills
 /// in for itself is materialised, so a read-modify-write round trip through
 /// `GetFeed` -> `UpdateFeed` (a full-replacement PUT) carries the service's own
 /// configuration back instead of dropping it.
 ///
 /// Only members this service's model declares can be reported, so the defaults are
-/// exactly the modelled optional members the service resolves itself: a subtitling
-/// output's [`DEFAULT_SUBTITLING_ASPECT_RATIO`]. The cropping, clipping and
-/// contextual-metadata configs declare no member the service resolves
-/// (`smithy_query(query="shape",shape="CroppingConfig,ClippingConfig,ContextualMetadataConfig")`),
-/// so they are stored as the request carried them.
+/// exactly the modelled optional members the service resolves itself: the ones whose
+/// documentation names the value the service applies when the request omits them —
+/// [`DEFAULT_SUMMARY_GENERATION`], [`DEFAULT_EXTENDED_ANALYSIS`] and
+/// [`DEFAULT_PROFANITY_FILTER`] — plus a subtitling output's
+/// [`DEFAULT_SUBTITLING_ASPECT_RATIO`]. The cropping and clipping configs declare no
+/// member the service resolves
+/// (`smithy_query(query="shape",shape="CroppingConfig,ClippingConfig")`), so they are
+/// stored as the request carried them. A member the request DID carry is never
+/// rewritten: the stored config is the request's, widened with what it left unsaid.
 pub fn output_config_with_defaults(mut config: OutputConfig) -> OutputConfig {
-    if let OutputConfig::Subtitling(subtitling) = &mut config {
-        subtitling
-            .aspect_ratio
-            .get_or_insert(DEFAULT_SUBTITLING_ASPECT_RATIO);
+    match &mut config {
+        OutputConfig::Subtitling(subtitling) => {
+            subtitling
+                .aspect_ratio
+                .get_or_insert(DEFAULT_SUBTITLING_ASPECT_RATIO);
+            subtitling
+                .profanity_filter
+                .get_or_insert_with(|| DEFAULT_PROFANITY_FILTER.to_string());
+        }
+        OutputConfig::contextualMetadata(contextual_metadata) => {
+            contextual_metadata
+                .summary_generation
+                .get_or_insert_with(|| DEFAULT_SUMMARY_GENERATION.to_string());
+            contextual_metadata
+                .extended_analysis
+                .get_or_insert_with(|| DEFAULT_EXTENDED_ANALYSIS.to_string());
+        }
+        OutputConfig::Cropping(_) | OutputConfig::Clipping(_) => {}
     }
     config
 }

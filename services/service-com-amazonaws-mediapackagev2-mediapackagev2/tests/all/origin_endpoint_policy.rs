@@ -45,6 +45,10 @@ const REGION: &str = "us-west-2";
 /// (`smithy_query(query="shape", shape="PolicyText")` -> `length {max: 6144}`).
 const POLICY_TEXT_MAX: usize = 6144;
 
+/// The account every resource this emulator serves belongs to, which is therefore the
+/// account a CDN authorization secret has to live in for MediaPackage to read it.
+const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+
 /// MediaPackage's FIXED not-found sentences. The service words a not-found by the
 /// resource type that is missing and puts none of the caller's identifiers in it, so
 /// these are constants a test can compare against exactly.
@@ -277,9 +281,9 @@ fn policy_cases() -> Vec<PolicyCase> {
             cdn_auth: Some(|| {
                 json!({
                     "CdnIdentifierSecretArns": [
-                        "arn:aws:secretsmanager:us-west-2:123456789012:secret:cdn-one",
+                        format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:cdn-one"),
                     ],
-                    "SecretsRoleArn": "arn:aws:iam::123456789012:role/MediaPackageCdnAuth",
+                    "SecretsRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/MediaPackageCdnAuth"),
                 })
             }),
         },
@@ -292,10 +296,10 @@ fn policy_cases() -> Vec<PolicyCase> {
             cdn_auth: Some(|| {
                 json!({
                     "CdnIdentifierSecretArns": [
-                        "arn:aws:secretsmanager:us-west-2:123456789012:secret:cdn-one",
-                        "arn:aws:secretsmanager:us-west-2:123456789012:secret:cdn-two",
+                        format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:cdn-one"),
+                        format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:cdn-two"),
                     ],
-                    "SecretsRoleArn": "arn:aws:iam::123456789012:role/MediaPackageCdnAuth",
+                    "SecretsRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/MediaPackageCdnAuth"),
                 })
             }),
         },
@@ -922,14 +926,14 @@ async fn the_cdn_secret_list_a_policy_carries_is_bounded() {
     let secrets = |count: usize| -> Value {
         let arns: Vec<String> = (0..count)
             .map(|index| {
-                format!("arn:aws:secretsmanager:us-west-2:123456789012:secret:cdn-auth-{index}")
+                format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:cdn-auth-{index}")
             })
             .collect();
         json!({
             "CdnIdentifierSecretArns": arns,
             // `SecretsRoleArn` is modelled `@length 20..2048`, so the role ARN is a real
             // one rather than a placeholder.
-            "SecretsRoleArn": "arn:aws:iam::123456789012:role/MediaPackageCdnAuth",
+            "SecretsRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/MediaPackageCdnAuth"),
         })
     };
     // The bound on `com.amazonaws.mediapackagev2#CdnIdentifierSecretArns` itself

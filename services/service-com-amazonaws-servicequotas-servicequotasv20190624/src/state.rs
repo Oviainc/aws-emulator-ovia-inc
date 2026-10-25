@@ -11,7 +11,10 @@
 //!   construction rather than by convention;
 //! * the **applied quota overlay** (`GetServiceQuota`, `ListServiceQuotas`) — written
 //!   only when a quota increase request is decided, and read with the default as the
-//!   fallback;
+//!   fallback. It is keyed by the quota AND the plane the value was applied on: the
+//!   account, or one resource context of a quota AWS publishes as adjustable per
+//!   resource, so one quota holds an account-wide value and a value per resource at
+//!   once;
 //! * the **quota increase requests** (`RequestServiceQuotaIncrease`,
 //!   `GetRequestedServiceQuotaChange`,
 //!   `ListRequestedServiceQuotaChangeHistoryByQuota`) — append-only, with an
@@ -51,8 +54,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 
 use crate::ops::types::{
-    MetricInfo, QuotaInfo, QuotaPeriod, QuotaUtilizationInfo, RequestedServiceQuotaChange,
-    ServiceInfo, ServiceQuota, Tag,
+    MetricInfo, QuotaContextInfo, QuotaInfo, QuotaPeriod, QuotaUtilizationInfo,
+    RequestedServiceQuotaChange, ServiceInfo, ServiceQuota, Tag,
 };
 
 /// The region a request carries no SigV4 credential scope to name, and the one a
@@ -116,6 +119,22 @@ pub const ARN_NAMESPACE: &str = "servicequotas";
 pub const LEVEL_ACCOUNT: &str = "ACCOUNT";
 /// `AppliedLevelEnum` / `AdjustableAtLevelEnum` member `ALL`.
 pub const LEVEL_ALL: &str = "ALL";
+/// `AppliedLevelEnum` member `RESOURCE`: a value applied to ONE resource context
+/// rather than to the account.
+pub const LEVEL_RESOURCE: &str = "RESOURCE";
+/// `AdjustableAtLevelEnum` member `PER_RESOURCE`: an increase may be requested for an
+/// individual resource ONLY, never account-wide.
+pub const LEVEL_PER_RESOURCE: &str = "PER_RESOURCE";
+
+/// `QuotaContextScope` member `RESOURCE`: the value is applied to each resource of the
+/// context's scope type.
+pub const CONTEXT_SCOPE_RESOURCE: &str = "RESOURCE";
+/// `QuotaContextScope` member `ACCOUNT`: the value is applied to the account.
+pub const CONTEXT_SCOPE_ACCOUNT: &str = "ACCOUNT";
+/// The `ContextId` that names every resource of the context's scope type, as
+/// `QuotaContextInfo$ContextId` documents it: the value applies to all resources no
+/// value of their own has been applied to, and to any new such resource.
+pub const CONTEXT_ID_EVERY_RESOURCE: &str = "*";
 
 /// `OptInStatus` member `ENABLED`: Automatic Management is started.
 pub const OPT_IN_STATUS_ENABLED: &str = "ENABLED";
@@ -347,6 +366,10 @@ pub struct DefaultQuota {
     /// request may not carry a `ContextId`, because there is no resource context to
     /// adjust the quota for.
     pub adjustable_at_level: String,
+    /// `QuotaContextInfo$ContextScopeType`: the resource type the quota's per-resource
+    /// plane applies to. `None` for a quota adjustable at the account level only,
+    /// which has no such plane.
+    pub context_scope_type: Option<String>,
     /// `UsageMetric`, for the quotas AWS publishes a CloudWatch usage metric for.
     pub usage_metric: Option<MetricInfo>,
     /// `Period`: the window the quota's value is measured over — the rate denominator
@@ -368,23 +391,74 @@ impl DefaultQuota {
             unit: row.unit,
             adjustable: row.adjustable,
             global_quota: row.global_quota,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
+            adjustable_at_level: row.adjustable_at_level,
+            context_scope_type: row.context_scope_type,
             usage_metric: row.usage_metric,
             period: row.period,
             description: row.description,
         }
     }
+
+    /// Whether this quota's value can be applied to an individual resource: its
+    /// `AdjustableAtLevel` is `PER_RESOURCE` or `ALL`, the two members that name the
+    /// per-resource plane. Only such a quota reads or stores a `ContextId`.
+    pub fn resource_adjustable(&self) -> bool {
+        self.adjustable_at_level == LEVEL_PER_RESOURCE || self.adjustable_at_level == LEVEL_ALL
+    }
+
+    /// Whether this quota's value can be applied account-wide: its
+    /// `AdjustableAtLevel` is `ACCOUNT` or `ALL`.
+    pub fn account_adjustable(&self) -> bool {
+        self.adjustable_at_level == LEVEL_ACCOUNT || self.adjustable_at_level == LEVEL_ALL
+    }
+
+    /// The `QuotaContext` of a record read on `context`'s plane — the resource context
+    /// named, or `None` for the account-wide record.
+    ///
+    /// A quota adjustable at the account level only has no resource plane to describe,
+    /// so it carries NO context, which is what `QuotaContextInfo`'s own documentation
+    /// says of a quota managed at the account level for each Region. Any other quota
+    /// carries one, describing the plane the record answers for: `RESOURCE` scope
+    /// naming the resource asked for, or `ACCOUNT` scope for the account-wide record.
+    /// It is the SAME predicate the record's `QuotaAppliedAtLevel` is derived from, so
+    /// the two cannot disagree about which plane the record is.
+    pub fn context_info(&self, context: Option<&str>) -> Option<QuotaContextInfo> {
+        if !self.resource_adjustable() {
+            return None;
+        }
+        Some(QuotaContextInfo {
+            context_scope: Some(
+                if context.is_some() {
+                    CONTEXT_SCOPE_RESOURCE
+                } else {
+                    CONTEXT_SCOPE_ACCOUNT
+                }
+                .to_string(),
+            ),
+            context_scope_type: self.context_scope_type.clone(),
+            context_id: context.map(str::to_string),
+            adjustable_at_level: Some(self.adjustable_at_level.clone()),
+        })
+    }
 }
 
 /// The applied value of one quota: the overlay a decided increase writes over the
 /// AWS default.
+///
+/// The level the value was applied at is not stored on the entry: it is the KEY that
+/// carries it (see [`AppliedKey`]), so one quota can hold the account-wide value and a
+/// value per resource context at once without either shadowing the other.
 #[derive(Debug, Clone)]
 pub struct AppliedQuota {
     /// The value now in force.
     pub value: f64,
-    /// `QuotaAppliedAtLevel` — the level the value was applied at.
-    pub quota_applied_at_level: String,
 }
+
+/// The key one applied-overlay entry is stored under: the `(ServiceCode, QuotaCode)`
+/// pair, and the resource context the value was applied to — `None` for the
+/// account-wide value, `Some(id)` for the `ContextId` an increase named (an ARN, or
+/// [`CONTEXT_ID_EVERY_RESOURCE`]).
+type AppliedKey = (String, String, Option<String>);
 
 /// The account's Service Quotas Automatic Management configuration.
 ///
@@ -434,8 +508,13 @@ pub struct QuotaRequest {
     /// submitter opting out of the support case that reviews an increase, which is what
     /// decides the request's terminal status.
     pub support_case_allowed: bool,
-    /// `QuotaRequestedAtLevel` — an `AppliedLevelEnum` member.
+    /// `QuotaRequestedAtLevel` — an `AppliedLevelEnum` member: [`LEVEL_RESOURCE`] when
+    /// the request named a resource context, [`LEVEL_ACCOUNT`] otherwise.
     pub quota_requested_at_level: String,
+    /// The `ContextId` the request named, for a quota adjustable per resource —
+    /// `None` for an account-wide request. It is what the approved value is keyed by,
+    /// so an increase for one resource leaves every other resource where it was.
+    pub context_id: Option<String>,
 }
 
 /// One quota utilization report: the snapshot `StartQuotaUtilizationReport` froze,
@@ -489,8 +568,9 @@ pub struct TagCeilingExceeded {
 /// The mutable, per-region half of this service's state.
 #[derive(Debug, Default)]
 struct RegionState {
-    /// Keyed by `(service code, quota code)`; written only by a decided request.
-    applied_quotas: BTreeMap<(String, String), AppliedQuota>,
+    /// Keyed by `(service code, quota code, context)`; written only by a decided
+    /// request.
+    applied_quotas: BTreeMap<AppliedKey, AppliedQuota>,
     quota_requests: BTreeMap<String, QuotaRequest>,
     /// Request ids in the order they were minted: the index a history listing walks
     /// backwards and a pagination token indexes into.
@@ -518,7 +598,7 @@ pub struct ComAmazonawsServicequotasServicequotasv20190624State {
     /// A global quota has one value for the whole account — which is why its ARN
     /// carries no region — so an approved increase on it is in force at every
     /// regional endpoint, not just the one it was requested at.
-    global_applied_quotas: BTreeMap<(String, String), AppliedQuota>,
+    global_applied_quotas: BTreeMap<AppliedKey, AppliedQuota>,
     /// The mutable state, per region.
     regions: BTreeMap<String, RegionState>,
     /// The account's Automatic Management configuration: `None` until the account
@@ -633,34 +713,91 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .collect()
     }
 
-    /// The value in force for a quota: the applied overlay when a decided request
-    /// wrote one, else the AWS default.
-    pub fn applied_value(&self, region: &str, service_code: &str, quota_code: &str) -> Option<f64> {
+    /// The value in force for a quota in `context`: the applied overlay when a
+    /// decided request wrote one, else the AWS default.
+    ///
+    /// A resource context reads the most specific value that covers it: the one
+    /// applied to that resource, then the one applied to every resource with no value
+    /// of its own ([`CONTEXT_ID_EVERY_RESOURCE`]), then the account-wide value, then
+    /// the AWS default. `None` as the context reads the account-wide value only.
+    pub fn applied_value(
+        &self,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+        context: Option<&str>,
+    ) -> Option<f64> {
         let default = self.default_quota(service_code, quota_code)?;
-        Some(
-            self.applied_entry(region, service_code, quota_code)
-                .map_or(default.value, |applied| applied.value),
-        )
+        Some(self.value_in_force(region, default, context))
+    }
+
+    /// [`Self::applied_value`] for a quota whose catalog row the caller already holds,
+    /// so a view does not look the same row up twice.
+    fn value_in_force(&self, region: &str, default: &DefaultQuota, context: Option<&str>) -> f64 {
+        contexts_in_force(context)
+            .into_iter()
+            .find_map(|candidate| self.applied_entry(region, default, candidate))
+            .map_or(default.value, |applied| applied.value)
     }
 
     /// The quota as `GetServiceQuota` / `ListServiceQuotas` report it: the AWS
-    /// default with the applied overlay laid over its `Value` and
-    /// `QuotaAppliedAtLevel`.
+    /// default with the applied overlay laid over its `Value`, reported at the level
+    /// `context` names and carrying that context's `QuotaContext`.
     pub fn applied_quota_view(
         &self,
         region: &str,
         service_code: &str,
         quota_code: &str,
+        context: Option<&str>,
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
-        let applied = self.applied_entry(region, service_code, quota_code);
-        let mut quota = self.quota_view(region, default, true);
-        quota.value = Some(applied.map_or(default.value, |entry| entry.value));
-        quota.quota_applied_at_level = Some(applied.map_or_else(
-            || LEVEL_ACCOUNT.to_string(),
-            |entry| entry.quota_applied_at_level.clone(),
-        ));
+        let mut quota = self.quota_view(region, default, true, context);
+        quota.value = Some(self.value_in_force(region, default, context));
+        // The record answers for the plane it was read on: a value read for a
+        // resource is applied at the RESOURCE level, the account-wide one at ACCOUNT.
+        quota.quota_applied_at_level = Some(
+            if context.is_some() {
+                LEVEL_RESOURCE
+            } else {
+                LEVEL_ACCOUNT
+            }
+            .to_string(),
+        );
         Some(quota)
+    }
+
+    /// Every resource context a value has been applied to for one quota, in
+    /// `ContextId` order. Empty for a quota no resource-level increase has been
+    /// approved for.
+    ///
+    /// The overlays are keyed `(ServiceCode, QuotaCode, context)` and ordered, so this
+    /// walks only the entries of the quota asked for rather than every entry held.
+    pub fn applied_contexts(
+        &self,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+    ) -> Vec<String> {
+        let regional = self.regions.get(region).map(|state| &state.applied_quotas);
+        let first = (service_code.to_string(), quota_code.to_string(), None);
+        let mut contexts: BTreeSet<&str> = BTreeSet::new();
+        for overlay in [Some(&self.global_applied_quotas), regional]
+            .into_iter()
+            .flatten()
+        {
+            let entries = overlay
+                .range(first.clone()..)
+                .map(|(key, _)| key)
+                .take_while(|(service, quota, _)| {
+                    service.as_str() == service_code && quota.as_str() == quota_code
+                });
+            for (_, _, context) in entries {
+                if let Some(context) = context {
+                    contexts.insert(context.as_str());
+                }
+            }
+        }
+        contexts.into_iter().map(str::to_string).collect()
     }
 
     /// The quota as `GetAWSDefaultServiceQuota` / `ListAWSDefaultServiceQuotas`
@@ -674,15 +811,20 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         quota_code: &str,
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
-        Some(self.quota_view(region, default, false))
+        Some(self.quota_view(region, default, false, None))
     }
 
     /// Mint and store a quota increase request, and return the stored record —
     /// `None` when this region already holds [`MAX_REQUESTS_PER_REGION`] of them.
     ///
     /// The caller has already checked that the quota exists, that it is adjustable,
-    /// and that `desired_value` is above the value in force. The ceiling is enforced
+    /// that `desired_value` is above the value in force, and that `context_id` (when
+    /// given) names a quota that is adjustable per resource. The ceiling is enforced
     /// HERE, at the one insertion point, so no caller can grow the store past it.
+    ///
+    /// `context_id` is what decides the level the request is recorded at, and the key
+    /// the approved value lands on: a request naming a resource context is recorded at
+    /// the RESOURCE level and applies to that resource alone.
     ///
     /// `support_case_allowed` is recorded, not acted on: it is what
     /// [`Self::settle_due_requests`] reads when the decision comes due.
@@ -695,6 +837,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         desired_value: f64,
         support_case_allowed: bool,
         requester: String,
+        context_id: Option<String>,
         now: SystemTime,
     ) -> Option<QuotaRequest> {
         if self.stored_request_count(region) >= MAX_REQUESTS_PER_REGION {
@@ -718,7 +861,12 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             requester,
             case_id: None,
             support_case_allowed,
-            quota_requested_at_level: LEVEL_ACCOUNT.to_string(),
+            quota_requested_at_level: if context_id.is_some() {
+                LEVEL_RESOURCE.to_string()
+            } else {
+                LEVEL_ACCOUNT.to_string()
+            },
+            context_id,
         };
         let state = self.regions.entry(region.to_string()).or_default();
         state.quota_requests.insert(id.clone(), request.clone());
@@ -774,7 +922,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         // The decision: flip the stored requests, and note the overlay each APPROVED
         // one puts in force. A request that opted out of its support case settles to
         // NOT_APPROVED and contributes no overlay.
-        let mut decided: Vec<(String, String, AppliedQuota)> = Vec::new();
+        let mut decided: Vec<(AppliedKey, AppliedQuota)> = Vec::new();
         if let Some(state) = self.regions.get_mut(region) {
             for id in due {
                 let Some(request) = state.quota_requests.get_mut(&id) else {
@@ -788,18 +936,19 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
                 }
                 request.status = STATUS_APPROVED.to_string();
                 decided.push((
-                    request.service_code.clone(),
-                    request.quota_code.clone(),
+                    (
+                        request.service_code.clone(),
+                        request.quota_code.clone(),
+                        request.context_id.clone(),
+                    ),
                     AppliedQuota {
                         value: request.desired_value,
-                        quota_applied_at_level: request.quota_requested_at_level.clone(),
                     },
                 ));
             }
         }
 
-        for (service_code, quota_code, applied) in decided {
-            let key = (service_code, quota_code);
+        for (key, applied) in decided {
             if self
                 .default_quota(&key.0, &key.1)
                 .is_some_and(|quota| quota.global_quota)
@@ -892,8 +1041,10 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             global_quota: default.is_some_and(|quota| quota.global_quota),
             unit: default.map(|quota| quota.unit.clone()),
             quota_requested_at_level: Some(request.quota_requested_at_level.clone()),
-            // Only a quota that is adjustable per resource carries a context.
-            quota_context: None,
+            // Only a quota that is adjustable per resource carries a context, and it
+            // describes the plane the request was made on.
+            quota_context: default
+                .and_then(|quota| quota.context_info(request.context_id.as_deref())),
         }
     }
 
@@ -979,9 +1130,8 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .iter()
             .map(|default| {
                 let service_code = default.service_code.as_str();
-                let quota_code = default.quota_code.as_str();
                 let applied = self
-                    .applied_entry(region, service_code, quota_code)
+                    .applied_entry(region, default, None)
                     .map_or(default.value, |entry| entry.value);
                 QuotaUtilizationInfo {
                     quota_code: Some(default.quota_code.clone()),
@@ -1129,19 +1279,21 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
-    /// The applied overlay in force for a quota, read from where that quota's scope
-    /// keeps it: account-wide for a `GlobalQuota`, the caller's region otherwise.
+    /// The applied overlay in force for a quota in one context, read from where that
+    /// quota's scope keeps it: account-wide for a `GlobalQuota`, the caller's region
+    /// otherwise.
     fn applied_entry(
         &self,
         region: &str,
-        service_code: &str,
-        quota_code: &str,
+        default: &DefaultQuota,
+        context: Option<&str>,
     ) -> Option<&AppliedQuota> {
-        let key = (service_code.to_string(), quota_code.to_string());
-        if self
-            .default_quota(service_code, quota_code)
-            .is_some_and(|quota| quota.global_quota)
-        {
+        let key = (
+            default.service_code.clone(),
+            default.quota_code.clone(),
+            context.map(str::to_string),
+        );
+        if default.global_quota {
             return self.global_applied_quotas.get(&key);
         }
         self.regions.get(region)?.applied_quotas.get(&key)
@@ -1152,7 +1304,16 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     /// `applied` picks the ARN form: an APPLIED quota belongs to the account, so its
     /// ARN names it, while an AWS DEFAULT quota belongs to no account and its ARN's
     /// account segment is empty (see [`default_quota_arn`]).
-    fn quota_view(&self, region: &str, default: &DefaultQuota, applied: bool) -> ServiceQuota {
+    ///
+    /// `context` is the plane the record answers for, and decides the `QuotaContext`
+    /// it carries (see [`DefaultQuota::context_info`]).
+    fn quota_view(
+        &self,
+        region: &str,
+        default: &DefaultQuota,
+        applied: bool,
+        context: Option<&str>,
+    ) -> ServiceQuota {
         let service_code = default.service_code.as_str();
         let quota_code = default.quota_code.as_str();
         let arn = if applied {
@@ -1176,9 +1337,20 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             // reading seeded state cannot fail that way.
             error_reason: None,
             quota_applied_at_level: None,
-            quota_context: None,
+            quota_context: default.context_info(context),
             description: default.description.clone(),
         }
+    }
+}
+
+/// The overlay contexts that cover `context`, most specific first: the resource's own
+/// value, then the value applied to every resource with none of its own, then the
+/// account-wide value. An account-wide read is covered by that value alone.
+fn contexts_in_force(context: Option<&str>) -> Vec<Option<&str>> {
+    match context {
+        None => vec![None],
+        Some(CONTEXT_ID_EVERY_RESOURCE) => vec![Some(CONTEXT_ID_EVERY_RESOURCE), None],
+        Some(id) => vec![Some(id), Some(CONTEXT_ID_EVERY_RESOURCE), None],
     }
 }
 
@@ -1577,6 +1749,11 @@ struct QuotaRow {
     adjustable: bool,
     /// `GlobalQuota`: counted account-wide rather than per region.
     global_quota: bool,
+    /// `AdjustableAtLevelEnum`: the level AWS publishes the quota as adjustable at.
+    adjustable_at_level: String,
+    /// `QuotaContextInfo$ContextScopeType`: the resource type the quota's
+    /// per-resource plane applies to, for a row that has one.
+    context_scope_type: Option<String>,
     /// `UsageMetric`, for a quota CloudWatch publishes usage for.
     usage_metric: Option<MetricInfo>,
     /// `Period`, for a quota AWS publishes as a RATE (so many per unit of time).
@@ -1594,6 +1771,8 @@ fn quota(name: impl Into<String>, value: f64) -> QuotaRow {
         unit: "None".to_string(),
         adjustable: true,
         global_quota: false,
+        adjustable_at_level: LEVEL_ACCOUNT.to_string(),
+        context_scope_type: None,
         usage_metric: None,
         period: None,
         description: None,
@@ -1622,6 +1801,20 @@ impl QuotaRow {
     /// AWS counts this quota account-wide rather than per region.
     fn global(mut self) -> Self {
         self.global_quota = true;
+        self
+    }
+
+    /// The level AWS publishes this quota as adjustable at ([`LEVEL_PER_RESOURCE`] or
+    /// [`LEVEL_ALL`]), and the resource type its per-resource plane applies to — the
+    /// `ContextScopeType` every record of the quota reports.
+    ///
+    /// A row that does not name this is adjustable at the account level only, which is
+    /// what most published quotas are: `QuotaContextInfo`'s own documentation calls out
+    /// that the context is absent for a quota managed at the account level for each
+    /// Region.
+    fn adjustable_at(mut self, level: &str, context_scope_type: &str) -> Self {
+        self.adjustable_at_level = level.to_string();
+        self.context_scope_type = Some(context_scope_type.to_string());
         self
     }
 
@@ -2151,7 +2344,14 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon OpenSearch Service",
             vec![
                 quota("Domains per Region", 100.0),
-                quota("Instances per domain", 80.0),
+                // The quota `QuotaContextInfo`'s own documentation uses as its worked
+                // example of a RESOURCE-level quota: the instance count is applied per
+                // OpenSearch Service domain, and can also be set account-wide, so AWS
+                // publishes it as adjustable at either level. The scope type names the
+                // resource type the per-resource plane applies to, which for the `es`
+                // service code is its domain resource.
+                quota("Instances per domain", 80.0)
+                    .adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain"),
             ],
         ),
         service(

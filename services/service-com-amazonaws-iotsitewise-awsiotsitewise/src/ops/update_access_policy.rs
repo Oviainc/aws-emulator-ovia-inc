@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccessPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccessPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccessPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +148,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccessPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccessPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccessPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAccessPolicyError::Modeled(
+                UpdateAccessPolicyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // An access policy is about ONE identity and ONE Monitor resource, and both
+        // are stated as a structure of optional alternatives, so the choice is the
+        // handler's to enforce — the model cannot. The same rule `CreateAccessPolicy`
+        // enforces, from the same place.
+        if let Err(message) =
+            crate::state::check_access_policy_identity(&input.access_policy_identity)
+        {
+            return Err(invalid_request(message));
+        }
+        if let Err(message) =
+            crate::state::check_access_policy_resource(&input.access_policy_resource)
+        {
+            return Err(invalid_request(message));
+        }
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token writes the policy a
+        // second time rather than replaying the first answer. Left to the idempotency
+        // issue, exactly as `UpdateDataset` leaves it.
+        let mut store = state.lock();
+
+        // The policy is about a Monitor resource, so a resource this store does not
+        // hold is an absence this operation's modelled 404 states. Resolved for the
+        // portal form, which this store holds; a project is accepted unchecked
+        // because no operation of this crate stores one yet (`CreateProject` is
+        // still a scaffold), so there is nothing a check could consult. Reported
+        // after the policy's own absence: the request addresses the policy, so an id
+        // that names no policy is what a caller is told about first.
+        let missing_portal = input
+            .access_policy_resource
+            .portal
+            .as_ref()
+            .filter(|portal| !store.portals.contains_key(&portal.id))
+            .map(|portal| portal.id.clone());
+
+        let policy = store
+            .access_policies
+            .get_mut(&input.access_policy_id)
+            .ok_or_else(|| {
+                not_found(
+                    crate::state::RESOURCE_ACCESS_POLICY,
+                    &input.access_policy_id,
+                )
+            })?;
+
+        if let Some(portal_id) = missing_portal {
+            return Err(not_found(crate::state::RESOURCE_PORTAL, &portal_id));
+        }
+
+        // Every member this operation carries is required, so the request states the
+        // policy's new identity, resource and permission in full; what it does not
+        // carry — the policy's id, ARN, tags and creation date — is not this call's
+        // to change.
+        policy.apply_update(
+            input.access_policy_identity,
+            input.access_policy_resource,
+            input.access_policy_permission,
+            now,
+        );
+
+        Ok(UpdateAccessPolicyOutput {})
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateAccessPolicyError {
+    UpdateAccessPolicyError::Modeled(UpdateAccessPolicyErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind and the
+/// identifier that resolved to nothing, in the one wording every not-found refusal
+/// in this service carries.
+fn not_found(resource: &str, requested: &str) -> UpdateAccessPolicyError {
+    UpdateAccessPolicyError::Modeled(UpdateAccessPolicyErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        },
+    ))
 }

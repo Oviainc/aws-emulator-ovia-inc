@@ -44,7 +44,7 @@ const PAGE_MAXIMUM: usize = 50;
 
 /// Send one `CreateVPCAssociationAuthorization` request carrying `vpc` (a
 /// [`vpc_block`]).
-async fn authorize(router: &MultiServiceRouter, zone_id: &str, vpc: &str) -> Reply {
+pub(crate) async fn authorize(router: &MultiServiceRouter, zone_id: &str, vpc: &str) -> Reply {
     let body = format!(
         "<CreateVPCAssociationAuthorizationRequest \
          xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">{vpc}\
@@ -60,7 +60,12 @@ async fn authorize(router: &MultiServiceRouter, zone_id: &str, vpc: &str) -> Rep
 }
 
 /// Authorize `vpc_id` in `region` and assert the request was accepted.
-async fn authorize_ok(router: &MultiServiceRouter, zone_id: &str, vpc_id: &str, region: &str) {
+pub(crate) async fn authorize_ok(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    vpc_id: &str,
+    region: &str,
+) {
     let reply = authorize(router, zone_id, &vpc_block(Some(vpc_id), Some(region))).await;
     assert_eq!(
         reply.status, 200,
@@ -72,7 +77,11 @@ async fn authorize_ok(router: &MultiServiceRouter, zone_id: &str, vpc_id: &str, 
 
 /// Send one `ListVPCAssociationAuthorizations` request, with `query` appended to
 /// the URI (`"?maxresults=2"`).
-async fn list_authorizations(router: &MultiServiceRouter, zone_id: &str, query: &str) -> Reply {
+pub(crate) async fn list_authorizations(
+    router: &MultiServiceRouter,
+    zone_id: &str,
+    query: &str,
+) -> Reply {
     call(
         router,
         "GET",
@@ -86,7 +95,7 @@ async fn list_authorizations(router: &MultiServiceRouter, zone_id: &str, query: 
 ///
 /// The same reader `vpc_associations` uses for a zone's association list: both
 /// lists are `VPC` elements, so one extractor serves both.
-fn page_of(reply: &Reply) -> Vec<(String, String)> {
+pub(crate) fn page_of(reply: &Reply) -> Vec<(String, String)> {
     associations(reply)
 }
 
@@ -165,7 +174,7 @@ async fn walk_pages(
 
 /// The VPC id of the `index`-th member of a generated authorization set: the
 /// 17-character long form, which is lowercase hexadecimal.
-fn generated_vpc_id(index: usize) -> String {
+pub(crate) fn generated_vpc_id(index: usize) -> String {
     format!("vpc-{index:017x}")
 }
 

@@ -379,6 +379,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create reads: a segment's key provider role has to be the ARN
+        // of an IAM role, decided before a single field is written.
+        if let Some(rejection) = crate::state::speke_role_arn_rejection(input.segment.as_ref()) {
+            return Err(UpdateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
+
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(UpdateOriginEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),

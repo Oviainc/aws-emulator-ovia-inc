@@ -72,3 +72,5 @@ mod multiview_configuration_validation;
 mod regional_partitioning;
 #[path = "all/manifest_count_range.rs"]
 mod manifest_count_range;
+#[path = "all/caller_supplied_arns.rs"]
+mod caller_supplied_arns;

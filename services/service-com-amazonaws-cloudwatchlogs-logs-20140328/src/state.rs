@@ -246,6 +246,23 @@ pub const INDEX_SOURCE_ACCOUNT: &str = "ACCOUNT";
 /// [`INDEX_SOURCE_ACCOUNT`].
 pub const INDEX_SOURCE_LOG_GROUP: &str = "LOG_GROUP";
 
+/// The one log group class a log-group-level field index policy can be put on, from
+/// `PutIndexPolicy`: "Only log groups in the Standard log class support field index
+/// policies." Spelled as the model's `LogGroupClass` spells it
+/// (`LOG_GROUP_CLASS_VALUES`), and named apart from [`TRANSFORMER_LOG_GROUP_CLASS`]
+/// because it is a different feature's sentence even where the class is spelled the same.
+pub const INDEX_POLICY_LOG_GROUP_CLASS: &str = "STANDARD";
+
+/// How many field indexes one log-group-level field index policy can name, from
+/// `PutIndexPolicy`'s quota list: "As many as 20 fields can be included in the policy."
+/// Only the fields the document names count — "Default field indexes are not counted
+/// towards your field index quota."
+pub const MAX_INDEX_POLICY_FIELDS: usize = 20;
+
+/// How long one indexed field's name can be, from the same quota list: "Each field name
+/// can include as many as 100 characters."
+pub const MAX_INDEX_FIELD_NAME_CHARS: usize = 100;
+
 /// The scope an account-level policy carries when the put naming it specified none, from
 /// `PutAccountPolicy$scope`: "Currently the only valid value for this parameter is ALL,
 /// which specifies that the data protection policy applies to all log groups in the
@@ -2378,7 +2395,7 @@ pub fn check_account_policy_document(
             check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
         }
         POLICY_TYPE_FIELD_INDEX => {
-            check_field_index_policy_document(document).map(|()| AccountPolicyShape::default())
+            check_field_index_policy_document(document).map(|_| AccountPolicyShape::default())
         }
         POLICY_TYPE_TRANSFORMER => {
             check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
@@ -2459,12 +2476,20 @@ fn check_subscription_filter_policy_document(document: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Judge a `FIELD_INDEX_POLICY` document. From `PutAccountPolicy$policyDocument`: the
-/// attributes are "Fields The array of field indexes to create" and "FieldsV2 The object
-/// of field indexes to create along with it's type"; "It must contain at least one field
-/// index"; "Supported types are FIELD_INDEX and FACET" (the model's `IndexType` enum);
-/// and "Field names within Fields and FieldsV2 must be mutually exclusive."
-fn check_field_index_policy_document(document: &str) -> Result<(), String> {
+/// Judge a field index policy document, answering the message to refuse it with, or the
+/// field names it indexes — `Fields` in the order the array lists them, then the
+/// `FieldsV2` names.
+///
+/// From `PutAccountPolicy$policyDocument`, which states the same document's rules as
+/// `PutIndexPolicy$policyDocument`: the attributes are "Fields The array of field indexes
+/// to create" and "FieldsV2 The object of field indexes to create along with it's type";
+/// "It must contain at least one field index"; "Supported types are FIELD_INDEX and FACET"
+/// (the model's `IndexType` enum); and "Field names within Fields and FieldsV2 must be
+/// mutually exclusive."
+///
+/// The per-policy field quotas are NOT judged here, because they are a log-group-level
+/// policy's own ([`check_index_policy_quotas`]).
+pub fn check_field_index_policy_document(document: &str) -> Result<Vec<String>, String> {
     let members = policy_object(document)?;
     let fields = match members.get("Fields") {
         Some(fields) => fields
@@ -2511,6 +2536,45 @@ fn check_field_index_policy_document(document: &str) -> Result<(), String> {
         return Err(format!(
             "the field '{name}' is listed in both Fields and FieldsV2 in policyDocument; field names within Fields and FieldsV2 must be mutually exclusive"
         ));
+    }
+    let mut indexed = fields;
+    indexed.extend(fields_v2.keys().cloned());
+    Ok(indexed)
+}
+
+/// Why a log-group-level field index policy breaches one of the quotas `PutIndexPolicy`
+/// states for "each index policy", carrying the sentence to refuse it with.
+///
+/// The two breaches are refused differently: too many field indexes is a count of what the
+/// policy would create, and an over-long field name is one value of the document being
+/// wrong — so the caller maps each onto the error its operation declares for that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexPolicyQuotaBreach {
+    /// The document names more than [`MAX_INDEX_POLICY_FIELDS`] field indexes.
+    TooManyFields(String),
+    /// One field name is longer than [`MAX_INDEX_FIELD_NAME_CHARS`] characters.
+    FieldNameTooLong(String),
+}
+
+/// Judge the field indexes of a log-group-level field index policy against the quotas
+/// `PutIndexPolicy` states for "each index policy": [`MAX_INDEX_POLICY_FIELDS`] fields in
+/// the policy, and [`MAX_INDEX_FIELD_NAME_CHARS`] characters in each field name. The names
+/// are the ones [`check_field_index_policy_document`] read out of the document.
+pub fn check_index_policy_quotas(fields: &[String]) -> Result<(), IndexPolicyQuotaBreach> {
+    if let Some(length) = fields
+        .iter()
+        .map(|name| name.chars().count())
+        .find(|length| *length > MAX_INDEX_FIELD_NAME_CHARS)
+    {
+        return Err(IndexPolicyQuotaBreach::FieldNameTooLong(format!(
+            "a field name in policyDocument is {length} characters; each field name can include as many as {MAX_INDEX_FIELD_NAME_CHARS} characters"
+        )));
+    }
+    if fields.len() > MAX_INDEX_POLICY_FIELDS {
+        return Err(IndexPolicyQuotaBreach::TooManyFields(format!(
+            "policyDocument names {} field indexes; as many as {MAX_INDEX_POLICY_FIELDS} fields can be included in an index policy",
+            fields.len()
+        )));
     }
     Ok(())
 }

@@ -305,9 +305,9 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// Contact channels, keyed by `ContactChannelArn`.
     pub contact_channels: BTreeMap<String, ContactChannelRecord>,
     /// How many channels this store has ever minted. Feeds
-    /// [`ContactChannelRecord::sequence`] and the channel ARN's opaque id, so two
-    /// channels created with the same name under the same contact are still two
-    /// resources with two ARNs.
+    /// [`ContactChannelRecord::sequence`] and the channel ARN's opaque id, so a channel
+    /// recreated under the name a deleted one used is a NEW resource with its own ARN,
+    /// and the listing order of a contact's channels is their creation order.
     pub channels_created: u64,
     /// On-call rotations, keyed by `RotationArn`.
     pub rotations: BTreeMap<String, RotationRecord>,
@@ -470,6 +470,23 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             .into_iter()
             .map(|channel| channel.arn.clone())
             .collect()
+    }
+
+    /// The channel of `contact_arn` that carries `name`, when the contact has one.
+    ///
+    /// A channel's `Name` is its identifier WITHIN its contact, so this is the lookup a
+    /// create consults before minting: at most one live channel of a contact answers to a
+    /// given name. The scan is over a store bounded by [`MAX_CONTACT_CHANNELS`], and the
+    /// map is keyed by ARN because that is what every channel-addressed operation names.
+    pub fn channel_of_contact_named(
+        &self,
+        contact_arn: &str,
+        name: &str,
+    ) -> Option<&ContactChannelRecord> {
+        self.contact_channels
+            .values()
+            .filter(|channel| channel.contact_arn == contact_arn && channel.name == name)
+            .min_by_key(|channel| channel.sequence)
     }
 
     /// The channels one engagement of `contact_arn` pages, in the order the engagement plan
@@ -781,9 +798,11 @@ pub fn contact_arn(region: &str, alias: &str) -> String {
 /// A contact channel's ARN:
 /// `arn:aws:ssm-contacts:<region>:<account>:contact-channel/<contact alias>/<id>`.
 ///
-/// A channel has no caller-chosen unique name, so the id is derived from the channel's
-/// identity plus the store's own creation counter: deterministic for a given sequence of
-/// calls, and distinct for every channel the store mints.
+/// The id is NOT the channel's `Name`: the name identifies the channel within its contact
+/// only while that channel lives, so a name freed by a delete and used again names a new
+/// resource. The id is therefore derived from the channel's identity plus the store's own
+/// creation counter: deterministic for a given sequence of calls, and distinct for every
+/// channel the store mints.
 pub fn contact_channel_arn(region: &str, alias: &str, name: &str, sequence: u64) -> String {
     let id = opaque_uuid(&["contact-channel", alias, name, &sequence.to_string()].join("\u{1f}"));
     ::emulator_server::emulator_arn(

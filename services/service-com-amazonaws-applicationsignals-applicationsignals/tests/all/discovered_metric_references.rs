@@ -264,9 +264,9 @@ async fn seed(router: &MultiServiceRouter) {
 /// entity or edge the entry is about.
 ///
 /// The rows differ along the READ (all five), the kind of entry (an entity, an operation of
-/// one, an edge out of one, an edge into one), the SIZE of the identity (one attribute to
-/// four), the `Type` of the far end (a remote service, a remote resource) and the
-/// environment the entity runs in.
+/// one, an edge out of one, an edge into one), the SIZE of the reported identity (two
+/// attributes to four), the `Type` of the far end (a remote service, a remote resource) and
+/// the environment the entity runs in.
 #[tokio::test]
 async fn every_reported_entry_carries_the_metrics_of_its_own_identity() {
     /// One read, and the dimension set every entry it reports must carry.
@@ -296,14 +296,11 @@ async fn every_reported_entry_carries_the_metrics_of_its_own_identity() {
             member: None,
             expected: vec![dimension_set(&["Environment=prod", "Service=checkout"])],
         },
-        Case {
-            case: "GetService billing, an identity that names no Environment",
-            method: "POST",
-            path: "/service",
-            body: Some(json!({ "KeyAttributes": { "Type": "Service", "Name": "billing" } })),
-            member: None,
-            expected: vec![dimension_set(&["Service=billing"])],
-        },
+        // `GetService` of the `billing` entity is NOT a row here: its stored identity names no
+        // `Environment`, which is one of the attributes `Type: Service` makes part of an
+        // entity-read identity, so that read is refused rather than served (pinned in
+        // `entity_identity.rs`). The dimensions of such an identity are covered by the
+        // `ListServices` row below, which takes no identity from the caller.
         Case {
             case: "ListServices",
             method: "GET",

@@ -29,6 +29,8 @@ mod deployment_resource_group;
 mod deployment_update;
 #[path = "all/deployment_update_in_flight.rs"]
 mod deployment_update_in_flight;
+#[path = "all/dry_run_preflight.rs"]
+mod dry_run_preflight;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/not_found_contract.rs"]

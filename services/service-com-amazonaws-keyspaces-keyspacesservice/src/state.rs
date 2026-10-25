@@ -1008,7 +1008,43 @@ pub struct UserDefinedType {
     pub status_due_at: Option<SystemTime>,
 }
 
+/// The first user-defined type a supplied column's or field's `type` refers to that
+/// `usable_type_names` does not hold, or `None` when every reference in it resolves.
+///
+/// A column's or a field's type is "any supported Cassandra data type, including
+/// collections and other user-defined types that are contained in the same keyspace"
+/// (`ColumnDefinition$type` / `FieldDefinition$type`), so every identifier in it that
+/// names neither a native type nor a type constructor ([`referenced_type_names`]) must
+/// name a type of the SAME keyspace that is usable — one in status `ACTIVE`
+/// ([`Keyspace::usable_type_names`]). Any other reference is a type "that doesn't exist.
+/// The resource might not be specified correctly, or its status might not be ACTIVE"
+/// ([`type_not_found`]), wherever a caller supplies a type expression: creating a table,
+/// creating a type, or adding columns to a table that already exists.
+pub fn unresolvable_type_reference(
+    type_expression: &str,
+    usable_type_names: &BTreeSet<String>,
+) -> Option<String> {
+    referenced_type_names(type_expression)
+        .into_iter()
+        .find(|referenced| !usable_type_names.contains(referenced))
+}
+
 impl Keyspace {
+    /// The names of this keyspace's user-defined types a column's or field's type may
+    /// refer to: the ones in status `ACTIVE`, in the FORMATTED form
+    /// [`referenced_type_names`] yields.
+    ///
+    /// Taken as a set so one pass over the keyspace's types serves a whole request's type
+    /// expressions, and so a caller that must read the types BEFORE borrowing one of the
+    /// keyspace's tables (as `UpdateTable` does) resolves against the same values.
+    pub fn usable_type_names(&self) -> BTreeSet<String> {
+        self.types
+            .values()
+            .filter(|udt| udt.status == TYPE_STATUS_ACTIVE)
+            .map(|udt| udt.type_name.clone())
+            .collect()
+    }
+
     /// The types of this keyspace that use `type_name` in one of their fields —
     /// `GetType`'s `directParentTypes` ("The types that use this type").
     ///

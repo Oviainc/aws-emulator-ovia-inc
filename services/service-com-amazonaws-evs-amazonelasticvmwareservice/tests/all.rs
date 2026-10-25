@@ -30,6 +30,8 @@ mod create_environment_validation;
 mod created_environment_hosts;
 #[path = "all/depot_url.rs"]
 mod depot_url;
+#[path = "all/eip_allocation_existence.rs"]
+mod eip_allocation_existence;
 #[path = "all/eip_ec2_propagation.rs"]
 mod eip_ec2_propagation;
 #[path = "all/entitlement_connector.rs"]

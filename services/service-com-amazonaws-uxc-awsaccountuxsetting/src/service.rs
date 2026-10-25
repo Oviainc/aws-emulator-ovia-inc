@@ -61,6 +61,15 @@
 //! violation from a URI one. [`FrontDoor`] is where that distinction lives:
 //! each modelled operation is served wrapped in it, and the wrapper reads the
 //! HTTP BINDING of the violated member off that operation's own input schema.
+//!
+//! The same wrapper is why a URI-bound violation is answered with the MODELLED
+//! `ValidationException` value rather than through the refusal channel: that
+//! channel carries a code and a message only ([`Refused`]), while the modelled
+//! shape also reports the refused members structurally in `fieldList`
+//! (`smithy_query(query="shape", shape="ValidationException")`). The wrapper
+//! builds that shape from the violations it already holds and serializes it
+//! through this service's own protocol, so a boundary refusal and a
+//! handler-raised `ValidationException` reach the wire as the same document.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::Schema;
@@ -116,6 +125,10 @@ fn unanchored(regex: &str) -> String {
 /// so it is worded through the framework's refusal channel
 /// ([`smithy_server_runtime::Refused`]) rather than through an error enum.
 const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The HTTP status the model declares for this service's `ValidationException`
+/// (`smithy_query(query="shape", shape="ValidationException")`).
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 
 /// What the front door says about a body it refused.
 ///
@@ -186,20 +199,21 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// One modelled operation, served behind this service's front door.
 ///
 /// WHY this is a seam and not a line in each handler: the framework validates
-/// every modelled constraint BEFORE a handler runs, so a body that breaks one
+/// every modelled constraint BEFORE a handler runs, so a request that breaks one
 /// never reaches `handle` — and the seam that words that refusal
-/// ([`Service::override_refusal`]) is handed the violations alone, with no way
-/// to tell which HTTP location the violated value came from. A wrapper is handed
-/// the request and the operation, so it can: it keeps only the violations on
-/// members the operation's input schema binds to the BODY (no `@httpLabel`, no
-/// `@httpQuery`, no `@httpHeader`), and answers those with
-/// [`BAD_REQUEST_EXCEPTION`].
+/// ([`Service::override_refusal`]) is handed the violations alone, with no way to
+/// tell which HTTP location the violated value came from, nor any channel for the
+/// `fieldList` the modelled exception carries. A wrapper is handed the request
+/// and the operation, so it has both: it places each violation by the binding the
+/// operation's input schema gives that member, and answers a BODY one with
+/// [`BAD_REQUEST_EXCEPTION`] and a URI-bound one (`@httpLabel`, `@httpQuery`,
+/// `@httpHeader`) with the modelled `ValidationException` naming every refused
+/// member ([`constraint_rejection`]).
 ///
-/// Nothing else is re-implemented. A body this wrapper does not refuse is handed
-/// to the generated `ErasedOperation::run`, which owns deserialize -> validate ->
-/// handle -> serialize, telemetry and every modelled error — including the
-/// modelled `ValidationException` for a URI-bound value outside its constraint,
-/// and for the rules a handler enforces that the model states only in prose.
+/// Nothing else is re-implemented. A request this wrapper does not refuse is
+/// handed to the generated `ErasedOperation::run`, which owns deserialize ->
+/// validate -> handle -> serialize, telemetry and every modelled error — including
+/// the ones a handler raises for the rules the model states only in prose.
 ///
 /// The violations come from the framework's own machinery (the protocol's
 /// deserializer and `constraints::validate` over the built input), so this
@@ -229,9 +243,8 @@ where
             // The protocol is read, used and dropped inside this one statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across
             // the await below would make this future non-`Send`.
-            let refused = body_violations::<O>(svc.definition().protocol(), req);
-            if !refused.is_empty() {
-                return front_door_rejection(svc, refused);
+            if let Some(refusal) = constraint_rejection::<O>(svc, req) {
+                return refusal;
             }
             self.operation.run(svc, req, ctx).await
         })
@@ -244,14 +257,13 @@ where
     }
 }
 
-/// Every modelled constraint `req`'s BODY breaks, for the operation `O`.
+/// Every modelled constraint `req` breaks, for the operation `O`.
 ///
-/// Empty when the body satisfies the model, when the operation binds nothing to
-/// the body, and when the request cannot be read into `O`'s input shape at all —
-/// a codec failure is not a constraint violation, so it is left to the
-/// framework's own walk, which refuses it in this service's modelled
-/// `ValidationException`.
-fn body_violations<O: Operation>(
+/// Empty when the request satisfies the model and when it cannot be read into
+/// `O`'s input shape at all — a codec failure is not a constraint violation, so
+/// it is left to the framework's own walk, which refuses it through this
+/// service's refusal wording.
+fn member_violations<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> Vec<Violation> {
@@ -263,9 +275,34 @@ fn body_violations<O: Operation>(
     };
     drop(deserializer);
     constraints::validate(&input, O::INPUT_SCHEMA)
+}
+
+/// How this service answers a request for `O` that breaks a modelled member
+/// constraint, or `None` when it breaks none and the operation should run.
+///
+/// The two refusals this service words differ only in WHERE the refused value
+/// travelled, which is read off `O`'s own input schema:
+///
+/// * a member in the request BODY keeps the front door's `BadRequestException`;
+/// * a member bound to the request URI (`@httpQuery`, `@httpLabel`,
+///   `@httpHeader`) is refused with the modelled `ValidationException`, whose
+///   `fieldList` names every refused member.
+///
+/// A request breaking both is a body rejection: the front door refuses a body it
+/// will not read before anything is said about the rest of the request.
+fn constraint_rejection<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+    let protocol = svc.definition().protocol();
+    let violations = member_violations::<O>(protocol, req);
+    if violations.is_empty() {
+        return None;
+    }
+    let (body, uri): (Vec<Violation>, Vec<Violation>) = violations
         .into_iter()
-        .filter(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path))
-        .collect()
+        .partition(|violation| binds_to_body(O::INPUT_SCHEMA, &violation.path));
+    if !body.is_empty() {
+        return Some(front_door_rejection(svc, body));
+    }
+    Some(member_constraint_rejection(svc, protocol, uri))
 }
 
 /// Whether `violation_path` names a member `input_schema` carries in the request
@@ -306,6 +343,78 @@ fn front_door_rejection(svc: &dyn Service, refused: Vec<Violation>) -> RtRespons
     )
 }
 
+/// `violations` with every requirement stated the way THIS service states it: a
+/// `@pattern` quotes the expression without the model's whole-value anchors
+/// ([`unanchored`]), and every other kind stays the framework's own, so a member
+/// path or a requirement cannot drift from the walk that produced it.
+fn restated(violations: &[Violation]) -> Vec<Violation> {
+    violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::Pattern(pattern) => Violation {
+                path: violation.path.clone(),
+                kind: ViolationKind::Pattern(unanchored(pattern)),
+                value: violation.value.clone(),
+            },
+            _ => violation.clone(),
+        })
+        .collect()
+}
+
+/// The modelled `ValidationException` for member-constraint `violations`: the
+/// AWS envelope in `message`, and the SAME clauses reported member by member in
+/// `fieldList` — one entry per refused member, `path` its dotted member path and
+/// `message` that member's clause.
+///
+/// `None` when there is nothing to state (no violations), since the exception's
+/// `message` is a required member.
+fn member_constraint_exception(
+    violations: &[Violation],
+) -> Option<crate::ops::types::ValidationException> {
+    let restated = restated(violations);
+    Some(crate::ops::types::ValidationException {
+        message: envelope(&restated)?,
+        field_list: Some(
+            restated
+                .iter()
+                .map(|violation| crate::ops::types::ValidationExceptionField {
+                    path: violation.path.clone(),
+                    message: violation.message(),
+                })
+                .collect(),
+        ),
+    })
+}
+
+/// The answer to a URI-bound member this service refused: the modelled
+/// `ValidationException`, serialized through this service's own protocol so the
+/// `fieldList` the model declares reaches the wire.
+///
+/// Falls back to the framework's refusal channel — the same code, status and
+/// envelope message, without `fieldList` — if the modelled shape cannot be
+/// serialized, so a refusal is never dropped over a rendering failure.
+fn member_constraint_rejection(
+    svc: &dyn Service,
+    protocol: &dyn ServerHttpProtocol,
+    violations: Vec<Violation>,
+) -> RtResponse {
+    let rendered = member_constraint_exception(&violations).and_then(|exception| {
+        protocol
+            .serialize_error(
+                &exception,
+                &crate::ops::types::SCHEMA_VALIDATION_EXCEPTION,
+                VALIDATION_EXCEPTION,
+                VALIDATION_EXCEPTION_STATUS,
+            )
+            .ok()
+    });
+    rendered.unwrap_or_else(|| {
+        let chosen = svc.override_refusal(&Refusal::Invalid(violations.clone()));
+        svc.definition()
+            .refusal_response(ProtocolError::Invalid(violations), chosen)
+    })
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -342,10 +451,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service state it. What reaches it here is a value bound to the request
-        // URI — a `maxResults` outside its `@range`, a `nextToken` outside its
-        // `@length`/`@pattern` — since a BODY that breaks a modelled constraint is
-        // answered by `FrontDoor` before the framework's walk is reached.
+        // service state it. What reaches it here is a refusal `FrontDoor` could
+        // not place against an input member — a request the codec could not read
+        // into the input shape at all — since a violation of a modelled member
+        // constraint is answered by `FrontDoor` before the framework's walk is
+        // reached: a body one with `BadRequestException`, a URI-bound one with the
+        // modelled `ValidationException` and its `fieldList`.
         //
         // AWS states it as the `400 ValidationException` envelope the framework
         // already renders — `N validation error(s) detected: Value '<value>' at
@@ -362,20 +473,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
-        let restated: Vec<Violation> = violations
-            .iter()
-            .map(|violation| match &violation.kind {
-                ViolationKind::Pattern(pattern) => Violation {
-                    path: violation.path.clone(),
-                    kind: ViolationKind::Pattern(unanchored(pattern)),
-                    value: violation.value.clone(),
-                },
-                _ => violation.clone(),
-            })
-            .collect();
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: envelope(&restated)?,
+            message: envelope(&restated(violations))?,
         })
     }
 

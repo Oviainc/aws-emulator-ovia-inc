@@ -15,6 +15,8 @@
 mod create_graph_using_import_task;
 #[path = "all/error_message_rendering.rs"]
 mod error_message_rendering;
+#[path = "all/export_task_cancellation.rs"]
+mod export_task_cancellation;
 #[path = "all/export_task_lifecycle.rs"]
 mod export_task_lifecycle;
 #[path = "all/graph_deletion.rs"]
@@ -37,6 +39,8 @@ mod import_task_lifecycle;
 mod import_task_minting;
 #[path = "all/private_graph_endpoint_lifecycle.rs"]
 mod private_graph_endpoint_lifecycle;
+#[path = "all/private_graph_endpoint_listing.rs"]
+mod private_graph_endpoint_listing;
 #[path = "all/private_graph_endpoint_read.rs"]
 mod private_graph_endpoint_read;
 #[path = "all/query_cancellation.rs"]

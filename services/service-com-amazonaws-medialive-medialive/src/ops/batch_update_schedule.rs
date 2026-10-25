@@ -201,9 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One update: the whole request is validated before anything is written,
         // so a request naming one unusable action leaves the schedule as it was.
+        // The validation includes what each created action references in THIS
+        // channel — an input attachment, an output, a pipeline or a feature the
+        // channel's configuration has to declare — because an action the channel
+        // could never execute is not a queued action.
+        let scope = crate::state::ChannelScheduleScope::of(channel);
         let applied = channel
             .schedule
-            .apply(&creates, &deletes, now)
+            .apply(&creates, &deletes, &scope, now)
             .map_err(refused)?;
 
         Ok(BatchUpdateScheduleOutput {

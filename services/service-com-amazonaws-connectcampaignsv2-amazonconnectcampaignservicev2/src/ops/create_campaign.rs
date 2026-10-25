@@ -13,6 +13,13 @@
 //! `crate::state::MAX_CAMPAIGNS`; past that a create answers the modelled
 //! `ServiceQuotaExceededException` (HTTP 402).
 //!
+//! The `tags` the create carries are held to the same rules a tag call is: every key
+//! is checked against the key shape's modelled bounds and the map against the
+//! per-resource tag ceiling (`crate::state::tag_keys_violation` /
+//! `crate::state::tag_count_violation`), so a campaign cannot be born with a tag map
+//! `TagResource` would have refused. Either is the modelled `ValidationException`
+//! (HTTP 400), answered before anything is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -199,6 +206,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::communication_time_violation("communicationTimeConfig", config)
             })
         {
+            return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
+        // A tag map's KEYS are a constrained shape like any other input member, and
+        // the centralized walk reaches neither their `@length` (a map key is captured
+        // as a path segment, never validated as a leaf) nor their `@pattern` (whose
+        // negative lookahead the pattern engine cannot compile), so they are checked
+        // here. The per-resource tag ceiling is checked the same way, so a campaign
+        // cannot be born holding a tag map no tag call could have produced. Both are
+        // bad requests, refused before anything is stored.
+        if let Some(message) = input.tags.as_ref().and_then(|tags| {
+            crate::state::tag_keys_violation("tags", tags.keys().map(String::as_str))
+                .or_else(|| crate::state::tag_count_violation("tags", tags.len()))
+        }) {
             return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
                 message,
                 x_amz_error_type: None,

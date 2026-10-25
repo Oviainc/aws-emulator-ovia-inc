@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those digests and for the opaque pagination token.
 hex = { workspace = true }
+# `service-common` carries the ONE caller-supplied-ARN parse, which the CDN authorization
+# and key-provider ARN members are read against.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
