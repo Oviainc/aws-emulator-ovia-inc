@@ -25,9 +25,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
 
-use backup_gateway::state::{service_state, HYPERVISOR_PENDING};
+use backup_gateway::state::HYPERVISOR_PENDING;
 
-use crate::gateway_lifecycle::{build_engine, build_router, call, Reply};
+use crate::gateway_lifecycle::{
+    build_engine, build_router, call, hypervisor_arns_for_host, hypervisor_count, Reply,
+};
 
 /// The `Host` racer `index` imports, cycling the host forms the member accepts: an IPv4
 /// address, an FQDN, and the modelled 3-character minimum
@@ -92,26 +94,6 @@ async fn race_imports(
     }
     replies.sort_by_key(|(index, _)| *index);
     replies
-}
-
-/// How many hypervisors the store holds.
-fn stored_hypervisors(engine: &Arc<engine::InMemoryEngine>) -> usize {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .hypervisor_count()
-}
-
-/// The ARNs the store holds records for `host` under. A set, because `Host` is not a
-/// key: any number of records may carry one host.
-fn stored_arns_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> BTreeSet<String> {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .hypervisors_for_host(host)
-        .iter()
-        .map(|record| record.arn.clone())
-        .collect()
 }
 
 async fn get_hypervisor(router: &MultiServiceRouter, arn: &str) -> Reply {
@@ -195,19 +177,19 @@ async fn concurrent_imports_of_distinct_hosts_are_all_independent() {
              {arns:?}"
         );
         assert_eq!(
-            stored_hypervisors(&engine),
+            hypervisor_count(&engine),
             racers,
             "case {case:?}: the store must hold one record per host, got {} for {arns:?}",
-            stored_hypervisors(&engine)
+            hypervisor_count(&engine)
         );
         for (index, (_, host, _)) in requests.iter().enumerate() {
             assert_eq!(
-                stored_arns_for_host(&engine, host),
+                hypervisor_arns_for_host(&engine, host),
                 BTreeSet::from([arns[index].clone()]),
                 "case {case:?}: host {host:?} must be held under racer {index}'s ARN {:?}, \
                  got {:?}",
                 arns[index],
-                stored_arns_for_host(&engine, host)
+                hypervisor_arns_for_host(&engine, host)
             );
         }
     }
@@ -300,16 +282,16 @@ async fn concurrent_imports_of_one_host_each_mint_their_own_record() {
             "case {case:?}: {racers} callers must mint {racers} distinct ARNs, got {arns:?}"
         );
         assert_eq!(
-            stored_hypervisors(&engine),
+            hypervisor_count(&engine),
             racers,
             "case {case:?}: {racers} imports must leave {racers} records, got {}",
-            stored_hypervisors(&engine)
+            hypervisor_count(&engine)
         );
         assert_eq!(
-            stored_arns_for_host(&engine, host),
+            hypervisor_arns_for_host(&engine, host),
             unique,
             "case {case:?}: every racer's record must be stored for host {host:?}, got {:?}",
-            stored_arns_for_host(&engine, host)
+            hypervisor_arns_for_host(&engine, host)
         );
     }
 }
@@ -365,19 +347,19 @@ async fn a_held_host_does_not_refuse_a_later_import() {
             );
         }
         assert_eq!(
-            stored_hypervisors(&engine),
+            hypervisor_count(&engine),
             minted.len(),
             "case {racers} late callers: every import must have left a record, got {} for \
              {} ARNs",
-            stored_hypervisors(&engine),
+            hypervisor_count(&engine),
             minted.len()
         );
         assert_eq!(
-            stored_arns_for_host(&engine, host),
+            hypervisor_arns_for_host(&engine, host),
             minted,
             "case {racers} late callers: every record must be stored for host {host:?}, \
              got {:?}",
-            stored_arns_for_host(&engine, host)
+            hypervisor_arns_for_host(&engine, host)
         );
     }
 
@@ -392,10 +374,10 @@ async fn a_held_host_does_not_refuse_a_later_import() {
     );
     minted.remove(&held);
     assert_eq!(
-        stored_arns_for_host(&engine, host),
+        hypervisor_arns_for_host(&engine, host),
         minted,
         "the records that were not deleted must still be stored for host {host:?}, got {:?}",
-        stored_arns_for_host(&engine, host)
+        hypervisor_arns_for_host(&engine, host)
     );
 
     let again = call(

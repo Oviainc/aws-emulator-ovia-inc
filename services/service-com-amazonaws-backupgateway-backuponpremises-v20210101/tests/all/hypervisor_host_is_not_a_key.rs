@@ -18,16 +18,13 @@
 //! update.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_backupgateway_backuponpremises_v20210101 as backup_gateway;
-
-use backup_gateway::state::service_state;
-
-use crate::gateway_lifecycle::{build_engine, build_router, call, Reply};
+use crate::gateway_lifecycle::{
+    build_engine, build_router, call, hypervisor_arns_for_host, Reply,
+};
 
 /// `Host` is `@length(min: 3, max: 128)` with pattern `^.+$`
 /// (`smithy_query(query="shape",shape="Host")`), so every one of these is a host the
@@ -72,17 +69,6 @@ async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> Reply {
 
 async fn get_hypervisor(router: &MultiServiceRouter, arn: &str) -> Reply {
     call(router, "GetHypervisor", &json!({ "HypervisorArn": arn })).await
-}
-
-/// The ARNs the STORE holds a record for `host` under, read out of the records.
-fn persisted_arns_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> BTreeSet<String> {
-    service_state(&**engine)
-        .expect("the in-memory engine must expose this state")
-        .lock()
-        .hypervisors_for_host(host)
-        .iter()
-        .map(|record| record.arn.clone())
-        .collect()
 }
 
 /// Every `HypervisorArn` `ListHypervisors` reports.
@@ -223,10 +209,10 @@ async fn any_number_of_hypervisors_may_share_one_host() {
 
             // The store holds them all, and so does a listing.
             assert_eq!(
-                persisted_arns_for_host(&engine, &host),
+                hypervisor_arns_for_host(&engine, &host),
                 arns,
                 "case {case:?}: every record must be stored for the shared host, got {:?}",
-                persisted_arns_for_host(&engine, &host)
+                hypervisor_arns_for_host(&engine, &host)
             );
             let listing = call(&router, "ListHypervisors", &json!({})).await;
             assert_eq!(
