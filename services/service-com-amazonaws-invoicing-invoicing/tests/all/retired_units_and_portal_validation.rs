@@ -716,9 +716,8 @@ fn seed_preference(engine: &Arc<engine::InMemoryEngine>, arn: &str, portal: &str
             last_update_date: at,
         },
         validation: None,
-        // No validation has been requested for a freshly seeded preference, so neither
-        // attempt counter has anything on it.
-        unconfirmed_validation_attempts: 0,
+        // No validation code has been submitted for a freshly seeded preference, so its
+        // failed-attempt count is at zero.
         failed_verification_attempts: 0,
     };
     engine

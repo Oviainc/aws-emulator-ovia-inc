@@ -310,6 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // notifications the resulting transitions owe are delivered. The alarm this call
         // wrote is not among them: its own evaluation is not due yet.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // This alarm's own rule evaluation is owed a span from here and the caller makes no
+        // further CloudWatch call before it looks for what that evaluation delivers, so the
+        // clock that materialises it is started here.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
 
         Ok(PutCompositeAlarmOutput)
     }
