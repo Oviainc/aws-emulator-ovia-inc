@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInvitationsCount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInvitationsCount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInvitationsCount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports HOW MANY membership invitations the current account's inbox holds, out of
+//! the same stored state `ListInvitations` reports one page of at a time: the count is
+//! the SIZE of that inbox, so the two can never disagree. A pure report: it never
+//! writes.
+//!
+//! An invitation that has been ACCEPTED is no longer in the inbox — accepting moves it
+//! onto the administrator relationship — which is why the documented count, which
+//! excludes the currently accepted invitation, is just the number of records the inbox
+//! still holds.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +134,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInvitationsCount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInvitationsCountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInvitationsCount"))
+        // The input shape carries no member at all (`GET /invitation/count` —
+        // `smithy_query(operation="GetInvitationsCount")`), so there is nothing on the
+        // request to read beyond the scope it was signed for.
+        let _ = &input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetInvitationsCountErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The operation names no detector, so the inbox it counts is the one the Region
+        // the request was signed for serves — resolved through the same helper
+        // `ListInvitations` reports that inbox with, so a count and a listing of one
+        // endpoint always agree.
+        let region = crate::state::request_region(ctx);
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let held = state.received_invitations_in(&region).len();
+
+        Ok(GetInvitationsCountOutput {
+            // `InvitationsCount` targets `Integer`, a 32-bit value. One inbox holds at
+            // most [`crate::state::MAX_INVITATIONS_PER_DETECTOR`] records and a Region
+            // holds one detector, so the fallback below is unreachable for any count
+            // this store can hold; it is there so the report can never wrap.
+            invitations_count: Some(i32::try_from(held).unwrap_or(i32::MAX)),
+        })
     }
 }

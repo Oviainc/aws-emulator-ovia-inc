@@ -31,8 +31,8 @@
 //! one, and the order `CreateOrder` accepts is never carried as far as being
 //! delivered and installed (see [`crate::order_lifecycle`]). Each row therefore
 //! RECORDS its assets on the stored Outpost
-//! through the same store seam [`crate::renewal_pricing`] records an Outpost's priced
-//! options through, and then asks over the wire: what the list answers about what is
+//! through the same store seam [`crate::quote_lifecycle`] ages a quote through, and
+//! then asks over the wire: what the list answers about what is
 //! recorded is the whole of rules 1 to 3. The hardware below is the rows' own data;
 //! the emulator is never expected to produce an asset of its own.
 

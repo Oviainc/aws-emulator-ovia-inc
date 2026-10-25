@@ -229,10 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // where to find, so it is not well formed.
         if let Some(member) = record.missing_config() {
             return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::missing_data_source_config_message(
-                    member,
-                    &record.r#type,
-                )),
+                message: Some(crate::state::missing_data_source_config_message(member)),
                 ..Default::default()
             })
             .into());

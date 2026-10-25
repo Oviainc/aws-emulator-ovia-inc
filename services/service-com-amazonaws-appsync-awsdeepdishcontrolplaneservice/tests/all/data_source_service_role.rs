@@ -38,7 +38,7 @@ use crate::graphql_api_lifecycle::REGION;
 /// a relational database are all reached with credentials AppSync assumes; `NONE`
 /// ("there is no data source") and `HTTP` (a plain endpoint) are not. `HTTP` is listed
 /// here in its credential-free form; the IAM-authorized form is its own case below.
-const DATA_SOURCE_TYPES: &[(&str, bool)] = &[
+pub(crate) const DATA_SOURCE_TYPES: &[(&str, bool)] = &[
     ("AWS_LAMBDA", true),
     ("AMAZON_DYNAMODB", true),
     ("AMAZON_ELASTICSEARCH", true),
@@ -51,7 +51,7 @@ const DATA_SOURCE_TYPES: &[(&str, bool)] = &[
 ];
 
 /// A role ARN of the shape `serviceRoleArn` carries.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/appsync-datasource";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/appsync-datasource";
 
 /// The refusal a data source of a role-requiring type with no role takes.
 const ROLE_REFUSAL: &str = "Service role arn not specified.";
@@ -63,7 +63,7 @@ const ROLE_REFUSAL: &str = "Service role arn not specified.";
 /// Source: `CreateDataSourceRequest`'s per-type configuration members and the members
 /// each of those shapes requires. `NONE` and `AMAZON_BEDROCK_RUNTIME` have no
 /// configuration member of their own, so they contribute none.
-fn config_for(data_source_type: &str) -> Value {
+pub(crate) fn config_for(data_source_type: &str) -> Value {
     match data_source_type {
         "AWS_LAMBDA" => json!({
             "lambdaConfig": {
@@ -111,7 +111,12 @@ fn config_for(data_source_type: &str) -> Value {
 /// A `CreateDataSource`/`UpdateDataSource` body of this type and name, with
 /// `serviceRoleArn` present only when `role` is `Some`, and any extra members merged
 /// in after the per-type configuration (so a row can replace it).
-fn request_body(name: &str, data_source_type: &str, role: Option<&str>, extra: Value) -> Value {
+pub(crate) fn request_body(
+    name: &str,
+    data_source_type: &str,
+    role: Option<&str>,
+    extra: Value,
+) -> Value {
     let mut body = json!({ "name": name, "type": data_source_type });
     for fragment in [config_for(data_source_type), extra] {
         if let (Some(target), Some(source)) = (body.as_object_mut(), fragment.as_object()) {
@@ -127,7 +132,7 @@ fn request_body(name: &str, data_source_type: &str, role: Option<&str>, extra: V
 }
 
 /// Read one data source of an API back.
-async fn get_data_source(
+pub(crate) async fn get_data_source(
     router: &smithy_server_runtime::MultiServiceRouter,
     api_id: &str,
     name: &str,

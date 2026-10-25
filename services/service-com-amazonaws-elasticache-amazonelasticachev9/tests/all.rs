@@ -136,3 +136,7 @@ mod global_replication_group_create;
 // Appended for the same reason: the `ModifyCacheParameterGroup` suite.
 #[path = "all/modify_cache_parameter_group.rs"]
 mod modify_cache_parameter_group;
+
+// Appended for the same reason: the `ModifyUser` suite.
+#[path = "all/modify_user.rs"]
+mod modify_user;
