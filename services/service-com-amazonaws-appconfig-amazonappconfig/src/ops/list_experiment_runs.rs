@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the experiment runs one experiment definition holds, optionally
+//! narrowed to one run status, one page at a time. Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +141,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentRuns"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListExperimentRunsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Reporting only: the guard is taken for reading and nothing below writes, so this
+        // listing cannot change what a later caller sees.
+        let store = state.lock();
+
+        // A run only exists under a definition, which only exists under an application, so
+        // an unresolvable level of the path is the 404 this operation models rather than an
+        // empty listing — the same refusal, with the same message, that `GetExperimentRun`
+        // answers for that same path. Both path members are `Identifier`s (the resource's
+        // "ID or name"), so the listing is reached however its application and definition
+        // are addressed.
+        let Some(application) = store.resolve_application(&input.application_identifier) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_identifier),
+                input.application_identifier,
+            ));
+        };
+        let Some(definition) =
+            application.resolve_experiment_definition(&input.experiment_definition_identifier)
+        else {
+            return Err(not_found(
+                crate::state::experiment_definition_not_found(
+                    &input.application_identifier,
+                    &input.experiment_definition_identifier,
+                ),
+                input.experiment_definition_identifier,
+            ));
+        };
+
+        // One summary per run the status filter leaves, every member read off the stored
+        // run — so a summary cannot disagree with what `GetExperimentRun` reports for that
+        // same run. `runs` is a `BTreeMap` keyed by run number, so walking it in REVERSE
+        // reports the definition's runs newest first, and (through the complement key)
+        // ascending cursor order, which is what `paginate` walks. A run number is unique
+        // within the definition and never reissued, so that key is a TOTAL order — what a
+        // pagination cursor needs to resume exactly once.
+        let ordered: Vec<(String, ExperimentRunSummary)> = definition
+            .runs
+            .values()
+            .rev()
+            .filter(|run| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| run.status == wanted)
+            })
+            .map(|run| {
+                (
+                    crate::state::descending_number_key(run.run),
+                    summary_of(run),
+                )
+            })
+            .collect();
+
+        // The same cursor every listing of this service hands out. `None` means the
+        // `NextToken` is not one this listing minted, which is a bad request rather than
+        // "start from the beginning": answering the first page again would silently repeat
+        // entries the caller already walked.
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_EXPERIMENT_RUNS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListExperimentRunsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::next_token_not_issued()),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListExperimentRunsOutput {
+            // Reported even when empty: a definition nothing has run yet, and one whose
+            // runs the filter excluded, hold no run to list — which is an empty list rather
+            // than an omitted member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The 404 this operation models for a level of the path that addresses no resource.
+fn not_found(message: String, resource_name: String) -> ListExperimentRunsError {
+    ListExperimentRunsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
+/// The summary this operation reports for one stored run.
+///
+/// `ExperimentRunSummary` is the run document without the parts only the single-run read
+/// carries (the definition snapshot, the exposure percentage, the treatment overrides and
+/// the result), so every member it does hold is read off the same record
+/// `GetExperimentRun` answers that run from.
+fn summary_of(run: &crate::state::ExperimentRun) -> ExperimentRunSummary {
+    ExperimentRunSummary {
+        experiment_definition_id: Some(run.experiment_definition_id.clone()),
+        run: run.run,
+        description: run.description.clone(),
+        status: Some(run.status.clone()),
+        started_at: Some(crate::state::to_date_time(run.started_at)),
+        updated_at: Some(crate::state::to_date_time(run.updated_at)),
+        ended_at: run.ended_at.map(crate::state::to_date_time),
     }
 }

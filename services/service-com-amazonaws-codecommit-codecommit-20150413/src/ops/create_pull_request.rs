@@ -665,7 +665,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let record = crate::state::PullRequestRecord {
+        // "Information about the source and destination branches for the pull
+        // request": the pull request's event log opens with the event that
+        // opened it, attributed to the caller who did.
+        let created_event = crate::state::PullRequestEventDetail::Created {
+            repository_name: target.repository_name.clone(),
+            source_commit_id: source_commit.clone(),
+            destination_commit_id: destination_commit.clone(),
+            merge_base: merge_base.clone(),
+        };
+        let mut record = crate::state::PullRequestRecord {
             pull_request_id,
             title: input.title.clone(),
             description,
@@ -691,6 +700,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }],
             approval_rules,
             revision: 0,
+            // Opening the pull request is the first thing that happened to it,
+            // so its log starts with that event; the entry is appended below,
+            // through the one recorder every such change goes through.
+            events: Vec::new(),
         };
 
         let repository = store
@@ -713,6 +726,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .pull_request_tokens
                 .insert(token, pull_request_id);
         }
+        let actor = record.author_arn.clone();
+        record.record_event(now, Some(actor), created_event);
         let response = created(&record);
         repository.pull_requests.insert(pull_request_id, record);
         Ok(response)

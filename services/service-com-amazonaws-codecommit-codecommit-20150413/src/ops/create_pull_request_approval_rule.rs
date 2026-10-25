@@ -344,10 +344,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             origin_template: None,
         };
         let approval_rule = rule.to_modeled();
+        let event = crate::state::PullRequestEventDetail::ApprovalRuleCreated(
+            crate::state::ApprovalRuleEvent {
+                approval_rule_id: rule.approval_rule_id.clone(),
+                approval_rule_name: rule.approval_rule_name.clone(),
+                approval_rule_content: rule.content.clone(),
+            },
+        );
+        let actor = rule.last_modified_user.clone();
         pull_request.approval_rules.push(rule);
-        // "The day and time of the last user or system activity on the pull
-        // request": adding a rule to it is such activity.
-        pull_request.last_activity_date = now;
+        // Adding a rule to the pull request changes it, so it is recorded on the
+        // pull request's event log — which also moves "the day and time of the
+        // last user or system activity on the pull request" onto this call.
+        pull_request.record_event(now, Some(actor), event);
 
         Ok(CreatePullRequestApprovalRuleOutput { approval_rule })
     }

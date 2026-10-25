@@ -915,14 +915,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         // The destination branch is left at the merge commit, which is what makes
-        // the merged content readable there by a later caller.
-        repository.branches.insert(
-            destination_branch.clone(),
-            crate::state::Branch {
-                name: destination_branch,
-                commit_id: merge_commit_id.clone(),
-            },
-        );
+        // the merged content readable there by a later caller — and every OPEN
+        // pull request reading from that branch follows it, through the one
+        // place a branch tip moves.
+        repository.set_branch_tip(&destination_branch, &merge_commit_id, now, Some(&merged_by));
         // Writing a commit and moving a reference modifies the repository, so
         // `lastModifiedDate` moves with it, exactly as it does for `PutFile` or
         // `CreateCommit`.
@@ -950,9 +946,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         pull_request.status = crate::state::PULL_REQUEST_STATUS_CLOSED.to_string();
-        // "The day and time of the last user or system activity on the pull
-        // request": merging it is such activity.
-        pull_request.last_activity_date = now;
+        let actor = merged_by.clone();
         if let Some(target) = pull_request.targets.first_mut() {
             target.source_commit = source_tip;
             target.destination_commit = destination_tip;
@@ -962,6 +956,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target.merge_commit_id = Some(merge_commit_id);
             target.merge_option = Some(merge::MERGE_OPTION_THREE_WAY.to_string());
         }
+        // The merge changed two things about the pull request, so its event log
+        // records both, in the order they happened: the merge state of the
+        // target, then the close that merge caused. Recording them also moves
+        // "the day and time of the last user or system activity on the pull
+        // request" onto this call.
+        let merged_state = pull_request.targets.first().map(|target| {
+            crate::state::PullRequestEventDetail::MergeStateChanged {
+                repository_name: target.repository_name.clone(),
+                destination_reference: target.destination_reference.clone(),
+                merged: target.merged,
+                merged_by: target.merged_by.clone(),
+                merge_commit_id: target.merge_commit_id.clone(),
+                merge_option: target.merge_option.clone(),
+            }
+        });
+        if let Some(merged_state) = merged_state {
+            pull_request.record_event(now, Some(actor.clone()), merged_state);
+        }
+        let status = pull_request.status.clone();
+        pull_request.record_event(
+            now,
+            Some(actor),
+            crate::state::PullRequestEventDetail::StatusChanged { status },
+        );
 
         Ok(MergePullRequestByThreeWayOutput {
             pull_request: Some(pull_request.to_modeled()),

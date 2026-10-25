@@ -137,6 +137,8 @@ mod load_balancer_instance_attachment;
 mod load_balancer_listing;
 #[path = "all/load_balancer_provisioning.rs"]
 mod load_balancer_provisioning;
+#[path = "all/load_balancer_tls_certificate_create.rs"]
+mod load_balancer_tls_certificate_create;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]
 mod load_balancer_tls_certificate_delete;
 #[path = "all/operations_for_resource.rs"]

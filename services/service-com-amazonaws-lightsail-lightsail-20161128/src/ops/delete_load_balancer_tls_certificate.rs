@@ -205,17 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // load balancer holds, so a name none of them carries names nothing
             // to delete — on a load balancer holding no certificate at all, and
             // on one whose certificate a previous call already deleted.
-            let is_attached = balancer
-                .certificate
-                .as_ref()
-                .filter(|certificate| certificate.name == certificate_name)
+            let held = balancer
+                .certificate_index(&certificate_name)
                 .ok_or_else(|| {
                     not_found(
                         crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
                         &certificate_name,
                     )
-                })?
-                .is_attached;
+                })?;
+            let is_attached = balancer
+                .certificates
+                .get(held)
+                .is_some_and(|certificate| certificate.is_attached);
             // "The `force` parameter is required when the primary SSL/TLS
             // certificate is in use by an instance attached to the load
             // balancer": the ATTACHED certificate is the one the load balancer
@@ -235,10 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // load balancer stops reporting a summary for it — and, where the
             // deleted certificate was the attached one, drops back to the plain
             // `HTTP` listener on port 80, which is what the modelled `protocol`
-            // and `publicPorts` are computed from. Nothing else about the load
-            // balancer changes: this call deletes a certificate, not a load
+            // and `publicPorts` are computed from. Every OTHER certificate it
+            // holds stays where it is, and so does everything else about the
+            // load balancer: this call deletes one certificate, not a load
             // balancer.
-            balancer.certificate = None;
+            balancer.certificates.remove(held);
 
             // `operations` is a list because a Lightsail call can act on several
             // resources at once; this one removes exactly one certificate, so it

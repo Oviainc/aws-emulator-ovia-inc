@@ -171,7 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The identity whose call removes the rule, which is the actor the
+        // pull request's event log attributes the removal to.
+        let actor = crate::state::caller_identity_arn(ctx.parts());
         // Which ids address a pull request is `crate::state`'s rule, so every
         // operation taking a `pullRequestId` agrees about it; this only maps each
         // outcome onto the error THIS operation models for it.
@@ -274,13 +276,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let approval_rule_id = rule.approval_rule_id.clone();
+        let event =
+            crate::state::PullRequestEventDetail::ApprovalRuleDeleted(crate::state::ApprovalRuleEvent {
+                approval_rule_id: approval_rule_id.clone(),
+                approval_rule_name: rule.approval_rule_name.clone(),
+                approval_rule_content: rule.content.clone(),
+            });
 
         pull_request
             .approval_rules
             .retain(|rule| rule.approval_rule_name != input.approval_rule_name);
-        // "The day and time of the last user or system activity on the pull
-        // request": removing a rule from it is such activity.
-        pull_request.last_activity_date = std::time::SystemTime::now();
+        // Removing a rule from the pull request changes it, so it is recorded on
+        // the pull request's event log — which also moves "the day and time of
+        // the last user or system activity on the pull request" onto this call.
+        pull_request.record_event(std::time::SystemTime::now(), Some(actor), event);
 
         Ok(DeletePullRequestApprovalRuleOutput { approval_rule_id })
     }

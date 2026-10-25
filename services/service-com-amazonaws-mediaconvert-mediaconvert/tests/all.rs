@@ -53,6 +53,8 @@ mod preset_deletion;
 mod preset_lifecycle;
 #[path = "all/preset_listing.rs"]
 mod preset_listing;
+#[path = "all/preset_settings_validation.rs"]
+mod preset_settings_validation;
 #[path = "all/preset_update.rs"]
 mod preset_update;
 #[path = "all/queue_capacity_validation.rs"]

@@ -558,7 +558,10 @@ async fn a_property_with_no_published_default_is_in_force_only_when_named() {
             );
 
             // Named by the request, it IS in force — at each value it accepts — and the
-            // schema is the table's own either way.
+            // schema is still the table's own: naming a property never DROPS or re-words a
+            // column the table publishes without it. A property that includes columns adds
+            // the ones its published description says it includes, and `property_gated_columns`
+            // pins which columns that is per property.
             let (baseline, _) = schema_of(
                 &case,
                 &get_table(&client, table, None).await,
@@ -574,10 +577,14 @@ async fn a_property_with_no_published_default_is_in_force_only_when_named() {
                     "case {case:?}: expected the named property in force, got {body}"
                 );
                 let (schema, _) = schema_of(&case, &body);
-                assert_eq!(
-                    schema, baseline,
-                    "case {case:?}: this property changes the data of the table, not its columns"
-                );
+                for (column, published) in &baseline {
+                    assert_eq!(
+                        schema.get(column),
+                        Some(published),
+                        "case {case:?}: expected {column} exactly as the table publishes it without the property, got {:?}",
+                        schema.get(column)
+                    );
+                }
             }
 
             // A value outside the published list is still refused.

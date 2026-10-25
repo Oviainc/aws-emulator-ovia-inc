@@ -154,7 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A reporting call answers with what the clock has already made due, so a
+        // manager whose teardown has come due is gone rather than still tagged.
+        store.settle(::std::time::SystemTime::now());
 
         // The configuration manager is this service's only ARN-addressable resource, so
         // an ARN naming no stored manager names no taggable resource at all.

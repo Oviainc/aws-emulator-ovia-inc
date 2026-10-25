@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfigurationManager
-//! Removes the ONE stored configuration manager the ARN names together with the
-//! configurations it owns, so a later `GetConfigurationManager` answers the modelled
-//! 404 and neither list reports it. The modelled 404 when no manager has that ARN; an
-//! empty body on success.
+//! Starts the teardown of the ONE stored configuration manager the ARN names: it and
+//! the configurations it owns stay readable reporting the modelled `DELETING` status
+//! while the teardown is in flight, and are gone once it completes, so a later
+//! `GetConfigurationManager` answers the modelled 404 and neither list reports them.
+//! The modelled
+//! 404 when no manager has that ARN; an empty body on success, for a first delete and
+//! for a repeat of one whose teardown is still in flight alike (`@idempotent`).
 //!
 //! ## Shape of an operation
 //!
@@ -173,11 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // Removing the manager removes the configurations it owns with it: a
-        // configuration is the deployment of one of its definitions and outlives
-        // nothing. An ARN the store does not hold — never created, or already deleted —
-        // is reported as absent.
-        if state.lock().remove_manager(&input.manager_arn).is_none() {
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // So a manager whose teardown has already come due is gone before this
+        // request looks for it, rather than being deleted a second time.
+        store.settle(now);
+
+        // An ARN the store does not hold — never created, or a teardown that has
+        // already completed — is reported as absent.
+        let Some(manager) = store.managers.get(&input.manager_arn) else {
             return Err(
                 DeleteConfigurationManagerErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -189,7 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        };
+
+        // Tearing the deployed resources down is work the service does after it has
+        // answered, and the operation is `@idempotent`: a repeat while that teardown
+        // is in flight answers the way the first did and leaves the teardown exactly
+        // as it was, so the removal still comes due when the first delete made it due.
+        if manager.is_deleting() {
+            return Ok(DeleteConfigurationManagerOutput);
         }
+
+        // The manager and the configurations it owns report the teardown status from
+        // now on, and go together once it comes due: a configuration is the deployment
+        // of one of its manager's definitions and outlives nothing.
+        store.begin_teardown(&input.manager_arn, now);
 
         Ok(DeleteConfigurationManagerOutput)
     }

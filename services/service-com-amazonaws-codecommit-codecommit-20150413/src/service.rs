@@ -278,6 +278,14 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
             "InvalidSortByException",
             "The specified sort by value is not valid.",
         ),
+        // `pullRequestEventType` is a modelled enum, so a value outside it is
+        // refused at the boundary rather than by the handler that reads the log;
+        // the code and sentence are the ones `DescribePullRequestEvents` models
+        // for that member.
+        ("pullRequestEventType", _) => (
+            "InvalidPullRequestEventTypeException",
+            crate::state::INVALID_PULL_REQUEST_EVENT_TYPE_MESSAGE,
+        ),
         // The merge members. Each error is the one the merge operations model for
         // that member, with that shape's own documented sentence.
         ("mergeOption", _) if missing => (
