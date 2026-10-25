@@ -263,6 +263,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .parameter_group_name
             .as_deref()
             .map(crate::state::fold_name);
+        // A replacement `Description` is bounded exactly as the one `CreateCluster`
+        // stores is, through the one rule every write path that takes a description
+        // reads: an update cannot grow a stored description past what a create may set.
+        if let Some(message) = crate::state::description_rejection(input.description.as_deref())
+        {
+            return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         if let Some(shards) = input.shard_configuration.as_ref() {
             // BOUND THE LAYOUT BEFORE ANYTHING IS BUILT OR LOCKED. Like
@@ -360,6 +372,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         acl_name,
                     )),
                 })
+                .into());
+            }
+        }
+        // And so must a new parameter group, resolved through the same rule
+        // `CreateCluster` resolves `ParameterGroupName` with: a repoint at a group that
+        // is not in state would leave the cluster naming settings no describe can
+        // report.
+        if let Some(parameter_group_name) = requested_parameter_group_name.as_deref() {
+            if !state.parameter_groups.contains_key(parameter_group_name) {
+                return Err(UpdateClusterErrorModeled::ParameterGroupNotFoundFault(
+                    ParameterGroupNotFoundFault {
+                        message: Some(crate::state::parameter_group_not_found_message(
+                            parameter_group_name,
+                        )),
+                    },
+                )
                 .into());
             }
         }
