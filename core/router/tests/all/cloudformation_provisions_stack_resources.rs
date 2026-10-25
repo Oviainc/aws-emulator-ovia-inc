@@ -897,12 +897,15 @@ async fn a_resource_the_owning_service_refuses_fails_the_stack() {
     });
     let stack_name = "doomed-stack";
     create_stack(&router, case, stack_name, &template.to_string(), &[]).await;
+    // The create failed, so the stack is being rolled back: that unwind is on the stack's
+    // own clock, like every other transition this suite waits out.
+    tokio::time::sleep(PAST_BOTH_SPANS).await;
 
     let body = describe_stack(&router, case, stack_name).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(

@@ -728,9 +728,9 @@ async fn a_metric_stream_cloudwatch_refuses_fails_the_stack() {
     let body = create_and_settle(&router, case, stack_name, &template).await;
     assert_eq!(
         opt_element(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than publish a stream nothing \
-         holds, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than publish a \
+         stream nothing holds, got {body}"
     );
     let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
     assert!(
