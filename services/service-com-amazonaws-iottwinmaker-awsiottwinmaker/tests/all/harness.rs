@@ -143,6 +143,22 @@ impl Emulator {
         .await
     }
 
+    /// `UpdateEntity`: PUT on the entity's own path, with both ids as
+    /// `@httpLabel`s and the members the patch names in the body.
+    pub(crate) async fn update_entity(
+        &self,
+        workspace_id: &str,
+        entity_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "PUT",
+            &format!("/workspaces/{workspace_id}/entities/{entity_id}"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `ListComponents`: POST
     /// /workspaces/{workspaceId}/entities/{entityId}/components-list, with both
     /// ids as `@httpLabel`s and `componentPath` and the page members

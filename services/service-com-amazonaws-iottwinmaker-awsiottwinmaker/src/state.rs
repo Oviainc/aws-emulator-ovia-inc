@@ -14,8 +14,11 @@
 //! `linkedServices` by reading the sources of the sync jobs it holds
 //! (`Workspace::linked_services`). A resource's `state`, by
 //! contrast, IS stored. An entity's create settles it in `ACTIVE` within the
-//! call that asked for it, so there is no provisioning instant for a read to
-//! compute a transient state from; a component type's create answers the
+//! call that asked for it, so a created entity has no provisioning instant for
+//! a read to compute a transient state from; an entity's UPDATE does open such
+//! a window, so the record carries the instant the state it was left in falls
+//! due (`Entity::settles_at`), which a reader reports through rather than
+//! sleeps for. A component type's create answers the
 //! non-terminal `CREATING`, so its record also carries the instant its
 //! transition to `ACTIVE` falls due (`ComponentType::settles_at`), which a
 //! reader materialises rather than sleeps for.
@@ -45,9 +48,11 @@ pub const ROOT_PARENT_ENTITY_ID: &str = "$ROOT";
 /// carries: a create completes within the call that asked for it, so no entity
 /// is ever persisted in the non-terminal `CREATING` state — recorded traffic
 /// reads a just-created entity back as `ACTIVE`, with no step anywhere in the
-/// corpus observing it `CREATING`. The other values belong to transitions a
-/// later slice owns (`UPDATING` for an update in flight, `ERROR` for a failed
-/// one); `DELETING` is what `DeleteEntity` reports for the removal it performs.
+/// corpus observing it `CREATING`. `UPDATING` is what an update in flight
+/// leaves an entity in ([`Entity::begin_update`]) until the clock settles it
+/// back in `ACTIVE`; `ERROR` belongs to a failed transition this emulator never
+/// produces, and `DELETING` is what `DeleteEntity` reports for the removal it
+/// performs.
 pub const STATE_ACTIVE: &str = "ACTIVE";
 /// See [`STATE_ACTIVE`].
 pub const STATE_DELETING: &str = "DELETING";
@@ -56,10 +61,10 @@ pub const STATE_DELETING: &str = "DELETING";
 /// [`STATE_ACTIVE`] once [`COMPONENT_TYPE_SETTLE_SPAN`] has elapsed.
 pub const STATE_CREATING: &str = "CREATING";
 /// See [`STATE_ACTIVE`]. The non-terminal state an UPDATE in flight leaves a
-/// component type in: `UpdateComponentType` answers with it, and the clock
-/// settles the component type back in [`STATE_ACTIVE`] once
-/// [`COMPONENT_TYPE_SETTLE_SPAN`] has elapsed, exactly as it does after a
-/// create.
+/// resource in: `UpdateComponentType` and `UpdateEntity` answer with it, and
+/// the clock settles the resource back in [`STATE_ACTIVE`] once the matching
+/// span ([`COMPONENT_TYPE_SETTLE_SPAN`], [`ENTITY_SETTLE_SPAN`]) has elapsed —
+/// for a component type, exactly as it does after a create.
 pub const STATE_UPDATING: &str = "UPDATING";
 
 /// How long a component type stays in a non-terminal state — [`STATE_CREATING`]
@@ -80,6 +85,23 @@ pub const STATE_UPDATING: &str = "UPDATING";
 /// record (see [`ComponentType::settles_at`]) and a reader materialises the
 /// transition the clock already owed.
 pub const COMPONENT_TYPE_SETTLE_SPAN: Duration = Duration::from_millis(500);
+
+/// How long an entity stays in [`STATE_UPDATING`] after an update before the
+/// clock makes its transition back to [`STATE_ACTIVE`] due.
+///
+/// `UpdateEntity` answers with "the current state of the entity update", and the
+/// state of an update the service has just accepted is the non-terminal
+/// `UPDATING`: the change is reported as in flight and the entity is `ACTIVE`
+/// again once it has landed. (A CREATE opens no such window — an entity's
+/// create settles it in [`STATE_ACTIVE`] inside the call that asked for it; see
+/// that constant.) AWS documents no duration for this window, so this span is
+/// CHOSEN by this emulator; it is deliberately non-zero, so a caller that reads
+/// the entity back in the same breath as the update still observes the
+/// transient state, and deliberately short, so a client that polls reaches
+/// `ACTIVE` without a long wait. Nothing sleeps for it: the instant it is due is
+/// stored on the record (see [`Entity::settles_at`]) and every read reports the
+/// state the clock has already made true.
+pub const ENTITY_SETTLE_SPAN: Duration = Duration::from_millis(500);
 
 /// The name of the function whose presence makes a component type's schema
 /// initialized.
@@ -202,6 +224,109 @@ pub const MAX_ENTITIES_PER_WORKSPACE: usize = 1000;
 pub const MAX_COMPONENT_TYPES_PER_WORKSPACE: usize = 1000;
 /// See [`MAX_WORKSPACES`].
 pub const MAX_SCENES_PER_WORKSPACE: usize = 1000;
+
+/// The most components one ENTITY holds, the most composite components one of
+/// those components holds, and the most properties and property groups one
+/// component — top-level or composite — holds, before `CreateEntity` /
+/// `UpdateEntity` answer the `ServiceQuotaExceededException` (HTTP 402) each
+/// operation models. See [`entity_contents_over_ceiling`], the one rule both
+/// writers apply.
+///
+/// The same reading as [`MAX_WORKSPACES`]: the real service's quotas are
+/// per-account and adjustable, so no fixed number is AWS's; these are this
+/// emulator's own declared ceilings, so the contents of one entity cannot be
+/// grown without bound by a caller that keeps writing components or properties
+/// into it. Each sits ABOVE what a read can report
+/// ([`MAX_COMPONENTS_RETURNED`], [`MAX_PROPERTIES_RETURNED`]), so a write is
+/// never refused merely for exceeding what one response carries.
+pub const MAX_COMPONENTS_PER_ENTITY: usize = 100;
+/// See [`MAX_COMPONENTS_PER_ENTITY`].
+pub const MAX_COMPOSITE_COMPONENTS_PER_COMPONENT: usize = 100;
+/// See [`MAX_COMPONENTS_PER_ENTITY`].
+pub const MAX_PROPERTIES_PER_COMPONENT: usize = 1000;
+/// See [`MAX_COMPONENTS_PER_ENTITY`].
+pub const MAX_PROPERTY_GROUPS_PER_COMPONENT: usize = 100;
+
+/// Which of this emulator's declared ceilings the contents of `entity` exceed,
+/// as the message a `ServiceQuotaExceededException` carries — `None` when they
+/// exceed none.
+///
+/// Checked over the WHOLE record a writer is about to store rather than over
+/// the entries one call carries, so neither a single huge request nor a long
+/// series of small ones can grow one entity past the ceilings
+/// ([`MAX_COMPONENTS_PER_ENTITY`] and the three beside it). Shared by
+/// `CreateEntity` and `UpdateEntity`, so both writers of an entity's contents
+/// are bounded by one rule, and applied BEFORE anything is committed.
+pub fn entity_contents_over_ceiling(entity: &Entity) -> Option<String> {
+    let scope = format!("entity {}", entity.entity_id);
+    over(
+        &scope,
+        "components",
+        entity.components.len(),
+        MAX_COMPONENTS_PER_ENTITY,
+    )
+    .or_else(|| {
+        entity
+            .components
+            .iter()
+            .find_map(|(component_name, component)| {
+                let scope = format!("{scope} component {component_name}");
+                over(
+                    &scope,
+                    "properties",
+                    component.properties.len(),
+                    MAX_PROPERTIES_PER_COMPONENT,
+                )
+                .or_else(|| {
+                    over(
+                        &scope,
+                        "property groups",
+                        component.property_groups.len(),
+                        MAX_PROPERTY_GROUPS_PER_COMPONENT,
+                    )
+                })
+                .or_else(|| {
+                    over(
+                        &scope,
+                        "composite components",
+                        component.composite_components.len(),
+                        MAX_COMPOSITE_COMPONENTS_PER_COMPONENT,
+                    )
+                })
+                .or_else(|| {
+                    component
+                        .composite_components
+                        .values()
+                        .find_map(|composite| {
+                            let scope =
+                                format!("{scope} compositeComponent {}", composite.component_path);
+                            over(
+                                &scope,
+                                "properties",
+                                composite.properties.len(),
+                                MAX_PROPERTIES_PER_COMPONENT,
+                            )
+                            .or_else(|| {
+                                over(
+                                    &scope,
+                                    "property groups",
+                                    composite.property_groups.len(),
+                                    MAX_PROPERTY_GROUPS_PER_COMPONENT,
+                                )
+                            })
+                        })
+                })
+            })
+    })
+}
+
+/// The message [`entity_contents_over_ceiling`] builds for one ceiling, or
+/// `None` while `count` is within it.
+fn over(scope: &str, kind: &str, count: usize, ceiling: usize) -> Option<String> {
+    (count > ceiling).then(|| {
+        format!("{scope} would hold {count} {kind}, past this service's limit of {ceiling}")
+    })
+}
 /// See [`MAX_WORKSPACES`]. A metadata transfer job is an ACCOUNT-level
 /// resource (`/metadata-transfer-jobs/{metadataTransferJobId}` names no
 /// workspace), so its ceiling is per account rather than per workspace, and
@@ -1388,18 +1513,55 @@ pub struct Entity {
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
-    /// The entity's `State`: the state the STORED record carries, so every
-    /// reader reports the same one and no read has to recompute it. A create
-    /// settles the entity in [`STATE_ACTIVE`] (see its docs); the operations a
-    /// later slice implements are what write any other value here.
+    /// The entity's `State`, as the WRITER that last touched the record left
+    /// it: [`STATE_ACTIVE`] from a create, which settles the entity inside the
+    /// call that asked for it (see that constant), or [`STATE_UPDATING`] from
+    /// an update, until [`settles_at`](Self::settles_at) passes.
     pub state: String,
+    /// The instant the transition out of [`STATE_UPDATING`] falls due — the
+    /// instant of the call that opened the window plus [`ENTITY_SETTLE_SPAN`].
+    /// Stored, never slept for, so a read reports the transition the clock
+    /// already owed without any caller having had to poll. Irrelevant while the
+    /// stored state is terminal, which is how a create leaves it.
+    pub settles_at: SystemTime,
 }
 
 impl Entity {
-    /// The entity's modelled `Status`: its stored state, with the `error`
-    /// structure every reported status carries. See [`status`].
-    pub fn status(&self) -> crate::ops::types::Status {
-        status(&self.state)
+    /// The entity's `State` AS OF `now`: the stored state, with the transition
+    /// the CLOCK has already made due applied.
+    ///
+    /// The `UPDATING` -> `ACTIVE` transition was owed at
+    /// [`settles_at`](Self::settles_at) whether or not anybody called, so
+    /// reporting it is saying what was already true. Computed rather than
+    /// written back, so a read of an entity leaves the store exactly as it
+    /// found it.
+    pub fn state_at(&self, now: SystemTime) -> &str {
+        if self.state == STATE_UPDATING && now >= self.settles_at {
+            STATE_ACTIVE
+        } else {
+            &self.state
+        }
+    }
+
+    /// The entity's modelled `Status` as of `now`: its state
+    /// ([`state_at`](Self::state_at)), with the `error` structure every reported
+    /// status carries. See [`status`].
+    pub fn status(&self, now: SystemTime) -> crate::ops::types::Status {
+        status(self.state_at(now))
+    }
+
+    /// Open the window an UPDATE owes.
+    ///
+    /// The update has landed on the record by the time this is called, so its
+    /// `updateDateTime` moves to the instant of the call that made the change;
+    /// its state leaves [`STATE_ACTIVE`] for the non-terminal
+    /// [`STATE_UPDATING`] the update answers with, and the instant the clock
+    /// owes the return to [`STATE_ACTIVE`] is stored beside it — never slept
+    /// for. See [`state_at`](Self::state_at).
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.update_date_time = now;
+        self.state = STATE_UPDATING.to_string();
+        self.settles_at = now + ENTITY_SETTLE_SPAN;
     }
 }
 
@@ -1667,6 +1829,33 @@ pub fn component_type_is_abstract(workspace: &Workspace, record: &ComponentType)
 /// asked for — so a caller is told which one to change.
 pub fn abstract_component_type_message(component_type_id: &str) -> String {
     format!("Abstract ComponentType {component_type_id} can not be used for creating a component")
+}
+
+/// Why a component instantiating `component_type_id` cannot be written — `None`
+/// when it can — as the message a `ValidationException` carries.
+///
+/// The component type is resolved in the WORKSPACE's own registry, which holds
+/// both the component types a caller created and the built-ins the workspace was
+/// provisioned with. A component INSTANTIATES the type its `componentTypeId`
+/// names, so that type has to be one that can be instantiated at all: an
+/// ABSTRACT one cannot, which is what makes it a base type to extend rather than
+/// one to hold a component of ([`abstract_component_type_message`]). An id the
+/// workspace does not hold is left alone — a real workspace carries more
+/// built-in component types than this emulator models, so refusing one would
+/// reject writes the real service accepts — and a component that names no
+/// component type instantiates nothing and so has nothing to resolve.
+///
+/// Shared by every writer of an entity's components, top-level and composite
+/// alike, so a create and an update hold one path to one rule.
+pub fn abstract_component_type_violation(
+    workspace: &Workspace,
+    component_type_id: Option<&str>,
+) -> Option<String> {
+    let component_type_id = component_type_id?;
+    let component_type = workspace.component_types.get(component_type_id)?;
+    component_type
+        .is_abstract
+        .then(|| abstract_component_type_message(component_type_id))
 }
 
 /// The id prefix the service's own BUILT-IN component types carry.
@@ -2187,7 +2376,10 @@ pub struct ResolvedComponentPath {
 /// segment that failed to resolve.
 ///
 /// Shared by every writer of an entity's composite components, so a create and
-/// an update hold one path to one rule.
+/// an update hold one path to one rule. `member` is the request member the path
+/// arrived in (`compositeComponents` on a create,
+/// `compositeComponentUpdates` on an update), so a refusal names the member the
+/// caller has to fix rather than another operation's.
 ///
 /// Two limits are deliberate, both inherited from how this service stores
 /// component types. A path of a single segment names a top-level component and
@@ -2200,12 +2392,13 @@ pub struct ResolvedComponentPath {
 pub fn resolve_composite_component_path(
     components: &BTreeMap<String, ComponentRecord>,
     component_types: &BTreeMap<String, ComponentType>,
+    member: &str,
     component_path: &str,
 ) -> Result<ResolvedComponentPath, String> {
     let segments: Vec<&str> = component_path.split(COMPONENT_PATH_SEPARATOR).collect();
     if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
         return Err(format!(
-            "compositeComponents.{component_path} is not the path of a composite component: a \
+            "{member}.{component_path} is not the path of a composite component: a \
              component path names one of the entity's components and at least one \
              compositeComponentType declared inside it, separated by \
              '{COMPONENT_PATH_SEPARATOR}'"
@@ -2214,32 +2407,32 @@ pub fn resolve_composite_component_path(
     let component_name = segments[0];
     let Some(component) = components.get(component_name) else {
         return Err(format!(
-            "compositeComponents.{component_path} names component {component_name}, which the \
+            "{member}.{component_path} names component {component_name}, which the \
              entity does not have"
         ));
     };
     let Some(mut component_type_id) = component.component_type_id.clone() else {
         return Err(format!(
-            "compositeComponents.{component_path} names component {component_name}, which \
+            "{member}.{component_path} names component {component_name}, which \
              instantiates no componentType and so declares no composite component"
         ));
     };
     for segment in &segments[1..] {
         let Some(parent) = component_types.get(&component_type_id) else {
             return Err(format!(
-                "compositeComponents.{component_path}: componentType {component_type_id} does \
+                "{member}.{component_path}: componentType {component_type_id} does \
                  not exist in this workspace, so {segment} cannot be resolved against it"
             ));
         };
         let Some(declaration) = parent.composite_component_types.get(*segment) else {
             return Err(format!(
-                "compositeComponents.{component_path}: componentType {component_type_id} \
+                "{member}.{component_path}: componentType {component_type_id} \
                  declares no compositeComponentTypes.{segment}"
             ));
         };
         let Some(declared) = declaration.component_type_id.clone() else {
             return Err(format!(
-                "compositeComponents.{component_path}: componentType {component_type_id} \
+                "{member}.{component_path}: componentType {component_type_id} \
                  declares compositeComponentTypes.{segment} with no componentTypeId, so it names \
                  no component type to instantiate"
             ));
