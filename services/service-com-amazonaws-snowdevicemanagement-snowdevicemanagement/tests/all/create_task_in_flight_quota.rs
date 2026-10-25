@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::state::{
-    service_state, EXECUTION_FINISH_SPAN, IN_FLIGHT_TASK_QUOTA,
+    service_state, EXECUTION_FINISH_SPAN, EXECUTION_START_SPAN, IN_FLIGHT_TASK_QUOTA,
 };
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -106,12 +106,25 @@ fn hold_pending(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// Bring every pending execution's due instant back within reach, far enough back that
-/// both of the spans the store owes it have elapsed: the next call's settle carries it
-/// to its terminal state, and its task with it.
+/// every span the store owes them has elapsed: the next call's settle carries them to
+/// their terminal state, and their tasks with them.
+///
+/// A device performs one execution at a time, so the executions this suite stacks on one
+/// device run one after another: the instant has to reach back past the WHOLE chain, not
+/// just past one execution's spans, or the ones behind the first would still be running.
 fn release_pending(engine: &Arc<engine::InMemoryEngine>) {
     let state = service_state(&**engine).expect("the in-memory engine carries this service's state");
     let mut store = state.lock();
-    let due = SystemTime::now() - EXECUTION_FINISH_SPAN - Duration::from_millis(50);
+    let pending = u32::try_from(
+        store
+            .executions
+            .values()
+            .filter(|execution| execution.due.is_some())
+            .count(),
+    )
+    .expect("a test holds fewer pending executions than u32 counts");
+    let chain = (EXECUTION_START_SPAN + EXECUTION_FINISH_SPAN) * (pending + 1);
+    let due = SystemTime::now() - chain - Duration::from_millis(50);
     for execution in store.executions.values_mut() {
         if execution.due.is_some() {
             execution.due = Some(due);

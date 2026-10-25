@@ -121,14 +121,6 @@ impl From<ListAdminAccountsForOrganizationErrorModeled> for ListAdminAccountsFor
     }
 }
 
-/// The largest page this operation serves, whether or not the caller bounds it.
-///
-/// The model's `com.amazonaws.fms#PaginationMaxResults` range is 1..100, so 100
-/// is the largest `MaxResults` a caller can ask for and therefore the largest
-/// page: a caller who sends none gets that bounded page plus a `NextToken`
-/// rather than every administrator in one response.
-const MAX_PAGE_SIZE: usize = 100;
-
 /// The `ListAdminAccountsForOrganization` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -221,14 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let lower = start.unwrap_or_default();
         let mut remaining = summaries.range(lower..);
 
-        // Clamped into 1..=MAX_PAGE_SIZE rather than only capped: the modelled
-        // range already refuses a page size outside it, and this keeps a page
-        // from ever being empty-with-a-token (which a client would follow
-        // forever) if that validation ever changes.
-        let page_size = input
-            .max_results
-            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
-            .clamp(1, MAX_PAGE_SIZE);
+        // Bounded whether or not the caller bounds it, by the one page-size rule
+        // every paginated operation of this service shares
+        // ([`crate::state::page_size`]): a caller who sends no `MaxResults` gets
+        // the largest page plus a `NextToken` rather than every administrator in
+        // one response.
+        let page_size = crate::state::page_size(input.max_results);
         let admin_accounts: Vec<AdminAccountSummary> = remaining
             .by_ref()
             .take(page_size)

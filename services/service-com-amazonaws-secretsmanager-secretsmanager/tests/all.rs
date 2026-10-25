@@ -15,6 +15,8 @@
 mod secret_error_responses;
 #[path = "all/secret_lifecycle.rs"]
 mod secret_lifecycle;
+#[path = "all/secret_policy_validation.rs"]
+mod secret_policy_validation;
 #[path = "all/secret_resource_policy.rs"]
 mod secret_resource_policy;
 #[path = "all/secret_restore.rs"]

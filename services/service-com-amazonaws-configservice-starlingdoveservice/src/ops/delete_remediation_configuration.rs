@@ -186,6 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.remediation_configurations.remove(name);
+        // The executions of a remediation configuration that no longer exists have
+        // nothing left to report: `DescribeRemediationExecutionStatus` answers for the
+        // configuration, so they go with it rather than outliving it unreadably.
+        store
+            .remediation_executions
+            .retain(|(rule_name, _, _), _| rule_name != name);
 
         Ok(DeleteRemediationConfigurationOutput {})
     }

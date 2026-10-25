@@ -3,7 +3,9 @@
 //! @op CreateTask
 //! Mints a task, persists it `IN_PROGRESS` with the targets, command, description and
 //! tags the request carried, and queues one execution per target device, so a later
-//! `DescribeTask` / `ListExecutions` reports what this call stored. A target naming no
+//! `DescribeTask` / `ListExecutions` reports what this call stored. "Only one task is
+//! executed on a device at a time", so an execution of a device that is already
+//! performing one stays `QUEUED` until that one is terminal. A target naming no
 //! managed device is answered with the modelled `ResourceNotFoundException`, a `tags`
 //! map that breaks the AWS-wide tagging rules with the modelled `ValidationException`,
 //! and `@idempotencyToken` means a repeated `clientToken` reports the first task rather
@@ -297,7 +299,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     execution_id,
                     managed_device_id: target,
                     // The command has not reached the device yet; the clock owes
-                    // it `IN_PROGRESS` once the dispatch span has passed.
+                    // it `IN_PROGRESS` once the dispatch span has passed and the
+                    // device is performing no other execution — "Only one task is
+                    // executed on a device at a time", so the instant stored here
+                    // is the EARLIEST it can be dispatched, not the instant it is.
                     state: "QUEUED".to_string(),
                     started_at: None,
                     last_updated_at: now,

@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(reason) = input
             .parameters
             .as_ref()
-            .and_then(crate::state::first_parameter_rejection)
+            .and_then(crate::state::parameter_rejection)
         {
             return Err(bad_request(reason));
         }

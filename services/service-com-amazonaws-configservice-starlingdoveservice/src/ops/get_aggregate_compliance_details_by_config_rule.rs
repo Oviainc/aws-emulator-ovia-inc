@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAggregateComplianceDetailsByConfigRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAggregateComplianceDetailsByConfigRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the evaluation results one source account and Region of a configuration
+//! aggregator holds for ONE Config rule: exactly the results that rule holds in state
+//! ([`crate::state::ConfigRuleEntry::evaluation_results`]), each carrying the source
+//! account and Region it was aggregated from, in the store's stable (resource type,
+//! resource id, evaluation mode) order and cut into pages of the requested `Limit` —
+//! where 0 asks for the operation's documented default of 50.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAggregateComplianceDetailsByConfigRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This store stands for ONE account in ONE Region, so it answers for that source
+//! alone: a request naming another account or Region, a source the aggregator does not
+//! take in, or a rule this account does not hold gets the empty result page this
+//! operation documents. It is a REPORT: it writes nothing. An aggregator that does not
+//! exist is refused with `NoSuchConfigurationAggregatorException`, a `ComplianceType`
+//! this read does not support with `ValidationException`, and a `NextToken` it did not
+//! issue with `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +180,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAggregateComplianceDetailsByConfigRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAggregateComplianceDetailsByConfigRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAggregateComplianceDetailsByConfigRule"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "Config supports only the COMPLIANT and NON_COMPLIANT [values]. Config does
+        // not support the NOT_APPLICABLE and INSUFFICIENT_DATA values"
+        // (`GetAggregateComplianceDetailsByConfigRuleRequest$ComplianceType`), so a
+        // value the published enum carries but this read does not support fails the
+        // input validation this operation models `ValidationException` for.
+        let wanted = input
+            .compliance_type
+            .as_deref()
+            .filter(|compliance_type| !compliance_type.is_empty());
+        if let Some(unsupported) =
+            wanted.filter(|compliance_type| !AGGREGATE_COMPLIANCE_TYPES.contains(compliance_type))
+        {
+            return Err(
+                GetAggregateComplianceDetailsByConfigRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ComplianceType",
+                            unsupported,
+                            &AGGREGATE_COMPLIANCE_TYPES,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A `Limit` of 0 asks for the operation's default page size; the modelled
+        // maximum of 100 is refused before this handler runs.
+        let page_size = usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(AGGREGATE_COMPLIANCE_DETAILS_PAGE_SIZE);
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_evaluation_result_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        GetAggregateComplianceDetailsByConfigRuleErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous GetAggregateComplianceDetailsByConfigRule \
+                                     response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                GetAggregateComplianceDetailsByConfigRuleErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(crate::state::no_such_configuration_aggregator_message(
+                            &input.configuration_aggregator_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The source the request asks about: this store answers for its own account and
+        // Region, and only while the aggregator takes that source in. Any other source
+        // — and a rule this account does not hold — is data this aggregator holds
+        // nothing of here, which is the empty result page this operation documents
+        // rather than a failure.
+        let holds_source = input.account_id == account_id
+            && input.aws_region == region
+            && aggregator.aggregates_source(account_id, &region);
+        let rule = holds_source
+            .then(|| store.config_rules.get(&input.config_rule_name))
+            .flatten();
+
+        let mut page = Vec::new();
+        let mut next_token = None;
+        if let Some(rule) = rule {
+            // Page over the rule's own result ordering, so a token holds the KEY the
+            // next page resumes at and survives results recorded or dropped between
+            // pages — the same ordering and the same token the account's own
+            // `GetComplianceDetailsByConfigRule` pages by.
+            for (key, result) in &rule.evaluation_results {
+                if resume_at.as_ref().is_some_and(|resume_at| key < resume_at) {
+                    continue;
+                }
+                if wanted.is_some_and(|compliance_type| compliance_type != result.compliance_type) {
+                    continue;
+                }
+                if page.len() == page_size {
+                    next_token = Some(crate::state::encode_evaluation_result_token(key));
+                    break;
+                }
+                page.push(result.to_aggregate_shape(&rule.name, account_id, &region));
+            }
+        }
+
+        Ok(GetAggregateComplianceDetailsByConfigRuleOutput {
+            aggregate_evaluation_results: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The `ComplianceType` values this read accepts as a filter
+/// (`GetAggregateComplianceDetailsByConfigRuleRequest$ComplianceType`: "Config supports
+/// only the COMPLIANT and NON_COMPLIANT. Config does not support the NOT_APPLICABLE and
+/// INSUFFICIENT_DATA values").
+const AGGREGATE_COMPLIANCE_TYPES: [&str; 2] = [
+    crate::state::COMPLIANCE_TYPE_COMPLIANT,
+    crate::state::COMPLIANCE_TYPE_NON_COMPLIANT,
+];
+
+/// How many evaluation results one page carries when the request asks for no size of
+/// its own (`GetAggregateComplianceDetailsByConfigRuleRequest$Limit`: "The maximum
+/// number of evaluation results returned on each page. The default is 50. … If you
+/// specify 0, Config uses the default").
+const AGGREGATE_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 50;

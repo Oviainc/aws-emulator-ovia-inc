@@ -774,6 +774,22 @@ pub fn image_frame_content_type(transfer_syntax_uid: Option<&str>) -> &'static s
 pub struct ImageFrame {
     /// `ImageFrameId` (`^[0-9a-z]{32}$`) — the identifier this frame is reached by.
     pub image_frame_id: String,
+    /// The SOP Instance UID of the DICOM instance this frame's pixel data came from,
+    /// `None` when whatever stored the pixel data recorded no instance.
+    ///
+    /// Frames are keyed by image frame id rather than by instance, because
+    /// `GetImageFrame` takes no instance — this is what lets the aggregated metadata
+    /// document place the pixel data an image set holds in the patient / study / series /
+    /// instance hierarchy it belongs to. A frame stored without one is still served by
+    /// `GetImageFrame`; it just appears under no instance in that document, because
+    /// nothing recorded which instance it belongs to.
+    ///
+    /// Carried wherever a frame is: a copy clones the frames it delivers, so the
+    /// destination reports them under the same instances. The DICOM import that will
+    /// RECORD an instance while minting frames from imported content is still to be
+    /// written (`issues/things-that-do-not-work/20261024T002353Z-medical-imaging-startdicomimportjob-event-propagation.md`),
+    /// which is why nothing in this crate sets it to `Some` yet.
+    pub sop_instance_uid: Option<String>,
     /// The DICOM transfer syntax UID the pixel data is STORED in, `None` when the
     /// instance it came from declared none. `GetImageFrame`'s `contentType` is computed
     /// from it (see [`image_frame_content_type`]); the bytes themselves are never

@@ -2453,27 +2453,11 @@ pub fn not_found(label: &str, id: &str) -> ResourceNotFoundException {
 /// identifier that was asked about, and the value the request carried for it — so the
 /// sentence always names what the caller asked for.
 ///
-/// The prose is the SAME whatever shape ends up carrying it: which modelled exception a
-/// failed lookup is reported as depends on the operation's own error list (see
-/// [`not_found`] and [`not_found_invalid_request`]), not on how the resource is worded.
+/// The prose is the SAME whatever shape ends up carrying it (see [`not_found`]), so an
+/// operation that words an unresolvable scope of its own says the same thing about the
+/// same resource.
 pub fn not_found_sentence(label: &str, id: &str) -> String {
     format!("{label} {id} not found.")
-}
-
-/// The `InvalidRequestException` ("The action or operation requested is invalid", HTTP
-/// 400) for a resource the request named BY ID that this service does not hold, worded by
-/// [`not_found_sentence`].
-///
-/// The counterpart of [`not_found`] for an operation whose MODELLED error list does not
-/// declare `ResourceNotFoundException`: a generated client's error union for such an
-/// operation has no not-found variant, so answering one would be an error no caller can
-/// catch. An id that resolves to nothing is then a request to fix — never a 404 the
-/// operation does not model, and never an empty success, which would claim the resource
-/// exists and is empty.
-pub fn not_found_invalid_request(label: &str, id: &str) -> InvalidRequestException {
-    InvalidRequestException {
-        message: Some(not_found_sentence(label, id)),
-    }
 }
 
 /// Whether `value` is an id of the space this service MINTS ids of `prefix` from:

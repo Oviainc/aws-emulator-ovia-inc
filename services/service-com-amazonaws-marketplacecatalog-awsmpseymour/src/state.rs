@@ -21,8 +21,9 @@ use crate::ops::types::{
     AccessDeniedException, AMISecuritySummary, AmiProductSummary, AssessmentSummary,
     AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
     ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, DataProductSummary,
-    Entity, EntitySummary, ErrorDetail, FrameworkFilters, FrameworkSummary,
-    MachineLearningProductSummary,
+    Entity, EntitySummary, ErrorDetail, ExpressPrivateOfferConfigurationSummary, FrameworkFilters,
+    FrameworkSummary, MachineLearningProductSummary, OfferSetSummary, OfferSummary,
+    ResaleAuthorizationSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
     ValidationException,
 };
@@ -148,15 +149,16 @@ pub const ENTITY_VISIBILITY_VALUES: &[&str] =
 /// created is, since publishing it to buyers takes a further change.
 pub const DEFAULT_ENTITY_VISIBILITY: &str = "Limited";
 
-/// The entity types whose `EntitySummary` projection this emulator fills, and
-/// the per-type summary member each one fills.
+/// The entity types whose per-type summary is the pair every `*ProductSummary`
+/// shape carries.
 ///
 /// Taken from `EntitySummary`'s own members: the five `*ProductSummary` shapes
-/// carry exactly `{ProductTitle, Visibility}`, both of which an entity record
-/// holds. The remaining types (`Offer`, `OfferSet`, `ResaleAuthorization`,
-/// `ExpressPrivateOfferConfiguration`) have summaries whose members — buyer
-/// accounts, release dates, targeting — this slice's change-set application
-/// does not model, so no per-type summary is reported for them.
+/// (`AmiProductSummary`, `ContainerProductSummary`, `DataProductSummary`,
+/// `MachineLearningProductSummary`, `SaaSProductSummary`) carry exactly
+/// `{ProductTitle, Visibility}`. The remaining types' summaries
+/// (`OfferSummary`, `OfferSetSummary`, `ResaleAuthorizationSummary`,
+/// `ExpressPrivateOfferConfigurationSummary`) name further members, each read
+/// from the details member of that name — see [`EntityRecord::to_summary`].
 pub const PRODUCT_ENTITY_TYPES: &[&str] = &[
     "AmiProduct",
     "ContainerProduct",
@@ -513,8 +515,8 @@ impl EntityRecord {
     /// `entity_type` names, and `None` for every other entity's.
     ///
     /// The [`PRODUCT_ENTITY_TYPES`] test is what keeps the member and the type
-    /// it belongs to in step: a type absent from that catalog reports no
-    /// per-type summary at all.
+    /// it belongs to in step: only a type in that catalog has a summary of this
+    /// shape.
     fn product_summary(&self, entity_type: &str) -> Option<(Option<String>, Option<String>)> {
         (self.entity_type == entity_type && PRODUCT_ENTITY_TYPES.contains(&entity_type))
             .then(|| (self.name.clone(), Some(self.visibility.clone())))
@@ -559,13 +561,75 @@ impl EntityRecord {
                     visibility,
                 },
             ),
-            // The summaries of the remaining entity types carry members this
-            // slice does not model; see `PRODUCT_ENTITY_TYPES`.
-            offer_summary: None,
-            resale_authorization_summary: None,
-            offer_set_summary: None,
-            express_private_offer_configuration_summary: None,
+            // The four remaining summaries name members of their own, each the
+            // name of the details member the entity carries that value in.
+            offer_summary: self.is_type("Offer").then(|| OfferSummary {
+                name: self.name.clone(),
+                product_id: self.detail_text("ProductId"),
+                resale_authorization_id: self.detail_text("ResaleAuthorizationId"),
+                release_date: self.detail_text("ReleaseDate"),
+                availability_end_date: self.detail_text("AvailabilityEndDate"),
+                buyer_accounts: self.detail_texts("BuyerAccounts"),
+                state: self.detail_text("State"),
+                targeting: self.detail_texts("Targeting"),
+                offer_set_id: self.detail_text("OfferSetId"),
+                target_agreement_id: self.detail_text("TargetAgreementId"),
+                target_agreement_intent: self.detail_text("TargetAgreementIntent"),
+                created_by_source: self.detail_text("CreatedBySource"),
+            }),
+            resale_authorization_summary: self.is_type("ResaleAuthorization").then(|| {
+                ResaleAuthorizationSummary {
+                    name: self.name.clone(),
+                    product_id: self.detail_text("ProductId"),
+                    product_name: self.detail_text("ProductName"),
+                    manufacturer_account_id: self.detail_text("ManufacturerAccountId"),
+                    manufacturer_legal_name: self.detail_text("ManufacturerLegalName"),
+                    reseller_account_id: self.detail_text("ResellerAccountID"),
+                    reseller_legal_name: self.detail_text("ResellerLegalName"),
+                    status: self.detail_text("Status"),
+                    offer_extended_status: self.detail_text("OfferExtendedStatus"),
+                    created_date: self.detail_text("CreatedDate"),
+                    availability_end_date: self.detail_text("AvailabilityEndDate"),
+                    reseller_role: self.detail_text("ResellerRole"),
+                    source_authorization: self.detail_text("SourceAuthorization"),
+                    issuer_account_id: self.detail_text("IssuerAccountId"),
+                }
+            }),
+            offer_set_summary: self.is_type("OfferSet").then(|| OfferSetSummary {
+                name: self.name.clone(),
+                state: self.detail_text("State"),
+                release_date: self.detail_text("ReleaseDate"),
+                associated_offer_ids: self.detail_texts("AssociatedOfferIds"),
+                solution_id: self.detail_text("SolutionId"),
+            }),
+            express_private_offer_configuration_summary: self
+                .is_type("ExpressPrivateOfferConfiguration")
+                .then(|| ExpressPrivateOfferConfigurationSummary {
+                    product_id: self.detail_text("ProductId"),
+                    state: self.detail_text("State"),
+                }),
         }
+    }
+
+    /// Whether this entity is of `entity_type`.
+    fn is_type(&self, entity_type: &str) -> bool {
+        self.entity_type == entity_type
+    }
+
+    /// The string the entity's details carry at `member`, if any.
+    pub fn detail_text(&self, member: &str) -> Option<String> {
+        self.details.get(member)?.as_str().map(str::to_string)
+    }
+
+    /// The strings the entity's details carry at `member` as a list, if any.
+    pub fn detail_texts(&self, member: &str) -> Option<Vec<String>> {
+        let items = self.details.get(member)?.as_array()?;
+        Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+        )
     }
 
     /// Whether this entity satisfies the `ListEntities` filter `name` with
@@ -578,13 +642,206 @@ impl EntityRecord {
         }
     }
 
-    /// The value this entity sorts on under `Sort$SortBy` value `sort_by`.
-    pub fn sort_key(&self, sort_by: &str) -> &str {
-        match sort_by {
-            "EntityId" => self.id.as_str(),
-            _ => self.last_modified_date.as_str(),
+    /// What this entity carries at the attribute `member` names, as the values a
+    /// filter matches and a sort orders on.
+    ///
+    /// Every attribute a request can select or order on — the two `Sort$SortBy`
+    /// publishes for every type, and the fields each type's own filter and sort
+    /// shapes add — is named after the `EntitySummary` member that reports it, so
+    /// one lookup serves all of them: the three common members the record holds
+    /// in their own fields, and every other member the details member of that
+    /// name. A list-valued attribute (an offer's buyer accounts) answers every
+    /// value it holds; an attribute the entity does not carry answers none.
+    pub fn attribute_values(&self, member: &str) -> Vec<String> {
+        match member {
+            "EntityId" => return vec![self.id.clone()],
+            "LastModifiedDate" => return vec![self.last_modified_date.clone()],
+            ENTITY_VISIBILITY_DETAIL_MEMBER => return vec![self.visibility.clone()],
+            _ => {}
+        }
+        let held = match self.details.get(member) {
+            Some(Value::String(text)) => vec![text.clone()],
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if held.is_empty() && ENTITY_NAME_DETAIL_MEMBERS.contains(&member) {
+            return self.name.clone().into_iter().collect();
+        }
+        held
+    }
+
+    /// The value this entity sorts on under the attribute `sort_by` names.
+    ///
+    /// An attribute holding several values sorts by its least one, and one the
+    /// entity does not carry sorts as the empty string — which puts it first
+    /// ascending and last descending, as a change set with no `EndTime` sorts.
+    pub fn attribute_sort_key(&self, sort_by: &str) -> String {
+        let mut values = self.attribute_values(sort_by);
+        values.sort();
+        values.into_iter().next().unwrap_or_default()
+    }
+}
+
+/// One condition a type-specific filter shape puts on one entity attribute.
+///
+/// Every member of every `*Filters` shape in the model is a shape carrying some
+/// of `ValueList` (match any of these values), `WildCardValue` ("matches the
+/// provided value as a substring in the actual value") and `DateRange` ("dates
+/// between which" the attribute falls) — so one condition carries all three, and
+/// each handler member fills the ones its own filter shape declares.
+#[derive(Debug, Clone, Default)]
+pub struct EntityCriterion {
+    /// The attribute, named as [`EntityRecord::attribute_values`] reads it.
+    pub member: String,
+    pub value_list: Vec<String>,
+    pub wild_card_value: Option<String>,
+    pub after_value: Option<String>,
+    pub before_value: Option<String>,
+}
+
+impl EntityCriterion {
+    /// A condition on `member` that constrains nothing yet.
+    pub fn on(member: &str) -> Self {
+        Self {
+            member: member.to_string(),
+            ..Self::default()
         }
     }
+
+    /// The `ValueList` of the filter shape, if it declares one and carries it.
+    pub fn values(mut self, value_list: Option<&Vec<String>>) -> Self {
+        self.value_list = value_list.cloned().unwrap_or_default();
+        self
+    }
+
+    /// The `WildCardValue` of the filter shape, if it declares one and carries
+    /// it.
+    pub fn wild_card(mut self, value: Option<&String>) -> Self {
+        self.wild_card_value = value.cloned();
+        self
+    }
+
+    /// The `DateRange` bounds of the filter shape, if it declares one and
+    /// carries it.
+    pub fn range(mut self, after: Option<&String>, before: Option<&String>) -> Self {
+        self.after_value = after.cloned();
+        self.before_value = before.cloned();
+        self
+    }
+
+    /// Whether this condition constrains nothing, because the filter shape it
+    /// was read from carried no value at all.
+    pub fn is_empty(&self) -> bool {
+        self.value_list.is_empty()
+            && self.wild_card_value.is_none()
+            && self.after_value.is_none()
+            && self.before_value.is_none()
+    }
+
+    /// Whether this condition is the one wildcard a request may carry.
+    pub fn is_wild_card(&self) -> bool {
+        self.wild_card_value.is_some()
+    }
+
+    /// Whether `record` satisfies every part of this condition.
+    ///
+    /// The parts conjoin: a filter shape carrying both a value list and a
+    /// wildcard selects an entity satisfying both. A date range is satisfied by
+    /// ONE value inside both of its bounds — the attributes it bounds are
+    /// `DateTimeISO8601`, which is fixed-width and UTC, so byte order is
+    /// chronological order.
+    pub fn matches(&self, record: &EntityRecord) -> bool {
+        let held = record.attribute_values(&self.member);
+        if !self.value_list.is_empty()
+            && !held
+                .iter()
+                .any(|value| self.value_list.iter().any(|wanted| wanted == value))
+        {
+            return false;
+        }
+        if let Some(wild_card) = self.wild_card_value.as_deref() {
+            if !held.iter().any(|value| value.contains(wild_card)) {
+                return false;
+            }
+        }
+        if self.after_value.is_some() || self.before_value.is_some() {
+            let within = held.iter().any(|value| {
+                self.after_value
+                    .as_deref()
+                    .is_none_or(|after| value.as_str() >= after)
+                    && self
+                        .before_value
+                        .as_deref()
+                        .is_none_or(|before| value.as_str() <= before)
+            });
+            if !within {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The attributes a list of `entity_type` sorts on BEYOND [`ENTITY_SORT_BY`].
+///
+/// `Sort$SortBy` documents "In addition to `LastModifiedDate` and `EntityId`,
+/// each `EntityType` might support additional fields", and the model names those
+/// fields per type in that type's own `*SortBy` enum — the same enums the
+/// `EntityTypeSort` union carries (`AmiProductSortBy`, `ContainerProductSortBy`,
+/// `DataProductSortBy`, `ExpressPrivateOfferConfigurationSortBy`,
+/// `MachineLearningProductSortBy`, `OfferSortBy`, `OfferSetSortBy`,
+/// `ResaleAuthorizationSortBy`, `SaaSProductSortBy`). This is those enums with
+/// the two common attributes dropped.
+pub fn entity_type_sort_fields(entity_type: &str) -> &'static [&'static str] {
+    match entity_type {
+        "AmiProduct" | "DataProduct" | "MachineLearningProduct" => &["ProductTitle", "Visibility"],
+        "ContainerProduct" => &["CompatibleAWSServices", "ProductTitle", "Visibility"],
+        "SaaSProduct" => &["DeliveryOptionTypes", "ProductTitle", "Visibility"],
+        "Offer" => &[
+            "AvailabilityEndDate",
+            "BuyerAccounts",
+            "CreatedBySource",
+            "Name",
+            "OfferSetId",
+            "ProductId",
+            "ReleaseDate",
+            "ResaleAuthorizationId",
+            "State",
+            "TargetAgreementId",
+            "TargetAgreementIntent",
+            "Targeting",
+        ],
+        "OfferSet" => &["Name", "ReleaseDate", "SolutionId", "State"],
+        "ResaleAuthorization" => &[
+            "AvailabilityEndDate",
+            "CreatedDate",
+            "IssuerAccountId",
+            "ManufacturerAccountId",
+            "ManufacturerLegalName",
+            "Name",
+            "OfferExtendedStatus",
+            "ProductId",
+            "ProductName",
+            "ResellerAccountID",
+            "ResellerLegalName",
+            "ResellerRole",
+            "SourceAuthorization",
+            "Status",
+        ],
+        "ExpressPrivateOfferConfiguration" => &["ProductId", "State"],
+        _ => &[],
+    }
+}
+
+/// Every attribute a `ListEntities` of `entity_type` sorts on: the two
+/// [`ENTITY_SORT_BY`] publishes for every type, then that type's own fields.
+pub fn entity_sort_attributes(entity_type: &str) -> Vec<&'static str> {
+    let mut attributes = ENTITY_SORT_BY.to_vec();
+    attributes.extend_from_slice(entity_type_sort_fields(entity_type));
+    attributes
 }
 
 /// One assessment, as this emulator persists it: the record

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePortal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePortal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: PATCHes a persisted [`crate::state::Portal`] and answers 200 with the
+//! record the store now holds, which is the record `GetPortal` reports afterwards. A
+//! member the request carries replaces the stored one; a member it omits leaves the
+//! stored value as it was. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePortal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The portal's publication is NOT this operation's to move: a patch asked for while a
+//! publish or a disable the service is still carrying out would replace the very
+//! configuration that build is publishing, so it is refused 409 `ConflictException`
+//! until that build comes due (see [`crate::state::Portal::publication_change_in_flight`]).
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +178,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePortal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePortalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // Every refusal of the request itself is decided BEFORE the store is touched, so
+        // a refused patch leaves the portal exactly as it was. A request whose VALUES
+        // cannot be applied to any portal is refused before the portal is looked up,
+        // because whether those values are applicable does not depend on which portal the
+        // request addresses.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePortal"))
+        // `Authorization` and `EndpointConfiguration` are tagged unions modelled as
+        // structures, so the ONE alternative each names is its meaning; a patch carrying
+        // one of them that names none, or names several, is incomplete-or-incorrect
+        // input. The same check `create_portal` makes — see
+        // `crate::state::validate_exclusive_choice`.
+        if let Some(authorization) = input.authorization.as_ref() {
+            if let Err(message) = crate::state::validate_exclusive_choice(
+                "Authorization",
+                &[
+                    ("CognitoConfig", authorization.cognito_config.is_some()),
+                    ("None", authorization.none.is_some()),
+                ],
+            ) {
+                return Err(bad_request(message));
+            }
+        }
+        if let Some(endpoint_configuration) = input.endpoint_configuration.as_ref() {
+            if let Err(message) = crate::state::validate_exclusive_choice(
+                "EndpointConfiguration",
+                &[
+                    ("AcmManaged", endpoint_configuration.acm_managed.is_some()),
+                    ("None", endpoint_configuration.none.is_some()),
+                ],
+            ) {
+                return Err(bad_request(message));
+            }
+        }
+
+        // `IncludedPortalProductArns` holds "The ARNs of the portal products included in
+        // the portal", so a value that is not an ARN of this service's portal-product
+        // namespace names no product at all. Whether each ARN names a product THIS
+        // account's store holds is deliberately not checked, for the reason
+        // `create_portal` gives: a product another account shared is a legitimate
+        // inclusion this store holds no record of.
+        if let Some(arns) = input.included_portal_product_arns.as_ref() {
+            if let Err(message) = crate::state::validate_arns_of(
+                "IncludedPortalProductArns",
+                crate::state::ARN_SERVICE,
+                crate::state::PORTAL_PRODUCT_RESOURCE_PREFIX,
+                arns.iter().map(String::as_str),
+            ) {
+                return Err(bad_request(message));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePortal"));
+        };
+        let mut store = state.lock();
+
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = store.portals.get_mut(&input.portal_id) else {
+            // The message a portal reader answers for an id the account holds no portal
+            // under; the same wording `get_portal` uses.
+            return Err(UpdatePortalErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid portal identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.portal_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // Materialise a publish or disable the CLOCK has already made due before
+        // deciding: that change was owed at its due instant whether or not anyone
+        // called, so the refusal below lifts of its own accord once the build the
+        // service already owed this portal has come due.
+        record.settle(now);
+
+        // A portal's publication is changed by work the SERVICE carries out on its own
+        // (`PublishPortal`/`DisablePortal` only start it), and that work publishes the
+        // configuration the portal holds now — so replacing that configuration
+        // mid-change would leave two answers for what the in-flight build serves.
+        // `ConflictException` is the modelled error for exactly that: "the requested
+        // operation would cause a conflict with the current state of a service resource
+        // associated with the request. Resolve the conflict before retrying this
+        // request." A preview in flight does not block the write: it changes nothing
+        // about what the portal publishes.
+        if let Some(in_flight) = record.publication_change_in_flight(now) {
+            return Err(UpdatePortalErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "The portal {} is {in_flight} and cannot be updated until that \
+                     operation is complete.",
+                    input.portal_id
+                )),
+            })
+            .into());
+        }
+
+        // The update is a PATCH (`PATCH /v2/portals/{PortalId}`): a member the request
+        // carries replaces the stored one, and a member it omits leaves the stored value
+        // exactly as it was. The portal's id, its ARN, its publication state and its
+        // tags are not inputs of this operation, so they are carried over untouched: an
+        // ARN names the Region its resource was created in, a publication is moved only
+        // by the calls that publish or disable it, and tags are moved by the tagging
+        // operations.
+        let mut modified = false;
+        if let Some(authorization) = input.authorization {
+            record.authorization = authorization;
+            modified = true;
+        }
+        if let Some(endpoint_configuration) = input.endpoint_configuration.as_ref() {
+            // Only the domain the ACCOUNT brought is the request's to move: the default
+            // domain name and the hosted zone id this portal reports were generated from
+            // its id and the Region it lives in, neither of which this call moves.
+            record.endpoint_configuration = crate::state::portal_endpoint_configuration(
+                record
+                    .endpoint_configuration
+                    .portal_default_domain_name
+                    .clone(),
+                record
+                    .endpoint_configuration
+                    .portal_domain_hosted_zone_id
+                    .clone(),
+                endpoint_configuration,
+            );
+            modified = true;
+        }
+        if let Some(included_portal_product_arns) = input.included_portal_product_arns {
+            record.included_portal_product_arns = included_portal_product_arns;
+            modified = true;
+        }
+        if let Some(rum_app_monitor_name) = input.rum_app_monitor_name {
+            record.rum_app_monitor_name = Some(rum_app_monitor_name);
+            modified = true;
+        }
+
+        // `PortalTheme$LogoLastUploaded` ("The timestamp when the logo was last
+        // uploaded") is a fact about an upload the SERVICE performed, not a value a
+        // caller owns, so it survives a request that rewrites the theme around it: a
+        // request carrying a `LogoUri` uploaded a logo in THIS call and the theme reports
+        // this call's instant, while a request carrying none uploaded nothing and the
+        // theme keeps the instant of the upload there WAS. Carrying the member at all is
+        // what counts as the upload, whatever URI it names — the same reading
+        // `create_portal` takes of the same pair of members, and the modelled bound is
+        // `len 0..1092`, so an empty one is a value the member accepts like any other.
+        let logo_last_uploaded = match input.logo_uri {
+            Some(logo_uri) => {
+                record.logo_uri = Some(logo_uri);
+                modified = true;
+                Some(crate::state::to_timestamp(now))
+            }
+            ::std::option::Option::None => record.portal_content.theme.logo_last_uploaded,
+        };
+        if let Some(portal_content) = input.portal_content {
+            record.portal_content = portal_content;
+            modified = true;
+        }
+        record.portal_content.theme.logo_last_uploaded = logo_last_uploaded;
+
+        // "The timestamp when the portal was last modified" — it advances only when this
+        // request carried a member to apply, so a patch that configures nothing is not
+        // recorded as a modification of the record.
+        if modified {
+            record.last_modified = now;
+        }
+
+        // Projected from the very value the store now holds, which is what makes this
+        // answer the one a later `GetPortal` reports.
+        let stored = record.to_wire(now);
+        Ok(UpdatePortalOutput {
+            authorization: Some(stored.authorization),
+            endpoint_configuration: Some(stored.endpoint_configuration),
+            included_portal_product_arns: Some(stored.included_portal_product_arns),
+            last_modified: Some(stored.last_modified),
+            last_published: stored.last_published,
+            last_published_description: stored.last_published_description,
+            portal_arn: Some(stored.portal_arn),
+            portal_content: Some(stored.portal_content),
+            portal_id: Some(stored.portal_id),
+            preview: stored.preview,
+            publish_status: stored.publish_status,
+            rum_app_monitor_name: stored.rum_app_monitor_name,
+            status_exception: stored.status_exception,
+            tags: stored.tags,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the member and the constraint it
+/// broke. Takes the `String` the `crate::state` validators hand back.
+fn bad_request(message: String) -> UpdatePortalError {
+    UpdatePortalErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

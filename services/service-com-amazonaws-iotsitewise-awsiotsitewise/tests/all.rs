@@ -194,6 +194,11 @@ mod batch_get_latest_values;
 mod batch_property_value_history;
 #[path = "all/batch_put_timestamp_and_quality.rs"]
 mod batch_put_timestamp_and_quality;
+// In its alphabetical place inside the sorted list, rather than appended after
+// it: the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there collided with this one.
+#[path = "all/create_computation_model_bounds.rs"]
+mod create_computation_model_bounds;
 #[path = "all/dataset_export_jobs.rs"]
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]
@@ -211,6 +216,8 @@ mod execute_query_follows_the_store;
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]
 mod hierarchies_etags_and_refusals;
+#[path = "all/list_asset_models.rs"]
+mod list_asset_models;
 #[path = "all/logging_options.rs"]
 mod logging_options;
 #[path = "all/portal_lifecycle.rs"]

@@ -3,8 +3,8 @@
 //! `ListMembers`, end to end over HTTP: the page it answers with is cut from the members
 //! stored on one network, every summary member comes from that record, each input filter
 //! selects on the stored value it names, and a `NetworkId` that names no network is
-//! refused with a shape this operation's own error list declares rather than answered
-//! with an empty page.
+//! reported as not found rather than answered with an empty page or a request-validation
+//! refusal.
 //!
 //! The tables below span the classes the rules generalise over: the member
 //! configurations a Fabric network is created with, every value `MemberStatus` declares,
@@ -518,61 +518,104 @@ async fn list_members_pages_through_every_member() {
     }
 }
 
-/// A `NetworkId` that names no stored network is refused with a shape this operation's
-/// MODELLED error list declares — `InvalidRequestException`, HTTP 400, naming the network
-/// the request asked about — never an empty page, and never the `ResourceNotFoundException`
-/// the operation does not model (smithy_query: operation ListMembers declares
-/// AccessDeniedException 403, InternalServiceErrorException 500, InvalidRequestException
-/// 400 and ThrottlingException 429, and no not-found).
+/// A `NetworkId` that names no stored network is reported as NOT FOUND — the service's
+/// `ResourceNotFoundException`, HTTP 404, with the service's one not-found sentence naming
+/// the network the request asked about — never an empty page, and never a
+/// request-validation code, which a caller cannot tell from a genuinely malformed request.
+///
+/// The rows span the id forms a caller can pass that name no network and the filter
+/// combinations a well-formed request can carry, because the condition being reported is
+/// the unresolvable scope and not the filters.
 #[tokio::test]
-async fn a_network_id_that_names_nothing_stored_is_the_modelled_invalid_request() {
+async fn a_network_id_that_names_nothing_stored_is_the_not_found() {
     let router = crate::network_and_node_lifecycle::new_router();
     let (network_id, _) =
         create_network(&router, create_network_body("missing-1", "present-net")).await;
 
-    // Rows: the id forms a caller can pass that name no network — a well-shaped one, the
-    // shortest `ResourceIdString`'s `@length(1, 32)` allows, and one that is not
-    // member-shaped at all.
-    let cases: &[&str] = &[
-        "n-NOSUCHNETWORKNOSUCHNETWOR",
-        "x",
-        "n-doesnotexist00000000000000000",
+    // Rows: a well-shaped id, the shortest `ResourceIdString`'s `@length(1, 32)` allows,
+    // one that is not network-shaped at all, and the 32-character maximum — each with a
+    // different, in-model filter combination (none, a valid `MemberStatus`, a name, and
+    // every filter at once with a `MaxResults` inside `@range(1, 20)`).
+    let cases: &[(&str, &str)] = &[
+        ("n-NOSUCHNETWORKNOSUCHNETWOR", ""),
+        ("x", "status=AVAILABLE"),
+        ("n-doesnotexist00000000000000000", "name=org1"),
+        (
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "status=CREATING&isOwned=true&maxResults=5",
+        ),
     ];
 
-    for unknown in cases {
-        let answer = list_members(&router, unknown, "").await;
+    for (unknown, query) in cases {
+        let case = format!("{unknown} ?{query}");
+        let answer = list_members(&router, unknown, query).await;
         assert_eq!(
             (answer.status, answer.error_type.as_str()),
-            (400, "InvalidRequestException"),
-            "case {unknown}: expected 400 InvalidRequestException, got {} {:?}",
+            (404, "ResourceNotFoundException"),
+            "case {case}: expected 404 ResourceNotFoundException, got {} {:?}",
             answer.status,
             answer.body
         );
         assert_eq!(
             answer.text(&["__type"]),
-            "InvalidRequestException",
-            "case {unknown}: expected the body to name the modelled shape, got {:?}",
+            "ResourceNotFoundException",
+            "case {case}: expected the body to name the not-found shape, got {:?}",
             answer.body
         );
-        assert!(
-            answer.text(&["Message"]).contains(unknown),
-            "case {unknown}: expected a Message naming the network that was not resolved, \
-             got {:?}",
+        assert_eq!(
+            answer.text(&["Message"]),
+            format!("Network {unknown} not found."),
+            "case {case}: expected the service's not-found sentence for the network, got {:?}",
             answer.body
         );
-        // `InvalidRequestException` declares `Message` and nothing else, so no member of
-        // the not-found shape leaks into the refusal.
+        // The network was named by id, so there is no ARN to report:
+        // `ResourceNotFoundException$ResourceName` is an `ArnString`
+        // (`@pattern ^arn:.+:.+:.+:.+:.+$`) and stays absent.
         assert_eq!(
             answer.body.get("ResourceName"),
             None,
-            "case {unknown}: expected no ResourceName member, got {:?}",
+            "case {case}: expected no ResourceName member, got {:?}",
             answer.body
         );
     }
 
+    // The other side of the classification: a request that is WRONG rather than
+    // unresolvable is still the 400 request-validation refusal naming the offending value,
+    // and it is decided BEFORE the network is resolved — the same `Status` outside
+    // `MemberStatus` answers the same way whether the network exists or not.
+    // (smithy_query: ListMembersInput$Status targets MemberStatus = CREATING | AVAILABLE |
+    // CREATE_FAILED | UPDATING | DELETING | DELETED | INACCESSIBLE_ENCRYPTION_KEY.)
+    for (scope, target) in [
+        ("the stored network", network_id.as_str()),
+        ("a network that does not exist", "n-NOSUCHNETWORKNOSUCHNETWOR"),
+    ] {
+        for value in [
+            "NOT_A_REAL_STATUS",
+            "available",
+            "CREATING_EXTRA",
+            "AVAILABLE,DELETING",
+        ] {
+            let answer = list_members(&router, target, &format!("status={value}")).await;
+            assert_eq!(
+                (answer.status, answer.error_type.as_str()),
+                (400, "InvalidRequestException"),
+                "case status={value:?} against {scope}: expected 400 InvalidRequestException, \
+                 got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            assert!(
+                answer.text(&["Message"]).contains("Status"),
+                "case status={value:?} against {scope}: expected a Message naming the Status \
+                 member, got {:?}",
+                answer.body
+            );
+        }
+    }
+
     // And the refusals changed nothing: the network that does exist still lists.
     // A network that DOES exist and holds members is the other half of the rule: the
-    // refusal is about resolving the network, not about the page being empty.
+    // not-found is about resolving the network, not about the page being empty.
     let answer = list_members(&router, &network_id, "").await;
     assert_eq!(
         (answer.status, listed_ids(&answer).len()),

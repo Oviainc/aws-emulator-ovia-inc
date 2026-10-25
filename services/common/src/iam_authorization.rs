@@ -52,7 +52,7 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string operators below. A clause this CAN decide is
+//! `PutRumEvents`) and only for the string and ARN operators below. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
 //! `Deny` whose condition demonstrably does not hold refuses nothing. A clause this CANNOT
 //! decide — an operator it does not implement, or a key the request context does not carry
@@ -72,7 +72,7 @@
 //! multi-valued key is left undecided rather than compared against one of its values.
 
 /// The string condition operators this evaluator decides. Everything else — the numeric,
-/// date, IP, ARN and `Null` operators — leaves the statement undecided (see the module
+/// date, IP and `Null` operators — leaves the statement undecided (see the module
 /// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
     "StringEquals",
@@ -82,6 +82,23 @@ const STRING_OPERATORS: &[&str] = &[
     "StringLike",
     "StringNotLike",
 ];
+
+/// The ARN condition operators this evaluator decides, which is how a resource policy
+/// scopes a grant to the resource a request came FROM (`aws:SourceArn`). Like the string
+/// operators, each may be written under a set qualifier; see [`split_set_qualifier`].
+///
+/// "ArnEquals, ArnLike: case-sensitive matching of the ARN. Each of the six colon-delimited
+/// components of the ARN is checked separately and each can include a multi-character match
+/// wildcard (*) or a single-character match wildcard (?)" — both spellings compare the same
+/// way, so both are the wildcard comparison [`wildcard_match`] performs on an ARN, and the
+/// `ArnNot…` spellings are their negations.
+///
+/// The comparison is performed over the WHOLE ARN, the way this module already matches a
+/// statement's `Resource` element, rather than component by component: a `*` therefore spans
+/// the `:` separators, so `arn:aws:sns:*` matches every ARN of that service where
+/// per-component matching would need a wildcard per component. Every pattern that is exact,
+/// or wildcards only within one component, is decided identically either way.
+const ARN_OPERATORS: &[&str] = &["ArnEquals", "ArnNotEquals", "ArnLike", "ArnNotLike"];
 
 /// The most bytes one policy document this evaluator reads may carry.
 ///
@@ -478,8 +495,9 @@ fn principal_values(value: &::serde_json::Value) -> Option<Vec<&str>> {
 /// `Some(true)` when the statement carries no `Condition` or every clause holds,
 /// `Some(false)` when a clause this evaluator decides does NOT hold (so the statement does
 /// not apply, whichever effect it states), and `None` when a clause cannot be decided at
-/// all — an operator outside [`STRING_OPERATORS`], or a single-valued key the request
-/// context does not carry — which the caller reads fail-closed in both directions.
+/// all — an operator outside [`STRING_OPERATORS`] and [`ARN_OPERATORS`], or a single-valued
+/// key the request context does not carry — which the caller reads fail-closed in both
+/// directions.
 ///
 /// A key the request carries SEVERAL values for (the session tag keys of an STS mint,
 /// say) is decided only under one of the set qualifiers, and then by IAM's own rule for
@@ -500,7 +518,7 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
     for (clause, keys) in clauses {
         let keys = keys.as_object()?;
         let (qualifier, operator) = split_set_qualifier(clause);
-        if !STRING_OPERATORS.contains(&operator) {
+        if !STRING_OPERATORS.contains(&operator) && !ARN_OPERATORS.contains(&operator) {
             return None;
         }
         for (key, expected) in keys {
@@ -568,8 +586,8 @@ fn split_set_qualifier(clause: &str) -> (Option<SetQualifier>, &str) {
     (None, clause)
 }
 
-/// Whether one decided string clause holds: `expected` are the clause's values, `actual`
-/// the value the request carries for its key.
+/// Whether one decided clause holds: `expected` are the clause's values, `actual` the value
+/// the request carries for its key.
 fn clause_holds(operator: &str, expected: &[&str], actual: &str) -> bool {
     let any_equals = |case_sensitive: bool| {
         expected.iter().any(|value| {
@@ -592,7 +610,12 @@ fn clause_holds(operator: &str, expected: &[&str], actual: &str) -> bool {
         "StringNotEqualsIgnoreCase" => !any_equals(false),
         "StringLike" => any_like(),
         "StringNotLike" => !any_like(),
-        // Unreachable: the caller checks the operator against `STRING_OPERATORS` first.
+        // An ARN is compared case-sensitively with the same two wildcards, and the two
+        // positive spellings are documented as doing the same comparison.
+        "ArnEquals" | "ArnLike" => any_like(),
+        "ArnNotEquals" | "ArnNotLike" => !any_like(),
+        // Unreachable: the caller checks the operator against the two operator tables
+        // first.
         _ => false,
     }
 }
@@ -863,6 +886,72 @@ mod tests {
         for (case, condition, expected) in deny_rows {
             let document = identity(&format!(
                 "{{\"Effect\":\"Deny\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ));
+            let request =
+                Request::new("rum:PutRumEvents", RESOURCE, &held).with_context(&context);
+            let reached = identity_decision(&[document], &request);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+    }
+
+    /// The ARN operators decide a clause over an ARN-valued key the same way their string
+    /// counterparts decide one over a string: that is what lets a resource policy scope a
+    /// grant to the resource a cross-service request came from.
+    #[test]
+    fn an_arn_condition_is_decided_the_way_its_string_counterpart_is() {
+        let source = "arn:aws:sns:us-east-1:000000000000:alarms";
+        let context = [("aws:SourceArn".to_string(), source.to_string())];
+        let held = principals();
+        // (case, the `Condition` element, the decision it must reach)
+        let rows: [(&str, &str, Decision); 8] = [
+            (
+                "ArnEquals on the very ARN the request carries",
+                "{\"ArnEquals\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:alarms\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "ArnEquals on another ARN",
+                "{\"ArnEquals\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:other\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "ArnLike with a wildcard that matches",
+                "{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:*\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "ArnLike with a wildcard that does not match",
+                "{\"ArnLike\":{\"aws:SourceArn\":\"arn:aws:sqs:*\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "ArnNotEquals on another ARN",
+                "{\"ArnNotEquals\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:other\"}}",
+                Decision::Allowed,
+            ),
+            (
+                "ArnNotLike on the ARN the request carries",
+                "{\"ArnNotLike\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:*\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "an ARN clause over a key the request does not carry",
+                "{\"ArnEquals\":{\"aws:SourceAccount\":\"000000000000\"}}",
+                Decision::NotStated,
+            ),
+            (
+                "an ARN comparison is case-sensitive, like a resource ARN",
+                "{\"ArnEquals\":{\"aws:SourceArn\":\"ARN:AWS:SNS:US-EAST-1:000000000000:ALARMS\"}}",
+                Decision::NotStated,
+            ),
+        ];
+        for (case, condition, expected) in rows {
+            let document = identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
                  \"Condition\":{condition}}}"
             ));
             let request =

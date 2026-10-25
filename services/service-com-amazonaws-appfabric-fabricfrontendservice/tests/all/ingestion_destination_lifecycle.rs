@@ -14,8 +14,9 @@
 //!   UUID) at every level of the chain;
 //! * a WRITE naming an ingestion-chain child that does not exist is refused with
 //!   HTTP 400 `ValidationException`, while the READ path answers HTTP 404
-//!   `ResourceNotFoundException` for the same identifier — naming the FIRST link
-//!   of the chain that does not resolve, whichever level that is;
+//!   `ResourceNotFoundException` for the same identifier — about the app bundle
+//!   when that scope does not resolve, and otherwise about the destination the
+//!   read targets;
 //! * a value outside a modelled bound is refused with HTTP 400;
 //! * a DELETE removes exactly the destination it resolves to and leaves every
 //!   sibling and every parent in place; it is `@idempotent` below the app bundle
@@ -679,13 +680,11 @@ async fn a_missing_chain_resource_is_a_validation_failure_on_writes_and_not_foun
 /// AppFabric's reporting-path not-found text: one CONSTANT per resource KIND,
 /// which no identifier is interpolated into (the identifier the caller supplied
 /// travels in the modelled `resourceId` member instead). Each pair is
-/// `(resourceType, message)`, and the three are the ones this crate's state
-/// module holds — the app-bundle sentence is the one `GetAppBundle` answers and
-/// the ingestion sentence the one `ListIngestionDestinations` answers for an
-/// `ingestionIdentifier` that names nothing inside a real bundle, which is the
-/// same chain this operation reads.
+/// `(resourceType, message)` as this crate's state module holds it — the
+/// app-bundle sentence is the one `GetAppBundle` answers, and the destination
+/// sentence the one this operation answers for a chain it cannot follow to the
+/// destination it targets.
 const BUNDLE_NOT_FOUND: (&str, &str) = ("AppBundle", "The app bundle ID was not found.");
-const INGESTION_NOT_FOUND: (&str, &str) = ("Ingestion", "The specified ingestion does not exist");
 const DESTINATION_NOT_FOUND: (&str, &str) = (
     "IngestionDestination",
     "The specified ingestion destination does not exist",
@@ -696,19 +695,22 @@ const DESTINATION_NOT_FOUND: (&str, &str) = (
 /// pair the refusal must carry.
 type ChainCase<'a> = (&'a str, &'a str, &'a str, &'a str, (&'a str, &'a str));
 
-/// RULE: a reporting read down a parent/child chain is refused at the FIRST link
-/// whose identifier resolves to nothing, and the refusal NAMES that link: HTTP
-/// 404 `ResourceNotFoundException` whose `resourceType` is the absent resource's
-/// kind, whose `resourceId` is the identifier the caller supplied for THAT link,
-/// and whose message is that kind's constant reporting-path sentence — so a
-/// client can tell which level of the chain it got wrong.
+/// RULE: a reporting read down a parent/child chain is refused about the
+/// resource it TARGETS — HTTP 404 `ResourceNotFoundException` whose
+/// `resourceType` is the targeted resource's kind, whose `resourceId` is the
+/// identifier the caller supplied for THAT resource, and whose message is that
+/// kind's constant reporting-path sentence — whatever part of the chain below the
+/// app bundle failed to resolve; the app bundle is the scope the path is rooted
+/// at, so only an app bundle that does not resolve is refused about itself.
+/// (`crate::chain_read_not_found_attribution` asserts the same rule across the
+/// other reads of this chain.)
 ///
 /// The table spans what the rule generalises over: which link of the chain does
 /// not resolve, both modelled `Identifier` forms (ARN and bare UUID) of the
 /// unresolved identifier, whether the link never existed or a delete removed it,
-/// and how many links are unresolved at once (the outermost one is reported).
+/// and how many links are unresolved at once.
 #[tokio::test]
-async fn a_read_names_the_link_of_the_chain_that_is_absent() {
+async fn a_read_names_the_destination_it_targets_when_the_chain_does_not_resolve() {
     let emulator = Emulator::new();
     let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
     let created = emulator
@@ -781,14 +783,14 @@ async fn a_read_names_the_link_of_the_chain_that_is_absent() {
             bundle.as_str(),
             unknown.as_str(),
             destination.as_str(),
-            INGESTION_NOT_FOUND,
+            DESTINATION_NOT_FOUND,
         ),
         (
             "the ingestion, named by ARN",
             bundle.as_str(),
             unknown_ingestion_arn.as_str(),
             destination.as_str(),
-            INGESTION_NOT_FOUND,
+            DESTINATION_NOT_FOUND,
         ),
         (
             "the destination, named by bare UUID",
@@ -812,12 +814,13 @@ async fn a_read_names_the_link_of_the_chain_that_is_absent() {
             DESTINATION_NOT_FOUND,
         ),
         (
-            // Two links unresolved: the OUTERMOST one is the one reported.
+            // Two links unresolved below the bundle: the refusal is still about
+            // the destination this read targets.
             "the ingestion and the destination together",
             bundle.as_str(),
             unknown.as_str(),
             unknown.as_str(),
-            INGESTION_NOT_FOUND,
+            DESTINATION_NOT_FOUND,
         ),
         (
             "every level of the chain at once",
@@ -830,11 +833,13 @@ async fn a_read_names_the_link_of_the_chain_that_is_absent() {
 
     for (case, bundle_identifier, ingestion_identifier, destination_identifier, absent) in cases {
         let (resource_type, message) = absent;
-        // The identifier the caller supplied for the link the refusal names.
-        let resource_id = match resource_type {
-            "AppBundle" => bundle_identifier,
-            "Ingestion" => ingestion_identifier,
-            _ => destination_identifier,
+        // The identifier the caller supplied for the resource the refusal is
+        // about: the bundle when the scope itself did not resolve, and otherwise
+        // the destination this read targets.
+        let resource_id = if resource_type == "AppBundle" {
+            bundle_identifier
+        } else {
+            destination_identifier
         };
         let answer = emulator
             .get_destination(

@@ -103,6 +103,8 @@ mod router_output_configuration_targets;
 mod router_output_lifecycle;
 #[path = "all/router_output_restart.rs"]
 mod router_output_restart;
+#[path = "all/router_output_start.rs"]
+mod router_output_start;
 #[path = "all/router_output_stop.rs"]
 mod router_output_stop;
 #[path = "all/router_outputs.rs"]

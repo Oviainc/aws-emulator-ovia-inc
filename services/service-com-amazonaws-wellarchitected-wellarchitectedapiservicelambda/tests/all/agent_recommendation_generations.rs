@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for an agent profile's recommendation generations:
-//! `StartAgentRecommendationGeneration`, which records one, and the
-//! `GetAgentRecommendationGeneration` that reports it.
+//! `StartAgentRecommendationGeneration`, which records one, the
+//! `GetAgentRecommendationGeneration` that reports it, and the
+//! `ListAgentRecommendationGenerations` that pages over them.
 //!
 //! The rules pinned here, each over a TABLE of inputs rather than one request:
 //!
@@ -42,6 +43,24 @@
 //!    profile takes its generations with it, which is what keeps the per-profile ceiling
 //!    a real bound on the store — an `AgentProfileArn` is never minted twice, so a
 //!    generation left under a deleted profile's ARN could never be reclaimed.
+//! 10. `ListAgentRecommendationGenerations` reports the generations of ONE profile, in
+//!     one stable id order: another profile's generations never appear, a profile that
+//!     holds none reports an empty `items`, and a well-formed `profileArn` that names no
+//!     stored profile is this operation's modelled `404 ResourceNotFoundException`
+//!     (unlike `ListAgentContexts`, which models no such error and so reports an empty
+//!     page). The path resource is resolved BEFORE the query members are judged.
+//! 11. Its optional `RecommendationType` filter selects the generations started for that
+//!     type and nothing else, for EVERY published value, and a value outside the enum's
+//!     published set is refused `400 ValidationException` rather than read as "no filter".
+//! 12. Paging enumerates every selected generation EXACTLY ONCE: no page is longer than
+//!     the `maxResults` asked for, the ids ascend across the pages, the union of the pages
+//!     is the whole selected set, and only the last page omits `nextToken` — with and
+//!     without the type filter. `maxResults` is held to its published
+//!     `@range(min: 1, max: 1000)`, and a `nextToken` this service did not issue is
+//!     refused `400 ValidationException` with reason `CANNOT_PARSE` naming the member.
+//! 13. Generations are metered PER PROFILE: a profile holding the quota refuses the next
+//!     start `402 ServiceQuotaExceededException` and records nothing further, while a
+//!     sibling profile still takes one.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -49,15 +68,38 @@
 //! generations hang off, and the goals a scope may name, are minted by the operations in
 //! `super::agent_goals`.
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
+// The id, list and timestamp assertions are the agent-suite helpers next door: an id the
+// service minted and the `items` of a list are the same shapes here.
+use super::agent_contexts::{assert_create_instant, assert_uuid, id_of, items};
 use super::agent_goals::{absent_profile_arn, create_goal, profile_arn_of, PILLARS};
 use super::agent_profile_lifecycle::delete_profile;
 use super::workload_harness::{encode_path_segment, Answer, Client};
+
+/// The published bounds of `ListAgentRecommendationGenerationsRequest$maxResults`
+/// (`@range(min: 1, max: 1000)` — `smithy_query(query="operation",
+/// operation="ListAgentRecommendationGenerations")`).
+const MAX_RESULTS_MIN: i64 = 1;
+/// See [`MAX_RESULTS_MIN`].
+const MAX_RESULTS_MAX: i64 = 1_000;
+
+/// The query-string names the listing binds its filter and paging members to.
+///
+/// They are CAPITALIZED here (`smithy_query(query="operation",
+/// operation="ListAgentRecommendationGenerations")` shows `httpQuery: "MaxResults"`,
+/// `"NextToken"` and `"RecommendationType"`), unlike the sibling `ListAgentContexts`,
+/// which binds `maxResults` / `nextToken`: the wire name is per member, so the suite
+/// sends what this operation's model says rather than one convention for the service.
+const MAX_RESULTS_QUERY: &str = "MaxResults";
+/// See [`MAX_RESULTS_QUERY`].
+const NEXT_TOKEN_QUERY: &str = "NextToken";
+/// See [`MAX_RESULTS_QUERY`].
+const RECOMMENDATION_TYPE_QUERY: &str = "RecommendationType";
 
 /// Every value the `GenerationStatus` enum publishes, in the order a generation passes
 /// through them; `ERROR` is the terminal status of a FAILED generation and is not on that
@@ -98,6 +140,518 @@ async fn get_generation(client: &Client, profile_arn: &str, generation_id: &str)
             None,
         )
         .await
+}
+
+/// `GET /api/v1/agent-profiles/{profileArn}/generations`, with the filter and paging
+/// members bound to the query string. `query` is passed as sent, empty for a request
+/// that names none.
+async fn list_generations(client: &Client, profile_arn: &str, query: &str) -> Answer {
+    let path = format!(
+        "/api/v1/agent-profiles/{}/generations",
+        encode_path_segment(profile_arn)
+    );
+    let uri = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    };
+    client.send("GET", &uri, None).await
+}
+
+/// The `status` a generation projection carries.
+fn status_of(value: &Value) -> String {
+    value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Assert `later` is at or after `earlier`. Both stamps come from the same serializer,
+/// so numbers compare numerically and ISO-8601 UTC strings compare lexicographically.
+fn assert_not_before(later: Option<&Value>, earlier: Option<&Value>, case: &str, label: &str) {
+    match (later, earlier) {
+        (Some(Value::Number(later)), Some(Value::Number(earlier))) => {
+            let (later, earlier) = (
+                later.as_f64().unwrap_or_default(),
+                earlier.as_f64().unwrap_or_default(),
+            );
+            assert!(
+                later >= earlier,
+                "case {case:?}: {label}, got {later} before {earlier}"
+            );
+        }
+        (Some(Value::String(later)), Some(Value::String(earlier))) => {
+            assert!(
+                later.as_str() >= earlier.as_str(),
+                "case {case:?}: {label}, got {later:?} before {earlier:?}"
+            );
+        }
+        (later, earlier) => panic!(
+            "case {case:?}: {label}: both stamps must be present in one form, got \
+             {later:?} and {earlier:?}"
+        ),
+    }
+}
+
+/// Assert a member is absent (or JSON null).
+fn assert_absent(value: &Value, member: &str, case: &str, why: &str) {
+    assert!(
+        value.get(member).is_none_or(Value::is_null),
+        "case {case:?}: {member} must be absent {why}, got {value:?}"
+    );
+}
+
+/// The rows the listing tests span. They differ along what the rule generalises over:
+/// which `RecommendationType` is asked for (every published value), whether the optional
+/// `name` and `additionalContext` are present, how many pillars the `scope` names (one,
+/// several, every published pillar), whether it names per-pillar `items`, and `name` at
+/// each modelled `@length(min: 1, max: 128)` bound. A scope's `goalIds` must name goals
+/// of the profile, which the rows of `rows()` below cover.
+fn generation_rows() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "minimal-one-pillar",
+            json!({
+                "types": [RECOMMENDATION_TYPES[0]],
+                "scope": { "pillars": [PILLARS[1]] },
+            }),
+        ),
+        (
+            "named-two-pillars",
+            json!({
+                "types": [RECOMMENDATION_TYPES[1]],
+                "name": "quarterly-architecture-review",
+                "scope": { "pillars": [PILLARS[0], PILLARS[2]] },
+            }),
+        ),
+        (
+            "every-pillar-with-items",
+            json!({
+                "types": [RECOMMENDATION_TYPES[2]],
+                // The modelled `@length(min: 1, max: 128)` / `^[A-Za-z0-9_-]+$` ceiling.
+                "name": "n".repeat(128),
+                "scope": {
+                    "pillars": PILLARS,
+                    "items": [
+                        { "pillar": PILLARS[3], "ids": ["SEC01-BP01", "arn:aws:s3:::bucket"] },
+                        { "pillar": PILLARS[4], "ids": ["lambda"] },
+                    ],
+                },
+            }),
+        ),
+        (
+            "additional-context-document",
+            json!({
+                "types": [RECOMMENDATION_TYPES[0]],
+                // The modelled `@length(min: 1, …)` floor.
+                "name": "x",
+                "scope": { "pillars": [PILLARS[4]] },
+                // `additionalContext` is a free-form `Document`, so a nested value has to
+                // round-trip verbatim.
+                "additionalContext": {
+                    "budgetUsd": 120000,
+                    "constraints": ["no downtime", "eu-only"],
+                    "nested": { "approved": true, "ratio": 0.25 },
+                },
+            }),
+        ),
+    ]
+}
+
+/// Assert one generation projection reports what `request` asked for plus the members
+/// the SERVICE owns, for a generation in ANY status: the clock-independent members, that
+/// `status` is a published `GenerationStatus`, and that the `lastModified…` pair is
+/// present exactly when the generation has settled — so this holds however long the test
+/// took to get here.
+fn assert_projection(value: &Value, request: &Value, profile_arn: &str, case: &str) {
+    assert_uuid(&id_of(value), case);
+    assert_eq!(
+        value.get("profileArn").and_then(Value::as_str),
+        Some(profile_arn),
+        "case {case:?}: profileArn must name the profile the generation was started \
+         against, got {value:?}"
+    );
+    assert_eq!(
+        value.get("name"),
+        request.get("name"),
+        "case {case:?}: name must report what the request carried, got {value:?}"
+    );
+    let status = status_of(value);
+    assert!(
+        GENERATION_STATUSES.contains(&status.as_str()),
+        "case {case:?}: status must be a published GenerationStatus, got {value:?}"
+    );
+    assert_eq!(
+        value.get("createdBy").and_then(Value::as_str),
+        Some(engine::emulator_account_id()),
+        "case {case:?}: createdBy must be the account the emulator serves, got {value:?}"
+    );
+    assert_create_instant(value.get("createdAt"), case, "createdAt");
+    // "The estimated time for the generation to complete" is the instant the clock owes
+    // this generation its terminal status, so it is at or after the start.
+    assert_create_instant(
+        value.get("estimatedCompletionTime"),
+        case,
+        "estimatedCompletionTime",
+    );
+    assert_not_before(
+        value.get("estimatedCompletionTime"),
+        value.get("createdAt"),
+        case,
+        "estimatedCompletionTime must not precede createdAt",
+    );
+    // A transition the clock owes is the only change a generation undergoes, so the
+    // `lastModified…` pair tracks the status rather than drifting from it.
+    if status == state::GENERATION_QUEUED {
+        for member in ["lastModifiedBy", "lastModifiedAt"] {
+            assert_absent(value, member, case, "while the generation is queued");
+        }
+    } else {
+        assert_eq!(
+            value.get("lastModifiedBy").and_then(Value::as_str),
+            Some(engine::emulator_account_id()),
+            "case {case:?}: a generation the clock has moved is modified by the account \
+             the emulator serves, got {value:?}"
+        );
+        assert_create_instant(value.get("lastModifiedAt"), case, "lastModifiedAt");
+    }
+}
+
+/// Assert a generation is still in the transient status, with nothing reported about a
+/// change to it. Called only where the test's own clock proves the queue span has not
+/// passed, so it never depends on wall-clock slack.
+fn assert_queued(value: &Value, case: &str) {
+    assert_eq!(
+        status_of(value),
+        state::GENERATION_QUEUED,
+        "case {case:?}: a generation whose analysis is not due yet is {}, got {value:?}",
+        state::GENERATION_QUEUED
+    );
+    for member in ["lastModifiedBy", "lastModifiedAt", "endedAt", "errorDetails"] {
+        assert_absent(value, member, case, "while the generation is queued");
+    }
+}
+
+/// Whether the generation started at `started_at` is certainly still queued by the test's
+/// own clock, so the strict assertions above may be made. A machine slow enough to spend
+/// the whole queue span inside one round trip simply skips them rather than failing.
+fn still_queued(started_at: Instant) -> bool {
+    started_at.elapsed() < state::GENERATION_QUEUE_DURATION
+}
+
+/// Rule 10: every row round-trips — the start's answer, the
+/// `GetAgentRecommendationGeneration` of its id and the entry
+/// `ListAgentRecommendationGenerations` reports agree, and each reports what the request
+/// carried plus the service-owned members.
+#[tokio::test]
+async fn a_started_generation_round_trips_through_get_and_list() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-host", 1).await;
+
+    let mut started: Vec<(&str, Value, Value)> = Vec::new();
+    for (case, request) in generation_rows() {
+        let started_at = Instant::now();
+        let answer = start_generation(&client, &profile_arn, request.clone()).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected StartAgentRecommendationGeneration 200, got {answer:?}"
+        );
+        assert_projection(&answer.body, &request, &profile_arn, case);
+        // The start's own answer is computed at the instant of the call, so it is queued
+        // whatever the machine does next.
+        assert_queued(&answer.body, case);
+
+        let read = get_generation(&client, &profile_arn, &id_of(&answer.body)).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected GetAgentRecommendationGeneration 200, got {read:?}"
+        );
+        assert_projection(&read.body, &request, &profile_arn, case);
+        if still_queued(started_at) {
+            assert_queued(&read.body, case);
+        }
+        // The getter reports the same projection plus the members only it carries. The
+        // clock-derived members (`status`, `lastModified…`) are left to
+        // `assert_projection` above: a read is free to be later than the start.
+        for member in [
+            "id",
+            "profileArn",
+            "name",
+            "createdBy",
+            "createdAt",
+            "estimatedCompletionTime",
+        ] {
+            assert_eq!(
+                read.body.get(member),
+                answer.body.get(member),
+                "case {case:?}: {member} must agree with what the start answered, got {read:?}"
+            );
+        }
+        assert_eq!(
+            read.body.get("scope"),
+            request.get("scope"),
+            "case {case:?}: scope must report what the request carried, got {read:?}"
+        );
+        assert_eq!(
+            read.body.get("additionalContext"),
+            request.get("additionalContext"),
+            "case {case:?}: additionalContext must round-trip verbatim, got {read:?}"
+        );
+        started.push((case, request, answer.body));
+    }
+
+    let listed = list_generations(&client, &profile_arn, &format!("{MAX_RESULTS_QUERY}=1000")).await;
+    assert_eq!(
+        listed.status, 200,
+        "expected ListAgentRecommendationGenerations 200, got {listed:?}"
+    );
+    let reported = items(&listed);
+    assert_eq!(
+        reported.len(),
+        started.len(),
+        "the list must report every stored generation, got {listed:?}"
+    );
+    for (case, request, _) in &started {
+        let entry = reported
+            .iter()
+            .find(|entry| entry.get("name") == request.get("name"))
+            .unwrap_or_else(|| panic!("case {case:?}: the list must report this generation, got {reported:?}"));
+        assert_projection(entry, request, &profile_arn, case);
+    }
+    let ids: Vec<String> = reported.iter().map(id_of).collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        ids, sorted,
+        "the list must report generations in one stable id order, got {ids:?}"
+    );
+    assert_absent(
+        &listed.body,
+        "nextToken",
+        "every-generation-on-one-page",
+        "on a page that reported every generation",
+    );
+}
+
+/// Rule 10 (cont.): the LISTING reports the status the clock owes, not one a caller
+/// moved: a generation is `QUEUED` while its analysis is not due to start, and the
+/// terminal `COMPLETED` once both owed spans have passed, with the transition attributed
+/// and `errorDetails` absent — and reading it never moves it.
+#[tokio::test]
+async fn the_listing_reports_the_status_the_clock_owes() {
+    assert!(
+        !state::GENERATION_QUEUE_DURATION.is_zero() && !state::GENERATION_RUN_DURATION.is_zero(),
+        "both owed spans must be non-zero so each status is observable, got {:?} and {:?}",
+        state::GENERATION_QUEUE_DURATION,
+        state::GENERATION_RUN_DURATION
+    );
+
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-settle", 1).await;
+
+    // One row per published recommendation type, so the rule is asserted over the whole
+    // class rather than for the one type the issue cited.
+    let mut queued: Vec<(&str, String)> = Vec::new();
+    for kind in RECOMMENDATION_TYPES {
+        let started_at = Instant::now();
+        let answer = start_generation(
+            &client,
+            &profile_arn,
+            json!({
+                "types": [kind],
+                "name": format!("settling-{}", kind.to_lowercase()),
+                "scope": { "pillars": [PILLARS[0]] },
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {kind:?}: expected StartAgentRecommendationGeneration 200, got {answer:?}"
+        );
+        // A caller acting straight after the start still sees the transient status: the
+        // start's own answer is computed at the instant of the call.
+        assert_queued(&answer.body, kind);
+        let id = id_of(&answer.body);
+        let listed = list_generations(&client, &profile_arn, "").await;
+        // Asserted only while the test's own clock proves the queue span has not passed,
+        // so a slow machine skips the strict check rather than failing it.
+        if still_queued(started_at) {
+            let entry = items(&listed)
+                .iter()
+                .find(|entry| id_of(entry) == id)
+                .unwrap_or_else(|| panic!("case {kind:?}: the list must report {id}"))
+                .clone();
+            assert_queued(&entry, kind);
+        }
+        queued.push((kind, id));
+    }
+
+    // A test, not a handler: the handler never sleeps for the stored instants, it compares
+    // them with the clock on every read. `std::thread::sleep` rather than
+    // `tokio::time::sleep` because the workspace pins tokio without its `time` feature
+    // ("macros", "rt", "rt-multi-thread" only), and the suite beside this one
+    // (`custom_lens_import::wait_for_the_import_to_land`) waits the same way; there is no
+    // other task on this test's runtime to starve.
+    std::thread::sleep(
+        state::GENERATION_QUEUE_DURATION
+            + state::GENERATION_RUN_DURATION
+            + Duration::from_millis(250),
+    );
+
+    let listed = list_generations(&client, &profile_arn, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "expected ListAgentRecommendationGenerations 200, got {listed:?}"
+    );
+    assert_eq!(
+        items(&listed).len(),
+        queued.len(),
+        "the list must report every started generation, got {listed:?}"
+    );
+    for (case, id) in &queued {
+        let entry = items(&listed)
+            .iter()
+            .find(|entry| &id_of(entry) == id)
+            .unwrap_or_else(|| panic!("case {case:?}: the list must report {id}, got {listed:?}"))
+            .clone();
+        assert_eq!(
+            status_of(&entry),
+            "COMPLETED",
+            "case {case:?}: a generation past both owed spans is terminal, got {entry:?}"
+        );
+        // The transition is the SERVICE's own change to the generation, so it is
+        // attributed to the account this emulator serves at the instant it was due.
+        assert_eq!(
+            entry.get("lastModifiedBy").and_then(Value::as_str),
+            Some(engine::emulator_account_id()),
+            "case {case:?}: lastModifiedBy must be the account the emulator serves, \
+             got {entry:?}"
+        );
+        assert_create_instant(entry.get("lastModifiedAt"), case, "lastModifiedAt");
+        assert_not_before(
+            entry.get("lastModifiedAt"),
+            entry.get("createdAt"),
+            case,
+            "lastModifiedAt must not precede createdAt",
+        );
+
+        // A read must not change what a later caller sees: the same read again answers the
+        // same thing.
+        let again = list_generations(&client, &profile_arn, "").await;
+        assert_eq!(
+            items(&again)
+                .iter()
+                .find(|other| id_of(other) == *id)
+                .cloned(),
+            Some(entry),
+            "case {case:?}: listing a terminal generation must not change it, got {again:?}"
+        );
+    }
+}
+
+/// Rule 10: the list is scoped to ONE profile — a sibling profile's generations, a profile
+/// holding none, and an ARN no profile carries.
+#[tokio::test]
+async fn generations_are_listed_per_profile() {
+    let client = Client::new();
+    let first = profile_arn_of(&client, "generation-host-first", 1).await;
+    let second = profile_arn_of(&client, "generation-host-second", 2).await;
+    let empty = profile_arn_of(&client, "generation-host-empty", 1).await;
+
+    // A different number of generations under each profile, so a handler that ignored the
+    // ARN could not pass by accident.
+    let mut expected: Vec<(&str, Vec<String>)> = Vec::new();
+    for (case, profile_arn, count) in [("first", &first, 1usize), ("second", &second, 3)] {
+        let mut ids = Vec::new();
+        for index in 0..count {
+            let answer = start_generation(
+                &client,
+                profile_arn,
+                json!({
+                    "types": [RECOMMENDATION_TYPES[index % RECOMMENDATION_TYPES.len()]],
+                    "name": format!("{case}-generation-{index}"),
+                    "scope": { "pillars": [PILLARS[index % PILLARS.len()]] },
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected StartAgentRecommendationGeneration 200, got {answer:?}"
+            );
+            ids.push(id_of(&answer.body));
+        }
+        ids.sort();
+        expected.push((case, ids));
+    }
+
+    for ((case, ids), profile_arn) in expected.iter().zip([&first, &second]) {
+        let answer = list_generations(&client, profile_arn, "").await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected ListAgentRecommendationGenerations 200, got {answer:?}"
+        );
+        let reported: Vec<String> = items(&answer).iter().map(id_of).collect();
+        assert_eq!(
+            &reported, ids,
+            "case {case:?}: the list must report exactly this profile's generations, \
+             got {answer:?}"
+        );
+    }
+
+    // A profile that holds none reports an empty page; a generation id that belongs to
+    // ANOTHER profile is as absent as one that belongs to none.
+    let answer = list_generations(&client, &empty, "").await;
+    assert_eq!(
+        answer.status, 200,
+        "case \"profile-with-no-generations\": expected 200, got {answer:?}"
+    );
+    assert!(
+        items(&answer).is_empty(),
+        "case \"profile-with-no-generations\": expected an empty items list, got {answer:?}"
+    );
+    let borrowed = expected[0].1[0].clone();
+    let crossed = get_generation(&client, &second, &borrowed).await;
+    assert_eq!(
+        (crossed.status, crossed.error_code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"another-profiles-generation\": a generation is reached only through its \
+         own profile, got {crossed:?}"
+    );
+
+    // An ARN that names no stored profile: the listing DOES model
+    // `ResourceNotFoundException`, so it is a 404 rather than an empty page. The missing
+    // resource differs by operation: the listing resolves the PROFILE the path names,
+    // while the single-generation read resolves the (profile, generation) pair in one
+    // lookup and so reports the generation that is missing.
+    for (case, profile_arn, resource_type) in [
+        (
+            "list",
+            absent_profile_arn("absent-for-list"),
+            state::AGENT_PROFILE_RESOURCE_TYPE,
+        ),
+        (
+            "get",
+            absent_profile_arn("absent-for-get"),
+            state::AGENT_GENERATION_RESOURCE_TYPE,
+        ),
+    ] {
+        let answer = if case == "list" {
+            list_generations(&client, &profile_arn, "").await
+        } else {
+            get_generation(&client, &profile_arn, &borrowed).await
+        };
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: an ARN that names no profile must be a 404, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body.get("ResourceType").and_then(Value::as_str),
+            Some(resource_type),
+            "case {case:?}: the 404 must name the resource that was missing, got {answer:?}"
+        );
+    }
 }
 
 /// The generation id a successful start answered with, checked against the modelled
@@ -1299,12 +1853,528 @@ async fn deleting_the_profile_takes_its_generations_with_it() {
             "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
         );
     }
-    let store = client.store();
-    let guard = store.lock();
+
+    let listed = list_generations(&client, &profile_arn, "").await;
+    assert_eq!(
+        (listed.status, listed.error_code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "a deleted profile resolves to nothing, got {listed:?}"
+    );
+    // Reached through the shared state rather than over HTTP, because an ARN is minted
+    // fresh per profile: a record left behind is invisible on the wire and still wrong.
     assert!(
-        !guard.agent_generations.contains_key(&profile_arn),
-        "a deleted profile leaves no generations behind, got {} under {profile_arn}",
-        guard.agent_generation_count(&profile_arn)
+        !client
+            .store()
+            .lock()
+            .agent_generations
+            .contains_key(&profile_arn),
+        "no generation may outlive the profile it belongs to"
+    );
+}
+
+/// Rule 11: the `RecommendationType` filter selects the generations asked for that type,
+/// for every published value; an unpublished value is refused.
+#[tokio::test]
+async fn the_recommendation_type_filter_selects_the_generations_asked_for_that_type() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-filter", 1).await;
+
+    // Two generations per published type, so a filter that reported one entry by accident
+    // could not pass.
+    let mut by_type: Vec<(&str, Vec<String>)> =
+        RECOMMENDATION_TYPES.iter().map(|kind| (*kind, Vec::new())).collect();
+    for round in 0..2 {
+        for (kind, ids) in &mut by_type {
+            let answer = start_generation(
+                &client,
+                &profile_arn,
+                json!({
+                    "types": [*kind],
+                    "name": format!("{}-{round}", kind.to_lowercase()),
+                    "scope": { "pillars": [PILLARS[round % PILLARS.len()]] },
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {kind:?}: expected StartAgentRecommendationGeneration 200, got {answer:?}"
+            );
+            ids.push(id_of(&answer.body));
+        }
+    }
+
+    let mut every_id: Vec<String> = by_type
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().cloned())
+        .collect();
+    every_id.sort();
+
+    for (kind, ids) in &by_type {
+        let mut expected = ids.clone();
+        expected.sort();
+        let answer = list_generations(
+            &client,
+            &profile_arn,
+            &format!("{RECOMMENDATION_TYPE_QUERY}={kind}&{MAX_RESULTS_QUERY}=1000"),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {kind:?}: expected ListAgentRecommendationGenerations 200, got {answer:?}"
+        );
+        let reported: Vec<String> = items(&answer).iter().map(id_of).collect();
+        assert_eq!(
+            reported, expected,
+            "case {kind:?}: the filter must report exactly the generations asked for that \
+             type, got {answer:?}"
+        );
+    }
+
+    let unfiltered =
+        list_generations(&client, &profile_arn, &format!("{MAX_RESULTS_QUERY}=1000")).await;
+    let reported: Vec<String> = items(&unfiltered).iter().map(id_of).collect();
+    assert_eq!(
+        reported, every_id,
+        "case \"no-filter\": a request that names no type must report every generation, \
+         got {unfiltered:?}"
+    );
+
+    // A value outside the enum's published set is a refusal, never "no filter".
+    for case in ["COST", "resource", "RESOURCES"] {
+        let answer = list_generations(
+            &client,
+            &profile_arn,
+            &format!("{RECOMMENDATION_TYPE_QUERY}={case}"),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a value outside the published set must be refused, got {answer:?}"
+        );
+    }
+}
+
+/// Rule 12: paging over a stored set with several page sizes enumerates every selected
+/// generation exactly once, in ascending id order, and only the last page omits
+/// `nextToken` — with and without the type filter.
+#[tokio::test]
+async fn paging_enumerates_every_generation_exactly_once() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-paging", 1).await;
+
+    let stored = 7usize;
+    let mut all_ids: Vec<String> = Vec::new();
+    let mut filtered_ids: Vec<String> = Vec::new();
+    for index in 0..stored {
+        // Alternating types, so the filtered enumeration is a strict subset with gaps.
+        let kind = RECOMMENDATION_TYPES[index % 2];
+        let answer = start_generation(
+            &client,
+            &profile_arn,
+            json!({
+                "types": [kind],
+                "name": format!("paged-generation-{index}"),
+                "scope": { "pillars": [PILLARS[index % PILLARS.len()]] },
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "expected StartAgentRecommendationGeneration 200 for generation {index}, \
+             got {answer:?}"
+        );
+        let id = id_of(&answer.body);
+        if kind == RECOMMENDATION_TYPES[0] {
+            filtered_ids.push(id.clone());
+        }
+        all_ids.push(id);
+    }
+    all_ids.sort();
+    filtered_ids.sort();
+
+    // A page size below, at and above the selected count, plus the request that names none
+    // (the member's `@default(100)`), so the rule is asserted where the page divides the
+    // set evenly, unevenly and not at all.
+    for filter in [None, Some(RECOMMENDATION_TYPES[0])] {
+        let expected = if filter.is_some() {
+            &filtered_ids
+        } else {
+            &all_ids
+        };
+        for page_size in [None, Some(1usize), Some(2), Some(3), Some(stored), Some(stored + 4)] {
+            let case = format!("filter={filter:?} maxResults={page_size:?}");
+            let mut seen: Vec<String> = Vec::new();
+            let mut next_token: Option<String> = None;
+            let mut pages = 0usize;
+            loop {
+                let mut query = String::new();
+                if let Some(kind) = filter {
+                    query.push_str(&format!("{RECOMMENDATION_TYPE_QUERY}={kind}"));
+                }
+                if let Some(size) = page_size {
+                    if !query.is_empty() {
+                        query.push('&');
+                    }
+                    query.push_str(&format!("{MAX_RESULTS_QUERY}={size}"));
+                }
+                if let Some(token) = &next_token {
+                    if !query.is_empty() {
+                        query.push('&');
+                    }
+                    query.push_str(&format!("{NEXT_TOKEN_QUERY}={token}"));
+                }
+                let answer = list_generations(&client, &profile_arn, &query).await;
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: expected ListAgentRecommendationGenerations 200, \
+                     got {answer:?}"
+                );
+                let page: Vec<String> = items(&answer).iter().map(id_of).collect();
+                if let Some(size) = page_size {
+                    assert!(
+                        page.len() <= size,
+                        "case {case:?}: a page must not be longer than maxResults, got {page:?}"
+                    );
+                }
+                seen.extend(page);
+                pages += 1;
+                assert!(
+                    pages <= stored + 1,
+                    "case {case:?}: paging must terminate, got {pages} pages for {stored} \
+                     generations"
+                );
+                next_token = answer
+                    .body
+                    .get("nextToken")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(
+                &seen, expected,
+                "case {case:?}: paging must enumerate every selected generation exactly \
+                 once, in ascending id order"
+            );
+        }
+    }
+}
+
+/// Rule 12 (cont.): `maxResults` at each published bound is served; one past either bound
+/// is
+/// refused by the boundary as a `400 ValidationException`.
+#[tokio::test]
+async fn max_results_is_held_to_its_published_range() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-max-results", 1).await;
+    for (index, kind) in RECOMMENDATION_TYPES.iter().enumerate().take(2) {
+        let answer = start_generation(
+            &client,
+            &profile_arn,
+            json!({
+                "types": [kind],
+                "name": format!("bounded-generation-{index}"),
+                "scope": { "pillars": [PILLARS[0]] },
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "expected StartAgentRecommendationGeneration 200 for generation {index}, \
+             got {answer:?}"
+        );
+    }
+
+    for max_results in [MAX_RESULTS_MIN, MAX_RESULTS_MAX] {
+        let answer = list_generations(
+            &client,
+            &profile_arn,
+            &format!("{MAX_RESULTS_QUERY}={max_results}"),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {max_results}: a published bound must be served, got {answer:?}"
+        );
+        let served = items(&answer).len();
+        assert!(
+            served >= 1 && served <= usize::try_from(max_results).expect("a positive bound"),
+            "case {max_results}: expected at most {max_results} of the 2 stored \
+             generations, got {served}"
+        );
+    }
+
+    for max_results in [MAX_RESULTS_MIN - 1, MAX_RESULTS_MAX + 1] {
+        let answer = list_generations(
+            &client,
+            &profile_arn,
+            &format!("{MAX_RESULTS_QUERY}={max_results}"),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {max_results}: a value past a published bound must be refused, \
+             got {answer:?}"
+        );
+    }
+}
+
+/// Rule 12 (cont.): a `nextToken` this service did not issue is a refusal, not a page.
+#[tokio::test]
+async fn an_unissued_next_token_is_refused() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-tokens", 1).await;
+    let started = start_generation(
+        &client,
+        &profile_arn,
+        json!({
+            "types": [RECOMMENDATION_TYPES[0]],
+            "name": "the-only-generation",
+            "scope": { "pillars": [PILLARS[0]] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        started.status, 200,
+        "expected StartAgentRecommendationGeneration 200, got {started:?}"
+    );
+
+    // Each row satisfies the modelled `NextToken` pattern `^[A-Za-z0-9+/=_-]+$`, so the
+    // boundary passes it to the handler: what is under test is the handler's own refusal.
+    // The last two rows are cursors OTHER paginated operations of this service issue,
+    // which are not cursors here.
+    let rows: Vec<(&str, String)> = vec![
+        ("not-a-cursor", "notacursor".to_string()),
+        ("hex-of-nothing", "6e756c6c".to_string()),
+        ("one-character", "a".to_string()),
+        (
+            "another-operations-cursor",
+            state::encode_agent_context_next_token(&id_of(&started.body)),
+        ),
+        (
+            "a-share-cursor",
+            state::encode_share_next_token("0123456789abcdef0123456789abcdef"),
+        ),
+    ];
+    for (case, token) in rows {
+        let answer =
+            list_generations(&client, &profile_arn, &format!("{NEXT_TOKEN_QUERY}={token}")).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: an unissued nextToken must be refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body.get("Reason").and_then(Value::as_str),
+            Some("CANNOT_PARSE"),
+            "case {case:?}: an undecodable cursor is CANNOT_PARSE, got {answer:?}"
+        );
+        let fields: Vec<&str> = answer
+            .body
+            .get("Fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field.get("Name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            fields,
+            vec![state::NEXT_TOKEN_MEMBER],
+            "case {case:?}: the finding must name the member whose value could not be \
+             decoded, got {answer:?}"
+        );
+    }
+
+    // The path's resource is resolved BEFORE the query members are judged: a request
+    // against a profile that is not there is the 404 however its token looks.
+    let absent = list_generations(
+        &client,
+        &absent_profile_arn("absent-with-a-bad-token"),
+        &format!("{NEXT_TOKEN_QUERY}=notacursor"),
+    )
+    .await;
+    assert_eq!(
+        (absent.status, absent.error_code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"absent-profile-and-bad-token\": the missing profile is reported before \
+         the token is judged, got {absent:?}"
+    );
+}
+
+/// Rule 7 (cont.): a start whose `profileArn` names no stored profile is refused as that
+/// field, and records nothing.
+#[tokio::test]
+async fn starting_a_generation_for_an_unknown_profile_is_refused_and_records_nothing() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-unknown-profile", 1).await;
+
+    for (case, target) in [
+        ("never-created", absent_profile_arn("no-such-profile")),
+        (
+            "another-account",
+            "arn:aws:wellarchitected:eu-west-1:210987654321:agent-profile/foreign".to_string(),
+        ),
+    ] {
+        let answer = start_generation(
+            &client,
+            &target,
+            json!({
+                "types": [RECOMMENDATION_TYPES[0]],
+                "name": "unstartable",
+                "scope": { "pillars": [PILLARS[0]] },
+            }),
+        )
+        .await;
+        // The operation models no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",
+        // operation="StartAgentRecommendationGeneration")`), so the unresolvable ARN is
+        // reported as the field whose value the service refused.
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: an ARN that names no profile must be refused, got {answer:?}"
+        );
+        let fields: Vec<&str> = answer
+            .body
+            .get("Fields")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field.get("Name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            fields,
+            vec![state::PROFILE_ARN_MEMBER],
+            "case {case:?}: the finding must name the member that could not be resolved, \
+             got {answer:?}"
+        );
+    }
+
+    // A value outside a published enum set is refused the same way, and stores nothing.
+    for (case, body) in [
+        (
+            "unknown-recommendation-type",
+            json!({
+                "types": ["COST"],
+                "scope": { "pillars": [PILLARS[0]] },
+            }),
+        ),
+        (
+            "unknown-pillar",
+            json!({
+                "types": [RECOMMENDATION_TYPES[0]],
+                "scope": { "pillars": ["COST"] },
+            }),
+        ),
+        (
+            "unknown-pillar-in-items",
+            json!({
+                "types": [RECOMMENDATION_TYPES[0]],
+                "scope": {
+                    "pillars": [PILLARS[0]],
+                    "items": [{ "pillar": "COST", "ids": ["x"] }],
+                },
+            }),
+        ),
+    ] {
+        let answer = start_generation(&client, &profile_arn, body).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a value outside the enum's published set must be refused, \
+             got {answer:?}"
+        );
+    }
+
+    let listed = list_generations(&client, &profile_arn, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "expected ListAgentRecommendationGenerations 200, got {listed:?}"
+    );
+    assert!(
+        items(&listed).is_empty(),
+        "a refused start must record nothing, got {listed:?}"
+    );
+}
+
+/// Rule 13: generations are metered per profile. A profile already holding the quota
+/// refuses the next start with the modelled `402 ServiceQuotaExceededException` and
+/// records nothing further; a sibling profile is unaffected, because the quota is per
+/// profile rather than per account.
+#[tokio::test]
+async fn a_profile_at_its_generation_quota_refuses_the_next_start() {
+    let client = Client::new();
+    let profile_arn = profile_arn_of(&client, "generation-quota", 1).await;
+    let sibling = profile_arn_of(&client, "generation-quota-sibling", 1).await;
+
+    let quota = state::MAX_GENERATIONS_PER_AGENT_PROFILE;
+    for index in 0..quota {
+        let answer = start_generation(
+            &client,
+            &profile_arn,
+            json!({
+                "types": [RECOMMENDATION_TYPES[index % RECOMMENDATION_TYPES.len()]],
+                "name": format!("metered-{index}"),
+                "scope": { "pillars": [PILLARS[index % PILLARS.len()]] },
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "a start inside the quota must be served (generation {index}), got {answer:?}"
+        );
+    }
+
+    let past = start_generation(
+        &client,
+        &profile_arn,
+        json!({
+            "types": [RECOMMENDATION_TYPES[0]],
+            "name": "one-too-many",
+            "scope": { "pillars": [PILLARS[0]] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        (past.status, past.error_code.as_str()),
+        (402, "ServiceQuotaExceededException"),
+        "a start past the quota must be refused, got {past:?}"
+    );
+    assert_eq!(
+        past.body.get("ResourceType").and_then(Value::as_str),
+        Some(state::AGENT_GENERATION_RESOURCE_TYPE),
+        "the refusal must name what the quota meters, got {past:?}"
+    );
+    assert_eq!(
+        items(&list_generations(&client, &profile_arn, &format!("{MAX_RESULTS_QUERY}=1000")).await)
+            .len(),
+        quota,
+        "the refused start must record nothing"
+    );
+
+    // The quota is per profile: the sibling still takes a start.
+    let sibling_start = start_generation(
+        &client,
+        &sibling,
+        json!({
+            "types": [RECOMMENDATION_TYPES[0]],
+            "name": "unmetered-elsewhere",
+            "scope": { "pillars": [PILLARS[0]] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        sibling_start.status, 200,
+        "another profile's quota must not refuse this start, got {sibling_start:?}"
     );
 }
 
