@@ -21,6 +21,8 @@ mod account_policy_removal;
 mod account_policy_selection_criteria;
 #[path = "all/anomaly_suppression.rs"]
 mod anomaly_suppression;
+#[path = "all/configuration_templates.rs"]
+mod configuration_templates;
 #[path = "all/data_protection_policies.rs"]
 mod data_protection_policies;
 #[path = "all/data_protection_policy.rs"]

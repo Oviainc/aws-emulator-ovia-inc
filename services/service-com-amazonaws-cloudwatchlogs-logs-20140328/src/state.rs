@@ -112,6 +112,15 @@
 //! within your account and Region"). A lookup table enriches the queries of any log group,
 //! so it is an account-level resource rather than one group's and lives beside the groups
 //! and not on [`LogGroupRecord`].
+//!
+//! The vended-log delivery CONFIGURATION TEMPLATES — "the valid and default values that are
+//! used when creating delivery sources, delivery destinations, and deliveries", which
+//! `DescribeConfigurationTemplates` reports — are not an account's resources at all: no
+//! operation creates, updates or deletes one, so they live in the catalogue
+//! [`CONFIGURATION_TEMPLATE_SOURCES`] and are rendered by [`configuration_templates`]
+//! rather than in a map of
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State`]. That is also what makes two calls
+//! report the same templates.
 
 use std::collections::BTreeMap;
 
@@ -1635,6 +1644,383 @@ pub fn delivery_source_service(resource_arn: &str) -> Option<&str> {
     arn_service_and_resource(resource_arn)
         .map(|(service, _resource)| service)
         .filter(|service| !service.is_empty())
+}
+
+/// The `logType` of a delivery source that sends TRACES rather than log records, as the
+/// `logType` member's own catalogue spells it ("For Amazon Bedrock AgentCore Runtime, the
+/// valid values are `APPLICATION_LOGS`, `USAGE_LOGS`, and `TRACES`"). Source: the `logType`
+/// member of `PutDeliverySourceRequest`
+/// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
+///
+/// It is the one log type delivered to an X-Ray TRACE delivery destination
+/// ([`TRACE_DELIVERY_DESTINATION_TYPE`]) rather than to a destination that receives log
+/// records.
+pub const TRACE_LOG_TYPE: &str = "TRACES";
+
+/// The `DeliveryDestinationType` of a delivery destination that is a log group of this
+/// service, as the model's enum spells it (the `logs` vendor of
+/// [`DELIVERY_DESTINATION_VENDOR_TYPES`]).
+pub const CWL_DELIVERY_DESTINATION_TYPE: &str = "CWL";
+
+/// The `DeliveryDestinationType` of a delivery destination that is an Amazon S3 bucket, as
+/// the model's enum spells it (the `s3` vendor of [`DELIVERY_DESTINATION_VENDOR_TYPES`]).
+pub const S3_DELIVERY_DESTINATION_TYPE: &str = "S3";
+
+/// The one `OutputFormat` that carries a whole record on its own, needing neither a field
+/// order nor a delimiter to be read back. Spelled as the model's `OutputFormat` enum spells
+/// it ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]).
+pub const STRUCTURED_OUTPUT_FORMAT: &str = "json";
+
+/// The one `OutputFormat` that is a columnar FILE layout rather than a per-record encoding,
+/// so it applies only where a delivery writes objects. Spelled as the model's `OutputFormat`
+/// enum spells it ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]).
+pub const COLUMNAR_OUTPUT_FORMAT: &str = "parquet";
+
+/// The `OutputFormat`s whose records are field values joined by a delimiter — the formats
+/// `fieldDelimiter` is about ("The field delimiter that is used between record fields when
+/// the final output format of a delivery is in Plain, W3C, or Raw format"). Each is spelled
+/// as the model's `OutputFormat` enum spells it
+/// ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]).
+pub const DELIMITED_OUTPUT_FORMATS: [&str; 3] = ["plain", "raw", "w3c"];
+
+/// The field delimiters a delivery may be configured with, and the one a template reports as
+/// its default (the first).
+///
+/// THE EMULATOR'S OWN CATALOGUE, not one cited from AWS: `FieldDelimiter` is modelled only as
+/// a string of up to 5 characters and AWS publishes the permitted set for a log type through
+/// this operation alone, so these are the single-character separators a delimited record
+/// format can be read back with.
+pub const CONFIGURATION_TEMPLATE_FIELD_DELIMITERS: [&str; 5] = [",", "\t", "|", ";", " "];
+
+/// The variable fields a delivery to an S3 bucket may use in its `suffixPath`.
+///
+/// THE EMULATOR'S OWN CATALOGUE: `S3DeliveryConfiguration$suffixPath` documents that "the
+/// valid variables to use in the suffix path vary by log type" and that a caller finds them
+/// by calling this operation and reading `allowedSuffixPathFields`, so AWS publishes the set
+/// nowhere else. These are the facts this service knows about a delivery — the account and
+/// Region it is made in, and the service and log type its source sends — together with the
+/// time partition of the object that is written.
+pub const CONFIGURATION_TEMPLATE_SUFFIX_PATH_FIELDS: [&str; 8] = [
+    "account-id",
+    "region",
+    "service",
+    "log-type",
+    "yyyy",
+    "MM",
+    "dd",
+    "HH",
+];
+
+/// The `suffixPath` a template reports as the default for a delivery to an S3 bucket: every
+/// variable in it is one of [`CONFIGURATION_TEMPLATE_SUFFIX_PATH_FIELDS`], because a default
+/// a caller cannot restate is no default.
+pub const CONFIGURATION_TEMPLATE_DEFAULT_SUFFIX_PATH: &str =
+    "AWSLogs/{account-id}/{service}/{region}/{yyyy}/{MM}/{dd}/{HH}";
+
+/// Whether a delivery to an S3 bucket writes Hive-compatible object prefixes by default.
+/// `enableHiveCompatiblePath` "causes the S3 objects that contain delivered logs to use a
+/// prefix structure that allows for integration with Apache Hive", which
+/// [`CONFIGURATION_TEMPLATE_DEFAULT_SUFFIX_PATH`] does not, so the default is off.
+pub const CONFIGURATION_TEMPLATE_DEFAULT_HIVE_COMPATIBLE_PATH: bool = false;
+
+/// The IAM action a caller needs on a resource "to be able to successfully create a delivery
+/// source on the desired resource type when calling PutDeliverySource", without the service
+/// prefix an IAM action carries. The prefix is the resource's own service — the same string a
+/// delivery source reports as its `service` ([`delivery_source_service`]) — so a template
+/// names the action as `<service>:<this>`.
+pub const VENDED_LOGS_DELIVERY_ACTION: &str = "AllowVendedLogDeliveryForResource";
+
+/// The record fields a delivery of any log type may carry, each paired with whether a delivery
+/// MUST include it.
+///
+/// `ConfigurationTemplate$allowedFields` is "the allowed fields that a caller can use in the
+/// recordFields parameter" of a delivery, and `CreateDelivery$recordFields` adds that "if the
+/// delivery's log source has mandatory fields, they must be included in this list".
+///
+/// THE EMULATOR'S OWN CATALOGUE: the fields a particular sending service puts in its records
+/// are published by that service, and this model names none, so these are the fields
+/// CloudWatch Logs itself generates for a record — the same ones `GetLogGroupFields` reports
+/// as generated ("fields that start with @ are fields generated by CloudWatch Logs. For
+/// example, @timestamp is the timestamp of each log event") — with the two carrying a record's
+/// instant and its content mandatory, because a delivered record without them is not the
+/// record.
+pub const CONFIGURATION_TEMPLATE_RECORD_FIELDS: [(&str, bool); 5] = [
+    ("@ingestionTime", false),
+    ("@log", false),
+    ("@logStream", false),
+    ("@message", true),
+    ("@timestamp", true),
+];
+
+/// One entry of the catalogue behind `DescribeConfigurationTemplates`: a kind of resource that
+/// can send vended logs, and the log types it sends.
+///
+/// `service` is the resource's service as this emulator names it everywhere else — the service
+/// namespace of the resource's ARN, which is what a stored delivery source reports as its
+/// `service` ([`delivery_source_service`]) — so a caller that holds a delivery source can find
+/// the templates that apply to it. `resource_type` is the resource kind within that service,
+/// and `log_types` are the log types that service's resource sends.
+///
+/// Source for the service / log-type pairings: the `logType` member of
+/// `PutDeliverySourceRequest`, whose own catalogue names the log types each service sends
+/// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigurationTemplateSource {
+    /// `ConfigurationTemplate$service` — "A string specifying which service this configuration
+    /// template applies to."
+    pub service: &'static str,
+    /// `ConfigurationTemplate$resourceType` — the kind of resource of that service which sends
+    /// the logs.
+    pub resource_type: &'static str,
+    /// `ConfigurationTemplate$logType` — "the type of log that the source is sending", one
+    /// template per entry.
+    pub log_types: &'static [&'static str],
+}
+
+impl ConfigurationTemplateSource {
+    /// The delivery destination types a delivery of `log_type` can be sent to: traces go to an
+    /// X-Ray trace delivery destination ([`TRACE_DELIVERY_DESTINATION_TYPE`], the kind
+    /// `PutDeliveryDestination` documents as needing no destination configuration), and log
+    /// records go to each of the other destination types the model's
+    /// `DeliveryDestinationType` names.
+    pub fn delivery_destination_types(log_type: &str) -> Vec<String> {
+        crate::ops::types::DELIVERY_DESTINATION_TYPE_VALUES
+            .iter()
+            .filter(|destination_type| {
+                (**destination_type == TRACE_DELIVERY_DESTINATION_TYPE)
+                    == (log_type == TRACE_LOG_TYPE)
+            })
+            .map(|destination_type| (*destination_type).to_string())
+            .collect()
+    }
+
+    /// Every template this entry contributes: one per (log type, delivery destination type)
+    /// pair it supports, because a template carries "the valid and default values" for
+    /// delivering ONE log type to ONE kind of destination.
+    pub fn templates(&self) -> Vec<crate::ops::types::ConfigurationTemplate> {
+        self.log_types
+            .iter()
+            .flat_map(|log_type| {
+                Self::delivery_destination_types(log_type)
+                    .into_iter()
+                    .map(|destination_type| self.template(log_type, &destination_type))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// This entry's template for one log type delivered to one kind of destination.
+    ///
+    /// Everything but the three catalogue values is DERIVED from the destination type, because
+    /// what a delivery may be configured with is a property of what receives it: the formats it
+    /// can be written in, whether a field delimiter applies at all, and whether an S3 object
+    /// layout applies.
+    fn template(
+        &self,
+        log_type: &str,
+        destination_type: &str,
+    ) -> crate::ops::types::ConfigurationTemplate {
+        let output_formats = configuration_template_output_formats(destination_type);
+        let is_delimited = output_formats
+            .iter()
+            .any(|format| DELIMITED_OUTPUT_FORMATS.contains(&format.as_str()));
+        let writes_objects = destination_type == S3_DELIVERY_DESTINATION_TYPE;
+        let s3_delivery_configuration =
+            writes_objects.then(|| crate::ops::types::S3DeliveryConfiguration {
+                suffix_path: Some(CONFIGURATION_TEMPLATE_DEFAULT_SUFFIX_PATH.to_string()),
+                enable_hive_compatible_path: Some(
+                    CONFIGURATION_TEMPLATE_DEFAULT_HIVE_COMPATIBLE_PATH,
+                ),
+            });
+        let field_delimiter = is_delimited.then(|| {
+            CONFIGURATION_TEMPLATE_FIELD_DELIMITERS
+                .first()
+                .copied()
+                .unwrap_or_default()
+                .to_string()
+        });
+        crate::ops::types::ConfigurationTemplate {
+            service: Some(self.service.to_string()),
+            log_type: Some(log_type.to_string()),
+            resource_type: Some(self.resource_type.to_string()),
+            delivery_destination_type: Some(destination_type.to_string()),
+            default_delivery_config_values: Some(
+                crate::ops::types::ConfigurationTemplateDeliveryConfigValues {
+                    // The default record field list is every field the template allows, in
+                    // the order the caller would have to restate them in
+                    // (`CreateDelivery$recordFields` is "the list of record fields to be
+                    // delivered to the destination, IN ORDER"): a delivery created without a
+                    // field list delivers the whole record, and the mandatory ones are the
+                    // subset a caller may not drop from it.
+                    record_fields: Some(
+                        CONFIGURATION_TEMPLATE_RECORD_FIELDS
+                            .iter()
+                            .map(|(field, _mandatory)| (*field).to_string())
+                            .collect(),
+                    ),
+                    field_delimiter,
+                    s3_delivery_configuration,
+                },
+            ),
+            allowed_fields: Some(
+                CONFIGURATION_TEMPLATE_RECORD_FIELDS
+                    .iter()
+                    .map(|(field, mandatory)| crate::ops::types::RecordField {
+                        name: Some((*field).to_string()),
+                        mandatory: Some(*mandatory),
+                    })
+                    .collect(),
+            ),
+            allowed_output_formats: Some(output_formats),
+            allowed_action_for_allow_vended_logs_delivery_for_resource: Some(format!(
+                "{}:{VENDED_LOGS_DELIVERY_ACTION}",
+                self.service
+            )),
+            allowed_field_delimiters: is_delimited.then(|| {
+                CONFIGURATION_TEMPLATE_FIELD_DELIMITERS
+                    .iter()
+                    .map(|delimiter| (*delimiter).to_string())
+                    .collect()
+            }),
+            allowed_suffix_path_fields: writes_objects.then(|| {
+                CONFIGURATION_TEMPLATE_SUFFIX_PATH_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect()
+            }),
+            // The schema of "a configuration that can be set when calling PutDeliverySource":
+            // no log type in this catalogue takes one, so none is reported.
+            delivery_source_configuration: None,
+            // An S3 Tables integration is a property of an integration created by its own
+            // operations, not of a template, so none is reported here.
+            s3_tables_integration: None,
+        }
+    }
+}
+
+/// The `OutputFormat`s a delivery to `destination_type` can be written in.
+///
+/// DERIVED from what receives the delivery rather than listed per destination type: a
+/// destination that stores one structured record per delivered item — a log group of this
+/// service, or the X-Ray trace destination that receives spans — takes only the structured
+/// format ([`STRUCTURED_OUTPUT_FORMAT`]), and the columnar file format
+/// ([`COLUMNAR_OUTPUT_FORMAT`]) applies only where the delivery writes objects, which is the
+/// S3 destination. Every other value of the model's `OutputFormat`
+/// ([`crate::ops::types::OUTPUT_FORMAT_VALUES`]) applies to the rest.
+pub fn configuration_template_output_formats(destination_type: &str) -> Vec<String> {
+    let one_record_each = destination_type == CWL_DELIVERY_DESTINATION_TYPE
+        || destination_type == TRACE_DELIVERY_DESTINATION_TYPE;
+    let writes_objects = destination_type == S3_DELIVERY_DESTINATION_TYPE;
+    crate::ops::types::OUTPUT_FORMAT_VALUES
+        .iter()
+        .filter(|format| !one_record_each || **format == STRUCTURED_OUTPUT_FORMAT)
+        .filter(|format| writes_objects || **format != COLUMNAR_OUTPUT_FORMAT)
+        .map(|format| (*format).to_string())
+        .collect()
+}
+
+/// The resources that can send vended logs, and the log types each of them sends — the
+/// catalogue `DescribeConfigurationTemplates` reports templates from.
+///
+/// Source for every row: the `logType` member of `PutDeliverySourceRequest`, whose catalogue
+/// names the log types each service sends
+/// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`); each
+/// service is named by its ARN namespace, the same spelling a stored delivery source reports
+/// ([`delivery_source_service`]).
+pub const CONFIGURATION_TEMPLATE_SOURCES: &[ConfigurationTemplateSource] = &[
+    ConfigurationTemplateSource {
+        service: "amplify",
+        resource_type: "app",
+        log_types: &["ACCESS_LOGS", "WAF_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "bedrock-agentcore",
+        resource_type: "runtime",
+        log_types: &["APPLICATION_LOGS", "USAGE_LOGS", TRACE_LOG_TYPE],
+    },
+    ConfigurationTemplateSource {
+        service: "cloudfront",
+        resource_type: "distribution",
+        log_types: &["ACCESS_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "elasticloadbalancing",
+        resource_type: "loadbalancer",
+        log_types: &[
+            "ALB_ACCESS_LOGS",
+            "ALB_CONNECTION_LOGS",
+            "ALB_HEALTH_CHECK_LOGS",
+            "NLB_ACCESS_LOGS",
+        ],
+    },
+    ConfigurationTemplateSource {
+        service: "logs",
+        resource_type: "log-group",
+        log_types: &["INSIGHTS_QUERY_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "s3",
+        resource_type: "bucket",
+        log_types: &["S3_SERVER_ACCESS_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "securityhub",
+        resource_type: "hubv2",
+        log_types: &["SECURITY_FINDING_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "ses",
+        resource_type: "mailmanager",
+        log_types: &["APPLICATION_LOGS", "TRAFFIC_POLICY_DEBUG_LOGS"],
+    },
+    ConfigurationTemplateSource {
+        service: "workmail",
+        resource_type: "organization",
+        log_types: &[
+            "ACCESS_CONTROL_LOGS",
+            "AUTHENTICATION_LOGS",
+            "WORKMAIL_AVAILABILITY_PROVIDER_LOGS",
+            "WORKMAIL_MAILBOX_ACCESS_LOGS",
+            "WORKMAIL_PERSONAL_ACCESS_TOKEN_LOGS",
+        ],
+    },
+];
+
+/// Every configuration template of this service, in [`configuration_template_key`] order.
+///
+/// One enumeration, built from [`CONFIGURATION_TEMPLATE_SOURCES`] on every call: the catalogue
+/// is service-managed — no operation creates, updates or deletes a template — so two calls
+/// report the same templates in the same order, and the order is what makes
+/// `DescribeConfigurationTemplates`'s pagination cursor resume at a position that does not
+/// move.
+pub fn configuration_templates() -> Vec<crate::ops::types::ConfigurationTemplate> {
+    let mut templates: Vec<crate::ops::types::ConfigurationTemplate> =
+        CONFIGURATION_TEMPLATE_SOURCES
+            .iter()
+            .flat_map(ConfigurationTemplateSource::templates)
+            .collect();
+    templates.sort_by_key(configuration_template_key);
+    templates
+}
+
+/// What identifies one configuration template: the four values that distinguish it from every
+/// other — its service, log type, resource type and delivery destination type — joined by a
+/// character none of them admits (`Service` is `^[\w_-]*$`, `LogType` `^[\w]*$`,
+/// `ResourceType` `^[\w-_]*$`, and `DeliveryDestinationType` is an enum of letters).
+///
+/// It is also the order templates are enumerated in, and the position a pagination cursor
+/// resumes after.
+pub fn configuration_template_key(template: &crate::ops::types::ConfigurationTemplate) -> String {
+    [
+        template.service.as_deref().unwrap_or_default(),
+        template.log_type.as_deref().unwrap_or_default(),
+        template.resource_type.as_deref().unwrap_or_default(),
+        template
+            .delivery_destination_type
+            .as_deref()
+            .unwrap_or_default(),
+    ]
+    .join("|")
 }
 
 /// The ARN service namespaces of the GLOBAL log senders: a resource of one of these lives in
