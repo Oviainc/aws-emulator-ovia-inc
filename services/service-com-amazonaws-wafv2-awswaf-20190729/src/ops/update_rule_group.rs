@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -238,18 +229,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRuleGroup"))
+        // `ctx` carries only request metadata, which this operation does not need: an
+        // update never re-mints the ARN, so it needs no region.
+        let _ = ctx;
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the rule group lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        // The rule tree comes straight off the wire and nests, so its depth is
+        // bounded here, before anything walks, stores or measures it.
+        if let Err(reason) =
+            crate::state::validate_statement_nesting(input.rules.as_deref().unwrap_or_default())
+        {
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_STATEMENT,
+                    "Rules",
+                    &reason,
+                ),
+            )
+            .into());
+        }
+
+        // "You cannot use a rule group reference statement inside another rule
+        // group" (`RuleGroupReferenceStatement`'s own doc), and "you cannot use a
+        // managed rule group inside another rule group" (`ManagedRuleGroupStatement`'s):
+        // the same rule `CreateRuleGroup` applies, because a save is a save however the
+        // rules got there.
+        if let Some((field, reason)) = crate::state::misplaced_rule_group_statement(
+            input.rules.as_deref().unwrap_or_default(),
+            false,
+        ) {
+            return Err(UpdateRuleGroupErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(field, "Rules", &reason),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(entry) = state.rule_group(&input.scope, &input.name, &input.id) else {
+            crate::state::audit(
+                "UpdateRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(UpdateRuleGroupErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        // Checked BEFORE anything is written, so a stale token leaves the stored rule
+        // group exactly as it was.
+        if entry.lock_token != input.lock_token {
+            crate::state::audit(
+                "UpdateRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFOptimisticLockException",
+            );
+            return Err(UpdateRuleGroupErrorModeled::WAFOptimisticLockException(
+                crate::state::optimistic_lock_exception(),
+            )
+            .into());
+        }
+        // "When you create a rule group, you define an immutable capacity limit. If you
+        // update a rule group, you must stay within the capacity": the limit the group
+        // was created with, which this call carries no member to change.
+        let declared_capacity = entry.rule_group.capacity;
+
+        // Every reference the new rule tree carries must name an entity this service
+        // holds, in this scope: a dangling reference is refused, and the stored rule
+        // group and its lock token are left untouched.
+        if let Some(reason) = state
+            .unresolvable_rule_reference(&input.scope, input.rules.as_deref().unwrap_or_default())
+        {
+            crate::state::audit(
+                "UpdateRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                // The unresolvable reference is a diagnostic, so it is recorded here;
+                // the refusal itself carries the exception type's constant sentence.
+                &format!("WAFNonexistentItemException: {reason}"),
+            );
+            return Err(UpdateRuleGroupErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        }
+
+        // "When you add or modify the rules in a rule group, WAF enforces this limit"
+        // (`Capacity`'s doc): the new rules are priced with the SAME derivation
+        // `CheckCapacity` reports and `CreateRuleGroup` saves against, and a rule list
+        // that needs more WCUs than the group's immutable capacity is refused rather
+        // than stored under a capacity it does not fit — so a save is accepted exactly
+        // when the capacity the caller could have checked fits.
+        let rule_group_capacities = state.rule_group_capacities(&input.scope);
+        let required_capacity = crate::state::web_acl_capacity(
+            input.rules.as_deref().unwrap_or_default(),
+            &rule_group_capacities,
+        );
+        if required_capacity > declared_capacity {
+            crate::state::audit(
+                "UpdateRuleGroup",
+                &input.scope,
+                &input.name,
+                &input.id,
+                &format!(
+                    "WAFLimitsExceededException: the rules require {required_capacity} WCUs, \
+                     above the immutable capacity {declared_capacity}"
+                ),
+            );
+            return Err(UpdateRuleGroupErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
+        // The checks above hold an immutable borrow, so the entry is resolved again —
+        // by the same triple, under the same lock — to write through.
+        let Some(entry) = state.rule_group_mut(&input.scope, &input.name, &input.id) else {
+            return Err(UpdateRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // "This operation completely replaces the mutable specifications that you
+        // already have for the rule group with the ones that you provide to this call":
+        // everything the request carries replaces what was stored, and a member the
+        // request omits is CLEARED rather than kept. `Name`, `Id`, `ARN`, `Capacity`
+        // and the derived `LabelNamespace` are immutable. The server-side defaults and
+        // derived members are then materialised exactly as at create, so a rule group
+        // reads back the same way however it was last saved.
+        entry.rule_group.description = input.description;
+        entry.rule_group.rules = input.rules;
+        entry.rule_group.visibility_config = input.visibility_config;
+        entry.rule_group.custom_response_bodies = input.custom_response_bodies;
+        entry.rule_group.monetization_config = input.monetization_config;
+        crate::state::apply_rule_group_defaults(&mut entry.rule_group);
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working.
+        let next_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_lock_token.clone();
+        crate::state::audit(
+            "UpdateRuleGroup",
+            &input.scope,
+            &input.name,
+            &input.id,
+            "updated",
+        );
+
+        Ok(UpdateRuleGroupOutput {
+            next_lock_token: Some(next_lock_token),
+        })
     }
 }

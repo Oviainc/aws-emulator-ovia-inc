@@ -41,7 +41,7 @@ fn arn_parts(scope: &str) -> (&'static str, &'static str) {
 
 /// The ARN this service mints for a rule group, as
 /// `arn:aws:wafv2:<region>:<account>:<global|regional>/rulegroup/<name>/<id>`.
-fn rule_group_arn(scope: &str, name: &str, id: &str) -> String {
+pub(crate) fn rule_group_arn(scope: &str, name: &str, id: &str) -> String {
     let (region, prefix) = arn_parts(scope);
     let account = engine::EMULATOR_ACCOUNT_ID;
     format!("arn:aws:wafv2:{region}:{account}:{prefix}/rulegroup/{name}/{id}")
@@ -49,12 +49,12 @@ fn rule_group_arn(scope: &str, name: &str, id: &str) -> String {
 
 /// `awswaf:<account ID>:rulegroup:<rule group name>:` — the prefix
 /// `RuleGroup$LabelNamespace` documents for a rule group's labels.
-fn label_namespace(name: &str) -> String {
+pub(crate) fn label_namespace(name: &str) -> String {
     format!("awswaf:{}:rulegroup:{name}:", engine::EMULATOR_ACCOUNT_ID)
 }
 
 /// `[{ "Name": … }, …]` — the `LabelSummaries` projection of a label list.
-fn label_summaries(names: &[&str]) -> Value {
+pub(crate) fn label_summaries(names: &[&str]) -> Value {
     Value::Array(names.iter().map(|name| json!({ "Name": name })).collect())
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn byte_match_statement() -> Value {
 }
 
 /// A rule carrying `labels` in its `RuleLabels`.
-fn labelled_rule(name: &str, statement: Value, labels: &[&str]) -> Value {
+pub(crate) fn labelled_rule(name: &str, statement: Value, labels: &[&str]) -> Value {
     let mut built = rule(name, statement);
     built["RuleLabels"] = label_summaries(labels);
     built
@@ -82,7 +82,7 @@ fn labelled_rule(name: &str, statement: Value, labels: &[&str]) -> Value {
 /// `LabelMatchStatement$Scope` is `LABEL` or `NAMESPACE`
 /// (`smithy_query(query="shape",shape="LabelMatchScope")`); `LABEL` matches one
 /// label.
-fn label_match_rule(name: &str, key: &str) -> Value {
+pub(crate) fn label_match_rule(name: &str, key: &str) -> Value {
     rule(name, json!({ "LabelMatchStatement": { "Scope": "LABEL", "Key": key } }))
 }
 
@@ -104,7 +104,7 @@ fn rule_group_reference_rule(name: &str, priority: i64, arn: &str) -> Value {
 /// A `CreateRuleGroup` body. `Description` and `CustomResponseBodies` are present
 /// only when the case supplies them, so an absent member is really absent on the
 /// wire.
-fn create_body(
+pub(crate) fn create_body(
     name: &str,
     scope: &str,
     capacity: i64,
