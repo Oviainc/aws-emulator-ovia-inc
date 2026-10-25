@@ -9,7 +9,11 @@
 //! applies it): a member the request carries replaces the stored value, a member it omits
 //! leaves the stored value alone, and the template that results is judged by the very
 //! rules `CreateExperimentTemplate` judges the template it builds by — so an update can
-//! only leave behind a template a create could have produced. `id`, `arn`, `creationTime`,
+//! only leave behind a template a create could have produced. A `logConfiguration` the
+//! request carries with NONE of its members set names no configuration, so it REMOVES the
+//! one the template carried — this request is the only mutator of that member and FIS
+//! models no operation that deletes it, which is how experiment logging is switched off.
+//! `id`, `arn`, `creationTime`,
 //! the `tags` (`TagResource`'s business) and the target account configurations are not
 //! members of this request and are not touched; `lastUpdateTime` moves to the instant of
 //! this call.
@@ -207,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A log configuration says WHERE the experiment's logs are delivered, so the
         // candidate's — the one this request named, or the stored one it left alone — is
-        // refused when it names no destination.
+        // refused when it names no destination. A candidate carrying NO configuration (one
+        // this request removed, or a template that never had one) is not logging at all,
+        // which is admissible.
         if let Some(refusal) =
             crate::state::log_configuration_refusal(candidate.log_configuration.as_ref())
         {

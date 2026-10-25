@@ -22,8 +22,9 @@
 //! 3. **Model units are bought out of the quota the account has been GRANTED for them**,
 //!    and which quota applies depends on whether the request carries a
 //!    `commitmentDuration`: a no-commitment create is refused with
-//!    `ServiceQuotaExceededException` naming the model it asked for, and a committed one is
-//!    admitted up to the granted units and refused past them.
+//!    `ServiceQuotaExceededException` naming the model it asked for and handing over the
+//!    documented service-limit-increase support case form for the region it addressed, and
+//!    a committed one is admitted up to the granted units and refused past them.
 //! 4. **`modelId` must name a base model the account's catalog offers with Provisioned
 //!    Throughput**: a model the catalog does not carry is 404 `ResourceNotFoundException`,
 //!    one it carries but offers on demand only is 400 `ValidationException`.
@@ -529,6 +530,112 @@ async fn model_units_are_bought_out_of_the_granted_quota() {
                 "case {case}: a refused create must store nothing"
             );
         }
+    }
+}
+
+/// The support-center case form the model's own `modelUnits` documentation hands a caller
+/// who has no model units granted, written out HERE rather than taken from the service so
+/// the wording and the link form are pinned by the test and not by the code under test.
+///
+/// Source: `smithy_query(query="doc", shape="CreateProvisionedModelThroughputRequest",
+/// member="modelUnits")` — "By default, your account has no model units for purchasing
+/// Provisioned Throughputs with commitment. You must first visit the
+/// <a href=\"https://console.aws.amazon.com/support/home#/case/create?issueType=service-limit-increase\">Amazon
+/// Web Services support center</a> to request MUs." The `issueType=service-limit-increase`
+/// selector is what opens the quota-increase form, and the region the request addressed is
+/// carried so the form opens against it.
+fn expected_no_commitment_refusal(base_model_id: &str, region: &str) -> String {
+    format!(
+        "Your account does not currently have any no commitment model units reserved for \
+         {base_model_id}. Please see \
+         https://support.console.aws.amazon.com/support/home?region={region}\
+         #/case/create?issueType=service-limit-increase to request a service quota increase."
+    )
+}
+
+/// A no-commitment create is refused for want of granted model units, and the refusal
+/// hands the caller the documented service-limit-increase case form for the region it
+/// addressed, naming the BASE model the request asked for whichever `ModelIdentifier`
+/// spelling named it.
+///
+/// Rows differ along everything the rule generalises over — base model (including models
+/// the recorded case never named), `modelId` spelling (bare id and model ARN), the region
+/// the request signs for, and the unit count asked for (`modelUnits` is `range 1..`) — so
+/// the only constant across them is the remedy clause itself.
+#[tokio::test]
+async fn the_no_commitment_quota_refusal_hands_over_the_service_limit_increase_case_form() {
+    let emu = emulator();
+
+    let rows: Vec<(&str, String, &str, &str, i32)> = vec![
+        (
+            "a bare model id in the suite's region, one unit",
+            PROVISIONABLE_MODELS[0].to_string(),
+            PROVISIONABLE_MODELS[0],
+            REGION,
+            1,
+        ),
+        (
+            "the model ARN spelling, a second region, several units",
+            model_arn("us-east-1", PROVISIONABLE_MODELS[1]),
+            PROVISIONABLE_MODELS[1],
+            "us-east-1",
+            4,
+        ),
+        (
+            "a third base model in a third region, every granted committed unit",
+            PROVISIONABLE_MODELS[2].to_string(),
+            PROVISIONABLE_MODELS[2],
+            "eu-central-1",
+            GRANTED_COMMITTED_UNITS,
+        ),
+        (
+            "a fourth base model, ARN spelling, past any granted units",
+            model_arn("ap-northeast-1", PROVISIONABLE_MODELS[3]),
+            PROVISIONABLE_MODELS[3],
+            "ap-northeast-1",
+            GRANTED_COMMITTED_UNITS + 1,
+        ),
+    ];
+
+    for (index, (case, model_id, base_model_id, region, units)) in rows.into_iter().enumerate() {
+        let name = format!("pt-remedy-{index}");
+        let reply =
+            create_in_region(&emu, region, create_body(&name, &model_id, units, None)).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case}: the refused create must answer 400, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("ServiceQuotaExceededException"),
+            "case {case}: the refused create must answer ServiceQuotaExceededException, got {:?}",
+            reply.error
+        );
+        let stated = refusal_message(&reply);
+        let expected = expected_no_commitment_refusal(base_model_id, region);
+        assert_eq!(
+            stated, expected,
+            "case {case}: the refusal must name the base model and hand over the \
+             service-limit-increase case form for {region}, got {stated:?}"
+        );
+        assert!(
+            stated.contains("?issueType=service-limit-increase"),
+            "case {case}: the remedy link must carry the documented issueType selector, \
+             got {stated:?}"
+        );
+        assert_eq!(
+            emu.call_in_region(
+                region,
+                "GET",
+                &format!("/provisioned-model-throughput/{}", label(&name)),
+                None
+            )
+            .await
+            .status,
+            404,
+            "case {case}: a refused create must store nothing in {region}"
+        );
     }
 }
 

@@ -186,11 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateTable with TransactionId",
             ));
         }
-        // "The version ID at which to update the table contents": writing against one
-        // named version needs the table-version history this emulator does not keep
-        // (`GetTableVersion`/`GetTableVersions` are unimplemented), and applying the
-        // write to the latest version instead would be the wrong write, so a request
-        // that names a version is refused.
+        // "The version ID at which to update the table contents": an update against one
+        // named version is an optimistic-concurrency write, which has to refuse a
+        // version that is no longer current rather than apply the write to the latest
+        // one, and that refusal is not written yet — so a request that names a version
+        // is refused instead of silently applied to the current version.
         if input.version_id.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "UpdateTable with VersionId",
@@ -242,13 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        // `SkipArchive` and `Force` are inert here, and neither changes what this
-        // update writes: the archived previous version `SkipArchive` suppresses is read
-        // back only through the unimplemented table-version operations, and `Force`
+        // "By default, `UpdateTable` always creates an archived version of the table
+        // before updating it. However, if `SkipArchive` is set to true, `UpdateTable`
+        // does not create the archived version" — so unless this request asks
+        // otherwise, the definition this write replaces is kept as the version it was
+        // current under, which is what a later version read serves. `Force`
         // "ignore[s] matching storage descriptor and subobject matching requirements"
         // over subobjects (partitions, column statistics) this slice stores none of, so
         // there is no stored subobject the new storage descriptor could disagree with.
-        let _ = (input.skip_archive, input.force);
+        let archive_previous = !input.skip_archive.unwrap_or(false);
+        let _ = input.force;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateTableErrorModeled::InternalServiceException(
@@ -262,6 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
 
         let mut store = state.lock();
+        // The store keeps every definition an update replaces, and this update is
+        // reachable by any caller, so the number of archived definitions one process
+        // will hold is bounded, store-wide as well as per table. The store-wide answer
+        // is read BEFORE the parent database is borrowed, but used AFTER the table is
+        // resolved, so a request naming a database or table that does not exist still
+        // gets the precise `EntityNotFoundException`.
+        let store_can_archive_another_version = store.can_archive_table_version();
         let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
             return Err(UpdateTableErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
@@ -284,9 +294,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An update that would archive past either ceiling is refused rather than
+        // applied, leaving the stored table and its history exactly as they are.
+        if archive_previous && !store_can_archive_another_version {
+            return Err(
+                UpdateTableErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "the Data Catalog already holds the maximum of {} archived table \
+                             versions",
+                            crate::state::MAX_STORED_ARCHIVED_TABLE_VERSIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if archive_previous && !entry.can_archive_version() {
+            return Err(
+                UpdateTableErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "Table {} already holds the maximum of {} archived versions",
+                            table_input.name,
+                            crate::state::MAX_ARCHIVED_TABLE_VERSIONS_PER_TABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Write the submitted definition into the stored record the read path serves,
         // so the next `GetTable`/`GetTables` reports what this request sent.
-        entry.apply_input(table_input, ::std::time::SystemTime::now());
+        entry.apply_input(
+            table_input,
+            ::std::time::SystemTime::now(),
+            archive_previous,
+        );
         ::tracing::info!(
             operation = "UpdateTable",
             catalog_id = %catalog_id,

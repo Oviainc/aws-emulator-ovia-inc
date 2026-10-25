@@ -397,7 +397,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // narrower than the model's `Timeout` range (1..5400), so the wider bound the
         // boundary validator checked is not the whole constraint; the request is refused
         // here against the published one, naming the member and the bound it failed.
-        let timeout = input.timeout.unwrap_or(crate::state::DEFAULT_TIMEOUT_SECONDS);
+        //
+        // A function the request configures for DURABLE execution defaults to that
+        // published maximum instead of the documented 3 seconds: a durable function's own
+        // invocations are the steps of an execution that runs far longer than one of
+        // them, so the per-invocation timeout a durable function starts at is the longest
+        // Lambda allows. RECORDED from AWS's own answer to a `CreateFunction` carrying a
+        // `DurableConfig` and no `Timeout`, which reports 900 where the member's
+        // documentation states 3 — so do not "correct" this back to the plain default. A
+        // caller that states a `Timeout` gets the one it stated, either way.
+        let default_timeout = if input.durable_config.is_some() {
+            crate::state::MAX_TIMEOUT_SECONDS
+        } else {
+            crate::state::DEFAULT_TIMEOUT_SECONDS
+        };
+        let timeout = input.timeout.unwrap_or(default_timeout);
         if timeout > crate::state::MAX_TIMEOUT_SECONDS {
             return Err(invalid_parameter(format!(
                 "1 validation error detected: Value '{timeout}' at 'timeout' failed to satisfy \
@@ -502,7 +516,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|snap_start| snap_start.apply_on.clone()),
             logging_config: input.logging_config.clone(),
             capacity_provider_config: input.capacity_provider_config.clone(),
-            durable_config: input.durable_config.clone(),
+            // A durable-execution configuration the request names carries the documented
+            // default for every member it leaves out; a function that is not configured
+            // for durability holds none at all.
+            durable_config: crate::state::effective_durable_config(
+                None,
+                input.durable_config.as_ref(),
+            ),
             tenancy_config: input.tenancy_config.clone(),
         };
 
@@ -557,18 +577,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Use the Publish parameter to create version 1 of your function from its
         // initial configuration." A published version is a snapshot of the
-        // configuration this call stored.
+        // configuration this call stored, taken through the one place that takes one
+        // (so version 1 gets its own revision and its own frozen package exactly as
+        // every later version does).
         let reported_version = if input.publish {
-            record.latest_version = 1;
-            record.versions.insert(
-                1,
-                crate::state::FunctionVersionRecord {
-                    version: 1,
-                    config: record.config.clone(),
-                    created: record.config.last_modified.clone(),
-                },
-            );
-            "1".to_string()
+            let config = record.config.clone();
+            let Some(version_number) = record.publish_next_version(config, now) else {
+                return Err(CreateFunctionErrorModeled::ServiceException(ServiceException {
+                    r#type: None,
+                    message: Some(
+                        "No version number can be assigned to this function".to_string(),
+                    ),
+                })
+                .into());
+            };
+            version_number.to_string()
         } else {
             crate::state::VERSION_LATEST.to_string()
         };

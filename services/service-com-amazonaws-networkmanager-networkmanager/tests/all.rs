@@ -67,6 +67,8 @@ mod global_network_lifecycle;
 mod link_association_lifecycle;
 #[path = "all/link_lifecycle.rs"]
 mod link_lifecycle;
+#[path = "all/list_attachments.rs"]
+mod list_attachments;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]

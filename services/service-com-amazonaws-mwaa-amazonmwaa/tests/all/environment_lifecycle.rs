@@ -410,7 +410,12 @@ fn cases() -> Vec<EnvCase> {
                 ("StartupScriptS3ObjectVersion", "aB3dEf5GhI7"),
             ],
             webserver_access_mode: Some("PRIVATE_ONLY"),
-            endpoint_management: Some("CUSTOMER"),
+            // Service-managed endpoints, like every row here: a create that asks to own
+            // the VPC endpoints itself has its own create lifecycle (the environment is
+            // paused instead of becoming available), which is asserted over its own table
+            // in `environment_endpoint_management_lifecycle.rs`. Every row of THIS table
+            // reaches AVAILABLE and takes an update.
+            endpoint_management: Some("SERVICE"),
             weekly_window: Some("SUN:00:00"),
             kms_key: Some("arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012"),
         },
