@@ -50,6 +50,8 @@ mod address_transfers;
 mod allowed_images_settings;
 #[path = "all/application_status.rs"]
 mod application_status;
+#[path = "all/application_status_checks.rs"]
+mod application_status_checks;
 #[path = "all/associate_address.rs"]
 mod associate_address;
 #[path = "all/authorize_security_group_egress.rs"]
