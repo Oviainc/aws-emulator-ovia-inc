@@ -249,11 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if image.is_archived() {
             return Err(StartImageScanErrorModeled::ImageArchivedException(
                 ImageArchivedException {
-                    message: Some(format!(
-                        "The image with '{}' in the repository with name \
-                         '{repository_name}' in the registry with id '{registry_id}' is \
-                         archived and cannot be scanned",
-                        crate::state::identifier_description(&input.image_id)
+                    message: Some(crate::state::image_archived_message(
+                        &input.image_id,
+                        &repository_name,
                     )),
                 },
             )
@@ -317,13 +315,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The scan examines the image as it stands now, and what it found is stored:
-        // reading the findings back reports this run rather than computing a fresh one.
+        // The scan examines the image as it stands now, and what it came to is stored:
+        // reading it back reports this run rather than computing a fresh one. Where the run
+        // ENDS follows from the image it was started on, so an image basic scanning cannot
+        // examine settles at the status that says so rather than at a success.
         let findings = crate::state::basic_scan_findings(image);
+        let terminal = crate::state::basic_scan_outcome(image);
 
         let scan = crate::state::ImageScan {
             started_at: now,
             complete_due_at: now + crate::state::IMAGE_SCAN_DELAY,
+            terminal,
             findings,
         };
         // The status answered is the record's own projection, so the start and a read
