@@ -7,6 +7,10 @@
 //! answered in the non-terminal `pending` state the model publishes, with its
 //! `available` move owed to the clock a [`crate::state::TRANSITION_DELAY`] later.
 //!
+//! A `ClientToken` is idempotent only for the request it was first given with: replayed
+//! with the same parameters it reports the gateway it already minted, and replayed with
+//! any different parameter it is refused with `IdempotentParameterMismatch` ([`same_request`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -177,11 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
 
-        // Idempotency: one token names the one gateway it minted, so a replay reports that
-        // gateway and creates nothing. Read here and answered below the DryRun check,
-        // because a replay stores nothing and so passes the ceilings a fresh create has to
-        // clear.
-        let replayed = input
+        // Idempotency: one token names the one gateway it minted, so a replay of the SAME
+        // request reports that gateway and creates nothing. Read here and answered below the
+        // DryRun check, because a replay stores nothing and so passes the ceilings a fresh
+        // create has to clear.
+        let replayed_id = input
             .client_token
             .as_deref()
             .and_then(|token| store.carrier_gateway_client_tokens.get(token).cloned());
@@ -192,6 +196,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.vpcs.contains_key(&input.vpc_id) {
             return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
         }
+
+        let replayed = match replayed_id {
+            None => None,
+            Some(carrier_gateway_id) => {
+                let carrier_gateway = store
+                    .carrier_gateways
+                    .get(&carrier_gateway_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names carrier gateway '{carrier_gateway_id}', \
+                             which is not stored"
+                        ))
+                    })?;
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different parameter it names a gateway the caller did not
+                // ask for, which EC2 refuses rather than answers, the way every other create
+                // in this crate that reads a client token does.
+                if !same_request(&carrier_gateway, &input.vpc_id, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(carrier_gateway)
+            }
+        };
 
         // A count ceiling first, then the byte budget: a record count on its own admits
         // gigabytes, because each record holds strings the caller chose the length of. A
@@ -219,20 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        if let Some(carrier_gateway_id) = replayed {
-            return store
-                .carrier_gateways
-                .get(&carrier_gateway_id)
-                .cloned()
-                .map(|carrier_gateway| CreateCarrierGatewayOutput {
-                    carrier_gateway: Some(carrier_gateway),
-                })
-                .ok_or_else(|| {
-                    state::internal_error(format!(
-                        "a client token names carrier gateway '{carrier_gateway_id}', \
-                         which is not stored"
-                    ))
-                });
+        // The gateway that token already minted, exactly as it is stored now.
+        if let Some(carrier_gateway) = replayed {
+            return Ok(CreateCarrierGatewayOutput {
+                carrier_gateway: Some(carrier_gateway),
+            });
         }
 
         let carrier_gateway_id = store.insert_carrier_gateway(state::CarrierGatewaySpec {
@@ -261,4 +280,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             carrier_gateway: Some(carrier_gateway),
         })
     }
+}
+
+/// Does `carrier_gateway` — the gateway a replayed `ClientToken` names — hold what THIS
+/// request asks for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with a
+/// gateway the caller did not ask for; the same contract `create_ipam`'s `same_request` has
+/// for an IPAM. The members this service derives (the id, the owning account and the state
+/// the clock moves) are not compared: they follow from the ones that are. Tags are a SET,
+/// so the order a request names them in is not a difference.
+fn same_request(carrier_gateway: &CarrierGateway, vpc_id: &str, tags: &[Tag]) -> bool {
+    let tag_pairs = |tags: &[Tag]| {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    carrier_gateway.vpc_id.as_deref() == Some(vpc_id)
+        && tag_pairs(carrier_gateway.tags.as_deref().unwrap_or_default()) == tag_pairs(tags)
 }

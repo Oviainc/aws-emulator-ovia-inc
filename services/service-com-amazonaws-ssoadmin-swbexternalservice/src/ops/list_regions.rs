@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRegions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRegions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the Regions one IAM Identity Center instance is enabled in,
+//! exactly as this service's state (`crate::state`) holds them. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRegions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read — every record the instance holds, whatever its `RegionStatus` ("including
+//! those that are being added or removed … ACTIVE, ADDING, or REMOVING") — in `RegionName`
+//! order, paged by `MaxResults` with a `NextToken` that resumes after the name the
+//! previous page ended on and is absent on the last page.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRegions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRegionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRegions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRegionsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the instance whose
+        // Regions it walks, since a `RegionName` only distinguishes rows within one
+        // instance.
+        let scope = crate::state::cursor_regions(&input.instance_arn);
+        let after =
+            crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(|message| {
+                ListRegionsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which a rejected pagination token is.
+                    reason: None,
+                })
+            })?;
+
+        let ordered: Vec<(String, RegionMetadata)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes: an instance whose activation
+            // instant has passed is ACTIVE in every Region it holds, a Region whose own
+            // removal workflow has run out is no longer one of them, and the account's
+            // ambient instance is enabled if nothing has enabled one yet — all of it owed
+            // at this instant whether or not anybody called.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // An `InstanceArn` this account holds no instance for: this operation models no
+            // `ResourceNotFoundException`, and `AccessDeniedException` is the not-found
+            // channel the instance-scoped reads of this service declare.
+            let Some(instance) = store.instance(&input.instance_arn) else {
+                return Err(ListRegionsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::instance_not_found_message(
+                            &input.instance_arn,
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            };
+            // Every Region record the instance holds, whatever its status — the operation
+            // "returns Regions with ACTIVE, ADDING, or REMOVING status" — keyed by the
+            // `RegionName`, which is unique on one instance and is both the page order and
+            // the cursor order.
+            let mut rows: Vec<(String, RegionMetadata)> = instance
+                .regions
+                .iter()
+                .map(|region| (region.region_name.clone(), region.to_shape()))
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+
+        let (regions, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListRegionsOutput {
+            regions: Some(regions),
+            next_token,
+        })
     }
 }

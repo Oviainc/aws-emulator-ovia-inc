@@ -3637,6 +3637,13 @@ pub fn cursor_permission_sets(instance_arn: &str) -> String {
     format!("permissionSets|{instance_arn}")
 }
 
+/// Cursor scope of a `ListRegions` enumeration: the operation and the instance whose
+/// enabled Regions it walks, since the key (a `RegionName`) only distinguishes rows
+/// WITHIN one instance.
+pub fn cursor_regions(instance_arn: &str) -> String {
+    format!("regions|{instance_arn}")
+}
+
 /// Cursor scope of a `ListManagedPoliciesInPermissionSet` enumeration: the operation and
 /// the permission set whose attached AWS managed policies it walks, qualified by the
 /// instance that permission set belongs to (the same pair the read resolves against).

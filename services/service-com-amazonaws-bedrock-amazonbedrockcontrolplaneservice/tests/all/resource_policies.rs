@@ -21,10 +21,14 @@
 //!    nothing.
 //! 4. **A document that is not an IAM resource-based policy is refused** the same 400,
 //!    over the rows the shared grammar separates (not JSON, not an object, no statement,
-//!    an unknown policy version, a statement missing an element).
-//! 5. **A resource with no policy is 404 `ResourceNotFoundException`** on the read, and a
-//!    policy whose resource is deleted is reported the same way — a read never reports a
-//!    grant on a resource that no longer exists.
+//!    an unknown policy version, a statement missing an element), each with Bedrock's own
+//!    FIXED non-conforming-document sentence — one text for every such document, carrying
+//!    nothing of the request.
+//! 5. **A resource this account holds which carries no policy is 200 with `resourcePolicy`
+//!    ABSENT** (the member is not `@required`), while an ARN naming no resource of this
+//!    account — including a resource that was deleted — is 404
+//!    `ResourceNotFoundException`: a read never reports a grant on a resource that no
+//!    longer exists, and never reports a found resource as missing.
 //!
 //! The status codes and error shapes come from the model
 //! (`smithy_query(query="operation",operation="PutResourcePolicy,GetResourcePolicy")`:
@@ -480,15 +484,59 @@ async fn a_document_that_is_not_a_resource_policy_is_refused_and_attaches_nothin
     }
 }
 
+#[tokio::test]
+async fn a_document_that_is_not_a_resource_policy_is_refused_with_bedrocks_own_sentence() {
+    let emu = emulator();
+    let arn = guardrail_arn(&emu, "policy-refusal-wording").await;
+
+    // Bedrock's refusal of a non-conforming policy document, word for word: entirely fixed
+    // text, so every row below — whatever the document was and whichever part of the
+    // grammar it broke — is answered with the SAME sentence, naming neither the member,
+    // nor the document, nor the defect.
+    let expected = "The provided policy document does not conform to the supported policy \
+                    formats. For more information about valid policy document formats, \
+                    check out the Amazon Bedrock Guardrails documentation";
+
+    for (case, document) in refused_documents() {
+        let put = put_policy(&emu, &arn, &document).await;
+        assert_eq!(
+            put.status, 400,
+            "case {case:?}: a document that is not a resource policy is refused 400, got {} \
+             {:?}",
+            put.status, put.body
+        );
+        assert_eq!(
+            put.error.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: the refusal is the modelled ValidationException, got {:?}",
+            put.error
+        );
+        let stated = put.text("message");
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+        // Nothing of the request reaches this sentence: neither the document, nor the
+        // member it arrived in, nor the resource it was put on.
+        for leaked in [document.as_str(), "resourcePolicy", arn.as_str()] {
+            assert!(
+                !stated.contains(leaked),
+                "case {case:?}: the refusal states nothing of the request, got {stated:?} \
+                 carrying {leaked:?}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // 5. A resource with no policy, and a policy whose resource is gone.
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_resource_with_no_policy_is_not_found_on_the_read() {
+async fn a_resource_holding_no_policy_reports_an_absent_policy_on_the_read() {
     let emu = emulator();
-    // One resource of each type, each holding no policy: the read reports the modelled
-    // 404 rather than an empty 200.
+    // One resource of each type, each holding no policy: the read reports the resource it
+    // FOUND, with the optional `resourcePolicy` member absent rather than a 404.
     let rows = [
         ("guardrail", guardrail_arn(&emu, "unattached-guardrail").await),
         (
@@ -504,8 +552,57 @@ async fn a_resource_with_no_policy_is_not_found_on_the_read() {
     for (case, arn) in rows {
         let read = get_policy(&emu, &arn).await;
         assert_eq!(
+            read.status, 200,
+            "case {case:?}: a resource this account holds is found, got {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.get("resourcePolicy"),
+            json!(null),
+            "case {case:?}: a resource carrying no policy reports the member absent, got \
+             {:?}",
+            read.body
+        );
+        // The same resource, once a policy IS attached, reports it — so the absence above
+        // is the resource's state and not a read that reports nothing whatever is stored.
+        let document = admitted_documents()[0].1.clone();
+        put_policy(&emu, &arn, &document).await;
+        let attached = get_policy(&emu, &arn).await;
+        assert_eq!(
+            attached.text("resourcePolicy"),
+            document,
+            "case {case:?}: the attached policy is reported, got {:?}",
+            attached.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_naming_no_resource_of_this_account_is_not_found_on_the_read() {
+    let emu = emulator();
+    // The rows differ along what the rule generalises over: the ARN's vendor, resource
+    // type and resource id, and a value that is no ARN at all.
+    let rows = [
+        (
+            "another vendor's resource",
+            format!("arn:aws:sagemaker:{REGION}:{ACCOUNT}:endpoint/x"),
+        ),
+        (
+            "a guardrail id nothing minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:guardrail/zzzzzzzzzzzz"),
+        ),
+        (
+            "a Bedrock resource type nothing created",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/zzzzzzzzzzzz"),
+        ),
+        ("text that is no ARN", "not-an-arn".to_string()),
+    ];
+
+    for (case, arn) in rows {
+        let read = get_policy(&emu, &arn).await;
+        assert_eq!(
             read.status, 404,
-            "case {case:?}: a resource holding no policy is 404, got {} {:?}",
+            "case {case:?}: an ARN naming no resource of this account is 404, got {} {:?}",
             read.status, read.body
         );
         assert_eq!(
