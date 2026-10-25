@@ -34,7 +34,10 @@ const SUBNETS: &[&str] = &["subnet-0123456789abcdef0"];
 
 /// The `InstanceSummary` `ListInstances` currently reports for `instance_id`, or `None`
 /// when no summary names it.
-async fn summary_of(h: &Harness, instance_id: &str, case: &str) -> Option<Value> {
+///
+/// Shared with `tests/all/instance_status_check_date.rs`, which reads the same view
+/// through the same single reader rather than growing a second copy of it.
+pub(crate) async fn summary_of(h: &Harness, instance_id: &str, case: &str) -> Option<Value> {
     let reply = call(h, "/instance/ListInstances", &json!({})).await;
     reply.ok(case)["InstanceSummaries"]
         .as_array()
