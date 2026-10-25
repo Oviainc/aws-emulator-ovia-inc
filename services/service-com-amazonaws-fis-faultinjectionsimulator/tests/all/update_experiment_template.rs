@@ -493,8 +493,8 @@ fn update_cases() -> Vec<(&'static str, Value, Value)> {
                 },
                 "actions": {
                     "only": {
-                        "actionId": "aws:fis:wait",
-                        "parameters": { "duration": "PT9M" },
+                        "actionId": "aws:ec2:stop-instances",
+                        "parameters": { "startInstancesAfterDuration": "PT9M" },
                         "targets": { "Instances": "hosts" }
                     }
                 },
@@ -518,8 +518,8 @@ fn update_cases() -> Vec<(&'static str, Value, Value)> {
                 },
                 "actions": {
                     "only": {
-                        "actionId": "aws:fis:wait",
-                        "parameters": { "duration": "PT9M" },
+                        "actionId": "aws:ec2:stop-instances",
+                        "parameters": { "startInstancesAfterDuration": "PT9M" },
                         "targets": { "Instances": "hosts" }
                     }
                 },

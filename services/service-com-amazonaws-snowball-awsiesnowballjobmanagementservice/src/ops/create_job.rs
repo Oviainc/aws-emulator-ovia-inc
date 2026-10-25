@@ -362,8 +362,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // for your cluster and you have more nodes to create for this cluster, try
             // again and create jobs until your cluster has exactly five nodes"
             // (`ClusterLimitExceededException`): a cluster that already holds its quorum
-            // of node jobs takes no further node.
-            if cluster.has_quorum() {
+            // of node jobs takes no further node. The quorum is counted over the nodes the
+            // cluster will SHIP with — a cancelled node is not one of them, and the "more
+            // nodes to create for this cluster" the error names are exactly the nodes a
+            // cluster short of five is still missing — so the count comes from the store
+            // rather than from the length of the cluster's node list.
+            if store.cluster_has_quorum(&cluster_id) {
                 return Err(CreateJobErrorModeled::ClusterLimitExceededException(
                     ClusterLimitExceededException {
                         message: Some(format!(

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSourceApiAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSourceApiAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the configuration choices the request names onto the stored
+//! association `associationId` names under the Merged API `mergedApiIdentifier` names
+//! (see [`crate::state`]), then answers the same projection `GetSourceApiAssociation`
+//! reports for it afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSourceApiAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A MODIFICATION: the pair is resolved by the rule the read follows
+//! ([`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::resolve_association`])
+//! and the association's configuration is then replaced
+//! ([`crate::state::SourceApiAssociationRecord::apply_update`]). The merge the clock
+//! owes is neither performed nor re-scheduled here, so the status, its detail and the
+//! merge date are left where the clock put them.
+//!
+//! An `associationId` that resolves to no association of the addressed Merged API is a
+//! MALFORMED request to this operation: it is refused 400 `BadRequestException` naming
+//! the rejected id (`crate::state::invalid_association_id_message`), where the read and
+//! the merge report the absent association as a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +162,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSourceApiAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSourceApiAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The new configuration comes from the deserialized input and everything else
+        // from the stored association, so no request metadata takes part here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateSourceApiAssociationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "the appsync store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // Materialise everything the clock already owes first, so this call writes
+        // against the association state of THIS instant rather than the one the last
+        // caller left behind: an association whose deletion came due is gone before it
+        // can be updated.
+        guard.settle_associations(now);
+
+        // Which association the pair names, by the rule the read follows too. The id is
+        // the STORED record's key, so the write below reaches the record the lookup
+        // resolved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSourceApiAssociation"))
+        // An `associationId` that resolves to no association of the Merged API
+        // addressed is a MALFORMED request to this operation rather than an absent
+        // resource: the refusal is a 400 naming the rejected id
+        // (`crate::state::invalid_association_id_message`), while an absent Merged API
+        // stays the not-found every operation answers for one.
+        let association_id =
+            match guard.resolve_association(&input.merged_api_identifier, &input.association_id) {
+                Ok(association) => association.association_id.clone(),
+                Err(crate::state::AssociationLookupRefusal::AssociationNotFound(
+                    association_id,
+                )) => {
+                    return Err(refuse(crate::state::AssociationRefusal::BadRequest(
+                        crate::state::invalid_association_id_message(&association_id),
+                    )))
+                }
+                Err(refusal) => return Err(refuse(refusal.into())),
+            };
+
+        // A `mergeType` is only ever carried inside the config object, so a request
+        // that names no config names no merge type either.
+        let merge_type = input
+            .source_api_association_config
+            .and_then(|config| config.merge_type);
+
+        let Some(association) = guard.source_api_associations.get_mut(&association_id) else {
+            // Unreachable: the lookup above resolved this very key under the same lock.
+            return Err(
+                UpdateSourceApiAssociationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(format!(
+                            "the appsync store lost source API association {association_id}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        association
+            .apply_update(input.description, merge_type)
+            .map_err(refuse)?;
+
+        // Answer from the record this update STORED, so this body is the one
+        // `GetSourceApiAssociation` answers with next.
+        Ok(UpdateSourceApiAssociationOutput {
+            source_api_association: Some(association.to_source_api_association()),
+        })
     }
+}
+
+/// This operation's modelled error for a refusal the shared association rules state:
+/// the pair lookup's, and the update's own.
+///
+/// Each variant keeps the status the model gives its shape and carries the rule's own
+/// text: the bad request this operation builds for an unresolvable `associationId`
+/// names that id, while a not-found names no identifier at all.
+fn refuse(refusal: crate::state::AssociationRefusal) -> UpdateSourceApiAssociationError {
+    match refusal {
+        crate::state::AssociationRefusal::BadRequest(message) => {
+            UpdateSourceApiAssociationErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationRefusal::NotFound(message) => {
+            UpdateSourceApiAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        crate::state::AssociationRefusal::ConcurrentModification(message) => {
+            UpdateSourceApiAssociationErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }
