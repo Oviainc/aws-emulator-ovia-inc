@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPagesByContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPagesByContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPagesByContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the pages engaged against the channels of the contact the request's `ContactId`
+//! names: every page an engagement left on one of that contact's contact channels, whichever
+//! engagement reached it — an escalation plan engaging a person's channel pages THAT person,
+//! so the page belongs to the contact whose channel was engaged rather than to the contact the
+//! engagement named. A read — it writes nothing.
+//!
+//! Only the pages already SENT are reported, exactly as `ListPagesByEngagement` reports an
+//! engagement's own: a page is Incident Manager HAVING engaged a channel, so a page whose plan
+//! stage has not come round yet has engaged nobody
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::sent_pages_of_contact`]).
+//!
+//! The order is the order the pages were sent, so the opaque `NextToken` carries nothing but
+//! the send sequence the page of results ended on, exactly as `ListPagesByEngagement` carries
+//! its own — and a token one of the two listings issued is not accepted by the other, since
+//! each is scoped to its own list.
+//!
+//! Being addressed BY a contact ARN, it is gated on the account's Incident Manager replication
+//! set the way `ListContactChannels` is: without an active set the ARN resolves to nothing. A
+//! `ContactId` the store does not hold is the modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +167,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPagesByContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPagesByContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPagesByContact"))
+        use crate::state::{
+            decode_next_token, invalid_next_token_message, page_size, take_page,
+            TOKEN_SCOPE_PAGES_BY_CONTACT,
+        };
+
+        // The contact is addressed by ARN; nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPagesByContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST — before the `NextToken` is read and before `ContactId`
+        // is resolved — so a non-onboarded account is refused identically whatever else the
+        // request carries, and the refusal names the ARN the request supplied, which is what
+        // cannot be resolved without a replication set.
+        state
+            .require_active_replication_set_for(&input.contact_id)
+            .map_err(account_precondition_failed)?;
+
+        // The resume point: the send sequence the previous page of results ended on. Read
+        // before the contact is resolved, as every other listing in this service reads its
+        // token first: a token this service never issued for this list is a malformed request
+        // whatever it is paired with.
+        let after: Option<u64> = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_PAGES_BY_CONTACT, token)
+                    .and_then(|decoded| decoded.parse::<u64>().ok())
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        if !state.contacts.contains_key(&input.contact_id) {
+            return Err(ListPagesByContactErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Only the pages the contact's channels have actually been SENT: a stage whose wait
+        // has not run out yet has engaged nobody.
+        let matching: Vec<(u64, Page)> = state
+            .sent_pages_of_contact(&input.contact_id, ::std::time::SystemTime::now())
+            .into_iter()
+            .filter(|(sequence, _)| after.is_none_or(|last| *sequence > last))
+            .collect();
+
+        let (results, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_PAGES_BY_CONTACT,
+            |(sequence, _)| sequence.to_string(),
+        );
+
+        Ok(ListPagesByContactOutput {
+            next_token,
+            pages: results.into_iter().map(|(_, page)| page).collect(),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names: what the request named is the
+/// contact whose pages it asks for, spelled as the contact handlers spell it.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one — the request's
+/// `ContactId` is well formed; what cannot be resolved is the account's registry — and
+/// `fields` is present but EMPTY for the same reason, as `ListContactChannels` answers it.
+fn account_precondition_failed(message: String) -> ListPagesByContactError {
+    ListPagesByContactErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListPagesByContactError {
+    ListPagesByContactErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

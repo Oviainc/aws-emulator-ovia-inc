@@ -37,7 +37,7 @@ use crate::ops::types::{
     MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest,
     MergeRouterInputIndexedStreamDetails,
     MergeRouterInputStreamDetails, MonitoringConfig,
-    NdiConfig, Output, Reservation, ResourceSpecification,
+    NdiConfig, Offering, Output, Reservation, ResourceSpecification,
     RouterContentQualityAnalysisConfiguration, RouterInput,
     RouterInputConfiguration, RouterInputStreamDetails, RouterInputTransitEncryption,
     RouterInputTransitEncryptionKeyConfiguration,
@@ -4192,6 +4192,151 @@ impl StoredRouterNetworkInterface {
     }
 }
 
+/// The `CurrencyCode` every offering and reservation is priced in: "the currencyCode used
+/// for all reservations is US dollars"
+/// (`smithy_query(query="shape",shape="Offering",member="CurrencyCode")`).
+pub const CURRENCY_CODE_USD: &str = "USD";
+
+/// The only value the modelled `PriceUnits` enum carries
+/// (`smithy_query(query="shape",shape="PriceUnits")`: HOURLY), so `PricePerUnit` is the
+/// cost of ONE HOUR of the bandwidth an offering reserves.
+pub const PRICE_UNITS_HOURLY: &str = "HOURLY";
+
+/// The only value the modelled `DurationUnits` enum carries
+/// (`smithy_query(query="shape",shape="DurationUnits")`: MONTHS), so `Duration` is a
+/// number of months.
+pub const DURATION_UNITS_MONTHS: &str = "MONTHS";
+
+/// The only value the modelled `ResourceType` enum carries
+/// (`smithy_query(query="shape",shape="ResourceType")`: Mbps_Outbound_Bandwidth), so what
+/// an offering reserves is outbound bandwidth counted in Mbps — which is also what
+/// `ResourceSpecification$ReservedBitrate`, "the amount of outbound bandwidth that is
+/// discounted in the offering", carries.
+pub const RESOURCE_TYPE_MBPS_OUTBOUND_BANDWIDTH: &str = "Mbps_Outbound_Bandwidth";
+
+/// The term every offering in this service's catalogue runs for, in
+/// [`DURATION_UNITS_MONTHS`] — `Offering$Duration`, "the length of time that your
+/// reservation would be active".
+///
+/// One term for the whole catalogue: the catalogue below varies only along the bandwidth
+/// it reserves, so a purchase picks an amount rather than a length.
+pub const OFFERING_DURATION_MONTHS: i32 = 12;
+
+/// The amounts of outbound bandwidth, in Mbps, this service's offering catalogue reserves
+/// — one offering per entry, each for [`OFFERING_DURATION_MONTHS`].
+///
+/// An offering is AWS's own catalogue entry rather than a resource a caller creates
+/// (ListOfferings "displays a list of all offerings that are available to this account",
+/// and nothing in the model creates one), so the ladder of amounts is this emulator's: the
+/// model fixes what an entry MEANS (outbound bandwidth in Mbps, priced per hour, in US
+/// dollars) and carries no price list. Ordered ascending, which
+/// [`offering_resource_fragment`] also makes the order of their ARNs.
+pub const OFFERING_RESERVED_BITRATES: &[i32] = &[
+    100, 200, 300, 500, 750, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 20_000,
+];
+
+/// What one Mbps of reserved outbound bandwidth costs for one hour, in ten-thousandths of
+/// a [`CURRENCY_CODE_USD`] dollar — the rate [`offering_price_per_unit`] prices every
+/// entry of [`OFFERING_RESERVED_BITRATES`] at.
+///
+/// AWS publishes its rates on its pricing pages and not in the model, so the rate is this
+/// emulator's, like the ladder it prices; what the model fixes is that the price is per
+/// hour ([`PRICE_UNITS_HOURLY`]) and in US dollars. Held as an integer count of a
+/// fraction of a dollar so the rendered price carries no rounding of its own.
+const OFFERING_PRICE_PER_MBPS_HOUR: i64 = 10;
+
+/// `Offering$PricePerUnit` for an offering reserving `reserved_bitrate` Mbps: the rate
+/// [`OFFERING_PRICE_PER_MBPS_HOUR`] charges for that much bandwidth, as the decimal string
+/// the member is modelled as (`PricePerUnit` targets `String`).
+pub fn offering_price_per_unit(reserved_bitrate: i32) -> String {
+    let ten_thousandths = i64::from(reserved_bitrate) * OFFERING_PRICE_PER_MBPS_HOUR;
+    format!(
+        "{}.{:04}",
+        ten_thousandths / 10_000,
+        ten_thousandths % 10_000
+    )
+}
+
+/// `Offering$OfferingDescription`, "a description of the offering": the terms it is made
+/// of, which is all the member carries.
+///
+/// The one wording of an offering's description, so the catalogue and a reservation bought
+/// from it (`Reservation$OfferingDescription`) cannot describe one offering two ways.
+pub fn offering_description(reserved_bitrate: i32, duration_months: i32) -> String {
+    format!("{reserved_bitrate} Mbps outbound bandwidth for {duration_months} months")
+}
+
+/// The resource fragment of an offering ARN: `offering:1-<offering id>`.
+///
+/// The id is the offering's TERMS, zero-padded, so it is stable: an offering is a
+/// catalogue entry rather than a record a request mints, so its ARN must be the same for
+/// every caller and in every process — which is also what lets a `NextToken` naming one
+/// resume a listing. Padding the bitrate keeps the ARNs' lexicographic order the ascending
+/// order of the amounts they reserve.
+///
+/// The model puts no pattern on `OfferingArn`
+/// (`smithy_query(query="shape",shape="OfferingArn")`: a plain string carrying an
+/// `@arnReference` to `AWS::MediaConnect::Offering`), so the form is this service's own,
+/// shaped like every other ARN it mints.
+pub fn offering_resource_fragment(reserved_bitrate: i32, duration_months: i32) -> String {
+    format!("offering:1-{reserved_bitrate:06}mbps-{duration_months:02}months")
+}
+
+/// Whether `arn` is an offering ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `offering` resource type, then the
+/// offering id [`offering_resource_fragment`] mints.
+///
+/// ListOfferings' `NextToken` is the ARN its next page resumes at, so a token the service
+/// never minted is a semantic error in the request rather than a key to page from. The
+/// offering it names need NOT be in the catalogue: paging must survive a catalogue that
+/// does not hold that entry.
+pub fn is_mintable_offering_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., offering_id] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 7
+        && has_mintable_arn_prefix(&segments, "offering")
+        && !offering_id.is_empty()
+        && offering_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// This service's whole offering catalogue in `region`, in ARN order: one `Offering` per
+/// entry of [`OFFERING_RESERVED_BITRATES`], with the terms that entry is offered on.
+///
+/// The ONE projection of the catalogue, so the operations that read an offering — the
+/// listing, and a purchase copying its terms onto the reservation it mints — cannot report
+/// one entry differently. The Region is a segment of every ARN this service mints, so the
+/// catalogue is projected for the Region the request was signed for.
+pub fn published_offerings(region: &str) -> Vec<Offering> {
+    let mut offerings: Vec<Offering> = OFFERING_RESERVED_BITRATES
+        .iter()
+        .map(|&reserved_bitrate| Offering {
+            offering_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &offering_resource_fragment(reserved_bitrate, OFFERING_DURATION_MONTHS),
+            ),
+            offering_description: offering_description(reserved_bitrate, OFFERING_DURATION_MONTHS),
+            currency_code: CURRENCY_CODE_USD.to_string(),
+            price_per_unit: offering_price_per_unit(reserved_bitrate),
+            price_units: PRICE_UNITS_HOURLY.to_string(),
+            duration: OFFERING_DURATION_MONTHS,
+            duration_units: DURATION_UNITS_MONTHS.to_string(),
+            resource_specification: ResourceSpecification {
+                reserved_bitrate: Some(reserved_bitrate),
+                resource_type: RESOURCE_TYPE_MBPS_OUTBOUND_BANDWIDTH.to_string(),
+            },
+        })
+        .collect();
+    // The listing pages from an ARN, so the order it reports the catalogue in is the order
+    // of those ARNs — sorted here rather than assumed of the ladder above.
+    offerings.sort_by(|left, right| left.offering_arn.cmp(&right.offering_arn));
+    offerings
+}
+
 /// The documented wire form of `Reservation$Start` and `Reservation$End`: "Use the
 /// following format: `YYYY-MM-DDTHH:mm:SSZ`, where `T` and `Z` are literal characters"
 /// (`smithy_query(query="doc",shape="PurchaseOfferingRequest",member="Start")`).
@@ -4605,6 +4750,27 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .retain(|_, router_output| !router_output.is_removal_due(now));
         self.router_network_interfaces
             .retain(|_, interface| !interface.is_removal_due(now));
+    }
+
+    /// Whether this account holds an ACTIVE reservation at `now` — the condition
+    /// ListOfferings states its eligibility against: "if you have an active reservation
+    /// (which means you've purchased an offering that has already started and hasn't
+    /// expired yet), your account isn't eligible for other offerings"
+    /// (`smithy_query(query="operation",operation="ListOfferings")`).
+    ///
+    /// Judged on the two INSTANTS the agreement runs between, because that sentence is
+    /// what defines an active reservation: one that has STARTED and whose `End` has not
+    /// passed. Reading the instants rather than the state string also means no read has to
+    /// settle the store to answer — a reservation the clock has expired is past its `End`
+    /// whether or not anything has written that state onto the record yet. A reservation in
+    /// the terminal `CANCELED` state is no agreement any more, so it holds no bandwidth and
+    /// leaves the account eligible.
+    pub fn holds_active_reservation(&self, now: SystemTime) -> bool {
+        self.reservations.values().any(|reservation| {
+            reservation.reservation_state != RESERVATION_STATE_CANCELED
+                && reservation.start_at <= now
+                && now < reservation.end_at
+        })
     }
 
     /// The router input `arn` addresses, with everything the clock already made due

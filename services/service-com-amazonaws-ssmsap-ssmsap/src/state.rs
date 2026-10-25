@@ -34,7 +34,9 @@
 //! WHICH checks there are to run is the service's own catalogue rather than an account's
 //! record: [`configuration_check_definitions`] is the set `ListConfigurationCheckDefinitions`
 //! reports and the set [`configuration_checks_to_run`] starts when a request names no
-//! check, so the two cannot disagree about what this service supports.
+//! check, so the two cannot disagree about what this service supports. Both read the
+//! check's prose from the one [`CONFIGURATION_CHECK_CATALOGUE`] every
+//! `ConfigurationCheckOperation` names its check with.
 //!
 //! The record is the stored half; the wire half (`Application`, `ApplicationSummary`,
 //! `Operation`, `ConfigurationCheckOperation`, `ComponentSummary`) is PROJECTED from it
@@ -74,6 +76,15 @@
 //! caller can read is one some run produced, and it is forgotten exactly when the run
 //! that produced it is.
 //!
+//! WHAT a run produces is the EVALUATION of its check's rules against the registered
+//! application: [`CONFIGURATION_CHECK_CATALOGUE`] is the sub-checks and
+//! [`ConfigurationRule`]s each `ConfigurationCheckType` runs, and each rule reads its
+//! status off that application's own record, so the same check passes for one
+//! registration and fails for another. The run reaches `SUCCESS` with those results when
+//! the clock brings it there, and the `RuleStatusCounts` its record reports are the tally
+//! of them ([`StoredConfigurationCheckOperation::rule_status_counts`]) rather than a
+//! second copy.
+//!
 //! What an operation PASSED is derived from that same operation record rather than held
 //! beside it: its milestones ([`StoredOperation::events`], projected onto the wire
 //! `OperationEvent` by [`OperationEventRecord::view`]) are the start of its work and, once
@@ -97,9 +108,9 @@ use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
     ComponentInfo, ComponentSummary, ConfigurationCheckDefinition, ConfigurationCheckOperation,
     ConflictException, Database, DatabaseSummary, Filter, InternalServerException, Operation,
-    OperationEvent, Resource, ResourceNotFoundException, RuleResult, SubCheckResult,
-    ValidationException,
-    APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES,
+    OperationEvent, Resource, ResourceNotFoundException, RuleResult, RuleStatusCounts,
+    SubCheckResult, ValidationException,
+    APPLICATION_TYPE_VALUES, CONFIGURATION_CHECK_TYPE_VALUES, RULE_RESULT_STATUS_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -1104,22 +1115,727 @@ impl OperationEventRecord {
     }
 }
 
-/// What a configuration check operation reports once the clock has brought it to its
-/// terminal status.
+/// `RuleResultStatus` of a rule the registered configuration satisfies. One of the
+/// model's `RuleResultStatus` values (see
+/// [`crate::ops::types::RULE_RESULT_STATUS_VALUES`]).
+pub const RULE_RESULT_STATUS_PASSED: &str = "PASSED";
+
+/// `RuleResultStatus` of a rule the registered configuration does not satisfy.
+pub const RULE_RESULT_STATUS_FAILED: &str = "FAILED";
+
+/// `RuleResultStatus` of a rule the registered configuration satisfies only in part, so
+/// the system runs but not as the rule asks.
+pub const RULE_RESULT_STATUS_WARNING: &str = "WARNING";
+
+/// `RuleResultStatus` of a rule that has nothing to judge in this configuration — the
+/// subject it is about is not part of the system the application registered.
+pub const RULE_RESULT_STATUS_INFO: &str = "INFO";
+
+/// `RuleResultStatus` of a rule whose outcome is not known: the registration does not
+/// state the property the rule is about, so neither a pass nor a failure can be
+/// reported for it. The model documents this value as "the number of rules with unknown
+/// status" in `RuleStatusCounts$Unknown`.
+pub const RULE_RESULT_STATUS_UNKNOWN: &str = "UNKNOWN";
+
+/// ONE rule of this service's configuration check catalogue: what it validates about a
+/// registered application, and the result it yields for one.
 ///
-/// A configuration check evaluates AWS's own catalogue of SAP rules against a live SAP
-/// system. This emulator holds the service's CONTROL plane — the registered
-/// application, the operation record, its id, its status and its timestamps — but it
-/// runs no SAP system and the model carries no rule catalogue
-/// (`smithy_query(query="shape", shape="ConfigurationCheckType")` is three opaque
-/// identifiers with no prose), so there is nothing here that can evaluate a rule.
-/// Rather than synthesise results that would look computed, the run ends in the
-/// model's own failure status (`ERROR`, see
-/// [`crate::ops::types::OPERATION_STATUS_VALUES`]) with a `StatusMessage` that says
-/// why, and reports NO `RuleStatusCounts`: no rule ran, so there is nothing to count.
-pub const CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE: &str =
-    "This emulator holds no SAP system to evaluate configuration check rules against, \
-     so no rule results were produced for this check.";
+/// A configuration check evaluates rules against the SAP system an application is
+/// registered for. What this service knows of that system is the REGISTRATION and what
+/// is derived from it — the System ID and instance number it declared, the Amazon EC2
+/// instances it named, its credentials, its [`StoredApplication::databases`] and its
+/// [`StoredComponent`]s — so those are what the rules here are about, and every result
+/// is READ OFF that record by [`Self::outcome`] rather than fixed: the same rule passes
+/// for one registration and fails for another. A rule whose subject the registration
+/// does not state at all yields [`RULE_RESULT_STATUS_UNKNOWN`], which is the modelled
+/// status for a rule whose outcome is not known, with a message saying what was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConfigurationRule {
+    /// The registration declares the System ID of the SAP system.
+    SystemIdDeclared,
+    /// The registration declares the SAP instance number of the SAP system.
+    SapInstanceNumberDeclared,
+    /// The registration names the Amazon EC2 instances the system runs on.
+    RegisteredOnEc2Instance,
+    /// The operating system release of each registered instance is a supported one —
+    /// which the registration does not state, so this is the catalogue's rule about a
+    /// property this service does not hold. CONSTANT by construction: it reports
+    /// [`RULE_RESULT_STATUS_UNKNOWN`] for every application, and only its message varies
+    /// with the instances the registration named.
+    HostOperatingSystemSupported,
+    /// The SAP HANA databases of the application are known to the service.
+    HanaDatabaseRegistered,
+    /// The system database of a multitenant HANA system is among them.
+    SystemDatabaseRegistered,
+    /// Every known database has credentials the service can connect with.
+    DatabaseCredentialsPresent,
+    /// Every credential names the secret that holds it.
+    CredentialSecretsNamed,
+    /// The registration declares the components of the SAP system.
+    ComponentsDeclared,
+    /// Every declared component runs on a registered Amazon EC2 instance.
+    ComponentsOnRegisteredInstances,
+    /// Every declared component belongs to the registered System ID.
+    ComponentsCarrySystemId,
+}
+
+impl ConfigurationRule {
+    /// What this rule validates: the `RuleResult$Description` every result of it carries,
+    /// which is how a caller tells one rule's result from another's.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::SystemIdDeclared => {
+                "The application declares the System ID (SID) of the SAP system it manages."
+            }
+            Self::SapInstanceNumberDeclared => {
+                "The application declares the SAP instance number of the SAP system it manages."
+            }
+            Self::RegisteredOnEc2Instance => {
+                "The application is registered against at least one Amazon EC2 instance."
+            }
+            Self::HostOperatingSystemSupported => {
+                "The operating system release of every registered Amazon EC2 instance is one \
+                 the SAP system supports."
+            }
+            Self::HanaDatabaseRegistered => {
+                "The SAP HANA databases of the application are known to the service."
+            }
+            Self::SystemDatabaseRegistered => {
+                "The system database of the SAP HANA system is among the databases known to \
+                 the service."
+            }
+            Self::DatabaseCredentialsPresent => {
+                "Every SAP HANA database known to the service has credentials the service can \
+                 connect with."
+            }
+            Self::CredentialSecretsNamed => {
+                "Every application credential names the secret that holds it."
+            }
+            Self::ComponentsDeclared => {
+                "The application declares the components of its SAP system."
+            }
+            Self::ComponentsOnRegisteredInstances => {
+                "Every declared component runs on an Amazon EC2 instance the application is \
+                 registered against."
+            }
+            Self::ComponentsCarrySystemId => {
+                "Every declared component belongs to the System ID the application is \
+                 registered with."
+            }
+        }
+    }
+
+    /// Evaluate this rule against `application` and return the result a run records.
+    ///
+    /// `region` is the Region the application is registered in, which is what its
+    /// derived databases are resolved for ([`StoredApplication::databases`]).
+    pub fn evaluate(self, application: &StoredApplication, region: &str) -> StoredRuleResult {
+        let (status, message, metadata) = self.outcome(application, region);
+        StoredRuleResult {
+            id: new_result_id(),
+            description: Some(self.description().to_string()),
+            status: Some(status.to_string()),
+            message: Some(message),
+            metadata,
+        }
+    }
+
+    /// The status, the message and the metadata this rule yields for `application`: the
+    /// whole of what one rule DECIDES, in one place, so a result is a function of the
+    /// registered configuration and of nothing else.
+    fn outcome(
+        self,
+        application: &StoredApplication,
+        region: &str,
+    ) -> (&'static str, String, BTreeMap<String, String>) {
+        match self {
+            Self::SystemIdDeclared => match application.sid.as_deref() {
+                Some(sid) => (
+                    RULE_RESULT_STATUS_PASSED,
+                    format!("The application is registered with System ID {sid}."),
+                    rule_metadata(&[("Sid", sid)]),
+                ),
+                None => (
+                    RULE_RESULT_STATUS_FAILED,
+                    "The application declares no System ID, so the SAP system it manages \
+                     cannot be identified."
+                        .to_string(),
+                    BTreeMap::new(),
+                ),
+            },
+            Self::SapInstanceNumberDeclared => match application.sap_instance_number.as_deref() {
+                Some(number) => (
+                    RULE_RESULT_STATUS_PASSED,
+                    format!("The application is registered with SAP instance number {number}."),
+                    rule_metadata(&[("SapInstanceNumber", number)]),
+                ),
+                None => (
+                    RULE_RESULT_STATUS_FAILED,
+                    "The application declares no SAP instance number, so the instance of the \
+                     SAP system it manages cannot be identified."
+                        .to_string(),
+                    BTreeMap::new(),
+                ),
+            },
+            Self::RegisteredOnEc2Instance => {
+                if application.instances.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_FAILED,
+                        "The application is registered against no Amazon EC2 instance, so the \
+                         SAP system it manages runs nowhere this service knows of."
+                            .to_string(),
+                        BTreeMap::new(),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "The application is registered against Amazon EC2 instance {}.",
+                            application.instances.join(", ")
+                        ),
+                        rule_metadata(&[("Instances", &application.instances.join(","))]),
+                    )
+                }
+            }
+            Self::HostOperatingSystemSupported => (
+                RULE_RESULT_STATUS_UNKNOWN,
+                format!(
+                    "The registration of the application states no operating system for {}, so \
+                     the operating system release could not be evaluated.",
+                    if application.instances.is_empty() {
+                        "its Amazon EC2 instances".to_string()
+                    } else {
+                        format!("Amazon EC2 instance {}", application.instances.join(", "))
+                    }
+                ),
+                BTreeMap::new(),
+            ),
+            Self::HanaDatabaseRegistered => {
+                let databases = application.databases(region);
+                if let Some(first) = databases.first() {
+                    let names: Vec<&str> = databases
+                        .iter()
+                        .map(|database| database.database_name.as_str())
+                        .collect();
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "The application has {} SAP HANA database(s) known to the service: \
+                             {}.",
+                            databases.len(),
+                            names.join(", ")
+                        ),
+                        rule_metadata(&[
+                            ("DatabaseCount", &databases.len().to_string()),
+                            ("DatabaseNames", &names.join(",")),
+                            ("ComponentId", first.component_id.as_deref().unwrap_or("")),
+                        ]),
+                    )
+                } else if application.app_type == HANA_APPLICATION_TYPE {
+                    (
+                        RULE_RESULT_STATUS_FAILED,
+                        format!(
+                            "The application is registered with type {} and names no SAP HANA \
+                             database, so the service reaches none.",
+                            application.app_type
+                        ),
+                        rule_metadata(&[("ApplicationType", &application.app_type)]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_INFO,
+                        format!(
+                            "The application is registered with type {} and names no SAP HANA \
+                             database, so this rule has none to evaluate.",
+                            application.app_type
+                        ),
+                        rule_metadata(&[("ApplicationType", &application.app_type)]),
+                    )
+                }
+            }
+            Self::SystemDatabaseRegistered => {
+                let databases = application.databases(region);
+                let system: Vec<&str> = databases
+                    .iter()
+                    .filter(|database| database.database_type == DATABASE_TYPE_SYSTEM)
+                    .map(|database| database.database_name.as_str())
+                    .collect();
+                if databases.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_INFO,
+                        "No SAP HANA database of the application is known to the service, so \
+                         there is no system database to evaluate."
+                            .to_string(),
+                        BTreeMap::new(),
+                    )
+                } else if system.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_WARNING,
+                        format!(
+                            "The service knows no system database of the application: every \
+                             database it knows ({}) is a tenant database, so the system \
+                             database {HANA_SYSTEM_DATABASE_NAME} is unreachable.",
+                            databases
+                                .iter()
+                                .map(|database| database.database_name.as_str())
+                                .collect::<Vec<&str>>()
+                                .join(", ")
+                        ),
+                        rule_metadata(&[("DatabaseCount", &databases.len().to_string())]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "The system database {} of the application is known to the service.",
+                            system.join(", ")
+                        ),
+                        rule_metadata(&[("SystemDatabases", &system.join(","))]),
+                    )
+                }
+            }
+            Self::DatabaseCredentialsPresent => {
+                let databases = application.databases(region);
+                if databases.is_empty() {
+                    return (
+                        RULE_RESULT_STATUS_INFO,
+                        "No SAP HANA database of the application is known to the service, so \
+                         there is no database connection to evaluate."
+                            .to_string(),
+                        BTreeMap::new(),
+                    );
+                }
+                let uncovered: Vec<&str> = databases
+                    .iter()
+                    .filter(|database| {
+                        !application.credentials.iter().any(|credential| {
+                            database_id_from_name(&credential.database_name) == database.database_id
+                        })
+                    })
+                    .map(|database| database.database_name.as_str())
+                    .collect();
+                if uncovered.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "Every one of the {} SAP HANA database(s) of the application has \
+                             credentials.",
+                            databases.len()
+                        ),
+                        rule_metadata(&[("DatabaseCount", &databases.len().to_string())]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_WARNING,
+                        format!(
+                            "The application names no credentials for {} of its {} SAP HANA \
+                             database(s) ({}), so the service cannot connect to them.",
+                            uncovered.len(),
+                            databases.len(),
+                            uncovered.join(", ")
+                        ),
+                        rule_metadata(&[
+                            ("DatabasesWithoutCredentials", &uncovered.join(",")),
+                            ("DatabaseCount", &databases.len().to_string()),
+                        ]),
+                    )
+                }
+            }
+            Self::CredentialSecretsNamed => {
+                if application.credentials.is_empty() {
+                    return (
+                        RULE_RESULT_STATUS_INFO,
+                        "The application names no credentials, so there is no secret to \
+                         evaluate."
+                            .to_string(),
+                        BTreeMap::new(),
+                    );
+                }
+                let unnamed = application
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.secret_id.trim().is_empty())
+                    .count();
+                if unnamed == 0 {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "Every one of the {} credential(s) of the application names the \
+                             secret that holds it.",
+                            application.credentials.len()
+                        ),
+                        rule_metadata(&[
+                            (
+                                "CredentialCount",
+                                &application.credentials.len().to_string(),
+                            ),
+                            (
+                                "CredentialTypes",
+                                &application
+                                    .credentials
+                                    .iter()
+                                    .map(|credential| credential.credential_type.as_str())
+                                    .collect::<BTreeSet<&str>>()
+                                    .into_iter()
+                                    .collect::<Vec<&str>>()
+                                    .join(","),
+                            ),
+                        ]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_FAILED,
+                        format!(
+                            "{unnamed} of the {} credential(s) of the application name no \
+                             secret, so the service holds nothing to connect with.",
+                            application.credentials.len()
+                        ),
+                        rule_metadata(&[("CredentialsWithoutSecret", &unnamed.to_string())]),
+                    )
+                }
+            }
+            Self::ComponentsDeclared => {
+                if application.components.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_WARNING,
+                        "The application declares no component, so the service manages no \
+                         component of its SAP system."
+                            .to_string(),
+                        BTreeMap::new(),
+                    )
+                } else {
+                    let types: Vec<&str> = application
+                        .components
+                        .iter()
+                        .map(|component| component.component_type.as_str())
+                        .collect();
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "The application declares {} component(s): {}.",
+                            application.components.len(),
+                            application
+                                .components
+                                .iter()
+                                .map(|component| component.id.as_str())
+                                .collect::<Vec<&str>>()
+                                .join(", ")
+                        ),
+                        rule_metadata(&[
+                            ("ComponentCount", &application.components.len().to_string()),
+                            ("ComponentTypes", &types.join(",")),
+                        ]),
+                    )
+                }
+            }
+            Self::ComponentsOnRegisteredInstances => {
+                if application.components.is_empty() {
+                    return (
+                        RULE_RESULT_STATUS_INFO,
+                        "The application declares no component, so there is no component \
+                         placement to evaluate."
+                            .to_string(),
+                        BTreeMap::new(),
+                    );
+                }
+                let elsewhere: Vec<&str> = application
+                    .components
+                    .iter()
+                    .filter(|component| !application.instances.contains(&component.ec2_instance_id))
+                    .map(|component| component.id.as_str())
+                    .collect();
+                if elsewhere.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "Every one of the {} component(s) of the application runs on an \
+                             Amazon EC2 instance it is registered against.",
+                            application.components.len()
+                        ),
+                        rule_metadata(&[("ComponentCount", &application.components.len().to_string())]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_FAILED,
+                        format!(
+                            "{} component(s) of the application ({}) run on an Amazon EC2 \
+                             instance it is not registered against.",
+                            elsewhere.len(),
+                            elsewhere.join(", ")
+                        ),
+                        rule_metadata(&[("ComponentsElsewhere", &elsewhere.join(","))]),
+                    )
+                }
+            }
+            Self::ComponentsCarrySystemId => {
+                if application.components.is_empty() {
+                    return (
+                        RULE_RESULT_STATUS_INFO,
+                        "The application declares no component, so there is no component \
+                         System ID to evaluate."
+                            .to_string(),
+                        BTreeMap::new(),
+                    );
+                }
+                let Some(sid) = application.sid.as_deref() else {
+                    return (
+                        RULE_RESULT_STATUS_UNKNOWN,
+                        "The application declares no System ID, so the System ID of its \
+                         components could not be compared with it."
+                            .to_string(),
+                        BTreeMap::new(),
+                    );
+                };
+                let foreign: Vec<&str> = application
+                    .components
+                    .iter()
+                    .filter(|component| component.sid != sid)
+                    .map(|component| component.id.as_str())
+                    .collect();
+                if foreign.is_empty() {
+                    (
+                        RULE_RESULT_STATUS_PASSED,
+                        format!(
+                            "Every one of the {} component(s) of the application belongs to \
+                             System ID {sid}.",
+                            application.components.len()
+                        ),
+                        rule_metadata(&[("Sid", sid)]),
+                    )
+                } else {
+                    (
+                        RULE_RESULT_STATUS_FAILED,
+                        format!(
+                            "{} component(s) of the application ({}) belong to another System \
+                             ID than {sid}.",
+                            foreign.len(),
+                            foreign.join(", ")
+                        ),
+                        rule_metadata(&[("Sid", sid), ("ComponentsOfAnotherSid", &foreign.join(","))]),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// The `ApplicationType` of an application that IS an SAP HANA database, which is why a
+/// registration of that type is the one the service requires credentials from (see
+/// [`CONDITIONALLY_REQUIRED_MEMBERS`]). One of the model's `ApplicationType` values
+/// (see [`crate::ops::types::APPLICATION_TYPE_VALUES`]).
+pub const HANA_APPLICATION_TYPE: &str = "HANA";
+
+/// The longest `RuleResultMetadata` value the model admits
+/// (`smithy_query(query="shape", shape="RuleResultMetadataValue")`: length 1..1000),
+/// which is what [`rule_metadata`] cuts a value to — a registration may name more
+/// databases, credentials or components than one metadata value can hold.
+pub const MAX_RULE_RESULT_METADATA_VALUE_LENGTH: usize = 1000;
+
+/// `RuleResultMetadata` from the entries that have a value: the model constrains a
+/// metadata value to 1..1000 characters, so an entry whose value is empty is left out
+/// rather than written as an empty string, and a longer one is cut to the first
+/// [`MAX_RULE_RESULT_METADATA_VALUE_LENGTH`] CHARACTERS — the unit the constraint is
+/// declared in, so a multi-byte name is neither split nor counted twice.
+///
+/// A value that lists several names joined by [`METADATA_LIST_SEPARATOR`] is cut at an
+/// ELEMENT boundary, dropping the entry the bound would have halved, so every name a
+/// caller reads in it is a whole one.
+fn rule_metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| {
+            let within_bound: String = value
+                .chars()
+                .take(MAX_RULE_RESULT_METADATA_VALUE_LENGTH)
+                .collect();
+            let whole_entries = if within_bound.chars().count() < value.chars().count() {
+                match within_bound.rfind(METADATA_LIST_SEPARATOR) {
+                    Some(last) => within_bound
+                        .get(..last)
+                        .unwrap_or(within_bound.as_str())
+                        .to_string(),
+                    None => within_bound,
+                }
+            } else {
+                within_bound
+            };
+            ((*key).to_string(), whole_entries)
+        })
+        .collect()
+}
+
+/// What joins the names a `RuleResultMetadata` value lists, and therefore the boundary
+/// [`rule_metadata`] cuts such a value at.
+const METADATA_LIST_SEPARATOR: char = ',';
+
+/// ONE sub-check of a configuration check: the group of rules a `SubCheckResult`
+/// reports, with the prose the service reports for it.
+#[derive(Debug, Clone, Copy)]
+pub struct SubCheckDefinition {
+    /// `SubCheckResult$Name`.
+    pub name: &'static str,
+    /// `SubCheckResult$Description`: what the sub-check validates.
+    pub description: &'static str,
+    /// The rules this sub-check evaluates, which become its `RuleResult`s.
+    pub rules: &'static [ConfigurationRule],
+}
+
+/// ONE entry of this service's configuration check catalogue: a `ConfigurationCheckType`,
+/// the prose the service reports for it, and the sub-checks a run of it evaluates.
+///
+/// The prose is the catalogue's, so the SAME `Name` and `Description` are reported by
+/// `ListConfigurationCheckDefinitions` ([`configuration_check_definitions`]) and by every
+/// `ConfigurationCheckOperation` of that check
+/// ([`StoredConfigurationCheckOperation::view`]): one catalogue, two readers, which is
+/// what stops them disagreeing about what a check is.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigurationCheckEntry {
+    /// A `ConfigurationCheckType` value (see
+    /// [`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]).
+    pub id: &'static str,
+    /// `ConfigurationCheckDefinition$Name` / `ConfigurationCheckOperation$ConfigurationCheckName`.
+    pub name: &'static str,
+    /// `ConfigurationCheckDefinition$Description` /
+    /// `ConfigurationCheckOperation$ConfigurationCheckDescription`.
+    pub description: &'static str,
+    /// The sub-checks a run of this check evaluates, in the order they are evaluated.
+    pub sub_checks: &'static [SubCheckDefinition],
+}
+
+impl ConfigurationCheckEntry {
+    /// Evaluate every rule of every sub-check of this check against `application`: the
+    /// sub-check results a run of it produces, each holding its own rule results.
+    ///
+    /// `region` is the Region the application is registered in; see
+    /// [`ConfigurationRule::evaluate`].
+    pub fn evaluate(
+        &self,
+        application: &StoredApplication,
+        region: &str,
+    ) -> Vec<StoredSubCheckResult> {
+        self.sub_checks
+            .iter()
+            .map(|sub_check| StoredSubCheckResult {
+                id: new_result_id(),
+                name: Some(sub_check.name.to_string()),
+                description: Some(sub_check.description.to_string()),
+                // `SubCheckReferencesList` is "references or documentation links related
+                // to the sub-check", which this service holds none of, so none is
+                // reported rather than one invented.
+                references: Vec::new(),
+                rule_results: sub_check
+                    .rules
+                    .iter()
+                    .map(|rule| rule.evaluate(application, region))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// How many rules a run of this check evaluates, which is the total its
+    /// `RuleStatusCounts` add up to.
+    pub fn rule_count(&self) -> usize {
+        self.sub_checks
+            .iter()
+            .map(|sub_check| sub_check.rules.len())
+            .sum()
+    }
+}
+
+/// The configuration checks this service supports: one entry per value of the model's
+/// `ConfigurationCheckType` enum (see
+/// [`crate::ops::types::CONFIGURATION_CHECK_TYPE_VALUES`]), each naming the sub-checks
+/// and rules a run of it evaluates against the registered application.
+///
+/// The model gives the enum no documentation of its own
+/// (`smithy_query(query="shape", shape="ConfigurationCheckType")` is three identifiers),
+/// so each entry's prose states what its own rules are about — the registration's
+/// identifiers and compute, its SAP HANA databases and credentials, and its components —
+/// which is what a caller of either reader is told the check does.
+pub const CONFIGURATION_CHECK_CATALOGUE: &[ConfigurationCheckEntry] = &[
+    ConfigurationCheckEntry {
+        id: "SAP_CHECK_01",
+        name: "SAP system identification",
+        description: "Checks that the application identifies the SAP system it manages and the \
+                      Amazon EC2 instances that system runs on.",
+        sub_checks: &[
+            SubCheckDefinition {
+                name: "System identifiers",
+                description: "The System ID and SAP instance number the application is \
+                              registered with.",
+                rules: &[
+                    ConfigurationRule::SystemIdDeclared,
+                    ConfigurationRule::SapInstanceNumberDeclared,
+                ],
+            },
+            SubCheckDefinition {
+                name: "Compute",
+                description: "The Amazon EC2 instances the registered SAP system runs on.",
+                rules: &[
+                    ConfigurationRule::RegisteredOnEc2Instance,
+                    ConfigurationRule::HostOperatingSystemSupported,
+                ],
+            },
+        ],
+    },
+    ConfigurationCheckEntry {
+        id: "SAP_CHECK_02",
+        name: "SAP HANA database connectivity",
+        description: "Checks the SAP HANA databases of the application and the credentials the \
+                      service connects to them with.",
+        sub_checks: &[
+            SubCheckDefinition {
+                name: "Database registration",
+                description: "The SAP HANA databases the registration made known to the service.",
+                rules: &[
+                    ConfigurationRule::HanaDatabaseRegistered,
+                    ConfigurationRule::SystemDatabaseRegistered,
+                ],
+            },
+            SubCheckDefinition {
+                name: "Database credentials",
+                description: "The credentials that reach the SAP HANA databases of the \
+                              application.",
+                rules: &[
+                    ConfigurationRule::DatabaseCredentialsPresent,
+                    ConfigurationRule::CredentialSecretsNamed,
+                ],
+            },
+        ],
+    },
+    ConfigurationCheckEntry {
+        id: "SAP_CHECK_03",
+        name: "SAP application component layout",
+        description: "Checks the components the application declares for its SAP system and \
+                      where they run.",
+        sub_checks: &[
+            SubCheckDefinition {
+                name: "Component declaration",
+                description: "The components the registration declared for the SAP system.",
+                rules: &[ConfigurationRule::ComponentsDeclared],
+            },
+            SubCheckDefinition {
+                name: "Component placement",
+                description: "The Amazon EC2 instance and System ID each declared component \
+                              belongs to.",
+                rules: &[
+                    ConfigurationRule::ComponentsOnRegisteredInstances,
+                    ConfigurationRule::ComponentsCarrySystemId,
+                ],
+            },
+        ],
+    },
+];
+
+/// The catalogue entry for `check_id`, or `None` for a `ConfigurationCheckType` this
+/// service catalogues no rules for — which is what keeps the catalogue the single place
+/// a check's prose and rules are stated.
+pub fn configuration_check_entry(check_id: &str) -> Option<&'static ConfigurationCheckEntry> {
+    CONFIGURATION_CHECK_CATALOGUE
+        .iter()
+        .find(|entry| entry.id == check_id)
+}
 
 /// The result of ONE rule a sub-check evaluated: the record `ListSubCheckRuleResults`
 /// reports, held inside the [`StoredSubCheckResult`] it belongs to.
@@ -1234,11 +1950,10 @@ pub struct StoredConfigurationCheckOperation {
     /// The sub-check results this run produced, which is what `ListSubCheckResults`
     /// pages over and where `ListSubCheckRuleResults` resolves a `SubCheckResultId`.
     ///
-    /// A run of this emulator evaluates no rule, for the reason
-    /// [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states, so it produces no
-    /// sub-check result either: the two listings report what the run produced, and a
-    /// run that produced nothing is reported as holding nothing rather than as
-    /// something invented.
+    /// Written by the RUN: a check evaluates the rules its catalogue entry names
+    /// ([`ConfigurationCheckEntry::evaluate`]) when it reaches its terminal status, so a
+    /// run that is still `INPROGRESS` holds nothing yet and what a finished one holds is
+    /// what its rules decided about the application it was started against.
     pub sub_check_results: Vec<StoredSubCheckResult>,
 }
 
@@ -1248,38 +1963,107 @@ impl StoredConfigurationCheckOperation {
     fn eviction_rank(&self) -> (bool, SystemTime) {
         (self.status == OPERATION_STATUS_INPROGRESS, self.start_time)
     }
+    /// Whether the terminal status of this run has fallen due by `now` and has not been
+    /// materialised yet — which is when [`Self::settle`] has something to do.
+    pub fn terminal_due(&self, now: SystemTime) -> bool {
+        self.status == OPERATION_STATUS_INPROGRESS && now >= self.terminal_due_at
+    }
+
     /// Materialise the terminal status the clock already owes this check: it was due to
     /// end at `terminal_due_at` whether or not anybody asked.
     ///
-    /// See [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] for why the terminal status is
-    /// the model's failure status rather than `SUCCESS`.
-    pub fn settle(&mut self, now: SystemTime) {
-        if self.status != OPERATION_STATUS_INPROGRESS || now < self.terminal_due_at {
+    /// `evaluated` is what the run produced at that instant: the sub-check results of
+    /// its rules ([`ConfigurationCheckEntry::evaluate`]), which end the run in `SUCCESS`
+    /// — the rules ran, so there is nothing to explain and the counts are the tally of
+    /// their results ([`Self::rule_status_counts`]) — or the reason they could not be
+    /// evaluated, which ends it in the model's failure status stating that reason. The
+    /// caller computes it only for a run [`Self::terminal_due`] holds for, because the
+    /// rules are evaluated by the run and not by the read that observes it.
+    pub fn settle(&mut self, now: SystemTime, evaluated: Result<Vec<StoredSubCheckResult>, String>) {
+        if !self.terminal_due(now) {
             return;
         }
-        self.status = OPERATION_STATUS_ERROR.to_string();
-        self.status_message = Some(CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE.to_string());
+        match evaluated {
+            Ok(results) => {
+                self.status = OPERATION_STATUS_SUCCESS.to_string();
+                // `StatusMessage` explains a non-success status; a check whose rules ran
+                // has nothing to explain.
+                self.status_message = None;
+                self.sub_check_results = results;
+            }
+            Err(reason) => {
+                self.status = OPERATION_STATUS_ERROR.to_string();
+                self.status_message = Some(reason);
+            }
+        }
         self.end_time = Some(self.terminal_due_at);
+    }
+
+    /// A summary of all the rule results of this run, counted per `RuleResultStatus` —
+    /// which is what the model documents `RuleStatusCounts` as.
+    ///
+    /// DERIVED from the results the run produced rather than held beside them, so the
+    /// counts cannot disagree with what `ListSubCheckResults` and
+    /// `ListSubCheckRuleResults` report; a result whose status is absent or outside the
+    /// modelled catalogue counts as one of unknown status. A run that has produced no
+    /// result yet has nothing to summarise, so it reports no counts at all.
+    pub fn rule_status_counts(&self) -> Option<RuleStatusCounts> {
+        let results: Vec<&StoredRuleResult> = self
+            .sub_check_results
+            .iter()
+            .flat_map(|sub_check| sub_check.rule_results.iter())
+            .collect();
+        if results.is_empty() {
+            return None;
+        }
+        let count = |status: &str| -> i32 {
+            let counted = results
+                .iter()
+                .filter(|result| match result.status.as_deref() {
+                    Some(reported) if RULE_RESULT_STATUS_VALUES.contains(&reported) => {
+                        reported == status
+                    }
+                    // A result that reports no status, or one the model does not
+                    // define, is a rule whose status is not known.
+                    _ => status == RULE_RESULT_STATUS_UNKNOWN,
+                })
+                .count();
+            // A run evaluates the rules of ONE catalogue entry
+            // ([`ConfigurationCheckEntry::rule_count`]), so a count never comes near
+            // this conversion's ceiling.
+            i32::try_from(counted).unwrap_or(i32::MAX)
+        };
+        Some(RuleStatusCounts {
+            passed: Some(count(RULE_RESULT_STATUS_PASSED)),
+            failed: Some(count(RULE_RESULT_STATUS_FAILED)),
+            warning: Some(count(RULE_RESULT_STATUS_WARNING)),
+            info: Some(count(RULE_RESULT_STATUS_INFO)),
+            unknown: Some(count(RULE_RESULT_STATUS_UNKNOWN)),
+        })
     }
 
     /// Project the stored check onto the modelled `ConfigurationCheckOperation`.
     ///
     /// `ConfigurationCheckName` / `ConfigurationCheckDescription` are the catalogue's
-    /// prose for the check. Neither the model nor this emulator holds that text, so
-    /// they are reported ABSENT rather than invented; `RuleStatusCounts` is absent for
-    /// the reason [`CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`] states.
+    /// prose for the check this run performs ([`configuration_check_entry`]), which is
+    /// the same text `ListConfigurationCheckDefinitions` reports for that
+    /// `ConfigurationCheckType`; a check the catalogue does not hold is reported without
+    /// them rather than with invented ones. `RuleStatusCounts` is the tally of the rule
+    /// results this run produced ([`Self::rule_status_counts`]).
     pub fn view(&self) -> ConfigurationCheckOperation {
+        let catalogued = configuration_check_entry(&self.check_id);
         ConfigurationCheckOperation {
             id: Some(self.id.clone()),
             application_id: Some(self.application_id.clone()),
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
             configuration_check_id: Some(self.check_id.clone()),
-            configuration_check_name: None,
-            configuration_check_description: None,
+            configuration_check_name: catalogued.map(|entry| entry.name.to_string()),
+            configuration_check_description: catalogued
+                .map(|entry| entry.description.to_string()),
             start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),
             end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
-            rule_status_counts: None,
+            rule_status_counts: self.rule_status_counts(),
         }
     }
 
@@ -1402,10 +2186,12 @@ pub fn configuration_checks_to_run(requested: Option<&[String]>) -> Vec<String> 
 /// ([`crate::ops::types::APPLICATION_TYPE_VALUES`]) — the types a start of that check is
 /// accepted for.
 ///
-/// `Name` and `Description` are the catalogue's PROSE for the check, which neither the
-/// model nor this emulator holds (the enum is three opaque identifiers with no
-/// documentation), so they are reported ABSENT rather than invented — the same choice
-/// [`StoredConfigurationCheckOperation::view`] makes for the same two values.
+/// `Name` and `Description` are the catalogue's PROSE for the check, which the model
+/// itself does not carry: they come from this service's own catalogue
+/// ([`CONFIGURATION_CHECK_CATALOGUE`]), so they are the SAME text every
+/// `ConfigurationCheckOperation` of that check reports
+/// ([`StoredConfigurationCheckOperation::view`]) and a modelled check the catalogue
+/// holds no entry for is reported without them rather than with invented ones.
 pub fn configuration_check_definitions() -> Vec<(String, ConfigurationCheckDefinition)> {
     let applicable: Vec<String> = APPLICATION_TYPE_VALUES
         .iter()
@@ -1415,12 +2201,13 @@ pub fn configuration_check_definitions() -> Vec<(String, ConfigurationCheckDefin
         CONFIGURATION_CHECK_TYPE_VALUES
             .iter()
             .map(|check| {
+                let catalogued = configuration_check_entry(check);
                 (
                     (*check).to_string(),
                     ConfigurationCheckDefinition {
                         id: Some((*check).to_string()),
-                        name: None,
-                        description: None,
+                        name: catalogued.map(|entry| entry.name.to_string()),
+                        description: catalogued.map(|entry| entry.description.to_string()),
                         applicable_application_types: Some(applicable.clone()),
                     },
                 )
@@ -1533,8 +2320,33 @@ impl RegionState {
         for operation in self.operations.values_mut() {
             operation.settle(now);
         }
-        for check in self.configuration_check_operations.values_mut() {
-            check.settle(now);
+        // A configuration check run reaches its terminal status at its own instant too,
+        // and what it reports then is the EVALUATION of its check's rules against the
+        // application it was started for ([`ConfigurationCheckEntry::evaluate`]) — so the
+        // rules are evaluated here, at the instant the run was due to finish whether or
+        // not anybody polled it, and never by the read that observes the record.
+        let due: Vec<String> = self
+            .configuration_check_operations
+            .iter()
+            .filter(|(_, run)| run.terminal_due(now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let Some(run) = self.configuration_check_operations.get(&id) else {
+                continue;
+            };
+            let (application_id, check_id) = (run.application_id.clone(), run.check_id.clone());
+            // The application is resolved here rather than held on the run, so the rules
+            // judge the configuration as it stands when the run ends.
+            let evaluated = match self.applications.get(&application_id) {
+                Some(application) => configuration_check_entry(&check_id)
+                    .map(|entry| entry.evaluate(application, arn_region(&application.arn)))
+                    .ok_or_else(|| uncatalogued_configuration_check_message(&check_id)),
+                None => Err(configuration_check_subject_gone_message(&application_id)),
+            };
+            if let Some(run) = self.configuration_check_operations.get_mut(&id) {
+                run.settle(now, evaluated);
+            }
         }
     }
 
@@ -1858,9 +2670,8 @@ impl RegionState {
             // A check that has not finished has no end time yet.
             end_time: None,
             terminal_due_at: now + TRANSITION_SPAN,
-            // The results a run produces are written by the run; see
-            // [`StoredConfigurationCheckOperation::sub_check_results`] for why a run of
-            // this emulator produces none.
+            // The results a run produces are written by the run, when it reaches its
+            // terminal status; see [`StoredConfigurationCheckOperation::settle`].
             sub_check_results: Vec::new(),
         };
         self.configuration_check_operations
@@ -2060,6 +2871,13 @@ impl ComAmazonawsSsmsapSsmsapState {
 /// (`^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$`) describes.
 pub fn new_operation_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
+}
+
+/// A fresh `SubCheckResultId` / `RuleResultId`: the same v4 UUID form BOTH patterns
+/// describe, minted by the one generator this crate decides an id's form in
+/// ([`new_operation_id`]), so the two cannot drift apart.
+pub fn new_result_id() -> String {
+    new_operation_id()
 }
 
 /// The ARN of the application `application_id` in `region`:
@@ -2382,7 +3200,7 @@ impl ConditionalMember {
 /// requires nothing conditionally.
 pub const CONDITIONALLY_REQUIRED_MEMBERS: &[(&str, &[ConditionalMember])] = &[
     (
-        "HANA",
+        HANA_APPLICATION_TYPE,
         &[
             ConditionalMember::Sid,
             ConditionalMember::SapInstanceNumber,
@@ -2517,6 +3335,23 @@ pub fn no_sub_check_result_message(sub_check_result_id: &str) -> String {
     format!(
         "No sub-check result with ID {sub_check_result_id} exists in this account and Region"
     )
+}
+
+/// Why a configuration check run ended in the model's failure status instead of
+/// `SUCCESS`: the application it was started against stopped being registered before the
+/// run finished, so the configuration its rules are about no longer exists.
+pub fn configuration_check_subject_gone_message(application_id: &str) -> String {
+    format!(
+        "Application {application_id} is no longer registered, so the rules of this \
+         configuration check were not evaluated"
+    )
+}
+
+/// Why a run of a check this service catalogues no rules for
+/// ([`CONFIGURATION_CHECK_CATALOGUE`]) ended in the model's failure status: there was
+/// nothing to evaluate for it.
+pub fn uncatalogued_configuration_check_message(check_id: &str) -> String {
+    format!("No configuration check rules are defined for {check_id}")
 }
 
 /// This service's modelled `ResourceNotFoundException` (HTTP 404) carrying `message`.

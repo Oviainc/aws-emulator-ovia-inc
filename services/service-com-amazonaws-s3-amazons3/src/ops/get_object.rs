@@ -502,11 +502,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             expiration: store
                 .bucket(&input.bucket)
                 .and_then(|bucket| bucket.object_expiration_header(&input.key, object)),
+            // "Provides information about object restoration action and expiration time of
+            // the restored object copy" (`GetObjectOutput$Restore`): the state of the
+            // restore `RestoreObject` initiated on THIS version, reported through the one
+            // renderer `HeadObject` reports it through, so a GET and a HEAD of the same
+            // version cannot disagree about it.
+            restore: object
+                .restore
+                .as_ref()
+                .and_then(|restore| restore.header_value(::std::time::SystemTime::now())),
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `AcceptRanges` would advertise
             // the ranged reads refused above, `DeleteMarker` needs a delete marker (a
-            // delete records none, so no read can be of one), `Restore`/`ArchiveStatus`
-            // need an archive tier, the checksum members need a checksum `PutObject` did
+            // delete records none, so no read can be of one), `ArchiveStatus` needs an
+            // S3 Intelligent-Tiering archive tier, the checksum members need a checksum
+            // `PutObject` did
             // not compute, the SSE-C members are refused at write time, `PartsCount` needs
             // a multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
             // counts unreadable metadata headers (there are none), `ReplicationStatus`

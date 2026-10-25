@@ -39,6 +39,8 @@ mod error_envelope;
 mod foreign_page_token_wording;
 #[path = "all/get_composition.rs"]
 mod get_composition;
+#[path = "all/get_encoder_configuration.rs"]
+mod get_encoder_configuration;
 #[path = "all/get_participant.rs"]
 mod get_participant;
 #[path = "all/ingest_configurations.rs"]

@@ -618,6 +618,19 @@ pub const SYNC_JOB_ERROR_MESSAGE: &str =
     "this emulator synchronises nothing: no resource was read from the sync source and none was \
      created, updated or deleted in the workspace";
 
+/// This service's own principal, as an IAM trust policy names it: the principal
+/// a role this service has to act as must admit.
+///
+/// A `syncRole` "is used by the SyncJob to read from the syncSource, and create,
+/// update, or delete the corresponding resources"
+/// (`smithy_query(query="operation",operation="CreateSyncJob")`), so the service
+/// itself assumes that role — which IAM only lets it do when the role's trust
+/// policy grants this principal `sts:AssumeRole`. The rule that reads a role's
+/// trust policy against this principal lives with the operation that owns the
+/// only member naming such a role
+/// (`crate::ops::create_sync_job::assume_role_refusal`).
+pub const SERVICE_PRINCIPAL: &str = "iottwinmaker.amazonaws.com";
+
 /// The `PricingMode` an account that has never changed its pricing plan is on,
 /// and the `UpdateReason` such a plan carries.
 ///
@@ -2945,7 +2958,7 @@ impl RegionalState {
 /// The message for a resource no ARN in this service's index names.
 ///
 /// Built from the request, naming the ARN that was looked for — the same
-/// construction as [`workspace_not_found_message`], one level up from an id to
+/// construction as [`entity_not_found_message`], one level up from an id to
 /// the ARN the tagging operations address a resource by.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("Resource {resource_arn} not found.")
@@ -2996,11 +3009,37 @@ pub fn sync_job_not_found_message(workspace_id: &str, sync_source: &str) -> Stri
     format!("SyncJob for sync source {sync_source} in workspace {workspace_id} not found.")
 }
 
-/// The message for a workspace this service does not hold: built from the
-/// request, naming the workspace that was looked for. Same construction as
-/// [`entity_not_found_message`], one level up the resource tree.
+/// The message for a workspace this service does not hold, on a path that LOOKS
+/// a workspace UP to serve the request: built from the request, naming the
+/// workspace that was looked for.
+///
+/// The service's not-found message is per-operation, not one string for the
+/// whole API: the look-up path reports what it could not find for the id it was
+/// given, while the workspace's own UPDATE path reports the account-scoped form
+/// [`workspace_does_not_exist_message`] builds. Every operation that resolves a
+/// workspace in order to read or write something it contains uses this one.
 pub fn workspace_not_found_message(workspace_id: &str) -> String {
-    format!("Workspace {workspace_id} not found.")
+    format!("Unable to find workspace for id: {workspace_id}")
+}
+
+/// The message the workspace UPDATE path reports for a workspace this service
+/// does not hold: built from the request and the caller's account, which is what
+/// scopes a workspace id.
+///
+/// The other construction of the same miss is [`workspace_not_found_message`];
+/// see it for why the two differ.
+pub fn workspace_does_not_exist_message(workspace_id: &str) -> String {
+    format!(
+        "Workspace with id {}|{workspace_id} does not exist.",
+        ::emulator_server::emulator_account_id()
+    )
+}
+
+/// The message for a delete of an entity that still has children, which only
+/// `isRecursive` removes: built from the request, naming the entity the delete
+/// addressed and the workspace it addressed it in.
+pub fn entity_has_children_message(workspace_id: &str, entity_id: &str) -> String {
+    format!("Cannot delete entity {entity_id} in {workspace_id} as it has child entities.")
 }
 
 /// The message for a create whose id is already TAKEN, as the message a
@@ -3138,7 +3177,7 @@ pub fn metadata_transfer_job_role() -> String {
 
 /// The message for a metadata transfer job this account does not hold. Built
 /// from the request, naming the job that was looked for — the same construction
-/// as [`workspace_not_found_message`], one resource across.
+/// as [`resource_not_found_message`], one resource across.
 pub fn metadata_transfer_job_not_found_message(metadata_transfer_job_id: &str) -> String {
     format!("MetadataTransferJob {metadata_transfer_job_id} not found.")
 }

@@ -5,9 +5,10 @@
 //! `ResourceNotFoundException` and `ListEntities` no longer reports it.
 //!
 //! `isRecursive` decides what happens to the entity's children: without it, an
-//! entity that still has children is a `ValidationException`; with it, the whole
-//! subtree below the entity goes too. An unknown workspace or entity is a
-//! `ResourceNotFoundException`.
+//! entity that still has children is a `ValidationException`, in the
+//! construction [`crate::state::entity_has_children_message`] builds; with it,
+//! the whole subtree below the entity goes too. An unknown workspace or entity
+//! is a `ResourceNotFoundException`.
 //!
 //! The removal is SYNCHRONOUS and the `DELETING` the output reports is the state
 //! the entity was in when it was removed, not a stage to poll: the next
@@ -200,10 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !recursive && !children.is_empty() {
             return Err(DeleteEntityErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "entity {} has {} child entities; set isRecursive to delete them too",
-                        input.entity_id,
-                        children.len()
+                    message: Some(crate::state::entity_has_children_message(
+                        &input.workspace_id,
+                        &input.entity_id,
                     )),
                 },
             )
