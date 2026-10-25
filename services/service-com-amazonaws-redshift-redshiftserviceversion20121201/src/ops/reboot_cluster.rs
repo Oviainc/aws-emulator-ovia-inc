@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts one stored cluster: the record moves to the `rebooting` state for the
+//! momentary outage, the changes that were waiting for a restart are applied, and
+//! the cluster is reported back. The cluster is available again at the due instant
+//! this call sets, materialised by the store's clock-owed settle.
 //!
 //! ## Shape of an operation
 //!
@@ -84,11 +79,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `RebootClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#RebootCluster")]
+// `DependentServiceUnavailableFault` is widened in, exactly as `ModifyCluster`
+// widens it: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#RebootCluster",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum RebootClusterErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -137,23 +140,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::REBOOT_CLUSTER_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Restart the cluster the request names.
+    ///
+    /// A MUTATION: the restart "is taken as soon as possible" and "results in a
+    /// momentary outage to the cluster, during which the cluster status is set to
+    /// rebooting", and "any pending cluster modifications … are applied at this
+    /// reboot". So the stored record leaves this call in the restarting state,
+    /// with nothing pending and with the parameter values that were waiting for a
+    /// restart now in force; it is available again a span later, applied by the
+    /// store's clock-owed settle rather than by this call.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootCluster"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(RebootClusterErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let started = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The cluster to restart has to be there, and it has to be in the state
+        // that admits the work: a cluster the service is already working on
+        // cannot take a restart as well.
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(RebootClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        };
+        let cluster_status = store.clusters[position]
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(RebootClusterErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {} is in state {cluster_status}; it must be {} to be rebooted.",
+                        input.cluster_identifier,
+                        st::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The restart applies what was waiting for one: a parameter value the
+        // cluster had not seen is now in force, through the store's own rule.
+        store.apply_pending_parameter_changes(position);
+
+        let stored = &mut store.clusters[position];
+        // "Any pending cluster modifications … are applied at this reboot", so
+        // from here the cluster carries them and reports nothing pending.
+        stored.cluster.pending_modified_values = Some(PendingModifiedValues::default());
+        stored.cluster.cluster_status = Some(st::STATUS_REBOOTING.to_string());
+        // The outage is momentary, not instantaneous: the cluster is available
+        // again a span from this call, so a caller acting straight afterwards
+        // still observes the restart. The due instant is stored and nothing
+        // sleeps for it.
+        stored.available_at = started + st::PROVISIONING_SPAN;
+
+        // Re-derive every member this service computes from the cluster's own
+        // configuration, through the same rule the create and the modify paths
+        // use, so this response reports the member set a later read does.
+        let cluster_type = stored.cluster_type.clone();
+        st::populate_derived_members(
+            &mut stored.cluster,
+            &cluster_type,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
+
+        Ok(RebootClusterOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

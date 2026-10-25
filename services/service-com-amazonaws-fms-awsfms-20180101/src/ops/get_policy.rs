@@ -174,7 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         Ok(GetPolicyOutput {
-            policy: Some(record.policy()),
+            // `PolicyStatus` is SERVICE-DERIVED — "whether the policy is in or
+            // out of an admin's policy or Region scope" — so it is read from
+            // the store, never from the document the policy was written with.
+            policy: Some(record.policy(store.policy_status(record))),
             policy_arn: Some(record.policy_arn.clone()),
         })
     }

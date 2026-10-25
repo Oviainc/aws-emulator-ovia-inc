@@ -436,9 +436,9 @@ fn validate_statistics_configurations(
         }
         for statistic in &configuration.additional_statistics {
             let supported = if percentiles_only {
-                percentile_statistic(statistic).is_some()
+                crate::state::parse_percentile(statistic).is_some()
             } else {
-                is_cloudwatch_statistic(statistic)
+                crate::state::is_cloudwatch_statistic(statistic)
             };
             if !supported {
                 return Err(invalid_parameter_value(format!(
@@ -469,122 +469,25 @@ fn is_opentelemetry_format(format: &str) -> bool {
     format.starts_with("opentelemetry")
 }
 
-/// The percentile a `p??` statistic names, in percent: `p90` is 90 and `p99.9` is 99.9.
-/// `None` for anything that is not a percentile statistic.
-fn percentile_statistic(statistic: &str) -> Option<f64> {
-    percentage(strip_prefix_ignore_ascii_case(statistic, "p")?)
-}
-
-/// The statistics CloudWatch names outright on the "CloudWatch statistics definitions" page
-/// `MetricStreamStatisticsConfiguration$AdditionalStatistics` points at for the `json`
-/// output format: the five basic statistics and the interquartile mean.
-const BASIC_STATISTICS: &[&str] = &["SampleCount", "Average", "Sum", "Minimum", "Maximum", "IQM"];
-
-/// The statistic families from the same page that take a trimming span, either as a bare
-/// percentile ("this includes tm98, wm90") or as a span: trimmed mean, trimmed count,
-/// trimmed sum and Winsorized mean.
-const TRIMMED_FAMILIES: &[&str] = &["tm", "tc", "ts", "wm"];
-
-/// The percentile-rank family from the same page, which takes a span of metric VALUES
-/// rather than a percentile ("and `PR(:300)`").
-const RANK_FAMILIES: &[&str] = &["pr"];
-
-/// Whether `statistic` is one CloudWatch supports, which is what a `json` metric stream may
-/// carry: a basic statistic, a percentile, or a member of a bounded family.
-fn is_cloudwatch_statistic(statistic: &str) -> bool {
-    BASIC_STATISTICS
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(statistic))
-        || percentile_statistic(statistic).is_some()
-        || bounded_statistic(statistic)
-}
-
-/// A statistic of one of the bounded families, in either documented form:
-/// `<family><percentile>` (`tm98`) or `<family>(<low>:<high>)` (`TM(10%:90%)`, `PR(:300)`),
-/// where one side of a span may be omitted but not both.
-fn bounded_statistic(statistic: &str) -> bool {
-    if let Some(open) = statistic.find('(') {
-        let (family, span) = statistic.split_at(open);
-        return TRIMMED_FAMILIES
-            .iter()
-            .chain(RANK_FAMILIES)
-            .any(|known| known.eq_ignore_ascii_case(family))
-            && is_span(span);
-    }
-    TRIMMED_FAMILIES.iter().any(|family| {
-        strip_prefix_ignore_ascii_case(statistic, family)
-            .and_then(percentage)
-            .is_some()
-    })
-}
-
-/// Whether `span` is a `(<low>:<high>)` bound pair with at least one bound given.
-fn is_span(span: &str) -> bool {
-    let Some(inner) = span
-        .strip_prefix('(')
-        .and_then(|rest| rest.strip_suffix(')'))
-    else {
-        return false;
-    };
-    let Some((low, high)) = inner.split_once(':') else {
-        return false;
-    };
-    !(low.is_empty() && high.is_empty())
-        && [low, high]
-            .iter()
-            .all(|bound| bound.is_empty() || bound_value(bound).is_some())
-}
-
-/// One bound of a span: a percentage when it carries a `%`, otherwise a plain metric value.
-fn bound_value(bound: &str) -> Option<f64> {
-    match bound.strip_suffix('%') {
-        Some(percent) => percentage(percent),
-        None => decimal(bound),
-    }
-}
-
-/// A percentage: a decimal in 0..=100.
-fn percentage(text: &str) -> Option<f64> {
-    decimal(text).filter(|value| (0.0..=100.0).contains(value))
-}
-
-/// A plain non-negative decimal number, so `f64`'s sign and exponent forms (`+5`, `1e3`,
-/// `inf`) cannot slip through where a statistic's bound is expected.
-fn decimal(text: &str) -> Option<f64> {
-    if text.is_empty()
-        || !text
-            .chars()
-            .all(|character| character.is_ascii_digit() || character == '.')
-    {
-        return None;
-    }
-    text.parse().ok()
-}
-
-/// `text` without `prefix`, comparing the prefix without regard to ASCII case.
-fn strip_prefix_ignore_ascii_case<'text>(text: &'text str, prefix: &str) -> Option<&'text str> {
-    let head = text.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &text[prefix.len()..])
-}
+// The statistic grammar every operation of this service that takes a statistic NAME is
+// judged by lives in `crate::state` — `is_cloudwatch_statistic` and `parse_percentile` — so
+// a metric stream, a metric read and an alarm all admit the same set.
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn percentile_statistics_are_recognised_by_form() {
         for statistic in ["p0", "p90", "p99.9", "p100", "P95"] {
             assert!(
-                percentile_statistic(statistic).is_some(),
+                crate::state::parse_percentile(statistic).is_some(),
                 "case {statistic:?}: expected a percentile, got None"
             );
         }
         for statistic in ["p101", "p", "pp9", "Average", "tm98", "p1e2", "p+9"] {
             assert!(
-                percentile_statistic(statistic).is_none(),
+                crate::state::parse_percentile(statistic).is_none(),
                 "case {statistic:?}: expected no percentile, got {:?}",
-                percentile_statistic(statistic)
+                crate::state::parse_percentile(statistic)
             );
         }
     }
@@ -607,13 +510,13 @@ mod tests {
             "TC(0.5:2.5)",
         ] {
             assert!(
-                is_cloudwatch_statistic(statistic),
+                crate::state::is_cloudwatch_statistic(statistic),
                 "case {statistic:?}: expected a supported statistic, got unsupported"
             );
         }
         for statistic in ["Median", "tm", "tm110", "TM(:)", "PR(300)", "PR(a:b)", ""] {
             assert!(
-                !is_cloudwatch_statistic(statistic),
+                !crate::state::is_cloudwatch_statistic(statistic),
                 "case {statistic:?}: expected an unsupported statistic, got supported"
             );
         }

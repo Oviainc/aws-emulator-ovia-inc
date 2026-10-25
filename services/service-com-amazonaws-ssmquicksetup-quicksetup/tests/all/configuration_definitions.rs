@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
-    MAX_PARAMETERS, STATUS_INITIALIZING, STATUS_SUCCEEDED, STATUS_TYPE_DEPLOYMENT, TRANSITION_SPAN,
+    MAX_PARAMETERS, QUICK_SETUP_TYPE_CATALOG, STATUS_INITIALIZING, STATUS_SUCCEEDED,
+    STATUS_TYPE_DEPLOYMENT, TRANSITION_SPAN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -195,16 +196,31 @@ async fn list_configurations(router: &MultiServiceRouter, body: &Value) -> (u16,
     call(router, "POST", "/listConfigurations", Some(body)).await
 }
 
-/// The two definitions every case below starts from: both carry a `TypeVersion` and a
-/// parameter set, the first also both local-deployment role members, so an update that
-/// omits a member is observably leaving a STORED value alone rather than leaving an
-/// absent one absent.
+/// The Quick Setup type the definition every `TypeVersion` case below updates
+/// deploys: its published version history is what those versions are resolved
+/// against.
+const BASELINE_TYPE: &str = "AWSQuickSetupType-SSMHostMgmt";
+
+/// The newest configuration version the catalog publishes for `type_` — what the
+/// modelled `LATEST` alias resolves to.
+fn latest_version_of(type_: &str) -> &'static str {
+    QUICK_SETUP_TYPE_CATALOG
+        .iter()
+        .find(|entry| entry.type_ == type_)
+        .unwrap_or_else(|| panic!("{type_:?} must be a published Quick Setup type"))
+        .latest_version()
+}
+
+/// The two definitions every case below starts from: both carry a `TypeVersion` the
+/// catalog publishes for their type and a parameter set, the first also both
+/// local-deployment role members, so an update that omits a member is observably
+/// leaving a STORED value alone rather than leaving an absent one absent.
 fn baseline() -> Value {
     json!({
         "Name": "definition-updates",
         "ConfigurationDefinitions": [
             {
-                "Type": "AWSQuickSetupType-SSMHostMgmt",
+                "Type": BASELINE_TYPE,
                 "Parameters": { "TargetType": "*", "UpdateSSMAgent": "true" },
                 "TypeVersion": "1.0",
                 "LocalDeploymentExecutionRoleName": "QuickSetupExecution",
@@ -314,6 +330,7 @@ fn parameters(count: usize) -> Value {
 /// request carries, and the form and the size of their values.
 #[tokio::test]
 async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_names() {
+    let latest = latest_version_of(BASELINE_TYPE);
     // (case, the update body, the members the named definition must then report)
     let cases: Vec<(&str, Value, Value)> = vec![
         (
@@ -322,22 +339,26 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             json!({}),
         ),
         (
-            "type version only",
-            json!({ "TypeVersion": "3" }),
-            json!({ "TypeVersion": "3" }),
+            // A version the catalog publishes for this definition's type.
+            "a published type version",
+            json!({ "TypeVersion": "1.1" }),
+            json!({ "TypeVersion": "1.1" }),
         ),
         (
             // `^\d{1,3}(\.\d{1,3})?$|^LATEST$` — the modelled `TypeVersion` pattern of
-            // this operation's input — admits the `LATEST` sentinel.
-            "the LATEST sentinel",
+            // this operation's input — admits the `LATEST` alias, which names whichever
+            // version the catalog publishes as this type's newest, so that version is
+            // what the definition is moved to and reports.
+            "the LATEST alias",
             json!({ "TypeVersion": "LATEST" }),
-            json!({ "TypeVersion": "LATEST" }),
+            json!({ "TypeVersion": latest }),
         ),
         (
-            // The widest form that pattern admits: three digits either side.
-            "type version at the pattern's widest form",
-            json!({ "TypeVersion": "999.999" }),
-            json!({ "TypeVersion": "999.999" }),
+            // That pattern admits a major with no minor, which numbers the same version
+            // as `<major>.0`: the spelling the catalog publishes is what is stored.
+            "a published type version spelled without its minor",
+            json!({ "TypeVersion": "2" }),
+            json!({ "TypeVersion": "2.0" }),
         ),
         (
             "parameters are replaced, not merged into",
@@ -392,7 +413,7 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
                     "arn:aws:iam::000000000000:role/AllAtOnceAdministration",
             }),
             json!({
-                "TypeVersion": "LATEST",
+                "TypeVersion": latest,
                 "Parameters": { "TargetType": "tag-key", "TargetTagKey": "Env" },
                 "LocalDeploymentExecutionRoleName": "AllAtOnceExecution",
                 "LocalDeploymentAdministrationRoleArn":
@@ -487,7 +508,7 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
         &manager_arn,
         &target,
         &json!({
-            "TypeVersion": "4.5",
+            "TypeVersion": "1.1",
             "Parameters": { "TargetType": "instance" },
         }),
     )
@@ -505,7 +526,7 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
         .unwrap_or_else(|| panic!("case {case}: expected a row for {target}, got {rows_after:?}"));
     assert_eq!(
         target_after.get("TypeVersion"),
-        Some(&json!("4.5")),
+        Some(&json!("1.1")),
         "case {case}: the deployed configuration must carry the updated TypeVersion, got {target_after:?}"
     );
     assert_eq!(
@@ -675,6 +696,26 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
             "a type version that is not a number",
             target.clone(),
             json!({ "TypeVersion": "latest" }),
+        ),
+        (
+            // Inside that pattern, but no version the catalog publishes for this
+            // definition's type: it names no revision of that type's template.
+            "a type version the definition's type does not publish",
+            target.clone(),
+            json!({ "TypeVersion": "99.99" }),
+        ),
+        (
+            // The widest form the pattern admits is still only a form.
+            "a type version at the pattern's widest form",
+            target.clone(),
+            json!({ "TypeVersion": "999.999" }),
+        ),
+        (
+            // Published for `AWSQuickSetupType-CFGRecording`, not for this type: each
+            // type's template is versioned independently.
+            "a type version another type publishes",
+            target.clone(),
+            json!({ "TypeVersion": "1.2" }),
         ),
         (
             // Outside the modelled `^[\w+=,.@-]{1,64}$` pattern: one past its upper

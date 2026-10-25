@@ -854,11 +854,15 @@ pub fn duplicate_attribute_key_message(key: &str) -> String {
     )
 }
 
-/// The encryption configuration of an instance, as the last `UpdateInstance` that
-/// carried one set it.
+/// The encryption configuration an instance is encrypted under.
+///
+/// Every instance HAS one: data at rest is encrypted from the moment the instance
+/// exists, under an Amazon Web Services owned key ([`Self::aws_owned_default`]) until a
+/// caller opts into a key of its own, so this is a property of the instance rather than
+/// something a write brings into being. `UpdateInstance` REPLACES it; nothing removes it.
 ///
 /// `EncryptionStatus` is DERIVED from [`effective_at`](Self::effective_at) rather than
-/// stored, so a read never has to write to move the status on: the instant the change
+/// stored, so a read never has to write to move the status on: the instant a change
 /// becomes effective is fixed when the update is accepted, and every later read computes
 /// the status the clock implies at the moment it is asked.
 #[derive(Debug, Clone)]
@@ -869,8 +873,10 @@ pub struct EncryptionConfigurationRecord {
     /// Web Services owned key, which no ARN names.
     pub kms_key_arn: Option<String>,
     /// When the configuration stops being `UPDATING` and becomes `ENABLED`:
-    /// [`ENCRYPTION_UPDATE_DELAY`] after the update that set it was accepted.
-    pub effective_at: SystemTime,
+    /// [`ENCRYPTION_UPDATE_DELAY`] after the update that set it was accepted, or `None`
+    /// for a configuration that is ALREADY in effect — the Amazon Web Services owned
+    /// default an instance carries from creation, which no key change is pending on.
+    pub effective_at: Option<SystemTime>,
 }
 
 impl EncryptionConfigurationRecord {
@@ -879,13 +885,26 @@ impl EncryptionConfigurationRecord {
         Self {
             key_type,
             kms_key_arn,
-            effective_at: accepted_at + ENCRYPTION_UPDATE_DELAY,
+            effective_at: Some(accepted_at + ENCRYPTION_UPDATE_DELAY),
         }
     }
 
-    /// `KmsKeyStatus` as of `now`: `UPDATING` until the change is due, `ENABLED` after.
+    /// The configuration an instance nobody has reconfigured is encrypted under: an
+    /// Amazon Web Services owned key, in effect already — so no `KmsKeyArn` names it
+    /// ("Cannot be specified when KeyType is AWS_OWNED_KMS_KEY") and no key change is in
+    /// flight.
+    pub fn aws_owned_default() -> Self {
+        Self {
+            key_type: KEY_TYPE_AWS_OWNED.to_string(),
+            kms_key_arn: None,
+            effective_at: None,
+        }
+    }
+
+    /// `KmsKeyStatus` as of `now`: `UPDATING` while a key change is not due yet,
+    /// `ENABLED` once it is — and for a configuration already in effect.
     pub fn status(&self, now: SystemTime) -> &'static str {
-        if now < self.effective_at {
+        if self.effective_at.is_some_and(|effective_at| now < effective_at) {
             KMS_KEY_STATUS_UPDATING
         } else {
             KMS_KEY_STATUS_ENABLED
@@ -1024,11 +1043,12 @@ pub struct Instance {
     /// than decided per read. `InstanceMetadata` (what `ListInstances` projects) carries
     /// no such member, so only `DescribeInstance` reports it.
     pub permission_sets_enabled: bool,
-    /// The instance's encryption configuration, or `None` while nothing has configured
-    /// one: `UpdateInstance` is the only operation that writes it and
-    /// `DescribeInstance$EncryptionConfigurationDetails` the only one that reports it, so
-    /// an instance no caller has configured reports no details rather than invented ones.
-    pub encryption: Option<EncryptionConfigurationRecord>,
+    /// The encryption configuration this instance's data at rest is encrypted under.
+    /// Never absent: an instance is encrypted from the moment it exists, under the
+    /// Amazon Web Services owned key default
+    /// ([`EncryptionConfigurationRecord::aws_owned_default`]), and `UpdateInstance`
+    /// REPLACES that configuration rather than bringing one into being.
+    pub encryption: EncryptionConfigurationRecord,
     /// The instance's ABAC configuration, or `None` while ABAC is not enabled on it:
     /// `CreateInstanceAccessControlAttributeConfiguration` is what enables it,
     /// `UpdateInstanceAccessControlAttributeConfiguration` replaces the attributes it
@@ -1085,10 +1105,11 @@ impl Instance {
             // What this KIND of instance starts with; `UpdateInstance` can enable
             // permission sets on an instance that starts without them.
             permission_sets_enabled: instance_type.permission_sets_enabled(),
-            // Nothing configures encryption at creation: `CreateInstance` takes no
-            // encryption configuration, so there is none to report until an
-            // `UpdateInstance` writes one.
-            encryption: None,
+            // An instance is encrypted at rest from the moment it exists, and
+            // `CreateInstance` takes no encryption configuration to say otherwise, so it
+            // starts under the Amazon Web Services owned key default; `UpdateInstance`
+            // is what opts it into a customer managed key.
+            encryption: EncryptionConfigurationRecord::aws_owned_default(),
             // ABAC is off until a caller enables it: `CreateInstance` takes no attribute
             // configuration, so there is none to report until a
             // `CreateInstanceAccessControlAttributeConfiguration` writes one.
