@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFirewallManagerRuleGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFirewallManagerRuleGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFirewallManagerRuleGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears both Firewall Manager rule group lists of the WebACL named by
+//! `WebACLArn` once its `WebACLLockToken` still matches the stored one, and answers
+//! the rotated token as `NextWebACLLockToken`. A malformed ARN is
+//! `WAFInvalidParameterException`, one naming no stored web ACL
+//! `WAFNonexistentItemException`, a stale token `WAFOptimisticLockException`, and a
+//! web ACL Firewall Manager manages `WAFInvalidOperationException` (all HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +97,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// This operation's name, as the audit trail records it.
+const OPERATION: &str = "DeleteFirewallManagerRuleGroups";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +172,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFirewallManagerRuleGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFirewallManagerRuleGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFirewallManagerRuleGroups"))
+        // `ctx` carries only request metadata, which this operation does not need: the
+        // web ACL is named by an ARN that was already minted, so nothing here derives
+        // one from the request's region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFInternalErrorException(
+                    WAFInternalErrorException {
+                        message: Some("the wafv2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // The model names two different ARN failures, as the sibling by-ARN readers
+        // separate them: an ARN that is malformed is a parameter fault, while a
+        // well-formed one naming nothing stored is a nonexistent item.
+        if !crate::state::is_wafv2_resource_arn(&input.web_acl_arn) {
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_arn_exception(&input.web_acl_arn),
+                )
+                .into(),
+            );
+        }
+        // An ARN that resolves to a resource of another kind is not a web ACL ARN, so
+        // it names no web ACL here.
+        let located = match state.arn_index.get(&input.web_acl_arn) {
+            Some(crate::state::ResourceRef::WebAcl { scope, id }) => {
+                Some((scope.clone(), id.clone()))
+            }
+            Some(crate::state::ResourceRef::IpSet { .. })
+            | Some(crate::state::ResourceRef::RegexPatternSet { .. })
+            | Some(crate::state::ResourceRef::RuleGroup { .. })
+            | None => None,
+        };
+        let Some((scope, id)) = located else {
+            crate::state::audit(OPERATION, "", "", "", "WAFNonexistentItemException");
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+        let Some(entry) = state.web_acls.get_mut(&(scope.clone(), id.clone())) else {
+            crate::state::audit(OPERATION, &scope, "", &id, "WAFNonexistentItemException");
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+        let name = entry.web_acl.name.clone();
+
+        // Checked BEFORE anything is written, so a stale token leaves the stored web
+        // ACL — and its Firewall Manager rule groups — exactly as they were.
+        if entry.lock_token != input.web_acl_lock_token {
+            crate::state::audit(OPERATION, &scope, &name, &id, "WAFOptimisticLockException");
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFOptimisticLockException(
+                    crate::state::optimistic_lock_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // The operation's own precondition: "You can only use this if
+        // ManagedByFirewallManager and RetrofittedByFirewallManager are both false in
+        // the web ACL" — while either is true, only Firewall Manager itself may manage
+        // this web ACL's Firewall Manager rule groups, so the call is not a valid
+        // operation on it.
+        if entry.web_acl.managed_by_firewall_manager
+            || entry.web_acl.retrofitted_by_firewall_manager
+        {
+            crate::state::audit(OPERATION, &scope, &name, &id, "WAFInvalidOperationException");
+            return Err(
+                DeleteFirewallManagerRuleGroupsErrorModeled::WAFInvalidOperationException(
+                    crate::state::invalid_operation_exception(),
+                )
+                .into(),
+            );
+        }
+
+        // "Deletes ALL rule groups that are managed by Firewall Manager from the
+        // specified WebACL": both the pre-process and the post-process lists, which
+        // are where a web ACL carries them. The customer-owned `Rules` are untouched,
+        // and so is every other member — this operation edits only these two lists.
+        entry.web_acl.pre_process_firewall_manager_rule_groups = None;
+        entry.web_acl.post_process_firewall_manager_rule_groups = None;
+
+        // The token rotates on every successful mutation, so the one the caller just
+        // used stops working, and the new one is what the response hands back.
+        let next_web_acl_lock_token = crate::state::new_uuid();
+        entry.lock_token = next_web_acl_lock_token.clone();
+        crate::state::audit(OPERATION, &scope, &name, &id, "deleted");
+
+        Ok(DeleteFirewallManagerRuleGroupsOutput {
+            next_web_acl_lock_token: Some(next_web_acl_lock_token),
+        })
     }
 }
