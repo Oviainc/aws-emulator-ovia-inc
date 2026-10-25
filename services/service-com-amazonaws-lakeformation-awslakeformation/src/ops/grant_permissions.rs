@@ -10,10 +10,29 @@
 //! `ListPermissions` answers exactly one entry for it. `RevokePermissions` is what
 //! releases it.
 //!
-//! What this handler does NOT do: it does not check that the Data Catalog database or
-//! table named by `Resource` exists (the modelled `EntityNotFoundException`), because a
-//! Glue entity lives in another service's store; see the open issue
-//! `lakeformation-grantpermissions-stub` for that half.
+//! Two rules decide WHETHER and WHERE a grant is recorded:
+//!
+//! * The Data Catalog entity must EXIST. Lake Formation grants permissions ON Data
+//!   Catalog resources, so a grant naming a DATABASE or TABLE the catalog does not hold
+//!   (through `Database`, `Table` or `TableWithColumns`) is refused with HTTP 400 and the
+//!   modelled `InvalidInputException`, naming the kind of entity that could not be
+//!   resolved, and nothing is persisted. Those entities belong to Glue,
+//!   so they are read from Glue's own store in the shared engine (see
+//!   [`crate::state::missing_grant_entity`], which also says which resource kinds are
+//!   deliberately NOT checked — a data location, a cell filter, an LF-tag policy, a named
+//!   tag expression and an RLS policy, none of which this emulator keeps an authoritative
+//!   store of what exists for).
+//! * A permission is recorded at the SCOPE it applies at. A table's column-scoped
+//!   permissions ([`crate::state::COLUMN_SCOPED_TABLE_PERMISSIONS`]) are held as a
+//!   `TableWithColumns` record over every column and the rest as the table's own record,
+//!   so one grant on a table can write two records — the "table and the table w columns"
+//!   pair `ListPermissions$Resource` documents (see
+//!   [`crate::state::scoped_grant_records`]).
+//!
+//! What this handler does NOT model: who may grant. Real Lake Formation requires the
+//! caller to be a data lake administrator, the resource owner, or a holder of the
+//! permission WITH the grant option; no identity is modelled here, so the caller's access
+//! key id is recorded in the audit line and gates nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -217,61 +236,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let resource = crate::state::normalize_resource(&input.resource, &catalog_id);
+        // `TableWithColumnsResource` "is only used when granting a SELECT permission"
+        // (the shape's own documentation), so a request that addresses COLUMNS and asks
+        // for a permission that is not column-scoped names a scope that permission has no
+        // meaning at. A grant on the TABLE is not affected: that one is split below, which
+        // is what puts its table-scoped permissions on the table.
+        if let Some(violation) = crate::state::column_scope_violation(
+            &input.resource,
+            &permissions,
+            &permissions_with_grant_option,
+        ) {
+            return Err(invalid(violation));
+        }
+
+        // Lake Formation grants permissions ON a resource, so one the emulator does not
+        // hold names nothing and is refused with nothing persisted. The refusal is the
+        // one the recorded trace of a grant on an absent table shows: HTTP 400 with the
+        // modelled `InvalidInputException`, not the entity-not-found error the operation
+        // also models — the resource is resolved while the INPUT is being validated.
+        // Checked BEFORE this
+        // service's own lock is taken: the check reads Glue's store and this one, and
+        // holding both at once is what would deadlock against a handler that takes them
+        // in the other order.
+        if let Some(missing) =
+            crate::state::missing_grant_entity(&*self.engine, &input.resource, &catalog_id)
+        {
+            return Err(invalid(missing));
+        }
+
         let condition = input
             .condition
             .as_ref()
             .and_then(|condition| condition.expression.clone())
             .filter(|expression| !expression.is_empty());
-        let key = crate::state::grant_key(&catalog_id, principal, &resource, condition.as_deref());
+        // One record per SCOPE the requested permissions apply at: a table's
+        // column-scoped permissions are held as its "table w columns" record, the rest as
+        // the table's own. Each record's key is computed before anything is written, so
+        // the ceiling below is weighed for the whole grant.
+        let records: Vec<(String, crate::ops::types::Resource, Vec<String>, Vec<String>)> =
+            crate::state::scoped_grant_records(
+                &input.resource,
+                &permissions,
+                &permissions_with_grant_option,
+            )
+            .into_iter()
+            .map(|(resource, permissions, permissions_with_grant_option)| {
+                let resource = crate::state::normalize_resource(&resource, &catalog_id);
+                (
+                    crate::state::grant_key(
+                        &catalog_id,
+                        principal,
+                        &resource,
+                        condition.as_deref(),
+                    ),
+                    resource,
+                    permissions,
+                    permissions_with_grant_option,
+                )
+            })
+            .collect();
 
         let mut store = state.lock();
-        let outcome = match store.permission_grants.get_mut(&key) {
-            // The same principal, resource and condition: one record, whose permission
-            // sets grow by what this call adds. Granting the same permissions twice is
-            // therefore a no-op on state rather than a second entry.
-            Some(grant) => {
-                crate::state::merge_permissions(&mut grant.permissions, &permissions);
-                crate::state::merge_permissions(
-                    &mut grant.permissions_with_grant_option,
-                    &permissions_with_grant_option,
-                );
-                "updated"
-            }
-            None => {
-                // The single site that grows the grant store, so this is where its
-                // ceiling is enforced (see `crate::state::MAX_PERMISSION_GRANTS`).
-                if store.permission_grants.len() >= crate::state::MAX_PERMISSION_GRANTS {
-                    return Err(invalid(format!(
-                        "{} permission grants are already held, the maximum is {}",
-                        store.permission_grants.len(),
-                        crate::state::MAX_PERMISSION_GRANTS
-                    )));
-                }
-                store.permission_grants.insert(
-                    key,
-                    crate::state::PermissionGrant {
-                        catalog_id: catalog_id.clone(),
-                        principal: principal.to_string(),
-                        resource,
-                        permissions,
-                        permissions_with_grant_option,
-                        condition_expression: condition,
-                    },
-                );
-                "granted"
-            }
-        };
 
-        // The audit record for a state change: who, what, where, outcome. No secret and
-        // no credential material — the access key id identifies the caller the way the
-        // real service's trail does.
+        // This is the single site that grows the grant store, so this is where its
+        // ceiling is enforced (see `crate::state::MAX_PERMISSION_GRANTS`). The whole
+        // grant is weighed BEFORE the first write, so a refusal leaves no half of a split
+        // grant behind.
+        let held = store.permission_grants.len();
+        let inserts = records
+            .iter()
+            .filter(|(key, ..)| !store.permission_grants.contains_key(key))
+            .count();
+        if held + inserts > crate::state::MAX_PERMISSION_GRANTS {
+            return Err(invalid(format!(
+                "{held} permission grants are already held and this grant needs {inserts} \
+                 more, the maximum is {}",
+                crate::state::MAX_PERMISSION_GRANTS
+            )));
+        }
+
+        // One grant can write a record at more than one scope, so the audit line counts
+        // what each scope did rather than collapsing a mixed grant into one word.
+        let mut inserted = 0_usize;
+        let mut updated = 0_usize;
+        for (key, resource, permissions, permissions_with_grant_option) in records {
+            match store.permission_grants.get_mut(&key) {
+                // The same principal, resource and condition: one record, whose permission
+                // sets grow by what this call adds. Granting the same permissions twice is
+                // therefore a no-op on state rather than a second entry.
+                Some(grant) => {
+                    crate::state::merge_permissions(&mut grant.permissions, &permissions);
+                    crate::state::merge_permissions(
+                        &mut grant.permissions_with_grant_option,
+                        &permissions_with_grant_option,
+                    );
+                    updated += 1;
+                }
+                None => {
+                    store.permission_grants.insert(
+                        key,
+                        crate::state::PermissionGrant {
+                            catalog_id: catalog_id.clone(),
+                            principal: principal.to_string(),
+                            resource,
+                            permissions,
+                            permissions_with_grant_option,
+                            condition_expression: condition.clone(),
+                        },
+                    );
+                    inserted += 1;
+                }
+            }
+        }
+
+        // The audit record for a state change: who, what, where, and what each scope did.
+        // No secret and no credential material — the access key id identifies the caller
+        // the way the real service's trail does.
         tracing::info!(
             operation = "GrantPermissions",
             akid = %akid,
             catalog_id = %catalog_id,
             principal = %principal,
-            outcome = outcome,
+            records_inserted = inserted,
+            records_updated = updated,
             "Lake Formation permissions granted"
         );
 
