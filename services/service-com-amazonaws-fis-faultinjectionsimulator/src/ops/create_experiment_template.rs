@@ -206,6 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
         }
+        // A log configuration says WHERE the experiment's logs are delivered, so one that
+        // names no destination is refused rather than stored.
+        if let Some(refusal) =
+            crate::state::log_configuration_refusal(record.log_configuration.as_ref())
+        {
+            return Err(CreateExperimentTemplateErrorModeled::ValidationException(refusal).into());
+        }
         // A wait beyond the documented bound is refused HERE rather than persisted: a
         // template this call accepts is one the service would run. The action count is
         // capped for the same reason, and because it is what bounds the work the action

@@ -131,7 +131,7 @@ async fn put_group_policy(logs: &Logs, group: &str, document: &str) {
 /// operation associates a data source with a log group yet, and `DataSource$name` /
 /// `DataSource$type` target plain strings, so any pair does: what the case is about is
 /// which groups a data-source-scoped policy selects.
-fn seed_data_sources(logs: &Logs, group: &str, sources: &[(&str, &str)]) {
+pub(crate) fn seed_data_sources(logs: &Logs, group: &str, sources: &[(&str, &str)]) {
     let state = logs
         .engine()
         .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();

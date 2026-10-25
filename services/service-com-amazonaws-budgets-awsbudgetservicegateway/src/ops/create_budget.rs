@@ -232,7 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let key = (input.account_id.clone(), input.budget.budget_name.clone());
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = crate::state::store_at(&state, now);
         if store.budgets.contains_key(&key) {
             return Err(CreateBudgetErrorModeled::DuplicateRecordException(
                 DuplicateRecordException {
@@ -282,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the `HealthStatus`, and the spend and auto-adjust figures it derives from the
         // cost it tracks (dropped, not echoed) — are materialised here, so every later
         // read reports what was stored rather than recomputing anything per request.
-        crate::state::stamp_service_owned(&mut budget, ::std::time::SystemTime::now(), None);
+        crate::state::stamp_service_owned(&mut budget, now, None);
         let notifications = input
             .notifications_with_subscribers
             .unwrap_or_default()

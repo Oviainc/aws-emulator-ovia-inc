@@ -165,7 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let store = crate::state::store_at(&state, now);
         let held = crate::state::resource_tags(&store, &target).ok_or_else(|| {
             ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(match &target {

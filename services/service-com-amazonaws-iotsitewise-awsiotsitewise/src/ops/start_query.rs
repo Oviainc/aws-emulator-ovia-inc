@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation runs the request's SQL statement over the shared
+//! engine store through the service's one query engine
+//! ([`crate::ops::execute_query::run_statement`]) and records the query it started,
+//! which `DescribeQuery` then reports; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +85,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::ops::execute_query::QueryFailure;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,20 +158,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQuery"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let submitted_at = ::std::time::SystemTime::now();
+
+        // Everything that can REFUSE this request is decided before the statement
+        // runs, so a refused request runs nothing and writes nothing.
+        {
+            let store = state.lock();
+            // "A unique case-sensitive identifier that you can provide to ensure the
+            // idempotency of the request": a retry carrying the token of a query
+            // this workspace already started reports THAT query — its id and the
+            // status the clock has made due for it — and starts no second one.
+            if let Some(existing) = replayed(&store, &input.workspace_name, &input) {
+                return Ok(StartQueryOutput {
+                    query_id: existing.query_id.clone(),
+                    status: existing.status(submitted_at).to_string(),
+                });
+            }
+            check_can_start(&store, &input.workspace_name)?;
+        }
+
+        // The statement is RUN here, by the one query engine this service has — the
+        // same parse, the same views and the same budget `ExecuteQuery` answers
+        // with. The query is asynchronous to its caller, so what the run produces
+        // is not the response: it is recorded on the query, and `DescribeQuery`
+        // reports it once the clock has made the query's terminal status due.
+        let outcome = match crate::ops::execute_query::run_statement(
+            &state,
+            &input.query_statement,
+        )
+        .await
+        {
+            Ok(run) => crate::state::QueryOutcome::Completed {
+                row_count: as_statistic(run.row_count()),
+                bytes_scanned: as_statistic(run.bytes_scanned()),
+                execution_time_in_millis: as_statistic(run.elapsed().as_millis()),
+            },
+            Err(error) => match crate::ops::execute_query::classify(&error) {
+                // The statement itself is wrong — a syntax error, a view or column
+                // the catalog does not hold. That is this REQUEST being invalid,
+                // which is the error this operation models for it, so no query is
+                // started at all.
+                QueryFailure::Invalid(message) => {
+                    return Err(invalid_request(message.to_string()))
+                }
+                // Valid SQL the engine has not written: the 501 the emulator
+                // reserves for a construct nobody has implemented, exactly as the
+                // synchronous path answers it. Not a failed query: the query the
+                // caller wrote is one a real service would run.
+                QueryFailure::Unsupported(message) => {
+                    return Err(StartQueryError::NotImplemented(
+                        crate::scaffolded::NotImplemented {
+                            message: message.to_string(),
+                        },
+                    ))
+                }
+                QueryFailure::Internal(message) => {
+                    return Err(internal_failure(message.to_string()))
+                }
+                // The run itself did not finish inside the engine's budget. This
+                // operation models no timeout error — an asynchronous query reports
+                // the fate of its RUN through its own status — so the query is
+                // recorded as one that failed, with the message saying why.
+                QueryFailure::Timeout(message) => crate::state::QueryOutcome::Failed {
+                    error_message: error_message(message),
+                },
+            },
+        };
+
+        let mut store = state.lock();
+        // Checked again now the write lock is held: another request carrying this
+        // same token may have landed while this one was running its statement, and
+        // one token names one query.
+        if let Some(existing) = replayed(&store, &input.workspace_name, &input) {
+            return Ok(StartQueryOutput {
+                query_id: existing.query_id.clone(),
+                status: existing.status(::std::time::SystemTime::now()).to_string(),
+            });
+        }
+        check_can_start(&store, &input.workspace_name)?;
+
+        // Minted with a BOUNDED number of attempts: a fresh id collides with one
+        // the store already holds only by an astronomical coincidence, and a
+        // request path should carry no loop whose end depends on that.
+        let query_id = (0..MINT_ATTEMPTS)
+            .map(|_| crate::state::new_id())
+            .find(|candidate| {
+                !store
+                    .queries
+                    .contains_key(&crate::state::query_key(&input.workspace_name, candidate))
+            })
+            .ok_or_else(|| {
+                internal_failure("a fresh queryId could not be minted".to_string())
+            })?;
+        let record = crate::state::QueryRecord {
+            query_id,
+            workspace_name: input.workspace_name.clone(),
+            query_statement: input.query_statement.clone(),
+            client_token: input.client_token.clone(),
+            // The whole lifecycle is owed from here: the status is derived from this
+            // instant rather than stored, and nothing is slept on.
+            submitted_at,
+            outcome,
+        };
+        let output = StartQueryOutput {
+            query_id: record.query_id.clone(),
+            // "The initial query status. The value is always SUBMITTED upon
+            // creation", whatever the run that has just been recorded produced.
+            status: crate::state::QUERY_SUBMITTED.to_string(),
+        };
+        let key = crate::state::query_key(&record.workspace_name, &record.query_id);
+        store.queries.insert(key, record);
+
+        Ok(output)
     }
+}
+
+/// The query of `workspace` that a request carrying `input`'s `clientToken` already
+/// started, if any. A request carrying no token replays nothing: the token is what
+/// makes a retry recognisable.
+fn replayed<'a>(
+    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    workspace: &str,
+    input: &StartQueryInput,
+) -> Option<&'a crate::state::QueryRecord> {
+    let token = input.client_token.as_deref()?;
+    store.queries.values().find(|query| {
+        query.workspace_name == workspace && query.client_token.as_deref() == Some(token)
+    })
+}
+
+/// Refuse a request this store cannot take another query of: one naming a workspace
+/// it does not hold, or one past either bound on how many queries it holds.
+fn check_can_start(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    workspace: &str,
+) -> Result<(), StartQueryError> {
+    // A query is started IN a workspace, so a workspace this service does not hold
+    // is the modelled not-found refusal rather than a query of nothing.
+    if !store.workspaces.contains_key(workspace) {
+        return Err(StartQueryErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                ),
+            },
+        )
+        .into());
+    }
+    // The store is bounded: starting a query is the only thing that adds one and
+    // nothing evicts one. Past either cap the request exceeds what this emulator
+    // holds, which is the quota refusal this operation models.
+    if store.queries.len() >= crate::state::MAX_QUERIES {
+        return Err(throttled(format!(
+            "This emulator holds at most {} queries.",
+            crate::state::MAX_QUERIES
+        )));
+    }
+    let held = store
+        .queries
+        .keys()
+        .filter(|(held_in, _)| held_in == workspace)
+        .count();
+    if held >= crate::state::MAX_QUERIES_PER_WORKSPACE {
+        return Err(throttled(format!(
+            "This emulator holds at most {} queries per workspace.",
+            crate::state::MAX_QUERIES_PER_WORKSPACE
+        )));
+    }
+    Ok(())
+}
+
+/// How many ids one request may mint before it gives up. See the minting site: a
+/// collision is astronomically unlikely, so a handful of attempts is already far
+/// more than can be needed, and the request path carries no unbounded loop.
+const MINT_ATTEMPTS: usize = 8;
+
+/// A measured count as the `Long` a `QueryStatistics` member carries, saturating
+/// rather than wrapping: every one of them is a non-negative measurement.
+fn as_statistic<T: TryInto<i64>>(measured: T) -> i64 {
+    measured.try_into().unwrap_or(i64::MAX)
+}
+
+/// `message` as the `errorMessage` a failed query reports, cut to the length the
+/// `QueryErrorMessage` shape models (0..1024) on a character boundary.
+fn error_message(message: &str) -> String {
+    message.chars().take(MAX_ERROR_MESSAGE_CHARS).collect()
+}
+
+/// How long an `errorMessage` may be: `smithy_query(query="shape",
+/// shape="QueryErrorMessage")` — length 0..1024.
+const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> StartQueryError {
+    StartQueryErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> StartQueryError {
+    StartQueryErrorModeled::InternalFailureException(InternalFailureException { message }).into()
+}
+
+/// HTTP 429 `ThrottlingException` carrying `message` — the quota refusal this
+/// operation models ("Your request exceeded a rate limit … For more information,
+/// see Quotas in the IoT SiteWise User Guide"), used for the bound on how many
+/// queries this emulator holds.
+fn throttled(message: String) -> StartQueryError {
+    StartQueryErrorModeled::ThrottlingException(ThrottlingException { message }).into()
 }

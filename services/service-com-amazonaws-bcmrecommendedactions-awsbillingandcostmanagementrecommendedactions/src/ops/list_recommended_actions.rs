@@ -47,10 +47,15 @@
 //!   was found at the constraint boundary (see `crate::service`) or here.
 //! * **Pagination.** Records are reported in store (insertion) order, so a page
 //!   boundary is stable. `nextToken` is opaque: a 128-bit fingerprint of the
-//!   effective query (the filter plus `maxResults`) followed by the offset to
-//!   resume at. It is emitted only while unreported records remain, and a token
-//!   that does not parse, or that was issued for a different query, is refused
-//!   with `ValidationException` rather than silently restarting the listing.
+//!   SELECTION the token was issued over (the filter) followed by the offset to
+//!   resume at. `maxResults` is a per-call page-size hint and is deliberately NOT
+//!   part of the token's identity, so a caller may change it, or drop it, between
+//!   pages and still resume where the previous page stopped; a request that names
+//!   no `maxResults` is served at [`DEFAULT_PAGE_SIZE`], the largest page this
+//!   service puts in one response. A token is emitted only while unreported
+//!   records remain, and a token that does not parse, or that was issued over a
+//!   different filter, is refused with `ValidationException` rather than silently
+//!   restarting the listing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +174,16 @@ const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// The modelled `MaxResults` range (`smithy_query(query="shape",
 /// shape="MaxResults")`: range 1..1000).
 const MAX_RESULTS_RANGE: (i32, i32) = (1, 1000);
+
+/// The page size a request that names no `maxResults` is served at.
+///
+/// `maxResults` is "the maximum number of results to return in the response" and
+/// the model caps it at [`MAX_RESULTS_RANGE`]`.1`, so that bound is the largest
+/// page this operation can put in one response — whether or not the caller named a
+/// size. Serving an unnamed size at the cap keeps every answer a page the model can
+/// describe and keeps the listing terminating through `nextToken`, instead of
+/// reporting an unbounded set no page size permits.
+const DEFAULT_PAGE_SIZE: usize = MAX_RESULTS_RANGE.1 as usize;
 
 /// Hex characters of the query fingerprint a `nextToken` carries (128 bits).
 const TOKEN_FINGERPRINT_LEN: usize = 32;
@@ -411,17 +426,16 @@ fn compile_filters(
     Ok(compiled)
 }
 
-/// The fingerprint of an effective query: the filters (order-independent, since
-/// they are ANDed) plus the page size. A `nextToken` carries it so a token cannot
-/// resume a listing of a different query.
-fn query_fingerprint(filters: &[CompiledFilter], max_results: Option<i32>) -> String {
+/// The fingerprint of a listing's SELECTION: the filters (order-independent, since
+/// they are ANDed). A `nextToken` carries it so a token cannot resume a listing of a
+/// different selection, where the offset it names would land on an unrelated record.
+///
+/// `maxResults` is NOT part of it: a token names a position in the selection, and the
+/// page size is a per-call hint the caller may change or omit while paginating.
+fn query_fingerprint(filters: &[CompiledFilter]) -> String {
     let mut parts: Vec<String> = filters.iter().map(CompiledFilter::canonical).collect();
     parts.sort();
-    let canonical = format!(
-        "maxResults={}|filters={}",
-        max_results.map_or_else(|| "none".to_string(), |value| value.to_string()),
-        parts.join("&")
-    );
+    let canonical = format!("filters={}", parts.join("&"));
     let digest = hex::encode(sha2::Sha256::digest(canonical.as_bytes()));
     digest[..TOKEN_FINGERPRINT_LEN].to_string()
 }
@@ -432,7 +446,7 @@ fn mint_token(fingerprint: &str, offset: usize) -> String {
 }
 
 /// The offset `token` resumes at, or a `ValidationException` when it is not a token
-/// this service minted for this query.
+/// this service minted over this selection.
 fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedActionsError> {
     let malformed = || {
         cannot_parse(
@@ -452,10 +466,10 @@ fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedA
     let (token_fingerprint, offset) = token.split_at(TOKEN_FINGERPRINT_LEN);
     if token_fingerprint != fingerprint {
         return Err(cannot_parse(
-            "The nextToken was issued for a different request. Repeat the original filter and maxResults when paginating.",
+            "The nextToken was issued for a different request. Repeat the original filter when paginating.",
             (
                 "nextToken".to_string(),
-                "issued for a different filter or maxResults".to_string(),
+                "issued for a different filter".to_string(),
             ),
         ));
     }
@@ -523,16 +537,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Refuse a bad filter BEFORE touching the store, so a rejected request is
         // refused on its own terms whatever the store holds.
         let filters = compile_filters(input.filter.as_ref())?;
-        let fingerprint = query_fingerprint(&filters, input.max_results);
+        let fingerprint = query_fingerprint(&filters);
 
-        // `maxResults` absent means "no page limit": report every matching record.
-        // AWS documents no default page size for this operation, and the model's
-        // `MaxResults` range (1..1000) is refused at the constraint boundary before
-        // this handler runs; the same bound is enforced here as a backstop, because a
-        // page size of 0 would otherwise report an empty page while still owing a
-        // `nextToken` — a listing that never terminates. The range check and the
-        // conversion share ONE refusal, so neither can fall through to a silently
-        // unbounded page, and it is stated as the same violation the boundary states.
+        // `maxResults` absent means "as large a page as this operation serves":
+        // AWS documents no default for this operation, but the model caps a page at
+        // `MaxResults`'s maximum, so an unnamed size is served at that cap
+        // ([`DEFAULT_PAGE_SIZE`]) and the rest of the selection is reached through
+        // `nextToken`. The model's `MaxResults` range (1..1000) is refused at the
+        // constraint boundary before this handler runs; the same bound is enforced
+        // here as a backstop, because a page size of 0 would otherwise report an
+        // empty page while still owing a `nextToken` — a listing that never
+        // terminates. The range check and the conversion share ONE refusal, so
+        // neither can fall through to a silently unbounded page, and it is stated as
+        // the same violation the boundary states.
         let page_size = match input.max_results {
             Some(max_results) => usize::try_from(max_results)
                 .ok()
@@ -550,7 +567,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     };
                     ListRecommendedActionsError::from(field_validation_failed(&[violation]))
                 })?,
-            None => usize::MAX,
+            None => DEFAULT_PAGE_SIZE,
         };
 
         let resume_at = match input.next_token.as_deref() {

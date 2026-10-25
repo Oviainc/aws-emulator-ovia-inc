@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        let mut store = crate::state::store_at(&state, now);
         // An action is a resource OF the budget it names (`Action$BudgetName`), so a
         // budget this account does not hold holds no action either: an action of another
         // account, or of another budget of this account, is not this one.

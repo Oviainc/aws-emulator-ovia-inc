@@ -39,7 +39,14 @@ use std::sync::Arc;
 /// The recorded wire error code of the tagging surface's not-found: HTTP 404, code
 /// `NotFoundException` (NOT the model's `ResourceNotFoundException` — see the issue
 /// cited in the module header, whose check asserts exactly this code).
-const NOT_FOUND_CODE: &str = "NotFoundException";
+///
+/// `pub(crate)` with the rest of this harness: the sibling suite
+/// `tests/all/custom_line_item_tag_lifecycle.rs` asserts the same refusal, and the code
+/// and status have one home.
+pub(crate) const NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The status that refusal is served on.
+pub(crate) const NOT_FOUND_STATUS: u16 = 404;
 
 /// A live emulator holding only this service.
 ///
@@ -308,6 +315,48 @@ pub(crate) fn expected(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     owned
 }
 
+/// Assert that EVERY tagging operation answers the surface's not-found for `arn` — HTTP
+/// [`NOT_FOUND_STATUS`] with the code [`NOT_FOUND_CODE`] and a message saying what was
+/// not found — and that the refused attempts created nothing.
+///
+/// `pub(crate)` with the rest of this harness: `tests/all/custom_line_item_tag_lifecycle.rs`
+/// asserts the same refusal for a resource whose record has been deleted, so the
+/// per-operation loop has one home.
+pub(crate) async fn assert_tagging_not_found(em: &Emulator, case: &str, arn: &str) {
+    let attempts = [
+        ("TagResource", em.tag(arn, &tag_map(&[("env", "x")])).await),
+        ("UntagResource", em.untag(arn, &["env"]).await),
+        ("ListTagsForResource", em.list_tags(arn).await),
+    ];
+    for (operation, (status, body)) in &attempts {
+        assert_eq!(
+            *status, NOT_FOUND_STATUS,
+            "case {case:?} / {operation}: expected HTTP {NOT_FOUND_STATUS} for {arn:?}, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            error_code(body),
+            NOT_FOUND_CODE,
+            "case {case:?} / {operation}: expected the error code {NOT_FOUND_CODE}, got {body}"
+        );
+        assert!(
+            body.get("message")
+                .or_else(|| body.get("Message"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| !message.is_empty()),
+            "case {case:?} / {operation}: expected a message saying what was not found, got \
+             {body}"
+        );
+    }
+    // The refused calls created nothing: the ARN still names no resource.
+    let (status, body) = em.list_tags(arn).await;
+    assert_eq!(
+        status, NOT_FOUND_STATUS,
+        "case {case:?}: a refused tagging call must not create the resource, got {status} with \
+         {body}"
+    );
+}
+
 /// A deterministic string of `length` ASCII letters, for exercising a declared length
 /// bound rather than one hand-picked spelling.
 fn filler(length: usize) -> String {
@@ -462,7 +511,10 @@ async fn tag_resource_merges_its_pairs_into_the_named_resource() {
 /// The bare resource id of a full ARN — the other spelling the modelled tagging `Arn`
 /// admits for a custom line item
 /// (`^(arn:aws(-cn)?:billingconductor::[0-9]{12}:customlineitem/)?[a-zA-Z0-9]{10}$`).
-fn bare_id(arn: &str) -> &str {
+///
+/// `pub(crate)` with the rest of this harness: `tests/all/custom_line_item_tag_lifecycle.rs`
+/// addresses the same resource by the same two spellings, and the rule has one home.
+pub(crate) fn bare_id(arn: &str) -> &str {
     match arn.rsplit_once('/') {
         Some((_, id)) => id,
         None => arn,
@@ -880,39 +932,7 @@ async fn every_tagging_operation_answers_404_not_found_for_an_unknown_resource()
     ];
 
     for (label, arn) in &unknown {
-        let attempts = [
-            ("TagResource", em.tag(arn, &tag_map(&[("env", "x")])).await),
-            ("UntagResource", em.untag(arn, &["env"]).await),
-            ("ListTagsForResource", em.list_tags(arn).await),
-        ];
-        for (operation, (status, body)) in &attempts {
-            assert_eq!(
-                *status, 404,
-                "case {label:?} / {operation}: expected HTTP 404 for {arn:?}, got {status} \
-                 with {body}"
-            );
-            assert_eq!(
-                error_code(body),
-                NOT_FOUND_CODE,
-                "case {label:?} / {operation}: expected the error code {NOT_FOUND_CODE}, got \
-                 {body}"
-            );
-            assert!(
-                body.get("message")
-                    .or_else(|| body.get("Message"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|message| !message.is_empty()),
-                "case {label:?} / {operation}: expected a message saying what was not found, \
-                 got {body}"
-            );
-        }
-        // The refused calls created nothing: the ARN still names no resource.
-        let (status, body) = em.list_tags(arn).await;
-        assert_eq!(
-            status, 404,
-            "case {label:?}: a refused tagging call must not create the resource, got {status} \
-             with {body}"
-        );
+        assert_tagging_not_found(&em, label, arn).await;
     }
 
     // The stored resource is still readable and still untagged, so none of the refusals
