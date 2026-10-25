@@ -9,6 +9,8 @@ _Operation: UpdateAccountSettings | Class: stub_
 
 > _Note: this issue was identified against the code base at commit `5bfe48ddd26ea9415acafc303bdb706a28d090a8`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Update (fix of `20261024T072908Z-resource-groups-getaccountsettings-missing.md`): the handler is now IMPLEMENTED. `UpdateAccountSettings` is the writer the `GetAccountSettings` round-trip is proved through, so it was implemented in that change: it persists the requested `GroupLifecycleEventsDesiredStatus` in `state::ComAmazonawsResourcegroupsArdiState::account_settings` for the region the request was signed for, reports the switch as `IN_PROGRESS` until the span it starts has elapsed, refuses a desired status the model does not admit with `BadRequestException`, emits the service's audit record, and its `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is gone. Nothing of this issue's own text is left open; it can be closed as it stands._
+
 ## Description
 
 `UpdateAccountSettings` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-resourcegroups-ardi/src/ops/update_account_settings.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
