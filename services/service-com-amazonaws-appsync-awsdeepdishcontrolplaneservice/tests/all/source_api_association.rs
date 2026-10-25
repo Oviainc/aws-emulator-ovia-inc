@@ -40,31 +40,34 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for; the service reads it off the credential scope, so it
 /// must appear in every ARN it mints.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// How long a row that must observe the far side of the scheduled merge waits: the
 /// service's own span plus slack. Only the TEST waits — the handler stores the due
 /// instant.
-const PAST_THE_MERGE: Duration = Duration::from_millis(250);
+pub(crate) const PAST_THE_MERGE: Duration = Duration::from_millis(250);
 
 /// The alphabet the service mints opaque ids over (`state::mint_id`): RFC 4648
 /// base-32, lowercased.
-const ID_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz234567";
+pub(crate) const ID_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz234567";
 
 /// One answer from the emulator: the parts a client branches on.
+///
+/// Shared with the suite that asserts the same association rule from the Merged-API
+/// side, so both read the status, the error shape and the body the same way.
 #[derive(Debug, Clone)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves the error shape from.
-    error_type: String,
-    body: Value,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 /// A router with only this service mounted, over a fresh engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -73,7 +76,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Send one request and return what the emulator answered.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -119,13 +122,13 @@ async fn call(
 
 /// One created GraphQL API: the two forms an `…Identifier` member accepts.
 #[derive(Debug, Clone)]
-struct Api {
-    id: String,
-    arn: String,
+pub(crate) struct Api {
+    pub(crate) id: String,
+    pub(crate) arn: String,
 }
 
 /// Create one GraphQL API of `api_type` and return its id and ARN.
-async fn create_api(router: &MultiServiceRouter, name: &str, api_type: &str) -> Api {
+pub(crate) async fn create_api(router: &MultiServiceRouter, name: &str, api_type: &str) -> Api {
     let answer = call(
         router,
         "POST",
@@ -158,19 +161,19 @@ async fn create_api(router: &MultiServiceRouter, name: &str, api_type: &str) -> 
 }
 
 /// Create the pair an association needs: a standard source API and a Merged API.
-async fn create_pair(router: &MultiServiceRouter, label: &str) -> (Api, Api) {
+pub(crate) async fn create_pair(router: &MultiServiceRouter, label: &str) -> (Api, Api) {
     let source = create_api(router, &format!("{label}-source"), state::GRAPHQL_API_TYPE).await;
     let merged = create_api(router, &format!("{label}-merged"), state::MERGED_API_TYPE).await;
     (source, merged)
 }
 
 /// `AssociateMergedGraphqlApi`'s path for `source_api_identifier`.
-fn associate_path(source_api_identifier: &str) -> String {
+pub(crate) fn associate_path(source_api_identifier: &str) -> String {
     format!("/v1/sourceApis/{source_api_identifier}/mergedApiAssociations")
 }
 
 /// `GetSourceApiAssociation`'s path.
-fn get_path(merged_api_identifier: &str, association_id: &str) -> String {
+pub(crate) fn get_path(merged_api_identifier: &str, association_id: &str) -> String {
     format!("/v1/mergedApis/{merged_api_identifier}/sourceApiAssociations/{association_id}")
 }
 
