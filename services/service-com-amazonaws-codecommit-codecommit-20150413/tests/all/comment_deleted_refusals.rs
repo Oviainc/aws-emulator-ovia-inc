@@ -9,9 +9,10 @@
 //! `CommentDeletedException` carries the fixed sentence pair "The specified comment
 //! has already been marked as deleted." and "Verify that you specified a valid
 //! comment ID, and then try again.", separated by the TWO spaces the recording
-//! carries, led by a clause naming the refused action only for the
-//! repeated `DeleteCommentContent` the corpus records that way, and never carrying
-//! a value taken from the request. The deleted record is what decides this, so the
+//! carries, led by "You cannot delete this comment." for the calls that ask to
+//! edit or delete the dead comment itself (a repeated `DeleteCommentContent`, an
+//! `UpdateComment`), and never carrying a value taken from the request. The
+//! deleted record is what decides this, so the
 //! refusal does not depend on which comment it is, who is asking, or whether the
 //! caller is the author; and being refused changes nothing about the stored
 //! comment.
@@ -32,11 +33,12 @@ use crate::wire::{ok_as, refusal_as, DEFAULT_ACCESS_KEY_ID};
 const REACTOR_ACCESS_KEY_ID: &str = "AKIDREACTINGUSER";
 
 /// The message `CommentDeletedException` carries, by the OPERATION that refused
-/// the call. The sentence pair alone is the recorded answer to a `GetComment` of a
-/// comment whose content has been deleted; the recorded answer to a repeated
-/// `DeleteCommentContent` leads it with the action it refused. No recording gives
-/// `UpdateComment` or `PutCommentReaction` a lead clause, so they carry the
-/// sentence the exception is recorded with. The sentences are separated by TWO
+/// the call. The sentence pair alone is the recorded answer where the call only
+/// asks about the comment whose content has been deleted (`GetComment`) or about
+/// something hanging off it (`PutCommentReaction`, for which no lead clause is
+/// recorded); the calls that ask to edit or delete the dead comment itself — a
+/// repeated `DeleteCommentContent` and an `UpdateComment` — are recorded leading
+/// it with "You cannot delete this comment.". The sentences are separated by TWO
 /// spaces, which is part of the recorded constant — hence the explicit `concat!`,
 /// whose line continuation cannot swallow them.
 pub(crate) fn comment_deleted_message(operation: &str) -> String {
@@ -46,7 +48,9 @@ pub(crate) fn comment_deleted_message(operation: &str) -> String {
         "Verify that you specified a valid comment ID, and then try again.",
     );
     match operation {
-        "DeleteCommentContent" => format!("You cannot delete this comment.  {already_deleted}"),
+        "DeleteCommentContent" | "UpdateComment" => {
+            format!("You cannot delete this comment.  {already_deleted}")
+        }
         _ => already_deleted.to_string(),
     }
 }
