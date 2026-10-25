@@ -235,7 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(CreateAnomalyDetectorErrorModeled::ValidationException)?;
 
-        check_configuration(&input.configuration)?;
+        // The configuration's own rule, shared with every operation that stores one.
+        crate::state::check_random_cut_forest_configuration(&input.configuration)
+            .map_err(CreateAnomalyDetectorErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         store.materialize_due(now);
@@ -331,6 +333,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            // Nothing is pending on a detector that has just been minted.
+            update_token: None,
         };
 
         let response = response_for(&detector);
@@ -380,31 +384,6 @@ fn workspace_not_found(workspace_id: &str) -> CreateAnomalyDetectorError {
         resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
     })
     .into()
-}
-
-/// Refuse a configuration the model accepts but the service does not.
-///
-/// `AnomalyDetectorConfiguration` is a union whose only member is `randomCutForest`,
-/// and `RandomCutForestConfiguration$query` requires the query be "wrapped by a
-/// supported PromQL aggregation operator" — so the whole expression must be a call to
-/// one of [`crate::state::RANDOM_CUT_FOREST_AGGREGATION_OPERATORS`].
-fn check_configuration(
-    configuration: &AnomalyDetectorConfiguration,
-) -> Result<(), CreateAnomalyDetectorError> {
-    let AnomalyDetectorConfiguration::randomCutForest(random_cut_forest) = configuration;
-    let operators = crate::state::RANDOM_CUT_FOREST_AGGREGATION_OPERATORS;
-    let wrapping = crate::state::leading_call_operator(&random_cut_forest.query);
-    if wrapping.is_some_and(|operator| operators.contains(&operator)) {
-        return Ok(());
-    }
-    Err(field_validation(
-        "configuration.randomCutForest.query",
-        &format!(
-            "Member must be wrapped by one of the supported PromQL aggregation operators \
-             ({})",
-            operators.join(", ")
-        ),
-    ))
 }
 
 /// The response for a stored detector.

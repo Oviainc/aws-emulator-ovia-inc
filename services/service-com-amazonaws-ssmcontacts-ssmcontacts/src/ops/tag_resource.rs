@@ -16,13 +16,17 @@
 //!    until the account has an active replication set the call is refused with the modelled
 //!    `ValidationException` (HTTP 400) and NOTHING is written — so the follow-up
 //!    `ListTagsForResource` cannot report a tag this call fabricated.
-//! 2. Every tag must carry a `Key`: the modelled `Tag` makes both members optional, but a
+//! 2. The SYNTACTIC read of `ResourceARN` ([`TAGGABLE_RESOURCE`]): the member is an
+//!    `AmazonResourceName`, length-bound and with no `pattern`, so a value that is not an
+//!    ARN of this service reaches the handler and carries no resource identity to write
+//!    anything to — it is refused with the modelled `ValidationException` (HTTP 400).
+//! 3. Every tag must carry a `Key`: the modelled `Tag` makes both members optional, but a
 //!    tag with no key names nothing to read back or remove
 //!    ([`crate::state::require_tag_key`]).
-//! 3. The resource lookup: an onboarded account naming a resource the store does not hold
+//! 4. The resource lookup: an onboarded account naming a resource the store does not hold
 //!    gets the modelled `ResourceNotFoundException` (HTTP 404). Contacts (including
 //!    escalation plans) and rotations are this service's taggable resources.
-//! 4. The per-resource tag ceiling: `TagsList` — the shape both this input and
+//! 5. The per-resource tag ceiling: `TagsList` — the shape both this input and
 //!    `ListTagsForResource`'s output target — declares `length` 0..50, so a merge that
 //!    would leave the resource with more tags than
 //!    [`crate::state::MAX_TAGS_PER_RESOURCE`] is refused with the modelled
@@ -190,6 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
+        // Then the member itself: a value that is not an ARN of this service names no
+        // resource, so it is refused on the INPUT rather than reported as a missing
+        // resource.
+        if !TAGGABLE_RESOURCE.admits(&input.resource_arn) {
+            return Err(malformed_resource_arn(&input.resource_arn));
+        }
+
         for tag in &input.tags {
             require_tag_key(tag).map_err(validation)?;
         }
@@ -249,6 +260,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// known to be one this service holds — only that this service holds no such resource.
 const RESOURCE_TYPE: &str = "resource";
 
+/// What `ResourceARN` has to name for this operation to write anything at all: a resource of
+/// THIS service.
+///
+/// The member targets `AmazonResourceName`, which the model constrains by LENGTH only — so,
+/// unlike every other ARN member of this service (all `SsmContactsArn`, whose
+/// `^arn:(aws|aws-cn|aws-us-gov):ssm-contacts:…` pattern the boundary validator screens), a
+/// value that is not an ARN of this service reaches the handler and must be read here. The
+/// vendor is this service's own ARN namespace (`awsService.arnNamespace` in the model, the
+/// same token that pattern spells out) and no resource TYPE is fixed, because the member
+/// names a contact, an escalation plan, a rotation or an on-call schedule.
+///
+/// Expressed as `service_common::arn::Requirement`, the workspace's ONE reading of a member
+/// documented as the ARN of a given AWS resource, so the parse and the constraint phrase this
+/// service reports are the ones every other service uses.
+const TAGGABLE_RESOURCE: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
+    vendor: "ssm-contacts",
+    resource_type: None,
+    label: "a resource of this service",
+};
+
+/// The input member a malformed-ARN refusal blames.
+///
+/// Neither the model nor this service's documentation fixes a spelling for a
+/// `ValidationExceptionField` name, so the REQUIREMENT is only that the field identify the
+/// member the caller got wrong; this is the lower-camel spelling the rest of this crate's
+/// field-level refusals use (`tags`, `policy`, `nextToken`).
+const RESOURCE_ARN_FIELD: &str = "resourceArn";
+
 /// The account precondition's refusal: this operation's modelled `ValidationException`,
 /// which the model classifies `client` with `httpError` 400.
 ///
@@ -271,6 +310,24 @@ fn validation(message: String) -> TagResourceError {
         fields: Some(vec![ValidationExceptionField {
             name: "tags".to_string(),
             message: "Every tag must carry a Key".to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// A `ResourceARN` that is not an ARN of this service: the same modelled
+/// `ValidationException`, naming the member at fault.
+///
+/// The message is the one this crate already refuses an unresolvable resource ARN with
+/// ([`crate::state::invalid_resource_arn_message`]), built FROM the request, and the field's
+/// own text is the requirement stated as a phrase about the member.
+fn malformed_resource_arn(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: crate::state::invalid_resource_arn_message(resource_arn),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: RESOURCE_ARN_FIELD.to_string(),
+            message: format!("Member {}", TAGGABLE_RESOURCE.phrase()),
         }]),
     })
     .into()

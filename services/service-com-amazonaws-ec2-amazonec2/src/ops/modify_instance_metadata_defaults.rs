@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceMetadataDefaults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceMetadataDefaults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceMetadataDefaults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the account's instance metadata service (IMDS) default settings in this service's
+//! state ([`crate::state::ComAmazonawsEc2Amazonec2State::instance_metadata_defaults`]),
+//! where `GetInstanceMetadataDefaults` reads them back.
+//!
+//! Each member of the request names ONE setting: a value from that member's own catalog
+//! sets the account's default for it, the member's "no preference" value
+//! ([`crate::state::METADATA_NO_PREFERENCE`], or
+//! [`crate::state::METADATA_HOP_LIMIT_NO_PREFERENCE`] for the hop limit) CLEARS it, and a
+//! member the request leaves out leaves that setting exactly as it stands — which is why
+//! clearing one needs a word of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,6 +143,38 @@ impl<Eng> ModifyInstanceMetadataDefaults<Eng> {
     }
 }
 
+/// The value one enum member of this request asks a setting to take.
+///
+/// `None` when the request left the member out (the setting is not being changed),
+/// `Some(None)` for [`state::METADATA_NO_PREFERENCE`] (clear the account's default) and
+/// `Some(Some(word))` for a member of `catalog`, which is the catalog
+/// `GetInstanceMetadataDefaults` reports that setting from.
+///
+/// The modelled enum constraint already refuses a word outside the request's own catalog
+/// before this handler runs, so the refusal here is reached only if that boundary ever
+/// stops covering a member; it is an `InvalidParameterValue`, EC2's refusal for a member's
+/// value, never a 501.
+fn requested_state<E>(
+    member: &str,
+    requested: Option<&str>,
+    catalog: &'static [&'static str],
+) -> Result<Option<Option<&'static str>>, crate::scaffolded::Scaffolded<E>> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested == state::METADATA_NO_PREFERENCE {
+        return Ok(Some(None));
+    }
+    match state::catalog_member(catalog, requested) {
+        Some(word) => Ok(Some(Some(word))),
+        None => Err(state::invalid_parameter_value(format!(
+            "Value ({requested}) for parameter {member} is invalid. Valid values are {}, {}",
+            catalog.join(", "),
+            state::METADATA_NO_PREFERENCE,
+        ))),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyInstanceMetadataDefaults<Eng>
 {
@@ -157,18 +192,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceMetadataDefaults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceMetadataDefaultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceMetadataDefaults"))
+        // "Modifies the default instance metadata service (IMDS) settings at the ACCOUNT
+        // level": the defaults are one account-level fact, and this store is per account
+        // (`crate::state`'s module docs), so nothing of the request beyond its settings and
+        // `DryRun` is read and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+
+        // Every setting the request asks to change, resolved against the catalog the
+        // response reports that setting from — so what reaches the store is a modelled
+        // catalog member, never the request's own text. `None` is "the request left this
+        // member out", which says nothing about the setting.
+        let http_tokens = requested_state(
+            "httpTokens",
+            input.http_tokens.as_deref(),
+            HTTP_TOKENS_STATE_VALUES,
+        )?;
+        let http_endpoint = requested_state(
+            "httpEndpoint",
+            input.http_endpoint.as_deref(),
+            INSTANCE_METADATA_ENDPOINT_STATE_VALUES,
+        )?;
+        let instance_metadata_tags = requested_state(
+            "instanceMetadataTags",
+            input.instance_metadata_tags.as_deref(),
+            INSTANCE_METADATA_TAGS_STATE_VALUES,
+        )?;
+        let http_tokens_enforced = requested_state(
+            "httpTokensEnforced",
+            input.http_tokens_enforced.as_deref(),
+            HTTP_TOKENS_ENFORCED_STATE_VALUES,
+        )?;
+
+        // "Possible values: Integers from 1 to 64, and -1 to indicate no preference"
+        // (`HttpPutResponseHopLimit`). `BoxedInteger` carries no modelled `@range`, so this
+        // is the only place the documented range can be enforced, and -1 is the hop limit's
+        // own "no preference" word rather than a number of hops.
+        let hop_limit = match input.http_put_response_hop_limit {
+            None => None,
+            Some(state::METADATA_HOP_LIMIT_NO_PREFERENCE) => Some(None),
+            Some(limit)
+                if (state::MIN_METADATA_HOP_LIMIT..=state::MAX_METADATA_HOP_LIMIT)
+                    .contains(&limit) =>
+            {
+                Some(Some(limit))
+            }
+            Some(limit) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({limit}) for parameter httpPutResponseHopLimit is invalid. \
+                     Valid values are integers from {min} to {max}, and {none} to indicate \
+                     no preference",
+                    min = state::MIN_METADATA_HOP_LIMIT,
+                    max = state::MAX_METADATA_HOP_LIMIT,
+                    none = state::METADATA_HOP_LIMIT_NO_PREFERENCE,
+                )))
+            }
+        };
+
+        // A modify that names no setting asks for no modification: EC2 refuses a request
+        // that leaves out what the action needs with `MissingParameter`, the way
+        // `ModifyVpcAttribute` does for the same shape of request.
+        if http_tokens.is_none()
+            && hop_limit.is_none()
+            && http_endpoint.is_none()
+            && instance_metadata_tags.is_none()
+            && http_tokens_enforced.is_none()
+        {
+            return Err(state::missing_parameter(
+                "The request must name a setting to modify: httpTokens, \
+                 httpPutResponseHopLimit, httpEndpoint, instanceMetadataTags or \
+                 httpTokensEnforced",
+            ));
+        }
+
+        // DryRun sits AFTER every refusal above and BEFORE the store is even reached: the
+        // flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves the account's defaults exactly where they were.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The settings the request named are applied to the defaults as they stand, so a
+        // member it left out keeps its default and `no-preference` removes one. One write,
+        // after every refusal.
+        let mut defaults = store.instance_metadata_defaults();
+        if let Some(value) = http_tokens {
+            defaults.http_tokens = value;
+        }
+        if let Some(value) = hop_limit {
+            defaults.http_put_response_hop_limit = value;
+        }
+        if let Some(value) = http_endpoint {
+            defaults.http_endpoint = value;
+        }
+        if let Some(value) = instance_metadata_tags {
+            defaults.instance_metadata_tags = value;
+        }
+        if let Some(value) = http_tokens_enforced {
+            defaults.http_tokens_enforced = value;
+        }
+        store.set_instance_metadata_defaults(defaults);
+
+        // "If the request succeeds, the response returns true. If the request fails, no
+        // response is returned, and instead an error message is returned" (`Return`).
+        Ok(ModifyInstanceMetadataDefaultsOutput {
+            r#return: Some(true),
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketAccelerateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketAccelerateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketAccelerateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the Transfer Acceleration state of an existing bucket: the `Status` the submitted
+//! `AccelerateConfiguration` names is recorded on the named bucket and the operation
+//! answers 200 with an empty body, so `GetBucketAccelerateConfiguration` reports exactly
+//! what was last put. A configuration naming no settable state is refused, a bucket this
+//! emulator does not hold is `NoSuchBucket` (404), and a bucket whose name carries a
+//! period — a name Transfer Acceleration cannot be used with — is `InvalidRequest` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -120,14 +118,28 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketAccelerateConfi
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketAccelerateConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketAccelerateConfiguration")]
+// The operation's MODELED errors.
+//
+// `#[operation_error]` accepts only variants the model declares for this operation (plus
+// the `extra_errors` widening below), so the scaffold's `NotImplemented` cannot live here
+// — hence the `PutBucketAccelerateConfigurationError` alias further down.
+// Widened by `NoSuchBucket` and `InvalidRequest`: the model's error list for this
+// operation is empty (`smithy_query(query="operation",
+// operation="PutBucketAccelerateConfiguration")` reports `errors: []`), but `Bucket` is an
+// @httpLabel, so a request can name a bucket that does not exist and AWS answers the
+// service-wide `NoSuchBucket` ("The specified bucket does not exist", `httpError 404`);
+// and a bucket this feature cannot be used with is a request whose "parameter or header
+// in your request isn't valid", which is `InvalidRequest` (400). Both shapes are ones the
+// SERVICE models, so `extra_errors` widens the set with them rather than inventing a
+// second rule, the way `PutBucketVersioning` and `PutBucketAcl` do.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketAccelerateConfiguration",
+    extra_errors = ["NoSuchBucket", "InvalidRequest"]
+)]
 #[derive(Debug)]
 pub enum PutBucketAccelerateConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    InvalidRequest(InvalidRequest),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -181,18 +193,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketAccelerateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketAccelerateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketAccelerateConfiguration"))
+        // A write needs nothing from the request beyond its deserialized input: the
+        // expected owner travels as a member, not as a raw header.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — this request's `ExpectedBucketOwner`, judged the way every other
+        // bucket-scoped operation judges it (`PutBucketVersioning`, `PutBucketAbac`): this
+        // emulator serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketAccelerateConfiguration",
+            ));
+        };
+
+        // "The Transfer Acceleration state of a bucket can be set to one of the following
+        // two values: Enabled … Suspended …" (this operation's own documentation), carried
+        // by the `AccelerateConfiguration` container that is its whole payload.
+        // `AccelerateConfiguration$Status` is NOT a required member
+        // (`smithy_query(query="shape",shape="AccelerateConfiguration")`), so a request
+        // can carry a container that names no state to set — a payload that does not
+        // satisfy the schema the API publishes, which is what `MalformedXML` reports (HTTP
+        // 400), a code this model declares no shape for. A value OUTSIDE
+        // `BucketAccelerateStatus` never reaches here: `Status` targets an enum shape, so
+        // the boundary validator refuses it with 400 before this handler runs.
+        let Some(status) = input
+            .accelerate_configuration
+            .status
+            .as_deref()
+            .filter(|status| BUCKET_ACCELERATE_STATUS_VALUES.contains(status))
+        else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                // The documented sentence for the code, naming the member and the value
+                // set it is judged against; the rejected value is NOT echoed back, so a
+                // refusal reflects nothing the request carried.
+                format!(
+                    "{}: AccelerateConfiguration.Status must name one of \
+                     {BUCKET_ACCELERATE_STATUS_VALUES:?}",
+                    crate::state::MALFORMED_XML_MESSAGE
+                ),
+            ));
+        };
+
+        // The payload is judged BEFORE the store is touched, so a refused request leaves
+        // the bucket's current Transfer Acceleration state exactly as it was.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                PutBucketAccelerateConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // "The name of the bucket used for Transfer Acceleration must be DNS-compliant and
+        // must not contain periods (".")" (this operation's own documentation): the
+        // subresource cannot be set on such a bucket at all, whichever state the
+        // configuration names, so the request is one that cannot be carried out as given —
+        // the modelled `InvalidRequest` (HTTP 400). Judged after the lookup, so a name no
+        // bucket of this emulator's carries is still the 404 every bucket-scoped operation
+        // answers that with.
+        if input.bucket.contains(BUCKET_NAME_PERIOD) {
+            return Err(
+                PutBucketAccelerateConfigurationErrorModeled::InvalidRequest(InvalidRequest {})
+                    .into(),
+            );
+        }
+
+        bucket.set_accelerate_status(status);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketAccelerateConfigurationOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The character a bucket name used with Transfer Acceleration must not carry: "must not
+/// contain periods (".")" (this operation's documentation).
+const BUCKET_NAME_PERIOD: char = '.';

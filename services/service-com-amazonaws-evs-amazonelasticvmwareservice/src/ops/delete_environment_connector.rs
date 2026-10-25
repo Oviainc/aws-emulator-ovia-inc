@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEnvironmentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEnvironmentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes one stored connector of a stored Amazon EVS environment and reports the
+//! record it wrote together with a summary of the environment the connector was deleted
+//! from, which [`crate::ops::list_environment_connectors`] reads back. An
+//! `environmentId` this service holds no live environment for in the request's Region,
+//! or a `connectorId` that environment holds no connector record for, is a
+//! `ResourceNotFoundException`, and nothing is written for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEnvironmentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The connector goes `DELETING` and the clock owes it `DELETED`: the connection
+//! `CreateEnvironmentConnector` established to the VCF appliance has to be torn down,
+//! which is the same kind of work as establishing it and not a record to erase. The
+//! record itself is KEPT once it settles, so a later read still reports the deletion;
+//! [`crate::state::MAX_CONNECTORS_PER_ENVIRONMENT`] bounds how many finished records an
+//! environment keeps.
+//!
+//! "Before deleting a connector, you must remove all entitlements that are associated
+//! with the same vCenter": a connector whose vCenter still has live Windows Server
+//! License entitlements is refused with the operation's modelled `ValidationException`
+//! — the only client-input error it declares for a precondition no single member
+//! carries — and NOTHING about it changes
+//! ([`crate::state::StoredEnvironment::entitlements_sharing_vcenter`]).
+//!
+//! The operation is `@idempotent`
+//! (`smithy_query(query="operation",operation="DeleteEnvironmentConnector")`): a
+//! connector that is already going away is reported as it stands, so a repeated call
+//! neither restarts the teardown nor moves `modifiedAt`, and the precondition above is
+//! not re-judged for it — it was judged when the delete that started the teardown was
+//! accepted.
+//!
+//! Like every implemented operation of this service, the request is authorized before
+//! the environment it names is looked up ([`crate::state::authorization`]).
 //!
 //! ## Shape of an operation
 //!
@@ -97,12 +118,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-evs-amazonelasticvmware
 // here — hence the `DeleteEnvironmentConnectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.evs#DeleteEnvironmentConnector")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.evs#DeleteEnvironmentConnector",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteEnvironmentConnectorErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
+    /// Widened in from the service's own error set (this operation does not list it):
+    /// the one honest answer when this service's store cannot be reached at all.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,18 +183,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEnvironmentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEnvironmentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEnvironmentConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteEnvironmentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "The Amazon EVS environment store is unavailable.".to_string(),
+                },
+            )
+        })?;
+        // `clientToken` is read and ignored on purpose: "This parameter is not used in
+        // Amazon EVS currently. If you supply input for this parameter, it will have no
+        // effect." (`clientToken` doc). The operation is idempotent through the stored
+        // record instead — a connector that is already going away is reported as it
+        // stands.
+        let _ = &input.client_token;
+        let region = crate::state::request_region(ctx.parts());
+        // Authorization first: AWS decides it at the IAM layer, before the resource the
+        // request names is evaluated, so the ARN is the one the REQUEST names.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            Some(&crate::state::environment_arn(&region, &input.environment_id)),
+        ) {
+            return Err(denied);
+        }
+
+        let mut state = state.lock();
+        // Reporting only: this materialises the state changes the clock already owed,
+        // which were due whether or not anybody called, so the environment and its
+        // connectors are in the state that is due at this instant before the delete is
+        // evaluated.
+        state.materialise_due_transitions();
+
+        // Regional resource: an environment exists at the endpoint of the Region it was
+        // created in, so its connectors can only be deleted from that Region. An
+        // environment that has reached DELETED is gone as far as a delete is concerned:
+        // "The resource might not be specified correctly, or it may have a state of
+        // DELETED" (`ResourceNotFoundException` doc).
+        let environment = state
+            .environment_in_region_mut(&region, &input.environment_id)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
+            .ok_or_else(|| {
+                DeleteEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+        let environment_id = environment.environment_id.clone();
+        // "Before deleting a connector, you must remove all entitlements that are
+        // associated with the same vCenter": the entitlements in the way, counted before
+        // the connector record is borrowed mutably below. Zero for an id this
+        // environment holds no connector for, which the lookup after it reports.
+        let blocking_entitlements = environment.entitlements_sharing_vcenter(&input.connector_id);
+
+        // A connector record this environment never held is the missing resource,
+        // whatever state the records it does hold are in: a record that has already
+        // reached DELETED is what the idempotent repeat below reports.
+        let connector = environment
+            .connectors
+            .get_mut(&input.connector_id)
+            .ok_or_else(|| {
+                DeleteEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::connector_not_found(&input.connector_id),
+                )
+            })?;
+
+        // `@idempotent`: a connector that is already DELETING or DELETED is reported as
+        // it stands, so a repeated call neither restarts the teardown nor moves
+        // `modifiedAt` — and its precondition is not re-judged, having been judged when
+        // the delete that started the teardown was accepted.
+        let already_going_away = connector.state == crate::state::CONNECTOR_DELETING
+            || connector.state == crate::state::CONNECTOR_DELETED;
+
+        if !already_going_away && blocking_entitlements > 0 {
+            // Refused with the operation's modelled client error, and NOTHING about the
+            // connector changes: it stays in the state it was in and `modifiedAt` does
+            // not move. The count is read from the store, so the sentence tells the
+            // caller how many entitlements are still in the way.
+            return Err(
+                DeleteEnvironmentConnectorErrorModeled::ValidationException(
+                    crate::state::field_validation_error(
+                        "connectorId",
+                        &format!(
+                            "names a connector whose vCenter still has \
+                             {blocking_entitlements} entitlement(s); all entitlements that are \
+                             associated with the same vCenter must be removed with \
+                             DeleteEntitlement before the connector is deleted"
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // Tearing the connection to the appliance down has started but is not finished:
+        // the connector is DELETING and the clock owes it DELETED.
+        let due_at = if already_going_away {
+            None
+        } else {
+            let pending =
+                crate::state::PendingConnectorState::starting_now(crate::state::CONNECTOR_DELETED);
+            let due_at = pending.due_at;
+            connector.state = crate::state::CONNECTOR_DELETING.to_string();
+            connector.modified_at_ms = crate::state::now_ms();
+            connector.pending = Some(pending);
+            Some(due_at)
+        };
+        let deleted = connector.to_wire(&environment_id);
+        if let Some(due_at) = due_at {
+            // The records this environment is finished with are kept so a later read
+            // still reports the deletion, up to the cap this bounds them by.
+            environment.purge_finished_connectors();
+            state.note_transition_due(due_at);
+        }
+        // The connector was deleted FROM this environment, and the summary reports the
+        // environment as it stands: deleting a child resource of it is no modification
+        // of the environment itself, so its own `modifiedAt` does not move.
+        let environment_summary = state
+            .environment_in_region(&region, &input.environment_id)
+            .map(|environment| environment.to_summary())
+            .ok_or_else(|| {
+                DeleteEnvironmentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::environment_not_found(&input.environment_id),
+                )
+            })?;
+
+        Ok(DeleteEnvironmentConnectorOutput {
+            connector: Some(deleted),
+            environment_summary: Some(environment_summary),
+        })
     }
 }

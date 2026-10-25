@@ -7,7 +7,9 @@
 //! admitted, recorded when the scan got through its scope — so this listing and
 //! `GetSearchJob`'s `ItemsMatchedCount` are read off the same record and cannot
 //! disagree. An identifier
-//! this account holds no job for is a `ResourceNotFoundException` (404).
+//! this account holds no job for is a `ResourceNotFoundException` (404); one that is not
+//! a well-formed identifier at all is refused before the lookup as invalid input —
+//! `ValidationException` (400), see [`crate::state::check_job_identifier`].
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before any store lookup: a string that cannot
+        // be an identifier of this service is invalid input, not a missing resource.
+        crate::state::check_job_identifier(&input.search_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSearchJobResultsErrorModeled::InternalServerException(
                 InternalServerException {

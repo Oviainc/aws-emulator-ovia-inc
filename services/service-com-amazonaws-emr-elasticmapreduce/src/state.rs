@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Application, AutoScalingPolicyDescription, AutoScalingPolicyStatus,
+    Application, AutoScalingPolicy, AutoScalingPolicyDescription, AutoScalingPolicyStatus,
     BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata, BootstrapActionConfig,
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
     Configuration, EbsBlockDevice, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
@@ -110,6 +110,13 @@ pub mod market_type {
 pub mod instance_group_type {
     pub const MASTER: &str = "MASTER";
     pub const CORE: &str = "CORE";
+    pub const TASK: &str = "TASK";
+
+    /// The roles an automatic scaling policy may be attached to: "Creates or updates an
+    /// automatic scaling policy for a core instance group or task instance group in an
+    /// Amazon EMR cluster." (`PutAutoScalingPolicy` doc, Smithy model.) The master group
+    /// runs the one primary node, so nothing scales it.
+    pub const AUTO_SCALABLE: &[&str] = &[CORE, TASK];
 }
 
 /// `com.amazonaws.emr#CancelStepsRequestStatus`: "The value may be SUBMITTED or
@@ -195,6 +202,51 @@ pub fn not_valid_message(value: &str) -> String {
 /// with the error code `InvalidRequestException` — rather than an empty success.
 pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
     format!("Persistent application user interface id '{persistent_app_ui_id}' is not valid.")
+}
+
+/// How an instance-group-scoped operation that models no client error refuses an
+/// `InstanceGroupId` the named cluster carries no group for.
+///
+/// AWS does not document the wording, so the text is built from the request: it names
+/// the id the caller asked for, through the same tail [`unknown_cluster_message`] uses.
+/// What IS the contract is the refusal itself — HTTP 400 with the error code
+/// `ValidationException` — rather than an empty success.
+pub fn unknown_instance_group_message(instance_group_id: &str) -> String {
+    format!("Instance group id {}", not_valid_message(instance_group_id))
+}
+
+/// Refuse an `AutoScalingPolicy` this emulator cannot hold as submitted.
+///
+/// `MinCapacity` is "the lower boundary of Amazon EC2 units" and `MaxCapacity` "the
+/// upper boundary of Amazon EC2 units" of the scaling activity (`ScalingConstraints`
+/// member docs, Smithy model), so a negative lower boundary, and a lower boundary above
+/// the upper one, name no range the activity could stay inside. The rule list is bounded
+/// by [`MAX_SCALING_RULES`] because every rule is retained and reported on every later
+/// read of the group.
+///
+/// Every path that persists an `AutoScalingPolicy` calls this before storing it.
+pub fn validate_auto_scaling_policy(policy: &AutoScalingPolicy) -> Result<(), String> {
+    let constraints = &policy.constraints;
+    if constraints.min_capacity < 0 {
+        return Err(format!(
+            "Constraints.MinCapacity {} is below 0",
+            constraints.min_capacity
+        ));
+    }
+    if constraints.min_capacity > constraints.max_capacity {
+        return Err(format!(
+            "Constraints.MinCapacity {} is above Constraints.MaxCapacity {}",
+            constraints.min_capacity, constraints.max_capacity
+        ));
+    }
+    if policy.rules.len() > MAX_SCALING_RULES {
+        return Err(format!(
+            "Rules carries {} rules; an automatic scaling policy names at most \
+             {MAX_SCALING_RULES}",
+            policy.rules.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a `ManagedScalingPolicy` whose compute limits cannot hold together.
@@ -312,6 +364,15 @@ pub const MAX_INSTANCE_GROUPS_PER_CLUSTER: usize = 50;
 /// `Marker` that resumes the listing where the page stopped — is reachable rather than
 /// dead.
 pub const LIST_INSTANCE_GROUPS_PAGE_SIZE: usize = 20;
+
+/// How many scaling rules one automatic scaling policy may name.
+///
+/// CHOSEN, not documented: `ScalingRuleList` carries no length constraint, and every
+/// rule a policy was given is retained for the life of the group and cloned into every
+/// later read of it, so without a bound one request would make every
+/// `ListInstanceGroups` answer arbitrarily large. It is orders of magnitude above the
+/// handful of rules a real policy carries, so no faithful request is refused by it.
+pub const MAX_SCALING_RULES: usize = 100;
 
 /// How many EBS volumes the instances of one instance group may carry IN TOTAL, summed
 /// over every `EbsBlockDeviceConfig` its `EbsConfiguration` names.
@@ -1714,6 +1775,14 @@ impl ClusterRecord {
         self.steps.iter_mut().find(|step| step.id == step_id)
     }
 
+    /// The instance group `instance_group_id` of this cluster, for an operation that
+    /// changes it.
+    pub fn group_mut(&mut self, instance_group_id: &str) -> Option<&mut InstanceGroupRecord> {
+        self.groups
+            .iter_mut()
+            .find(|group| group.id == instance_group_id)
+    }
+
     /// The session `session_id` of this cluster, if it has one.
     pub fn session(&self, session_id: &str) -> Option<&Session> {
         self.sessions
@@ -1902,6 +1971,10 @@ pub struct InstanceGroupRecord {
     pub end_date_time: Option<SystemTime>,
     /// When the `PROVISIONING` -> `RUNNING` transition the clock owes comes due.
     pub ready_due_at: Option<SystemTime>,
+    /// When the `ATTACHING` -> `ATTACHED` transition the clock owes the automatic
+    /// scaling policy this group carries comes due, and `None` once that transition has
+    /// been materialised or the group carries no policy.
+    pub policy_attaching_due_at: Option<SystemTime>,
 }
 
 impl InstanceGroupRecord {
@@ -1909,8 +1982,13 @@ impl InstanceGroupRecord {
     ///
     /// A group EMR has just accepted is `PROVISIONING` (`InstanceGroupState`) — its
     /// Amazon EC2 instances are not up yet — and the clock owes it the move to
-    /// `RUNNING`.
+    /// `RUNNING`. A policy the configuration carries is `ATTACHING` for a span of its
+    /// own.
     pub fn from_config(id: String, config: InstanceGroupConfig, now: SystemTime) -> Self {
+        let policy_attaching_due_at = config
+            .auto_scaling_policy
+            .as_ref()
+            .map(|_| now + TRANSITION_SPAN);
         Self {
             id,
             config,
@@ -1920,13 +1998,32 @@ impl InstanceGroupRecord {
             ready_date_time: None,
             end_date_time: None,
             ready_due_at: Some(now + TRANSITION_SPAN),
+            policy_attaching_due_at,
         }
     }
 
-    /// Materialise the transition the clock already made due, and nothing else: a group
-    /// that was `PROVISIONING` is `RUNNING` once its span has passed, which was owed at
-    /// that instant whether or not anybody looked.
+    /// Attach `policy` to this group, replacing whatever policy it carried before.
+    ///
+    /// "Creates or updates an automatic scaling policy for a core instance group or task
+    /// instance group" (`PutAutoScalingPolicy` doc, Smithy model): the submitted policy
+    /// is what the group carries from here on. A policy EMR has just accepted is still
+    /// `ATTACHING` (`AutoScalingPolicyState`), and the clock owes it the move to
+    /// `ATTACHED`.
+    pub fn attach_auto_scaling_policy(&mut self, policy: AutoScalingPolicy, now: SystemTime) {
+        self.config.auto_scaling_policy = Some(policy);
+        self.policy_attaching_due_at = Some(now + TRANSITION_SPAN);
+    }
+
+    /// Materialise the transitions the clock already made due, and nothing else: a group
+    /// that was `PROVISIONING` is `RUNNING` once its span has passed, and a policy that
+    /// was `ATTACHING` is `ATTACHED` once its own has — each owed at that instant
+    /// whether or not anybody looked.
     pub fn advance_to(&mut self, now: SystemTime) {
+        if let Some(due) = self.policy_attaching_due_at {
+            if now >= due {
+                self.policy_attaching_due_at = None;
+            }
+        }
         if self.state != instance_group_state::PROVISIONING {
             return;
         }
@@ -1950,6 +2047,7 @@ impl InstanceGroupRecord {
             message: Some("The cluster was terminated.".to_string()),
         });
         self.ready_due_at = None;
+        self.policy_attaching_due_at = None;
         self.end_date_time = Some(at);
     }
 
@@ -2014,14 +2112,15 @@ impl InstanceGroupRecord {
     }
 
     /// The wire `AutoScalingPolicyDescription` for the automatic scaling policy this
-    /// group was configured with, and `None` when it carries none.
+    /// group carries — the one its configuration was given, or the one the last
+    /// `PutAutoScalingPolicy` attached — and `None` when it carries none.
     ///
-    /// The constraints and rules are the ones that were submitted. The status follows
-    /// the group: a policy on a group that is still provisioning is `ATTACHING`, and one
-    /// on a group that is up is `ATTACHED` (`AutoScalingPolicyState`).
-    fn to_auto_scaling_policy(&self) -> Option<AutoScalingPolicyDescription> {
+    /// The constraints and rules are the ones that were submitted. The status is where
+    /// the clock has got to: a policy whose attach span has not passed is `ATTACHING`,
+    /// and one past it is `ATTACHED` (`AutoScalingPolicyState`).
+    pub fn to_auto_scaling_policy(&self) -> Option<AutoScalingPolicyDescription> {
         let policy = self.config.auto_scaling_policy.as_ref()?;
-        let state = if self.state == instance_group_state::PROVISIONING {
+        let state = if self.policy_attaching_due_at.is_some() {
             auto_scaling_policy_state::ATTACHING
         } else {
             auto_scaling_policy_state::ATTACHED
@@ -2197,7 +2296,9 @@ pub fn implied_instance_group_configs(instances: &JobFlowInstancesConfig) -> Vec
 
 /// Refuse an `InstanceGroupConfig` this emulator cannot hold as submitted.
 ///
-/// The only such configuration is one whose `EbsConfiguration` names more block device
+/// The only such configuration is one whose `AutoScalingPolicy` names no range the
+/// scaling activity could stay inside (see [`validate_auto_scaling_policy`]), or whose
+/// `EbsConfiguration` names more block device
 /// configurations than [`MAX_EBS_BLOCK_DEVICE_CONFIGS`], or asks for a negative number of
 /// volumes, or asks for more volumes IN TOTAL than
 /// [`MAX_EBS_VOLUMES_PER_INSTANCE`] — every volume of every configuration becomes an
@@ -2207,6 +2308,9 @@ pub fn implied_instance_group_configs(instances: &JobFlowInstancesConfig) -> Vec
 ///
 /// Every path that persists an `InstanceGroupConfig` calls this before minting a record.
 pub fn validate_instance_group_config(config: &InstanceGroupConfig) -> Result<(), String> {
+    if let Some(policy) = config.auto_scaling_policy.as_ref() {
+        validate_auto_scaling_policy(policy)?;
+    }
     let block_devices = config
         .ebs_configuration
         .as_ref()

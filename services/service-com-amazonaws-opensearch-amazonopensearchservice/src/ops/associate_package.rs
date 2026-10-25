@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociatePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociatePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociatePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Links the ONE package the call names to the domain it names, as a
+//! [`crate::state::PackageAssociation`] held on that domain, and answers with the
+//! stored record through the same `DomainPackageDetails` projection every other
+//! operation reports an association with.
+//!
+//! The decision about whether a package can be linked to a domain is the store's one
+//! `plan_package_association`, shared with the operation that links several packages
+//! at once, so the two cannot serve or refuse the same request differently. The only
+//! difference is what can satisfy a prerequisite: this call associates nothing but the
+//! package it names, so a prerequisite is satisfied only by an association the domain
+//! already has.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +90,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
+use crate::state::{domain_not_found, AssociationRefusal, AssociationRequest};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +168,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociatePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociatePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociatePackage"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the call decides on the state of the store at `now`: a package
+        // whose copy has finished is AVAILABLE, and an association whose move has
+        // landed is no longer in flight.
+        store.settle_packages(now);
+        // A name that names no domain is refused by the decision this settling
+        // precedes.
+        let _ = store.settled_mut(&input.domain_name, now);
+
+        let request = AssociationRequest {
+            package_id: input.package_id.clone(),
+            prerequisite_package_ids: input
+                .prerequisite_package_id_list
+                .clone()
+                .unwrap_or_default(),
+            association_configuration: input.association_configuration.clone(),
+        };
+
+        // This call associates ONLY the package it names, so nothing it does can
+        // satisfy a prerequisite of that package: the set of packages associated
+        // alongside it is empty, and a prerequisite is satisfied only by an
+        // association the domain already has.
+        let package = store
+            .plan_package_association(&input.domain_name, &request, &BTreeSet::new())
+            .map_err(refuse)?;
+
+        let details = store
+            .put_package_association(&input.domain_name, &package, &request, now)
+            .ok_or_else(|| {
+                AssociatePackageErrorModeled::ResourceNotFoundException(domain_not_found(
+                    &input.domain_name,
+                ))
+            })?;
+
+        Ok(AssociatePackageOutput {
+            domain_package_details: Some(details),
+        })
     }
+}
+
+/// The shared refusal, as THIS operation's error channel names it.
+fn refuse(refusal: AssociationRefusal) -> AssociatePackageError {
+    match refusal {
+        AssociationRefusal::NotFound(payload) => {
+            AssociatePackageErrorModeled::ResourceNotFoundException(payload)
+        }
+        AssociationRefusal::Conflict(payload) => {
+            AssociatePackageErrorModeled::ConflictException(payload)
+        }
+        AssociationRefusal::Validation(payload) => {
+            AssociatePackageErrorModeled::ValidationException(payload)
+        }
+    }
+    .into()
 }
