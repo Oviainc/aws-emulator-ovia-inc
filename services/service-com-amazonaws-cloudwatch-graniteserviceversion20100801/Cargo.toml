@@ -24,12 +24,12 @@ tracing = { workspace = true }
 # Opaque pagination cursors: hex makes a token this service did not mint detectable,
 # which is what lets DescribeAlarms refuse a malformed NextToken.
 hex = { workspace = true }
+# GetMetricData's cursor carries a fixed-size digest of the request it was minted for, so a
+# token replayed against a different request is refused at constant token size.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

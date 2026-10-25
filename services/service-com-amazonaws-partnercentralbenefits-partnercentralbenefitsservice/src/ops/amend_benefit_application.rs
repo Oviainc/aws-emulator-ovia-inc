@@ -39,6 +39,17 @@
 //! the two strings the record keeps), and an amended document still within
 //! [`crate::state::details_rejection`]'s depth, member-count and byte bounds.
 //!
+//! The document the amendments produce is judged against the request schema the
+//! application's benefit declares, exactly as a document supplied to the create or the
+//! update is: an amended document that contradicts the schema is refused with the modelled
+//! `ValidationException` and nothing is persisted — see
+//! [`crate::state::benefit_schema_refusal`]. `Amendment$NewValue` is modelled as a String
+//! and is written as one, so a path naming a field the schema declares with another JSON
+//! type cannot be satisfied by any amendment: such a request is refused rather than
+//! answered by writing text where the schema says number. The caller changes that field
+//! through `UpdateBenefitApplication`, whose `BenefitApplicationDetails` is a `Document`
+//! and so can carry the declared type.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -469,6 +480,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_millis();
         let mut store = state.lock();
 
+        // The application's own benefit governs the document the amendments produce, the
+        // way it governs the one the create stores. The schema is read — and cloned —
+        // BEFORE the application is borrowed for writing.
+        let benefit_schema =
+            store.benefit_schema_for_application(&input.catalog, &input.identifier);
+
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
             return Err(
                 AmendBenefitApplicationErrorModeled::ResourceNotFoundException(
@@ -555,6 +572,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The amended document has to satisfy the benefit's request schema just as a
+        // supplied one does: an amendment can write a field the schema declares, so the
+        // rule the create applies to the document it stores is applied to this one.
+        if let Some(refusal) = crate::state::benefit_schema_refusal(
+            benefit_schema.as_ref(),
+            amended.benefit_application_details.as_ref(),
+        ) {
+            return Err(AmendBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
         amended.revise(now);

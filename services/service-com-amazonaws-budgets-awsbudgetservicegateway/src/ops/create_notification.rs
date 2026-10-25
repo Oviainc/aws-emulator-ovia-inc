@@ -10,6 +10,10 @@
 //! is a `DuplicateRecordException`, and the documented notification and per-type
 //! subscriber limits are answered with `CreationLimitExceededException`.
 //!
+//! A notification attached in the `ALARM` state has passed its threshold, so the alert
+//! it exists to deliver is published to each `SNS` subscriber's topic
+//! ([`crate::state::alerts`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -199,60 +202,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
-        let mut store = crate::state::store_at(&state, now);
-        // "You must create the budget before you create the associated notification":
-        // a notification is held inside the budget that owns it, so a budget this
-        // account does not hold is the resource this call cannot locate.
-        let stored = store
-            .budgets
-            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
-            .ok_or_else(|| {
-                CreateNotificationErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to create notification: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
-                })
-            })?;
+        // Every write this call makes is made under the store's lock, and the lock is
+        // released at the end of this block: the alert it leaves owed is published
+        // afterwards, so no delivery is made while the store is held.
+        let alerts = {
+            let mut store = crate::state::store_at(&state, now);
+            // "You must create the budget before you create the associated notification":
+            // a notification is held inside the budget that owns it, so a budget this
+            // account does not hold is the resource this call cannot locate.
+            let stored = store
+                .budgets
+                .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+                .ok_or_else(|| {
+                    CreateNotificationErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to create notification: {} - the budget doesn't exist.",
+                            input.budget_name
+                        )),
+                    })
+                })?;
 
-        // What a notification alerts on identifies it, so a budget cannot hold two of
-        // them: a repeat of one it already has is the duplicate record — not a second
-        // notification, and not an overwrite of the first one's subscribers.
-        if crate::state::find_notification(stored, &input.notification).is_some() {
-            return Err(CreateNotificationErrorModeled::DuplicateRecordException(
-                DuplicateRecordException {
-                    message: Some(format!(
-                        "Unable to create notification: {} - the notification already exists.",
-                        input.budget_name
-                    )),
-                },
-            )
-            .into());
-        }
-        // "A budget can have up to ten notifications."
-        if stored.notifications.len() >= crate::state::MAX_NOTIFICATIONS_PER_BUDGET {
-            return Err(CreateNotificationErrorModeled::CreationLimitExceededException(
-                CreationLimitExceededException {
-                    message: Some(format!(
-                        "Unable to create notification: {} - a budget can have at most {} \
-                         notifications.",
-                        input.budget_name,
-                        crate::state::MAX_NOTIFICATIONS_PER_BUDGET
-                    )),
-                },
-            )
-            .into());
-        }
+            // What a notification alerts on identifies it, so a budget cannot hold two
+            // of them: a repeat of one it already has is the duplicate record — not a
+            // second notification, and not an overwrite of the first one's subscribers.
+            if crate::state::find_notification(stored, &input.notification).is_some() {
+                return Err(CreateNotificationErrorModeled::DuplicateRecordException(
+                    DuplicateRecordException {
+                        message: Some(format!(
+                            "Unable to create notification: {} - the notification already exists.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "A budget can have up to ten notifications."
+            if stored.notifications.len() >= crate::state::MAX_NOTIFICATIONS_PER_BUDGET {
+                return Err(CreateNotificationErrorModeled::CreationLimitExceededException(
+                    CreationLimitExceededException {
+                        message: Some(format!(
+                            "Unable to create notification: {} - a budget can have at most {} \
+                             notifications.",
+                            input.budget_name,
+                            crate::state::MAX_NOTIFICATIONS_PER_BUDGET
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let mut notification = input.notification;
-        // The one member of a notification the SERVICE owns rather than the caller —
-        // the alarm state a new notification starts in — is materialised here, so every
-        // later read reports what was stored rather than recomputing it.
-        crate::state::stamp_notification(&mut notification);
-        stored.notifications.push(crate::state::StoredNotification {
-            notification,
-            subscribers: input.subscribers,
-        });
+            let mut notification = input.notification;
+            // The one member of a notification the SERVICE owns rather than the caller —
+            // the alarm state a new notification starts in — is materialised here, so
+            // every later read reports what was stored rather than recomputing it.
+            crate::state::stamp_notification(&mut notification);
+            // A notification in alarm has passed its threshold, so it owes the alert it
+            // exists to deliver to every subscriber this call attaches to it, decided
+            // from the state this call leaves behind.
+            let alerts = crate::state::alerts::owed(
+                &crate::state::alerts::source(&input.account_id, &stored.budget),
+                &notification,
+                &input.subscribers,
+            );
+            stored.notifications.push(crate::state::StoredNotification {
+                notification,
+                subscribers: input.subscribers,
+            });
+            alerts
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
 
         Ok(CreateNotificationOutput {})
     }

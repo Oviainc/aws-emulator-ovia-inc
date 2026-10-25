@@ -15,6 +15,12 @@
 //! one, so an update built on a stale read is refused with the modelled
 //! `ConflictException` rather than silently overwriting a newer write.
 //!
+//! A `BenefitApplicationDetails` document the update would store is judged against the
+//! request schema the application's benefit declares, exactly as the create's is: a
+//! document that contradicts the schema is refused with the modelled
+//! `ValidationException` (HTTP 400) and nothing is persisted — see
+//! [`crate::state::benefit_schema_refusal`].
+//!
 //! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of an
 //! update that already applied changes nothing a second time and answers with the
 //! `Id`/`Arn`/`Revision` that update reported (see
@@ -228,6 +234,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_millis();
 
         let mut store = state.lock();
+
+        // The application's own benefit governs the document this update would store, the
+        // way it governs the one the create stores. The schema is read — and cloned —
+        // BEFORE the application is borrowed for writing, and judged after the retry
+        // check below, so a replay of a write that already landed still answers with what
+        // it reported.
+        let benefit_schema =
+            store.benefit_schema_for_application(&input.catalog, &input.identifier);
+
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
             return Err(
                 UpdateBenefitApplicationErrorModeled::ResourceNotFoundException(
@@ -256,6 +271,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: Some(application.arn.clone()),
                 revision: Some(applied.revision.to_string()),
             });
+        }
+
+        // A document this update would store has to satisfy the benefit's request schema,
+        // exactly as the create's does: one rule, applied wherever the member is written.
+        if let Some(refusal) = crate::state::benefit_schema_refusal(
+            benefit_schema.as_ref(),
+            input.benefit_application_details.as_ref(),
+        ) {
+            return Err(UpdateBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
         // An update is the partner editing its own DRAFT: once the application has been

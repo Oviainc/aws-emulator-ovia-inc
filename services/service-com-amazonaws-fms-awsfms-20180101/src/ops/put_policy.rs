@@ -19,6 +19,12 @@
 //!   successful update rotates it. An unknown id is `ResourceNotFoundException`;
 //!   a stale or absent token is `InvalidOperationException`.
 //!
+//! Either way the SERVICE-OWNED members of the document are not the caller's to
+//! set: the `PolicyId` and `PolicyUpdateToken` the service mints, and the
+//! `PolicyStatus` it derives from the administrative scope governing the policy,
+//! are stripped from the stored document and overlaid from the store for every
+//! reader.
+//!
 //! Either way the document itself is checked FIRST — before the `PolicyId` is
 //! resolved and before the token is judged, so an update that carries both an
 //! unknown id and an invalid document reports the document's refusal — against
@@ -483,21 +489,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a refused call leaves the store exactly as it was.
         crate::state::require_administrator(&store, &region)?;
 
-        // Everything the caller sent is stored verbatim; the only member filled
-        // in here is the `PolicyStatus` default.
+        // Everything the caller sent is stored verbatim; nothing the service
+        // owns is.
         //
-        // The two SERVICE-OWNED members are TAKEN OUT of the stored copy:
+        // The SERVICE-OWNED members are TAKEN OUT of the stored copy:
         // `PolicyRecord`'s `policy_id` and `update_token` are the single source
-        // of truth for them, and `PolicyRecord::policy()` overlays both onto the
-        // stored document for every reader (this response and `GetPolicy`).
-        // Keeping the caller's copies would leave a second, stale `PolicyId` and
-        // `PolicyUpdateToken` in the store once a later update rotates the token.
+        // of truth for the identifiers, and the `PolicyStatus` follows from the
+        // administrative scope governing the policy
+        // ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_status`])
+        // — "whether the policy is in or out of an admin's policy or Region
+        // scope", which is not the caller's to choose. Every reader (this
+        // response, `GetPolicy` and the `ListPolicies` summary) overlays all
+        // three onto the stored document, so a status a request carried is
+        // neither persisted nor reported, exactly as a `PolicyId` and a
+        // `PolicyUpdateToken` the request carried are not.
         let mut policy = input.policy.clone();
         let requested_id = policy.policy_id.take();
         let requested_token = policy.policy_update_token.take();
-        if policy.policy_status.is_none() {
-            policy.policy_status = Some(crate::state::POLICY_STATUS_ACTIVE.to_string());
-        }
+        policy.policy_status = None;
 
         // The semantic rules on the document the model states but cannot
         // express as a constraint. Refused before the store is even reached, so
@@ -533,6 +542,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::PolicyRecord {
                     policy_id,
                     policy_arn: existing.policy_arn.clone(),
+                    // A policy stays in the Region it was created in: an update
+                    // edits the document, it does not move the resource (its
+                    // ARN, which names that Region, is kept above for the same
+                    // reason).
+                    region: existing.region.clone(),
                     // A successful update makes the caller's token stale, so the
                     // next update has to read the current one back first.
                     update_token: crate::state::mint_identifier(),
@@ -564,6 +578,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::PolicyRecord {
                     policy_arn: crate::state::policy_arn(&region, &policy_id),
                     policy_id,
+                    region: region.clone(),
                     update_token: crate::state::mint_identifier(),
                     policy,
                     // A new resource carries only the tags the create sent.
@@ -577,8 +592,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .tags_by_arn
             .insert(record.policy_arn.clone(), record.tags.clone());
+        // The derived status, read from the store the same way every other
+        // reader of this policy reads it.
+        let policy_status = store.policy_status(&record);
         let output = PutPolicyOutput {
-            policy: Some(record.policy()),
+            policy: Some(record.policy(policy_status)),
             policy_arn: Some(record.policy_arn.clone()),
         };
         store.policies.insert(record.policy_id.clone(), record);
