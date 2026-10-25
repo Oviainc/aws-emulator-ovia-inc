@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/configuration_session_poll.rs"]
 mod configuration_session_poll;
+#[path = "all/feature_flag_resolution.rs"]
+mod feature_flag_resolution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
