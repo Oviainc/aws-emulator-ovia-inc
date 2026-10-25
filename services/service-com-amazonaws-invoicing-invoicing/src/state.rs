@@ -41,12 +41,14 @@
 //! computed per read. There is no point-in-time read on this plane, so a DELETE erases
 //! the entry rather than tombstoning it as an invoice unit's delete does.
 //!
-//! Every call that WRITES a preference advances its `Version` and `LastUpdateDate`,
-//! including the two validation calls: they record what the validation flow tried
-//! ([`StoredProcurementPortalPreference::unconfirmed_validation_attempts`] and
-//! [`StoredProcurementPortalPreference::failed_verification_attempts`]), which is state
-//! about the preference that no modelled member reports, and a version counts the writes
-//! the resource took rather than the members a reader can see change.
+//! `Version` and `LastUpdateDate` are advanced by the calls that SUCCESSFULLY write a
+//! preference's configuration — the create, the configuration update and the status
+//! update — and by nothing else: `Version` is "the version number of the procurement
+//! portal preference configuration", so a call that answered an error wrote no
+//! configuration and leaves both exactly as the last successful write left them. The
+//! validation calls keep their own record of what the flow tried
+//! ([`StoredProcurementPortalPreference::failed_verification_attempts`]), which no
+//! modelled member reports, so a refused validation changes nothing a reader observes.
 //!
 //! The PORTALS themselves are not stored beside the preferences, because no operation of
 //! this service creates one: they are the catalog [`procurement_portals`] derives from
@@ -544,22 +546,14 @@ pub struct StoredProcurementPortalPreference {
     /// preference, if any. `None` means no code is outstanding, so there is
     /// no code a `VerifyProcurementPortalValidation` could match.
     pub validation: Option<IssuedPortalValidation>,
-    /// How many validations have been REQUESTED for this preference whose delivery of
-    /// the test e-invoice could not be confirmed — the attempts
-    /// `SendProcurementPortalValidation` made and refused.
+    /// How many submissions of a validation code for this preference have been REFUSED:
+    /// the failed attempts of `VerifyProcurementPortalValidation`, which its refusal
+    /// names ("attempt N of the budget").
     ///
     /// It is state the service keeps ABOUT the preference and no modelled member reports
-    /// it, which is why a reader never sees it; it is here because the attempt is a write
-    /// of the resource (the validation flow's own record of what it tried), and a write
-    /// is what `ProcurementPortalPreference$Version` counts.
-    pub unconfirmed_validation_attempts: u32,
-    /// How many submissions of a validation code for this preference have been REFUSED:
-    /// the failed attempts of `VerifyProcurementPortalValidation`.
-    ///
-    /// Like [`Self::unconfirmed_validation_attempts`] this is state the service keeps
-    /// about the preference that no modelled member reports, kept because a refused
-    /// submission is a write of the resource — what the validation flow has tried so far
-    /// — and a write is what `ProcurementPortalPreference$Version` counts.
+    /// it, so keeping it moves nothing a reader of the preference sees: in particular a
+    /// refused submission leaves `Version` and `LastUpdateDate` alone, because it wrote
+    /// no configuration.
     pub failed_verification_attempts: u32,
 }
 

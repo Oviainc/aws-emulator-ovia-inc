@@ -279,10 +279,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call, so one of them resolves below instead of 404-ing — and is then
-        // refused.
-        store.ensure_service_managed_catalog(&region);
         store.settle(now);
 
         // A system keyspace holds the SERVICE's own tables: Cassandra refuses DDL against
@@ -296,22 +292,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The source table. Resolved first: a restore of a table that is not there creates
-        // nothing.
-        let Some(source_keyspace) = store.keyspaces.get(&input.source_keyspace_name) else {
-            return Err(RestoreTableErrorModeled::ResourceNotFoundException(
-                crate::state::keyspace_not_found(&region, &input.source_keyspace_name),
-            )
-            .into());
-        };
-        let Some(source) = source_keyspace.tables.get(&input.source_table_name) else {
-            return Err(RestoreTableErrorModeled::ResourceNotFoundException(
-                crate::state::table_not_found(
-                    &region,
-                    &input.source_keyspace_name,
-                    &input.source_table_name,
-                ),
-            )
-            .into());
+        // nothing. Both keyspaces are resolved in the Region the request was signed for — a
+        // keyspace created in another Region is not a resource of this one.
+        let source = {
+            let Some(source_keyspace) = store.keyspace(&region, &input.source_keyspace_name)
+            else {
+                return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                    crate::state::keyspace_not_found(&region, &input.source_keyspace_name),
+                )
+                .into());
+            };
+            let Some(source) = source_keyspace.tables.get(&input.source_table_name) else {
+                return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                    crate::state::table_not_found(
+                        &region,
+                        &input.source_keyspace_name,
+                        &input.source_table_name,
+                    ),
+                )
+                .into());
+            };
+            // Taken out of the store here, so reading the source's settings holds no borrow
+            // of it while the TARGET keyspace below — which may be the source's own — is
+            // written.
+            source.clone()
         };
 
         // A table is restorable only from `ACTIVE`: "The operation tried to access a
@@ -425,7 +429,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The target keyspace, which is where the restored table is created. It may be the
         // source's own keyspace, so it is resolved only after everything above was read out
         // of the source table.
-        let Some(target_keyspace) = store.keyspaces.get_mut(&input.target_keyspace_name) else {
+        let Some(target_keyspace) = store.keyspace_mut(&region, &input.target_keyspace_name)
+        else {
             return Err(RestoreTableErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.target_keyspace_name),
             )

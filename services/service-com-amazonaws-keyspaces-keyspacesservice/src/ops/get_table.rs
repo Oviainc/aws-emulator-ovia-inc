@@ -210,16 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call.
-        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the table.
         let now = ::std::time::SystemTime::now();
         store.settle(now);
 
-        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+        // The keyspace this Region holds under the name: one created in it, or a
+        // service-managed one with its system tables, which every Region holds before any
+        // call.
+        let Some(keyspace) = store.keyspace(&region, &input.keyspace_name) else {
             return Err(GetTableErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )

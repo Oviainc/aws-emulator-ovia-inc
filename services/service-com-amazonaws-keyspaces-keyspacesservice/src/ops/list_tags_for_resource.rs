@@ -212,17 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call, so an ARN that names one resolves here: a resource Amazon
-        // Keyspaces always holds reports the tags it holds (none) rather than a 404.
-        store.ensure_service_managed_catalog(&crate::state::request_region(ctx));
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the tags.
         store.settle(::std::time::SystemTime::now());
 
-        let Some(tags) = store.resource_tags(&input.resource_arn) else {
+        // The ARN is resolved in the Region the request was signed for: a resource the
+        // service itself holds there reports the tags it holds (none) rather than a 404,
+        // and an ARN that names a resource of another Region names none of this one's.
+        let Some(tags) = store.resource_tags(&region, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::arn_not_found(&input.resource_arn),
             )

@@ -184,9 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call.
-        store.ensure_service_managed_catalog(&region);
         store.settle(now);
 
         // A system table of a service-managed keyspace is the SERVICE's table, not the
@@ -201,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(keyspace) = store.keyspaces.get_mut(&input.keyspace_name) else {
+        let Some(keyspace) = store.keyspace_mut(&region, &input.keyspace_name) else {
             return Err(DeleteTableErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )
@@ -264,8 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store no longer holds, not even in the span before `settle` removes the
             // table itself.
             if let Some(table) = store
-                .keyspaces
-                .get_mut(&input.keyspace_name)
+                .keyspace_mut(&region, &input.keyspace_name)
                 .and_then(|keyspace| keyspace.tables.get_mut(&input.table_name))
             {
                 table.cdc_stream_tags.clear();

@@ -22,6 +22,13 @@
 //! answer, so an action that cannot be reached is logged and recorded in the alarm's history
 //! as a failed action, and changes nothing about what the caller is told.
 //!
+//! Asynchronous also means NOBODY NEED CALL AGAIN: a client that publishes a datapoint or
+//! writes an alarm looks for the notification on the action's target, not at CloudWatch, so the
+//! transitions the clock makes due after that write are materialised — and the actions they
+//! fire executed — by [`drive_alarm_clock`], the one bounded in-process task a write starts.
+//! Every handler still settles what is due when it runs ([`settle_alarms`]); the clock is what
+//! makes the path observable to a client that makes no further call.
+//!
 //! Only an SNS topic ARN is delivered to here. Every other action kind an alarm may carry (a
 //! Lambda function, an Auto Scaling policy, an SSM OpsItem, an EC2 instance action) needs its
 //! own invocation path, which is not implemented in this emulator: such an action is logged
@@ -99,18 +106,19 @@ impl AlarmNotification {
             new_state_reason: alarm.state_reason.as_deref(),
             old_state_value,
             at_secs,
-            detail: ("Trigger", metric_trigger_document(alarm)),
+            detail: vec![("Trigger", metric_trigger_document(alarm))],
         }
         .build()
     }
 
     /// The notification a COMPOSITE alarm's transition to its current state owes. Same rule,
     /// same envelope: the alarm's own three action lists, selected by the state it moved to.
-    /// A composite alarm reports the rule it evaluated where a metric alarm reports the metric
-    /// it evaluated.
+    /// A composite alarm reports the rule it evaluated, and the CHILDREN whose states that rule
+    /// read, where a metric alarm reports the metric it evaluated.
     #[must_use]
     pub fn of_composite_transition(
         alarm: &CompositeAlarm,
+        children: &[super::ChildAlarmState],
         old_state_value: Option<&str>,
         at_secs: f64,
     ) -> Option<Self> {
@@ -137,13 +145,16 @@ impl AlarmNotification {
             new_state_reason: alarm.state_reason.as_deref(),
             old_state_value,
             at_secs,
-            detail: (
-                "AlarmRule",
-                alarm
-                    .alarm_rule
-                    .as_deref()
-                    .map_or(Value::Null, Value::from),
-            ),
+            detail: vec![
+                (
+                    "AlarmRule",
+                    alarm
+                        .alarm_rule
+                        .as_deref()
+                        .map_or(Value::Null, Value::from),
+                ),
+                ("TriggeringChildren", triggering_children(children)),
+            ],
         }
         .build()
     }
@@ -167,9 +178,10 @@ struct Transition<'a> {
     new_state_reason: Option<&'a str>,
     old_state_value: Option<&'a str>,
     at_secs: f64,
-    /// The member that says WHAT was evaluated: a metric alarm's `Trigger`, a composite
-    /// alarm's `AlarmRule`.
-    detail: (&'static str, Value),
+    /// The members that say WHAT was evaluated: a metric alarm's `Trigger`, a composite
+    /// alarm's `AlarmRule` and the children its rule read. A member whose value is null is
+    /// left out of the document.
+    detail: Vec<(&'static str, Value)>,
 }
 
 impl Transition<'_> {
@@ -213,7 +225,7 @@ impl Transition<'_> {
             &mut document,
             "AlarmConfigurationUpdatedTimestamp",
             self.configuration_updated_secs
-                .and_then(rfc3339)
+                .and_then(super::rfc3339)
                 .map(Value::from),
         );
         document.insert(
@@ -233,7 +245,7 @@ impl Transition<'_> {
         insert(
             &mut document,
             "StateChangeTime",
-            rfc3339(self.at_secs).map(Value::from),
+            super::rfc3339(self.at_secs).map(Value::from),
         );
         if !region.is_empty() {
             document.insert("Region".to_string(), Value::from(region));
@@ -250,9 +262,10 @@ impl Transition<'_> {
             "InsufficientDataActions".to_string(),
             string_list(self.insufficient_data_actions),
         );
-        let (member, detail) = self.detail;
-        if !detail.is_null() {
-            document.insert(member.to_string(), detail);
+        for (member, detail) in self.detail {
+            if !detail.is_null() {
+                document.insert(member.to_string(), detail);
+            }
         }
 
         // "ALARM: "my-alarm" in us-east-1" — the subject SNS carries to an email subscriber.
@@ -291,6 +304,16 @@ impl Transition<'_> {
 pub async fn settle_alarms<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
+) {
+    settle(engine, ctx.callback()).await;
+}
+
+/// The settle itself, over the handle it reaches the actions through: a request's own callback
+/// ([`settle_alarms`]) or the one the alarm clock ([`drive_alarm_clock`]) carries, which is the
+/// same handle into this same emulator.
+async fn settle<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
 ) {
     let Some(state) = super::service_state(engine) else {
         // No store to evaluate. The handler that called this answers the store's absence with
@@ -338,7 +361,7 @@ pub async fn settle_alarms<Eng: Send + Sync + 'static>(
             let client = match client.as_ref() {
                 Some((cached, client)) if cached == region => client,
                 _ => {
-                    let fresh = sns_client(ctx, region);
+                    let fresh = sns_client(callback, region);
                     &client.insert((region.to_string(), fresh)).1
                 }
             };
@@ -349,9 +372,7 @@ pub async fn settle_alarms<Eng: Send + Sync + 'static>(
                 .message(&notification.message)
                 .send()
                 .await;
-            let failure = published.err().map(|error| {
-                ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
-            });
+            let failure = published.err().map(|error| action_failure(&error));
             if let Some(failure) = failure.as_deref() {
                 ::tracing::warn!(
                     alarm = %notification.alarm_name,
@@ -376,6 +397,178 @@ pub async fn settle_alarms<Eng: Send + Sync + 'static>(
     for (alarm_name, item) in executed {
         store.record_history(&alarm_name, now, item);
     }
+}
+
+/// Start the one in-process task that waits for this store's earliest due alarm evaluation,
+/// materialises what is then due and delivers the action notifications those transitions owe,
+/// and stands down once the store holds no alarm at all or the wake-up cap is reached.
+///
+/// A client that publishes a datapoint or writes an alarm makes no further CloudWatch call
+/// before it looks for the notification on the action's target, so a transition the CLOCK makes
+/// due — a datapoint ageing out of the evaluation range, the first evaluation after a write —
+/// and the delivery it owes would never happen at all if only the next call could perform
+/// them. This is what makes the action path observable without one. It does not change WHEN a
+/// transition happens: the task only calls the same settle every handler calls, which applies
+/// what the stored due instants have already made due, so a caller reading the alarm before
+/// that instant still sees the state the write left behind. The task waits for the clock so
+/// that no request ever has to.
+///
+/// At most one clock runs per store (the store carries the claim), it is bounded by
+/// [`MAX_ALARM_WAKE_UPS`] wake-ups, and with no async runtime to spawn onto there is no clock
+/// — the evaluations are then materialised by the next operation instead, as they always were.
+pub fn drive_alarm_clock<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) {
+    let Some(state) = super::service_state(&**engine) else {
+        return;
+    };
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(generation) = claim_alarm_clock(&mut state.lock()) else {
+        return;
+    };
+    let engine = ::std::sync::Arc::clone(engine);
+    // The same handle into this same emulator the request itself would have published
+    // through, owned by the task rather than borrowed from the request that started it.
+    let callback = ctx.callback().clone();
+    let claimed = ::engine::ServiceState::clone(&state);
+    let handle = runtime.spawn(async move {
+        // `true` only if the wake-up cap is what ended the loop; a clock that ran out of work
+        // has already released its claim inside the one critical section that observed it.
+        let mut capped = true;
+        for _ in 0..MAX_ALARM_WAKE_UPS {
+            let Some(due_secs) = next_due_or_release(&mut state.lock(), generation) else {
+                capped = false;
+                break;
+            };
+            // Every wake-up waits, even for an instant already past: that is what keeps a due
+            // evaluation from costing a CPU-bound spin, and it hands the runtime back between
+            // wake-ups.
+            let wait = ::std::time::Duration::from_secs_f64(
+                (due_secs - super::now_secs()).clamp(0.0, MAX_ALARM_WAIT.as_secs_f64()),
+            )
+            .max(MIN_ALARM_WAIT);
+            ::tokio::time::sleep(wait).await;
+            settle(&*engine, &callback).await;
+        }
+        if capped {
+            // Only THIS clock's claim, so a clock started since is left holding its own.
+            release_alarm_clock(&mut state.lock(), generation);
+        }
+    });
+    set_alarm_clock(&mut claimed.lock(), generation, handle);
+}
+
+/// The shortest an alarm-clock wake-up waits, so an evaluation already past its due instant
+/// still costs a yield rather than a CPU-bound spin.
+const MIN_ALARM_WAIT: ::std::time::Duration = ::std::time::Duration::from_millis(50);
+
+/// The longest an alarm-clock wake-up waits, so the clock re-reads the store — which a write
+/// may have changed since — at least this often.
+const MAX_ALARM_WAIT: ::std::time::Duration = ::std::time::Duration::from_millis(500);
+
+/// How many times one alarm clock wakes up before it stands down.
+///
+/// A backstop, not a schedule: it bounds the work one request can start, and whatever the
+/// clock has not reached when it is spent is materialised by the next clock (every write
+/// starts one if none is running) or by the next call that settles.
+const MAX_ALARM_WAKE_UPS: usize = 2_000;
+
+/// Claim the single alarm clock for this store: the claim's GENERATION when the caller may
+/// start one, `None` when one already runs.
+fn claim_alarm_clock(
+    store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+) -> Option<u64> {
+    if store.alarm_clock_running {
+        return None;
+    }
+    store.alarm_clock_running = true;
+    store.alarm_clock_generation = store.alarm_clock_generation.wrapping_add(1);
+    Some(store.alarm_clock_generation)
+}
+
+/// Release the claim `generation` took — and ONLY that one, so a clock that ended on the
+/// wake-up cap cannot clear a claim a clock started since is holding.
+fn release_alarm_clock(
+    store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    generation: u64,
+) {
+    if store.alarm_clock_generation == generation {
+        store.alarm_clock_running = false;
+    }
+}
+
+/// Keep the running clock's task handle, aborting the one it replaces — and only while
+/// `generation` is still the CURRENT claim, so a starter whose own task has already stood down
+/// installs nothing and aborts nothing.
+fn set_alarm_clock(
+    store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    generation: u64,
+    handle: ::tokio::task::JoinHandle<()>,
+) {
+    if store.alarm_clock_generation != generation {
+        handle.abort();
+        return;
+    }
+    if let Some(previous) = store.alarm_clock.replace(handle) {
+        previous.abort();
+    }
+}
+
+/// The instant the alarm clock waits for next, or `None` — having RELEASED its claim — when the
+/// store owes nothing at all.
+///
+/// Observing "nothing is owed" and standing down happen in ONE critical section, which is what
+/// makes the hand-over race-free: a write holds this same lock to store the alarm BEFORE it
+/// tries to claim the clock, so either this call sees that alarm and the running clock keeps
+/// it, or the write's claim finds the flag cleared and starts a clock of its own.
+fn next_due_or_release(
+    store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    generation: u64,
+) -> Option<f64> {
+    let due = store
+        .alarms
+        .values()
+        .map(|stored| stored.evaluation_due_secs)
+        .chain(
+            store
+                .composite_alarms
+                .values()
+                .map(|stored| stored.evaluation_due_secs),
+        )
+        .min_by(f64::total_cmp);
+    if due.is_none() {
+        release_alarm_clock(store, generation);
+    }
+    due
+}
+
+/// Why ONE action execution failed, as the alarm's history records it.
+///
+/// The TARGET's own answer: an action the invoked service refused failed for the reason that
+/// service gave, so what is recorded is the `message` of the service error it answered with —
+/// not a rendering of the client-side error chain that carried it, which names the types of
+/// this emulator's transport rather than anything about the action. A failure the target never
+/// answered at all (nothing dispatched, no response to parse) carries no such message, and for
+/// it the chain is the only account of the failure there is.
+fn action_failure<Response>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        ::aws_sdk_sns::operation::publish::PublishError,
+        Response,
+    >,
+) -> String
+where
+    Response: ::std::fmt::Debug,
+{
+    error
+        .as_service_error()
+        .and_then(::aws_smithy_types::error::metadata::ProvideErrorMetadata::message)
+        .map_or_else(
+            || ::aws_smithy_types::error::display::DisplayErrorContext(error).to_string(),
+            ToString::to_string,
+        )
 }
 
 /// The history item recording ONE action execution: what was executed, for which state, and
@@ -405,7 +598,36 @@ fn action_history_item(
         "stateValue".to_string(),
         Value::from(notification.new_state_value.as_str()),
     );
-    insert(&mut document, "error", failure.map(Value::from));
+    // The member is present whether or not the action failed — `null` for one that succeeded —
+    // because a reader of the record asks whether there WAS an error, and a member that is
+    // simply absent answers that question with nothing at all.
+    document.insert(
+        "error".to_string(),
+        failure.map_or(Value::Null, Value::from),
+    );
+    // What was actually published, so a reader of the record can tell the notification THIS
+    // alarm's transition produced from any other message the target received. An action that
+    // FAILED handed nothing over, so it reports no published message at all: nothing received
+    // one.
+    //
+    // `AlarmHistoryItem$HistoryData` is `@length 1..4095` and the document is JSON, so it can
+    // never be truncated to fit: the published message is the one part of it whose size the
+    // alarm's own configuration drives, so it is the part dropped when the whole document
+    // would not fit. Each form is rendered at most once, because the document carries the
+    // notification itself and is the largest thing this item holds.
+    let with_message = failure
+        .is_none()
+        .then(|| {
+            let mut full = document.clone();
+            full.insert(
+                "publishedMessage".to_string(),
+                Value::from(notification.message.as_str()),
+            );
+            Value::Object(full).to_string()
+        })
+        .filter(|rendered| rendered.len() <= super::MAX_HISTORY_DATA_LEN);
+    let history_data =
+        with_message.unwrap_or_else(|| Value::Object(document).to_string());
     AlarmHistoryItem {
         alarm_name: Some(notification.alarm_name.clone()),
         alarm_contributor_id: None,
@@ -415,20 +637,20 @@ fn action_history_item(
         timestamp: Some(super::to_timestamp(now_secs)),
         history_item_type: Some("Action".to_string()),
         history_summary: Some(bounded(summary)),
-        history_data: Some(Value::Object(document).to_string()),
+        history_data: Some(history_data),
         alarm_contributor_attributes: None,
     }
 }
 
 /// An SNS client over the in-process callback into this same emulator.
 fn sns_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_sns::Client {
     let config = ::aws_sdk_sns::Config::builder()
         .behavior_version(::aws_sdk_sns::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
         .region(::aws_sdk_sns::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://sns.{region}.amazonaws.com"))
         // The transport is in-process: there is nothing to retry, time out or watch for a
@@ -443,6 +665,42 @@ fn sns_client(
         )
         .build();
     ::aws_sdk_sns::Client::from_conf(config)
+}
+
+/// The children a composite alarm's transition reports: the alarms its rule read a state from,
+/// each named by the ARN `DescribeAlarms` reports for it and carrying the state it is in and
+/// when it moved there.
+///
+/// A consumer of the notification reads which child put the alarm where it is out of this,
+/// which is why it is part of the envelope rather than only of the alarm's own explanation. A
+/// child the rule read no state for is left out: it contributed nothing to the outcome.
+fn triggering_children(children: &[super::ChildAlarmState]) -> Value {
+    Value::Array(
+        children
+            .iter()
+            .filter(|child| child.state_value.is_some())
+            .map(|child| {
+                let mut state = Map::new();
+                insert(
+                    &mut state,
+                    "Value",
+                    child.state_value.as_deref().map(Value::from),
+                );
+                insert(
+                    &mut state,
+                    "Timestamp",
+                    child
+                        .transitioned_secs
+                        .and_then(super::rfc3339)
+                        .map(Value::from),
+                );
+                let mut entry = Map::new();
+                entry.insert("Arn".to_string(), Value::from(child.identity()));
+                entry.insert("State".to_string(), Value::Object(state));
+                Value::Object(entry)
+            })
+            .collect(),
+    )
 }
 
 /// A metric alarm's `Trigger`: the configuration the evaluation applied, so a consumer of the
@@ -546,14 +804,6 @@ fn insert(document: &mut Map<String, Value>, member: &str, value: Option<Value>)
     if let Some(value) = value {
         document.insert(member.to_string(), value);
     }
-}
-
-/// `secs` as the RFC 3339 instant a notification reports, or `None` for an instant the
-/// timestamp type cannot render.
-fn rfc3339(secs: f64) -> Option<String> {
-    super::to_timestamp(secs)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
 }
 
 /// One history summary, inside the modelled `@length 1..255` of
