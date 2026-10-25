@@ -18,9 +18,11 @@ use bigdecimal::BigDecimal;
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, AttributeValueUpdate, BillingModeSummary, Capacity,
-    ConsumedCapacity, ExpectedAttributeValue, GlobalSecondaryIndexDescription,
+    ConsumedCapacity, ContinuousBackupsDescription, ExpectedAttributeValue,
+    GlobalSecondaryIndexDescription,
     GlobalSecondaryIndexWarmThroughputDescription,
-    ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription, Projection,
+    ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription,
+    PointInTimeRecoveryDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
     TableWarmThroughputDescription, WarmThroughput,
@@ -1671,6 +1673,124 @@ impl ResourceTags {
     }
 }
 
+/// The `ContinuousBackupsStatus` a table reports: "Continuous backups are ENABLED on
+/// all tables at table creation" (the `UpdateContinuousBackups` doc), and nothing in
+/// this API turns them off — `PointInTimeRecoverySpecification` carries only the
+/// point-in-time recovery flag — so every table reports the same one of the two values
+/// the model declares for that member
+/// ([`crate::ops::types::CONTINUOUS_BACKUPS_STATUS_VALUES`]).
+pub const CONTINUOUS_BACKUPS_STATUS: &str = "ENABLED";
+
+/// The two values `PointInTimeRecoveryStatus` takes: "ENABLED - Point in time recovery
+/// is enabled. DISABLED - Point in time recovery is disabled"
+/// (`PointInTimeRecoveryDescription$PointInTimeRecoveryStatus`), which are the model's
+/// own value table ([`crate::ops::types::POINT_IN_TIME_RECOVERY_STATUS_VALUES`]) named
+/// here one per meaning, so a reader of this store sees which one a setting reports.
+pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
+pub const POINT_IN_TIME_RECOVERY_DISABLED: &str = "DISABLED";
+
+/// The recovery period an enable that names none settles on: "This parameter is
+/// optional. If no value is provided, the value will default to 35"
+/// (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`).
+pub const DEFAULT_RECOVERY_PERIOD_IN_DAYS: i32 = 35;
+
+/// How far behind the present the newest restorable point sits:
+/// "`LatestRestorableDateTime` is typically 5 minutes before the current time" (the
+/// `UpdateContinuousBackups` doc and
+/// `PointInTimeRecoveryDescription$LatestRestorableDateTime`).
+pub const RESTORE_WINDOW_LAG: Duration = Duration::from_secs(5 * 60);
+
+/// One day, the unit `RecoveryPeriodInDays` counts the recovery window in.
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A table's point-in-time recovery settings: what `UpdateContinuousBackups` writes and
+/// what both it and `DescribeContinuousBackups` report.
+///
+/// Only the SETTINGS are stored. The restorable window is DERIVED from them at every
+/// read, because it moves with the clock rather than with any call: its newest point is
+/// one [`RESTORE_WINDOW_LAG`] behind now and its oldest the configured period behind
+/// that, bounded below by the instant recovery started — before which there is nothing
+/// to restore from.
+#[derive(Debug, Clone, Default)]
+pub struct PointInTimeRecovery {
+    /// When point-in-time recovery was last turned on, or `None` while it is off (which
+    /// is how every table starts: this API is the only way to turn it on, and
+    /// `CreateTable` carries no `PointInTimeRecoverySpecification`).
+    enabled_at: Option<SystemTime>,
+    /// The recovery period in force while recovery is on, in days.
+    recovery_period_in_days: i32,
+}
+
+impl PointInTimeRecovery {
+    /// Apply one `PointInTimeRecoverySpecification`.
+    ///
+    /// Turning recovery on while it is ALREADY on does not restart the window — the
+    /// recoverable period is as old as the recovery that has been running — so only the
+    /// period is re-stated; turning it off forgets where the window started, so a later
+    /// enable starts a new one.
+    pub fn apply(&mut self, enabled: bool, recovery_period_in_days: Option<i32>, now: SystemTime) {
+        if enabled {
+            self.enabled_at = Some(self.enabled_at.unwrap_or(now));
+            self.recovery_period_in_days =
+                recovery_period_in_days.unwrap_or(DEFAULT_RECOVERY_PERIOD_IN_DAYS);
+        } else {
+            self.enabled_at = None;
+            self.recovery_period_in_days = 0;
+        }
+    }
+
+    /// Whether point-in-time recovery is on, which is what a restore from a point in
+    /// time is served against.
+    pub fn enabled(&self) -> bool {
+        self.enabled_at.is_some()
+    }
+
+    /// The continuous-backups settings as the two continuous-backups operations report
+    /// them: the table's continuous-backups status, and the point-in-time recovery
+    /// description — the window only while recovery is on, since a table with recovery
+    /// off has no point in time to restore to.
+    pub fn describe(&self, now: SystemTime) -> ContinuousBackupsDescription {
+        let recovery = match self.enabled_at {
+            Some(enabled_at) => {
+                // The newest restorable point, never earlier than the instant recovery
+                // started: a table whose recovery is younger than the lag can be
+                // restored to when it started and no further back.
+                let latest = now
+                    .checked_sub(RESTORE_WINDOW_LAG)
+                    .unwrap_or(now)
+                    .max(enabled_at);
+                let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
+                // The oldest restorable point: the configured period behind now, held
+                // inside the window the recovery itself has been running for. The bounds
+                // are ordered by construction — `latest` is at least `enabled_at` — so
+                // this cannot be an empty range.
+                let earliest = now
+                    .checked_sub(DAY * period)
+                    .unwrap_or(now)
+                    .clamp(enabled_at, latest);
+                PointInTimeRecoveryDescription {
+                    point_in_time_recovery_status: Some(
+                        POINT_IN_TIME_RECOVERY_ENABLED.to_string(),
+                    ),
+                    recovery_period_in_days: Some(self.recovery_period_in_days),
+                    earliest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(
+                        earliest,
+                    )),
+                    latest_restorable_date_time: Some(::aws_smithy_types::DateTime::from(latest)),
+                }
+            }
+            None => PointInTimeRecoveryDescription {
+                point_in_time_recovery_status: Some(POINT_IN_TIME_RECOVERY_DISABLED.to_string()),
+                ..PointInTimeRecoveryDescription::default()
+            },
+        };
+        ContinuousBackupsDescription {
+            continuous_backups_status: CONTINUOUS_BACKUPS_STATUS.to_string(),
+            point_in_time_recovery_description: Some(recovery),
+        }
+    }
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
@@ -1707,6 +1827,10 @@ pub struct Table {
     pub local_secondary_indexes: Vec<LocalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
+    /// This table's continuous-backups settings: whether point-in-time recovery is on
+    /// and for how long a period, as `UpdateContinuousBackups` left them and both
+    /// continuous-backups operations report them.
+    pub point_in_time_recovery: PointInTimeRecovery,
     /// The tags this table carries: the set `CreateTable` seeded and every later
     /// `TagResource`/`UntagResource` edited, together with the set the eventually
     /// consistent `ListTagsOfResource` can see yet (see [`ResourceTags`]).
