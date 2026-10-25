@@ -4,9 +4,13 @@
 //!
 //! Moves the persisted data store to `DELETING` — the status AWS HealthImaging answers
 //! this call with — and leaves the clock to finish the deletion
-//! ([`crate::state::DATASTORE_DELETION_DELAY`]). Once that instant passes, the record
-//! is gone: `GetDatastore` answers `ResourceNotFoundException` and `ListDatastores` no
-//! longer lists it.
+//! ([`crate::state::DATASTORE_DELETION_DELAY`]). Once that instant passes the data store
+//! is deleted and reports `DELETED`, the terminal status the model declares: the record
+//! is a tombstone, reported by `GetDatastore` and by `ListDatastores` (which is what
+//! makes the modelled `datastoreStatus=DELETED` filter select anything) and reachable by
+//! nothing else, until the clock reaps it
+//! ([`crate::state::DATASTORE_DELETED_RETENTION`]) and reads answer
+//! `ResourceNotFoundException`.
 //!
 //! The model documents a precondition — "before a data store can be deleted, you must
 //! first delete all image sets within it" — so a store that still owns image sets is

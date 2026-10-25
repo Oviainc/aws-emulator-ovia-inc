@@ -25,9 +25,21 @@
 //! that region ([`Datastore::region`]), every id-keyed handler reaches a store through
 //! [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastore_in`] with the region
 //! of the request being served ([`request_region`]), and `ListDatastores` enumerates
-//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastores_in`] — so a request
-//! addressed to another region reaches nothing and is answered exactly as it would be
-//! for an id nothing ever minted.
+//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::reported_datastores_in`] — so a
+//! request addressed to another region reaches nothing and is answered exactly as it
+//! would be for an id nothing ever minted.
+//!
+//! # A finished deletion is reported before it is forgotten
+//!
+//! `DELETED` is a status the model declares on the data store shapes and accepts as the
+//! `ListDatastores` filter, so a deletion that has landed is OBSERVABLE in it: the
+//! record survives as a tombstone for [`DATASTORE_DELETED_RETENTION`], reported by
+//! `GetDatastore` and by the listing (filtered or not), and the clock then reaps it.
+//! A tombstone is reportable and not reachable — it holds no quota slot, and every call
+//! that would act on it is answered as it is for an id nothing ever minted, which is the
+//! split between
+//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::reported_datastore_in`] and
+//! [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastore_in`].
 //!
 //! # Pixel data belongs to the image set
 //!
@@ -58,9 +70,19 @@ use crate::ops::types::{DICOMTags, ImportConfiguration};
 /// that a poll loop terminates promptly.
 pub const DATASTORE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
-/// How long after `DeleteDatastore` the data store leaves `DELETING` and is gone.
+/// How long after `DeleteDatastore` the data store leaves `DELETING` for `DELETED`.
 /// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`].
 pub const DATASTORE_DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a finished deletion stays OBSERVABLE in `DELETED` before its record is
+/// reaped and the data store is gone for good.
+///
+/// `DELETED` is a status the model declares on `DatastoreProperties` / `DatastoreSummary`
+/// and accepts as the `ListDatastores` `datastoreStatus` filter, so a finished deletion
+/// is reportable in it rather than vanishing the instant it lands. AWS publishes no
+/// duration for how long it stays reportable, so this is a chosen span, for the same
+/// reason as [`DATASTORE_ACTIVATION_DELAY`].
+pub const DATASTORE_DELETED_RETENTION: Duration = Duration::from_millis(500);
 
 /// How long after `StartDICOMImportJob` the job leaves `SUBMITTED` for `IN_PROGRESS`.
 /// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`].
@@ -117,6 +139,10 @@ pub const MAX_DATASTORES: usize = 128;
 /// alone bounds no memory, because a caller is free to address as many regions as it
 /// likes. Past this cap `CreateDatastore` is refused with the same
 /// `ServiceQuotaExceededException`.
+///
+/// This one counts RECORDS, the tombstone of a finished deletion included
+/// ([`DATASTORE_DELETED_RETENTION`]), so what this emulator holds is bounded by it even
+/// while a create/delete loop is leaving tombstones behind.
 ///
 /// No test drives this refusal: reaching it costs this many successful creates, which
 /// is minutes of wall clock in a suite. The per-region cap, which shares the one code
@@ -1199,7 +1225,10 @@ pub struct Datastore {
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
-    /// When the next status change this data store owes falls due, if any.
+    /// When the next change this data store owes falls due, if any: the move from
+    /// `CREATING` to `ACTIVE`, the move from `DELETING` to `DELETED`, or — once the
+    /// deletion has landed — the reaping of the `DELETED` record
+    /// ([`DATASTORE_DELETED_RETENTION`]).
     pub status_due_at: Option<SystemTime>,
     pub import_jobs: HashMap<String, ImportJob>,
     pub image_sets: HashMap<String, ImageSet>,
@@ -1245,29 +1274,50 @@ impl Datastore {
         self.datastore_status == DatastoreStatus::Creating
     }
 
+    /// Whether this data store's deletion has LANDED (`DELETED`), i.e. the record is a
+    /// tombstone: it still reports its properties in that status until it is reaped
+    /// ([`DATASTORE_DELETED_RETENTION`]), but it holds nothing a caller can reach and
+    /// takes part in no further work.
+    ///
+    /// What separates the two accessor families in
+    /// [`ComAmazonawsMedicalimagingAhigatewayserviceState`]: a tombstone is REPORTABLE
+    /// and not reachable.
+    pub fn is_deleted(&self) -> bool {
+        self.datastore_status == DatastoreStatus::Deleted
+    }
+
     /// Materialise every change the clock owed this data store by `now`.
     ///
-    /// Returns `false` when the deletion it owed has fallen due, i.e. the record must
-    /// be dropped from the store.
+    /// Returns `false` once the record's `DELETED` retention has run out, i.e. the
+    /// record must be dropped from the store.
     fn advance_to(&mut self, now: SystemTime) -> bool {
-        if let Some(due) = self.status_due_at {
-            if now >= due {
-                match self.datastore_status {
-                    DatastoreStatus::Creating => {
-                        self.datastore_status = DatastoreStatus::Active;
-                        // The due instant, not `now`: `updatedAt` must be stable
-                        // across reads.
-                        self.updated_at = due;
-                        self.status_due_at = None;
-                    }
-                    DatastoreStatus::Deleting => {
-                        self.datastore_status = DatastoreStatus::Deleted;
-                        self.updated_at = due;
-                        self.status_due_at = None;
-                        return false;
-                    }
-                    _ => self.status_due_at = None,
+        // A LOOP, not one step: when a request arrives long after a delete, every
+        // change the clock owed in between is already due, so the record lands on
+        // `DELETED` and is reaped within this one pass rather than lingering until the
+        // next request happens to come along.
+        while let Some(due) = self.status_due_at {
+            if now < due {
+                break;
+            }
+            match self.datastore_status {
+                DatastoreStatus::Creating => {
+                    self.datastore_status = DatastoreStatus::Active;
+                    // The due instant, not `now`: `updatedAt` must be stable
+                    // across reads.
+                    self.updated_at = due;
+                    self.status_due_at = None;
                 }
+                DatastoreStatus::Deleting => {
+                    self.datastore_status = DatastoreStatus::Deleted;
+                    self.updated_at = due;
+                    // The finished deletion is reportable in `DELETED` from the instant
+                    // it landed, and the reaping that ends that window is the next
+                    // change the clock owes — dated from the DUE instant, so neither the
+                    // window nor `updatedAt` moves with when somebody happened to read.
+                    self.status_due_at = Some(due + DATASTORE_DELETED_RETENTION);
+                }
+                DatastoreStatus::Deleted => return false,
+                _ => self.status_due_at = None,
             }
         }
         for job in self.import_jobs.values_mut() {
@@ -1341,22 +1391,56 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
     /// id-keyed read and write goes through here (or through [`Self::datastore_in_mut`]),
     /// so one rule decides reachability for all of them rather than each handler
     /// deciding for itself.
+    ///
+    /// A data store whose deletion has LANDED is not reached here: its record lives on
+    /// only to be REPORTED in `DELETED` ([`Datastore::is_deleted`]), so every call that
+    /// would act on it, or on anything it held, is answered exactly as it is for an id
+    /// nothing ever minted. Use [`Self::reported_datastore_in`] where the data store's
+    /// status is itself what the call reports.
     pub fn datastore_in(&self, region: &str, datastore_id: &str) -> Option<&Datastore> {
-        self.datastores
-            .get(datastore_id)
-            .filter(|datastore| datastore.region == region)
+        self.reported_datastore_in(region, datastore_id)
+            .filter(|datastore| !datastore.is_deleted())
     }
 
     /// [`Self::datastore_in`], for a writer.
     pub fn datastore_in_mut(&mut self, region: &str, datastore_id: &str) -> Option<&mut Datastore> {
         self.datastores
             .get_mut(datastore_id)
+            .filter(|datastore| datastore.region == region && !datastore.is_deleted())
+    }
+
+    /// The data store `datastore_id` names, as seen from `region`, INCLUDING one whose
+    /// deletion has landed and whose record has not been reaped yet — `None` when this
+    /// emulator holds no such record there.
+    ///
+    /// What an operation whose job is to REPORT a data store's status reads, so a
+    /// finished deletion is observable in `DELETED` for as long as the record survives
+    /// ([`DATASTORE_DELETED_RETENTION`]) rather than being a status no response can
+    /// carry. Everything that ACTS on a data store goes through [`Self::datastore_in`].
+    pub fn reported_datastore_in(&self, region: &str, datastore_id: &str) -> Option<&Datastore> {
+        self.datastores
+            .get(datastore_id)
             .filter(|datastore| datastore.region == region)
     }
 
-    /// Every data store `region` holds, in no particular order — what a listing in that
-    /// region enumerates, and what its quota counts.
+    /// Every data store `region` holds that work can still reach, in no particular
+    /// order — what the per-region quota counts.
+    ///
+    /// A tombstone occupies no place: a data store whose deletion has landed has given
+    /// up everything it held, so it neither takes a quota slot nor can be worked on.
     pub fn datastores_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Datastore> {
+        self.reported_datastores_in(region)
+            .filter(|datastore| !datastore.is_deleted())
+    }
+
+    /// Every data store RECORD `region` holds, in no particular order, including the
+    /// tombstones of finished deletions — the collection a listing enumerates, and the
+    /// one its `datastoreStatus` filter selects from, so a filtered and an unfiltered
+    /// listing answer about the same population.
+    pub fn reported_datastores_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a Datastore> {
         self.datastores
             .values()
             .filter(move |datastore| datastore.region == region)
@@ -1415,10 +1499,10 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
     }
 
     /// Materialise every status change the clock owed by `now`, dropping the data
-    /// stores whose deletion has fallen due — and, with them, the ledger entries that
-    /// named the data store or any of its import jobs, so a create/delete loop cannot
-    /// leave entries behind forever. Every handler calls this first, so each request
-    /// sees the state the clock already made true.
+    /// stores whose `DELETED` record the clock has reaped — and, with them, the ledger
+    /// entries that named the data store or any of its import jobs, so a create/delete
+    /// loop cannot leave entries behind forever. Every handler calls this first, so each
+    /// request sees the state the clock already made true.
     pub fn advance_clock(&mut self, now: SystemTime) {
         let mut retired: HashSet<String> = HashSet::new();
         self.datastores.retain(|_, datastore| {

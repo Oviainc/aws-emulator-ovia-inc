@@ -17,6 +17,11 @@
 //! refused, and paging cannot skip or repeat a store even when the one the token named
 //! has been deleted in the meantime.
 //!
+//! A data store whose deletion has landed is enumerated in `DELETED` for as long as its
+//! record survives ([`crate::state::DATASTORE_DELETED_RETENTION`]), and leaves the
+//! listing when the clock reaps it — so every value of the status enum, that one
+//! included, can both appear in a summary and select rows as the filter.
+//!
 //! ---
 //!
 //! # Modeled contract for `ListDatastores`
@@ -205,9 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tie — so a page boundary is stable no matter how the underlying map iterates.
         // Only the data stores of the region this request was addressed to are
         // enumerated: a data store exists in ONE region, so another region's stores are
-        // not part of this collection at all.
+        // not part of this collection at all. The collection includes a finished
+        // deletion's record for as long as it survives
+        // (`crate::state::DATASTORE_DELETED_RETENTION`), so `DELETED` is a status this
+        // listing both reports and filters by, like every other value of the enum.
         let mut ordered: Vec<&crate::state::Datastore> = store
-            .datastores_in(&region)
+            .reported_datastores_in(&region)
             .filter(|datastore| {
                 status_filter.is_none_or(|status| datastore.datastore_status == status)
             })
