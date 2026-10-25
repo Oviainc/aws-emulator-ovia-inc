@@ -151,10 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no record of this account and Region is refused rather than answered with
             // a synthesized success.
             return Err(GetOperationErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "No operation with ID {} exists in this account and Region",
-                    input.operation_id
-                )),
+                crate::state::validation(crate::state::no_operation_message(&input.operation_id)),
             )
             .into());
         };

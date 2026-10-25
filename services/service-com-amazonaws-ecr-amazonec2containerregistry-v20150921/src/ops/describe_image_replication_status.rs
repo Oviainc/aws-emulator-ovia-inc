@@ -2,14 +2,14 @@
 
 //! @op DescribeImageReplicationStatus
 //!
-//! The registry's stored replication rules are deliberately NOT turned into statuses
-//! here. A `replicationStatuses` entry reports a replication ECR really started for a
-//! destination registry; this emulator serves exactly one registry and copies no image to
-//! another Region or account, so no replication was started for any stored image however
-//! the rules are configured. `replicationStatuses` is therefore the empty list ECR answers
-//! with for an image that has no destination — a per-destination status for a copy that
-//! never ran would be an invented one. A later change that really copies images between
-//! registries is where the per-destination statuses belong.
+//! One `replicationStatuses` entry per copy the push of this image started: the registry's
+//! replication configuration decides which images are copied where, so the entries are the
+//! record `PutImage` wrote on the image (`state::ImageReplication`) and not a projection of
+//! the rules as they stand now — replication is not retroactive, so a rule stored after a
+//! push copies nothing, and an image pushed while no rule matched its repository reports the
+//! empty list ECR answers with for an image that has no destination. Each entry's status is
+//! derived from the instant the clock owes that copy its completion, so reading it changes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
+        let now = ::std::time::SystemTime::now();
         // Both the repository and the image are resolved against the store before
         // anything is projected: an unknown repository is refused with
         // `RepositoryNotFoundException`, and an identifier no stored manifest answers to
@@ -203,15 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(fault_error)?;
         let image = repo.resolve_image(&input.image_id).map_err(fault_error)?;
 
-        // One status per destination the registry's replication configuration sends this
-        // repository's images to. A status reports a replication that was really started:
-        // ECR copies the image to the destination registry and reports how that copy
-        // went. This emulator serves exactly one registry and copies nothing to another
-        // Region or account, so no replication was started for any stored image whatever
-        // the registry's replication rules say, and the list is empty — which is what ECR
-        // answers for an image with no destination. A destination status is never invented
-        // for a copy that never ran; see the module header.
-        let replication_statuses: Vec<ImageReplicationStatus> = Vec::new();
+        // One status per destination the push of this image started a copy to, each
+        // reporting where that copy has got to as of now: `IN_PROGRESS` until the clock
+        // makes its completion due, `COMPLETE` afterwards. A read derives them from the
+        // stored record, so it reports the same thing twice and writes nothing.
+        let replication_statuses: Vec<ImageReplicationStatus> = image
+            .replications
+            .iter()
+            .map(|replication| replication.to_status(now))
+            .collect();
 
         Ok(DescribeImageReplicationStatusOutput {
             repository_name: Some(repo.name.clone()),

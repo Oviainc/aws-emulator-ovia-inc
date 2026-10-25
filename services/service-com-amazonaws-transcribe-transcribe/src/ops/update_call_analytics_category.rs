@@ -178,6 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The same co-requirement the create reads on a rule's time ranges
+        // ([`crate::state::rule_time_range_error`]): the rules this request carries
+        // REPLACE the stored ones, so a half-specified segment is refused here too —
+        // and the stored rules are left as they were. Decided first, before the clock
+        // is read or the store is touched, because it is a property of the REQUEST
+        // alone: a request this operation could not serve for ANY category is refused
+        // for its own shape, so request-shape validation deliberately precedes the
+        // existence check below (both answer the same modelled error and status).
+        if let Some(message) = crate::state::rule_time_range_error(&input.rules) {
+            return Err(bad_request(&message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(record) = store
@@ -245,9 +257,9 @@ fn not_found() -> UpdateCallAnalyticsCategoryError {
 }
 
 /// A `BadRequestException` refusing a request this operation cannot serve: one naming
-/// a category this account does not hold ([`not_found`]), or one whose `InputType`
-/// contradicts the stored category's — neither of which the model's own constraint
-/// traits can express.
+/// a category this account does not hold ([`not_found`]), one whose rules bound a
+/// search with only one end of a time range, or one whose `InputType` contradicts the
+/// stored category's — none of which the model's own constraint traits can express.
 fn bad_request(message: &str) -> UpdateCallAnalyticsCategoryError {
     UpdateCallAnalyticsCategoryErrorModeled::BadRequestException(BadRequestException {
         message: Some(message.to_string()),

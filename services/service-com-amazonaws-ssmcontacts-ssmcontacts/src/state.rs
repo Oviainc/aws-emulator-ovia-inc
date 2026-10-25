@@ -202,6 +202,14 @@ pub struct EngagementRecord {
 /// response from this record, and `AcceptPage` is what stamps [`delivery_time`]/[`read_time`]
 /// and appends to [`receipts`].
 ///
+/// A record exists for every channel the plan targets from the instant the engagement starts,
+/// each stamped with the [`sent_time`] its own stage is due at, so the schedule the plan
+/// describes is persisted rather than recomputed. Ending the engagement before a stage comes
+/// due means that stage engages nobody, so the pages it would have sent are dropped:
+/// [`ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`].
+///
+/// [`sent_time`]: PageRecord::sent_time
+///
 /// [`delivery_time`]: PageRecord::delivery_time
 /// [`read_time`]: PageRecord::read_time
 /// [`receipts`]: PageRecord::receipts
@@ -359,8 +367,10 @@ pub struct ComAmazonawsSsmcontactsSsmcontactsState {
     /// name for an engagement.
     pub engagements_started: u64,
     /// Pages, keyed by `PageArn`: one per contact channel an engagement engaged.
-    /// `StartEngagement` inserts, `AcceptPage` acknowledges and `DescribePage` reports;
-    /// nothing in this service removes one, since the model has no delete for a page.
+    /// `StartEngagement` inserts, `AcceptPage` acknowledges and `DescribePage` reports; the
+    /// model has no delete for a page, so the only call that removes one is
+    /// `StopEngagement`, and only for a page whose stage the stopped engagement never
+    /// reached ([`ComAmazonawsSsmcontactsSsmcontactsState::cancel_unsent_pages_of`]).
     ///
     /// Bounded by the channels it is derived from: a start pages each targeted channel at
     /// most once, so one start mints at most as many pages as the account holds channels
@@ -618,6 +628,26 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
             }
         }
         targets
+    }
+
+    /// Drop the pages of the engagement `engagement_arn` names that had not been sent by
+    /// `stopped_at`, answering how many went — informational, since `StopEngagement` models no
+    /// response member that reports it.
+    ///
+    /// An engagement engages the stages of its plan in turn, each due at its own offset into
+    /// the engagement, so ending the engagement at an instant means the stages still ahead of
+    /// that instant are never entered and engage no contact channel at all. A page is Incident
+    /// Manager HAVING engaged a channel — `sent_time` is when it did — so a page still ahead
+    /// of the end is not a page that was sent and cancelled, it is one that never came to
+    /// exist: nothing can report it, and nothing can acknowledge it.
+    ///
+    /// Pages of OTHER engagements are untouched, however late their own stages are: each
+    /// engagement runs its plan on its own.
+    pub fn cancel_unsent_pages_of(&mut self, engagement_arn: &str, stopped_at: SystemTime) -> usize {
+        let held = self.pages.len();
+        self.pages
+            .retain(|_, page| page.engagement_arn != engagement_arn || page.sent_time <= stopped_at);
+        held - self.pages.len()
     }
 
     /// The ARN a previous call with this `(operation, token)` minted, when the resource it

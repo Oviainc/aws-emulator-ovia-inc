@@ -541,10 +541,10 @@ async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
         (
-            "an element of a list of names",
+            "an element of a list of names, which is one value of that parameter",
             "DescribeRepositories",
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
-            "repositoryNames",
+            "repositoryName",
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
         (
