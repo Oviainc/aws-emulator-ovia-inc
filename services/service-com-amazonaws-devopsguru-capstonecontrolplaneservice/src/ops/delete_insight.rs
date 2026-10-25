@@ -19,8 +19,12 @@
 //! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`]),
 //! so every anomaly whose `AssociatedInsightId` names the deleted insight goes with it
 //! and `DescribeAnomaly` then refuses it as not found. An anomaly associated with no
-//! insight, or with another one, is left alone. Events and recommendations are not held
-//! by this store, so there is nothing of them to reclaim.
+//! insight, or with another one, is left alone. The recommendations are held too
+//! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::recommendations`]),
+//! keyed by the insight they remediate, so the deleted insight's advice goes with it and
+//! `ListRecommendations` then refuses that insight as not found, while another
+//! insight's advice is left alone. Events are not held by this store, so there is
+//! nothing of them to reclaim.
 //!
 //! What it does NOT touch is the insight FEEDBACK store
 //! ([`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::insight_feedback`]):
