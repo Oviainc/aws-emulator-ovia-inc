@@ -152,7 +152,10 @@ pub(crate) fn error_code(body: &Value) -> &str {
 
 /// Percent-encode the three characters a base64 `NextToken` can carry that a
 /// query string reads differently (`+` is a space to a query reader).
-fn query_encode(token: &str) -> String {
+///
+/// Shared with the sibling suites of this test target, since `MaxResults` and
+/// `NextToken` are bound to the query string on every listing of this service.
+pub(crate) fn query_encode(token: &str) -> String {
     token
         .replace('%', "%25")
         .replace('+', "%2B")
@@ -937,9 +940,10 @@ async fn a_resource_type_filter_selects_only_the_memberships_of_that_type() {
     }
 }
 
-/// A `ListGroups` filter selects the groups whose named attribute equals one of
-/// its values; a filter this slice cannot answer is 501 rather than silently
-/// ignored.
+/// A `ListGroups` filter selects the groups whose named attribute carries one of
+/// its values; a name the model does not declare is refused rather than silently
+/// ignored. (The set-valued `configuration-type` and `resource-type` names are the
+/// sibling `list_groups_filters` suite.)
 #[tokio::test]
 async fn a_list_groups_filter_selects_the_groups_whose_attribute_it_names() {
     let emulator = Emulator::new();
@@ -986,8 +990,9 @@ async fn a_list_groups_filter_selects_the_groups_whose_attribute_it_names() {
         );
     }
 
-    // A filter over data this slice does not hold is refused, not ignored.
-    for filter_name in ["configuration-type", "resource-type"] {
+    // A name the modelled `GroupFilterName` does not declare is refused, not
+    // ignored: it names an attribute no group has.
+    for filter_name in ["group-name", "Configuration-Type"] {
         let (status, body) = emulator
             .call(
                 "/groups-list",
@@ -995,9 +1000,10 @@ async fn a_list_groups_filter_selects_the_groups_whose_attribute_it_names() {
             )
             .await;
         assert_eq!(
-            status, 501,
-            "case {filter_name:?}: expected 501 for a filter this slice cannot answer, \
-             got {status} {body}",
+            (status, error_code(&body)),
+            (400, "BadRequestException"),
+            "case {filter_name:?}: expected 400 BadRequestException for an undeclared \
+             filter name, got {status} {body}",
         );
     }
 }

@@ -624,6 +624,32 @@ impl GroupRecord {
             .find(|declared| STATIC_MEMBERSHIP_CONFIGURATION_TYPES.contains(declared))
     }
 
+    /// The service-configuration types this group's stored configuration
+    /// declares, in the order the configuration holds them.
+    ///
+    /// A configuration is one document made of `GroupConfigurationItem`s, each
+    /// declaring one `GroupConfigurationType`, so a group has as many
+    /// configuration types as it has items. A group created with a resource
+    /// query, or with neither, declares none.
+    pub fn configuration_types(&self) -> impl Iterator<Item = &str> {
+        self.configuration
+            .iter()
+            .flatten()
+            .map(|item| item.r#type.as_str())
+    }
+
+    /// The resource types this group's stored resource query limits itself to,
+    /// or none for a group created without a query.
+    ///
+    /// See [`ResourceQueryRecord::resource_type_filters`] for where they are read
+    /// from.
+    pub fn query_resource_types(&self) -> Vec<String> {
+        self.resource_query
+            .as_ref()
+            .map(ResourceQueryRecord::resource_type_filters)
+            .unwrap_or_default()
+    }
+
     /// The modelled `ResourceQuery` for this record, if it was created with one.
     pub fn to_resource_query(&self) -> Option<ResourceQuery> {
         self.resource_query.as_ref().map(|q| ResourceQuery {
@@ -986,6 +1012,40 @@ pub struct ResourceQueryRecord {
     pub query_type: String,
     /// The query document, stored verbatim as the caller sent it.
     pub query: String,
+}
+
+/// The element of a query document that carries the resource types the query is
+/// limited to.
+///
+/// The model documents it as applying "to all `ResourceQuery` objects of either
+/// `Type`", holding either `AWS::AllSupported` or a JSON array of resource type
+/// identifiers (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`),
+/// so it is read the same way whatever the query's type.
+pub const RESOURCE_TYPE_FILTERS_ELEMENT: &str = "ResourceTypeFilters";
+
+impl ResourceQueryRecord {
+    /// The resource types this query is limited to: the string entries of its
+    /// [`RESOURCE_TYPE_FILTERS_ELEMENT`], in the order the document holds them.
+    ///
+    /// Read out of the stored document rather than from a second copy of it, so
+    /// a reader sees exactly the types the query was created with; the document
+    /// is a modelled `Query` (`length 0..4096`), so one read is bounded. A query
+    /// whose document holds no such element, holds a non-string entry, or is not
+    /// a JSON object at all is limited to nothing, and a document that spells the
+    /// element as a single string carries that one type.
+    pub fn resource_type_filters(&self) -> Vec<String> {
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&self.query) else {
+            return Vec::new();
+        };
+        match document.get(RESOURCE_TYPE_FILTERS_ELEMENT) {
+            Some(serde_json::Value::String(one)) => vec![one.clone()],
+            Some(serde_json::Value::Array(entries)) => entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// One static membership: a resource ARN added to a group by `GroupResources`.
