@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAcmeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAcmeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored ACME endpoint its `AcmeEndpointArn` identifies, and
+//! with it everything that exists only on that endpoint — the ACME accounts registered
+//! with it and the domain validations it holds ("any existing external account bindings
+//! and domain validations associated with the endpoint are also deleted") — so the
+//! endpoint's published URL serves nothing afterwards and every ARN under it answers to
+//! no record. Answers an empty body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAcmeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN that names ANOTHER account is `ValidationException`: a caller addresses only
+//! their own account's resources, so such an ARN is a verdict on the request rather than
+//! a lookup. An ARN of this account that no record answers to is already in the state
+//! this call asks for — the operation is `@idempotent` and its model declares no
+//! not-found error — so the call answers success and writes nothing. The endpoint's own
+//! status does not gate the delete (see the note in [`DeleteAcmeEndpoint::handle`]): an
+//! endpoint the caller is discarding mid-create, or one that is tearing down or failed,
+//! has nothing to wait for, which is what this operation's `ConflictException` would be
+//! telling a caller to do.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +173,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAcmeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAcmeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // No request metadata is needed: the `AcmeEndpointArn` the request names carries
+        // the Region and the account the endpoint was minted under, so the record is
+        // found by ARN alone — as in `DescribeAcmeEndpoint`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(DeleteAcmeEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the acm acme endpoint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The account segment of the ARN is INPUT this operation validates: a caller
+        // addresses only their own account's resources, so an ARN carrying another
+        // account's id names nothing they could delete. Decided before the store is
+        // consulted at all.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(DeleteAcmeEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::cross_account_arn_refusal(
+                        crate::state::ACME_ENDPOINT_RESOURCE_TYPE,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes, so the deletion acts on the endpoint as it stands now.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+        // Whatever status the endpoint carries, this call removes it, and the record goes
+        // with its accounts and its domain validations
+        // ([`crate::state::ComAmazonawsAcmCertificatemanagerState::remove_acme_endpoint`]).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAcmeEndpoint"))
+        // The status does not gate the delete the way it gates `UpdateAcmeEndpoint`,
+        // because the two calls ask for different things. An update asks the service to
+        // apply a configuration to an endpoint it is still standing up, which is the
+        // "resource or configuration that is already being created or updated" this
+        // operation's `ConflictException` names — the caller is told to wait and try again,
+        // and waiting makes the update possible. A delete asks for the endpoint to stop
+        // existing: a `CREATING` endpoint is one the caller is discarding before it ever
+        // served, and a `DELETING` or `FAILED` one has nothing left to wait for, so
+        // refusing those would leave a record no call could ever remove. The caller's own
+        // retry cannot change the answer either, since the endpoint is gone the first time.
+        //
+        // An ARN no record answers to leaves the store untouched and is a success: the
+        // endpoint is already gone, which is the state this `@idempotent` call asks for.
+        store.remove_acme_endpoint(&input.acme_endpoint_arn);
+
+        Ok(DeleteAcmeEndpointOutput)
     }
 }
