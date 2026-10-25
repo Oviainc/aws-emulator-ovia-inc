@@ -184,6 +184,12 @@ mod sagemaker_feature_store_control_plane_handoff;
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_role_id_agrees_with_sts.rs"]
 mod iam_role_id_agrees_with_sts;
+// Declared beside the role-side suite it is the counterpart of, in the sorted list rather
+// than appended at the end of this file: the tail is where every concurrently landing
+// router suite puts its line, so a declaration there conflicts with all of them, while
+// these neighbouring lines are stable.
+#[path = "all/iam_access_key_signs_as_its_user.rs"]
+mod iam_access_key_signs_as_its_user;
 #[path = "all/iam_signing_name_routing.rs"]
 mod iam_signing_name_routing;
 #[path = "all/iot_command_execution_lifecycle.rs"]
