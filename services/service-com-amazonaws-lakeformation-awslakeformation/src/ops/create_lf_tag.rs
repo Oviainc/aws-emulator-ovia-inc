@@ -167,11 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tag_values = crate::state::dedup_values(&input.tag_values);
 
         let mut store = state.lock();
-        if store
-            .lf_tags
-            .get(&catalog_id)
-            .is_some_and(|catalog| catalog.contains_key(&input.tag_key))
-        {
+        if store.holds_lf_tag(&catalog_id, &input.tag_key) {
             return Err(CreateLFTagErrorModeled::InvalidInputException(InvalidInputException {
                 message: Some(format!(
                     "Tag key {} already exists in catalog {catalog_id}",
