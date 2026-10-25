@@ -205,21 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| model_not_found(&input.asset_model_id))?;
 
         // `assetModelVersion` selects the LATEST (the default) or the ACTIVE
-        // version. This emulator keeps ONE version of an asset model, so ACTIVE
-        // resolves to it once the transition the clock owes has fallen due, and to
-        // nothing while the model is still CREATING or UPDATING.
-        let version = input.asset_model_version.as_deref().unwrap_or("LATEST");
-        if version == "ACTIVE" && record.state(now) != crate::state::STATE_ACTIVE {
-            return Err(DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: format!(
-                        "The asset model {asset_model_id} has no ACTIVE version yet; it is {}.",
-                        record.state(now)
-                    ),
-                },
-            )
-            .into());
-        }
+        // version of the model whose composite model this reads: those are
+        // DIFFERENT definitions while a write the model already accepted is still
+        // settling. The selector is resolved on the record, so this read and the
+        // reads of the model itself answer from the same version, and a version
+        // the model does not have — one still being created has no active version
+        // — is the modelled 404.
+        let record = record
+            .version_view(input.asset_model_version.as_deref(), now)
+            .ok_or_else(|| no_active_version(&asset_model_id, record.state(now)))?;
+        let record = &*record;
 
         let composite_model_id = record
             .resolve_composite_model_id(&input.asset_model_composite_model_id)
@@ -273,6 +268,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action_definitions: None,
         })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a read scoped to the ACTIVE version
+/// of a model that has none, in this service's one wording for that absence.
+fn no_active_version(
+    asset_model_id: &str,
+    state: &str,
+) -> DescribeAssetModelCompositeModelError {
+    DescribeAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::no_active_version_message(asset_model_id, state),
+        },
+    )
+    .into()
 }
 
 /// HTTP 404 `ResourceNotFoundException` naming the asset model label that
