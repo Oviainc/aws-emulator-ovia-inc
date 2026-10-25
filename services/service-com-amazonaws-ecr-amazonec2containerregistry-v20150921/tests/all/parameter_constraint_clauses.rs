@@ -127,6 +127,14 @@ async fn an_unrecognised_account_setting_name_states_a_constraint_the_model_decl
 const REPOSITORY_NAME_EXPRESSION: &str =
     r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
+/// `PullThroughCacheRuleRepositoryPrefix`'s `@pattern` as ECR'S OWN validation publishes
+/// it, by the same two rules as [`REPOSITORY_NAME_EXPRESSION`].
+///
+/// `smithy_query(query="shape", shape="PullThroughCacheRuleRepositoryPrefix")` gives
+/// `^([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*\/?|ROOT)$`.
+const PREFIX_EXPRESSION: &str =
+    r"([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*/?|ROOT)";
+
 /// `SigningRepositoryFilterValue`'s `@pattern` as THE MODEL declares it — anchors
 /// included, because the model-driven walk states the expression it was given.
 ///
@@ -190,10 +198,10 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
             "The principal ARN 'not-an-arn' must be well formed".to_string(),
         ),
         (
-            "an element of a top-level list, which is a value of that parameter",
+            "an element of a top-level list, which is one value of that parameter",
             "DescribeRepositories",
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
-            "repositoryNames".to_string(),
+            "repositoryName".to_string(),
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
         (
@@ -299,6 +307,31 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
             }),
             "imageTagMutabilityExclusionFilters.1.member.filter".to_string(),
             format!("Member must satisfy regular expression pattern: {EXCLUSION_FILTER_PATTERN}"),
+        ),
+        (
+            // The same element rule reached through another operation and another list of
+            // names, so the singular is the rule rather than one operation's wording.
+            "an element of another operation's name list",
+            "BatchGetRepositoryScanningConfiguration",
+            json!({"repositoryNames": ["well-formed", "Also-Upper"]}),
+            "repositoryName".to_string(),
+            format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
+        ),
+        (
+            // A collection whose name is the `-es` plural of its parameter, so undoing the
+            // plural is more than dropping an `s`.
+            "an element of a list whose name takes the -es plural",
+            "DescribePullThroughCacheRules",
+            json!({"ecrRepositoryPrefixes": ["Not A Prefix"]}),
+            "ecrRepositoryPrefix".to_string(),
+            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
+        ),
+        (
+            "an element of the shortest such list name",
+            "DescribeRepositoryCreationTemplates",
+            json!({"prefixes": ["Not A Prefix"]}),
+            "prefix".to_string(),
+            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
         ),
     ];
 

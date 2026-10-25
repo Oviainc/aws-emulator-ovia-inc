@@ -442,10 +442,12 @@ async fn a_read_reports_the_time_period_the_caller_sent_or_the_service_defaulted
     // defaulted. Rows differ along which half that is.
     let supplied: [(&str, Value, Option<i64>, Option<i64>); 3] = [
         (
+            // The end date is ahead of now: a budget past its `TimePeriod$End` is deleted
+            // (`tests/all/budget_end_date_expiry.rs`), so there would be nothing to read.
             "both halves supplied",
-            json!({"Start": 1_704_067_200, "End": 1_767_225_600}),
+            json!({"Start": 1_704_067_200, "End": 2_556_144_000_i64}),
             Some(1_704_067_200),
-            Some(1_767_225_600),
+            Some(2_556_144_000),
         ),
         (
             "only Start supplied",

@@ -45,6 +45,8 @@ mod instance_onboarding;
 mod instance_onboarding_tags_and_outbound_requests;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
+#[path = "all/outbound_request_expiration.rs"]
+mod outbound_request_expiration;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

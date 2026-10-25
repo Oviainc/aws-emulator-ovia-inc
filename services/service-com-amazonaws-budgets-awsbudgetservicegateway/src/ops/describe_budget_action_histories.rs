@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        let mut store = crate::state::store_at(&state, now);
         // The lookup materialises any settle the clock had already made due, so the
         // history this read reports holds the system-generated record of that status
         // change too — a history whose newest record is a status the action no longer

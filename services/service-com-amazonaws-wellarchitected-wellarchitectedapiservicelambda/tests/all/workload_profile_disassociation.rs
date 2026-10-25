@@ -14,9 +14,10 @@
 //! one the service handed out, and the association each row starts from is made over HTTP by
 //! `AssociateProfiles` wherever that operation can produce it. An association pinned at a
 //! version OTHER than the one the profile is at is not reachable over HTTP — associating
-//! pins the profile's current version and `UpgradeProfileVersion` is still a stub with its
-//! own issue — so those rows seed it through the shared state, exactly as this crate's
-//! suites seed a stored answer or a workload share whose writer is still a stub.
+//! pins the profile's current version, and `UpgradeProfileVersion` moves an association to
+//! the version its profile is at rather than to an arbitrary one — so those rows seed it
+//! through the shared state, exactly as this crate's suites seed a stored answer or a
+//! workload share whose writer is still a stub.
 //!
 //! Everything asserted crosses the HTTP boundary: requests go through the real
 //! `MultiServiceRouter`, so routing, restJson1 (de)serialization, boundary constraint
@@ -78,10 +79,10 @@ async fn disassociate_profiles(client: &Client, workload_id: &str, body: Value) 
 /// Over HTTP through `AssociateProfiles` when the version asked for is the one the profile
 /// is at, which is the version associating pins (`super::workload_profile_association`
 /// covers that operation itself). An association pinned at any OTHER version is reachable
-/// only by seeding the shared state — `UpgradeProfileVersion`, which moves a workload to a
-/// later version, is still a stub with its own issue — exactly as this crate's suites seed a
-/// stored answer whose writer is a stub. The operation under test and the `GetWorkload` that
-/// reads the result back both cross the HTTP boundary either way.
+/// only by seeding the shared state — `UpgradeProfileVersion` moves a workload to the
+/// version its profile is at, not to an arbitrary one — exactly as this crate's suites seed
+/// a stored answer whose writer is a stub. The operation under test and the `GetWorkload`
+/// that reads the result back both cross the HTTP boundary either way.
 async fn associate_profile(
     client: &Client,
     workload_id: &str,
@@ -132,8 +133,9 @@ async fn disassociate_profiles_removes_every_named_association() {
     // (`smithy_query(query="shape", shape="ProfileVersion")`), so the versions the rows
     // pin an association at span that form — the version the service itself minted, a
     // dashed spelling and the longest the model allows — rather than one spelling of it.
-    // A version other than the minted one is reachable only by seeding, because
-    // `UpgradeProfileVersion` is still a stub with its own issue.
+    // A version other than the minted one is pinned by seeding here: `UpgradeProfileVersion`
+    // moves an association to the version its PROFILE is at, which is not how a row reaches
+    // an arbitrary one.
     let rows = [
         RemovalCase {
             case: "one ARN, the version CreateProfile put the profile at",
