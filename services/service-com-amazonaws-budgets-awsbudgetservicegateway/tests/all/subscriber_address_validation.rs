@@ -22,7 +22,7 @@
 //! and subdomains, partitions, a Region-less ARN, a topic name with a suffix), and both
 //! are driven through EVERY write that establishes a subscriber: `CreateBudget`'s
 //! `NotificationsWithSubscribers`, `CreateNotification`, `CreateSubscriber`,
-//! `CreateBudgetAction` and `UpdateBudgetAction`.
+//! `UpdateSubscriber`, `CreateBudgetAction` and `UpdateBudgetAction`.
 
 use std::sync::Arc;
 
@@ -356,6 +356,22 @@ async fn a_notification_write_refuses_an_address_its_type_does_not_name() {
                 "BudgetName": budget_name,
                 "Notification": &seeded,
                 "Subscriber": &row.subscriber
+            }),
+        )
+        .await;
+        assert_refused(case, &address, status, &body);
+
+        // `UpdateSubscriber`, which establishes the subscriber it puts in the old one's
+        // place: the notification keeps the subscriber it held.
+        let (status, body) = call(
+            &router,
+            "UpdateSubscriber",
+            &json!({
+                "AccountId": &account_id,
+                "BudgetName": budget_name,
+                "Notification": &seeded,
+                "OldSubscriber": seed_subscriber(),
+                "NewSubscriber": &row.subscriber
             }),
         )
         .await;

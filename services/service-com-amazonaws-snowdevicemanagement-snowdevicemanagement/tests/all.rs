@@ -39,6 +39,8 @@ mod empty_inventory_refusals;
 mod list_tasks_empty_page;
 #[path = "all/one_execution_per_device.rs"]
 mod one_execution_per_device;
+#[path = "all/pagination_cursor_binding.rs"]
+mod pagination_cursor_binding;
 #[path = "all/region_gate_error_envelope.rs"]
 mod region_gate_error_envelope;
 #[path = "all/resource_tag_removal.rs"]

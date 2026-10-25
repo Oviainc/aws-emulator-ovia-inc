@@ -240,6 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .queues
             .get_mut(&name)
             .expect("the queue was resolved out of this same store");
+        // The pair rule is judged over the set this call would LEAVE the queue carrying:
+        // either attribute of such a pair may come from this request or from the queue.
+        let mut would_carry = queue.attributes.clone();
+        for (attribute, value) in &input.attributes {
+            would_carry.insert(attribute.clone(), value.clone());
+        }
+        if let Some(error) = state::attribute_combination_refusal(&would_carry) {
+            return Err(SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into());
+        }
+
         for (attribute, value) in &input.attributes {
             queue.attributes.insert(attribute.clone(), value.clone());
         }

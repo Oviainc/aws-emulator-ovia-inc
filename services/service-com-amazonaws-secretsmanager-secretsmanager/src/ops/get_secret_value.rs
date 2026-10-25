@@ -2,8 +2,10 @@
 
 //! @op GetSecretValue
 //! Returns a stored secret version's value. The version is named by `VersionId`,
-//! or by `VersionStage` (`AWSCURRENT` when the caller names neither). A read: it
-//! does not change what a later caller sees.
+//! or by `VersionStage` (`AWSCURRENT` when the caller names neither). It changes
+//! no value and moves no staging label; the one thing it records is the
+//! retrieval itself, the access `LastAccessedDate` reports ("This field is
+//! omitted if the secret has never been retrieved in the Region").
 //!
 //! ## Shape of an operation
 //!
@@ -196,10 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();
-        // The only write a read performs: dropping secrets whose recovery window
-        // has already elapsed, which the clock made due whether or not anybody
-        // called.
-        store.expire_due(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        // Dropping secrets whose recovery window has already elapsed, which the
+        // clock made due whether or not anybody called.
+        store.expire_due(now);
 
         let Some(secret) = store.get(&input.secret_id) else {
             return Err(no_such_secret());
@@ -242,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(GetSecretValueOutput {
+        let answer = GetSecretValueOutput {
             arn: Some(secret.arn.clone()),
             name: Some(secret.name.clone()),
             version_id: Some(version.version_id.clone()),
@@ -250,7 +252,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             secret_string: version.secret_string.clone(),
             version_stages: version.stages_out(),
             created_date: Some(crate::state::timestamp(version.created_date)),
-        })
+        };
+
+        // This call retrieved the version's value, which is what
+        // `LastAccessedDate` reports: "This field is omitted if the secret has
+        // never been retrieved in the Region."
+        // (`DescribeSecretResponse$LastAccessedDate`, this service's Smithy
+        // model.) Nothing else about the secret moves — see
+        // `state::Secret::record_access`.
+        let read = version.version_id.clone();
+        if let Some(secret) = store.get_mut(&input.secret_id) {
+            secret.record_access(&read, now);
+        }
+        Ok(answer)
     }
 }
 

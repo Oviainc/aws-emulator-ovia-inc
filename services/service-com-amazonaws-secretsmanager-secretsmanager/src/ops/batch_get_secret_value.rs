@@ -290,10 +290,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut values = Vec::new();
         let mut errors = Vec::new();
+        let mut retrieved: Vec<(String, String)> = Vec::new();
         for secret_id in selected.iter().skip(start).take(page_size) {
             match entry_for(&store, secret_id) {
-                Ok(entry) => values.push(entry),
+                Ok(entry) => {
+                    if let Some(version_id) = entry.version_id.clone() {
+                        retrieved.push((secret_id.clone(), version_id));
+                    }
+                    values.push(entry);
+                }
                 Err(error) => errors.push(error),
+            }
+        }
+        // Every entry this call answered retrieved that secret's current value,
+        // which is what `LastAccessedDate` reports: "This field is omitted if
+        // the secret has never been retrieved in the Region."
+        // (`DescribeSecretResponse$LastAccessedDate`, this service's Smithy
+        // model.) See `state::Secret::record_access`.
+        for (secret_id, version_id) in retrieved {
+            if let Some(secret) = store.get_mut(&secret_id) {
+                secret.record_access(&version_id, now);
             }
         }
         let next_token = selected

@@ -4,7 +4,9 @@
 //! Enumerates the managed-device inventory held in state for the signed Region as
 //! `DeviceSummary`, in `managedDeviceId` order, narrowed to one `jobId` when the
 //! request names one: `@paginated(items: devices)`, so a page is cut at
-//! `maxResults` and `nextToken` carries the device id the next page resumes at.
+//! `maxResults` and `nextToken` is an opaque cursor — bound to this operation, the
+//! signed Region and the `jobId` filter the page was served under — naming where the
+//! next page resumes.
 //! A Region this account has activated no device in is refused by the account/region
 //! device precondition (`AccessDeniedException`, HTTP 403) before any filter is
 //! looked at.
@@ -176,19 +178,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The token carries the device id the next page resumes at; a value this
-        // service never issued is refused rather than silently serving page one.
+        // The token is an opaque cursor this operation minted for THIS enumeration:
+        // the signed Region's inventory, narrowed by the `jobId` the previous page was
+        // served under. A value this service never issued — and one it issued for
+        // another operation, Region or filter — names no position here and is refused
+        // rather than reinterpreted as a resume key.
+        let cursor = crate::state::CursorScope {
+            operation: Self::NAME,
+            region: &region,
+            filters: &[input.job_id.as_deref()],
+        };
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_token(token) {
+            Some(token) => match crate::state::decode_token(token, &cursor) {
                 Some(key) => Some(key),
                 None => {
                     return Err(ListDevicesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token:?} is not a token returned by ListDevices"
-                            ),
-                        },
+                        crate::state::invalid_next_token(Self::NAME),
                     )
                     .into())
                 }
@@ -221,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if devices.len() == page_size {
-                next_token = Some(crate::state::encode_token(managed_device_id));
+                next_token = Some(crate::state::encode_token(&cursor, managed_device_id));
                 break;
             }
             devices.push(device.to_summary());
