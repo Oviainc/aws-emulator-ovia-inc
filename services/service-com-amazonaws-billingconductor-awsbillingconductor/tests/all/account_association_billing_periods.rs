@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// The month arithmetic over a `BillingPeriod` this crate's period-scoped suites
 /// share (`tests/all/pricing_rule_association_periods.rs`), so one ordering rule
 /// serves every one of them.
-use crate::pricing_rule_association_periods::shift_period;
+use crate::pricing_rule_association_periods::{period_start_millis, shift_period};
 
 /// The billing period the service calls current, read from the same clock it answers
 /// from so an expectation holds whatever month the suite runs in.
@@ -178,6 +178,23 @@ impl Emulator {
         );
     }
 
+    /// Backdate `group`'s creation to `period`, as if the creating call had been made in
+    /// that billing period — the setup a row needs because a billing group is reported
+    /// only for the periods from the one it was created in onward
+    /// (`tests/all/billing_group_billing_periods.rs` owns that rule), so the group a row
+    /// reads the per-period membership of has to exist in every period it reads.
+    fn group_created_in(&self, group: &str, period: &str) {
+        let at = period_start_millis(period);
+        let state = self.engine.state::<BillingConductorState>();
+        let mut state = state.lock();
+        let record = state
+            .billing_groups
+            .get_mut(group)
+            .expect("setup group_created_in: the group was created above");
+        record.creation_time_millis = at;
+        record.last_modified_time_millis = at;
+    }
+
     /// Backdate one account's stored membership to the half-open period range
     /// `[start, end)`, as if the associating call had been made in `start` and the
     /// membership had ended in `end` — the world no request can ask for, since a call
@@ -296,6 +313,9 @@ async fn a_standing_membership_is_reported_from_the_period_it_began_in_onward() 
             .await;
         em.associate(&group, &[account.as_str()]).await;
         em.membership_ran(&account, start, None);
+        // The group has to exist in every period this row reads, since a read reports a
+        // group only for the periods from the one it was created in onward.
+        em.group_created_in(&group, &shift_period(start, -13));
 
         // Rows differ along the period the read asks about: a year before, the month
         // before, the start itself, the month after and a year after.
@@ -392,6 +412,9 @@ async fn a_membership_that_ended_covers_the_periods_it_ran_for_and_no_other() {
         em.associate(&group, &[account.as_str()]).await;
         let end = shift_period(start, months);
         em.membership_ran(&account, start, Some(&end));
+        // The group has to exist in every period this row reads — see
+        // [`Emulator::group_created_in`].
+        em.group_created_in(&group, &shift_period(start, -1));
 
         // Rows differ along where in or out of the range the read falls: before the
         // start, the start, the last period the membership covers, the period it ended
@@ -443,6 +466,9 @@ async fn a_membership_ended_by_a_release_or_a_delete_still_covers_its_own_period
         // The membership began a year ago, which only the store can say.
         let start = shift_period(&now, -12);
         em.membership_ran(&account, &start, None);
+        // The group has to exist in every period this row reads — see
+        // [`Emulator::group_created_in`].
+        em.group_created_in(&group, &shift_period(&start, -1));
         match *how {
             "disassociated" => em.disassociate(&group, &[account.as_str()]).await,
             "group deleted" => em.delete_group(&group).await,
