@@ -408,6 +408,16 @@ fn calls_naming(created: &Created) -> Vec<Call> {
                 "LineItems": [{ "CatalogItemId": "OR-ABCDEFG", "Quantity": 1 }],
             })),
         ));
+        calls.push(Call::new(
+            format!("CreateRenewal for {outpost}"),
+            "POST",
+            "/renewals".to_string(),
+            Some(json!({
+                "OutpostIdentifier": outpost,
+                "PaymentOption": "ALL_UPFRONT",
+                "PaymentTerm": "ONE_YEAR",
+            })),
+        ));
     }
     calls.push(Call::new(
         format!("GetQuote {}", created.quote_id),
