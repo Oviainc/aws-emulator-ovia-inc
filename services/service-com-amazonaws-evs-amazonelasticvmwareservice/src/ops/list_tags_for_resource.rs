@@ -5,7 +5,10 @@
 //! `CreateEnvironment` was given plus every later `TagResource`/`UntagResource`. An
 //! ARN this service holds no environment for is a `ResourceNotFoundException` — the
 //! tagging surface's own, answered with HTTP 400 and carrying the request's
-//! `resourceArn` (see `crate::scaffolded`).
+//! `resourceArn` (see `crate::scaffolded`). An environment is a REGIONAL resource that
+//! stops existing once it reaches `DELETED`, so the ARN resolves only to a live
+//! environment of the Region the request was signed for; any other ARN names no
+//! resource of this endpoint and draws that same refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "The Amazon EVS environment store is unavailable.".to_string(),
             })
         })?;
+        let region = crate::state::request_region(ctx.parts());
         // Authorization first: AWS decides it at the IAM layer, BEFORE the resource the
         // request names is evaluated. This surface addresses the resource by ARN, so the
         // ARN the decision is made against is the one the request gave.
@@ -156,10 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        let state = state.lock();
+        let mut state = state.lock();
+        // Reporting only: this materialises the state change the clock already owed
+        // these environments, which was due whether or not anybody read them.
+        state.materialise_due_transitions();
 
+        // The ARN is resolved against the Region the request was signed for, and only
+        // to an environment that still exists: a resource of another Region's endpoint
+        // and one that has reached `DELETED` are both gone for addressing purposes.
         let environment = state
-            .environment_by_arn(&input.resource_arn)
+            .environment_by_arn(&region, &input.resource_arn)
+            .filter(|environment| environment.state != crate::state::STATE_DELETED)
             .ok_or_else(|| {
                 // The tagging surface's own not-found refusal: HTTP 400, the fixed
                 // resource-agnostic message, and the request's `resourceArn` echoed.

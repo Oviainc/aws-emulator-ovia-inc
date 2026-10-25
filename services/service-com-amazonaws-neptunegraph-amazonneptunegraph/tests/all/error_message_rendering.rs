@@ -14,6 +14,11 @@
 //!    reports the account the lookup resolved in as well as the identifier requested.
 //!    The rows span every operation that resolves a `graphIdentifier` and several
 //!    well-formed identifiers.
+//! 3. That account-scoped wording names the KIND of resource that was looked for, spelled
+//!    the same way in the identifier clause as in the opening clause, for every
+//!    account-scoped namespace this service resolves in — not just graphs. The rows span
+//!    every resource kind, each of its implemented lookups, and several well-formed
+//!    identifiers per kind.
 
 use std::sync::Arc;
 
@@ -425,5 +430,161 @@ async fn a_missing_graph_is_reported_against_the_account_and_the_requested_id() 
         (listed_status, listed["graphs"].as_array().map(Vec::len)),
         (200, Some(1)),
         "the stored graph must still be listed, got {listed_status}: {listed}"
+    );
+}
+
+/// One implemented lookup of a resource kind: the operation, its HTTP method, its path
+/// template (with `{id}` where the identifier goes) and the body it needs.
+type Lookup = (&'static str, &'static str, &'static str, Option<Value>);
+
+/// One account-scoped resource kind: the kind as the service names it, the kind of
+/// identifier it is addressed by, the lookups that resolve it, and identifiers that name
+/// nothing.
+type ResourceClass = (&'static str, &'static str, Vec<Lookup>, Vec<String>);
+
+/// Every account-scoped lookup words "this account holds no such resource" the same way,
+/// and names the KIND of resource it searched for in both clauses of that wording.
+///
+/// The table spans what the rule generalises over: the resource kind (graph, snapshot,
+/// import task, export task, and a resource addressed by ARN), the operation that
+/// resolves it (read and delete/cancel, GET, DELETE and POST), and the identifier value
+/// (the extremes of each id space, plus a mixed one, and for an ARN a changed resource
+/// type, resource id and partition).
+#[tokio::test]
+async fn every_missing_resource_is_reported_with_its_own_resource_kind() {
+    let router = emulator();
+
+    // A stored graph, so no lookup below is answered out of an empty store.
+    let (created_status, created) = call(
+        &router,
+        "POST",
+        "/graphs",
+        Some(json!({"graphName": "kinds-graph", "provisionedMemory": 16})),
+    )
+    .await;
+    assert_eq!(
+        created_status, 201,
+        "the fixture graph must be created, got {created_status}: {created}"
+    );
+
+    // The one canonical emulator account every request is served for — read from the
+    // framework rather than written out.
+    let account = engine::emulator_account_id();
+
+    // Well-formed identifiers that name nothing: the extremes of each id space and a
+    // mixed value, per the modelled patterns `^g-[a-z0-9]{10}$` (`GraphIdentifier`),
+    // `^gs-[a-z0-9]{10}$` (`SnapshotIdentifier`), `^t-[a-z0-9]{10}$` (`TaskId` /
+    // `ExportTaskId`) and `^arn:.+$` (`Arn`).
+    let graph_ids = ["g-0000000000", "g-a1b2c3d4e5", "g-zzzzzzzzzz"];
+    let snapshot_ids = ["gs-0000000000", "gs-a1b2c3d4e5", "gs-zzzzzzzzzz"];
+    let task_ids = ["t-0000000000", "t-a1b2c3d4e5", "t-zzzzzzzzzz"];
+    // `Arn` constrains only the `arn:` prefix, so these are well formed. Each is written
+    // with a colon in front of the resource id rather than a slash, so the whole ARN fits
+    // the one NON-greedy `{resourceArn}` label (`/tags/{resourceArn}`) as a single path
+    // segment. The rows differ in the resource type, the resource id and the partition.
+    let absent_arns = [
+        format!("arn:aws:neptune-graph:{REGION}:{account}:graph:g-0000000000"),
+        format!("arn:aws:neptune-graph:{REGION}:{account}:graph-snapshot:gs-0123456789"),
+        format!("arn:aws-cn:neptune-graph:cn-north-1:{account}:graph:g-a1b2c3d4e5"),
+    ];
+
+    // (resource kind as the service names it, the kind of identifier it is addressed by,
+    // the implemented lookups that resolve it, the identifiers that name nothing)
+    let classes: Vec<ResourceClass> = vec![
+        (
+            "graph",
+            "id",
+            vec![
+                ("GetGraph", "GET", "/graphs/{id}", None),
+                (
+                    "UpdateGraph",
+                    "PATCH",
+                    "/graphs/{id}",
+                    Some(json!({"provisionedMemory": 32})),
+                ),
+                (
+                    "DeleteGraph",
+                    "DELETE",
+                    "/graphs/{id}?skipSnapshot=true",
+                    None,
+                ),
+            ],
+            graph_ids.iter().map(|id| (*id).to_string()).collect(),
+        ),
+        (
+            "snapshot",
+            "id",
+            vec![("GetGraphSnapshot", "GET", "/snapshots/{id}", None)],
+            snapshot_ids.iter().map(|id| (*id).to_string()).collect(),
+        ),
+        (
+            "import task",
+            "id",
+            vec![
+                ("GetImportTask", "GET", "/importtasks/{id}", None),
+                ("CancelImportTask", "DELETE", "/importtasks/{id}", None),
+            ],
+            task_ids.iter().map(|id| (*id).to_string()).collect(),
+        ),
+        (
+            "export task",
+            "id",
+            vec![
+                ("GetExportTask", "GET", "/exporttasks/{id}", None),
+                ("CancelExportTask", "DELETE", "/exporttasks/{id}", None),
+            ],
+            task_ids.iter().map(|id| (*id).to_string()).collect(),
+        ),
+        (
+            "resource",
+            "arn",
+            vec![
+                ("ListTagsForResource", "GET", "/tags/{id}", None),
+                (
+                    "TagResource",
+                    "POST",
+                    "/tags/{id}",
+                    Some(json!({"tags": {"owner": "tests"}})),
+                ),
+            ],
+            absent_arns.to_vec(),
+        ),
+    ];
+
+    for (resource, identifier_kind, operations, identifiers) in classes {
+        for (operation, method, template, body) in operations {
+            for identifier in &identifiers {
+                let case = format!("{operation} for {identifier}");
+                let path = template.replace("{id}", identifier);
+                let (status, answer) = call(&router, method, &path, body.clone()).await;
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: expected 404, got {status}: {answer}"
+                );
+                assert_eq!(
+                    error_code(&answer),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException, got {answer}"
+                );
+                let actual = message(&answer);
+                let expected = format!(
+                    "No {resource} found for customer [{account}] with {resource} \
+                     {identifier_kind} [{identifier}]"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: expected {expected:?}, got {actual:?}"
+                );
+            }
+        }
+    }
+
+    // The resource that IS stored still reads back, so the wording above did not come
+    // from a lookup that stopped finding anything.
+    let (read_status, read) = call(&router, "GET", "/graphs", None).await;
+    assert_eq!(
+        (read_status, read["graphs"].as_array().map(Vec::len)),
+        (200, Some(1)),
+        "the stored graph must still be listed, got {read_status}: {read}"
     );
 }
