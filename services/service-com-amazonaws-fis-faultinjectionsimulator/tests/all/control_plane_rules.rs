@@ -996,10 +996,7 @@ fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they
             );
             if expected == expected_terminal {
                 assert!(
-                    settled
-                        .reason
-                        .as_deref()
-                        .is_some_and(|reason| !reason.is_empty()),
+                    !settled.reason.is_empty(),
                     "case {case:?}: an experiment that ended says why, got {:?}",
                     settled.reason
                 );

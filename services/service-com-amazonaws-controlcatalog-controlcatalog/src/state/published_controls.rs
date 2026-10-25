@@ -37,6 +37,10 @@
 //! * `aliases` are DERIVED for the two designators that are functions of an identifier
 //!   (see [`aliases`]); only a designator that is neither — a `CONFIG.…` or `CT.…`
 //!   catalog designator — is written in the row.
+//! * the compliance-framework items a control satisfies are mostly a property of the
+//!   control OBJECTIVE it implements, not of its own row, so they are recorded once per
+//!   objective in [`OBJECTIVE_FRAMEWORKS`]; a row carries only the items that name its
+//!   own check (see [`framework_mappings`]).
 //!
 //! The opaque 25-character identifier inside a catalog ARN is assigned by Amazon Web
 //! Services and is derivable from nothing in the request, so — exactly as for the
@@ -112,18 +116,51 @@ const NO_DESIGNATORS: &[&str] = &[];
 /// as an empty list."
 const NO_GOVERNED_RESOURCES: &[&str] = &[];
 
-// The compliance frameworks this catalog's FRAMEWORK mappings name, each written as
-// the framework's own published title. The modeled `FrameworkName` admits 3..250
-// characters, so the published title is what goes on the wire; the item beside it in
-// a mapping row is that framework's own identifier for the requirement.
-pub(super) const NIST_SP_800_53_R5: &str = "NIST Special Publication 800-53 Revision 5";
-pub(super) const NIST_CSF_V1_1: &str = "NIST Cybersecurity Framework Version 1.1";
-pub(super) const PCI_DSS_V4_0: &str = "Payment Card Industry Data Security Standard v4.0";
-pub(super) const CIS_AWS_FOUNDATIONS_V3_0_0: &str =
-    "CIS Amazon Web Services Foundations Benchmark v3.0.0";
-pub(super) const CIS_CONTROLS_V8_0: &str = "CIS Critical Security Controls Version 8.0";
-pub(super) const CIS_GCP_FOUNDATION_V2_0_0: &str =
-    "CIS Google Cloud Platform Foundation Benchmark v2.0.0";
+// The compliance frameworks this catalog cross-walks its controls into.
+//
+// A FRAMEWORK mapping names the framework by the compact, version-bearing designator
+// the catalog publishes it under — the framework's abbreviation, the revision or
+// version it is read at, and nothing else (`NIST-CSF-v1.1`, `PCI-DSS-v4.0`) — because
+// the designator is what identifies a framework ACROSS the surfaces that cross-walk
+// into it, while a prose title is one surface's wording of it. The item beside it in a
+// mapping row is that framework's own identifier for the requirement (`PR.AC-4`). The
+// modeled `FrameworkName` admits 3..250 characters, so either form would serialize;
+// the designator is the one a client can join on.
+pub(super) const NIST_SP_800_53_R5: &str = "NIST-SP-800-53-r5";
+pub(super) const NIST_SP_800_171_R2: &str = "NIST-SP-800-171-r2";
+pub(super) const NIST_CSF_V1_1: &str = "NIST-CSF-v1.1";
+pub(super) const PCI_DSS_V4_0: &str = "PCI-DSS-v4.0";
+pub(super) const CIS_AWS_BENCHMARK_V3_0: &str = "CIS-AWS-Benchmark-v3.0";
+pub(super) const CIS_CONTROLS_V8_0: &str = "CIS-v8.0";
+pub(super) const CIS_GCP_BENCHMARK_V2_0: &str = "CIS-GCP-Benchmark-v2.0";
+pub(super) const FEDRAMP_R5: &str = "FedRAMP-r5";
+pub(super) const ISO_IEC_27001: &str = "ISO-IEC-27001";
+pub(super) const CRI_PROFILE_V2_2: &str = "CRI-Profile-v2.2";
+pub(super) const CMMC_LEVEL_2: &str = "CMMC-Level2";
+pub(super) const SSAE_18_SOC_2: &str = "SSAE-18-SOC-2";
+pub(super) const AWS_WAF_V10: &str = "AWS-WAF-v10";
+
+/// Every framework designator the catalog publishes, which is also the set a
+/// FRAMEWORK mapping's `Name` is drawn from.
+pub(super) const PUBLISHED_FRAMEWORKS: &[&str] = &[
+    NIST_SP_800_53_R5,
+    NIST_SP_800_171_R2,
+    NIST_CSF_V1_1,
+    PCI_DSS_V4_0,
+    CIS_AWS_BENCHMARK_V3_0,
+    CIS_CONTROLS_V8_0,
+    CIS_GCP_BENCHMARK_V2_0,
+    FEDRAMP_R5,
+    ISO_IEC_27001,
+    CRI_PROFILE_V2_2,
+    CMMC_LEVEL_2,
+    SSAE_18_SOC_2,
+    AWS_WAF_V10,
+];
+
+/// One framework requirement: `(the framework's designator, that framework's own
+/// identifier for the requirement)`.
+pub(super) type FrameworkItem = (&'static str, &'static str);
 
 /// One control the catalog publishes.
 #[derive(Debug)]
@@ -157,9 +194,13 @@ pub(super) struct ControlSeed {
     /// The slug of the common control this control implements, in
     /// [`super::published_ontology`]: the control's COMMON_CONTROL mapping.
     pub(super) implements: &'static str,
-    /// `(framework title, that framework's identifier for the requirement)` for each
-    /// published framework item the control satisfies: its FRAMEWORK mappings.
-    pub(super) frameworks: &'static [(&'static str, &'static str)],
+    /// `(framework designator, that framework's identifier for the requirement)` for
+    /// each framework item that names THIS control's own check — a benchmark item
+    /// written against one service's setting. The items every control implementing the
+    /// same objective satisfies are recorded once, in [`OBJECTIVE_FRAMEWORKS`]; a
+    /// control's FRAMEWORK mappings are the two sets together (see
+    /// [`framework_mappings`]).
+    pub(super) frameworks: &'static [FrameworkItem],
 }
 
 /// The catalog's controls, in one table.
@@ -211,7 +252,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Event logging".
             (NIST_SP_800_53_R5, "AU-2"),
             // "Ensure CloudTrail is enabled in all Regions".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.1"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.1"),
         ],
     },
     ControlSeed {
@@ -269,7 +310,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Audit logs are enabled and active for all system components".
             (PCI_DSS_V4_0, "10.2.1"),
             // "Ensure CloudTrail is enabled in all Regions".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.1"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.1"),
         ],
     },
     ControlSeed {
@@ -293,7 +334,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Protection of audit information".
             (NIST_SP_800_53_R5, "AU-9"),
             // "Ensure CloudTrail log file validation is enabled".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.2"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.2"),
         ],
     },
     ControlSeed {
@@ -345,7 +386,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Access enforcement".
             (NIST_SP_800_53_R5, "AC-3"),
             // "Ensure that S3 buckets are configured with 'Block public access'".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "2.1.4"),
+            (CIS_AWS_BENCHMARK_V3_0, "2.1.4"),
         ],
     },
     ControlSeed {
@@ -414,7 +455,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "privileged-access-approval",
         frameworks: &[
             // "Ensure no 'root' user account access key exists".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.4"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.4"),
             // "Least privilege".
             (NIST_SP_800_53_R5, "AC-6"),
         ],
@@ -437,7 +478,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "require-multi-factor-authentication",
         frameworks: &[
             // "Ensure MFA is enabled for all IAM users that have a console password".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.10"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.10"),
             // "Identification and authentication (organizational users)".
             (NIST_SP_800_53_R5, "IA-2"),
         ],
@@ -463,7 +504,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "credential-rotation",
         frameworks: &[
             // "Ensure access keys are rotated every 90 days or less".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.14"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.14"),
             // "Authenticator management".
             (NIST_SP_800_53_R5, "IA-5"),
         ],
@@ -493,7 +534,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "password-strength-enforcement",
         frameworks: &[
             // "Ensure IAM password policy requires a minimum length of 14 or greater".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.8"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.8"),
             // "Authenticator management".
             (NIST_SP_800_53_R5, "IA-5"),
         ],
@@ -517,7 +558,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "encrypt-data-at-rest-in-storage-services",
         frameworks: &[
             // "Ensure EBS volume encryption is enabled".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "2.2.1"),
+            (CIS_AWS_BENCHMARK_V3_0, "2.2.1"),
             // "Protection of information at rest".
             (NIST_SP_800_53_R5, "SC-28"),
         ],
@@ -541,7 +582,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "data-egress-monitoring",
         frameworks: &[
             // "Ensure VPC flow logging is enabled in all VPCs".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.9"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.9"),
             // "Audit record generation".
             (NIST_SP_800_53_R5, "AU-12"),
         ],
@@ -565,7 +606,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "restrict-administrative-port-exposure",
         frameworks: &[
             // "Ensure no security group allows ingress from 0.0.0.0/0 to port 22".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "5.2"),
+            (CIS_AWS_BENCHMARK_V3_0, "5.2"),
             // "Boundary protection".
             (NIST_SP_800_53_R5, "SC-7"),
         ],
@@ -639,7 +680,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "System monitoring".
             (NIST_SP_800_53_R5, "SI-4"),
             // "Ensure GuardDuty is enabled".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.8"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.8"),
         ],
     },
     ControlSeed {
@@ -712,7 +753,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "enable-centralized-logging",
         frameworks: &[
             // "Ensure CloudTrail is enabled in all Regions".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "3.1"),
+            (CIS_AWS_BENCHMARK_V3_0, "3.1"),
             // "Event logging".
             (NIST_SP_800_53_R5, "AU-2"),
         ],
@@ -736,7 +777,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "privileged-access-approval",
         frameworks: &[
             // "Ensure no 'root' user account access key exists".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.4"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.4"),
             // "Least privilege".
             (NIST_SP_800_53_R5, "AC-6"),
         ],
@@ -787,7 +828,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         frameworks: &[
             // "Ensure that uniform bucket-level access is enabled on Cloud Storage
             // buckets".
-            (CIS_GCP_FOUNDATION_V2_0_0, "5.2"),
+            (CIS_GCP_BENCHMARK_V2_0, "5.2"),
             // "Access enforcement".
             (NIST_SP_800_53_R5, "AC-3"),
         ],
@@ -814,7 +855,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         implements: "privileged-access-approval",
         frameworks: &[
             // "Ensure no 'root' user account access key exists".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "1.4"),
+            (CIS_AWS_BENCHMARK_V3_0, "1.4"),
             // "Least privilege".
             (NIST_SP_800_53_R5, "AC-6"),
             // "Group, shared and generic accounts are managed".
@@ -918,7 +959,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
             // "Protection of information at rest".
             (NIST_SP_800_53_R5, "SC-28"),
             // "Ensure EBS volume encryption is enabled".
-            (CIS_AWS_FOUNDATIONS_V3_0_0, "2.2.1"),
+            (CIS_AWS_BENCHMARK_V3_0, "2.2.1"),
         ],
     },
     ControlSeed {
@@ -1020,6 +1061,442 @@ pub(super) const RELATED_CONTROLS: &[(&str, &str, &str)] = &[
         "COMPLEMENTARY",
     ),
 ];
+
+/// The framework requirements each control OBJECTIVE satisfies, keyed by the slug of
+/// the common control that states the objective (a control's `implements`).
+///
+/// A compliance framework states its requirements at the level of the objective —
+/// "protect information at rest", "log system events" — not at the level of one
+/// service's setting, and the frameworks a catalog cross-walks into restate the same
+/// objective each in its own words. So every control implementing an objective
+/// satisfies that objective's requirement in EVERY framework that states it, whichever
+/// surface the control is implemented on, which is why a control's mapping set spans
+/// the frameworks the catalog cross-walks rather than one or two of them. Recording the
+/// cross-walk once per objective is also what keeps two controls that implement one
+/// objective from reporting different framework coverage.
+///
+/// Each row's comment is the requirement's own title in that framework.
+pub(super) const OBJECTIVE_FRAMEWORKS: &[(&str, &[FrameworkItem])] = &[
+    (
+        "maintain-an-asset-inventory",
+        &[
+            // "System component inventory".
+            (NIST_SP_800_53_R5, "CM-8"),
+            // "Physical devices and systems within the organization are inventoried".
+            (NIST_CSF_V1_1, "ID.AM-1"),
+            // "Software platforms and applications within the organization are
+            // inventoried".
+            (NIST_CSF_V1_1, "ID.AM-2"),
+            // "Establish and maintain baseline configurations and inventories".
+            (NIST_SP_800_171_R2, "3.4.1"),
+            // "Establish and maintain detailed enterprise asset inventory".
+            (CIS_CONTROLS_V8_0, "1.1"),
+            // "An inventory of system components that are in scope is maintained".
+            (PCI_DSS_V4_0, "12.5.1"),
+            // "Inventory of information and other associated assets".
+            (ISO_IEC_27001, "A.5.9"),
+            // "Asset inventories are maintained".
+            (CRI_PROFILE_V2_2, "ID.AM-01.01"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "enable-centralized-logging",
+        &[
+            // "Event logging".
+            (NIST_SP_800_53_R5, "AU-2"),
+            // "Audit record review, analysis and reporting".
+            (NIST_SP_800_53_R5, "AU-6"),
+            // "Event data are collected and correlated from multiple sources and
+            // sensors".
+            (NIST_CSF_V1_1, "DE.AE-3"),
+            // "Create, protect and retain system audit records".
+            (NIST_SP_800_171_R2, "3.3.1"),
+            // "Audit logs are enabled and active for all system components".
+            (PCI_DSS_V4_0, "10.2.1"),
+            // "Collect audit logs".
+            (CIS_CONTROLS_V8_0, "8.2"),
+            // "Logging".
+            (ISO_IEC_27001, "A.8.15"),
+            // "Event logs are generated and made available for monitoring".
+            (CRI_PROFILE_V2_2, "DE.CM-09.01"),
+            // "Configure service and application logging".
+            (AWS_WAF_V10, "SEC04-BP01"),
+            // "Monitoring of system components for anomalies".
+            (SSAE_18_SOC_2, "CC7.2"),
+        ],
+    ),
+    (
+        "log-integrity-protection",
+        &[
+            // "Protection of audit information".
+            (NIST_SP_800_53_R5, "AU-9"),
+            // "Audit/log records are determined, documented, implemented and reviewed".
+            (NIST_CSF_V1_1, "PR.PT-1"),
+            // "Protect audit information and audit logging tools from unauthorized
+            // access, modification and deletion".
+            (NIST_SP_800_171_R2, "3.3.8"),
+            // "Audit log files are protected to prevent modifications".
+            (PCI_DSS_V4_0, "10.3.2"),
+            // "Ensure adequate audit log storage".
+            (CIS_CONTROLS_V8_0, "8.3"),
+            // "Logging".
+            (ISO_IEC_27001, "A.8.15"),
+            // "The integrity of logged data is protected".
+            (CRI_PROFILE_V2_2, "PR.DS-06.01"),
+            // "Monitoring of system components for anomalies".
+            (SSAE_18_SOC_2, "CC7.2"),
+        ],
+    ),
+    (
+        "log-retention-enforcement",
+        &[
+            // "Audit record retention".
+            (NIST_SP_800_53_R5, "AU-11"),
+            // "Create, protect and retain system audit records".
+            (NIST_SP_800_171_R2, "3.3.1"),
+            // "Audit/log records are determined, documented, implemented and reviewed".
+            (NIST_CSF_V1_1, "PR.PT-1"),
+            // "Audit log history is retained for at least 12 months".
+            (PCI_DSS_V4_0, "10.5.1"),
+            // "Retain audit logs".
+            (CIS_CONTROLS_V8_0, "8.10"),
+            // "Protection of records".
+            (ISO_IEC_27001, "A.5.33"),
+            // "Records are retained for the defined retention period".
+            (CRI_PROFILE_V2_2, "PR.IP-04.01"),
+            // "Monitoring of system components for anomalies".
+            (SSAE_18_SOC_2, "CC7.2"),
+        ],
+    ),
+    (
+        "encrypt-data-at-rest-in-storage-services",
+        &[
+            // "Protection of information at rest".
+            (NIST_SP_800_53_R5, "SC-28"),
+            // "Data-at-rest is protected".
+            (NIST_CSF_V1_1, "PR.DS-1"),
+            // "Protect the confidentiality of CUI at rest".
+            (NIST_SP_800_171_R2, "3.13.16"),
+            // "Primary account number is rendered unreadable wherever it is stored".
+            (PCI_DSS_V4_0, "3.5.1"),
+            // "Encrypt sensitive data at rest".
+            (CIS_CONTROLS_V8_0, "3.11"),
+            // "Use of cryptography".
+            (ISO_IEC_27001, "A.8.24"),
+            // "Data at rest is protected by encryption".
+            (CRI_PROFILE_V2_2, "PR.DS-01.01"),
+            // "Enforce encryption at rest".
+            (AWS_WAF_V10, "SEC08-BP02"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "enforce-encryption-in-transit",
+        &[
+            // "Transmission confidentiality and integrity".
+            (NIST_SP_800_53_R5, "SC-8"),
+            // "Data-in-transit is protected".
+            (NIST_CSF_V1_1, "PR.DS-2"),
+            // "Implement cryptographic mechanisms to prevent unauthorized disclosure of
+            // CUI during transmission".
+            (NIST_SP_800_171_R2, "3.13.8"),
+            // "Strong cryptography is implemented to safeguard data in transit".
+            (PCI_DSS_V4_0, "4.2.1"),
+            // "Encrypt sensitive data in transit".
+            (CIS_CONTROLS_V8_0, "3.10"),
+            // "Use of cryptography".
+            (ISO_IEC_27001, "A.8.24"),
+            // "Data in transit is protected by encryption".
+            (CRI_PROFILE_V2_2, "PR.DS-02.01"),
+            // "Enforce encryption in transit".
+            (AWS_WAF_V10, "SEC09-BP02"),
+            // "Transmission, movement and removal of information".
+            (SSAE_18_SOC_2, "CC6.7"),
+        ],
+    ),
+    (
+        "restrict-public-access",
+        &[
+            // "Access enforcement".
+            (NIST_SP_800_53_R5, "AC-3"),
+            // "Access permissions and authorizations are managed, incorporating the
+            // principles of least privilege".
+            (NIST_CSF_V1_1, "PR.AC-4"),
+            // "Protections against data leaks are implemented".
+            (NIST_CSF_V1_1, "PR.DS-5"),
+            // "Control the flow of CUI in accordance with approved authorizations".
+            (NIST_SP_800_171_R2, "3.1.3"),
+            // "Inbound traffic to the cardholder data environment is restricted".
+            (PCI_DSS_V4_0, "1.3.1"),
+            // "Configure data access control lists".
+            (CIS_CONTROLS_V8_0, "3.3"),
+            // "Access control".
+            (ISO_IEC_27001, "A.5.15"),
+            // "Access permissions are granted on a least-privilege basis".
+            (CRI_PROFILE_V2_2, "PR.AC-04.01"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "privileged-access-approval",
+        &[
+            // "Least privilege".
+            (NIST_SP_800_53_R5, "AC-6"),
+            // "Access permissions and authorizations are managed, incorporating the
+            // principles of least privilege".
+            (NIST_CSF_V1_1, "PR.AC-4"),
+            // "Employ the principle of least privilege".
+            (NIST_SP_800_171_R2, "3.1.5"),
+            // "Group, shared and generic accounts are managed".
+            (PCI_DSS_V4_0, "8.2.2"),
+            // "Restrict administrator privileges to dedicated administrator accounts".
+            (CIS_CONTROLS_V8_0, "5.4"),
+            // "Privileged access rights".
+            (ISO_IEC_27001, "A.8.2"),
+            // "Privileged access is approved and recorded".
+            (CRI_PROFILE_V2_2, "PR.AC-04.03"),
+            // "Grant least privilege access".
+            (AWS_WAF_V10, "SEC03-BP02"),
+            // "Registration and authorization of new internal and external users".
+            (SSAE_18_SOC_2, "CC6.3"),
+        ],
+    ),
+    (
+        "require-multi-factor-authentication",
+        &[
+            // "Identification and authentication (organizational users)".
+            (NIST_SP_800_53_R5, "IA-2"),
+            // "Users, devices and other assets are authenticated commensurate with the
+            // risk of the transaction".
+            (NIST_CSF_V1_1, "PR.AC-7"),
+            // "Use multifactor authentication for local and network access".
+            (NIST_SP_800_171_R2, "3.5.3"),
+            // "Multi-factor authentication is implemented for all access".
+            (PCI_DSS_V4_0, "8.4.2"),
+            // "Require MFA for administrative access".
+            (CIS_CONTROLS_V8_0, "6.5"),
+            // "Authentication information".
+            (ISO_IEC_27001, "A.5.17"),
+            // "Multi-factor authentication is required for privileged access".
+            (CRI_PROFILE_V2_2, "PR.AC-01.02"),
+            // "Use strong sign-in mechanisms".
+            (AWS_WAF_V10, "SEC02-BP01"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "credential-rotation",
+        &[
+            // "Authenticator management".
+            (NIST_SP_800_53_R5, "IA-5"),
+            // "Identities and credentials are issued, managed, verified, revoked and
+            // audited".
+            (NIST_CSF_V1_1, "PR.AC-1"),
+            // "Prohibit password reuse for a specified number of generations".
+            (NIST_SP_800_171_R2, "3.5.8"),
+            // "Passwords are changed at least once every 90 days".
+            (PCI_DSS_V4_0, "8.3.9"),
+            // "Use unique passwords".
+            (CIS_CONTROLS_V8_0, "5.2"),
+            // "Authentication information".
+            (ISO_IEC_27001, "A.5.17"),
+            // "Credentials are rotated at a defined frequency".
+            (CRI_PROFILE_V2_2, "PR.AC-01.03"),
+            // "Use temporary credentials".
+            (AWS_WAF_V10, "SEC02-BP02"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "password-strength-enforcement",
+        &[
+            // "Authenticator management".
+            (NIST_SP_800_53_R5, "IA-5"),
+            // "Identities and credentials are issued, managed, verified, revoked and
+            // audited".
+            (NIST_CSF_V1_1, "PR.AC-1"),
+            // "Enforce a minimum password complexity and change of characters when new
+            // passwords are created".
+            (NIST_SP_800_171_R2, "3.5.7"),
+            // "Passwords have a minimum length and contain both numeric and alphabetic
+            // characters".
+            (PCI_DSS_V4_0, "8.3.6"),
+            // "Use unique passwords".
+            (CIS_CONTROLS_V8_0, "5.2"),
+            // "Authentication information".
+            (ISO_IEC_27001, "A.5.17"),
+            // "Authentication credentials meet defined strength requirements".
+            (CRI_PROFILE_V2_2, "PR.AC-01.01"),
+            // "Logical access security software, infrastructure and architectures".
+            (SSAE_18_SOC_2, "CC6.1"),
+        ],
+    ),
+    (
+        "data-egress-monitoring",
+        &[
+            // "Audit record generation".
+            (NIST_SP_800_53_R5, "AU-12"),
+            // "System monitoring".
+            (NIST_SP_800_53_R5, "SI-4"),
+            // "The network is monitored to detect potential cybersecurity events".
+            (NIST_CSF_V1_1, "DE.CM-1"),
+            // "Monitor organizational systems, including inbound and outbound
+            // communications traffic".
+            (NIST_SP_800_171_R2, "3.14.6"),
+            // "Audit logs are enabled and active for all system components".
+            (PCI_DSS_V4_0, "10.2.1"),
+            // "Collect network traffic flow logs".
+            (CIS_CONTROLS_V8_0, "13.6"),
+            // "Monitoring activities".
+            (ISO_IEC_27001, "A.8.16"),
+            // "Network traffic is monitored for anomalous activity".
+            (CRI_PROFILE_V2_2, "DE.CM-01.01"),
+            // "Monitoring of system components for anomalies".
+            (SSAE_18_SOC_2, "CC7.2"),
+        ],
+    ),
+    (
+        "restrict-administrative-port-exposure",
+        &[
+            // "Boundary protection".
+            (NIST_SP_800_53_R5, "SC-7"),
+            // "Network integrity is protected".
+            (NIST_CSF_V1_1, "PR.AC-5"),
+            // "Monitor, control and protect communications at the external boundaries
+            // of organizational systems".
+            (NIST_SP_800_171_R2, "3.13.1"),
+            // "Inbound traffic to the cardholder data environment is restricted".
+            (PCI_DSS_V4_0, "1.3.1"),
+            // "Implement and manage a firewall on servers".
+            (CIS_CONTROLS_V8_0, "4.4"),
+            // "Networks security".
+            (ISO_IEC_27001, "A.8.20"),
+            // "Network boundaries restrict administrative access".
+            (CRI_PROFILE_V2_2, "PR.IR-01.03"),
+            // "Create network layers".
+            (AWS_WAF_V10, "SEC05-BP01"),
+            // "Protection against threats from outside system boundaries".
+            (SSAE_18_SOC_2, "CC6.6"),
+        ],
+    ),
+    (
+        "intrusion-detection-deployment",
+        &[
+            // "System monitoring".
+            (NIST_SP_800_53_R5, "SI-4"),
+            // "The network is monitored to detect potential cybersecurity events".
+            (NIST_CSF_V1_1, "DE.CM-1"),
+            // "Monitor organizational systems, including inbound and outbound
+            // communications traffic".
+            (NIST_SP_800_171_R2, "3.14.6"),
+            // "Intrusion-detection and intrusion-prevention techniques are used".
+            (PCI_DSS_V4_0, "11.5.1"),
+            // "Centralize security event alerting".
+            (CIS_CONTROLS_V8_0, "13.1"),
+            // "Monitoring activities".
+            (ISO_IEC_27001, "A.8.16"),
+            // "Malicious activity is detected and analyzed".
+            (CRI_PROFILE_V2_2, "DE.CM-01.02"),
+            // "Analyze logs, findings and metrics centrally".
+            (AWS_WAF_V10, "SEC04-BP02"),
+            // "Monitoring of system components for anomalies".
+            (SSAE_18_SOC_2, "CC7.2"),
+        ],
+    ),
+];
+
+/// The requirement family each `NIST-SP-800-171-r2` section belongs to:
+/// `(section, that family's abbreviation)`.
+///
+/// A requirement is numbered `3.<section>.<n>` and its section IS its family, in the
+/// order the publication lists them.
+const NIST_800_171_FAMILIES: &[(&str, &str)] = &[
+    // Access control.
+    ("3.1", "AC"),
+    // Awareness and training.
+    ("3.2", "AT"),
+    // Audit and accountability.
+    ("3.3", "AU"),
+    // Configuration management.
+    ("3.4", "CM"),
+    // Identification and authentication.
+    ("3.5", "IA"),
+    // Incident response.
+    ("3.6", "IR"),
+    // Maintenance.
+    ("3.7", "MA"),
+    // Media protection.
+    ("3.8", "MP"),
+    // Personnel security.
+    ("3.9", "PS"),
+    // Physical protection.
+    ("3.10", "PE"),
+    // Risk assessment.
+    ("3.11", "RA"),
+    // Security assessment.
+    ("3.12", "CA"),
+    // System and communications protection.
+    ("3.13", "SC"),
+    // System and information integrity.
+    ("3.14", "SI"),
+];
+
+/// The `CMMC-Level2` practice that restates an `NIST-SP-800-171-r2` requirement.
+///
+/// A Level 2 practice IS an 800-171 requirement, designated `<family>.L2-<requirement>`
+/// — so the practice is DERIVED from the requirement rather than cross-walked by hand,
+/// and a requirement whose section names no family (none, as the table is the whole
+/// list) yields no practice.
+fn cmmc_practice(requirement: &str) -> Option<String> {
+    let mut parts = requirement.split('.');
+    let section = format!("{}.{}", parts.next()?, parts.next()?);
+    let family = NIST_800_171_FAMILIES
+        .iter()
+        .find(|(candidate, _)| *candidate == section)
+        .map(|(_, family)| *family)?;
+    Some(format!("{family}.L2-{requirement}"))
+}
+
+/// Every framework requirement a control satisfies: its objective's cross-walk, the
+/// items naming its own check, and the restatements those imply.
+///
+/// Two frameworks here publish another framework's requirements rather than
+/// requirements of their own, so their rows are DERIVED from the rows they restate
+/// instead of being written out: a `FedRAMP-r5` baseline is composed of
+/// `NIST-SP-800-53-r5` controls, under the same control identifier, and a
+/// `CMMC-Level2` practice is an `NIST-SP-800-171-r2` requirement (see
+/// [`cmmc_practice`]). Each `(framework, item)` pair appears once, however many of the
+/// three sources name it.
+pub(super) fn framework_mappings(seed: &ControlSeed) -> Vec<(&'static str, String)> {
+    let objective = OBJECTIVE_FRAMEWORKS
+        .iter()
+        .find(|(slug, _)| *slug == seed.implements)
+        .map(|(_, items)| *items)
+        .unwrap_or(&[]);
+
+    let mut mappings: Vec<(&'static str, String)> = Vec::new();
+    for &(framework, item) in objective.iter().chain(seed.frameworks) {
+        let restatements = match framework {
+            NIST_SP_800_53_R5 => vec![(FEDRAMP_R5, item.to_string())],
+            NIST_SP_800_171_R2 => cmmc_practice(item)
+                .map(|practice| vec![(CMMC_LEVEL_2, practice)])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for mapping in std::iter::once((framework, item.to_string())).chain(restatements) {
+            if !mappings.contains(&mapping) {
+                mappings.push(mapping);
+            }
+        }
+    }
+    mappings
+}
 
 /// The aliases a control is published under.
 ///

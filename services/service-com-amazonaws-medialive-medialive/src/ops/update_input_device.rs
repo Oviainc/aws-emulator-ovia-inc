@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInputDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInputDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInputDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInputDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInputDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInputDevice"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "Updates the parameters for the input device": the update is applied
+        // TO a device this account owns, so the id is resolved through the
+        // store — an id no claim registered is the operation's own modelled 404
+        // rather than a device conjured out of the request.
+        let device = state
+            .input_device_mut(&input.input_device_id)
+            .ok_or_else(|| {
+                UpdateInputDeviceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "InputDevice",
+                        &input.input_device_id,
+                    )),
+                })
+            })?;
+
+        // Which of the two settings members configures THIS device is the
+        // device's own type; the member for the other type names no settings it
+        // has, so it is refused rather than silently dropped.
+        let device_type = device.r#type.clone();
+        let (settings, mismatched) =
+            device.settings_of_this_type(input.hd_device_settings, input.uhd_device_settings);
+        if let Some(member) = mismatched {
+            return Err(UpdateInputDeviceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::settings_member_mismatch_message(
+                        member,
+                        &input.input_device_id,
+                        &device_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The bounds the settings' own documentation states — the members only a
+        // UHD device has, the audio pairs a source carries and the resolutions a
+        // Link source can be set to — which the model cannot express, so the
+        // service is what refuses them. Checked BEFORE anything is written, so a
+        // refused update leaves the device exactly as it was.
+        if let Some(settings) = &settings {
+            if let Some(message) = crate::state::configurable_settings_error(&device_type, settings)
+            {
+                return Err(UpdateInputDeviceErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An update names what it changes: a member the request omits leaves the
+        // stored value alone. `Name` ("The name that you assigned to this input
+        // device") and `AvailabilityZone` ("The Availability Zone you want
+        // associated with this input device") carry no documented form, so they
+        // are stored as the request spelled them.
+        if let Some(name) = input.name {
+            device.name = Some(name);
+        }
+        if let Some(availability_zone) = input.availability_zone {
+            device.availability_zone = Some(availability_zone);
+        }
+        // Configuring the device is what MediaLive sends to the unit, so the
+        // device is `SYNCING` until the clock makes that synchronisation due —
+        // see `apply_configuration`. Setting only the name or the availability
+        // zone changes no device setting, so it leaves the sync state alone.
+        if let Some(settings) = settings {
+            device.apply_configuration(settings, now);
+        }
+
+        // Reported out of the stored record, through the one projection every
+        // operation that reports a device reads.
+        let device = state
+            .input_device_summary(&input.input_device_id)
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::input_device_output!(
+            UpdateInputDeviceOutput,
+            device
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no device store to update. A modelled server error, never a fresh
+/// engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateInputDeviceError {
+    UpdateInputDeviceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

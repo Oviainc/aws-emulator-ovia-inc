@@ -8,6 +8,12 @@
 //! tags live on the resource record itself — the ARN index says which record an
 //! ARN points at — so `ListTagsForResource` reads back exactly what this wrote.
 //!
+//! A tag key in the reserved `aws:` namespace
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a
+//! key a caller owns, so a call naming one is refused with `ValidationException`
+//! (HTTP 400) and NONE of the batch is applied — a legal key sharing the request
+//! with a reserved one is not stored either.
+//!
 //! An ARN that names no stored resource is refused with `ResourceNotFoundException`
 //! (HTTP 404); a call that would leave the resource carrying more than
 //! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags with
@@ -90,9 +96,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // the shape (HTTP 402) and the per-resource tag count is one of its quotas, so the
 // refusal this handler owes a call that would exceed it has to be sayable here even
 // though this operation's own error list does not name the shape.
+// `ValidationException` is widened in for the same reason again: the service models the
+// shape (HTTP 400, declared by every create of it) and a request naming a tag key in
+// the reserved namespace is a bad request rather than a tag-count one, so the refusal
+// it earns has to be sayable here.
 #[smithy_macros::operation_error(
     "com.amazonaws.iottwinmaker#TagResource",
-    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+    extra_errors = [
+        "InternalServerException",
+        "ServiceQuotaExceededException",
+        "ValidationException"
+    ]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
@@ -101,6 +115,7 @@ pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     TooManyTagsException(TooManyTagsException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,6 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "serving a request"
         );
         let _ = ctx;
+
+        // The reserved namespace is AWS's own, so a key under it is not one this
+        // call may write — decided on the request alone, before the store is
+        // reached, and over the WHOLE batch, so a request mixing a legal key with
+        // a reserved one applies neither.
+        if let Some(message) = crate::state::reserved_tag_keys_violation(
+            "tags",
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),

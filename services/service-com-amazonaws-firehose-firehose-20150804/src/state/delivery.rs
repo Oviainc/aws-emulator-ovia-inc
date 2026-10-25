@@ -782,6 +782,9 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             metadata: BTreeMap::new(),
             tags: Vec::new(),
             encryption: ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption::default(),
+            // A delivered object carries no Object Lock retention: a retention is placed
+            // on a stored version afterwards, by S3's own `PutObjectRetention`.
+            retention: None,
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(
@@ -1068,12 +1071,30 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 /// * it DEFINES a function (`def`), which — with no library function registered — is the
 ///   one construct left that may call itself, or LOOPS (`reduce`, `foreach`), which re-apply
 ///   their update expression once per element of the value they are given;
-/// * it carries `+` or `*`, the operators that GROW a value in place (`+` concatenates and
-///   merges, `*` repeats a string and merges deeply), so repeated application of either
-///   doubles a value per step;
+/// * it carries `+`, `*`, `-` or a lone `/`, the operators that GROW a value out of
+///   proportion to the one they were given (`+` concatenates and merges, `*` repeats a
+///   string and merges deeply, `-` subtracts one array from another by comparing every pair
+///   of their elements, and `/` over two strings SPLITS one into an array of its pieces —
+///   one piece per occurrence of the separator), so repeated application of any of them
+///   costs far more than the record it started from. None of the four is needed to read a
+///   partition key out of a JSON document, which is what a `MetadataExtractionQuery` is
+///   for; the DOUBLED `/` — the alternative operator `//`, which takes one of two values
+///   and grows neither — is admitted;
+/// * it ASSIGNS into a value (`=`, `|=`, `//=`, and any other operator ending in a lone
+///   `=`), which embeds a value into a field of itself and chains, so a handful of tokens
+///   multiplies the record many times over; the COMPARISONS `==`, `!=`, `<=` and `>=` are
+///   admitted, since each yields one boolean whatever it was given;
+/// * it carries any punctuation outside the set this accounting can cost — the admitted
+///   ones are the forms a program needs to read a partition key out of a JSON document
+///   (`.`, `?`, a string literal, an identifier, `[`/`]`, `{`/`}`, `(`/`)`, `|`, `,`, `:`,
+///   `$`, `//`, a comparison) — so an operator this scanner was never taught, jq's or a
+///   future engine's, is refused rather than silently charged one ordinary token;
 /// * it interpolates (`\(…)`), whose contents are an expression this accounting does not
 ///   read, so brackets, tokens and a definition inside one would be charged nothing;
-/// * it carries more than [`MAX_PROGRAM_CONSTRUCTIONS`] container constructions;
+/// * it carries more than [`MAX_PROGRAM_CONSTRUCTIONS`] container constructions, counted
+///   with every `{` and with every `[` that does not follow something INDEXABLE — a
+///   keyword is not indexable, so the `[` of `if . then [., .] else . end` is counted as
+///   the construction the engine reads it as rather than as an index;
 /// * it carries a string literal this scanner cannot read as the engine would — one that
 ///   never closes, or that carries a raw line break jq does not admit — because a scanner
 ///   that read the text differently from the engine would be shown one program while the
@@ -1109,6 +1130,17 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
     // follows one on that line is not program text — a scanner that missed them could be
     // shown one program and the engine another.
     let mut in_comment = false;
+    // Whether a `/` is waiting to be read: a LONE one is division, which over two strings
+    // splits one into an array, while a doubled one is the cheap alternative operator `//`.
+    // The two are told apart by the character after the first slash, so it is held until
+    // then rather than refused or admitted on sight.
+    let mut pending_slash = false;
+    // The same for an `=` that may still turn out to be the `==` of a comparison: held
+    // until the next character says whether it assigns.
+    let mut pending_equals = false;
+    // The last program character read outside a string or a comment, which is what tells
+    // the `=` of `!=`, `<=` and `>=` from the one that assigns.
+    let mut previous = '\0';
     for character in query.chars() {
         if in_comment {
             in_comment = character != '\n';
@@ -1133,6 +1165,29 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
             }
             continue;
         }
+        if pending_slash {
+            pending_slash = false;
+            if character == '/' {
+                // `//`, the alternative operator: it takes one of two values it is given
+                // and grows neither, so it is one ordinary token.
+                tokens += 1;
+                indexable = false;
+                continue;
+            }
+            return Err("it carries an operator that grows a value");
+        }
+        if pending_equals {
+            pending_equals = false;
+            if character == '=' {
+                // `==`, a comparison: it yields one boolean whatever it was given.
+                tokens += 1;
+                indexable = false;
+                continue;
+            }
+            return Err("it assigns into a value");
+        }
+        let preceding = previous;
+        previous = character;
         if character == '#' {
             in_comment = true;
             continue;
@@ -1150,9 +1205,12 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
             if let Some(refusal) = inadmissible_word(&word) {
                 return Err(refusal);
             }
+            // A jq KEYWORD is not a value, so nothing can be indexed out of it: the `[`
+            // after one opens a construction, which is why a keyword leaves `indexable`
+            // off where an identifier or a literal sets it.
+            indexable = !is_keyword(&word);
             word.clear();
             tokens += 1;
-            indexable = true;
         }
         match character {
             '(' | '[' | '{' => {
@@ -1171,22 +1229,56 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
                 tokens += 1;
                 indexable = true;
             }
-            '+' | '*' => return Err("it carries an operator that grows a value"),
+            // `-` is here for the same reason as `+` and `*`, and a lone `/` for the same
+            // reason again: in jq neither is numeric-only — `Str / Str` splits a string
+            // into an array and `Array - Array` subtracts one from the other elementwise —
+            // so either can hand the engine a value far larger, and a walk far longer, than
+            // the record the accounting above charges for. A `/` is held by `pending_slash`
+            // above instead, because `//` is not division.
+            '+' | '*' | '-' => return Err("it carries an operator that grows a value"),
+            '/' => {
+                pending_slash = true;
+            }
             character if character.is_whitespace() => {}
             '.' | '?' => {
                 tokens += 1;
                 indexable = true;
             }
-            _ => {
+            // An `=` completing a comparison is one token; a lone one ASSIGNS, which
+            // embeds a value into a field of itself and chains, so it is held until the
+            // next character says which it is.
+            '=' if matches!(preceding, '!' | '<' | '>') => {
                 tokens += 1;
                 indexable = false;
             }
+            '=' => {
+                pending_equals = true;
+            }
+            // The punctuation a program needs to take a JSON record apart: the pipe, the
+            // comma, an object key separator, a binding's `$`, and the two halves of a
+            // comparison. Everything else is refused below rather than charged one
+            // ordinary token, so an operator this accounting was never taught cannot slip
+            // through it.
+            '|' | ',' | ':' | '$' | '<' | '>' | '!' => {
+                tokens += 1;
+                indexable = false;
+            }
+            _ => return Err("it carries a construct this emulator does not run"),
         }
     }
     if in_string {
         // Text whose string literal never closes is text this scanner cannot read as the
         // engine would, so it is refused rather than admitted on a partial reading.
         return Err("it carries a string this emulator cannot read");
+    }
+    if pending_slash {
+        // A program ending in a single slash carries division, whatever follows it would
+        // have been.
+        return Err("it carries an operator that grows a value");
+    }
+    if pending_equals {
+        // And one ending in a single `=` assigns, whatever follows it would have been.
+        return Err("it assigns into a value");
     }
     if let Some(refusal) = inadmissible_word(&word) {
         return Err(refusal);
@@ -1218,6 +1310,36 @@ fn inadmissible_word(word: &str) -> Option<&'static str> {
         "reduce" | "foreach" => Some("it loops over a value"),
         _ => None,
     }
+}
+
+/// Whether `word` is one of jq's own KEYWORDS rather than a name, a literal or a function.
+///
+/// What it decides is the one thing the construction count turns on: a keyword is not a
+/// value, so nothing can be indexed out of one, and a `[` that follows it therefore opens
+/// an array CONSTRUCTION ("`[ if . then [., .] else . end, . ]`") where the same bracket
+/// after an identifier or a literal is an index or a slice. Reading it the other way would
+/// leave a construction uncounted, and with it the memory bound
+/// [`admissible_program`] documents.
+fn is_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "end"
+            | "try"
+            | "catch"
+            | "as"
+            | "and"
+            | "or"
+            | "not"
+            | "label"
+            | "import"
+            | "include"
+            | "def"
+            | "reduce"
+            | "foreach"
+    )
 }
 
 /// Compile `query` once and run it over every record. See [`partition_keys`].
@@ -1756,6 +1878,120 @@ fn next_due_or_release_pump(
         None => {
             release_pump(store, generation);
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The text accounting a client-supplied `MetadataExtractionQuery` has to pass before
+    //! any engine sees it: what [`admissible_program`] admits, and what it refuses so that
+    //! the memory and step bound that function documents actually holds.
+
+    use super::{admissible_program, MAX_PROGRAM_CONSTRUCTIONS};
+
+    #[test]
+    fn a_program_that_reads_a_partition_key_out_of_a_record_is_admitted() {
+        // The forms a metadata-extraction query needs: an object construction over a path,
+        // a nested path, a binding, the alternative operator, and each comparison — none of
+        // which can hand the engine more than the record it was given.
+        for program in [
+            "{dept:.dept}",
+            "{dept:.dept,region:.region}",
+            "{customer:.customer.id}",
+            "{dept:(.dept // \"unknown\")}",
+            "{dept:(.a[0] // .b[\"k\"] // .c[1:2])}",
+            ". as $record | {dept:$record.dept}",
+            "{dept:(if .a == .b then .a else .b end)}",
+            "{dept:(if .a != .b then .a else .b end)}",
+            "{dept:(if .a <= .b then .a else .b end)}",
+            "{dept:(if .a >= .b then .a else .b end)}",
+            "{dept:(try .dept catch .other)}",
+            "# a comment\n{dept:.dept}",
+        ] {
+            assert_eq!(
+                admissible_program(program),
+                Ok(()),
+                "case {program:?}: a program that only reads the record must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_that_can_grow_a_value_past_the_documented_bound_is_refused() {
+        // (the program, the refusal it must earn). Every row is a way of handing the engine
+        // a value, or a walk, larger than the accounting charges for: the four growing
+        // operators, every assignment form (which embeds a value into a field of itself and
+        // chains), a construction hidden behind a keyword where an index-or-construction
+        // heuristic would miss it, and punctuation this accounting was never taught.
+        for (program, refusal) in [
+            ("{dept:(.a + .b)}", "it carries an operator that grows a value"),
+            ("{dept:(.a * 2)}", "it carries an operator that grows a value"),
+            ("{dept:(.a - .b)}", "it carries an operator that grows a value"),
+            (
+                "{dept:(.a / \",\")}",
+                "it carries an operator that grows a value",
+            ),
+            ("{dept:.a} | .b /", "it carries an operator that grows a value"),
+            ("{dept:.a} | .b = .", "it assigns into a value"),
+            ("{dept:.a} | .b |= .", "it assigns into a value"),
+            ("{dept:.a} | .b //= .", "it assigns into a value"),
+            ("{dept:.a} | .b =", "it assigns into a value"),
+            (
+                "[if . then [.,.] else . end,.]",
+                "it constructs more containers than this emulator runs",
+            ),
+            (
+                "{dept:(.a @base64)}",
+                "it carries a construct this emulator does not run",
+            ),
+            (
+                "{dept:(.a; .b)}",
+                "it carries a construct this emulator does not run",
+            ),
+            ("{dept:(.a % 2)}", "it carries a construct this emulator does not run"),
+            ("def f: f; f", "it defines a function"),
+            (
+                "{dept:(reduce .items[] as $i ([]; $i))}",
+                "it loops over a value",
+            ),
+        ] {
+            assert_eq!(
+                admissible_program(program),
+                Err(refusal),
+                "case {program:?}: expected the program to be refused as {refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_construction_is_admitted_whatever_precedes_it() {
+        // The construction CAP is what bounds the value a run can build, so the count has
+        // to be the one the engine reads: a single array construction is admitted whether
+        // it opens the program, follows a keyword, or follows a pipe — and a second one is
+        // refused in each of those positions.
+        assert_eq!(
+            MAX_PROGRAM_CONSTRUCTIONS, 1,
+            "these rows are written for a cap of one construction"
+        );
+        for one in ["[.,.]", "if . then [.,.] else . end", ". | [.,.]"] {
+            assert_eq!(
+                admissible_program(one),
+                Ok(()),
+                "case {one:?}: one construction is inside the cap"
+            );
+        }
+        for two in [
+            "[[.,.],.]",
+            "[if . then [.,.] else . end,.]",
+            ". | [.,.] | [.,.]",
+            "{a:[.,.]}",
+        ] {
+            assert_eq!(
+                admissible_program(two),
+                Err("it constructs more containers than this emulator runs"),
+                "case {two:?}: a second construction is past the cap"
+            );
         }
     }
 }

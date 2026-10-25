@@ -34,6 +34,8 @@ mod state_roundtrip;
 mod support;
 #[path = "all/synthesis_tasks.rs"]
 mod synthesis_tasks;
+#[path = "all/task_report_bounds.rs"]
+mod task_report_bounds;
 #[path = "all/task_id_validity.rs"]
 mod task_id_validity;
 #[path = "all/voice_catalog.rs"]

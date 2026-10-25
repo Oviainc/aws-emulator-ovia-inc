@@ -54,19 +54,27 @@ fn search_uri(workspace: &str, search_id: &str) -> String {
 }
 
 /// `StartSearch` with `body`.
-async fn start(router: &MultiServiceRouter, workspace: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn start(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    body: Value,
+) -> (u16, Value) {
     call(router, "POST", &searches_uri(workspace), Some(body)).await
 }
 
 /// `DescribeSearch`.
-async fn describe(router: &MultiServiceRouter, workspace: &str, search_id: &str) -> (u16, Value) {
+pub(crate) async fn describe(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    search_id: &str,
+) -> (u16, Value) {
     call(router, "GET", &search_uri(workspace, search_id), None).await
 }
 
 /// `CreateWorkspace` with the service's default encryption, asserted accepted:
 /// a search runs against a workspace's data, so every suite below creates the
 /// workspaces it searches first.
-async fn create_workspace(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_workspace(router: &MultiServiceRouter, name: &str) {
     let (status, body) = call(
         router,
         "POST",

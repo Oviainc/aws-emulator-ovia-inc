@@ -8,9 +8,14 @@
 //! most one statement out of [`crate::state::LayerVersionRecord::policy`] and leaves a
 //! new revision behind. A statement id the policy does not hold, like an unknown layer
 //! or version, is the modelled `ResourceNotFoundException`, and a `RevisionId` that does
-//! not match the policy's current revision is a `PreconditionFailedException`. A policy
-//! whose last statement is removed is no policy at all, which is what
-//! `GetLayerVersionPolicy`'s 404 reports.
+//! not match the policy's current revision is a `PreconditionFailedException`.
+//!
+//! Removing the LAST statement leaves the version holding an EMPTY policy rather than
+//! none at all: the policy record outlives its statements, and a later read reports no
+//! policy either way while saying which of the two states the version is in (see
+//! [`crate::state::LayerVersionRecord::policy_read_absence_message`]). A removal has
+//! nothing to act on in either state and refuses with
+//! [`crate::state::LAYER_VERSION_NO_POLICY_MESSAGE`].
 //!
 //! ## Shape of an operation
 //!
@@ -218,14 +223,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let resource = resolved.arn;
-        let Some(policy) = resolved.version.policy.as_mut() else {
+        // The layer version EXISTS, so a version with no statement to take out is refused
+        // for its POLICY rather than reported as an absent resource: there is no policy
+        // this removal can act on, whether the version never had one or its statements
+        // have all been removed already. The same read decides both, so there is no
+        // policy-less state this handler can fall through with.
+        let Some(policy) = resolved
+            .version
+            .policy
+            .as_mut()
+            .filter(|policy| !policy.statements.is_empty())
+        else {
             return Err(
                 RemoveLayerVersionPermissionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         r#type: None,
-                        message: Some(format!(
-                            "The resource you requested does not exist. Resource: {resource}"
-                        )),
+                        message: Some(
+                            crate::state::LAYER_VERSION_NO_POLICY_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -276,13 +291,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A policy with no statements is no policy: the version goes back to holding
-        // none, which is what `GetLayerVersionPolicy`'s 404 reports.
-        if policy.statements.is_empty() {
-            resolved.version.policy = None;
-        } else {
-            policy.revision_id = crate::state::mint_revision_id();
-        }
+        // The policy changed, so it is at a new revision — including when its last
+        // statement has just gone: the record outlives the statements it held, so the
+        // version keeps an EMPTY policy rather than going back to holding none, and a
+        // later read says which of the two states it is in.
+        policy.revision_id = crate::state::mint_revision_id();
 
         Ok(RemoveLayerVersionPermissionOutput)
     }

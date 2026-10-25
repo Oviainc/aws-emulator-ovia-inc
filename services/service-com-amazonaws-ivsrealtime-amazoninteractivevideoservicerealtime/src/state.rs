@@ -5,9 +5,9 @@
 //! The stage lifecycle (`CreateStage`, `GetStage`, `ListStages`, `UpdateStage`,
 //! `DeleteStage`), the token issuance that makes a stage usable
 //! (`CreateParticipantToken`), the stage sessions a stage's participants are
-//! grouped into (`ListParticipants`), the occurrences during one of those sessions
-//! (`ListParticipantEvents`) and the compositions a stage is composed into
-//! (`StartComposition`, `GetComposition`, `StopComposition`) all read and write the
+//! grouped into (`GetParticipant`, `ListParticipants`), the occurrences during one of
+//! those sessions (`ListParticipantEvents`) and the compositions a stage is composed
+//! into (`StartComposition`, `GetComposition`, `StopComposition`) all read and write the
 //! records below, so the records, the id minting they share and the modelled defaults
 //! they apply live here rather than in any one operation's file.
 
@@ -24,7 +24,7 @@ use crate::ops::types::{
     AutoParticipantRecordingConfiguration, Composition, ConflictException,
     CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
     EncoderConfiguration, Event, GridConfiguration, IngestConfiguration, InternalServerException,
-    LayoutConfiguration, ParticipantRecordingHlsConfiguration, ParticipantReplica,
+    LayoutConfiguration, Participant, ParticipantRecordingHlsConfiguration, ParticipantReplica,
     ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSessionSummary, StageSummary,
@@ -1004,6 +1004,19 @@ impl IngestConfigurationRecord {
                 .iter()
                 .any(|credential| credential.participant_id == participant_id)
     }
+
+    /// Whether the participant `record` broadcasts with THIS configuration: its join
+    /// named this configuration, or it publishes as one of the participants this
+    /// configuration's ingest credentials were minted for.
+    ///
+    /// The ONE predicate for "does this participant broadcast with this configuration",
+    /// so the lookup that finds a configuration's publishers
+    /// ([`ingest_configuration_publishers`]) and the one that finds a participant's
+    /// configuration ([`participant_ingest_configuration`]) cannot drift apart.
+    pub fn publishes_participant(&self, record: &ParticipantRecord) -> bool {
+        record.ingest_configuration_arn.as_deref() == Some(self.arn.as_str())
+            || self.mints_participant(&record.participant_id)
+    }
 }
 
 /// One encoder configuration, as `CreateEncoderConfiguration` persisted it and
@@ -1402,8 +1415,8 @@ impl CompositionRecord {
 // [`join_stage_session`] / [`leave_stage_session`] — the one entry point a stage data
 // plane uses, and the one place the modelled defaults of a joining participant are
 // applied — over the session [`ensure_active_session`] opens, and the reporting
-// operations (`ListParticipants` and `ListStageSessions` today; `GetParticipant` and
-// `GetStageSession`, each its own gap issue) answer from exactly what those
+// operations (`GetParticipant`, `ListParticipants` and `ListStageSessions` today;
+// `GetStageSession`, its own gap issue) answer from exactly what those
 // recorded, never from a value invented for a join that never happened.
 // ---------------------------------------------------------------------------
 
@@ -1440,6 +1453,23 @@ pub const NOT_RECORDED_PARTICIPANT_RECORDING_STATE: &str = "DISABLED";
 /// moves a participant off it.
 pub const REPLICATION_TYPE_NONE: &str = "NONE";
 
+/// `ParticipantProtocol` of a participant this store holds no broadcast protocol for.
+///
+/// One of the four values the modelled `ParticipantProtocol` enum carries
+/// (`smithy_query(query="shape",shape="ParticipantProtocol")`), and the only one that is
+/// not a protocol: `Participant$protocol` is the "type of ingest protocol that the
+/// participant employs for broadcasting", so a participant that broadcasts nothing — and
+/// one whose join named no protocol and used no ingest configuration — carries this.
+pub const PARTICIPANT_PROTOCOL_UNKNOWN: &str = "UNKNOWN";
+
+/// What `Participant$recordingS3BucketName` and `$recordingS3Prefix` report for a
+/// participant that is not being recorded.
+///
+/// Both members document exactly this value: the bucket and prefix the participant is
+/// being recorded to "if individual participant recording is enabled, or `\"\"` (empty
+/// string), if recording is not enabled".
+pub const NOT_RECORDED_PARTICIPANT_RECORDING_S3_LOCATION: &str = "";
+
 /// One participant of one stage session, as the stage's data plane recorded it
 /// joining ([`join_stage_session`]) and `ListParticipants` reports it.
 #[derive(Debug, Clone)]
@@ -1450,8 +1480,8 @@ pub struct ParticipantRecord {
     /// The customer-assigned name the token carried, when it carried one.
     pub user_id: Option<String>,
     /// The attributes the token carried. No member of `ParticipantSummary` reports
-    /// them — `Participant$attributes` does, which `GetParticipant` reports (its own
-    /// gap issue) — so they are recorded here where the join supplies them.
+    /// them — `Participant$attributes` does, which `GetParticipant` reports — so they
+    /// are recorded here where the join supplies them.
     pub attributes: HashMap<String, String>,
     /// [`PARTICIPANT_STATE_CONNECTED`] or [`PARTICIPANT_STATE_DISCONNECTED`].
     pub state: String,
@@ -1476,9 +1506,210 @@ pub struct ParticipantRecord {
     pub redundant_ingest: bool,
     /// The ingest configuration the publisher broadcast with, when it used one.
     pub ingest_configuration_arn: Option<String>,
+    /// What the stage's data plane observed about the joining client. No member of
+    /// `ParticipantSummary` reports any of it; `Participant`'s client members do, which
+    /// is why it is recorded here where the join observes it.
+    pub client: ParticipantClient,
+    /// The broadcast protocol the data plane saw this participant publish with, when it
+    /// saw one. `None` leaves [`participant_protocol`] to resolve it from the ingest
+    /// configuration the participant publishes through, and finally to
+    /// [`PARTICIPANT_PROTOCOL_UNKNOWN`].
+    pub protocol: Option<String>,
     /// Join order within the session, and the stable key `ListParticipants` pages
     /// over — the same role [`StageRecord::sequence`] plays for `ListStages`.
     pub sequence: u64,
+}
+
+/// What a stage's data plane observed about the client one participant joined with.
+///
+/// The six members `Participant` carries about the joining client — its Internet
+/// Service Provider, operating system, browser and SDK version — each of which the model
+/// targets at `ParticipantClientAttribute` and none of which any request of this control
+/// plane supplies. A member the data plane did not observe stays `None`, which is how the
+/// model says "not known": the alternative would be a value nothing reported.
+#[derive(Debug, Default, Clone)]
+pub struct ParticipantClient {
+    pub isp_name: Option<String>,
+    pub os_name: Option<String>,
+    pub os_version: Option<String>,
+    pub browser_name: Option<String>,
+    pub browser_version: Option<String>,
+    pub sdk_version: Option<String>,
+}
+
+impl ParticipantClient {
+    /// Take over every member `observed` names, keeping what an earlier connection
+    /// observed for the ones it does not.
+    ///
+    /// The ONE rule for "this connection observed nothing about that", applied per member
+    /// and shared with the rest of a rejoin ([`join_stage_session`]): an absent member
+    /// means the data plane did not observe it on this connection, never that an earlier
+    /// observation is withdrawn — exactly as an absent `ingestConfigurationArn` or
+    /// recording state leaves the record's own value standing.
+    pub fn observe(&mut self, observed: &ParticipantClient) {
+        for (member, value) in [
+            (&mut self.isp_name, &observed.isp_name),
+            (&mut self.os_name, &observed.os_name),
+            (&mut self.os_version, &observed.os_version),
+            (&mut self.browser_name, &observed.browser_name),
+            (&mut self.browser_version, &observed.browser_version),
+            (&mut self.sdk_version, &observed.sdk_version),
+        ] {
+            if value.is_some() {
+                *member = value.clone();
+            }
+        }
+    }
+}
+
+/// Where one participant's individual recording is written: the S3 bucket and the prefix
+/// under it, both empty for a participant that is not being recorded.
+#[derive(Debug, Clone)]
+pub struct ParticipantRecordingLocation {
+    pub bucket_name: String,
+    pub prefix: String,
+}
+
+impl ParticipantRecordingLocation {
+    /// What both members report when nothing records the participant — see
+    /// [`NOT_RECORDED_PARTICIPANT_RECORDING_S3_LOCATION`].
+    pub fn not_recorded() -> Self {
+        Self {
+            bucket_name: NOT_RECORDED_PARTICIPANT_RECORDING_S3_LOCATION.to_string(),
+            prefix: NOT_RECORDED_PARTICIPANT_RECORDING_S3_LOCATION.to_string(),
+        }
+    }
+}
+
+/// The S3 prefix one participant's individual recording is stored under.
+///
+/// `Participant$recordingS3Prefix` is documented only as the "S3 prefix of the S3 bucket
+/// where the participant is being recorded" and the model publishes no format for it
+/// beyond `@pattern ^[a-zA-Z0-9-]*$` (which admits no `/`), so the prefix is DERIVED from
+/// the two ids that identify the recording — the session and the participant within it,
+/// both minted by this service from [`mint_id`]'s id characters. That makes it unique per
+/// participant and stable across reads, which is what a caller can rely on, and it keeps
+/// a publisher that disconnects and reconnects on the same prefix within the session, as
+/// the member's merge note describes; it is not read back off any request.
+///
+/// Every id character outside the member's own pattern is rendered as `-`, so the prefix
+/// satisfies it whatever the ids carry: `ParticipantId` admits `_`, which
+/// `recordingS3Prefix` does not, and the data plane names the participant that joined.
+///
+/// The companion of [`recording_prefix`], which does the same for a composition's S3
+/// destination under its own member's pattern.
+pub fn participant_recording_prefix(session_id: &str, participant_id: &str) -> String {
+    format!("{session_id}-{participant_id}")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Where the participant `record` of the session `session_id` of `stage_arn` is being
+/// recorded, or [`ParticipantRecordingLocation::not_recorded`] when nothing records it.
+///
+/// Both members report their value only "if individual participant recording is
+/// enabled", which takes two things. Recording is enabled on the STAGE: its
+/// `autoParticipantRecordingConfiguration` names the storage configuration the media is
+/// written to, and [`NO_STORAGE_CONFIGURATION_ARN`] is that member's documented "no
+/// storage configuration is specified". And it is the RECORDER that reports whether this
+/// participant is being recorded, which [`ParticipantRecord::recording_state`] holds:
+/// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`] is the one value of
+/// `ParticipantRecordingState` that is not a state of a running recording, so a
+/// participant carrying it is recorded nowhere even on a stage that configures storage,
+/// and the two members answer the empty string exactly when `recordingState` says
+/// nothing records it.
+///
+/// The bucket is then the one that storage configuration holds
+/// ([`StorageConfigurationRecord::bucket_name`]) and the prefix is
+/// [`participant_recording_prefix`] — both derived from the stored records on every read,
+/// the way an ingest configuration's `state` is, so a stage whose recording configuration
+/// changes reports the change at once.
+pub fn participant_recording_location(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    record: &ParticipantRecord,
+) -> ParticipantRecordingLocation {
+    if record.recording_state == NOT_RECORDED_PARTICIPANT_RECORDING_STATE {
+        return ParticipantRecordingLocation::not_recorded();
+    }
+    let configured = state
+        .stages
+        .get(stage_arn)
+        .map(|stage| {
+            stage
+                .auto_participant_recording_configuration
+                .storage_configuration_arn
+                .as_str()
+        })
+        .filter(|arn| *arn != NO_STORAGE_CONFIGURATION_ARN)
+        .and_then(|arn| state.storage_configurations.get(arn));
+    match configured {
+        Some(configuration) => ParticipantRecordingLocation {
+            bucket_name: configuration.bucket_name.clone(),
+            prefix: participant_recording_prefix(session_id, &record.participant_id),
+        },
+        None => ParticipantRecordingLocation::not_recorded(),
+    }
+}
+
+/// The ingest configuration the participant `record` of `stage_arn` broadcasts with, or
+/// `None` when it broadcasts with none.
+///
+/// The one its join named, and otherwise one of `stage_arn`'s configurations whose ingest
+/// credentials were minted for that participant — the one predicate
+/// [`IngestConfigurationRecord::publishes_participant`] states, which
+/// [`ingest_configuration_publishers`] answers in the other direction, so what a read of
+/// a participant says about its ingest and what a read of the configuration says about
+/// its publishers cannot disagree.
+pub fn participant_ingest_configuration<'a>(
+    state: &'a ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    record: &ParticipantRecord,
+) -> Option<&'a IngestConfigurationRecord> {
+    if let Some(arn) = record.ingest_configuration_arn.as_deref() {
+        if let Some(configuration) = state.ingest_configurations.get(arn) {
+            return Some(configuration);
+        }
+    }
+    // By creation order, not by however the store happens to hold the configurations: a
+    // read of one participant must not report one configuration's protocol now and
+    // another's on the next call.
+    state
+        .ingest_configurations
+        .values()
+        .filter(|configuration| {
+            configuration.stage_arn == stage_arn && configuration.publishes_participant(record)
+        })
+        .min_by_key(|configuration| configuration.sequence)
+}
+
+/// The `ParticipantProtocol` the participant `record` of `stage_arn` broadcasts with.
+///
+/// `Participant$protocol` is the "type of ingest protocol that the participant employs
+/// for broadcasting", so it is the protocol of whatever the participant publishes
+/// through: the one the data plane observed, else the `ingestProtocol` of the ingest
+/// configuration it broadcasts with ([`participant_ingest_configuration`]) — `RTMP` or
+/// `RTMPS`, the two values that member carries — and [`PARTICIPANT_PROTOCOL_UNKNOWN`]
+/// when this store holds neither.
+pub fn participant_protocol(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    record: &ParticipantRecord,
+) -> String {
+    if let Some(protocol) = record.protocol.as_deref() {
+        return protocol.to_string();
+    }
+    participant_ingest_configuration(state, stage_arn, record)
+        .map(|configuration| configuration.ingest_protocol.clone())
+        .unwrap_or_else(|| PARTICIPANT_PROTOCOL_UNKNOWN.to_string())
 }
 
 impl ParticipantRecord {
@@ -1495,6 +1726,56 @@ impl ParticipantRecord {
             first_join_time: Some(::aws_smithy_types::DateTime::from(self.first_join_time)),
             published: self.published,
             recording_state: Some(self.recording_state.clone()),
+            replication_type: Some(self.replication_type.clone()),
+            replication_state: self.replication_state.clone(),
+            source_stage_arn: self.source_stage_arn.clone(),
+            source_session_id: self.source_session_id.clone(),
+            redundant_ingest: self.redundant_ingest,
+            ingest_configuration_arn: self.ingest_configuration_arn.clone(),
+        }
+    }
+
+    /// The modelled `Participant` this record reports — what `GetParticipant` answers,
+    /// read against `store` for the session `session_id` of `stage_arn`.
+    ///
+    /// Every member `ParticipantSummary` also carries is reported exactly as
+    /// [`Self::to_summary`] reports it, so a read of one participant and the page it
+    /// appears in cannot disagree about it. The members only `Participant` carries come
+    /// from the same record — the attributes the join supplied and what it observed about
+    /// the client — except the two that are not stored values but facts about the stage
+    /// right now: where the participant's media is being recorded
+    /// ([`participant_recording_location`]) and the protocol it broadcasts with
+    /// ([`participant_protocol`]), both computed on every read.
+    pub fn to_participant(
+        &self,
+        store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+        stage_arn: &str,
+        session_id: &str,
+    ) -> Participant {
+        let recording = participant_recording_location(store, stage_arn, session_id, self);
+        Participant {
+            participant_id: Some(self.participant_id.clone()),
+            // Reported only when the token named one, exactly as on a summary.
+            user_id: self.user_id.clone(),
+            state: Some(self.state.clone()),
+            first_join_time: Some(::aws_smithy_types::DateTime::from(self.first_join_time)),
+            // Reported only when the participant's identity carried attributes, the same
+            // way a participant token's and an ingest configuration's are: the member is
+            // optional, and an absent member is how the model says "none".
+            attributes: (!self.attributes.is_empty()).then(|| self.attributes.clone()),
+            published: self.published,
+            isp_name: self.client.isp_name.clone(),
+            os_name: self.client.os_name.clone(),
+            os_version: self.client.os_version.clone(),
+            browser_name: self.client.browser_name.clone(),
+            browser_version: self.client.browser_version.clone(),
+            sdk_version: self.client.sdk_version.clone(),
+            // Always reported, the empty value included: both members document that
+            // empty string as what a participant nothing records carries.
+            recording_s3_bucket_name: Some(recording.bucket_name),
+            recording_s3_prefix: Some(recording.prefix),
+            recording_state: Some(self.recording_state.clone()),
+            protocol: Some(participant_protocol(store, stage_arn, self)),
             replication_type: Some(self.replication_type.clone()),
             replication_state: self.replication_state.clone(),
             source_stage_arn: self.source_stage_arn.clone(),
@@ -1696,8 +1977,8 @@ pub struct ParticipantReplicaRecord {
     /// merged with any attributes set for this participant when creating the token. If
     /// there is overlap in keys, the values in these attributes are replaced."). No
     /// member of `ParticipantReplica` reports them; the participant operations
-    /// (`GetParticipant` / `ListParticipants`, each its own gap issue) are what report a
-    /// replica participant's attributes.
+    /// (`GetParticipant` / `ListParticipants`) are what report a replica participant's
+    /// attributes.
     pub attributes: HashMap<String, String>,
     /// When replication started. Reported by no member of `ParticipantReplica`, and
     /// recorded for the same reason [`StageRecord::created_at`] is.
@@ -1831,6 +2112,13 @@ pub struct JoinedParticipant {
     pub redundant_ingest: bool,
     /// The ingest configuration it broadcast with, when it used one.
     pub ingest_configuration_arn: Option<String>,
+    /// What the data plane observed about the joining client; see
+    /// [`ParticipantClient`]. Nothing observed is the default.
+    pub client: ParticipantClient,
+    /// The broadcast protocol it was seen publishing with, when the data plane saw one
+    /// — one of the values the modelled `ParticipantProtocol` carries. `None` leaves
+    /// [`participant_protocol`] to resolve it.
+    pub protocol: Option<String>,
 }
 
 /// Record the participant `joined` describes joining `stage_arn`, opening a session
@@ -1889,6 +2177,16 @@ pub fn join_stage_session(
             rejoined.redundant_ingest = joined.redundant_ingest;
             if joined.ingest_configuration_arn.is_some() {
                 rejoined.ingest_configuration_arn = joined.ingest_configuration_arn.clone();
+            }
+            // A rejoin is a fresh connection, so what the data plane observes about it
+            // — the client it came from and the protocol it publishes with — is what
+            // the participant carries from now on. A member this connection did not
+            // observe leaves the earlier observation standing, the rule every other
+            // optional member of this block follows
+            // ([`ParticipantClient::observe`]).
+            rejoined.client.observe(&joined.client);
+            if joined.protocol.is_some() {
+                rejoined.protocol = joined.protocol.clone();
             }
             Some(rejoined.clone())
         } else {
@@ -1961,6 +2259,8 @@ fn new_participant_record(
         source_session_id: None,
         redundant_ingest: joined.redundant_ingest,
         ingest_configuration_arn: joined.ingest_configuration_arn,
+        client: joined.client,
+        protocol: joined.protocol,
         sequence,
     };
     session_mut(state, stage_arn, session_id)?
@@ -2664,9 +2964,7 @@ pub fn ingest_configuration_publishers(
             if participant.state != PARTICIPANT_STATE_CONNECTED {
                 continue;
             }
-            let publishes_with_configuration = participant.ingest_configuration_arn.as_deref()
-                == Some(configuration.arn.as_str())
-                || configuration.mints_participant(&participant.participant_id);
+            let publishes_with_configuration = configuration.publishes_participant(participant);
             if publishes_with_configuration {
                 publishers.push(IngestPublisher {
                     session_id: session.session_id.clone(),

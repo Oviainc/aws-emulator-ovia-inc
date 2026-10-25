@@ -23,6 +23,8 @@ mod ip_set_mutations;
 mod list_rule_groups;
 #[path = "all/managed_products.rs"]
 mod managed_products;
+#[path = "all/managed_rule_group_description.rs"]
+mod managed_rule_group_description;
 #[path = "all/managed_rule_group_versions.rs"]
 mod managed_rule_group_versions;
 #[path = "all/managed_rule_groups.rs"]

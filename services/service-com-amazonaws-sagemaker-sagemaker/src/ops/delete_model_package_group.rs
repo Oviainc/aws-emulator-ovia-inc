@@ -168,9 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "model-package-group",
                 name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Model Package Group \"{arn}\" does not exist."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::entity_does_not_exist(
+                    crate::state::MODEL_PACKAGE_GROUP_ENTITY,
+                    &arn,
+                ),
+            ));
         };
         let arn = group.arn.clone();
 
@@ -178,17 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`ModelPackage::group_name`), so it cannot go while any version is still stored:
         // those versions would be unreachable through the group they belong to, and a later
         // create of the same name would adopt them. Recorded AWS classifies this refusal as
-        // a 400 `ValidationException` rather than as the modelled `ConflictException`.
-        let versions = store
+        // a 400 `ValidationException` rather than as the modelled `ConflictException`, and
+        // words it from the resolved group ARN plus the fixed clause below — no count and no
+        // remediation sentence, both of which would be values the real service never reports
+        // here, and the count would additionally change with the group's contents.
+        let contains_versions = store
             .model_packages
             .values()
-            .filter(|package| package.group_name.as_deref() == Some(name))
-            .count();
-        if versions > 0 {
+            .any(|package| package.group_name.as_deref() == Some(name));
+        if contains_versions {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Model Package Group \"{arn}\" cannot be deleted because it contains \
-                 {versions} model package version(s). Delete the model packages in the \
-                 group first."
+                "Model Package Group {arn} cannot be deleted because it still contains \
+                 Model Packages."
             )));
         }
 

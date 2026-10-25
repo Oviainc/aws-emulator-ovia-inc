@@ -751,6 +751,50 @@ pub const COMMIT_ID_REQUIRED_MESSAGE: &str = "A commit ID was not specified.";
 /// sentence, worded here once for every operation that raises the code.
 pub const INVALID_COMMIT_ID_MESSAGE: &str = "The specified commit ID is not valid.";
 
+/// Why a commit id named in a request addresses no commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitIdProblem {
+    /// The id is absent (empty): the operations model
+    /// `CommitIdRequiredException` for this.
+    Missing,
+    /// The id is not a git object name: `InvalidCommitIdException`.
+    Invalid,
+}
+
+impl CommitIdProblem {
+    /// What the refusal says. Each sentence is the one this crate words that code
+    /// with ([`COMMIT_ID_REQUIRED_MESSAGE`], [`INVALID_COMMIT_ID_MESSAGE`]), which
+    /// `crate::service` also uses when the request boundary refuses the member:
+    /// one code, one message, and nothing naming the emulator's own validator.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Missing => COMMIT_ID_REQUIRED_MESSAGE,
+            Self::Invalid => INVALID_COMMIT_ID_MESSAGE,
+        }
+    }
+}
+
+/// Does this commit id address a commit at all? The model leaves `CommitId`
+/// unconstrained, so every operation that takes one classifies it here and only
+/// maps the outcome onto the error IT models for that code.
+pub fn checked_commit_id(commit_id: &str) -> Result<(), CommitIdProblem> {
+    if commit_id.is_empty() {
+        return Err(CommitIdProblem::Missing);
+    }
+    if !is_object_id(commit_id) {
+        return Err(CommitIdProblem::Invalid);
+    }
+    Ok(())
+}
+
+/// `BeforeCommitIdAndAfterCommitIdAreSameException`'s message: the sentence pair
+/// the model states for that error shape, naming neither commit. The one place
+/// this crate words that code, so the operations that compare the two sides of a
+/// comparison cannot word it differently.
+pub const BEFORE_AND_AFTER_COMMIT_ID_SAME_MESSAGE: &str =
+    "The before commit ID and the after commit ID are the same, which is not valid. The before \
+     commit ID and the after commit ID must be different commit IDs.";
+
 /// The file a commit leaves behind in a folder that its deletions emptied, when the
 /// caller asked to keep the folder. CodeCommit documents `keepEmptyFolders`: "If
 /// true, a ..gitkeep file is created for empty folders."
@@ -1139,6 +1183,12 @@ pub struct CommentRecord {
     pub author_arn: String,
     pub deleted: bool,
     pub client_request_token: Option<String>,
+    /// The pull request this comment was posted ON, for a comment posted on one;
+    /// `None` for a comment posted on a commit comparison alone. A pull request
+    /// comment is filed under a comparison too — the two commits the pull request
+    /// is between — so this is what tells the two kinds of comment apart, and a
+    /// read of a comparison's comments reports only the comparison's own.
+    pub pull_request_id: Option<u64>,
     pub comparison: ComparedCommit,
     pub location: Option<Location>,
     /// The emoji reactions left on this comment, keyed by the ARN of the
@@ -1217,6 +1267,235 @@ pub fn line_count(content: &[u8]) -> i64 {
     let separators = content.iter().filter(|byte| **byte == b'\n').count();
     let trailing = usize::from(!content.ends_with(b"\n"));
     i64::try_from(separators + trailing).unwrap_or(i64::MAX)
+}
+
+/// Why the content a comment is posted with cannot be accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentContentProblem {
+    /// Nothing was written: the operations model
+    /// `CommentContentRequiredException` for this.
+    Required,
+    /// Past [`MAX_COMMENT_CHARACTERS`]:
+    /// `CommentContentSizeLimitExceededException`.
+    TooLarge,
+}
+
+impl CommentContentProblem {
+    /// What the refusal says. Worded here once, so every operation that posts a
+    /// comment answers the same text for the same code.
+    pub fn message(self) -> String {
+        match self {
+            Self::Required => COMMENT_CONTENT_REQUIRED_MESSAGE.to_string(),
+            Self::TooLarge => format!(
+                "the comment is too large: comments are limited to {MAX_COMMENT_CHARACTERS} characters"
+            ),
+        }
+    }
+}
+
+/// Is this content a comment this service accepts? The model puts no length bound
+/// on `Content`, so both bounds are checked here — the one place every operation
+/// that posts a comment classifies its content.
+pub fn checked_comment_content(content: &str) -> Result<(), CommentContentProblem> {
+    if content.is_empty() {
+        return Err(CommentContentProblem::Required);
+    }
+    if content.chars().count() > MAX_COMMENT_CHARACTERS {
+        return Err(CommentContentProblem::TooLarge);
+    }
+    Ok(())
+}
+
+/// Why the `location` a comment names is not a place in a comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentLocationProblem {
+    /// The location names a position or a version but no file at all:
+    /// `InvalidFileLocationException`.
+    FileLocation,
+    /// `PathRequiredException`.
+    PathRequired,
+    /// `InvalidPathException`, carrying the path as the request spelled it.
+    InvalidPath(String),
+    /// A `relativeFileVersion` outside [`RELATIVE_FILE_VERSION_BEFORE`] and
+    /// [`RELATIVE_FILE_VERSION_AFTER`]: `InvalidRelativeFileVersionEnumException`.
+    RelativeFileVersion(String),
+    /// A position below the first line: `InvalidFilePositionException`.
+    FilePosition,
+}
+
+impl CommentLocationProblem {
+    /// What the refusal says, worded here once for every operation that places a
+    /// comment.
+    pub fn message(&self) -> String {
+        match self {
+            Self::FileLocation => {
+                "the location of the file is not valid: it names no file path".to_string()
+            }
+            Self::PathRequired => "a file path is required".to_string(),
+            Self::InvalidPath(file_path) => format!("the path {file_path} is not valid"),
+            Self::RelativeFileVersion(version) => format!(
+                "the relative file version {version} is not valid: expected {RELATIVE_FILE_VERSION_BEFORE} or {RELATIVE_FILE_VERSION_AFTER}"
+            ),
+            Self::FilePosition => {
+                "the position is not valid: a line number starts at 1".to_string()
+            }
+        }
+    }
+}
+
+/// The place a comment is posted at, as this service HOLDS it, or why the request
+/// names no such place.
+///
+/// The file path is reduced to the form a git tree holds (as `GetFile` does), so
+/// the same file is the same location however it is spelled. A location naming
+/// nothing at all places the comment nowhere, so it is the same as leaving the
+/// optional member out. Every operation that posts a comment normalizes its
+/// location here, so they cannot disagree about where a comment sits.
+pub fn normalized_comment_location(
+    location: Option<Location>,
+) -> Result<Option<Location>, CommentLocationProblem> {
+    let mut location =
+        location.filter(|location| location_key(Some(location)) != (None, None, None));
+    let Some(place) = location.as_mut() else {
+        return Ok(None);
+    };
+    if place.file_path.is_none()
+        && (place.file_position.is_some() || place.relative_file_version.is_some())
+    {
+        return Err(CommentLocationProblem::FileLocation);
+    }
+    if let Some(file_path) = place.file_path.as_deref() {
+        place.file_path = Some(match normalize_path(file_path) {
+            Ok(path) => path,
+            Err(PathProblem::Missing) => return Err(CommentLocationProblem::PathRequired),
+            Err(PathProblem::Invalid) => {
+                return Err(CommentLocationProblem::InvalidPath(file_path.to_string()))
+            }
+        });
+    }
+    // `RelativeFileVersionEnum` is an enum, so a value outside it is already
+    // refused at the boundary; this keeps the invariant explicit for every caller.
+    if let Some(version) = place.relative_file_version.as_deref() {
+        if version != RELATIVE_FILE_VERSION_BEFORE && version != RELATIVE_FILE_VERSION_AFTER {
+            return Err(CommentLocationProblem::RelativeFileVersion(
+                version.to_string(),
+            ));
+        }
+    }
+    // A line number starts at 1, so a position below that names no line.
+    if place.file_position.is_some_and(|position| position < 1) {
+        return Err(CommentLocationProblem::FilePosition);
+    }
+    Ok(location)
+}
+
+/// Why a comment cannot be anchored in the comparison its request names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentAnchorProblem {
+    /// The commented version of the comparison holds no such file:
+    /// `PathDoesNotExistException`.
+    PathDoesNotExist { file_path: String, version: String },
+    /// The position names no line of the commented version of the file:
+    /// `InvalidFilePositionException`.
+    FilePosition {
+        file_path: String,
+        version: String,
+        position: i64,
+        lines: i64,
+    },
+    /// The before version was asked for in a comparison that has no before
+    /// commit: `InvalidRelativeFileVersionEnumException`.
+    NoBeforeVersion,
+}
+
+impl CommentAnchorProblem {
+    /// What the refusal says, worded here once for every operation that anchors a
+    /// comment.
+    pub fn message(&self) -> String {
+        match self {
+            Self::PathDoesNotExist { file_path, version } => format!(
+                "the path {file_path} does not exist in the {version} version of the comparison"
+            ),
+            Self::FilePosition {
+                file_path,
+                version,
+                position,
+                lines,
+            } => format!(
+                "the position {position} is not valid: {file_path} has {lines} line(s) in the \
+                 {version} version of the comparison"
+            ),
+            Self::NoBeforeVersion => format!(
+                "the relative file version {RELATIVE_FILE_VERSION_BEFORE} is not valid for a \
+                 comparison with no before commit"
+            ),
+        }
+    }
+}
+
+/// The blobs a comment is anchored to, as `(beforeBlobId, afterBlobId)`: the
+/// commented file's blob in each side of the comparison, read out of the two
+/// commits' stored tree snapshots.
+///
+/// A comment that names no file is anchored to no blob, so both are absent. The
+/// version the comment is ON — `relativeFileVersion`, which defaults to the after
+/// side of the comparison — is the one whose stored blob has to hold the path, and
+/// whose own line count bounds the position the location may name ("Make sure that
+/// the line number exists in the version of the file you want to comment on").
+///
+/// Both commits are assumed to be commits this repository holds: a caller checks
+/// that first, because the error it answers for a commit the repository never had
+/// is its own.
+pub fn comment_anchor(
+    repository: &Repository,
+    before_commit_id: Option<&str>,
+    after_commit_id: &str,
+    location: Option<&Location>,
+) -> Result<(Option<String>, Option<String>), CommentAnchorProblem> {
+    let Some(file_path) = location.and_then(|location| location.file_path.as_deref()) else {
+        return Ok((None, None));
+    };
+    let entry_in = |commit_id: &str| {
+        repository
+            .commits
+            .get(commit_id)
+            .and_then(|commit| commit.files.get(file_path))
+            .cloned()
+    };
+    let before_entry = before_commit_id.and_then(entry_in);
+    let after_entry = entry_in(after_commit_id);
+
+    let version = location
+        .and_then(|location| location.relative_file_version.clone())
+        .unwrap_or_else(|| RELATIVE_FILE_VERSION_AFTER.to_string());
+    let commented = if version == RELATIVE_FILE_VERSION_BEFORE {
+        if before_commit_id.is_none() {
+            // There is no before side to comment on.
+            return Err(CommentAnchorProblem::NoBeforeVersion);
+        }
+        before_entry.clone()
+    } else {
+        after_entry.clone()
+    };
+    let commented = commented.ok_or_else(|| CommentAnchorProblem::PathDoesNotExist {
+        file_path: file_path.to_string(),
+        version: version.clone(),
+    })?;
+    if let Some(position) = location.and_then(|location| location.file_position) {
+        let lines = repository.blob(&commented.blob_id).map_or(0, line_count);
+        if position > lines {
+            return Err(CommentAnchorProblem::FilePosition {
+                file_path: file_path.to_string(),
+                version,
+                position,
+                lines,
+            });
+        }
+    }
+    Ok((
+        before_entry.map(|entry| entry.blob_id),
+        after_entry.map(|entry| entry.blob_id),
+    ))
 }
 
 impl Repository {
@@ -2242,6 +2521,18 @@ pub const INVALID_PULL_REQUEST_ID_MESSAGE: &str =
 /// `PullRequestIdRequiredException`'s message: a FIXED sentence.
 pub const PULL_REQUEST_ID_REQUIRED_MESSAGE: &str =
     "A pull request ID is required, but none was provided.";
+
+/// `RepositoryNotAssociatedWithPullRequestException`'s message: the sentence pair
+/// the model states for that error shape, echoing nothing from the request.
+///
+/// The one place this crate words that code, for the same reason
+/// [`pull_request_does_not_exist_message`] is the one place it words its own: a
+/// pull request that exists but belongs to another repository is refused the same
+/// way by every operation that takes both a `repositoryName` and a
+/// `pullRequestId`.
+pub const REPOSITORY_NOT_ASSOCIATED_WITH_PULL_REQUEST_MESSAGE: &str =
+    "The repository does not contain any pull requests with that pull request ID. Use \
+     GetPullRequest to verify the correct repository name for the pull request ID.";
 
 /// `ReferenceNameRequiredException`'s message: a FIXED sentence.
 ///

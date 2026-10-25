@@ -198,9 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeHyperParameterTuningJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Could not find hyperparameter tuning job \"{}\".",
-                        input.hyper_parameter_tuning_job_name
+                    message: Some(crate::state::tuning_job_not_found(
+                        &input.hyper_parameter_tuning_job_name,
                     )),
                 },
             )

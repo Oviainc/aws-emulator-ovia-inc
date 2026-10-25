@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds the request's tags to the resource its `WorkloadArn` names — a
+//! workload, a custom lens, a profile, a review template or an agent profile, resolved
+//! through [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resource_tags_mut`],
+//! the write twin of the lookup `ListTagsForResource` reads through. The tags are MERGED
+//! into the resource's stored tag map — "Adds one or more tags to the specified
+//! resource" — so a key the resource already carries takes the request's value and every
+//! other key it carries survives, which is what [`crate::ops::list_tags_for_resource`]
+//! reports back. An ARN that names no resource this store holds answers
+//! `ResourceNotFoundException`, and a request that would push the resource past
+//! `TagMap`'s maximum is refused before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +136,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool resource store is unavailable".to_string(),
+            })
+        })?;
+
+        // `TagMap`'s keys are unique on the wire, so the request's own pairs need no
+        // de-duplication; a `BTreeMap` is how every stored tag map here is held, so the
+        // tags of a resource are reported in one stable order.
+        let tags: std::collections::BTreeMap<String, String> = input.tags.into_iter().collect();
+
+        let mut store = state.lock();
+        let stored = store
+            .resource_tags_mut(&input.workload_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::tagged_resource_not_found(&input.workload_arn),
+                )
+            })?;
+
+        // A resource holds at most `TagMap`'s own maximum of tags — the boundary
+        // enforces that on the map a REQUEST carries, and the same ceiling bounds what
+        // the resource ends up holding. Counted and worded by the shared helpers beside
+        // `MAX_TAGS_PER_RESOURCE`, so this and `ImportLens`'s tag write cannot drift,
+        // and checked BEFORE anything is written, so a refused request leaves the
+        // resource's tags exactly as they were.
+        if crate::state::merged_tag_count(stored, &tags) > crate::state::MAX_TAGS_PER_RESOURCE {
+            // This operation models no client-input error (only `ResourceNotFound` and
+            // `InternalServer`), so the refusal goes through the service's 400
+            // `ValidationException` channel, worded like a modelled member-constraint
+            // failure. A 501 would be the wrong answer: the operation IS written, the
+            // request asks for more tags than a resource can hold.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::constraint_sentence(
+                    crate::state::TAGS_MEMBER,
+                    &crate::state::tag_ceiling_constraint("the resource"),
+                ),
+            ));
+        }
+
+        // "Adds one or more tags to the specified resource": the request's pairs are
+        // added to the ones the resource carries, a repeated key taking the new value.
+        stored.extend(tags);
+        Ok(TagResourceOutput {})
     }
 }

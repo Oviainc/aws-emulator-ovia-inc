@@ -284,6 +284,21 @@ pub fn invalid_source_message(name: &str) -> String {
     )
 }
 
+/// A put refused because the stream it named is not accepting data: the stream the
+/// request named and the account the put was scoped to.
+///
+/// Like [`invalid_source_message`], this one DOES name the stream: the refusal is about a
+/// stream the caller already named successfully, so the sentence discloses nothing a
+/// caller enumerating names could not learn from the lookup itself. The state the stream
+/// is in is not part of the sentence — the data plane states that the stream is not
+/// active, whichever non-`ACTIVE` state that is.
+pub fn not_active_message(name: &str) -> String {
+    format!(
+        "Firehose {name} is not active in {} account.",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// A delete the stream's current state blocks: the name, the account and the state that
 /// blocks it, stated for whatever that state is rather than asserting a precondition of
 /// its own.

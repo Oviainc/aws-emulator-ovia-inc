@@ -184,14 +184,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         })?;
 
-        let resource = resolved.arn;
-        let Some(policy) = resolved.version.policy.as_ref() else {
+        let Some(policy) = resolved
+            .version
+            .policy
+            .as_ref()
+            .filter(|policy| !policy.statements.is_empty())
+        else {
+            // The layer version EXISTS — it was just resolved out of the store — so what
+            // is absent is its policy, not the resource, and the refusal says which of
+            // the two no-policy states it is in rather than reporting the layer version
+            // as one this account does not hold.
             return Err(GetLayerVersionPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "The resource you requested does not exist. Resource: {resource}"
-                    )),
+                    message: resolved.version.policy_read_absence_message(&resolved.arn),
                 },
             )
             .into());

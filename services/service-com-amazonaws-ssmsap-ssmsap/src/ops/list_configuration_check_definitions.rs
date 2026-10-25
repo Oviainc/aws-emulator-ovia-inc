@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationCheckDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationCheckDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationCheckDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration check catalogue this service supports: one
+//! `ConfigurationCheckDefinition` per check
+//! ([`crate::state::configuration_check_definitions`]), handed out in pages of at most
+//! `MaxResults` by [`crate::state::page`], so a `NextToken` resumes exactly where the
+//! previous page stopped.
+//!
+//! The catalogue is the SERVICE's own — which checks exist to run, not what an account
+//! has run — so it is derived from the model's `ConfigurationCheckType` enum and is the
+//! same set `StartConfigurationChecks` starts when a request names no check
+//! ([`crate::state::configuration_checks_to_run`]). It is therefore identical for every
+//! caller and every Region: this listing resolves no per-account record and writes
+//! nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +147,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationCheckDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationCheckDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationCheckDefinitions"))
+        // What this listing reports is the catalogue of checks the SERVICE supports, of
+        // which no account and no Region holds a record: it is the same set
+        // `StartConfigurationChecks` runs, so neither the store nor the Region the
+        // request was signed for can narrow it — which is why this handler resolves
+        // neither.
+        let _ = (ctx, &self.engine);
+        let definitions = crate::state::configuration_check_definitions();
+
+        // The page the request asked for, taken by the pager every listing of this
+        // service shares: at most `MaxResults` definitions, with a `NextToken` only
+        // while further ones remain, and a token this service did not issue refused as
+        // the `ValidationException` this operation models rather than resumed from.
+        let page = crate::state::page(definitions, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListConfigurationCheckDefinitionsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListConfigurationCheckDefinitionsOutput {
+            configuration_checks: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

@@ -125,6 +125,9 @@ mod profile_reads;
 #[path = "all/question_choice_catalog.rs"]
 mod question_choice_catalog;
 
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

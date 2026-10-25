@@ -45,6 +45,8 @@ mod rule_groups_namespace_update;
 mod scraper_deletion;
 #[path = "all/scraper_listing.rs"]
 mod scraper_listing;
+#[path = "all/scraper_logging_configuration_deletion.rs"]
+mod scraper_logging_configuration_deletion;
 #[path = "all/scraper_update.rs"]
 mod scraper_update;
 #[path = "all/state_roundtrip.rs"]

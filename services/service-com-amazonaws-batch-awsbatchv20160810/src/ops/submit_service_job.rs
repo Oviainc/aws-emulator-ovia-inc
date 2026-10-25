@@ -370,13 +370,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// of a `clientToken` can be told apart from the same token carrying a different payload
 /// ("two submit requests with identical payloads and `clientToken`s").
 ///
-/// SHA-256 over the request's members (the `sha2` crate, hex-encoded with `hex`, as
-/// [`crate::state::new_uuid`] does), each separated by a NUL so two members cannot run
-/// together into the same bytes. `tags` is a map, whose iteration order is not stable, so
-/// it is collected into a `BTreeMap` first: the digest must depend on what the request
-/// says, never on how it happened to be iterated.
+/// The digest itself is [`crate::state::request_members_digest`]; what this builds is the
+/// member list. `tags` is a map, whose iteration order is not stable, so it is collected
+/// into a `BTreeMap` first: the digest must depend on what the request says, never on how
+/// it happened to be iterated.
 fn request_digest(input: &SubmitServiceJobInput) -> String {
-    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
 
     let tags: BTreeMap<&str, &str> = input
@@ -385,8 +383,7 @@ fn request_digest(input: &SubmitServiceJobInput) -> String {
         .flatten()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
-    let mut hasher = Sha256::new();
-    for part in [
+    crate::state::request_members_digest([
         input.job_name.clone(),
         input.job_queue.clone(),
         input.service_job_type.clone(),
@@ -398,9 +395,5 @@ fn request_digest(input: &SubmitServiceJobInput) -> String {
         format!("{:?}", input.timeout_config),
         format!("{:?}", input.preemption_configuration),
         format!("{tags:?}"),
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update([0_u8]);
-    }
-    hex::encode(hasher.finalize())
+    ])
 }

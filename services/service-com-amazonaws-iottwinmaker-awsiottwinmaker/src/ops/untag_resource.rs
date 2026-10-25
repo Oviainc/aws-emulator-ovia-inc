@@ -9,6 +9,11 @@
 //! parameter, and the tags are the same set `TagResource` writes and
 //! `ListTagsForResource` reads.
 //!
+//! A key in the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`],
+//! matched however it is cased) names a tag Amazon Web Services owns, which a caller
+//! may not remove, so a call naming one is refused with `ValidationException`
+//! (HTTP 400) and NONE of the named keys is removed.
+//!
 //! An ARN that names no stored resource is refused with `ResourceNotFoundException`
 //! (HTTP 404).
 //!
@@ -84,15 +89,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // (every other operation of it declares it) but `UntagResource`'s own error list omits
 // it, and an unreachable shared store is a server fault this handler must be able to
 // report as one rather than as a client error it is not.
+// `ValidationException` is widened in for the same reason: the service models the shape
+// (HTTP 400, declared by every create of it) and a request naming a tag key in the
+// reserved namespace is a bad request this handler has to be able to refuse as one.
 #[smithy_macros::operation_error(
     "com.amazonaws.iottwinmaker#UntagResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,6 +164,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "serving a request"
         );
         let _ = ctx;
+
+        // A key in the reserved namespace is AWS's own: a caller may no more
+        // delete one than create it. Decided on the request alone, before the
+        // store is reached, and over the whole list, so a request mixing a legal
+        // key with a reserved one removes neither.
+        if let Some(message) = crate::state::reserved_tag_keys_violation(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),

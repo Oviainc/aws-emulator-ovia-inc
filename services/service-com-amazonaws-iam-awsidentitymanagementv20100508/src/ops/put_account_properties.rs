@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation persists the account-level properties `GetAccountProperties`
+//! reports.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountPropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only: the properties are account-wide and
+        // IAM is global, so nothing in it selects what is written.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAccountPropertiesErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The request's pairs in a total key order, so the refusals below name the
+        // same key however the request's map happened to be ordered on the wire.
+        let supplied: ::std::collections::BTreeMap<String, String> =
+            input.properties.into_iter().collect();
+
+        // A key is within the published length and alphabet of
+        // `accountPropertyKeyType`, and is in the format "Namespace/PropertyName"
+        // with "exactly one / separating the namespace from the property name", so a
+        // key outside either is "an invalid … value … supplied for an input
+        // parameter". A map key's own constraints are outside the framework's
+        // constraint walk, so this is where they are taken; both rules live once in
+        // `crate::state`, and each refusal names the key and the rule it broke.
+        let mut namespaces = ::std::collections::BTreeSet::new();
+        for key in supplied.keys() {
+            if !crate::state::is_account_property_key_shape(key) {
+                return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Property key must be at most {} characters of letters, digits, \
+                             underscores, dashes and the namespace separator /, beginning \
+                             with a letter: {key}",
+                            crate::state::MAX_ACCOUNT_PROPERTY_KEY_CHARACTERS
+                        )),
+                    },
+                )
+                .into());
+            }
+            let Some(namespace) = crate::state::account_property_namespace(key) else {
+                return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Property key must be in format Namespace/PropertyName: {key}"
+                        )),
+                    },
+                )
+                .into());
+            };
+            namespaces.insert(namespace);
+        }
+
+        // "All keys must belong to the same namespace", so a request spanning two is
+        // refused as a whole and writes nothing. Namespaces compare exactly: the key
+        // alphabet admits both cases and nothing documents a case-insensitive
+        // namespace, so two spellings are two namespaces, as the keys themselves are
+        // stored verbatim.
+        if namespaces.len() > 1 {
+            let spanned: Vec<&str> = namespaces.into_iter().collect();
+            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "All account property keys must belong to the same namespace, \
+                         but the request spans {}",
+                        spanned.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The write: each supplied key SETS that property, so a key the account
+        // already holds takes the new value and a key it does not hold is added.
+        // Properties the request does not name are left alone — this call sets the
+        // properties it carries, and a request carries only one namespace, so it can
+        // say nothing about any other.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountProperties"))
+        // `ConcurrentModificationException` is the refusal for "multiple requests to
+        // change this object … submitted simultaneously"; the store serialises every
+        // write under its own lock, so no caller here observes a partial one.
+        let mut store = state.lock();
+
+        // The bound an account's property set is held to
+        // (`crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT`), taken against what the
+        // account would hold AFTER the write, under the same lock the write takes:
+        // re-setting held keys is therefore never refused, while a write of fresh
+        // keys past the bound is refused as a whole and stores nothing.
+        let would_hold = store
+            .account_properties
+            .keys()
+            .filter(|held| !supplied.contains_key(held.as_str()))
+            .count()
+            + supplied.len();
+        if would_hold > crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT {
+            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Cannot hold more than {} account properties, and this request \
+                         would hold {would_hold}",
+                        crate::state::MAX_ACCOUNT_PROPERTIES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in supplied {
+            store.account_properties.insert(key, value);
+        }
+        Ok(PutAccountPropertiesOutput {})
     }
 }

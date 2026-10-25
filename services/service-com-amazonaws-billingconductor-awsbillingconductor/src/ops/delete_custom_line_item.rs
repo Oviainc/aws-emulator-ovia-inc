@@ -4,9 +4,10 @@
 //! Removes a stored custom line item from the billing periods the request names, so a
 //! later read no longer reports it for them. A request that names no
 //! `BillingPeriodRange` deletes the item outright; one that names a range deletes it
-//! only from the periods that range covers, which narrows the span the stored item
-//! applies in and removes the record only once nothing is left of it. A range that
-//! starts outside the current or previous billing period is refused.
+//! only from the periods that range covers, so the item keeps the periods on either
+//! side of it — including the ones from the range's exclusive end on — and the record
+//! goes only once nothing is left of it. A range that starts outside the current or
+//! previous billing period is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -169,8 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation models no `ResourceNotFoundException`, so an `Arn` that names
         // no stored item is refused with the modelled `ValidationException` and the
         // reason `ValidationExceptionReason` enumerates for exactly that
-        // (`MISSING_CUSTOMLINEITEM`).
-        let Some(stored) = state.custom_line_items.get(&item_arn).cloned() else {
+        // (`MISSING_CUSTOMLINEITEM`). The record this resolves to is the one every
+        // branch below writes, so the store is reached exactly once.
+        let Some(item) = state.custom_line_items.get_mut(&item_arn) else {
             return Err(validation(
                 "MISSING_CUSTOMLINEITEM",
                 "Arn",
@@ -178,11 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let remaining = match input.billing_period_range.as_ref() {
+        // What the delete did, and whether nothing of the item is left for the record
+        // itself to hold.
+        let (outcome, gone) = match input.billing_period_range.as_ref() {
             // "Deletes the custom line item identified by the given ARN": a request
             // that names no billing periods deletes the item itself, so no read of any
             // billing period reports it again.
-            None => Remaining::Gone,
+            None => ("deleted", true),
             Some(range) => {
                 // The range is half-open, as its member names say, so an end at or
                 // before the start would name no billing period to delete the item
@@ -206,35 +210,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     return Err(validation(reason, field, message));
                 }
-                remaining_span(&stored, range)
+                // The periods the request names the item is to be deleted FROM. Taking
+                // them out of the periods the item applies in leaves it applying in
+                // every other one — including the periods from the range's exclusive
+                // end on, which the request did not name.
+                let removed = crate::state::BillingPeriodSpan::new(
+                    Some(range.inclusive_start_billing_period.clone()),
+                    range.exclusive_end_billing_period.clone(),
+                );
+                match item.remove_periods(&removed) {
+                    crate::state::PeriodsRemoval::Changed => {
+                        // The record changed, so the instant a read reports as its most
+                        // recent modification advances with it.
+                        item.last_modified_time_millis = crate::state::now_millis();
+                        // An item left applying in no billing period at all has nothing
+                        // for a read to report, so its record goes.
+                        if item.is_empty() {
+                            ("deleted", true)
+                        } else {
+                            ("narrowed", false)
+                        }
+                    }
+                    // The request named only billing periods the item never applied in,
+                    // so there is nothing of it to delete from them and no stored value
+                    // changes.
+                    crate::state::PeriodsRemoval::Unchanged => ("unchanged", false),
+                    // One stretch of billing periods more than a stored item may apply
+                    // over is a limit the request cannot get around, and nothing of it
+                    // was written.
+                    crate::state::PeriodsRemoval::AtSpanLimit => {
+                        return Err(validation(
+                            "ILLEGAL_CUSTOMLINEITEM_MODIFICATION",
+                            "BillingPeriodRange",
+                            format!(
+                                "the custom line item {item_arn} applies over at most {} \
+                                 separate ranges of billing periods",
+                                crate::state::MAX_BILLING_PERIOD_SPANS
+                            ),
+                        ));
+                    }
+                }
             }
         };
 
-        let outcome = match remaining {
-            Remaining::Gone => {
-                // One state method removes the item and everything that only existed
-                // because of it: the associations other percentage items held to it,
-                // and the idempotency entries that named it.
-                state.remove_custom_line_item(&item_arn);
-                "deleted"
-            }
-            Remaining::Narrowed {
-                inclusive_start,
-                exclusive_end,
-            } => {
-                if let Some(item) = state.custom_line_items.get_mut(&item_arn) {
-                    item.inclusive_start_billing_period = inclusive_start;
-                    item.exclusive_end_billing_period = exclusive_end;
-                    // The record changed, so the instant a read reports as its most
-                    // recent modification advances with it.
-                    item.last_modified_time_millis = crate::state::now_millis();
-                }
-                "narrowed"
-            }
-            // The request named only billing periods the item never applied in, so
-            // there is nothing of it to delete from them and no stored value changes.
-            Remaining::Unchanged => "unchanged",
-        };
+        if gone {
+            // One state method removes the item and everything that only existed
+            // because of it: the associations other percentage items held to it, and
+            // the idempotency entries that named it.
+            state.remove_custom_line_item(&item_arn);
+        }
 
         // The audit record for a state-changing call: who asked, what it addressed and
         // what it did. Never a `@sensitive` member — the item's name and its
@@ -251,82 +275,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: Some(item_arn),
         })
     }
-}
-
-/// What a delete leaves of the billing periods a stored custom line item applies in.
-///
-/// A stored item holds ONE half-open span
-/// ([`crate::state::CustomLineItemRecord`]), so deleting it from the periods a
-/// request names either leaves that span alone, narrows it, or leaves nothing of it.
-#[derive(Debug)]
-enum Remaining {
-    /// The request named only periods the item does not apply in, so it keeps the span
-    /// it had.
-    Unchanged,
-    /// The item still applies, in this narrower half-open span.
-    Narrowed {
-        inclusive_start: Option<String>,
-        exclusive_end: Option<String>,
-    },
-    /// Nothing of the item is left, so the record goes.
-    Gone,
-}
-
-/// The billing periods `item` still applies in once it is deleted from the ones `range`
-/// covers.
-///
-/// Both spans are half-open (`InclusiveStartBillingPeriod` is in the range,
-/// `ExclusiveEndBillingPeriod` is not) and an absent bound is open, exactly as
-/// [`crate::state::billing_period_range_covers`] reads them. So what is left is the
-/// item's span MINUS the request's: the part before the request's start, the part from
-/// the request's end on, or neither.
-///
-/// A request whose range ends inside the item's span would leave both parts, which one
-/// stored span cannot hold — AWS keeps each generation of an item as a version
-/// ([`crate::state::CustomLineItemVersion`]), and a generation holds ONE span — so the
-/// part before the request's start is what remains and the item ends where the delete
-/// begins.
-fn remaining_span(
-    item: &crate::state::CustomLineItemRecord,
-    range: &CustomLineItemBillingPeriodRange,
-) -> Remaining {
-    let item_start = item
-        .inclusive_start_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key);
-    let item_end = item
-        .exclusive_end_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key);
-    let delete_start = crate::state::billing_period_key(&range.inclusive_start_billing_period);
-    let delete_end = range
-        .exclusive_end_billing_period
-        .as_deref()
-        .and_then(crate::state::billing_period_key);
-
-    // Two half-open spans share a billing period only when each one starts before the
-    // other ends. The half-open bound ordering is the store's
-    // ([`crate::state::billing_period_precedes`]): an absent start is the unbounded
-    // past and an absent end the unbounded future, so either one absent orders.
-    let precedes = crate::state::billing_period_precedes;
-    if !precedes(item_start, delete_end) || !precedes(delete_start, item_end) {
-        return Remaining::Unchanged;
-    }
-    if precedes(item_start, delete_start) {
-        return Remaining::Narrowed {
-            inclusive_start: item.inclusive_start_billing_period.clone(),
-            exclusive_end: Some(range.inclusive_start_billing_period.clone()),
-        };
-    }
-    // An open-ended request deletes every period from its start on, so only a request
-    // that names an end can leave a part of the item after it.
-    if delete_end.is_some() && precedes(delete_end, item_end) {
-        return Remaining::Narrowed {
-            inclusive_start: range.exclusive_end_billing_period.clone(),
-            exclusive_end: item.exclusive_end_billing_period.clone(),
-        };
-    }
-    Remaining::Gone
 }
 
 /// Refuse the request with this operation's modelled 400 `ValidationException`, naming
