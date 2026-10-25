@@ -525,7 +525,12 @@ async fn a_torn_down_instance_is_answered_the_same_way_as_one_that_never_existed
     let created = call(
         &router,
         "CreateWorkspaceInstance",
-        json!({ "ManagedInstance": {} }),
+        json!({
+            "ManagedInstance": {
+                "ImageId": "ami-0123456789abcdef0",
+                "InstanceType": "t3.medium",
+            },
+        }),
     )
     .await;
     assert_eq!(

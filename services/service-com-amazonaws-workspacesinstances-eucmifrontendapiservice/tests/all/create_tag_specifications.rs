@@ -23,8 +23,18 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 
 use crate::workspace_instance_lifecycle::{
-    call, create, error_code, harness, list_all_ids, ok, router, stored_tags,
+    call, create, error_code, harness, launchable_managed_instance, list_all_ids, minimal_create,
+    ok, router, stored_tags,
 };
+
+/// A `ManagedInstance` this service can launch, carrying `specifications` as its
+/// `TagSpecifications`: the tag rules under test are about the tags, so every body
+/// here names the image and instance type a launch cannot be made without.
+fn configuration(specifications: Value) -> Value {
+    let mut managed_instance = launchable_managed_instance();
+    managed_instance["TagSpecifications"] = specifications;
+    managed_instance
+}
 
 /// A `TagList` body from pairs.
 fn tags(pairs: &[(&str, &str)]) -> Value {
@@ -199,7 +209,7 @@ async fn tag_specifications_tag_the_instance_the_call_creates() {
     let router = router();
 
     for row in rows() {
-        let mut managed_instance = json!({ "InstanceType": "t3.medium" });
+        let mut managed_instance = launchable_managed_instance();
         if let Some(specifications) = &row.specifications {
             managed_instance["TagSpecifications"] = specifications.clone();
         }
@@ -245,12 +255,7 @@ async fn a_specification_tags_only_the_resource_type_its_call_creates() {
 
         let instance = create(
             &router,
-            json!({
-                "ManagedInstance": {
-                    "InstanceType": "t3.medium",
-                    "TagSpecifications": [specification.clone()],
-                },
-            }),
+            json!({ "ManagedInstance": configuration(json!([specification.clone()])) }),
         )
         .await;
         let instance_tags = stored_tags(&router, &instance).await;
@@ -294,7 +299,7 @@ async fn a_specification_tags_only_the_resource_type_its_call_creates() {
 #[tokio::test]
 async fn a_reserved_key_in_a_specification_is_refused_and_creates_no_instance() {
     let router = router();
-    let existing = create(&router, json!({ "ManagedInstance": {} })).await;
+    let existing = create(&router, minimal_create()).await;
 
     // Rows from the same namespace rule the sibling `reserved_tag_keys` suite pins,
     // crossed with the resource type the specification names: the prefix is reserved
@@ -314,12 +319,7 @@ async fn a_reserved_key_in_a_specification_is_refused_and_creates_no_instance() 
             let (status, payload) = call(
                 &router,
                 "CreateWorkspaceInstance",
-                json!({
-                    "ManagedInstance": {
-                        "InstanceType": "t3.medium",
-                        "TagSpecifications": [specification],
-                    },
-                }),
+                json!({ "ManagedInstance": configuration(json!([specification])) }),
             )
             .await;
             assert_eq!(
@@ -359,7 +359,7 @@ async fn a_reserved_key_in_a_specification_is_refused_and_creates_no_instance() 
 async fn the_tag_set_a_specification_builds_cannot_exceed_what_the_model_reports() {
     let router = router();
     let limit = wsinst::state::MAX_TAGS_PER_INSTANCE;
-    let existing = create(&router, json!({ "ManagedInstance": {} })).await;
+    let existing = create(&router, minimal_create()).await;
 
     // Specifications carrying exactly the modelled maximum between them, split over
     // two specifications: stored whole and reported whole.
@@ -378,12 +378,10 @@ async fn the_tag_set_a_specification_builds_cannot_exceed_what_the_model_reports
     let id = create(
         &router,
         json!({
-            "ManagedInstance": {
-                "TagSpecifications": [
-                    { "ResourceType": "instance", "Tags": as_list(first) },
-                    { "Tags": as_list(second) },
-                ],
-            },
+            "ManagedInstance": configuration(json!([
+                { "ResourceType": "instance", "Tags": as_list(first) },
+                { "Tags": as_list(second) },
+            ])),
         }),
     )
     .await;
@@ -400,34 +398,28 @@ async fn the_tag_set_a_specification_builds_cannot_exceed_what_the_model_reports
         (
             "one key past the limit, all from specifications",
             json!({
-                "ManagedInstance": {
-                    "TagSpecifications": [
-                        { "ResourceType": "instance", "Tags": as_list(&half) },
-                        { "ResourceType": "instance", "Tags": tags(&[("one-too-many", "x")]) },
-                    ],
-                },
+                "ManagedInstance": configuration(json!([
+                    { "ResourceType": "instance", "Tags": as_list(&half) },
+                    { "ResourceType": "instance", "Tags": tags(&[("one-too-many", "x")]) },
+                ])),
             }),
         ),
         (
             "one key past the limit, split across both members",
             json!({
-                "ManagedInstance": {
-                    "TagSpecifications": [
-                        { "ResourceType": "instance", "Tags": tags(&[("one-too-many", "x")]) }
-                    ],
-                },
+                "ManagedInstance": configuration(json!([
+                    { "ResourceType": "instance", "Tags": tags(&[("one-too-many", "x")]) }
+                ])),
                 "Tags": as_list(&half),
             }),
         ),
         (
             "far past the limit, from several specifications",
             json!({
-                "ManagedInstance": {
-                    "TagSpecifications": [
-                        { "ResourceType": "instance", "Tags": as_list(&half) },
-                        { "Tags": as_list(&half.iter().map(|(k, v)| (format!("other-{k}"), v.clone())).collect::<Vec<_>>()) },
-                    ],
-                },
+                "ManagedInstance": configuration(json!([
+                    { "ResourceType": "instance", "Tags": as_list(&half) },
+                    { "Tags": as_list(&half.iter().map(|(k, v)| (format!("other-{k}"), v.clone())).collect::<Vec<_>>()) },
+                ])),
             }),
         ),
     ];

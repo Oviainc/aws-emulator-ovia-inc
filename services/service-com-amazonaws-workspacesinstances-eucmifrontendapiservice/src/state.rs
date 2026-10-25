@@ -271,6 +271,31 @@ pub const GPU_PLATFORM_TYPES: &[&str] = &[
 /// (`smithy_query(query="shape",shape="InstanceConfigurationTenancyEnum")`).
 pub const TENANCY_SHARED: &str = "SHARED";
 
+/// The `InstanceConfigurationTenancyEnum` value for an instance on hardware its
+/// account does not share, the other value of that same modelled enum.
+pub const TENANCY_DEDICATED: &str = "DEDICATED";
+
+/// The `TenancyEnum` value a `Placement` carries for shared hardware, and the one EC2
+/// places an instance under when the request names no tenancy
+/// (`smithy_query(query="shape",shape="TenancyEnum")`).
+pub const PLACEMENT_TENANCY_DEFAULT: &str = "default";
+
+/// The `InstanceConfigurationTenancyEnum` value a `Placement$Tenancy` asks for.
+///
+/// The two modelled enums name one dimension from two sides: a placement tenancy is
+/// EC2's (`default` | `dedicated` | `host`), while a catalogued configuration
+/// publishes `SHARED` | `DEDICATED`. Shared hardware is `default`; both `dedicated`
+/// (hardware dedicated to the account) and `host` (a dedicated host of the account)
+/// are hardware the account does not share, so both ask for the dedicated
+/// configuration.
+pub fn configuration_tenancy(placement_tenancy: &str) -> &'static str {
+    if placement_tenancy == PLACEMENT_TENANCY_DEFAULT {
+        TENANCY_SHARED
+    } else {
+        TENANCY_DEDICATED
+    }
+}
+
 /// Both tenancies the model declares, as the generated constant: what a family AWS
 /// also offers as a Dedicated Instance supports.
 pub const SHARED_AND_DEDICATED_TENANCY: &[&str] = INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES;
@@ -336,6 +361,22 @@ impl InstanceTypeSpec {
         CATALOG_BILLING_MODES.contains(&billing_mode)
             && self.platform_types.contains(&platform_type)
             && self.tenancies.contains(&tenancy)
+    }
+
+    /// Whether this instance type publishes any configuration carrying `tenancy` —
+    /// the tenancy half of the question a create asks, which names a tenancy (through
+    /// `Placement`) and a billing mode but no platform image.
+    pub fn supports_tenancy(&self, tenancy: &str) -> bool {
+        self.tenancies.contains(&tenancy)
+    }
+
+    /// Whether this instance type publishes a configuration carrying BOTH
+    /// `billing_mode` and `tenancy`, on any platform image it carries: the whole
+    /// question a create asks of the catalog.
+    pub fn supports_billing_mode(&self, billing_mode: &str, tenancy: &str) -> bool {
+        self.platform_types
+            .iter()
+            .any(|platform_type| self.supports(billing_mode, platform_type, tenancy))
     }
 
     /// Every configuration combination this instance type supports, as the modelled
@@ -1032,6 +1073,15 @@ pub fn instance_type_index(instance_type: &str) -> Option<usize> {
     instance_type_catalog()
         .binary_search_by(|spec| spec.instance_type.as_str().cmp(instance_type))
         .ok()
+}
+
+/// The catalog row for `instance_type`, if [`instance_type_catalog`] holds it.
+///
+/// The ONE place a request's instance type is resolved against the catalog
+/// `ListInstanceTypes` publishes, so an operation that has to decide whether the
+/// service can launch a type reads the same rows that call reports.
+pub fn instance_type_spec(instance_type: &str) -> Option<&'static InstanceTypeSpec> {
+    instance_type_index(instance_type).map(|at| &instance_type_catalog()[at])
 }
 
 /// The AWS Regions `ListRegions` reports as supporting WorkSpaces Instances, in

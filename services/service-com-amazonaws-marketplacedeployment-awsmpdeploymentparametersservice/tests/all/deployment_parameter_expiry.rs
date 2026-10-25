@@ -26,10 +26,10 @@
 //! (`PutDeploymentParameter`, `ListTagsForResource`, `TagResource`,
 //! `UntagResource`, then a repeat put) under its own identity.
 //!
-//! `expirationDate` reaches the wire as EPOCH SECONDS: the model marks the member
-//! `@timestampFormat("date-time")`, but the generated schema this emulator
-//! deserializes against carries no timestamp format, so the restJson1 default is what
-//! the wire accepts — the same form the `deployment_parameters` suite sends.
+//! `expirationDate` reaches the wire as the RFC 3339 STRING its
+//! `@timestampFormat("date-time")` declares, which is what every AWS SDK sends; each
+//! row below names the instant it means as an epoch second and `support::rfc3339`
+//! renders it. `expiration_date_wire_form` owns the wire-form rule itself.
 //!
 //! The harness (router, signed request, per-operation callers) is the one the
 //! `deployment_parameters` suite owns.
@@ -47,6 +47,7 @@ use crate::deployment_parameters::{
     emulator, error_code, is_parameter_id, list_tags, message, provision, put, tag, tag_map,
     tags_of, untag, CATALOG,
 };
+use crate::support::rfc3339;
 
 /// The status every refusal of an expired (or never-stored) parameter carries.
 const NOT_FOUND_STATUS: u16 = 404;
@@ -101,7 +102,10 @@ fn put_body(
         );
     }
     if let Some(expiration_date) = expiration_date {
-        map.insert("expirationDate".to_string(), json!(expiration_date));
+        map.insert(
+            "expirationDate".to_string(),
+            json!(rfc3339(expiration_date)),
+        );
     }
     body
 }
@@ -148,8 +152,8 @@ fn stored_expiration(
 /// One row of the expiry table: a date (or none) and whether it has already passed.
 struct Expiry {
     case: &'static str,
-    /// `expirationDate` as epoch seconds, as the wire carries it. `None` omits the
-    /// member.
+    /// The instant `expirationDate` names, as an epoch second; it reaches the wire as
+    /// the RFC 3339 string the member's format declares. `None` omits the member.
     expiration_date: Option<i64>,
     /// Whether the parameter that date names is expired at the time the row runs.
     expired: bool,
