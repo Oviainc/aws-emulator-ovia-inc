@@ -147,9 +147,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name nothing created names no job, so the delete is REFUSED with the
         // not-found failure this operation models rather than answered 200: a caller
         // reading a 200 here would be told a job it never created had just been released.
-        // The ARN that refusal names is the one this name WOULD carry, minted from the
-        // Region the request signed for, because there is no stored record to read one
-        // from.
+        // That refusal names the job name the request presented, because there is no
+        // stored record to report anything else from.
         //
         // The operation models no in-use or state failure, and its documentation names no
         // status a job must reach first ("Deletes the specified AI recommendation job."),
@@ -159,14 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ai_recommendation_jobs
             .remove(&input.ai_recommendation_job_name)
         else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::AI_RECOMMENDATION_JOB_KIND,
-                &input.ai_recommendation_job_name,
-            );
             return Err(DeleteAIRecommendationJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::ai_recommendation_job_not_found(&arn)),
+                    message: Some(crate::state::ai_recommendation_job_not_found(
+                        &input.ai_recommendation_job_name,
+                    )),
                 },
             )
             .into());
