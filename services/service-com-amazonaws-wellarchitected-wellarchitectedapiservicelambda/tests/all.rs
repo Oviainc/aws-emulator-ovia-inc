@@ -113,6 +113,9 @@ mod official_lens_catalog;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
 
+#[path = "all/profile_listing.rs"]
+mod profile_listing;
+
 #[path = "all/profile_reads.rs"]
 mod profile_reads;
 
