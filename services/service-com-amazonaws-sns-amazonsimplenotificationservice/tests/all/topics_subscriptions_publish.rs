@@ -9,8 +9,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    MAX_ATTRIBUTE_BYTES_PER_RECORD, MAX_DATA_PROTECTION_POLICY_LEN, MAX_RECORDS_PER_STORE,
-    MAX_RETAINED_DELIVERY_BYTES, MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION,
+    INVALID_NEXT_TOKEN_REFUSAL, MAX_ATTRIBUTE_BYTES_PER_RECORD, MAX_DATA_PROTECTION_POLICY_LEN,
+    MAX_RECORDS_PER_STORE, MAX_RETAINED_DELIVERY_BYTES, MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION,
 };
 use service_com_amazonaws_sns_amazonsimplenotificationservice::{
     ComAmazonawsSnsAmazonsimplenotificationserviceState as SnsState, EmulatedService,
@@ -153,6 +153,24 @@ pub(crate) fn xml_unescape(text: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+/// The text of the first `<tag>…</tag>` element inside `block`, or `""` when the
+/// element is absent or empty (`<tag/>`, `<tag></tag>`).
+///
+/// `pub(crate)` so every suite that reads an element NESTED inside a list member or a
+/// map entry — which [`Answer::elements`] cannot pair up — scrapes it the same way
+/// rather than writing another copy of this walk.
+pub(crate) fn text_of(block: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let Some(start) = block.find(&open) else {
+        return String::new();
+    };
+    let rest = &block[start + open.len()..];
+    match rest.find(&format!("</{tag}>")) {
+        Some(end) => xml_unescape(&rest[..end]),
+        None => String::new(),
+    }
 }
 
 /// Percent-encode a form value: everything but the unreserved set, so an ARN's `:`
@@ -1522,6 +1540,14 @@ async fn the_listings_page_at_the_documented_page_size() {
             "case {bad:?}: expected the InvalidParameter code, got {}",
             answer.body
         );
+        // The sentence is per error class, not per listing: every paginated SNS list
+        // refuses a token it did not mint with the same one.
+        assert_eq!(
+            answer.element("Message").as_deref(),
+            Some(INVALID_NEXT_TOKEN_REFUSAL),
+            "case {bad:?}: expected the member's refusal sentence, got {}",
+            answer.body
+        );
     }
 
     // The same rule on the subscription listing.
@@ -1563,6 +1589,26 @@ async fn the_listings_page_at_the_documented_page_size() {
         TOPICS - 100,
         "the last subscription page must hold the remainder, got {}",
         second.body
+    );
+    // A token the subscription listing did not mint is refused with the same sentence
+    // every paginated SNS list states for the member.
+    let unissued = sns
+        .call(
+            "ListSubscriptionsByTopic",
+            &[("TopicArn", &topic), ("NextToken", "not-a-token")],
+        )
+        .await;
+    assert_eq!(
+        unissued.status, 400,
+        "an unissued subscription-listing token must be 400, got {} / {}",
+        unissued.status, unissued.body
+    );
+    assert_eq!(
+        unissued.element("Message").as_deref(),
+        Some(INVALID_NEXT_TOKEN_REFUSAL),
+        "an unissued subscription-listing token: expected the member's refusal \
+         sentence, got {}",
+        unissued.body
     );
     let absent = sns
         .call(
