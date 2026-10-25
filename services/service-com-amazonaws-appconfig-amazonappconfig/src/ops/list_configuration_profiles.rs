@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A profile only exists under an application, so an unresolvable application is
         // not an empty listing: it is the 404 this operation models.
-        let Some(application) = store.applications.get(&input.application_id) else {
+        let Some(application) = store.application(&input.application_id) else {
             return Err(ListConfigurationProfilesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::application_not_found(
