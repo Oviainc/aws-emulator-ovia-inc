@@ -7,6 +7,11 @@
 //! with nothing to report (DynamoDB's delete is idempotent). An unknown — or not yet
 //! `ACTIVE` — table is `ResourceNotFoundException`.
 //!
+//! A delete that REMOVED an item from a table whose stream is enabled publishes one
+//! `REMOVE` record on that stream before this call answers
+//! ([`crate::state::publish_item_changes`]); a delete that found nothing modified no
+//! item, so it publishes nothing.
+//!
 //! Conditional deletes are served: `ConditionExpression` (or the legacy
 //! `Expected`/`ConditionalOperator`) is read against the item this delete would remove,
 //! and an unmet condition is `ConditionalCheckFailedException`, carrying that item when
@@ -369,6 +374,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let capacity = table.write_capacity(removed.as_ref(), None);
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&input.key));
+        // The change this write made reaches the table's stream before the response
+        // does, so a consumer that reads the stream after seeing this answer sees it.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(DeleteItemOutput {
             attributes: if return_old { removed } else { None },

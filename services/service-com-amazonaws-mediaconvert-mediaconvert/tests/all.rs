@@ -57,6 +57,8 @@ mod preset_listing;
 mod preset_update;
 #[path = "all/queue_capacity_validation.rs"]
 mod queue_capacity_validation;
+#[path = "all/queue_concurrency_pool.rs"]
+mod queue_concurrency_pool;
 #[path = "all/queue_deletion.rs"]
 mod queue_deletion;
 #[path = "all/queue_hopping.rs"]

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterMarketplaceModelEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterMarketplaceModelEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes a Bedrock Marketplace model endpoint's registration with Amazon Bedrock: the
+//! endpoint stops being one this service knows, so every operation that addresses it by
+//! `endpointArn` afterwards refuses it as absent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterMarketplaceModelEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A deregistration does NOT touch the SageMaker endpoint behind it — this emulator holds
+//! no SageMaker state, so the whole effect is on this service's registry
+//! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::marketplace_model_endpoints`]).
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +145,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterMarketplaceModelEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterMarketplaceModelEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterMarketplaceModelEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeregisterMarketplaceModelEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "marketplace model endpoint state is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The endpoint is addressed by its ARN, which carries its region, so the request's
+        // own signing region decides nothing here. An ARN this account holds no registered
+        // endpoint for is refused the way the sibling write
+        // `UpdateMarketplaceModelEndpoint` refuses it: 404 `ResourceNotFoundException`.
+        if store
+            .remove_marketplace_model_endpoint(&input.endpoint_arn)
+            .is_none()
+        {
+            return Err(
+                DeregisterMarketplaceModelEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::MARKETPLACE_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The output models no members: the registration is gone, and a later read of the
+        // same ARN is what reports that.
+        Ok(DeregisterMarketplaceModelEndpointOutput {})
     }
 }

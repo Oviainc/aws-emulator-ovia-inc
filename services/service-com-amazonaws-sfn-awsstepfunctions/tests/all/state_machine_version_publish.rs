@@ -18,7 +18,8 @@
 //!    nothing new, while a revision that has none takes the next number;
 //! 3. `revisionId` PINS the revision to publish: the state machine's current revision
 //!    (`INITIAL` while it has none) publishes, and any other value is
-//!    `ConflictException` (HTTP 409) that stores nothing;
+//!    `ConflictException` (HTTP 409) that stores nothing and reports the revision the
+//!    request pinned and then the one the state machine holds;
 //! 4. the ARN is judged before the lookup, and a state machine that is absent or
 //!    being deleted is the operation's own modelled refusal — never a published
 //!    version.
@@ -494,6 +495,177 @@ async fn revision_id_must_name_the_current_revision() {
             reported, owed,
             "case {case:?}: the version must snapshot the revision it was published from, got \
              {described:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a stale pin REPORTS
+// ---------------------------------------------------------------------------
+
+/// How many updates have revised the state machine before the publish — what decides
+/// which revision the refusal reports as the current one.
+enum Revised {
+    Never,
+    Once,
+    Twice,
+}
+
+/// What the mismatched pin is built from.
+enum Pin {
+    /// The revision an EARLIER update reported, which a later update moved on: the
+    /// optimistic-concurrency case, where the caller read a revision and then lost
+    /// the race.
+    Stale,
+    /// The current revision of ANOTHER state machine — a real revision of something,
+    /// but not of the state machine being published.
+    OtherMachine,
+    /// Literal text that names no revision of anything.
+    Literal(&'static str),
+}
+
+/// A publish whose `revisionId` is not the state machine's current revision reports
+/// the revision the REQUEST asked to publish and then the revision the state machine
+/// holds, so a caller can re-drive the publish from the message body — over a table
+/// varying both the pinned value and the current revision, which is what the rule
+/// generalises over.
+#[tokio::test]
+async fn a_stale_revision_pin_reports_the_requested_and_the_current_revision() {
+    let emulator = Emulator::new();
+
+    // Another state machine, revised once, so a row can pin a value that IS a
+    // revision — of a different state machine.
+    let other = create_machine(&emulator, "another-machine", HELLO_DEFINITION).await;
+    let other_revision = update_definition(&emulator, &other, GOODBYE_DEFINITION).await;
+
+    let cases: Vec<(&str, Revised, Pin)> = vec![
+        (
+            "never revised, pinned to another machine's revision",
+            Revised::Never,
+            Pin::OtherMachine,
+        ),
+        (
+            "never revised, pinned to the sentinel in the wrong case",
+            Revised::Never,
+            Pin::Literal("initial"),
+        ),
+        (
+            "never revised, pinned to nothing",
+            Revised::Never,
+            Pin::Literal(""),
+        ),
+        (
+            "revised once, pinned to the initial sentinel",
+            Revised::Once,
+            Pin::Literal(INITIAL_REVISION_ID),
+        ),
+        (
+            "revised once, pinned to a UUID that is no revision",
+            Revised::Once,
+            Pin::Literal("8e9f0a1b-2c3d-4e5f-8a9b-0c1d2e3f4a5b"),
+        ),
+        (
+            "revised twice, pinned to the revision the first update reported",
+            Revised::Twice,
+            Pin::Stale,
+        ),
+        (
+            "revised twice, pinned to another machine's revision",
+            Revised::Twice,
+            Pin::OtherMachine,
+        ),
+        (
+            "revised twice, pinned to text carrying the refusal's own words",
+            Revised::Twice,
+            Pin::Literal("The current State Machine revision is"),
+        ),
+    ];
+
+    for (index, (case, revised, pin)) in cases.into_iter().enumerate() {
+        let name = format!("stale-pin-{index}");
+        let arn = create_machine(&emulator, &name, HELLO_DEFINITION).await;
+
+        let updates = match revised {
+            Revised::Never => 0,
+            Revised::Once => 1,
+            Revised::Twice => 2,
+        };
+        let mut revisions: Vec<String> = Vec::new();
+        for definition in [GOODBYE_DEFINITION, AGAIN_DEFINITION].iter().take(updates) {
+            revisions.push(update_definition(&emulator, &arn, definition).await);
+        }
+        // What `DescribeStateMachine` reports as the current revision, which is
+        // nothing at all while no update has revised the state machine.
+        let current = revisions.last().cloned();
+        assert_eq!(
+            describe(&emulator, &arn)
+                .await
+                .get("revisionId")
+                .and_then(Value::as_str),
+            current.as_deref(),
+            "case {case:?}: expected the read to report the last update's revision"
+        );
+
+        let pinned = match pin {
+            Pin::Stale => revisions
+                .first()
+                .cloned()
+                .expect("a stale pin needs an earlier revision"),
+            Pin::OtherMachine => other_revision.clone(),
+            Pin::Literal(text) => text.to_string(),
+        };
+
+        let (status, code, message) = crate::error_messages::failure(
+            &emulator,
+            case,
+            "PublishStateMachineVersion",
+            &json!({ "stateMachineArn": &arn, "revisionId": &pinned }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (409, "ConflictException"),
+            "case {case:?}: expected 409 ConflictException, got {status} {code} with message \
+             {message:?}"
+        );
+
+        let reported_current = current
+            .clone()
+            .unwrap_or_else(|| INITIAL_REVISION_ID.to_string());
+        let expected = format!(
+            "Failed to publish the State Machine version for revision {pinned}. The current \
+             State Machine revision is {reported_current}."
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&arn) && !message.contains(&name),
+            "case {case:?}: the refusal reports the two revisions, not the state machine it is \
+             about, got {message:?}"
+        );
+        assert_eq!(
+            listed_versions(&emulator, &arn).await,
+            Vec::<String>::new(),
+            "case {case:?}: a refused publish must store nothing"
+        );
+
+        // The revision the refusal reported as the current one is the one that
+        // publishes — what a caller re-driving the publish out of the message body
+        // does with it.
+        let body = publish(&emulator, &arn, json!({ "revisionId": reported_current })).await;
+        let version_arn = string(&body, "stateMachineVersionArn");
+        assert_eq!(
+            version_arn,
+            format!("{arn}:1"),
+            "case {case:?}: expected the re-driven publish to mint {arn}:1, got {version_arn:?}"
+        );
+        assert_eq!(
+            listed_versions(&emulator, &arn).await,
+            vec![version_arn.clone()],
+            "case {case:?}: the re-driven version must be the one the listing reports, got \
+             {version_arn:?}"
         );
     }
 }

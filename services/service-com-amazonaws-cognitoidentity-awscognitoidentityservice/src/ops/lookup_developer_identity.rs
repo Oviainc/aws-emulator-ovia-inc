@@ -298,15 +298,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (identity_id, identifiers)
             }
             (None, Some(identifier)) => {
+                // A developer user identifier this pool has indexed against no identity
+                // names no mapping the caller may be told about: resolving one is an
+                // authorization question, not the lookup of a resource the request already
+                // names, so it is refused as access this caller does not have.
                 let Some(identity_id) = registered_to else {
                     return Err(
-                        LookupDeveloperIdentityErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException {
-                                message: Some(format!(
-                                    "Developer user identifier '{identifier}' is not registered \
-                                     in identity pool '{}'.",
-                                    input.identity_pool_id
-                                )),
+                        LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
+                            NotAuthorizedException {
+                                message: Some(
+                                    crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE
+                                        .to_string(),
+                                ),
                             },
                         )
                         .into(),

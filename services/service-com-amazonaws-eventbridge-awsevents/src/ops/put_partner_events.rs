@@ -11,8 +11,9 @@
 //! properties an event must carry, `Detail`'s form and the published entry size
 //! are the same rules `PutEvents` applies, and beyond them the entry's `Source`
 //! has to lie in a namespace this caller is the registered SaaS partner of — a
-//! caller that is not is not the origin its entry claims, exactly as for a forged
-//! source on `PutEvents` — and name a source this partner has authored and not
+//! caller that is not is reported the rejected member and the reason on the
+//! entry's own row, since this operation models no top-level error for it — and
+//! name a source this partner has authored and not
 //! withdrawn. An accepted entry is minted an `EventId` and routed onto the bus
 //! the customer matched with that source — which is what ACTIVATING the source
 //! turned on, so a source in `PENDING` publishes nowhere, exactly as deactivating
@@ -189,14 +190,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // partner its namespace is registered to — the same entitlement
                 // every other operation of this slice checks. It is a property
                 // of the entry's own `Source`, so the entry fails on its own row
-                // while the rest of the batch is published, and the verdict is
-                // the one this service already reports for a source a caller may
-                // not publish under.
+                // while the rest of the batch is published. This operation
+                // models no top-level error for it, so the verdict is reported
+                // as what it is — an input member this service will not accept —
+                // through the per-entry parameter-validation code and the
+                // message form every rejected member of this service gets,
+                // naming the member and the reason.
                 if store.partner_authoring_refusal(&accepted.source).is_some() {
                     failed += 1;
                     entries.push(refused(
-                        NOT_AUTHORIZED_FOR_SOURCE,
-                        NOT_AUTHORIZED_FOR_SOURCE_MESSAGE.to_string(),
+                        INVALID_ARGUMENT,
+                        crate::state::parameter_violation(
+                            SOURCE_MEMBER,
+                            SOURCE_NOT_WHITELISTED_REASON,
+                        ),
                     ));
                     continue;
                 }
@@ -329,15 +336,15 @@ struct Publication {
 /// "A specified parameter is not valid" — the per-entry code this service
 /// reports for an entry it will not publish, as `PutEvents` does.
 const INVALID_ARGUMENT: &str = "InvalidArgument";
-/// The per-entry code this service reports for a `Source` the caller may not
-/// publish under — the same one `PutEvents` reports for an entry forging a
-/// source, because it is the same verdict: the caller is not the origin the
-/// entry claims.
-const NOT_AUTHORIZED_FOR_SOURCE: &str = "NotAuthorizedForSourceException";
-/// The message that accompanies [`NOT_AUTHORIZED_FOR_SOURCE`]. A CONSTANT of the
-/// condition — the verdict is on the namespace the source claims — so it carries
-/// none of the request's values.
-const NOT_AUTHORIZED_FOR_SOURCE_MESSAGE: &str = "Not authorized for the source.";
+/// The input member an entry's partner namespace is carried by, which the
+/// refusal of that namespace is reported about.
+const SOURCE_MEMBER: &str = "Source";
+/// Why a `Source` the caller is not the registered SaaS partner of is not
+/// accepted. A CONSTANT of the condition — the verdict is on the namespace the
+/// source claims, not on any value of this request — so it carries none of the
+/// request's values.
+const SOURCE_NOT_WHITELISTED_REASON: &str =
+    "Caller AWS account is not whitelisted for the source.";
 /// "The JSON provided is not valid" — the per-entry code for a malformed
 /// `Detail`.
 const MALFORMED_DETAIL: &str = "MalformedDetail";

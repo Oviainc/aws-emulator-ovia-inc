@@ -43,6 +43,8 @@ mod etl_jobs_and_connections;
 mod form_types;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
+#[path = "all/glossaries.rs"]
+mod glossaries;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 #[path = "all/job_runs.rs"]

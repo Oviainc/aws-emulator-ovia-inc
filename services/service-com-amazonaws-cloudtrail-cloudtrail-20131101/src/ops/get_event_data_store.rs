@@ -122,6 +122,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The HTTP status a not-found refusal answers with is the service-wide
+// `crate::state::NOT_FOUND_STATUS`: the model annotates
+// `EventDataStoreNotFoundException` `@httpError(404)`, but CloudTrail answers 400 for
+// it on the wire — the recorded response for this very operation is `HTTP 400` with
+// `__type` `EventDataStoreNotFoundException` and a `Message` naming the store's ARN.
+// The error CODE is the model's; the status is applied through
+// `crate::scaffolded::Scaffolded::modeled_with_status`.
+use crate::state::NOT_FOUND_STATUS;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -251,17 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(report(record))
     }
 }
-
-/// The HTTP status this service answers a not-found refusal with.
-///
-/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
-/// CloudTrail answers 400 for it on the wire: the recorded response for this very
-/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and a
-/// `Message` naming the store's ARN. The error CODE is the model's; only the
-/// status is stated here, through
-/// [`crate::scaffolded::Scaffolded::modeled_with_status`] — the same way
-/// `describe_query` states it.
-const NOT_FOUND_STATUS: u16 = 400;
 
 /// Project a stored event data store onto this operation's response.
 ///

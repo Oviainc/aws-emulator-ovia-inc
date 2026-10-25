@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlossary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlossary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlossary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a business glossary in this account's per-account glossary namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::glossaries`]): the name and the optional
+//! description come from the request, the catalog mints the `GlossaryId` that addresses
+//! the record, and the create answers with the three members it stored. `GetGlossary`
+//! reads that record back by id.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlossary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlossaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlossary"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(CreateGlossaryErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency
+        // of the request" (`ClientToken`): a retry of the very same create — same token,
+        // same name — is answered with the glossary that create already stored, so the
+        // retry neither mints a second record nor is refused as a duplicate name.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(stored) = store
+                .glossaries
+                .values()
+                .find(|glossary| {
+                    glossary.client_token.as_deref() == Some(token) && glossary.name == input.name
+                })
+                .cloned()
+            {
+                return Ok(CreateGlossaryOutput {
+                    id: Some(stored.id),
+                    name: Some(stored.name),
+                    description: stored.description,
+                });
+            }
+        }
+
+        // A glossary's name identifies it to a caller, so the namespace holds one glossary
+        // per name: a create under a name already stored is refused rather than minting a
+        // second glossary the caller could not tell apart.
+        if store.glossary_by_name(&input.name).is_some() {
+            return Err(CreateGlossaryErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    // Wording for this slice is pinned by no recording or doc, so the
+                    // refusal states the resource kind and withholds the requested name,
+                    // as this service's other already-exists refusals do.
+                    message: Some("Glossary already exists.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store is resident memory and this create is reachable by any caller, so the
+        // number of records one process will hold is bounded. Past the ceiling the request
+        // is refused with the closest client error this operation models.
+        if !store.can_store_glossary() {
+            return Err(CreateGlossaryErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "This account already holds the maximum of {} glossaries",
+                        crate::state::MAX_GLOSSARIES
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let entry = crate::state::GlossaryEntry::from_create_input(&input);
+        let stored = entry.clone();
+        store.glossaries.insert(entry.id.clone(), entry);
+        ::tracing::info!(
+            operation = "CreateGlossary",
+            glossary = %stored.id,
+            "created a Glue business glossary"
+        );
+
+        // Every member comes from the record just stored, so the create reports exactly
+        // what a later `GetGlossary` of this id will.
+        Ok(CreateGlossaryOutput {
+            id: Some(stored.id),
+            name: Some(stored.name),
+            description: stored.description,
+        })
     }
 }

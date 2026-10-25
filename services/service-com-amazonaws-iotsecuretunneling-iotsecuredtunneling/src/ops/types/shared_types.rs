@@ -17,6 +17,15 @@ pub struct ResourceNotFoundException {
     pub message: Option<String>,
 }
 
+/// The service's limit refusal. Reached by `OpenTunnel`, which lists it, and by
+/// `TagResource`, which widens it in through `extra_errors` on its own
+/// `#[operation_error]` enum: both refuse an exhausted limit with it.
+#[smithy_macros::smithy(shape = "com.amazonaws.iotsecuretunneling#LimitExceededException")]
+#[derive(Debug, Clone, Default)]
+pub struct LimitExceededException {
+    pub message: Option<String>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.iotsecuretunneling#DestinationConfig")]
 #[derive(Debug, Clone, Default)]
 pub struct DestinationConfig {

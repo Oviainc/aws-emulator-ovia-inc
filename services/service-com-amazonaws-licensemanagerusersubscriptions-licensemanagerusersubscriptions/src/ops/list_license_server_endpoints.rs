@@ -6,6 +6,12 @@
 //! endpoints `CreateLicenseServerEndpoint` persisted, selected by the `Filters` the
 //! model documents (`IdentityProviderArn`) and paged by `MaxResults`/`NextToken`.
 //!
+//! Every member of a reported endpoint — including the `LicenseServers` the endpoint was
+//! provisioned with, each with its provisioning status, its health and the addresses it
+//! was given — is computed from the stored record by
+//! `crate::state::license_server_endpoint`, so a client polling this list watches the
+//! hosts behind the endpoint come up.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

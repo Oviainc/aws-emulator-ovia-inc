@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeyValueStores
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeyValueStores`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeyValueStores::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the key value stores this account holds, one page at a time. Every store
+//! answered here was put in the store by `CreateKeyValueStore`, so each item reports the
+//! same record `DescribeKeyValueStore` answers that store with. The records are held under
+//! their names, which are unique per account, so the listing has one stable total order
+//! over names that `Marker` indexes into: walking the pages enumerates every store exactly
+//! once. `Status` narrows the answer to the stores whose own stored status is the one
+//! asked for.
+//!
+//! A reporting operation: it reads the stored records and writes nothing beyond the
+//! provisioning transition the clock already owes them.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +72,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -139,20 +144,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // This listing answers from the store alone, so no request metadata is read.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeyValueStores` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeyValueStoresErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeyValueStores"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of items in the key value stores list" — a page holds at
+        // least one item, so a non-positive size names no page at all. The size served is
+        // bounded above by this emulator's own page ceiling, the same one every listing of
+        // this service is bounded by, while the answer echoes the size ASKED FOR.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListKeyValueStoresErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "The status of the request for the key value stores list": a request that names a
+        // status is served the stores whose own STORED status is that one, and a request
+        // that names none is served every store. The comparison is against the record, so a
+        // status no store carries selects nothing rather than being refused — the model
+        // constrains this parameter to no value set at all.
+        let wanted_status = input.status.as_deref();
+
+        // "The marker associated with the key value stores list": the resume point this
+        // listing hands out is the NAME the previous page ended at, and the name of a key
+        // value store is a `KeyValueStoreName`, so a value outside that constraint was
+        // never a resume point this service issued (`InvalidArgument`). A well-formed name
+        // the store does not hold is still a position in the one name order, so a page
+        // resumes after it: this listing models no not-found refusal. Refused BEFORE the
+        // store is reached, as the sibling listings refuse their own markers.
+        if input
+            .marker
+            .as_deref()
+            .is_some_and(|marker| !crate::state::is_key_value_store_name(marker))
+        {
+            return Err(ListKeyValueStoresErrorModeled::InvalidArgument(
+                crate::state::invalid_key_value_store_marker(),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state, so no item
+        // reports a stale status — and so the `Status` filter reads the status each store
+        // has at this instant.
+        store.settle(SystemTime::now());
+
+        // `Marker` names where the previous page ENDED, so this page starts after it. The
+        // records are held under their names, so the resume point is a range bound rather
+        // than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<KeyValueStore> = Vec::new();
+        let mut more_remain = false;
+        for stored in store
+            .key_value_stores
+            .range::<str, _>((start, Bound::Unbounded))
+            .map(|(_, stored)| stored)
+        {
+            if wanted_status.is_some_and(|wanted| stored.status != wanted) {
+                continue;
+            }
+            if items.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            // Read from the one stored record — the same projection a describe of this
+            // store answers with.
+            items.push(stored.to_key_value_store());
+        }
+
+        Ok(ListKeyValueStoresOutput {
+            // "The resulting key value stores list."
+            key_value_store_list: Some(KeyValueStoreList {
+                // "The next marker associated with the key value store list": present
+                // exactly when stores remain, carrying the name this page ended at.
+                next_marker: if more_remain {
+                    items.last().map(|item| item.name.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of items in the key value store list" — what the
+                // request asked for, or the default this service pages at.
+                max_items,
+                // "The quantity of the key value store list": the length of this page.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather than
+                // an empty one — as every other listing of this service answers.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

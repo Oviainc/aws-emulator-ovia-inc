@@ -3,6 +3,9 @@
 //! @op StartExperimentRun
 //! IMPLEMENTED: starts an experiment run of one experiment definition and persists it.
 //!
+//! The start is also the first entry on the run's timeline, so the record it writes
+//! carries the `RUN_STARTED` event `ListExperimentRunEvents` reports.
+//!
 //! At most ONE run of a definition is active at a time, so the check for an active run
 //! and the write of the new one happen together under the single state lock: of any
 //! number of simultaneous starts on one definition exactly one creates a run and every
@@ -278,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Runs are numbered from 1 within the definition and a number is never reissued.
         let run_number = definition.next_run_number;
-        let run = crate::state::ExperimentRun {
+        let mut run = crate::state::ExperimentRun {
             run: run_number,
             application_id: definition.application_id.clone(),
             experiment_definition_id: definition.id.clone(),
@@ -299,7 +302,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // not rewrite what this run ran.
             definition_snapshot: definition.snapshot(),
             tags: input.tags.unwrap_or_default(),
+            // The timeline starts empty and the entry below is the first thing on it.
+            event_log: Vec::new(),
         };
+        // Starting the run is the first action anything performed on it, so it is the
+        // first entry on the timeline `ListExperimentRunEvents` reports.
+        run.record_start_event();
         // The run is written FIRST, so a start that cannot be stored moves no part of the
         // definition: it is refused with the definition exactly as it was.
         let Some(stored) = definition.record_run(run) else {

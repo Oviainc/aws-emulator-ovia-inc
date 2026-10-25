@@ -7,6 +7,10 @@
 //! `GetItem`, `Query` or statement, and a classic write is visible to every later
 //! `SELECT`.
 //!
+//! A statement that changes an item publishes the same stream record the equivalent
+//! classic write does ([`crate::state::publish_item_changes`]): the surface a change
+//! arrives through does not decide what the table's stream carries.
+//!
 //! The dialect is parsed in [`crate::state::partiql`], which renders the `WHERE`
 //! clause and the `SET`/`REMOVE` clauses back into the `ConditionExpression` and
 //! `UpdateExpression` grammars [`crate::state::ParsedCondition`] and
@@ -299,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
         }
-        match &statement {
+        let answered = match &statement {
             crate::state::PartiqlStatement::Select(select) => {
                 select_items(&mut store, &region, &name, now, select, &input)
             }
@@ -324,7 +328,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input,
                 return_old_on_failure,
             ),
-        }
+        };
+        // A statement that changed an item owes the table's stream a record, exactly as
+        // the equivalent single-item write does: the surface a change arrives through is
+        // not what decides whether the stream carries it.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
+        answered
     }
 }
 

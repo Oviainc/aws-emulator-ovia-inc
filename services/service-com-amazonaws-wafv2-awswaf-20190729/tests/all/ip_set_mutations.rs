@@ -26,7 +26,10 @@ use crate::web_acl_lifecycle::{is_model_uuid, visibility, Waf};
 
 /// Create an IP set of `version` with `addresses` and `description`, and answer
 /// `(id, arn, lock token)`.
-async fn create_ip_set(
+///
+/// Shared with the sibling suites that need a set with a chosen family, address
+/// list and description (`crate::ip_set_listing`).
+pub(crate) async fn create_ip_set(
     waf: &Waf,
     scope: &str,
     name: &str,
@@ -56,7 +59,7 @@ async fn create_ip_set(
 }
 
 /// `GetIPSet` for `(scope, name, id)`, as a 200.
-async fn get_ip_set(waf: &Waf, scope: &str, name: &str, id: &str) -> Value {
+pub(crate) async fn get_ip_set(waf: &Waf, scope: &str, name: &str, id: &str) -> Value {
     waf.ok(
         "GetIPSet",
         json!({ "Name": name, "Scope": scope, "Id": id }),

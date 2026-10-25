@@ -46,8 +46,11 @@ const APEX: &str = "example.com.";
 // ---------------------------------------------------------------------------
 
 /// One record set, as the members a `<Change>` carries for it.
+///
+/// `pub(crate)` so a sibling suite in this test target writes its changes with
+/// the SAME builder rather than growing a second copy of it.
 #[derive(Debug, Clone, Default)]
-struct Rrset {
+pub(crate) struct Rrset {
     name: String,
     rr_type: String,
     set_identifier: Option<String>,
@@ -60,7 +63,7 @@ struct Rrset {
 }
 
 impl Rrset {
-    fn new(name: &str, rr_type: &str) -> Self {
+    pub(crate) fn new(name: &str, rr_type: &str) -> Self {
         Self {
             name: name.to_string(),
             rr_type: rr_type.to_string(),
@@ -68,22 +71,22 @@ impl Rrset {
         }
     }
 
-    fn set_identifier(mut self, identifier: &str) -> Self {
+    pub(crate) fn set_identifier(mut self, identifier: &str) -> Self {
         self.set_identifier = Some(identifier.to_string());
         self
     }
 
-    fn routing(mut self, elements: &str) -> Self {
+    pub(crate) fn routing(mut self, elements: &str) -> Self {
         self.routing = elements.to_string();
         self
     }
 
-    fn ttl(mut self, ttl: i64) -> Self {
+    pub(crate) fn ttl(mut self, ttl: i64) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
-    fn values(mut self, values: &[&str]) -> Self {
+    pub(crate) fn values(mut self, values: &[&str]) -> Self {
         self.values = values.iter().map(|value| (*value).to_string()).collect();
         self
     }
@@ -94,7 +97,7 @@ impl Rrset {
     }
 
     /// The name in the canonical form a refusal and a listing report it in.
-    fn canonical(&self) -> String {
+    pub(crate) fn canonical(&self) -> String {
         format!("{}.", self.name.trim_end_matches('.'))
     }
 }
@@ -105,7 +108,7 @@ impl Rrset {
 /// `SetIdentifier`, the routing policy, `TTL`, `ResourceRecords`,
 /// `AliasTarget`), which is the order the operation's documentation requires of
 /// the XML elements.
-fn change(action: &str, record: &Rrset) -> String {
+pub(crate) fn change(action: &str, record: &Rrset) -> String {
     let set_identifier = record.set_identifier.as_deref().map_or_else(
         String::new,
         |identifier| format!("<SetIdentifier>{}</SetIdentifier>", escape_xml(identifier)),
@@ -146,7 +149,7 @@ fn change(action: &str, record: &Rrset) -> String {
 }
 
 /// Submit already-rendered `<Change>` elements as one batch.
-async fn submit(router: &MultiServiceRouter, zone_id: &str, changes: &str) -> Reply {
+pub(crate) async fn submit(router: &MultiServiceRouter, zone_id: &str, changes: &str) -> Reply {
     call(
         router,
         "POST",
@@ -167,7 +170,7 @@ async fn submit_one(
 }
 
 /// List the zone's record sets.
-async fn list(router: &MultiServiceRouter, zone_id: &str) -> Reply {
+pub(crate) async fn list(router: &MultiServiceRouter, zone_id: &str) -> Reply {
     call(
         router,
         "GET",
@@ -178,7 +181,7 @@ async fn list(router: &MultiServiceRouter, zone_id: &str) -> Reply {
 }
 
 /// The `Error/Message` of a refusal, or the whole body when there is none.
-fn message(reply: &Reply) -> String {
+pub(crate) fn message(reply: &Reply) -> String {
     reply
         .first("Error/Message")
         .unwrap_or(&reply.body)

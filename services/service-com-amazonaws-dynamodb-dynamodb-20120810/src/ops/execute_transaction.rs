@@ -4,7 +4,10 @@
 //! IMPLEMENTED: runs a list of PartiQL statements as ONE transaction against the SAME
 //! item store the classic item API, `ExecuteStatement` and `TransactWriteItems` read
 //! and write, so what a transaction leaves is visible to every later read and what an
-//! earlier call wrote is what its statements are read against.
+//! earlier call wrote is what its statements are read against. A write transaction that
+//! COMMITS publishes one record per change it made on the stream of the table that
+//! change was made to ([`crate::state::publish_item_changes`]); a cancelled one made no
+//! modification, so its tables' streams carry none.
 //!
 //! "The entire transaction must consist of either read statements or write statements,
 //! you cannot mix both in one transaction": a mixed list is refused as a whole, and the
@@ -330,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if reads == parsed.len() {
             return read_transaction(&store, &region, now, &parsed, requested_capacity);
         }
-        write_transaction(
+        let answered = write_transaction(
             &mut store,
             &region,
             now,
@@ -339,7 +342,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             token,
             &canonical,
             requested_capacity,
-        )
+        );
+        // Every change the transaction made reaches its table's stream before the
+        // response does; a cancelled one rolls its queued changes back with the items,
+        // so there is nothing to hand over for it.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
+        answered
     }
 }
 
@@ -779,6 +787,10 @@ fn write_transaction(
     let mut recorded = crate::state::WriteLedger::default();
     let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
     let mut refused: Option<ExecuteTransactionError> = None;
+    // Where the streams of the tables this transaction writes stood before it started:
+    // a transaction that is rolled back below made no modification, so its queued
+    // changes go back with the items.
+    let stream_mark = store.queued_stream_record_count();
     for statement in &planned {
         let after = match &statement.write {
             PlannedWrite::Put(item) => Some(item.clone()),
@@ -853,6 +865,10 @@ fn write_transaction(
                 );
             }
         }
+        // The restoring writes above queued changes of their own, so the queue is put
+        // back where it stood: the streams of these tables carry neither the cancelled
+        // modifications nor their undo.
+        store.rewind_stream_records(stream_mark);
         return Err(refused);
     }
 

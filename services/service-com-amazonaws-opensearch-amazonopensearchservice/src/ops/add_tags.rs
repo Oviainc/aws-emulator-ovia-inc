@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let arn = input.arn;
         let tags = store.tagged_resource_mut(&arn).ok_or_else(|| {
-            AddTagsErrorModeled::ValidationException(crate::state::tagged_resource_absent(&arn))
+            AddTagsErrorModeled::ValidationException(crate::state::tagged_resource_absent())
         })?;
 
         // The tag set is keyed by tag key, so attaching a key the resource already

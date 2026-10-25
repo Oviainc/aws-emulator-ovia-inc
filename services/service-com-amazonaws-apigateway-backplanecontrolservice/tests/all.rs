@@ -186,3 +186,5 @@ mod refusal_message_constants;
 mod delete_documentation_version;
 #[path = "all/delete_usage_plan.rs"]
 mod delete_usage_plan;
+#[path = "all/update_integration_response.rs"]
+mod update_integration_response;

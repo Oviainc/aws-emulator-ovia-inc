@@ -277,22 +277,18 @@ pub fn tag_quota_exceeded(arn: &str, requested: usize) -> LimitExceededException
     }
 }
 
-/// The `ValidationException` payload for an ARN that names no resource of this
-/// account — "an exception for accessing or deleting a resource that doesn't exist",
-/// which is how the tag-writing operations model that refusal (neither declares
-/// `ResourceNotFoundException`).
-pub fn tagged_resource_absent(arn: &str) -> ValidationException {
+/// The refusal every tagging operation answers with when its `ARN` resolves to no
+/// resource of this account: `ValidationException`, "an exception for accessing or
+/// deleting a resource that doesn't exist", which is the ONE not-found error all
+/// three tagging operations model (`AddTags` and `RemoveTags` declare no
+/// `ResourceNotFoundException` at all, so the reader cannot answer a miss with an
+/// error the writers of the same tag set have no way to report).
+///
+/// The wording is fixed text with no variable part: the ARN resolved to nothing, so
+/// there is no resource whose name could fill one in.
+pub fn tagged_resource_absent() -> ValidationException {
     ValidationException {
-        message: Some(format!("Resource not found: {arn}")),
-    }
-}
-
-/// The `ResourceNotFoundException` payload for the same miss on an operation that
-/// DOES model it — the mirror of [`tagged_resource_absent`], so one refusal reads
-/// like the other.
-pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Resource not found: {arn}")),
+        message: Some("Invalid ARN. Domain not found.".to_string()),
     }
 }
 

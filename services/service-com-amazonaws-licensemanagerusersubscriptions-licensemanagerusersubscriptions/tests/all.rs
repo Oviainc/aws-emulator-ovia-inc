@@ -31,6 +31,8 @@ mod license_server_endpoint_delete_resolution;
 mod license_server_endpoint_deletion;
 #[path = "all/license_server_endpoints.rs"]
 mod license_server_endpoints;
+#[path = "all/license_servers_behind_an_endpoint.rs"]
+mod license_servers_behind_an_endpoint;
 #[path = "all/list_instances.rs"]
 mod list_instances;
 #[path = "all/optional_settings_registration.rs"]

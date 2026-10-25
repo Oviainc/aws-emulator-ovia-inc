@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQuotaShares
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQuotaShares`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQuotaShares::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the quota shares one job queue holds, as one `QuotaShareDetail` per stored
+//! share, in one stable order and one `maxResults` page at a time.
+//!
+//! A REPORTING operation: it materialises only what the clock already owed (a share's
+//! `CREATING` -> `VALID` move) and writes nothing else, so two listings at one instant
+//! answer alike.
+//!
+//! The `jobQueue` the listing hangs off is a reference this call resolves by name or by
+//! ARN; one that resolves to no stored queue is the modelled `ClientException` (HTTP 400),
+//! worded the way the quota-share refusals are. A `maxResults` outside the bound its doc
+//! publishes, and a `nextToken` that resumes nothing, are the same modelled 400.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +159,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQuotaShares` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQuotaSharesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQuotaShares"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                ListQuotaSharesErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+
+        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
+        // model, so the published bound is applied here.
+        if let Some(requested) = input.max_results.filter(|requested| {
+            !(batch::MIN_LIST_QUOTA_SHARES_RESULTS..=batch::MAX_LIST_QUOTA_SHARES_RESULTS)
+                .contains(requested)
+        }) {
+            return Err(ListQuotaSharesErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "maxResults {requested} must be between {} and {}",
+                    batch::MIN_LIST_QUOTA_SHARES_RESULTS,
+                    batch::MAX_LIST_QUOTA_SHARES_RESULTS
+                ),
+            ))
+            .into());
+        }
+
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published below (that call reaches another
+        // service in-process).
+        let shares: Vec<batch::QuotaShare> = {
+            let mut state = state.lock();
+            // A read: this only materialises what the clock already owed at `now`, so a
+            // later caller sees exactly what this caller saw.
+            state.materialize_due(now);
+
+            let Some(queue) = state.job_queue(&input.job_queue) else {
+                // The queue this listing hangs off, which the call only REFERS to: AWS is
+                // recorded echoing the reference the request gave for such a queue (a name
+                // stays a name), in the envelope the quota-share refusals carry.
+                return Err(ListQuotaSharesErrorModeled::ClientException(
+                    batch::client_exception_enveloped(batch::does_not_exist_sentence(
+                        &input.job_queue,
+                    )),
+                )
+                .into());
+            };
+            let queue_arn = queue.arn.clone();
+            // The store is keyed by a share's ARN, which nests the share's name under its
+            // queue's, so iterating it answers one queue's shares in name order — the
+            // stable order paging needs, without which a page could show a share twice or
+            // never.
+            state
+                .quota_shares
+                .values()
+                .filter(|share| share.job_queue_arn == queue_arn)
+                .cloned()
+                .collect()
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        // "If this parameter isn't used, ListQuotaShares returns up to 100 results and a
+        // nextToken value if applicable": the page is bounded even when the request names
+        // no size.
+        let page_size = input
+            .max_results
+            .unwrap_or(batch::MAX_LIST_QUOTA_SHARES_RESULTS);
+        let (page, next_token) =
+            batch::paginate(shares, Some(page_size), input.next_token.as_deref()).map_err(
+                |message| {
+                    // The only failure paging can answer is a `nextToken` that resumes
+                    // nothing, which carries the detail the helper words it with.
+                    ListQuotaSharesError::from(ListQuotaSharesErrorModeled::ClientException(
+                        batch::client_exception(message),
+                    ))
+                },
+            )?;
+
+        let quota_shares = page
+            .into_iter()
+            .map(|share| QuotaShareDetail {
+                quota_share_name: Some(share.name),
+                quota_share_arn: Some(share.arn),
+                job_queue_arn: Some(share.job_queue_arn),
+                capacity_limits: Some(share.capacity_limits),
+                resource_sharing_configuration: Some(share.resource_sharing_configuration),
+                preemption_configuration: Some(share.preemption_configuration),
+                state: Some(share.state),
+                status: Some(share.status),
+            })
+            .collect();
+
+        Ok(ListQuotaSharesOutput {
+            quota_shares: Some(quota_shares),
+            next_token,
+        })
     }
 }
+

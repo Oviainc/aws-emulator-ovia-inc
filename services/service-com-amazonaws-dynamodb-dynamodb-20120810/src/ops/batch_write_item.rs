@@ -7,7 +7,8 @@
 //! overwritten". Each operation lands through the same store write sites `PutItem` and
 //! `DeleteItem` use ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]
 //! and `delete_item`), so numbers are canonicalized and capacity is accounted the same way
-//! on this path as on the single-item one.
+//! on this path as on the single-item one — and so is the record each change publishes
+//! on its table's stream ([`crate::state::publish_item_changes`]).
 //!
 //! The whole request is resolved and validated BEFORE any item lands — the tables, the key
 //! schema, every value's own rules, the documented item size and the index key limits — so
@@ -355,28 +356,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // landed in, so the capacity fan-out and the item-collection size are computed
         // from stored state rather than from the request.
         let mut ledger = crate::state::WriteLedger::default();
-        for (name, write) in pending {
-            match write {
-                PendingWrite::Put { key, item } => {
-                    let replaced = store
-                        .put_item(&region, &name, now, key, item.clone())
-                        .map_err(lift)?;
-                    let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    ledger.record(&name, &table.write_capacity(replaced.as_ref(), Some(&item)));
-                    if report_item_collection {
-                        ledger.record_metrics(&name, table.item_collection_metrics(&item));
+        // Written as a closure's result rather than with `?`, so the changes the batch
+        // already made are handed to the streams service on EVERY exit: a write that
+        // landed is a change the stream carries whether or not the write after it did.
+        let applied = (|| -> Result<(), Self::Error> {
+            for (name, write) in pending {
+                match write {
+                    PendingWrite::Put { key, item } => {
+                        let replaced = store
+                            .put_item(&region, &name, now, key, item.clone())
+                            .map_err(lift)?;
+                        let table = store.active_table(&region, &name, now).map_err(lift)?;
+                        ledger
+                            .record(&name, &table.write_capacity(replaced.as_ref(), Some(&item)));
+                        if report_item_collection {
+                            ledger.record_metrics(&name, table.item_collection_metrics(&item));
+                        }
                     }
-                }
-                PendingWrite::Delete { key, addressed } => {
-                    let removed = store.delete_item(&region, &name, now, &key).map_err(lift)?;
-                    let table = store.active_table(&region, &name, now).map_err(lift)?;
-                    ledger.record(&name, &table.write_capacity(removed.as_ref(), None));
-                    if report_item_collection {
-                        ledger.record_metrics(&name, table.item_collection_metrics(&addressed));
+                    PendingWrite::Delete { key, addressed } => {
+                        let removed =
+                            store.delete_item(&region, &name, now, &key).map_err(lift)?;
+                        let table = store.active_table(&region, &name, now).map_err(lift)?;
+                        ledger.record(&name, &table.write_capacity(removed.as_ref(), None));
+                        if report_item_collection {
+                            ledger
+                                .record_metrics(&name, table.item_collection_metrics(&addressed));
+                        }
                     }
                 }
             }
-        }
+            Ok(())
+        })();
+        // Every change this batch made reaches its table's stream before the response
+        // does, in the order the batch applied them.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
+        applied?;
 
         Ok(BatchWriteItemOutput {
             // "A map of tables and requests against those tables that were not

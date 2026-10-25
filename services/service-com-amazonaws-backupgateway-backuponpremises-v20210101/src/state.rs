@@ -174,6 +174,26 @@ pub fn gateway_already_associated_message(server_arn: &str) -> String {
     format!("The gateway is already associated with the server '{server_arn}'.")
 }
 
+/// `ConflictException$ErrorCode` for disassociating a gateway that is associated with NO
+/// server, and the sentence that states it.
+///
+/// `DisassociateGatewayFromServer` "disassociates a backup gateway from the specified
+/// server" — the server is not a member of its input, so the server it names is the one the
+/// gateway's stored link points at
+/// (`smithy_query(query="operation",operation="DisassociateGatewayFromServer")`). With no
+/// link there is no server the request names, and the operation is NOT `@idempotent` where
+/// `DeleteGateway` is, so repeating it is not declared to succeed: it is the modelled "the
+/// operation cannot proceed because it is not supported", whose `ErrorCode` member is
+/// REQUIRED and documented as "a description of why the operation is not supported". The
+/// code names the condition the way [`GATEWAY_ALREADY_ASSOCIATED`] names its own.
+pub const GATEWAY_NOT_ASSOCIATED: &str = "GatewayNotAssociated";
+
+/// See [`GATEWAY_NOT_ASSOCIATED`]: the sentence the refusal states, phrased like
+/// [`gateway_already_associated_message`] so the two halves of one link are worded alike.
+/// AWS publishes no wording for the member, so this sentence is an example; the
+/// requirement is the shape, its status and the `ErrorCode`.
+pub const GATEWAY_NOT_ASSOCIATED_MESSAGE: &str = "The gateway is not associated with a server.";
+
 /// `ResourceNotFoundException$ErrorCode` for a hypervisor that really exists but carries
 /// no property mappings, so there is no mappings resource to report. See
 /// [`MissingResource::PropertyMappings`].
@@ -1034,6 +1054,37 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         Ok(gateway.clone())
     }
 
+    /// Clear the association of the gateway stored under `gateway_arn`, and hand back the
+    /// gateway as it is now STORED — cloned off the record in the map after the write, so
+    /// the ARN a caller gets is the key the store holds.
+    ///
+    /// The inverse of [`Self::associate_gateway_to_server`] and the only way a link it
+    /// wrote is removed: the link is a fact about the GATEWAY record, so both the server's
+    /// ARN and the `HypervisorId` read off it are dropped together and every later read of
+    /// that gateway (`GetGateway`, `ListGateways`) reports no server. The HYPERVISOR record
+    /// is not touched — it exists independently of the gateways that back it up, and it may
+    /// not be in this store at all, since a gateway keeps naming a server that was deleted.
+    ///
+    /// Refused, with nothing written, for a `gateway_arn` this store holds no record under
+    /// ([`DisassociationRefusal::NoSuchGateway`]) and for a gateway associated with no
+    /// server ([`DisassociationRefusal::NotAssociated`]): there is no link to remove, and
+    /// no server the request could be naming.
+    pub fn disassociate_gateway_from_server(
+        &mut self,
+        gateway_arn: &str,
+    ) -> Result<StoredGateway, DisassociationRefusal> {
+        let gateway = self
+            .gateways
+            .get_mut(gateway_arn)
+            .ok_or(DisassociationRefusal::NoSuchGateway)?;
+        if gateway.hypervisor_arn.is_none() {
+            return Err(DisassociationRefusal::NotAssociated);
+        }
+        gateway.hypervisor_arn = None;
+        gateway.hypervisor_id = None;
+        Ok(gateway.clone())
+    }
+
     /// Persist a hypervisor for `configuration` and hand back the record as it is now
     /// STORED — read out of the map after the insert, so the ARN that comes back is the
     /// key the store holds rather than a string built from the request.
@@ -1615,6 +1666,20 @@ pub enum AssociationRefusal {
     NoSuchServer,
     /// The gateway is already associated with a DIFFERENT server, whose ARN this carries.
     AlreadyAssociated(String),
+}
+
+/// Why a gateway could not be disassociated from the server it backs up.
+///
+/// Returned by
+/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::disassociate_gateway_from_server`],
+/// which writes nothing on either arm. As with [`AssociationRefusal`], the store names the
+/// CONDITION and the handler maps it to the modelled error its own operation declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisassociationRefusal {
+    /// The `GatewayArn` names no gateway this store holds.
+    NoSuchGateway,
+    /// The gateway is associated with no server, so there is no link to remove.
+    NotAssociated,
 }
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.

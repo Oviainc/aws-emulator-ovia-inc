@@ -144,63 +144,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let mut store = state.lock();
+        // Settle first, so the status this write is held against is the one the
+        // clock already owes — a data store whose deletion has fallen due is
+        // DELETED here, not still DELETING.
+        store.settle_lifecycle();
         // The modelled `AmazonResourceName` pattern admits BOTH of this
         // service's resource forms, and both carry tags, so the ARN is resolved
-        // to whichever resource it names; an ARN of neither form names nothing,
-        // and this service's not-found texts name no identifier.
-        let resolved = crate::state::tagged_resource_from_arn(&input.resource_arn);
-
-        let mut store = state.lock();
-        store.settle_lifecycle();
-        // Whichever resource it is, the stored record's own ARN must equal the
-        // one the caller handed in, so an ARN naming another partition, region
-        // or account resolves to nothing even when its id segment happens to
-        // match a local one.
-        let (tags, max, noun, not_found) = match resolved {
-            Some(crate::state::TaggedResource::Datastore(id)) => {
-                let datastore = store
-                    .datastores
-                    .get_mut(id)
-                    .filter(|datastore| datastore.arn == input.resource_arn);
-                (
-                    datastore.map(|datastore| &mut datastore.tags),
-                    crate::state::MAX_TAGS_PER_DATASTORE,
-                    "data store",
-                    crate::state::DATASTORE_NOT_FOUND_MESSAGE,
-                )
-            }
-            Some(crate::state::TaggedResource::Profile(id)) => {
-                let profile = store
-                    .profiles
-                    .get_mut(id)
-                    .filter(|profile| profile.arn == input.resource_arn);
-                (
-                    profile.map(|profile| &mut profile.tags),
-                    crate::state::MAX_TAGS_PER_PROFILE,
-                    "data transformation profile",
-                    crate::state::PROFILE_NOT_FOUND_MESSAGE,
-                )
-            }
-            // Unreachable through the wire — the modelled pattern is enforced
-            // before this handler runs — but an ARN of neither form names no
-            // resource, so it is answered the same way a missing one is.
-            None => (
-                None,
-                crate::state::MAX_TAGS_PER_DATASTORE,
-                "data store",
-                crate::state::DATASTORE_NOT_FOUND_MESSAGE,
-            ),
-        };
-        let Some(tags) = tags else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
+        // to whichever resource it names through the ONE resolver the mutating
+        // tagging operations share: it refuses an ARN that names no resource
+        // this service still holds — including a data store that has reached
+        // the terminal `DELETED` status, which every operation that would
+        // change it answers for as gone — and this service's not-found texts
+        // name no identifier.
+        let target = store
+            .tags_for_mutation(&input.resource_arn)
+            .map_err(|not_found| {
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(not_found.to_string()),
-                },
-            )
-            .into());
-        };
+                })
+            })?;
 
-        merge_tags(tags, input.tags, max, noun)?;
+        let crate::state::MutableTags {
+            tags,
+            max_tags,
+            noun,
+        } = target;
+        merge_tags(tags, input.tags, max_tags, noun)?;
         Ok(TagResourceOutput {})
     }
 }

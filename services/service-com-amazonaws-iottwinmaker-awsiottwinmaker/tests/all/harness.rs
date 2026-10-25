@@ -510,6 +510,34 @@ impl Emulator {
         .await
     }
 
+    /// `BatchPutPropertyValues`: POST
+    /// /workspaces/{workspaceId}/entity-properties, with the workspace as the
+    /// only `@httpLabel` and the `entries` in the body.
+    pub(crate) async fn batch_put_property_values(&self, workspace_id: &str, entries: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/entity-properties"),
+            Some(json!({"entries": entries})),
+        )
+        .await
+    }
+
+    /// `GetPropertyValueHistory`: POST
+    /// /workspaces/{workspaceId}/entity-properties/history, with the workspace
+    /// as the only `@httpLabel` and every other member in the body.
+    pub(crate) async fn get_property_value_history(
+        &self,
+        workspace_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/entity-properties/history"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `DeleteSyncJob`: DELETE on the sync job's own path, with both the
     /// workspace and the sync source as `@httpLabel`s and no body.
     pub(crate) async fn delete_sync_job(&self, workspace_id: &str, sync_source: &str) -> Resp {

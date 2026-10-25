@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let arn = input.arn;
         let tags = store.tagged_resource_mut(&arn).ok_or_else(|| {
-            RemoveTagsErrorModeled::ValidationException(crate::state::tagged_resource_absent(&arn))
+            RemoveTagsErrorModeled::ValidationException(crate::state::tagged_resource_absent())
         })?;
 
         // Removal is by KEY and the set holds one value per key, so a key the

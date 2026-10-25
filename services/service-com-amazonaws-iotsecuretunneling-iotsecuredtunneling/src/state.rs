@@ -38,6 +38,16 @@ pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 /// number itself is this emulator's bound, since the model publishes none.
 pub const MAX_TUNNELS: usize = 500;
 
+/// The refusal message for an `OpenTunnel` the store has no room for, beside
+/// the constant it reports exactly as [`tag_limit_message`] sits beside its
+/// own: the text names the limit and what releases a record.
+pub fn tunnel_limit_message() -> String {
+    format!(
+        "Tunnel limit of {MAX_TUNNELS} exceeded; close a tunnel with delete set before opening \
+         another"
+    )
+}
+
 /// The number of tags one tunnel may carry.
 ///
 /// AWS's tagging convention across services is 50 tags per resource, and IoT
@@ -45,11 +55,27 @@ pub const MAX_TUNNELS: usize = 500;
 /// (`length(min: 1, max: 200)`) bounds ONE request's list but not the set a
 /// resource accumulates over repeated `TagResource` calls, so the accumulated
 /// key count is bounded here: a request that would take a tunnel past it is
-/// refused and stores nothing. This is also what keeps the tag store from
-/// growing without bound in a long-lived emulator — each key and value is
-/// bounded by the modelled `@length` constraints on `Tag`, the keys per tunnel
-/// by this constant, and the tunnels by [`MAX_TUNNELS`].
+/// refused — with the modelled `LimitExceededException` (HTTP 403), the one
+/// error this service models for an exhausted limit — and stores nothing. This
+/// is also what keeps the tag store from growing without bound in a long-lived
+/// emulator — each key and value is bounded by the modelled `@length`
+/// constraints on `Tag`, the keys per tunnel by this constant, and the tunnels
+/// by [`MAX_TUNNELS`].
 pub const MAX_TAGS_PER_TUNNEL: usize = 50;
+
+/// The refusal message for a request that would take one tunnel past
+/// [`MAX_TAGS_PER_TUNNEL`] tags.
+///
+/// Kept beside the constant so every tagging entry point refuses in the same
+/// words. `count` is the number of distinct keys the tunnel would end up
+/// carrying, so the text names the limit and how far past it the request goes
+/// and nothing else; both entry points carry the tags on the `tags` member, so
+/// that is the member the text names.
+pub fn tag_limit_message(count: usize) -> String {
+    format!(
+        "Tag limit of {MAX_TAGS_PER_TUNNEL} exceeded; tags would take this tunnel to {count} tags"
+    )
+}
 
 /// The number of service names one tunnel's `destinationConfig` may carry.
 ///
@@ -503,4 +529,14 @@ pub fn max_lifetime(minutes: i32) -> Duration {
     );
     let minutes = u64::try_from(minutes.max(1)).unwrap_or(1);
     Duration::from_secs(minutes.saturating_mul(60))
+}
+
+/// The refusal message for a lifetime whose expiry instant cannot be
+/// represented, i.e. one that [`max_lifetime`] cannot be added to the current
+/// time without leaving the range `SystemTime` can hold.
+///
+/// `member` is the request member the lifetime arrived on and `minutes` is what
+/// it carried, so the caller can fix the request from the text alone.
+pub fn unrepresentable_expiry_message(member: &str, minutes: i32) -> String {
+    format!("{member} of {minutes} minutes puts this tunnel's expiry out of range")
 }

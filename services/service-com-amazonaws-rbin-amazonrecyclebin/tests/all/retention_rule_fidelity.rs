@@ -273,12 +273,12 @@ async fn an_absent_rule_answers_the_not_exist_message_composed_from_the_request(
                 "case {case:?}: expected the message {expected:?}, got {:?}",
                 message_of(&body)
             );
-            // `Reason` is the fault class the model names for an addressed rule that
-            // does not exist (see `crate::state::rule_not_found`).
+            // The optional `Reason` of the modelled 404 is not populated on this path,
+            // so the body carries the message alone (see `crate::state::rule_not_found`).
             assert_eq!(
-                body["Reason"].as_str(),
-                Some("RULE_NOT_FOUND"),
-                "case {case:?}: expected Reason RULE_NOT_FOUND on the not-found body, got {:?}",
+                body.get("Reason"),
+                None,
+                "case {case:?}: expected no Reason member on the not-found body, got {:?}",
                 body["Reason"]
             );
         }

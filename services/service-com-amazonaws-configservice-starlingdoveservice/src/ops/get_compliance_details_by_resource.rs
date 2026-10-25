@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComplianceDetailsByResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComplianceDetailsByResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComplianceDetailsByResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the evaluation results recorded against ONE Amazon Web Services resource:
+//! for every Config rule this account holds, the result that rule recorded for the
+//! resource the request names — either by its own `ResourceType` and `ResourceId`, or
+//! by the `ResourceEvaluationId` of an execution, whose resource and evaluation mode
+//! then say which results are its own; a request carrying both is served from the
+//! execution, which names a resource on its own. The report is in the store's stable (rule name,
+//! evaluation mode) order, narrowed to the `ComplianceTypes` the request filters by and
+//! cut into pages, handing back a `NextToken` exactly when results remain. It writes
+//! nothing: a resource nothing has evaluated reports an empty page, and a request that
+//! names no resource, an execution this account does not hold, a `NextToken` this
+//! operation did not issue, or a `ComplianceType` no filter may name is refused with
+//! `InvalidParameterValueException` — the only error this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +155,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComplianceDetailsByResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComplianceDetailsByResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComplianceDetailsByResource"))
+        // `ctx` carries request metadata only; this report is computed from state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `INSUFFICIENT_DATA` is a ComplianceType a result can carry but no filter may
+        // name, so a filter naming it — or any value outside the published list — is a
+        // bad parameter rather than an empty page.
+        let wanted = input.compliance_types.unwrap_or_default();
+        if let Some(rejected) = wanted.iter().find(|compliance_type| {
+            !crate::state::FILTERABLE_COMPLIANCE_TYPES.contains(&compliance_type.as_str())
+        }) {
+            return Err(invalid_parameter(
+                crate::state::unfilterable_compliance_type_message("ComplianceTypes", rejected),
+            ));
+        }
+
+        // The token is opaque: anything this operation did not issue is malformed. This
+        // operation models no `InvalidNextTokenException`, so a token it cannot place is
+        // refused as the bad parameter it is.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_resource_compliance_detail_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(invalid_parameter(
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                    ));
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // WHICH resource the report is about, and — when an execution named it — the one
+        // evaluation mode that execution's results are recorded in. An id this account
+        // does not hold names no resource, and neither does a request that carries no
+        // resource identification at all. A request carrying BOTH is served from the
+        // execution: an execution already carries the resource it was handed, so the
+        // caller "need[s] to only provide either" of the two ways and the one that names
+        // a resource on its own decides.
+        let (resource_type, resource_id, only_mode) = match input
+            .resource_evaluation_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            Some(id) => {
+                let Some(evaluation) = store.resource_evaluations.get(id) else {
+                    return Err(invalid_parameter(
+                        crate::state::no_such_resource_evaluation_message(id),
+                    ));
+                };
+                (
+                    evaluation.resource_details.resource_type.clone(),
+                    evaluation.resource_details.resource_id.clone(),
+                    Some(evaluation.evaluation_mode.clone()),
+                )
+            }
+            None => {
+                let named = input
+                    .resource_type
+                    .as_deref()
+                    .filter(|resource_type| !resource_type.is_empty())
+                    .zip(
+                        input
+                            .resource_id
+                            .as_deref()
+                            .filter(|resource_id| !resource_id.is_empty()),
+                    );
+                let Some((resource_type, resource_id)) = named else {
+                    return Err(invalid_parameter(
+                        crate::state::RESOURCE_NOT_IDENTIFIED_MESSAGE.to_string(),
+                    ));
+                };
+                (resource_type.to_string(), resource_id.to_string(), None)
+            }
+        };
+
+        // A resource falls in the scope of every rule that evaluated it, so its details
+        // are the results EVERY rule holds for it, walked in the store's own rule-name
+        // order and then in the rule's own result order — which is what lets a token
+        // hold the (rule name, evaluation mode) key the next page resumes at and survive
+        // rules or results written between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        'rules: for rule in store.config_rules.values() {
+            for (key, result) in &rule.evaluation_results {
+                if key.0 != resource_type || key.1 != resource_id {
+                    continue;
+                }
+                // An execution evaluates the resource in ITS mode, so only the results
+                // recorded in that mode are the ones it produced.
+                if only_mode.as_ref().is_some_and(|mode| &key.2 != mode) {
+                    continue;
+                }
+                if !wanted.is_empty()
+                    && !wanted
+                        .iter()
+                        .any(|compliance_type| compliance_type == &result.compliance_type)
+                {
+                    continue;
+                }
+                let resume_key = (rule.name.clone(), key.2.clone());
+                if resume_at
+                    .as_ref()
+                    .is_some_and(|resume_at| &resume_key < resume_at)
+                {
+                    continue;
+                }
+                if page.len() == crate::state::GET_COMPLIANCE_DETAILS_BY_RESOURCE_PAGE_SIZE {
+                    next_token =
+                        Some(crate::state::encode_resource_compliance_detail_token(&resume_key));
+                    break 'rules;
+                }
+                page.push(result.to_shape(&rule.name));
+            }
+        }
+
+        Ok(GetComplianceDetailsByResourceOutput {
+            evaluation_results: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The only failure this operation models, carrying `message`: every request it cannot
+/// serve is a bad parameter value, because `InvalidParameterValueException` is the one
+/// error the model declares for it.
+fn invalid_parameter(message: String) -> GetComplianceDetailsByResourceError {
+    GetComplianceDetailsByResourceErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

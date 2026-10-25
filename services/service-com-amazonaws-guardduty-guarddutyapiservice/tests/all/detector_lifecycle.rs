@@ -1427,22 +1427,15 @@ async fn a_detector_belongs_to_the_region_its_endpoint_created_it_in() {
 #[tokio::test]
 async fn an_operation_outside_this_slice_still_answers_501() {
     let router = new_router();
-    let detector_id = enabled_detector(&router).await;
-    // `ListTrustedEntitySets` is still a scaffold
-    // (`src/ops/list_trusted_entity_sets.rs` carries the SCAFFOLDED marker);
-    // `ListFilters`, `ListIPSets`, `ListThreatIntelSets` and `ListThreatEntitySets` are
-    // implemented, and the `filter_listing`, `ip_set_listing`,
-    // `threat_intel_set_listing` and `threat_entity_set_listing` suites are what assert
-    // their behaviour.
-    let (status, body) = call(
-        &router,
-        "GET",
-        &format!("/detector/{detector_id}/trustedentityset"),
-        None,
-    )
-    .await;
+    // `ListMalwareProtectionPlans` is still a scaffold
+    // (`src/ops/list_malware_protection_plans.rs` carries the SCAFFOLDED marker);
+    // `ListFilters`, `ListIPSets`, `ListThreatIntelSets`, `ListThreatEntitySets` and
+    // `ListTrustedEntitySets` are implemented, and the `filter_listing`,
+    // `ip_set_listing`, `threat_intel_set_listing`, `threat_entity_set_listing` and
+    // `trusted_entity_set_listing` suites are what assert their behaviour.
+    let (status, body) = call(&router, "GET", "/malware-protection-plan", None).await;
     assert_eq!(
         status, 501,
-        "ListTrustedEntitySets is still scaffolded, so it must answer 501: got {status} {body:?}"
+        "ListMalwareProtectionPlans is still scaffolded, so it must answer 501: got {status} {body:?}"
     );
 }

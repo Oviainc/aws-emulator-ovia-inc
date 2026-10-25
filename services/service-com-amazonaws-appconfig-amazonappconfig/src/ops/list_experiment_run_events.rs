@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentRunEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentRunEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the timeline of one experiment run, a page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentRunEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: every entry is read out of the run's stored event log, which the calls
+//! that act on the run append to as they act. Nothing here writes, so listing a run's
+//! events changes nothing a later caller sees.
+//!
+//! The entries come back in the order they HAPPENED — the operation is documented as
+//! answering "a timeline of actions and state changes that occurred during the run", and a
+//! timeline reads forwards. The model documents no other order for this listing (unlike
+//! `Deployment$EventLog`, whose own documentation asks for the most recent first), so
+//! chronological order is this service's reading of it; the log is append-only, so an
+//! entry's position in it is a stable total order and therefore what
+//! [`crate::state::paginate`] keys its cursor on.
 //!
 //! ## Shape of an operation
 //!
@@ -147,20 +151,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentRunEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentRunEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentRunEvents"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListExperimentRunEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Reporting only: the guard is taken for reading, and nothing below writes, so
+        // this read cannot change what a later caller sees.
+        let store = state.lock();
+
+        // An event only exists on a run, which only exists under a definition of an
+        // application, so an unresolvable level of the path is not an empty listing: it is
+        // the 404 this operation models, exactly as the run's own reader answers it. Both
+        // path identifiers are `Identifier`s — the resource's "ID or name" — so the run is
+        // reached however its application and definition are addressed.
+        let Some(application) = store.resolve_application(&input.application_identifier) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_identifier),
+                input.application_identifier,
+            ));
+        };
+        let Some(definition) =
+            application.resolve_experiment_definition(&input.experiment_definition_identifier)
+        else {
+            return Err(not_found(
+                crate::state::experiment_definition_not_found(
+                    &input.application_identifier,
+                    &input.experiment_definition_identifier,
+                ),
+                input.experiment_definition_identifier,
+            ));
+        };
+        let Some(run) = definition.runs.get(&input.run) else {
+            return Err(not_found(
+                crate::state::experiment_run_not_found(
+                    &input.application_identifier,
+                    &input.experiment_definition_identifier,
+                    input.run,
+                ),
+                input.run.to_string(),
+            ));
+        };
+
+        // The log is append-only, so an entry's position in it is both the order the
+        // entries happened in and a TOTAL order — what a pagination cursor needs to
+        // resume exactly once.
+        let ordered: Vec<(String, ExperimentRunEvent)> = run
+            .event_log
+            .iter()
+            .enumerate()
+            .map(|(position, event)| (timeline_key(position), event.clone()))
+            .collect();
+
+        // A `NextToken` this listing did not mint is a bad request rather than "start from
+        // the beginning": answering the first page again would silently restart a caller's
+        // walk.
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_EXPERIMENT_RUN_EVENTS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListExperimentRunEventsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::next_token_not_issued()),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListExperimentRunEventsOutput {
+            // Reported even when empty: it is an answer about a run whose timeline holds
+            // no entry rather than a missing member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The sort key of the entry at `position` in a run's event log, built so that ASCENDING
+/// key order is the order the entries happened in: [`crate::state::paginate`] walks its
+/// input in ascending key order, and the fixed width makes the string comparison agree
+/// with the numeric one (`"10"` must not sort before `"9"`).
+fn timeline_key(position: usize) -> String {
+    format!("{position:010}")
+}
+
+/// The 404 this operation answers for a level of the path that addresses nothing.
+fn not_found(message: String, resource_name: String) -> ListExperimentRunEventsError {
+    ListExperimentRunEventsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
 }

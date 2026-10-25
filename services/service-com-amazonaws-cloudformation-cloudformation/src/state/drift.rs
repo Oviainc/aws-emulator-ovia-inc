@@ -38,6 +38,25 @@
 //! Only the properties BOTH sides name are compared: a service whose read spells the same
 //! configuration under other member names reports nothing comparable, and a resource of
 //! such a type is reported as existing rather than as modified on a name mismatch.
+//!
+//! ## What a MODIFIED resource differs IN
+//!
+//! A resource that differs carries the difference itself, not just the verdict: a
+//! `PropertyDifference` per LEAF the two sides disagree about, at "the fully-qualified path
+//! to the resource property" — the declared property, then the members and list indices
+//! inside it — with both values and which kind of difference it is. So the comparison walks
+//! INTO a declared property the owning service reports: a value the two sides spell
+//! differently is `NOT_EQUAL`, one the reported document no longer carries is `REMOVE` ("the
+//! property has been removed from the current resource configuration"), and a list element
+//! only the reported document carries is `ADD` ("a value has been added to a resource
+//! property that's an array or list data type").
+//!
+//! The two rules are the same rule at two depths, and the difference between them is what
+//! each side's absence means. A TOP-LEVEL property the service's read does not report at all
+//! is no evidence of anything — a service reports the configuration it models, not every
+//! property a template may declare. INSIDE a value that service does report, what it reports
+//! is that value in full, so a member missing from it really is missing from the resource's
+//! configuration.
 
 use serde_json::Value;
 
@@ -49,12 +68,100 @@ use super::{resource_drift_status, StoredResource, DRIFT_STATUS_DRIFTED, DRIFT_S
 /// which is what `NOT_CHECKED` states.
 const NOT_IMPLEMENTED: &str = "NotImplemented";
 
+/// The model's `DifferenceType`: which kind of difference one property difference is.
+pub mod difference_type {
+    /// "A value has been added to a resource property that's an array or list data type."
+    pub const ADD: &str = "ADD";
+    /// "The property has been removed from the current resource configuration."
+    pub const REMOVE: &str = "REMOVE";
+    /// "The current property value differs from its expected value (as defined in the
+    /// stack template and any values specified as template parameters)."
+    pub const NOT_EQUAL: &str = "NOT_EQUAL";
+}
+
+/// One property the two sides of the comparison disagree about, as the modelled
+/// `PropertyDifference` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyDiff {
+    /// "The fully-qualified path to the resource property": the declared property, and the
+    /// members and list indices inside it, each segment after a `/`.
+    pub property_path: String,
+    /// "The expected property value of the resource property, as defined in the stack
+    /// template" — empty for a difference the expected configuration has no value in
+    /// ([`difference_type::ADD`]).
+    pub expected_value: String,
+    /// "The actual property value of the resource property" — empty for a difference the
+    /// reported configuration has no value in ([`difference_type::REMOVE`]).
+    pub actual_value: String,
+    /// One of [`difference_type`].
+    pub difference_type: String,
+}
+
+impl PropertyDiff {
+    /// A leaf the two sides spell differently.
+    fn not_equal(path: &str, expected: &Value, actual: &Value) -> Self {
+        Self {
+            property_path: path.to_string(),
+            expected_value: value_text(expected),
+            actual_value: value_text(actual),
+            difference_type: difference_type::NOT_EQUAL.to_string(),
+        }
+    }
+
+    /// A value the reported configuration no longer carries.
+    fn removed(path: &str, expected: &Value) -> Self {
+        Self {
+            property_path: path.to_string(),
+            expected_value: value_text(expected),
+            actual_value: String::new(),
+            difference_type: difference_type::REMOVE.to_string(),
+        }
+    }
+
+    /// A list element only the reported configuration carries.
+    fn added(path: &str, actual: &Value) -> Self {
+        Self {
+            property_path: path.to_string(),
+            expected_value: String::new(),
+            actual_value: value_text(actual),
+            difference_type: difference_type::ADD.to_string(),
+        }
+    }
+}
+
+/// The two sides of one resource's comparison, as the check really read them.
+///
+/// Recorded for every resource a check COMPARED, so the drift report of that resource is
+/// the comparison that was carried out rather than one recomputed on a read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceDriftDetail {
+    /// "A JSON structure that contains the expected property values of the stack resource,
+    /// as defined in the stack template and any values specified as template parameters" —
+    /// absent for a resource that declared no properties, and for one the owning service no
+    /// longer holds ("for resources whose StackResourceDriftStatus is DELETED, this
+    /// structure will not be present").
+    pub expected_properties: Option<String>,
+    /// "A JSON structure that contains the actual property values of the stack resource" —
+    /// absent for a resource no configuration was read for, for the same reasons.
+    pub actual_properties: Option<String>,
+    /// "A collection of the resource properties whose actual values differ from their
+    /// expected values", which is what makes the resource `MODIFIED`.
+    pub differences: Vec<PropertyDiff>,
+    /// `StackResourceDrift$DriftStatusReason`: "the reason for the drift status", for a
+    /// resource whose check could not be run.
+    pub reason: Option<String>,
+}
+
 /// One resource's drift outcome, as the detection computed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceDrift {
     pub logical_id: String,
     /// One of [`resource_drift_status`].
     pub status: String,
+    /// What the comparison read and found, for a resource it really compared. `None` for
+    /// one no check was asked of any service for — nothing was compared, so there is no
+    /// comparison to report.
+    pub detail: Option<ResourceDriftDetail>,
 }
 
 /// What one drift detection found across the resources it covered.
@@ -122,66 +229,191 @@ pub async fn detect(
 ) -> Detected {
     let mut detected = Detected::default();
     for resource in resources {
-        let status = match provisioner_for(&resource.resource_type) {
+        let (status, detail) = match provisioner_for(&resource.resource_type) {
             // Nothing was created for this resource in any service, so there is no actual
             // configuration to compare: the type does not support drift detection here.
             Some(provisioner) if resource.materialised => {
                 match provisioner.actual_configuration(ctx, region, resource).await {
-                    Ok(None) => resource_drift_status::DELETED.to_string(),
+                    // "For resources whose StackResourceDriftStatus is DELETED", neither
+                    // property structure "will be present": there is no configuration left
+                    // to report, and none was compared.
+                    Ok(None) => (
+                        resource_drift_status::DELETED.to_string(),
+                        Some(ResourceDriftDetail::default()),
+                    ),
                     Ok(Some(actual)) => {
-                        if differs(&resource.properties, &actual) {
-                            resource_drift_status::MODIFIED.to_string()
+                        let differences = differences(&resource.properties, &actual);
+                        let status = if differences.is_empty() {
+                            resource_drift_status::IN_SYNC
                         } else {
-                            resource_drift_status::IN_SYNC.to_string()
-                        }
+                            resource_drift_status::MODIFIED
+                        };
+                        (
+                            status.to_string(),
+                            Some(ResourceDriftDetail {
+                                expected_properties: properties_text(&resource.properties),
+                                actual_properties: properties_text(&actual),
+                                differences,
+                                reason: None,
+                            }),
+                        )
                     }
                     // The owning service does not serve the read, so this resource's
                     // configuration cannot be checked here.
                     Err(refusal) if refusal.code == NOT_IMPLEMENTED => {
-                        resource_drift_status::NOT_CHECKED.to_string()
+                        (resource_drift_status::NOT_CHECKED.to_string(), None)
                     }
                     Err(refusal) => {
                         // "DETECTION_FAILED: The stack drift detection operation has
                         // failed for at least one resource in the stack."
-                        detected.failure.get_or_insert_with(|| {
-                            format!(
-                                "Failed to detect drift on resource {}: {refusal}",
-                                resource.logical_id
-                            )
-                        });
-                        resource_drift_status::UNKNOWN.to_string()
+                        let reason = format!(
+                            "Failed to detect drift on resource {}: {refusal}",
+                            resource.logical_id
+                        );
+                        detected.failure.get_or_insert_with(|| reason.clone());
+                        (
+                            resource_drift_status::UNKNOWN.to_string(),
+                            Some(ResourceDriftDetail {
+                                // The expected configuration is known — it is the
+                                // template's — and nothing was read back, so "the reason
+                                // for the drift status" is the refusal that stopped it.
+                                expected_properties: properties_text(&resource.properties),
+                                actual_properties: None,
+                                differences: Vec::new(),
+                                reason: Some(reason),
+                            }),
+                        )
                     }
                 }
             }
-            _ => resource_drift_status::NOT_CHECKED.to_string(),
+            _ => (resource_drift_status::NOT_CHECKED.to_string(), None),
         };
         detected.results.push(ResourceDrift {
             logical_id: resource.logical_id.clone(),
             status,
+            detail,
         });
     }
     detected
 }
 
+/// One side of the comparison as the modelled `Properties` member carries it: "a JSON
+/// structure that contains the … property values of the stack resource".
+///
+/// A resource that declared no properties has no such structure, which the shape spells as
+/// an absent member rather than as an empty one.
+fn properties_text(value: &Value) -> Option<String> {
+    (!value.is_null()).then(|| value.to_string())
+}
+
+/// One value as the single text a `PropertyValue` carries it in: a scalar's own spelling,
+/// and a composite's compact JSON — the text the create would have sent it as.
+fn value_text(value: &Value) -> String {
+    scalar_text(value).unwrap_or_else(|| value.to_string())
+}
+
 /// Whether the ACTUAL configuration differs from the EXPECTED one, over the properties the
-/// template declared.
+/// template declared — which is exactly whether the comparison found any difference.
+pub fn differs(expected: &Value, actual: &Value) -> bool {
+    !differences(expected, actual).is_empty()
+}
+
+/// Every property the ACTUAL configuration disagrees with the EXPECTED one about, over the
+/// properties the template declared.
 ///
 /// Only a declared property the actual document also carries under the same name is
 /// compared — "only resource properties explicitly defined in the stack template are
 /// checked for drift", and a property the owning service's read does not report is not
-/// evidence of anything. A scalar is compared on its TEXT, because a configuration a
-/// template writes as a number or a boolean is carried as the string an API member takes
-/// (`VisibilityTimeout: 30` against `"30"`); anything else is compared as the document it
-/// is.
-fn differs(expected: &Value, actual: &Value) -> bool {
-    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
-        return false;
+/// evidence of anything. Each compared property is then walked to its LEAVES, so what is
+/// reported is the fully-qualified path of every value the two sides disagree about rather
+/// than the whole property.
+pub fn differences(expected: &Value, actual: &Value) -> Vec<PropertyDiff> {
+    let mut found = Vec::new();
+    let (Some(declared), Some(reported)) = (expected.as_object(), actual.as_object()) else {
+        return found;
     };
-    expected.iter().any(|(property, declared)| {
-        actual
-            .get(property)
-            .is_some_and(|reported| !same_value(declared, reported))
-    })
+    for (property, declared) in declared {
+        if let Some(reported) = reported.get(property) {
+            compare(&format!("/{property}"), declared, reported, 0, &mut found);
+        }
+    }
+    found
+}
+
+/// The deepest a compared property is descended into, past which the two values are
+/// compared whole.
+///
+/// The declared side of the comparison comes from a caller-supplied template body, so the
+/// nesting is the REQUESTER's choice and a recursive walk over it is bounded by a constant
+/// rather than by the input: exhausting the native stack aborts the process instead of
+/// unwinding. This is the nesting a template body is already held to
+/// ([`crate::state::template::MAX_TEMPLATE_DEPTH`]), so no document a stored template can
+/// carry reaches it and the bound changes nothing a client sees.
+const MAX_COMPARISON_DEPTH: usize = super::template::MAX_TEMPLATE_DEPTH;
+
+/// Walk one declared value against the one the owning service reports, appending a
+/// difference per leaf the two disagree about.
+///
+/// A scalar is compared on its TEXT, because a configuration a template writes as a number
+/// or a boolean is carried as the string an API member takes (`VisibilityTimeout: 30`
+/// against `"30"`). Two documents are compared member by member and element by element, so
+/// the path names the value that changed; what one side carries and the other does not is a
+/// removal or an addition. The descent stops at [`MAX_COMPARISON_DEPTH`], past which the
+/// two values are compared as the documents they are.
+fn compare(
+    path: &str,
+    expected: &Value,
+    actual: &Value,
+    depth: usize,
+    found: &mut Vec<PropertyDiff>,
+) {
+    // A composite the service reports as a STRING is the document the create sent it as, so
+    // the reported text is parsed and walked as that document (see [`same_value`]).
+    let parsed = reported_document(expected, actual);
+    let actual = parsed.as_ref().unwrap_or(actual);
+    if depth >= MAX_COMPARISON_DEPTH {
+        if !same_value(expected, actual) {
+            found.push(PropertyDiff::not_equal(path, expected, actual));
+        }
+        return;
+    }
+    match (expected, actual) {
+        (Value::Object(declared), Value::Object(reported)) => {
+            for (member, declared) in declared {
+                let path = format!("{path}/{member}");
+                match reported.get(member) {
+                    Some(reported) => compare(&path, declared, reported, depth + 1, found),
+                    None => found.push(PropertyDiff::removed(&path, declared)),
+                }
+            }
+        }
+        (Value::Array(declared), Value::Array(reported)) => {
+            for (index, element) in declared.iter().enumerate() {
+                let path = format!("{path}/{index}");
+                match reported.get(index) {
+                    Some(reported) => compare(&path, element, reported, depth + 1, found),
+                    None => found.push(PropertyDiff::removed(&path, element)),
+                }
+            }
+            for (index, element) in reported.iter().enumerate().skip(declared.len()) {
+                found.push(PropertyDiff::added(&format!("{path}/{index}"), element));
+            }
+        }
+        _ => {
+            if !same_value(expected, actual) {
+                found.push(PropertyDiff::not_equal(path, expected, actual));
+            }
+        }
+    }
+}
+
+/// The document a reported STRING spells, when the declared value is a composite: `None`
+/// when the declared value is a scalar, or when the reported text is not a document at all.
+fn reported_document(expected: &Value, actual: &Value) -> Option<Value> {
+    if scalar_text(expected).is_some() {
+        return None;
+    }
+    ::serde_json::from_str::<Value>(actual.as_str()?).ok()
 }
 
 /// Whether two configuration values are the same value.
@@ -305,6 +537,129 @@ mod tests {
         }
     }
 
+    /// A difference names the fully-qualified path of the value the two sides disagree
+    /// about, both values, and which kind of difference it is.
+    #[test]
+    fn a_difference_names_the_path_both_values_and_its_kind() {
+        for (case, expected, actual, expected_differences) in [
+            (
+                "a scalar the service reports differently",
+                serde_json::json!({"VisibilityTimeout": 30}),
+                serde_json::json!({"VisibilityTimeout": "60"}),
+                vec![("/VisibilityTimeout", "30", "60", difference_type::NOT_EQUAL)],
+            ),
+            (
+                "a member inside a declared document",
+                serde_json::json!({"VersioningConfiguration": {"Status": "Enabled"}}),
+                serde_json::json!({"VersioningConfiguration": {"Status": "Suspended"}}),
+                vec![(
+                    "/VersioningConfiguration/Status",
+                    "Enabled",
+                    "Suspended",
+                    difference_type::NOT_EQUAL,
+                )],
+            ),
+            (
+                "a member the reported document no longer carries",
+                serde_json::json!({"RedrivePolicy": {"maxReceiveCount": 3, "queue": "dlq"}}),
+                serde_json::json!({"RedrivePolicy": "{\"maxReceiveCount\":3}"}),
+                vec![(
+                    "/RedrivePolicy/queue",
+                    "dlq",
+                    "",
+                    difference_type::REMOVE,
+                )],
+            ),
+            (
+                "an element only the reported list carries",
+                serde_json::json!({"Subnets": ["one"]}),
+                serde_json::json!({"Subnets": ["one", "two"]}),
+                vec![("/Subnets/1", "", "two", difference_type::ADD)],
+            ),
+            (
+                "an element the reported list dropped",
+                serde_json::json!({"Subnets": ["one", "two"]}),
+                serde_json::json!({"Subnets": ["one"]}),
+                vec![("/Subnets/1", "two", "", difference_type::REMOVE)],
+            ),
+            (
+                "an element the reported list changed",
+                serde_json::json!({"Subnets": ["one", "two"]}),
+                serde_json::json!({"Subnets": ["one", "three"]}),
+                vec![("/Subnets/1", "two", "three", difference_type::NOT_EQUAL)],
+            ),
+            (
+                "two properties, one of them changed",
+                serde_json::json!({"DelaySeconds": 0, "VisibilityTimeout": 30}),
+                serde_json::json!({"DelaySeconds": "0", "VisibilityTimeout": "45"}),
+                vec![("/VisibilityTimeout", "30", "45", difference_type::NOT_EQUAL)],
+            ),
+            (
+                "a member only the reported document carries is not a declared property",
+                serde_json::json!({"Policy": {"Version": "2012-10-17"}}),
+                serde_json::json!({"Policy": {"Version": "2012-10-17", "Id": "x"}}),
+                vec![],
+            ),
+            (
+                "nothing differs",
+                serde_json::json!({"FifoQueue": true}),
+                serde_json::json!({"FifoQueue": "true"}),
+                vec![],
+            ),
+        ] {
+            let found = differences(&expected, &actual);
+            let rendered: Vec<(&str, &str, &str, &str)> = found
+                .iter()
+                .map(|difference| {
+                    (
+                        difference.property_path.as_str(),
+                        difference.expected_value.as_str(),
+                        difference.actual_value.as_str(),
+                        difference.difference_type.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                rendered, expected_differences,
+                "case {case:?}: expected {expected_differences:?}, got {rendered:?}"
+            );
+        }
+    }
+
+    /// The descent is BOUNDED: a document nested past [`MAX_COMPARISON_DEPTH`] is compared
+    /// whole at that depth rather than walked further, so the walk's cost cannot be chosen
+    /// by whoever wrote the template — and the difference is still reported.
+    #[test]
+    fn the_descent_into_a_document_is_bounded() {
+        fn nested(depth: usize, leaf: &str) -> Value {
+            let mut value = Value::String(leaf.to_string());
+            for _ in 0..depth {
+                value = serde_json::json!({"Inner": value});
+            }
+            serde_json::json!({"Outer": value})
+        }
+        let depth = MAX_COMPARISON_DEPTH + 8;
+        let found = differences(&nested(depth, "declared"), &nested(depth, "reported"));
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one difference past the bound, got {found:?}"
+        );
+        let difference = found.first().expect("the one difference");
+        let segments = difference.property_path.matches('/').count();
+        assert!(
+            segments <= MAX_COMPARISON_DEPTH + 1,
+            "expected at most {} path segments, got {segments} in {:?}",
+            MAX_COMPARISON_DEPTH + 1,
+            difference.property_path
+        );
+        assert_eq!(
+            difference.difference_type,
+            difference_type::NOT_EQUAL,
+            "expected the bounded comparison to report a changed value, got {difference:?}"
+        );
+    }
+
     /// The stack-level status is what the per-resource outcomes add up to.
     #[test]
     fn stack_status_follows_the_resource_outcomes() {
@@ -359,6 +714,7 @@ mod tests {
                     .map(|(index, status)| ResourceDrift {
                         logical_id: format!("Resource{index}"),
                         status: (*status).to_string(),
+                        detail: None,
                     })
                     .collect(),
                 failure: None,

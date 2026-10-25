@@ -45,6 +45,14 @@
 //! * A per-id call naming a configuration the bucket does not carry — one never put, one
 //!   already deleted, or one only another bucket carries — answers `NoSuchConfiguration`
 //!   (HTTP 404) and changes nothing.
+//! * Once every configuration a bucket carried has been deleted, the bucket carries NONE:
+//!   the listing reports an untruncated, EMPTY page — `IntelligentTieringConfigurationList`
+//!   is `xmlFlattened` with `xmlName` `IntelligentTieringConfiguration`
+//!   (`smithy_query(query="operation",operation="ListBucketIntelligentTieringConfigurations")`),
+//!   so a page carrying no configuration carries no container at all, `IsTruncated` is
+//!   false and no `NextContinuationToken` is handed back — whatever the bucket carried
+//!   before and in whatever order the deletes arrived, and configurations another bucket
+//!   carries under the same ids are left alone.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -1506,6 +1514,177 @@ async fn a_per_id_call_naming_nothing_the_bucket_carries_is_refused() {
             2,
             "case {case:?} via {operation:?}: the neighbouring bucket must keep both its \
              configurations, got {neighbours:?}"
+        );
+    }
+}
+
+/// The order one row of [`deleting_every_configuration_leaves_the_bucket_carrying_none`]
+/// deletes the configurations the bucket carried in.
+///
+/// A delete is addressed by id alone, so the order the deletes arrive in must not change
+/// where the bucket ends up: these are the orders the rows walk.
+#[derive(Debug, Clone, Copy)]
+enum DeletionOrder {
+    /// The order the puts recorded them in, which is not the store's own order.
+    AsPut,
+    AscendingId,
+    DescendingId,
+}
+
+#[tokio::test]
+async fn deleting_every_configuration_leaves_the_bucket_carrying_none() {
+    let router = router();
+
+    // The rows differ along what the rule generalises over: HOW MANY configurations the
+    // bucket carried, which FORM each one took (the round-trip table's rows, prefix- and
+    // tag-filtered containers among them), and the ORDER the deletes arrived in.
+    let table = round_trip_rows();
+    let rows: Vec<(usize, DeletionOrder)> = vec![
+        (1, DeletionOrder::AsPut),
+        (2, DeletionOrder::DescendingId),
+        (3, DeletionOrder::AscendingId),
+        (table.len(), DeletionOrder::AsPut),
+        (table.len(), DeletionOrder::DescendingId),
+    ];
+
+    for (index, (count, order)) in rows.into_iter().enumerate() {
+        let case = format!("{count} configuration(s), deleted {order:?}");
+        let name = format!("itc-empty-after-delete-{index}");
+        bucket(&router, &name).await;
+        // A second bucket carrying the SAME ids, so what is pinned is "the configurations
+        // of the bucket the request names" rather than "every configuration under that id".
+        let neighbour = format!("itc-empty-after-delete-neighbour-{index}");
+        bucket(&router, &neighbour).await;
+
+        let carried: Vec<ConfigurationRow> = table
+            .iter()
+            .take(count)
+            .map(|(_, configuration)| configuration.clone())
+            .collect();
+        for configuration in &carried {
+            for on in [&name, &neighbour] {
+                let put = put_configuration(&router, on, &configuration.id, configuration).await;
+                assert_eq!(
+                    put.status,
+                    200,
+                    "case {case:?}: expected the put of {:?} on {on} to answer 200, got {} ({})",
+                    configuration.id,
+                    put.status,
+                    body_of(&put)
+                );
+            }
+        }
+
+        let mut deletes = carried.clone();
+        match order {
+            DeletionOrder::AsPut => {}
+            DeletionOrder::AscendingId => deletes.sort_by(|left, right| left.id.cmp(&right.id)),
+            DeletionOrder::DescendingId => deletes.sort_by(|left, right| right.id.cmp(&left.id)),
+        }
+
+        for (position, configuration) in deletes.iter().enumerate() {
+            let deleted = delete_configuration(&router, &name, &configuration.id, &[]).await;
+            assert_eq!(
+                deleted.status,
+                204,
+                "case {case:?}: expected the delete of {:?} to answer 204, got {} ({})",
+                configuration.id,
+                deleted.status,
+                body_of(&deleted)
+            );
+            assert!(
+                deleted.body.is_empty(),
+                "case {case:?}: a successful delete of {:?} carries no body, got {:?}",
+                configuration.id,
+                body_of(&deleted)
+            );
+
+            // Every configuration not yet deleted is still reported, in ascending id order:
+            // each delete drops exactly the one it names.
+            let mut expected: Vec<ConfigurationRow> = deletes[position + 1..].to_vec();
+            expected.sort_by(|left, right| left.id.cmp(&right.id));
+            let listing = list_configurations(&router, &name, None, &[]).await;
+            let reported = reported_configurations(&listing);
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: after deleting {:?} the bucket must carry {expected:?}, got \
+                 {reported:?}",
+                configuration.id
+            );
+        }
+
+        // The last delete left the bucket carrying none: one untruncated, EMPTY page.
+        let listing = list_configurations(&router, &name, None, &[]).await;
+        assert_eq!(
+            listing.status,
+            200,
+            "case {case:?}: a bucket carrying no configuration still lists, got {} ({})",
+            listing.status,
+            body_of(&listing)
+        );
+        assert!(
+            !body_of(&listing).contains("<IntelligentTieringConfiguration"),
+            "case {case:?}: a page carrying no configuration carries no container, got {:?}",
+            body_of(&listing)
+        );
+        assert!(
+            !is_truncated(&listing),
+            "case {case:?}: an empty page is complete, got {:?}",
+            body_of(&listing)
+        );
+        assert!(
+            listing.element("NextContinuationToken").is_none(),
+            "case {case:?}: a complete page hands back no cursor, got {:?}",
+            body_of(&listing)
+        );
+
+        // Each id is gone per-id as well, and a repeated delete has nothing left to delete.
+        for configuration in &carried {
+            let read = get_configuration(&router, &name, &configuration.id, &[]).await;
+            assert_eq!(
+                read.status,
+                404,
+                "case {case:?}: {:?} must be gone, got {} ({})",
+                configuration.id,
+                read.status,
+                body_of(&read)
+            );
+            assert_eq!(
+                read.error_code(),
+                NO_SUCH_CONFIGURATION_CODE,
+                "case {case:?}: expected {NO_SUCH_CONFIGURATION_CODE} for {:?}, got {}",
+                configuration.id,
+                read.error_code()
+            );
+            let repeated = delete_configuration(&router, &name, &configuration.id, &[]).await;
+            assert_eq!(
+                repeated.status,
+                404,
+                "case {case:?}: a repeated delete of {:?} has nothing to delete, got {} ({})",
+                configuration.id,
+                repeated.status,
+                body_of(&repeated)
+            );
+            assert_eq!(
+                repeated.error_code(),
+                NO_SUCH_CONFIGURATION_CODE,
+                "case {case:?}: expected {NO_SUCH_CONFIGURATION_CODE} for the repeated delete \
+                 of {:?}, got {}",
+                configuration.id,
+                repeated.error_code()
+            );
+        }
+
+        // The neighbouring bucket kept every one of them: the deletes were scoped to the
+        // bucket they named.
+        let mut untouched = carried.clone();
+        untouched.sort_by(|left, right| left.id.cmp(&right.id));
+        let neighbours =
+            reported_configurations(&list_configurations(&router, &neighbour, None, &[]).await);
+        assert_eq!(
+            neighbours, untouched,
+            "case {case:?}: the neighbouring bucket must still carry {untouched:?}, got \
+             {neighbours:?}"
         );
     }
 }
