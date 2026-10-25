@@ -284,15 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Tags are addressed by resource ARN, the key this service's tagging operations
-        // take, so they are stored there rather than on the record.
-        if let Some(tags) = input.tags.as_ref().filter(|tags| !tags.is_empty()) {
-            store.tags.insert(
-                configuration.arn.clone(),
-                tags.iter()
-                    .map(|tag| (tag.key.clone(), tag.value.clone()))
-                    .collect(),
-            );
-        }
+        // take, so they are stored there rather than on the record — through the one writer
+        // every tag attachment in this service goes through, so a tag a create attached is
+        // stored exactly as one `TagResource` attached later.
+        store.put_tags(&configuration.arn, input.tags.as_deref().unwrap_or_default());
 
         store.put_instrumentation_configuration(scope, configuration.clone(), now);
 

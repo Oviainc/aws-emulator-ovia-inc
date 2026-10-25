@@ -19,6 +19,12 @@
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
 //!
+//! The SCHEMA REGISTRY is the store's second resource tree and is independent of the
+//! catalog: a registry (keyed by name, per account) holds schema sets, and a schema set
+//! holds the versions registered against it. It is keyed by name rather than by
+//! `CatalogId` because every schema-registry operation addresses its resource by a
+//! `RegistryId`/`SchemaId` wrapper carrying a name or an ARN and no catalog id at all.
+//!
 //! CUSTOM ENTITY TYPES — the custom sensitive-data patterns `CreateCustomEntityType`
 //! registers — sit in the same kind of per-account namespace, keyed by pattern name:
 //! "This name must be unique per Amazon Web Services account"
@@ -42,7 +48,8 @@ use crate::ops::types::{
     DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty,
     FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration,
     LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
-    Schedule, SchemaChangePolicy, SourceControlDetails, StartJobRunInput, StorageDescriptor, Table,
+    RegistryId, Schedule, SchemaChangePolicy, SchemaId, SourceControlDetails, StartJobRunInput,
+    StorageDescriptor, Table,
     TableIdentifier, TableInput,
 };
 
@@ -290,6 +297,19 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// unique in your account"). The key is the name exactly as sent — the model
     /// documents no case fold for `Job$Name`.
     pub jobs: HashMap<String, JobEntry>,
+    /// Every schema registry this emulator holds, keyed by `RegistryName`, in name order.
+    ///
+    /// Registries live BESIDE the catalog tree: a schema-registry operation addresses its
+    /// resource through a `RegistryId`/`SchemaId` wrapper carrying a name or an ARN and no
+    /// `CatalogId`, so the namespace is per account. The key is the name exactly as sent —
+    /// the model documents no case fold for `SchemaRegistryNameString`, whose pattern
+    /// (`^[a-zA-Z0-9-_$#.]+$`) admits both cases and so distinguishes them.
+    ///
+    /// The map is NOT pre-seeded with [`DEFAULT_REGISTRY_NAME`]: that entry is materialised
+    /// by the first create that reaches it, which is what `CreateSchema` documents ("this
+    /// will create an entry for a "default-registry" in the registry database tables, if it
+    /// is not already present").
+    pub registries: BTreeMap<String, RegistryEntry>,
     /// Every custom entity type (custom sensitive-data pattern) this emulator holds,
     /// keyed by its name.
     ///
@@ -399,6 +419,45 @@ impl ComAmazonawsGlueAwsglueState {
     /// Whether the store can hold another job definition, i.e. is below [`MAX_JOBS`].
     pub fn can_store_job(&self) -> bool {
         self.jobs.len() < MAX_JOBS
+    }
+
+    /// Whether the store can hold another schema registry, i.e. is below
+    /// [`MAX_REGISTRIES`].
+    pub fn can_store_registry(&self) -> bool {
+        self.registries.len() < MAX_REGISTRIES
+    }
+
+    /// The stored registry `name`, or `None` when this store holds no such registry.
+    pub fn registry(&self, name: &str) -> Option<&RegistryEntry> {
+        self.registries.get(name)
+    }
+
+    /// The stored registry `name`, mutably.
+    pub fn registry_mut(&mut self, name: &str) -> Option<&mut RegistryEntry> {
+        self.registries.get_mut(name)
+    }
+
+    /// The stored schema set `schema_name` of registry `registry_name`, or `None` when
+    /// either the registry or the schema is absent.
+    pub fn schema(&self, registry_name: &str, schema_name: &str) -> Option<&SchemaEntry> {
+        self.registries
+            .get(registry_name)
+            .and_then(|registry| registry.schemas.get(schema_name))
+    }
+
+    /// How many schema sets the whole store holds. Bounded by [`MAX_REGISTRIES`], so this
+    /// walk is over at most that many entries.
+    pub fn stored_schemas(&self) -> usize {
+        self.registries
+            .values()
+            .map(|registry| registry.schemas.len())
+            .sum()
+    }
+
+    /// Whether the store as a whole can hold another schema set, i.e. is below
+    /// [`MAX_STORED_SCHEMAS`].
+    pub fn can_store_schema(&self) -> bool {
+        self.stored_schemas() < MAX_STORED_SCHEMAS
     }
 
     /// Whether the store can hold another custom entity type, i.e. is below
@@ -1835,6 +1894,451 @@ impl ConnectionEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The schema registry
+// ---------------------------------------------------------------------------
+
+/// The registry a schema-registry call that names no registry is served from.
+///
+/// `CreateSchema` documents the name: "When this API is called without a `RegistryId`,
+/// this will create an entry for a "default-registry" in the registry database tables, if
+/// it is not already present." It is the one registry name a create may bring into
+/// existence, so it resolves to the same create-if-absent whether a request defaults to it
+/// or names it outright; any other name must already have been created.
+pub const DEFAULT_REGISTRY_NAME: &str = "default-registry";
+
+/// Ceiling on the schema registries this emulator will hold, for the same reason as
+/// [`MAX_DATABASES_PER_CATALOG`]: resident memory bounded against a create any caller can
+/// reach. A create past it is refused with the operation's own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_REGISTRIES: usize = 100;
+
+/// Ceiling on the schema sets one registry may hold, for the same reason as
+/// [`MAX_REGISTRIES`].
+pub const MAX_SCHEMAS_PER_REGISTRY: usize = 1_000;
+
+/// Ceiling on the schema sets the whole store may hold, across every registry.
+///
+/// Bounds the product of the two ceilings above, which on its own would still let a caller
+/// grow the store far past what one process should hold: a schema set keeps every
+/// `SchemaDefinition` registered against it verbatim, and the modelled
+/// `SchemaDefinitionString` admits 170000 characters apiece, so the bound that matters is
+/// the one on how many of those the store holds at once.
+pub const MAX_STORED_SCHEMAS: usize = 2_000;
+
+/// `RegistryStatus` for a registry this store holds. The enum carries exactly two values
+/// and the other one (`DELETING`) belongs to a registry a delete is draining, so a
+/// registry that is simply present is this one.
+pub const REGISTRY_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `SchemaStatus` for a schema set this store holds. Nothing here is provisioned
+/// asynchronously, so a schema set a create returned is readable at once rather than
+/// passing through `PENDING`.
+pub const SCHEMA_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `SchemaVersionStatus` for a stored schema version, for the same reason as
+/// [`SCHEMA_STATUS_AVAILABLE`].
+pub const SCHEMA_VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// The `Compatibility` mode recorded for a schema created without one.
+///
+/// Source: AWS's schema-registry documentation, which names BACKWARD the default
+/// compatibility mode of a new schema and recommends it ("This compatibility choice is
+/// recommended as it allows data receivers to read both the current and one previous
+/// schema version" — `CreateSchemaInput$Compatibility`). A schema always has a mode: it is
+/// what every later version registration is checked against, and what
+/// [`SchemaEntry::checkpoint`] records a change of.
+pub const DEFAULT_COMPATIBILITY: &str = "BACKWARD";
+
+/// The number of the first version registered against a schema set, which is also the
+/// minimum the modelled `VersionLongNumber` admits (range 1..100000).
+pub const FIRST_SCHEMA_VERSION: i64 = 1;
+
+/// The version number reported for a schema set that holds no version yet — the one before
+/// [`FIRST_SCHEMA_VERSION`], i.e. the version a first registration advances FROM.
+///
+/// `CreateSchema$SchemaDefinition` is optional, so a schema set can exist with no version;
+/// its latest version and its checkpoint are then this, and its next version is
+/// [`FIRST_SCHEMA_VERSION`].
+pub const NO_SCHEMA_VERSION: i64 = 0;
+
+/// The ARN resource-type segment of a schema registry (`registry/<name>`), the way
+/// `CreateSchema$RegistryId` spells it ("The ARN format for the same will be:
+/// arn:aws:glue:us-east-2::registry/default-registry…").
+pub const REGISTRY_ARN_SEGMENT: &str = "registry";
+
+/// The ARN resource-type segment of a schema set. A schema lives inside a registry, so its
+/// resource portion carries BOTH names: `schema/<registry>/<schema>`.
+pub const SCHEMA_ARN_SEGMENT: &str = "schema";
+
+/// The ARN of registry `registry_name` as served in `region`.
+pub fn registry_arn(region: &str, registry_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{REGISTRY_ARN_SEGMENT}/{registry_name}"),
+    )
+}
+
+/// The ARN of schema set `schema_name` of registry `registry_name`, as served in `region`.
+pub fn schema_arn(region: &str, registry_name: &str, schema_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{SCHEMA_ARN_SEGMENT}/{registry_name}/{schema_name}"),
+    )
+}
+
+/// The identity fields and resource portion of a Glue resource ARN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlueArn {
+    /// Field 4 of the ARN: the Region whose estate the resource belongs to.
+    pub region: String,
+    /// Field 5: the account that owns it.
+    pub account_id: String,
+    /// The sixth field and everything after it, colons included.
+    pub resource: String,
+}
+
+impl GlueArn {
+    /// Whether this ARN names the estate this endpoint serves: its own account, and the
+    /// Region the request asking is served in. An ARN of any other account or Region names
+    /// a resource this process does not hold, whatever it holds under that name.
+    pub fn is_local(&self, region: &str) -> bool {
+        is_served_account(&self.account_id) && self.region == region
+    }
+
+    /// This ARN's resource portion with the resource-type segment `segment` and its `/`
+    /// stripped — the `default-registry` of `registry/default-registry`, the
+    /// `default-registry/payments` of `schema/default-registry/payments`.
+    ///
+    /// `None` when the resource names another type, or carries no name after the segment.
+    pub fn resource_of_type(&self, segment: &str) -> Option<&str> {
+        let (kind, name) = self.resource.split_once('/')?;
+        (kind == segment && !name.is_empty()).then_some(name)
+    }
+}
+
+/// `arn`'s identity fields and resource portion when it is a well-formed Glue resource
+/// ARN, or `None` when it is not one — a value in another service's namespace, or an ARN
+/// missing a field.
+///
+/// The ONE split this crate does of a Glue ARN, so no two operations can disagree about
+/// what one is. Only the fields are read here; which resource TYPE the ARN names
+/// ([`GlueArn::resource_of_type`]), whether it names this endpoint's estate
+/// ([`GlueArn::is_local`]) and whether this store holds the resource are separate answers.
+pub fn parse_glue_arn(arn: &str) -> Option<GlueArn> {
+    // `arn:<partition>:glue:<region>:<account>:<resource>`. The resource is the LAST
+    // field, so it keeps any colon and any `/` of its own.
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    if fields.len() != 6 || fields[0] != "arn" || fields[2] != ARN_NAMESPACE {
+        return None;
+    }
+    Some(GlueArn {
+        region: fields[3].to_string(),
+        account_id: fields[4].to_string(),
+        resource: fields[5].to_string(),
+    })
+}
+
+/// What a `RegistryId` or `SchemaId` resolves to.
+///
+/// Both wrappers may address their resource by name or by ARN, and an ARN carries an
+/// account and a Region of its own — so a well-formed reference can name an estate this
+/// endpoint does not serve. That is not a bad parameter and not a local resource either:
+/// it is a reference this endpoint holds nothing for, whatever it holds under that name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reference<T> {
+    /// A reference into this endpoint's own estate, resolved to its names.
+    Local(T),
+    /// A well-formed ARN of another account or another Region, resolved to the names it
+    /// carries so a refusal can say what was looked for.
+    Elsewhere(T),
+}
+
+/// The sentence a refusal carries for a `RegistryId` that names neither of the two members
+/// one has to carry. Stated by the model: "One of `RegistryArn` or `RegistryName` has to
+/// be provided" (`RegistryId$RegistryName`).
+pub const REGISTRY_ID_REQUIRES_ONE: &str =
+    "One of RegistryArn or RegistryName has to be provided.";
+
+/// The same for a `SchemaId`, from `SchemaId$SchemaArn`: "One of `SchemaArn` or
+/// `SchemaName` has to be provided."
+pub const SCHEMA_ID_REQUIRES_ONE: &str = "One of SchemaArn or SchemaName has to be provided.";
+
+/// The registry a `RegistryId` names, as served in `region`.
+///
+/// `Err` is a bad parameter — neither member carried, an `RegistryArn` that is not a Glue
+/// registry ARN, or two members naming different registries — and its string is the
+/// refusal's message, derived from the member that is wrong.
+pub fn registry_reference(
+    registry_id: &RegistryId,
+    region: &str,
+) -> Result<Reference<String>, String> {
+    let from_arn = match non_empty(registry_id.registry_arn.as_deref()) {
+        Some(arn) => {
+            let not_a_registry =
+                || format!("RegistryArn {arn:?} is not the ARN of a Glue schema registry");
+            let Some(parsed) = parse_glue_arn(arn) else {
+                return Err(not_a_registry());
+            };
+            // A registry's resource portion is its name alone; anything deeper names
+            // something else living under the segment, not a registry.
+            let name = parsed
+                .resource_of_type(REGISTRY_ARN_SEGMENT)
+                .filter(|name| !name.contains('/'))
+                .map(str::to_string);
+            let Some(name) = name else {
+                return Err(not_a_registry());
+            };
+            if !parsed.is_local(region) {
+                return Ok(Reference::Elsewhere(name));
+            }
+            Some(name)
+        }
+        None => None,
+    };
+    match (from_arn, non_empty(registry_id.registry_name.as_deref())) {
+        (None, None) => Err(REGISTRY_ID_REQUIRES_ONE.to_string()),
+        (Some(name), None) => Ok(Reference::Local(name)),
+        (None, Some(name)) => Ok(Reference::Local(name.to_string())),
+        (Some(from_arn), Some(name)) if from_arn == name => Ok(Reference::Local(from_arn)),
+        (Some(from_arn), Some(name)) => Err(format!(
+            "RegistryArn names registry {from_arn} but RegistryName is {name}; both members \
+             must name the same registry"
+        )),
+    }
+}
+
+/// The registry and schema names a `SchemaId` names, as served in `region`.
+///
+/// A `SchemaId` that names a schema by name and no registry addresses the registry a
+/// schema-registry call defaults to ([`DEFAULT_REGISTRY_NAME`]), which is the registry
+/// `CreateSchema` writes into when the create named none.
+///
+/// `Err` carries the refusal's message, like [`registry_reference`]'s.
+pub fn schema_reference(
+    schema_id: &SchemaId,
+    region: &str,
+) -> Result<Reference<(String, String)>, String> {
+    let from_arn = match non_empty(schema_id.schema_arn.as_deref()) {
+        Some(arn) => {
+            let not_a_schema = || format!("SchemaArn {arn:?} is not the ARN of a Glue schema");
+            let Some(parsed) = parse_glue_arn(arn) else {
+                return Err(not_a_schema());
+            };
+            // `schema/<registry>/<schema>`: exactly two names, so a schema name carrying a
+            // further `/` is not this ARN's shape.
+            let names = parsed
+                .resource_of_type(SCHEMA_ARN_SEGMENT)
+                .and_then(|resource| resource.split_once('/'))
+                .filter(|(registry, schema)| !registry.is_empty() && !schema.contains('/'))
+                .map(|(registry, schema)| (registry.to_string(), schema.to_string()));
+            let Some(names) = names else {
+                return Err(not_a_schema());
+            };
+            if !parsed.is_local(region) {
+                return Ok(Reference::Elsewhere(names));
+            }
+            Some(names)
+        }
+        None => None,
+    };
+    let by_name = non_empty(schema_id.schema_name.as_deref()).map(|schema| {
+        let registry = non_empty(schema_id.registry_name.as_deref())
+            .unwrap_or(DEFAULT_REGISTRY_NAME)
+            .to_string();
+        (registry, schema.to_string())
+    });
+    match (from_arn, by_name) {
+        (None, None) => Err(SCHEMA_ID_REQUIRES_ONE.to_string()),
+        (Some(named), None) => Ok(Reference::Local(named)),
+        (None, Some(named)) => Ok(Reference::Local(named)),
+        (Some(from_arn), Some(by_name)) if from_arn == by_name => Ok(Reference::Local(from_arn)),
+        (Some(from_arn), Some(by_name)) => Err(format!(
+            "SchemaArn names schema {}/{} but SchemaName names {}/{}; both must name the \
+             same schema",
+            from_arn.0, from_arn.1, by_name.0, by_name.1
+        )),
+    }
+}
+
+/// `value` when it carries a non-empty string. An absent member and one sent as `""` say
+/// the same thing about which member a wrapper carried, and `""` satisfies no name's
+/// modelled pattern.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|text| !text.is_empty())
+}
+
+/// One schema registry: the schema sets stored under a single `RegistryName`.
+#[derive(Debug, Clone)]
+pub struct RegistryEntry {
+    /// `RegistryName`, which is also this entry's key in
+    /// [`ComAmazonawsGlueAwsglueState::registries`].
+    pub name: String,
+    /// `CreateRegistry$Description`, absent for a registry created without one and for the
+    /// default registry a schema create materialises.
+    pub description: Option<String>,
+    /// `RegistryStatus`: [`REGISTRY_STATUS_AVAILABLE`] for every registry this store holds.
+    pub status: String,
+    /// When the registry was created, reported as `CreatedTime`.
+    pub created_time: SystemTime,
+    /// When it last changed, reported as `UpdatedTime`. Equal to [`Self::created_time`]
+    /// until something updates the registry itself — a schema created inside it does not
+    /// change the registry.
+    pub updated_time: SystemTime,
+    /// `CreateRegistry$Tags`.
+    pub tags: HashMap<String, String>,
+    /// The schema sets this registry holds, keyed by `SchemaName`, in name order.
+    pub schemas: BTreeMap<String, SchemaEntry>,
+}
+
+impl RegistryEntry {
+    /// A registry created at `now`, with the description and tags its create carried.
+    pub fn new(
+        name: &str,
+        description: Option<String>,
+        tags: Option<&HashMap<String, String>>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            description,
+            status: REGISTRY_STATUS_AVAILABLE.to_string(),
+            created_time: now,
+            updated_time: now,
+            tags: tags.cloned().unwrap_or_default(),
+            schemas: BTreeMap::new(),
+        }
+    }
+
+    /// The [`DEFAULT_REGISTRY_NAME`] entry a schema create materialises when it is not
+    /// already present. It carries no description and no tags: nothing asked for it, so
+    /// there is nothing to record on it.
+    pub fn default_registry(now: SystemTime) -> Self {
+        Self::new(DEFAULT_REGISTRY_NAME, None, None, now)
+    }
+
+    /// Whether this registry can hold another schema set, i.e. is below
+    /// [`MAX_SCHEMAS_PER_REGISTRY`].
+    pub fn can_store_schema(&self) -> bool {
+        self.schemas.len() < MAX_SCHEMAS_PER_REGISTRY
+    }
+}
+
+/// One schema set: the compatibility settings a `CreateSchema` recorded, plus the versions
+/// registered against it.
+#[derive(Debug, Clone)]
+pub struct SchemaEntry {
+    /// `SchemaName`, which is also this entry's key in [`RegistryEntry::schemas`].
+    pub name: String,
+    /// The name of the registry holding it, so a read of the schema alone can report the
+    /// registry it belongs to.
+    pub registry_name: String,
+    /// `CreateSchema$Description`: "If description is not provided, there will not be any
+    /// automatic default value for this", hence `Option` rather than an empty string.
+    pub description: Option<String>,
+    /// `DataFormat`, the format every version's definition is written in.
+    pub data_format: String,
+    /// `Compatibility`, the mode later version registrations are checked against
+    /// ([`DEFAULT_COMPATIBILITY`] for a create that named none).
+    pub compatibility: String,
+    /// `SchemaStatus`: [`SCHEMA_STATUS_AVAILABLE`] for every schema set this store holds.
+    pub status: String,
+    /// `SchemaCheckpoint`, "the version number of the checkpoint (the last time the
+    /// compatibility mode was changed)": the version in force when the mode was last set,
+    /// which at create is the version the create registered — or [`NO_SCHEMA_VERSION`] when
+    /// it registered none.
+    pub checkpoint: i64,
+    /// When the schema set was created, reported as `CreatedTime`.
+    pub created_time: SystemTime,
+    /// When it last changed, reported as `UpdatedTime`.
+    pub updated_time: SystemTime,
+    /// `CreateSchema$Tags`.
+    pub tags: HashMap<String, String>,
+    /// The versions registered against it, in registration order, so the last is the
+    /// latest.
+    pub versions: Vec<SchemaVersionEntry>,
+}
+
+impl SchemaEntry {
+    /// `LatestSchemaVersion`, "the latest version of the schema associated with the
+    /// returned schema definition": the number of the last version registered, or
+    /// [`NO_SCHEMA_VERSION`] for a schema set that holds none.
+    pub fn latest_schema_version(&self) -> i64 {
+        self.versions
+            .last()
+            .map_or(NO_SCHEMA_VERSION, |version| version.version_number)
+    }
+
+    /// `NextSchemaVersion`: the number the next registration would take, which is one past
+    /// [`Self::latest_schema_version`] — so a schema set holding no version reports
+    /// [`FIRST_SCHEMA_VERSION`].
+    pub fn next_schema_version(&self) -> i64 {
+        self.latest_schema_version().saturating_add(1)
+    }
+
+    /// The last version registered against this schema set.
+    pub fn latest_version(&self) -> Option<&SchemaVersionEntry> {
+        self.versions.last()
+    }
+}
+
+/// One version registered against a schema set.
+#[derive(Debug, Clone)]
+pub struct SchemaVersionEntry {
+    /// `SchemaVersionId`, the version's own identifier: a version-4 UUID, which is the
+    /// shape the modelled `SchemaVersionIdString` pins (len 36, pattern
+    /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`). Minted once, at
+    /// registration, so every later read of this version reports the same id.
+    pub version_id: String,
+    /// `VersionNumber`, counting from [`FIRST_SCHEMA_VERSION`].
+    pub version_number: i64,
+    /// The `SchemaDefinition` registered, stored verbatim: it is the artefact later reads
+    /// return and later registrations are compared against.
+    pub definition: String,
+    /// `SchemaVersionStatus`.
+    pub status: String,
+    /// When the version was registered, reported as `CreatedTime`.
+    pub created_time: SystemTime,
+}
+
+impl SchemaVersionEntry {
+    /// The version `version_number` of a schema set, registered at `now` with `definition`.
+    pub fn new(version_number: i64, definition: String, now: SystemTime) -> Self {
+        Self {
+            version_id: new_schema_version_id(),
+            version_number,
+            definition,
+            status: SCHEMA_VERSION_STATUS_AVAILABLE.to_string(),
+            created_time: now,
+        }
+    }
+}
+
+/// A fresh `SchemaVersionId`: a version-4 UUID, the shape the modelled
+/// `SchemaVersionIdString` pins.
+///
+/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s
+/// uuid-backed id newtype (`BatchId::random()` is `uuid::Uuid::new_v4()` rendered
+/// canonically), which this crate already depends on: nothing here is a hand-rolled
+/// generator. This names a RESOURCE, not a credential.
+pub fn new_schema_version_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
+/// A wall-clock instant as the schema registry reports it.
+///
+/// The registry's own timestamps (`CreatedTimestamp`, `UpdatedTimestamp`) are modelled as
+/// STRINGS rather than as the timestamp type the catalog's shapes use, so the instant is
+/// rendered as a date-time string here, once, and every schema-registry read formats it the
+/// same way.
+pub fn to_timestamp_string(at: SystemTime) -> String {
+    to_date_time(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
 /// The `VersionId` that follows `current`: the stored counter plus one.
 ///
 /// Only the server ever writes a `VersionId`, and it writes a decimal counter, so a
@@ -1873,6 +2377,13 @@ pub fn next_version_id(current: &str) -> String {
 /// and is built by [`super::catalog_error_detail`]. The job and connection slices are
 /// not here either: no recording or doc states their wording, so their messages are not
 /// requirements and are left to the issues that own them rather than guessed at.
+///
+/// The schema-registry misses ARE here, because every operation that resolves a
+/// `RegistryId` or a `SchemaId` resolves the same two references and so has to describe
+/// the same two misses. No recording or doc states their wording either: what is pinned
+/// is the behaviour — 400 with the operation's modelled `EntityNotFoundException` — and
+/// the sentence follows the per-resource template the catalog slice's recorded misses
+/// use.
 pub mod messages {
     /// A crawler lookup (`GetCrawler`) for a name no crawler in this account has.
     /// Built from the request's `Name`, which is stored and matched exactly as sent.
@@ -1916,6 +2427,28 @@ pub mod messages {
     /// inferred from the recorded `CreateDatabase` duplicate, like
     /// [`CRAWLER_ALREADY_EXISTS`].
     pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
+
+    /// Any schema-registry operation whose `RegistryId` resolves to a registry this
+    /// endpoint holds none of — the parent-registry miss of a schema create, and the miss
+    /// of every operation that addresses a registry directly. Built from the resolved
+    /// registry name alone, like [`database_not_found`].
+    pub fn registry_not_found(name: &str) -> String {
+        format!("Registry {name} not found.")
+    }
+
+    /// Any schema-registry operation whose `SchemaId` resolves to a schema set this
+    /// endpoint holds none of (`GetSchema`, and the parent-schema miss of every version
+    /// operation). Built from the resolved schema name alone — the registry the id
+    /// resolved to is the container, which this crate's refusals do not name.
+    pub fn schema_not_found(name: &str) -> String {
+        format!("Schema {name} not found.")
+    }
+
+    /// `CreateSchema` for a `SchemaName` its registry already holds. NOT recorded:
+    /// inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// the requested name.
+    pub const SCHEMA_ALREADY_EXISTS: &str = "Schema already exists.";
 }
 
 /// Fold a database or table name the way the catalog stores it: ASCII-lowercased.
@@ -2010,6 +2543,11 @@ pub const ARN_NAMESPACE: &str = "glue";
 /// definition (`CreateJob$Tags`). A table is NOT one of them — `CreateTable` models no
 /// `Tags` member — and a Glue resource this emulator does not store yet has no tag set
 /// to name either.
+///
+/// A schema-registry record holds a tag set too ([`SchemaEntry::tags`]), but is not a kind
+/// here: its ARN's resource portion carries two path segments
+/// (`schema/<registry>/<schema>`), which this one-segment table does not spell, so
+/// resolving one through the tagging operations belongs to those operations' own issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaggedResourceKind {
     /// `connection/<name>`.
@@ -2091,13 +2629,8 @@ pub struct TaggedResource {
 /// known kind that names nothing earns that kind's not-found refusal rather than being
 /// called malformed.
 pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
-    // `arn:<partition>:glue:<region>:<account>:<resource>`. The resource is the LAST
-    // field, so it keeps any colon of its own.
-    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
-    if fields.len() != 6 || fields[0] != "arn" || fields[2] != ARN_NAMESPACE {
-        return None;
-    }
-    let (segment, name) = fields[5].split_once('/')?;
+    let parsed = parse_glue_arn(resource_arn)?;
+    let (segment, name) = parsed.resource.split_once('/')?;
     if name.is_empty() {
         return None;
     }
@@ -2106,8 +2639,8 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         .find(|(candidate, _)| *candidate == segment)?;
     Some(TaggedResource {
         kind: *kind,
-        region: fields[3].to_string(),
-        account_id: fields[4].to_string(),
+        region: parsed.region.clone(),
+        account_id: parsed.account_id.clone(),
         name: match kind {
             // The two Hive-compatible catalog resources are the ones the catalog folds;
             // a crawler, job or connection name is keyed as written.

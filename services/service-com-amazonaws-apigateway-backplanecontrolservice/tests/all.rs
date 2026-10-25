@@ -53,6 +53,10 @@ mod documentation_versions;
 mod domain_name_access_association_reject;
 #[path = "all/domain_name_collection.rs"]
 mod domain_name_collection;
+#[path = "all/domain_name_create_bounds.rs"]
+mod domain_name_create_bounds;
+#[path = "all/domain_name_lifecycle.rs"]
+mod domain_name_lifecycle;
 #[path = "all/epoch_second_timestamps.rs"]
 mod epoch_second_timestamps;
 #[path = "all/execute_api_data_plane.rs"]

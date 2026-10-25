@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteExperimentDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteExperimentDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: archives the stored experiment definition, or removes it outright,
+//! according to the `DeleteType` the request asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteExperimentDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DeleteType` is optional and the model documents no default for it, so which deletion
+//! a request that names none asks for is read off the operation itself: it is documented
+//! as deleting the definition, with archiving offered as the alternative a caller may ask
+//! for, so naming no type removes the record. Should a recording ever show AppConfig
+//! preserving a definition for a request that named no type, this is the one decision to
+//! revisit — the handler's two branches and the test table already cover both readings.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +168,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteExperimentDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteExperimentDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteExperimentDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // Which deletion this request asks for: archiving "hide[s] it from the active list
+        // while preserving it for future reference" and the other kind deletes it
+        // "permanently … along with all associated run history" (this operation's own
+        // documentation). The member is optional and the model gives it no default, while
+        // the operation itself is documented as deleting the definition and offers
+        // archiving as the softer thing a caller may ASK for — so a request naming no type
+        // gets the delete the operation is named for: the removal of the record.
+        let delete_type = input
+            .delete_type
+            .as_deref()
+            .unwrap_or(crate::state::DELETE_TYPE_DESTROY);
+        if !DELETE_TYPE_VALUES.contains(&delete_type) {
+            return Err(DeleteExperimentDefinitionErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "DeleteType must be one of {}, not {delete_type}.",
+                        DELETE_TYPE_VALUES.join(", ")
+                    )),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Both identifiers are `Identifier` members, documented as the resource's "ID or
+        // name", so either addresses the record — and both are resolved BEFORE anything is
+        // written, so a refused delete leaves the stored definition exactly as it was.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(DeleteExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.applications.get_mut(&application_id) else {
+            return Err(DeleteExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while deleting the experiment \
+                         definition"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(definition_id) =
+            application.resolve_experiment_definition_id(&input.experiment_definition_identifier)
+        else {
+            return Err(DeleteExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::experiment_definition_not_found(
+                        &input.application_identifier,
+                        &input.experiment_definition_identifier,
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+
+        if delete_type == crate::state::DELETE_TYPE_ARCHIVE {
+            // An archiving delete PRESERVES the record and takes it out of the active set,
+            // so the definition's status is the one thing it moves — to the status the
+            // model's `ExperimentDefinitionStatus` carries for an archived definition —
+            // and `GetExperimentDefinition` still reports every other member it reported
+            // before. Archiving an already archived definition writes that same status
+            // again, which is what makes a repeated call answer the same 204.
+            let Some(definition) = application.experiment_definitions.get_mut(&definition_id)
+            else {
+                return Err(DeleteExperimentDefinitionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The experiment definition could not be read after it was resolved"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            definition.status = crate::state::EXPERIMENT_DEFINITION_ARCHIVED.to_string();
+            // This call wrote the record, so the record was last updated now; `CreatedAt`
+            // is the instant the definition was created and does not move.
+            definition.updated_at = now;
+        } else if application
+            .experiment_definitions
+            .remove(&definition_id)
+            .is_none()
+        {
+            // The id was resolved out of this same map under this same lock, so the slot
+            // cannot be empty; answering 204 for a record nothing took out would report a
+            // deletion that did not happen.
+            return Err(DeleteExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be removed after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // A permanent delete IS the removal of the stored record, and the definition owns
+        // everything this service holds about that experiment — its run history included,
+        // which lives nowhere else — so once this has answered 204,
+        // `GetExperimentDefinition`, `UpdateExperimentDefinition` and a second permanent
+        // delete all miss on it, because each of them reads the map this took it out of,
+        // and the name it held addresses nothing, so a new definition may take it.
+
+        Ok(DeleteExperimentDefinitionOutput)
     }
 }

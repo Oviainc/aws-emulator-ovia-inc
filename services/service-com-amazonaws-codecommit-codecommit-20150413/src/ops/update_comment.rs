@@ -218,11 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         // "This comment has already been deleted. You cannot edit or delete a
-        // deleted comment."
+        // deleted comment." An edit is one of those two, so this refusal carries
+        // the template the service words for them
+        // ([`crate::state::CommentDeletedRefusal::EditOrDeleteRefused`]) rather
+        // than the one a call that only reports on the comment is answered with.
         if comment.deleted {
             return Err(UpdateCommentErrorModeled::CommentDeletedException(
                 CommentDeletedException {
-                    message: Some(crate::state::comment_deleted_message(None)),
+                    message: Some(
+                        crate::state::comment_deleted_message(
+                            crate::state::CommentDeletedRefusal::EditOrDeleteRefused,
+                        )
+                        .to_string(),
+                    ),
                 },
             )
             .into());

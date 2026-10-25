@@ -35,6 +35,8 @@ mod campaign_resume;
 mod campaign_schedule_completion;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/connect_instance_config_deletion.rs"]
+mod connect_instance_config_deletion;
 #[path = "all/connect_instance_integration_deletion.rs"]
 mod connect_instance_integration_deletion;
 #[path = "all/connect_instance_integrations.rs"]

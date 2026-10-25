@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateBenefitApplicationResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateBenefitApplicationResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Links one AWS resource to the stored benefit application: the `ResourceArn` the request
+//! names is added to the record's `AssociatedResources`, every association it already
+//! carried is kept, and the application's revision and `UpdatedAt` advance because its
+//! content changed. The link is read back through `GetBenefitApplication` (and filtered on
+//! by `ListBenefitApplications`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateBenefitApplicationResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Linking is a set union, so a `ResourceArn` the application already carries leaves the
+//! record — its associations, its revision and its `UpdatedAt` — exactly as it was and
+//! still answers success with the application's current `Id`, `Arn` and `Revision`; that is
+//! the mirror of the set difference `crate::ops::disassociate_benefit_application_resource`
+//! applies, and the same rule `crate::ops::tag_resource` applies to a tag the resource
+//! already carries. An association on an application AWS has finished with (a status in
+//! [`crate::state::TERMINAL_STATUSES`]) is refused with the modelled `ConflictException`
+//! and persists nothing, as every other change to a terminal application is. This is the
+//! one operation that GROWS an application's association list, so it is also where the
+//! modelled bound on that list
+//! ([`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`], the `@length(max: 10)` the
+//! model gives `AssociatedResources`) is enforced: an association past it is refused with
+//! the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +102,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use smithy_server_runtime::ViolationKind;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -129,6 +141,39 @@ impl From<AssociateBenefitApplicationResourceErrorModeled> for AssociateBenefitA
     }
 }
 
+/// The member a refusal of this operation's association bound names: the application's own
+/// `AssociatedResources` list, spelled as the wire spells it, because that is the list the
+/// request would take past its modelled length — the same member a create carrying too
+/// many resources is refused on.
+const ASSOCIATED_RESOURCES_MEMBER: &str = "associatedResources";
+
+/// The refusal an association that would take one application past
+/// [`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] is answered with: this
+/// service's modelled `ValidationException`, stating the modelled length the stored list
+/// may not exceed. Worded through the same helpers every other refusal of this service goes
+/// through ([`crate::service::constraint_requirement`], [`crate::service::member_clause`]
+/// and [`crate::service::validation_envelope`]), so a caller is shown the same requirement
+/// whether the resource that would not fit arrives on a create or on an association, and
+/// NOTHING of the ARN the request carried is echoed.
+fn record_full() -> AssociateBenefitApplicationResourceError {
+    let requirement = crate::service::constraint_requirement(&ViolationKind::MaxLength(
+        crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION as i64,
+    ))
+    .unwrap_or_default();
+    let clause = crate::service::member_clause(ASSOCIATED_RESOURCES_MEMBER, &requirement, false);
+    AssociateBenefitApplicationResourceErrorModeled::ValidationException(ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or_else(|| clause.clone()),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(crate::state::validation_field(
+            ASSOCIATED_RESOURCES_MEMBER,
+            &requirement,
+            crate::state::VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+    .into()
+}
+
 /// The `AssociateBenefitApplicationResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,31 +208,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(
                 AssociateBenefitApplicationResourceErrorModeled::AccessDeniedException(denied)
                     .into(),
             );
         }
-        // Implement `AssociateBenefitApplicationResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateBenefitApplicationResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateBenefitApplicationResource"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateBenefitApplicationResourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let Some(application) =
+            store.application_mut(&input.catalog, &input.benefit_application_identifier)
+        else {
+            return Err(
+                AssociateBenefitApplicationResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::APPLICATION_KIND,
+                            &input.benefit_application_identifier,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // AWS has finished with a terminal application, so its record admits no change —
+        // see [`crate::state::TERMINAL_STATUSES`], the same gate
+        // `crate::ops::disassociate_benefit_application_resource` applies. Tracking the
+        // resources of a submitted application is part of managing it, so every
+        // non-terminal status is accepted.
+        if application.is_terminal() {
+            return Err(
+                AssociateBenefitApplicationResourceErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::status_conflict_message(
+                            &application.id,
+                            &application.status,
+                            "associated with an AWS resource",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A set union: the named ARN joins the associations the application already
+        // carries, and an ARN it already carries is stored once rather than twice. The
+        // revision and `UpdatedAt` move only when the record actually changed, so a request
+        // naming a resource this application is already linked to reports the revision it
+        // already had.
+        if !application
+            .associated_resources
+            .iter()
+            .any(|associated| associated == &input.resource_arn)
+        {
+            // The one request that GROWS this list, so the modelled bound on it is checked
+            // here, before anything is written: a record already holding
+            // `MAX_ASSOCIATED_RESOURCES_PER_APPLICATION` resources takes no more, which is
+            // also what keeps the stored list inside the length the read reports it with. A
+            // request naming one it already carries is unaffected, since it stores nothing.
+            if application.associated_resources.len()
+                >= crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION
+            {
+                return Err(record_full());
+            }
+            application
+                .associated_resources
+                .push(input.resource_arn.clone());
+            application.revise(now);
+        }
+
+        Ok(AssociateBenefitApplicationResourceOutput {
+            id: Some(application.id.clone()),
+            arn: Some(application.arn.clone()),
+            revision: Some(application.revision_text()),
+        })
     }
 }

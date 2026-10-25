@@ -72,7 +72,7 @@ fn status_rank(status: &str, detail: &Value) -> usize {
 }
 
 /// A service environment called `name`; answers its ARN.
-async fn service_environment(batch: &Batch, name: &str) -> String {
+pub(crate) async fn service_environment(batch: &Batch, name: &str) -> String {
     let body = batch
         .ok(
             "/v1/createserviceenvironment",
@@ -91,7 +91,7 @@ async fn service_environment(batch: &Batch, name: &str) -> String {
 
 /// A job queue of type `SAGEMAKER_TRAINING` over the service environment `environment`
 /// (named by name or by ARN, whichever the caller passes); answers its ARN.
-async fn sagemaker_queue(batch: &Batch, name: &str, environment: &str) -> String {
+pub(crate) async fn sagemaker_queue(batch: &Batch, name: &str, environment: &str) -> String {
     let body = batch
         .ok(
             "/v1/createjobqueue",

@@ -45,7 +45,9 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const REGION: &str = "us-east-1";
 
 /// The one account id a generated emulator presents (`engine::mock_account_id`).
-const ACCOUNT: &str = "000000000000";
+///
+/// `pub(crate)` because the GLOBAL tagging suite addresses the same account.
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Percent-encode one path segment or query value: everything outside RFC 3986 §2.3's
 /// unreserved set is escaped, which is what an SDK client sends for an ARN bound to a
@@ -64,14 +66,18 @@ pub(crate) fn pct(value: &str) -> String {
 
 /// A deterministic string of `length` ASCII characters, for exercising a documented
 /// length bound rather than one hand-picked spelling.
-fn filler(length: usize, seed: u8) -> String {
+///
+/// `pub(crate)` because the GLOBAL tagging suite drives the same documented bounds.
+pub(crate) fn filler(length: usize, seed: u8) -> String {
     (0..length)
         .map(|index| char::from(b'a' + ((index as u8).wrapping_add(seed) % 26)))
         .collect()
 }
 
 /// A JSON tag map from `(key, value)` pairs.
-fn tag_map(pairs: &[(String, String)]) -> Value {
+///
+/// `pub(crate)` because the GLOBAL tagging suite builds the same request member.
+pub(crate) fn tag_map(pairs: &[(String, String)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -81,7 +87,10 @@ fn tag_map(pairs: &[(String, String)]) -> Value {
 }
 
 /// One answer from the wire: `(status, error code, body)`.
-type Reply = (u16, Option<String>, Value);
+///
+/// `pub(crate)` because the GLOBAL tagging suite reads the same three things off
+/// every reply.
+pub(crate) type Reply = (u16, Option<String>, Value);
 
 /// One emulator: a router with only this service mounted on one shared engine.
 struct Emulator {

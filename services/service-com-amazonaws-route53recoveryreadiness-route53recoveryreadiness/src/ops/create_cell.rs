@@ -214,6 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::cell_arn(&input.cell_name);
+        // THE CONTAINMENT GATE. A cell belongs to one parent cell or to one recovery
+        // group, so a create may not name a cell another record already contains —
+        // refused before anything is written, so nothing exists afterwards for a list or
+        // a get to report.
+        state
+            .check_containment_available(&arn, input.cells.as_deref().unwrap_or_default())
+            .map_err(|message| {
+                CreateCellErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                })
+            })?;
+
         let record = crate::state::CellRecord {
             arn: arn.clone(),
             name: input.cell_name.clone(),

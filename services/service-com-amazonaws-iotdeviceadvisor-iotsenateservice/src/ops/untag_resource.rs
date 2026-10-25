@@ -161,13 +161,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Tags live on a resource, so an ARN this store holds no resource for is the
         // modelled 404, not a silently accepted no-op. Checked before anything is written,
-        // so a refused call leaves the store exactly as it was.
+        // so a refused call leaves the store exactly as it was. It is a lookup of the
+        // resource the request NAMED, so the refusal carries the service's single
+        // not-found template, built from the input member that identified it.
         if !store.holds_tagged_resource(&input.resource_arn, &resource) {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No IoT Device Advisor resource with resourceArn {}",
-                        input.resource_arn
+                    message: Some(crate::state::not_found_message(
+                        "resourceArn",
+                        &input.resource_arn,
                     )),
                 },
             )

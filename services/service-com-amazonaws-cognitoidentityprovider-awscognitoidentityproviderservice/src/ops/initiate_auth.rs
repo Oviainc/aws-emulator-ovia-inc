@@ -306,6 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             USER_PASSWORD_AUTH => {
                 password_sign_in(&mut guard, &input.client_id, &auth_parameters, now)
             }
+            USER_AUTH => email_otp_sign_in(&mut guard, &input.client_id, &auth_parameters, now),
             REFRESH_TOKEN_AUTH | REFRESH_TOKEN => refresh_sign_in(
                 &mut guard,
                 &input.client_id,
@@ -350,6 +351,27 @@ const ADMIN_NO_SRP_AUTH: &str = "ADMIN_NO_SRP_AUTH";
 /// The challenge a user that must change its password is answered with
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
+
+/// `AuthFlowType`'s choice-based entry point: "USER_AUTH — The entry point for
+/// choice-based authentication" (`InitiateAuth.AuthFlow` in this service's model).
+const USER_AUTH: &str = "USER_AUTH";
+
+/// The `AuthParameters` entry a `USER_AUTH` request names the challenge it wants
+/// with: "USER_AUTH: USERNAME (required), PREFERRED_CHALLENGE"
+/// (`InitiateAuth.AuthParameters`).
+const PREFERRED_CHALLENGE: &str = "PREFERRED_CHALLENGE";
+
+/// The email one-time-password challenge (`ChallengeNameType`), which is also the
+/// `SignInPolicyType.AllowedFirstAuthFactors` value that admits it.
+const EMAIL_OTP: &str = "EMAIL_OTP";
+
+/// The attribute an email one-time password is delivered to.
+const EMAIL: &str = "email";
+
+/// The `ChallengeParameters` entries a delivered challenge reports its delivery
+/// under, the same two values `CodeDeliveryDetailsType` carries.
+const CODE_DELIVERY_DELIVERY_MEDIUM: &str = "CODE_DELIVERY_DELIVERY_MEDIUM";
+const CODE_DELIVERY_DESTINATION: &str = "CODE_DELIVERY_DESTINATION";
 
 /// The `AuthParameters` entry that names the device the sign-in comes from:
 /// "Add `DEVICE_KEY` if you want to bypass multi-factor authentication with a
@@ -451,6 +473,9 @@ fn password_sign_in(
                     username: username.clone(),
                     challenge_name: NEW_PASSWORD_REQUIRED.to_string(),
                     expires_at: now + session_validity,
+                    // This challenge is answered with a password the user chooses,
+                    // not with a code anything delivered.
+                    code: None,
                 },
             );
             let mut challenge_parameters = ::std::collections::HashMap::new();
@@ -505,6 +530,125 @@ fn password_sign_in(
             Ok(authenticated(authentication_result))
         }
     }
+}
+
+/// `AuthFlow=USER_AUTH` with `PREFERRED_CHALLENGE=EMAIL_OTP`: the choice-based entry
+/// point, answered by DELIVERING a one-time password and asking for it back.
+///
+/// "USER_AUTH — The entry point for choice-based authentication", whose
+/// `AuthParameters` are "USERNAME (required), PREFERRED_CHALLENGE"
+/// (`InitiateAuth.AuthFlow` and `.AuthParameters` in this service's model). The code
+/// this mints lives on the challenge SESSION, so it is answerable exactly while that
+/// session lasts, and `RespondToAuthChallenge` is what accepts it.
+///
+/// Every other preference is left to its own implementation: a challenge nothing here
+/// starts has no stored state a response to it could be checked against.
+fn email_otp_sign_in(
+    state: &mut State,
+    client_id: &str,
+    auth_parameters: &::std::collections::HashMap<String, String>,
+    now: ::std::time::SystemTime,
+) -> Result<InitiateAuthOutput, InitiateAuthError> {
+    let username = auth_parameters
+        .get("USERNAME")
+        .ok_or_else(|| missing_auth_parameter("USERNAME", USER_AUTH))?;
+    let preferred = auth_parameters
+        .get(PREFERRED_CHALLENGE)
+        .map(String::as_str)
+        .unwrap_or_default();
+    if preferred != EMAIL_OTP {
+        return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+            "InitiateAuth with AuthFlow={USER_AUTH} and PREFERRED_CHALLENGE={preferred}"
+        )));
+    }
+
+    let (user_pool_id, stored_username, destination, session_validity) = {
+        let pool = state
+            .pool_of_client(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        let client = pool
+            .clients
+            .get(client_id)
+            .ok_or_else(|| client_not_found(client_id))?;
+        if !client.allows_user_auth() {
+            return Err(invalid_parameter(format!(
+                "{USER_AUTH} is not enabled for the client {client_id}"
+            )));
+        }
+        // `SignInPolicyType.AllowedFirstAuthFactors` is what the POOL admits as a
+        // first authentication factor, so a pool that does not list this one does
+        // not offer it.
+        if !pool.allows_first_auth_factor(EMAIL_OTP) {
+            return Err(invalid_parameter(format!(
+                "{EMAIL_OTP} is not an allowed first authentication factor of this user pool"
+            )));
+        }
+        let hides_user_existence = client.hides_user_existence();
+        let session_validity = client.auth_session_validity();
+        let user_pool_id = pool.id.clone();
+
+        let user = pool.user(username).ok_or_else(|| {
+            if hides_user_existence {
+                incorrect_credentials()
+            } else {
+                user_not_found()
+            }
+        })?;
+        refuse_unusable_user(user)?;
+        // A one-time password is a message, so it needs an address: only a VERIFIED
+        // email address is one this challenge is delivered to.
+        let destination = user.verified_destination_of(EMAIL).ok_or_else(|| {
+            invalid_parameter(format!(
+                "Cannot start {EMAIL_OTP} authentication as there is no registered/verified \
+                 {EMAIL}"
+            ))
+        })?;
+        (
+            user_pool_id,
+            user.username.clone(),
+            destination,
+            session_validity,
+        )
+    };
+
+    // Starting the challenge is what sends the code: it is stored on the session the
+    // response resumes, so answering that session is the only way to use it and a
+    // second challenge gets its own session and its own code.
+    let code = crate::state::VerificationCode::issued_email_otp(EMAIL, &destination, now);
+    let delivery = code.delivery_details();
+    let session = state.start_session(
+        now,
+        crate::state::AuthSession {
+            user_pool_id,
+            client_id: client_id.to_string(),
+            username: stored_username,
+            challenge_name: EMAIL_OTP.to_string(),
+            expires_at: now + session_validity,
+            code: Some(code),
+        },
+    );
+
+    // The delivery is reported as this API reports every sent code: the medium, and
+    // the stored address masked.
+    let mut challenge_parameters = ::std::collections::HashMap::new();
+    if let Some(delivery) = delivery {
+        if let Some(medium) = delivery.delivery_medium {
+            challenge_parameters.insert(CODE_DELIVERY_DELIVERY_MEDIUM.to_string(), medium);
+        }
+        if let Some(destination) = delivery.destination {
+            challenge_parameters.insert(CODE_DELIVERY_DESTINATION.to_string(), destination);
+        }
+    }
+    Ok(InitiateAuthOutput {
+        challenge_name: Some(EMAIL_OTP.to_string()),
+        session: Some(session),
+        challenge_parameters: Some(challenge_parameters),
+        authentication_result: None,
+        // "This response parameter prompts a user to select from multiple available
+        // challenges": this request named the challenge it wanted, so there is no
+        // selection to offer.
+        available_challenges: None,
+    })
 }
 
 /// `AuthFlow=REFRESH_TOKEN_AUTH` and its `REFRESH_TOKEN` alias: "Receive new ID and

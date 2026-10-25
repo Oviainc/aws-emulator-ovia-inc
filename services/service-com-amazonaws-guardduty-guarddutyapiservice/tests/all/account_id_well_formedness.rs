@@ -2,8 +2,9 @@
 
 //! The account-id well-formedness refusal, asserted through EVERY operation whose
 //! input carries account ids — the member operations that take an `AccountIds` list,
-//! the create that takes an `AccountDetails` list, and the organization-configuration
-//! pair whose include/exclude lists together name one account scope.
+//! the invitation delete that takes one, the create that takes an `AccountDetails`
+//! list, and the organization-configuration pair whose include/exclude lists together
+//! name one account scope.
 //!
 //! Every request goes over the wire through `MultiServiceRouter::dispatch` (the
 //! harness lives in the `detector_lifecycle` suite), so routing, restJson1
@@ -66,9 +67,10 @@ const MODE: &str = "LIVE";
 /// `smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`),
 /// so the create is driven through `includeAccountIds` and the update through
 /// `excludeAccountIds`: both sides of the pair are covered.
-const OPERATIONS: [&str; 9] = [
+const OPERATIONS: [&str; 10] = [
     "GetMembers",
     "InviteMembers",
+    "DeleteInvitations",
     "DisassociateMembers",
     "StopMonitoringMembers",
     "GetMemberDetectors",
@@ -130,6 +132,19 @@ async fn send(
                 router,
                 "POST",
                 &format!("/detector/{detector_id}/member/invite"),
+                Some(json!({"accountIds": ids})),
+            )
+            .await
+        }
+        "DeleteInvitations" => {
+            // The only one of these that names no detector: the inbox it deletes
+            // from is the one the request's Region serves
+            // (`POST /invitation/delete` —
+            // `smithy_query(operation="DeleteInvitations")`).
+            call(
+                router,
+                "POST",
+                "/invitation/delete",
                 Some(json!({"accountIds": ids})),
             )
             .await

@@ -484,14 +484,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: object.encryption.sse_algorithm.clone(),
             ssekms_key_id: object.encryption.kms_key_id.clone(),
             bucket_key_enabled: object.encryption.bucket_key_enabled,
+            // "If the object expiration is configured (see PutBucketLifecycleConfiguration
+            // ), the response includes this header" (`GetObjectOutput$Expiration`): the
+            // bucket's lifecycle configuration applied to THIS version, matched against the
+            // tag set and size it carries right now.
+            expiration: store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.object_expiration_header(&input.key, object)),
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `AcceptRanges` would advertise
             // the ranged reads refused above, `DeleteMarker` needs a delete marker (a
-            // delete records none, so no read can be of one), `Expiration` and
-            // `Restore`/`ArchiveStatus` need a lifecycle configuration and an archive
-            // tier, the checksum members need a checksum `PutObject` did not compute, the
-            // SSE-C members are refused at write time, `PartsCount` needs a
-            // multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
+            // delete records none, so no read can be of one), `Restore`/`ArchiveStatus`
+            // need an archive tier, the checksum members need a checksum `PutObject` did
+            // not compute, the SSE-C members are refused at write time, `PartsCount` needs
+            // a multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
             // counts unreadable metadata headers (there are none), `ReplicationStatus`
             // needs a replication configuration and `RequestCharged` a Requester Pays
             // charge this emulator does not model.

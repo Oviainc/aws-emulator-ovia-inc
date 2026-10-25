@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCloudFormationStack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCloudFormationStack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates the AWS CloudFormation stack that builds a new Amazon EC2 instance
+//! from an export snapshot record this account holds, and appends the one
+//! CloudFormation stack record that tracks it — answering the operation-log entry
+//! the call appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCloudFormationStack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCloudFormationStack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCloudFormationStackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the stack, the instance it creates and the record that
+        // tracks them live where the instance entry's Availability Zone is, not
+        // where the request signed.
+        let _ = ctx;
+
+        // `instances` is a modelled `@required` member and every constraint on an
+        // entry — the `sourceName` and `instanceType` patterns, and the
+        // `portInfoSource` enum — is a modelled one, so the centralized walk
+        // refused anything outside them before this body ran. What is left is
+        // what the model cannot express: one entry per call, an Amazon EC2
+        // instance type, a launch script Amazon EC2 accepts, a zone this service
+        // serves, and a source that is an export snapshot record of this account
+        // whose export has finished and whose region the new instance is created
+        // in. Every one of those is checked BEFORE the first write, so a refused
+        // request creates nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCloudFormationStack"))
+        // "You can only pass one instance entry at a time in this array. You
+        // will get an invalid parameter error if you pass more than one instance
+        // entry in this array" — and an empty array names no instance to create
+        // at all.
+        let [entry] = input.instances.as_slice() else {
+            return Err(invalid(format!(
+                "instances carries {} entries: exactly one instance entry can be passed at a \
+                 time in this array",
+                input.instances.len()
+            )));
+        };
+        if !crate::state::is_ec2_instance_type(&entry.instance_type) {
+            return Err(invalid(format!(
+                "instances[].instanceType '{}' is not an Amazon EC2 instance type: it is an \
+                 instance family and a size separated by a dot (t2.micro)",
+                entry.instance_type
+            )));
+        }
+        if let Some(user_data) = &entry.user_data {
+            if user_data.len() > crate::state::MAX_USER_DATA_BYTES {
+                return Err(invalid(format!(
+                    "instances[].userData carries {} bytes, more than the {} Amazon EC2 \
+                     accepts as an instance's user data",
+                    user_data.len(),
+                    crate::state::MAX_USER_DATA_BYTES
+                )));
+            }
+        }
+        let region = crate::state::region_of_availability_zone(&entry.availability_zone)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "instances[].availabilityZone '{}' is not a zone of a Lightsail region: it \
+                     must be a region name followed by a zone letter, for one of [{}]",
+                    entry.availability_zone,
+                    crate::state::region_names()
+                ))
+            })?;
+
+        let source_name = entry.source_name.clone();
+        let location = crate::state::StoredLocation::zonal(&entry.availability_zone, region);
+        let instance_type = entry.instance_type.clone();
+        let port_info_source = entry.port_info_source.clone();
+        let user_data = entry.user_data.clone();
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // `sourceName` names "the export snapshot record, which contains the
+            // exported Lightsail instance snapshot that will be used as the
+            // source of the new Amazon EC2 instance" — so the source is an
+            // export snapshot record of this account, and what the record
+            // reports about its source is taken from THAT record as it stands
+            // now. Looked up BEFORE the store's own capacity guard, so what the
+            // caller is told about its request does not depend on how many
+            // unrelated records the store holds.
+            let source = store
+                .export_snapshot_record(&source_name)
+                .ok_or_else(|| not_found(&source_name))?;
+            if source.state != crate::state::RECORD_STATE_SUCCEEDED {
+                return Err(invalid(format!(
+                    "the export snapshot record '{source_name}' is {}: the stack creates the new \
+                     Amazon EC2 instance from the resource the export created at the \
+                     destination, and that resource does not exist until the export has {}",
+                    source.state,
+                    crate::state::RECORD_STATE_SUCCEEDED
+                )));
+            }
+            // The exported resource is an Amazon EC2 resource of ONE region —
+            // "snapshots are exported to the same Amazon Web Services Region in
+            // Amazon EC2 as the source Lightsail snapshot" — so the instance the
+            // stack builds from it is created in that region too.
+            if source.location.region_name != region {
+                return Err(invalid(format!(
+                    "instances[].availabilityZone '{}' is not in region {}, where the export \
+                     snapshot record '{source_name}' exported its snapshot to",
+                    entry.availability_zone, source.location.region_name
+                )));
+            }
+            let source_info = CloudFormationStackRecordSourceInfo {
+                // The one member the modelled
+                // `CloudFormationStackRecordSourceType` enum carries: the source
+                // of a stack record is an export snapshot record.
+                resource_type: Some(
+                    crate::state::RESOURCE_TYPE_EXPORT_SNAPSHOT_RECORD.to_string(),
+                ),
+                name: Some(source.name.clone()),
+                arn: Some(source.arn.clone()),
+            };
+
+            // "Wait until after your new Amazon EC2 instance is created before
+            // running the create cloud formation stack operation again with the
+            // same export snapshot record": while the stack an earlier call
+            // started is still creating that instance, a second stack from the
+            // same export is refused rather than started beside it.
+            if let Some(in_progress) =
+                store.cloud_formation_stack_record_in_progress_for(&source_name)
+            {
+                return Err(invalid(format!(
+                    "the stack tracked by '{}' is still creating an Amazon EC2 instance from the \
+                     export snapshot record '{source_name}': wait until that instance is created \
+                     before creating another stack from the same record",
+                    in_progress.name
+                )));
+            }
+            if store.cloud_formation_stack_records.len()
+                >= crate::state::MAX_CLOUD_FORMATION_STACK_RECORDS
+            {
+                return Err(invalid(format!(
+                    "creating a stack would take this account past the {} CloudFormation stack \
+                     records this emulator holds",
+                    crate::state::MAX_CLOUD_FORMATION_STACK_RECORDS
+                )));
+            }
+
+            // The record's own id: it names the record and it is the id its ARN
+            // carries. The stack gets an id of its own, because it is an AWS
+            // CloudFormation resource and not this record.
+            let id = store.mint_uuid();
+            let stack_id = store.mint_uuid();
+            let name = format!(
+                "{}{id}",
+                crate::state::CLOUD_FORMATION_STACK_RECORD_NAME_PREFIX
+            );
+            let stack_name = crate::state::cloud_formation_stack_name(&id);
+            // The stack has only just been created: the clock owes the record
+            // `Succeeded`, which is why a read straight after this call still
+            // reports `Started`.
+            let due =
+                crate::state::DueNamedState::after(now, crate::state::RECORD_STATE_SUCCEEDED);
+            store.insert_cloud_formation_stack_record(
+                crate::state::StoredCloudFormationStackRecord {
+                    name: name.clone(),
+                    arn: crate::state::cloud_formation_stack_record_arn(region, &id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    state: crate::state::RECORD_STATE_STARTED,
+                    due: Some(due),
+                    source_info,
+                    stack_arn: crate::state::cloud_formation_stack_arn(
+                        region,
+                        &stack_name,
+                        &stack_id,
+                    ),
+                    instance_type,
+                    port_info_source,
+                    user_data,
+                },
+            );
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; one `CreateCloudFormationStack` call
+            // takes one instance entry and so creates exactly one stack, which
+            // is one entry — against the RECORD this call created, left
+            // non-terminal until the stack the clock owes is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_CLOUD_FORMATION_STACK,
+                crate::state::RESOURCE_TYPE_CLOUD_FORMATION_STACK_RECORD,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateCloudFormationStackOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateCloudFormationStackError {
+    CreateCloudFormationStackErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names no export snapshot record this account holds: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message built from the request.
+fn not_found(source_name: &str) -> CreateCloudFormationStackError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_EXPORT_SNAPSHOT_RECORD,
+        source_name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateCloudFormationStackError {
+    CreateCloudFormationStackErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail CloudFormation stack record store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

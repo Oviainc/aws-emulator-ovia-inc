@@ -342,13 +342,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.billing_groups.insert(arn.clone(), record);
         state.billing_group_names.insert(input.name, arn.clone());
         for account_id in linked_account_ids {
-            state.account_associations.insert(account_id, arn.clone());
+            state.associate_account(&account_id, &arn);
         }
         // The primary account belongs to the consolidated billing family whether or
         // not it is a member of this group. When it is not a member it is in no
         // billing group, which is what `UNMONITORED` reports.
         if let Some(primary) = input.primary_account_id {
-            if !state.account_associations.contains_key(&primary) {
+            if state.account_billing_group(&primary).is_none() {
                 state.note_unassociated_account(&primary);
             }
         }

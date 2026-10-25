@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReportGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReportGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReportGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the report group an ARN names from [`crate::state`]: this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +128,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReportGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReportGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteReportGroup (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // `arn` is typed `NonEmptyString`, so any non-empty text reaches this handler:
+        // a value that is not a report-group ARN of this service names no resource and
+        // is refused with the operation's own input error rather than reported as a
+        // successful deletion of nothing.
+        if crate::state::report_group_name_from_arn(&input.arn).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.arn),
+            );
+            return Err(DeleteReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid report group ARN: {} (expected \
+                         arn:<partition>:codebuild:<region>:<account>:report-group/<name>)",
+                        input.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN is the group's whole identity, so the record is resolved against the
+        // STORED ARN: one minted in another region, account or partition addresses no
+        // local record. Removing a report group this account does not hold is a
+        // success — the operation models no not-found error at all, the same way
+        // `DeleteProject` beside it does — so a repeated delete answers 200 and the
+        // store is left as the first one left it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReportGroup"))
+        // `deleteReports` selects whether the group's reports go with it. No operation
+        // this emulator implements mints a `Report`, so a stored group holds none and
+        // there is nothing for either setting to delete or to refuse on; the reports
+        // this flag governs arrive with the report operations that are still
+        // scaffolded, and the branch belongs here when they do.
+        let _ = input.delete_reports;
+        let held = state.lock().remove_report_group_by_arn(&input.arn);
+
+        if held {
+            // The lock is dropped before the audit record is written, so a log consumer
+            // can never hold this service's state.
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ReportGroupDeleted,
+                Some(&input.arn),
+            );
+        }
+
+        Ok(DeleteReportGroupOutput {})
     }
 }

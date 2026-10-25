@@ -63,8 +63,13 @@ fn policy_cases() -> Vec<PolicyCase> {
                 "InsideCidrBlocks": ["10.0.0.0/16"],
             }]),
             // A segment that restricts itself to no edge location exists in every edge
-            // location the core network has.
-            segments: json!([{ "Name": "shared", "EdgeLocations": ["us-west-2"] }]),
+            // location the core network has, and a policy carrying no `segment-actions`
+            // shares its routes with nothing.
+            segments: json!([{
+                "Name": "shared",
+                "EdgeLocations": ["us-west-2"],
+                "SharedSegments": [],
+            }]),
             network_function_groups: json!([]),
         },
         PolicyCase {
@@ -85,8 +90,12 @@ fn policy_cases() -> Vec<PolicyCase> {
                 { "EdgeLocation": "eu-west-1", "Asn": 64513 },
             ]),
             segments: json!([
-                { "Name": "prod", "EdgeLocations": ["us-east-1"] },
-                { "Name": "dev", "EdgeLocations": ["us-east-1", "eu-west-1"] },
+                { "Name": "prod", "EdgeLocations": ["us-east-1"], "SharedSegments": [] },
+                {
+                    "Name": "dev",
+                    "EdgeLocations": ["us-east-1", "eu-west-1"],
+                    "SharedSegments": [],
+                },
             ]),
             network_function_groups: json!([]),
         },
@@ -124,10 +133,17 @@ fn policy_cases() -> Vec<PolicyCase> {
                 "network-function-groups": [{ "name": "inspection" }],
             })),
             edges: json!([{ "EdgeLocation": "eu-central-1", "Asn": 64600 }]),
-            segments: json!([{ "Name": "shared", "EdgeLocations": ["eu-central-1"] }]),
+            segments: json!([{
+                "Name": "shared",
+                "EdgeLocations": ["eu-central-1"],
+                "SharedSegments": [],
+            }]),
+            // No `segment-actions` entry sends a segment through the group, so it serves
+            // no segment under either action.
             network_function_groups: json!([{
                 "Name": "inspection",
                 "EdgeLocations": ["eu-central-1"],
+                "Segments": { "SendVia": [], "SendTo": [] },
             }]),
         },
         PolicyCase {
@@ -146,7 +162,7 @@ fn policy_cases() -> Vec<PolicyCase> {
                 { "EdgeLocation": "sa-east-1", "Asn": 64700 },
                 { "EdgeLocation": "me-south-1" },
             ]),
-            segments: json!([{ "Name": "shared", "EdgeLocations": [] }]),
+            segments: json!([{ "Name": "shared", "EdgeLocations": [], "SharedSegments": [] }]),
             network_function_groups: json!([]),
         },
         PolicyCase {
@@ -162,7 +178,11 @@ fn policy_cases() -> Vec<PolicyCase> {
                 "segments": [{ "name": "shared" }],
             })),
             edges: json!([{ "EdgeLocation": "us-west-1" }]),
-            segments: json!([{ "Name": "shared", "EdgeLocations": ["us-west-1"] }]),
+            segments: json!([{
+                "Name": "shared",
+                "EdgeLocations": ["us-west-1"],
+                "SharedSegments": [],
+            }]),
             network_function_groups: json!([]),
         },
         PolicyCase {
@@ -201,7 +221,11 @@ fn policy_cases() -> Vec<PolicyCase> {
                 "segments": [{ "name": "s".repeat(256) }],
             })),
             edges: json!([{ "EdgeLocation": "e".repeat(63), "Asn": 64512 }]),
-            segments: json!([{ "Name": "s".repeat(256), "EdgeLocations": ["e".repeat(63)] }]),
+            segments: json!([{
+                "Name": "s".repeat(256),
+                "EdgeLocations": ["e".repeat(63)],
+                "SharedSegments": [],
+            }]),
             network_function_groups: json!([]),
         },
         PolicyCase {
@@ -221,8 +245,9 @@ pub(crate) async fn create_core_network(emulator: &Emulator, body: Value) -> (u1
 
 /// How many entries of one list a policy document may carry before it is refused: the
 /// caps `state::MAX_POLICY_EDGE_LOCATIONS` / `MAX_POLICY_SEGMENTS` /
-/// `MAX_POLICY_NETWORK_FUNCTION_GROUPS` fix, which bound the topology a stored document
-/// expands into (its edge-location count times its segment count).
+/// `MAX_POLICY_NETWORK_FUNCTION_GROUPS` / `MAX_POLICY_SEGMENT_ACTIONS` fix, which bound
+/// the topology a stored document expands into (its edge-location count times its segment
+/// count, and the segment actions derived over them).
 const MAX_LIST_ENTRIES: usize = 100;
 
 /// A policy document carrying `entries` entries in the list `key`, each a named object,
@@ -258,6 +283,7 @@ async fn a_policy_document_list_is_capped_at_its_bound() {
         ),
         ("segments", "$.segments"),
         ("network-function-groups", "$.network-function-groups"),
+        ("segment-actions", "$.segment-actions"),
     ] {
         let network_id = emulator.create_global_network(key).await;
         let (status, accepted) = create_core_network(

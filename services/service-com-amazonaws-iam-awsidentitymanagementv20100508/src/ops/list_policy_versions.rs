@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicyVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicyVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicyVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +157,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicyVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPolicyVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicyVersions"))
+        // `ctx` carries request metadata only; what this reports comes from the store
+        // and the request's own paging members.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPolicyVersionsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` constrains only the length, so a value that is not a
+        // managed-policy ARN at all is an "invalid … value … supplied for an input
+        // parameter" — a different refusal from an ARN naming a policy that is not
+        // held. The form is checked through the one definition of the ARN grammar
+        // this crate holds, the same one every read addressed by `PolicyArn` uses.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(ListPolicyVersionsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // The page resumes strictly after the POSITION the marker names in THIS
+        // policy's version order, so a token this service did not issue while paging
+        // this policy's versions is refused as an "invalid … value … supplied for an
+        // input parameter" rather than read as "start again". A token that decodes but
+        // names a version deleted since the previous page is NOT an error: paging
+        // resumes from the position, and that version is simply no longer in it.
+        let scope = crate::state::policy_versions_marker_scope(&input.policy_arn);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListPolicyVersionsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "Invalid Marker: the value is not a marker this service issued \
+                                 for this policy's versions"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default for
+        // an absent `MaxItems`: "the number of items defaults to 100". `.max(1)` is
+        // what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the versions the resolved policy carries and writes
+        // nothing. The policy is resolved the one way every managed-policy read
+        // resolves it, so AWS's own policies are served from the catalog beside the
+        // account's.
+        let store = state.lock();
+        let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
+            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "versions"),
+                ));
+            }
+            return Err(ListPolicyVersionsErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // ONE enumeration order over the policy's versions: ascending by version
+        // number, the order they were created in (`crate::state::policy_version_page_key`),
+        // which is what lets a single `Marker` page over them the way the model binds
+        // them (`paginated { inputToken: Marker, outputToken: Marker }`).
+        let mut ordered: Vec<(String, PolicyVersion)> = resolved
+            .versions
+            .values()
+            .map(|version| {
+                (
+                    crate::state::policy_version_page_key(
+                        version.version_id.as_deref().unwrap_or_default(),
+                    ),
+                    // "The policy document … is not returned in the response to the
+                    // CreatePolicyVersion or ListPolicyVersions operations"
+                    // (`PolicyVersion$Document`), so this listing reports the version's
+                    // identity, default flag and creation instant and withholds its
+                    // content — which `GetPolicyVersion` serves.
+                    PolicyVersion {
+                        document: None,
+                        ..version.clone()
+                    },
+                )
+            })
+            .collect();
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut versions = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (key, version) in ordered
+            .into_iter()
+            .filter(|(key, _)| resume_after.as_deref().is_none_or(|after| key.as_str() > after))
+        {
+            if versions.len() == page_size {
+                // There is at least one more version, so the caller needs another page
+                // to see it.
+                is_truncated = true;
+                break;
+            }
+            versions.push(version);
+            last_key = Some(key);
+        }
+
+        Ok(ListPolicyVersionsOutput {
+            versions: Some(versions),
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key
+                        .as_deref()
+                        .map(|key| crate::state::encode_marker(&scope, key))
+                })
+                .flatten(),
+        })
     }
 }

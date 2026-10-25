@@ -25,6 +25,11 @@
 //! production. The HTTP client and the request builders are the shared
 //! `super::workload_harness`; the lens document and the `ImportLens` wire helper are
 //! `super::custom_lens_import`'s.
+//!
+//! The taggable-resource table and the wire helpers below (`Kind`, `KINDS`,
+//! `create_tagged`, `list_tags`, `tag_map`, `tags_of`, `reported_tags`, `created_arn`) are
+//! `pub(crate)` because `super::untag_resource` is about the same resources and the same
+//! tag maps, and the two suites must not disagree about how one is created or read back.
 
 use std::collections::BTreeMap;
 
@@ -49,7 +54,7 @@ const MAX_TAG_VALUE: usize = 256;
 /// `GET /tags/{WorkloadArn}`, the wire form of `ListTagsForResource`. The ARN is a
 /// non-greedy `@httpLabel`, so it travels percent-encoded in ONE path segment, exactly as
 /// an SDK sends it.
-async fn list_tags(client: &Client, resource_arn: &str) -> Answer {
+pub(crate) async fn list_tags(client: &Client, resource_arn: &str) -> Answer {
     client
         .send(
             "GET",
@@ -63,7 +68,7 @@ async fn list_tags(client: &Client, resource_arn: &str) -> Answer {
 /// agent profile, the fifth resource of this service whose create takes tags
 /// (`smithy_query(query="operation", operation="CreateAgentProfile")`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Workload,
     CustomLens,
     Profile,
@@ -71,7 +76,7 @@ enum Kind {
     AgentProfile,
 }
 
-const KINDS: [Kind; 5] = [
+pub(crate) const KINDS: [Kind; 5] = [
     Kind::Workload,
     Kind::CustomLens,
     Kind::Profile,
@@ -82,7 +87,7 @@ const KINDS: [Kind; 5] = [
 impl Kind {
     /// The modelled `ResourceNotFoundException$ResourceType` a missing resource of this
     /// kind is reported under.
-    fn resource_type(self) -> &'static str {
+    pub(crate) fn resource_type(self) -> &'static str {
         match self {
             Kind::Workload => "WORKLOAD",
             Kind::CustomLens => "LENS",
@@ -98,13 +103,13 @@ impl Kind {
     /// where a `TagMap` value is `@length(max: 256)` with no pattern and no minimum — so
     /// an empty value is a tag only a `TagMap` carries, and boundary validation refuses it
     /// for an agent profile before any handler runs.
-    fn carries_tag_map_only_rows(self) -> bool {
+    pub(crate) fn carries_tag_map_only_rows(self) -> bool {
         self != Kind::AgentProfile
     }
 }
 
 /// A tag map as a `TagMap` travels the wire.
-fn tag_map(tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn tag_map(tags: &BTreeMap<String, String>) -> Value {
     Value::Object(
         tags.iter()
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
@@ -121,7 +126,7 @@ fn tag_list(tags: &BTreeMap<String, String>) -> Value {
     )
 }
 
-fn tags_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -190,7 +195,7 @@ fn tag_cases() -> Vec<TagCase> {
 }
 
 /// The ARN a create answered with, under the member that carries it for that kind.
-fn created_arn(answer: &Answer, member: &str, case: &str) -> String {
+pub(crate) fn created_arn(answer: &Answer, member: &str, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected the create to answer 200, got {answer:?}"
@@ -210,7 +215,7 @@ fn created_arn(answer: &Answer, member: &str, case: &str) -> String {
 
 /// Create a resource of `kind` carrying `tags` and answer its ARN. `slug` keys the names
 /// and idempotency tokens apart, so two rows never collide on a unique name.
-async fn create_tagged(
+pub(crate) async fn create_tagged(
     client: &Client,
     kind: Kind,
     case: &str,
@@ -296,7 +301,7 @@ async fn create_tagged(
 }
 
 /// The tags a successful `ListTagsForResource` reported, as a map.
-fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected ListTagsForResource 200, got {answer:?}"

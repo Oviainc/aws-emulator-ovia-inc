@@ -614,9 +614,11 @@ impl Client {
     }
 }
 
-/// Percent-encode a value so it survives as ONE path segment: everything RFC 3986 does
-/// not leave unreserved is escaped, so an ARN's `:` and `/` reach the server's label
-/// decoder intact. The one encoder in this crate's tests; every value they send is ASCII.
+/// Percent-encode a value so it survives as ONE path segment or ONE query value:
+/// everything RFC 3986 does not leave unreserved is escaped, so an ARN's `:` and `/` reach
+/// the server's label decoder intact. The one encoder in this crate's tests; it escapes
+/// BYTES, so a non-ASCII value (a tag key carrying the letters `TagKey`'s pattern allows)
+/// travels as its UTF-8 octets.
 pub(crate) fn encode_path_segment(value: &str) -> String {
     value
         .bytes()

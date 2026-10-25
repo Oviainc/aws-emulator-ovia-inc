@@ -27,9 +27,10 @@ use crate::ops::types::{
     InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason, InstanceGroupStatus,
     InstanceGroupTimeline, JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy,
     MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
-    NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PlacementGroupConfig,
-    PortRange, Session, SessionMappingDetail, SimplifiedApplication, StartNotebookExecutionInput,
-    Step, StepConfig, StepStatus, StepSummary, StepTimeline, Studio, SupportedInstanceType, Tag,
+    NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PersistentAppUI,
+    PlacementGroupConfig, PortRange, Session, SessionMappingDetail, SimplifiedApplication,
+    StartNotebookExecutionInput, Step, StepConfig, StepStatus, StepSummary, StepTimeline, Studio,
+    SupportedInstanceType, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -139,6 +140,21 @@ pub mod notebook_execution_status {
     pub const TERMINAL: &[&str] = &[FINISHED, FAILED, STOPPED];
 }
 
+/// `PersistentAppUI$PersistentAppUIStatus` ("The status for the persistent application
+/// user interface object"), as this emulator sets it.
+///
+/// CHOSEN, not modelled: the member targets a plain string and the model enumerates no
+/// value for it. A UI is not serving the instant it is created — the service has to
+/// attach it to its target resource first — so it starts at [`STARTING`] and the clock
+/// owes it the move to [`ATTACHED`] after [`TRANSITION_SPAN`], the same way a cluster
+/// owes its move out of `STARTING`.
+pub mod persistent_app_ui_status {
+    /// The UI has been created and is not serving yet.
+    pub const STARTING: &str = "STARTING";
+    /// The UI is attached to its target resource and serving.
+    pub const ATTACHED: &str = "ATTACHED";
+}
+
 /// `com.amazonaws.emr#AuthMode`
 /// (`smithy_query(query="shape", shape="AuthMode")`: SSO, IAM).
 pub mod auth_mode {
@@ -157,7 +173,28 @@ pub mod cluster_state_change_reason_code {
 /// the id the caller asked for. What IS the contract is the refusal itself — HTTP 400
 /// with the error code `ValidationException` — rather than an empty success.
 pub fn unknown_cluster_message(cluster_id: &str) -> String {
-    format!("Cluster id '{cluster_id}' is not valid.")
+    format!("Cluster id {}", not_valid_message(cluster_id))
+}
+
+/// How an operation refuses a value that names no resource it can resolve: the value,
+/// quoted, and that it is not valid.
+///
+/// The TEXT is built from the request — it names the value the caller sent — which is
+/// the form Amazon EMR answers a rejected `TargetResourceArn` with, and the tail
+/// [`unknown_cluster_message`] puts a cluster id in front of, so the wording lives in
+/// one place.
+pub fn not_valid_message(value: &str) -> String {
+    format!("'{value}' is not valid.")
+}
+
+/// How a persistent-application-UI operation refuses a `PersistentAppUIId` the service
+/// holds no UI for.
+///
+/// AWS does not document the wording, so the text is built from the request: it names
+/// the id the caller asked for. What IS the contract is the refusal itself — HTTP 400
+/// with the error code `InvalidRequestException` — rather than an empty success.
+pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
+    format!("Persistent application user interface id '{persistent_app_ui_id}' is not valid.")
 }
 
 /// Refuse a `ManagedScalingPolicy` whose compute limits cannot hold together.
@@ -359,6 +396,24 @@ pub const MAX_SECURITY_CONFIGURATION_BYTES: usize = 256 * 1024;
 /// quota is.
 pub const MAX_SECURITY_CONFIGURATIONS: usize = 1_000;
 
+/// How many persistent application user interfaces this emulator holds for the account.
+///
+/// CHOSEN, not documented, for the same reason [`MAX_STUDIOS`] is: every
+/// `CreatePersistentAppUI` mints a record, so without a bound a caller could grow the
+/// map without end. A create past it is refused — with the 400 `ValidationException`
+/// that operation answers a rejected request with — rather than accepted.
+pub const MAX_PERSISTENT_APP_UIS: usize = 1_000;
+
+/// How many clusters this emulator holds for the account.
+///
+/// CHOSEN, not documented, for the same reason [`MAX_STUDIOS`] is: every `RunJobFlow`
+/// inserts a [`ClusterRecord`] — with its steps, instance groups and instance fleets —
+/// and a terminated cluster is still reported by `ListClusters`, so nothing removes one.
+/// Without a bound a caller could grow the map, and the work every listing does walking
+/// it, without end. A launch past it is refused, the way a quota is, and nothing is
+/// stored.
+pub const MAX_CLUSTERS: usize = 1_000;
+
 /// Per-service state for com-amazonaws-emr-elasticmapreduce. A handler reaches it through [`service_state`].
 ///
 /// `clusters` is keyed by cluster id, and a minted id is the zero-padded base-36
@@ -400,6 +455,14 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// always exists: `PutBlockPublicAccessConfiguration` REPLACES it and
     /// `GetBlockPublicAccessConfiguration` reports it.
     pub block_public_access: BlockPublicAccessRecord,
+    /// The persistent application user interfaces, keyed by the id
+    /// `CreatePersistentAppUI` minted for each. `DescribePersistentAppUI` projects a
+    /// record onto the `PersistentAppUI` wire shape
+    /// ([`PersistentAppUIRecord::to_wire`]) and `GetPersistentAppUIPresignedURL`
+    /// derives its URL and readiness from the same record. Bounded by
+    /// [`MAX_PERSISTENT_APP_UIS`].
+    pub persistent_app_uis: BTreeMap<String, PersistentAppUIRecord>,
+    pub next_persistent_app_ui_seq: u64,
     /// Security configurations keyed by NAME: a security configuration "is stored in
     /// the service and can be specified when a cluster is created"
     /// (`CreateSecurityConfiguration` doc, Smithy model) by that name alone, so the
@@ -427,6 +490,8 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             notebook_executions: BTreeMap::new(),
             next_notebook_execution_seq: 0,
             block_public_access: BlockPublicAccessRecord::account_default(SystemTime::now()),
+            persistent_app_uis: BTreeMap::new(),
+            next_persistent_app_ui_seq: 0,
             security_configurations: BTreeMap::new(),
         }
     }
@@ -463,6 +528,26 @@ impl ComAmazonawsEmrElasticmapreduceState {
         format!("es-{}", base36_id(self.next_studio_seq))
     }
 
+    /// A fresh persistent application user interface id: `p-` followed by uppercase
+    /// alphanumerics, minted from the same monotonic, zero-padded sequence every other
+    /// id in this service is ([`base36_id`]), so the map's key order is creation order.
+    pub fn mint_persistent_app_ui_id(&mut self) -> String {
+        self.next_persistent_app_ui_seq += 1;
+        format!("p-{}", base36_id(self.next_persistent_app_ui_seq))
+    }
+
+    /// The persistent application user interface `id`, with every transition the clock
+    /// already made due applied.
+    pub fn persistent_app_ui_mut(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Option<&mut PersistentAppUIRecord> {
+        let record = self.persistent_app_uis.get_mut(id)?;
+        record.advance_to(now);
+        Some(record)
+    }
+
     /// A fresh notebook execution id: `ex-` followed by uppercase alphanumerics.
     pub fn mint_notebook_execution_id(&mut self) -> String {
         self.next_notebook_execution_seq += 1;
@@ -478,6 +563,38 @@ impl ComAmazonawsEmrElasticmapreduceState {
         let record = self.notebook_executions.get_mut(id)?;
         record.advance_to(now);
         Some(record)
+    }
+
+    /// Whether the cluster `cluster_id` is a runtime role enabled cluster.
+    ///
+    /// Runtime roles are switched on by the security configuration the cluster was
+    /// created with: its `AuthorizationConfiguration` carries an `IAMConfiguration`
+    /// whose `EnableApplicationScopedIAMRole` is true (Amazon EMR Management Guide,
+    /// "Runtime roles for Amazon EMR steps"). So the answer is COMPUTED from the
+    /// configuration the cluster names and the document that configuration holds,
+    /// rather than stored twice: a cluster naming no security configuration, one naming
+    /// a configuration this account does not hold, and one whose document leaves the
+    /// flag out are all not runtime role enabled.
+    pub fn is_runtime_role_enabled_cluster(&self, cluster_id: &str) -> bool {
+        let Some(cluster) = self.clusters.get(cluster_id) else {
+            return false;
+        };
+        let Some(name) = cluster.security_configuration.as_deref() else {
+            return false;
+        };
+        let Some(record) = self.security_configurations.get(name) else {
+            return false;
+        };
+        ::serde_json::from_str::<::serde_json::Value>(&record.security_configuration)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("AuthorizationConfiguration")
+                    .and_then(|section| section.get("IAMConfiguration"))
+                    .and_then(|section| section.get("EnableApplicationScopedIAMRole"))
+                    .and_then(::serde_json::Value::as_bool)
+            })
+            .unwrap_or(false)
     }
 
     /// Apply the clock to every notebook execution. Called by the listing, which
@@ -533,15 +650,15 @@ fn base36_id(seq: u64) -> String {
 /// The ARN of a cluster: `arn:aws:elasticmapreduce:<region>:<account>:cluster/<id>`.
 pub fn cluster_arn(region: &str, cluster_id: &str) -> String {
     ::engine::emulator_arn(
-        "elasticmapreduce",
+        ARN_VENDOR,
         region,
-        &format!("cluster/{cluster_id}"),
+        &format!("{CLUSTER_RESOURCE_TYPE}/{cluster_id}"),
     )
 }
 
 /// The ARN of a studio: `arn:aws:elasticmapreduce:<region>:<account>:studio/<id>`.
 pub fn studio_arn(region: &str, studio_id: &str) -> String {
-    ::engine::emulator_arn("elasticmapreduce", region, &format!("studio/{studio_id}"))
+    ::engine::emulator_arn(ARN_VENDOR, region, &format!("studio/{studio_id}"))
 }
 
 /// "The unique access URL of the Amazon EMR Studio" (`Studio$Url` doc): the studio's
@@ -2298,6 +2415,218 @@ impl StepRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent application user interfaces
+//
+// `CreatePersistentAppUI` "creates a persistent application user interface" for the
+// resource its `TargetResourceArn` names (its own doc); `DescribePersistentAppUI`
+// projects the stored record onto the `PersistentAppUI` wire shape and
+// `GetPersistentAppUIPresignedURL` derives that UI's URL and readiness from the same
+// record. Nothing below is built from one request's input alone.
+// ---------------------------------------------------------------------------
+
+/// This service's own ARN namespace — the vendor field of every ARN it mints
+/// ([`cluster_arn`], [`studio_arn`]) and reads.
+pub const ARN_VENDOR: &str = "elasticmapreduce";
+
+/// The resource type of an EMR on EC2 cluster's ARN: `…:cluster/<id>`.
+pub const CLUSTER_RESOURCE_TYPE: &str = "cluster";
+
+/// The ARN vendors whose resources Amazon EMR publishes a persistent application user
+/// interface for: an EMR on EC2 cluster (`elasticmapreduce`), an EMR on EKS job run
+/// (`emr-containers`, whose job run id `CreatePersistentAppUI$EMRContainersConfig`
+/// carries) and an EMR Serverless job run (`emr-serverless`). An ARN of any other
+/// vendor names nothing this operation can attach a UI to.
+pub const PERSISTENT_APP_UI_TARGET_VENDORS: &[&str] =
+    &[ARN_VENDOR, "emr-containers", "emr-serverless"];
+
+/// The fields of a caller-supplied ARN come from the tree's ONE
+/// caller-supplied-ARN parse ([`service_common::arn`]) — the same reading every other
+/// service makes, so no two of them disagree about what an ARN is. Below is only what
+/// Amazon EMR puts ON TOP of that parse: which vendors it serves a UI for, and how it
+/// reads one of its own cluster ARNs.
+///
+/// Whether Amazon EMR publishes a persistent application user interface for the
+/// resource the ARN `value` names: `value` is a well-formed resource ARN and its vendor
+/// is one of [`PERSISTENT_APP_UI_TARGET_VENDORS`]. A value that is no ARN at all names
+/// no resource either, so it fails the same way.
+pub fn is_persistent_app_ui_target_arn(value: &str) -> bool {
+    ::service_common::arn::vendor(value)
+        .is_some_and(|vendor| PERSISTENT_APP_UI_TARGET_VENDORS.contains(&vendor))
+}
+
+/// Whether the ARN `value` is one of THIS service's own ([`ARN_VENDOR`]) — the class
+/// whose only persistent-application-UI target is a cluster.
+pub fn is_own_vendor_arn(value: &str) -> bool {
+    ::service_common::arn::is_resource_arn_of(value, ARN_VENDOR)
+}
+
+/// Whether `value` names an IAM role of this account, which is what a member documented
+/// as a role ARN has to name.
+///
+/// Read through the tree's shared IAM-ARN reading
+/// ([`service_common::iam_role::role_name`]), the one this service already reads a
+/// `JobFlowRole` with: a value that is ARN-shaped but names another vendor, another IAM
+/// entity type, another account or a Region an IAM ARN does not carry names no role to
+/// assume.
+pub fn is_this_accounts_role_arn(value: &str) -> bool {
+    ::service_common::iam_role::role_name(value).is_some()
+}
+
+/// The EMR on EC2 cluster the ARN `value` names, when it names one: the
+/// `cluster/<id>` resource of this service's own vendor ([`cluster_arn`] is what mints
+/// it), read with the shared parse's resource readers.
+pub fn arn_cluster_id(value: &str) -> Option<&str> {
+    if !is_own_vendor_arn(value) {
+        return None;
+    }
+    ::service_common::arn::resource_id_of_type(value, CLUSTER_RESOURCE_TYPE)
+        .filter(|id| !id.is_empty())
+}
+
+/// The `PersistentAppUIType` a UI created for the profiler `profiler` is addressed by,
+/// or `None` for a profiler type the model does not declare.
+///
+/// The two vocabularies differ by one spelling: `ProfilerType` is `SHS | TEZUI | YTS`
+/// and `PersistentAppUIType` is `SHS | TEZ | YTS`
+/// (`smithy_query(query="shape", shape="ProfilerType,PersistentAppUIType")`), so the
+/// Tez UI profiler is published as the `TEZ` user interface and the other two keep
+/// their names.
+pub fn persistent_app_ui_type_of_profiler(profiler: &str) -> Option<&'static str> {
+    match profiler {
+        "SHS" => Some("SHS"),
+        "TEZUI" => Some("TEZ"),
+        "YTS" => Some("YTS"),
+        _ => None,
+    }
+}
+
+/// The user interface a persistent application UI publishes when the request names no
+/// `ProfilerType`: the Spark history server, which is the UI Amazon EMR keeps for a
+/// completed application's event logs.
+pub const DEFAULT_PERSISTENT_APP_UI_TYPE: &str = "SHS";
+
+/// How `GetPersistentAppUIPresignedURL` refuses a request it can resolve no published
+/// user interface for: an id this account holds no UI for, or a type the UI it names
+/// does not publish. Amazon EMR answers both with one refusal, naming the member that
+/// selects the interface rather than echoing the id back.
+pub const PRESIGNED_URL_NO_SUCH_UI_MESSAGE: &str = "PersistentAppUIType is not valid.";
+
+/// One persistent application user interface, as this service holds it.
+///
+/// The wire `PersistentAppUI` is a PROJECTION of this record
+/// ([`PersistentAppUIRecord::to_wire`]) and so is every answer
+/// `GetPersistentAppUIPresignedURL` gives, so two reads of one UI report the same
+/// thing and a read reports what the create stored.
+#[derive(Debug, Clone)]
+pub struct PersistentAppUIRecord {
+    pub id: String,
+    /// "The unique Amazon Resource Name (ARN) of the target resource."
+    /// (`CreatePersistentAppUI$TargetResourceArn` doc.)
+    pub target_resource_arn: String,
+    /// The EMR on EC2 cluster the target ARN names, when it names one.
+    pub cluster_id: Option<String>,
+    /// Whether that cluster is runtime role enabled, as
+    /// [`ComAmazonawsEmrElasticmapreduceState::is_runtime_role_enabled_cluster`]
+    /// computed it when the UI was created.
+    pub runtime_role_enabled_cluster: bool,
+    /// "The type list for the persistent application user interface object."
+    /// (`PersistentAppUI$PersistentAppUITypeList` doc.)
+    pub ui_types: Vec<String>,
+    /// The Region the creating request was addressed to, which the UI's URL sits in.
+    pub region: String,
+    /// A [`persistent_app_ui_status`] value.
+    pub status: String,
+    pub author_id: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub last_state_change_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    /// When the clock makes the move out of `STARTING` due, cleared once it is applied.
+    pub attached_due_at: Option<SystemTime>,
+}
+
+impl PersistentAppUIRecord {
+    /// Apply the transition the clock has already made due: once `now` has reached the
+    /// stored due instant the UI is attached to its target resource, and the instant it
+    /// became due is what it reports as last modified — so the answer does not depend
+    /// on when it was read.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        let Some(due) = self.attached_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.attached_due_at = None;
+        self.status = persistent_app_ui_status::ATTACHED.to_string();
+        self.last_modified_time = due;
+        self.last_state_change_reason = Some(format!(
+            "The persistent application user interface is attached to {}.",
+            self.target_resource_arn
+        ));
+    }
+
+    /// Whether this UI is attached to its target resource, which is what makes a
+    /// presigned URL for it ready.
+    pub fn is_attached(&self) -> bool {
+        self.status == persistent_app_ui_status::ATTACHED
+    }
+
+    /// Whether this UI publishes the `PersistentAppUIType` `ui_type`.
+    pub fn serves(&self, ui_type: &str) -> bool {
+        self.ui_types.iter().any(|served| served == ui_type)
+    }
+
+    /// The UI type a presigned-URL request that names none is answered for: the first
+    /// this UI publishes.
+    pub fn default_ui_type(&self) -> &str {
+        self.ui_types
+            .first()
+            .map_or(DEFAULT_PERSISTENT_APP_UI_TYPE, String::as_str)
+    }
+
+    /// The wire `PersistentAppUI` for this record — what `DescribePersistentAppUI`
+    /// answers with.
+    pub fn to_wire(&self) -> PersistentAppUI {
+        PersistentAppUI {
+            persistent_app_ui_id: Some(self.id.clone()),
+            persistent_app_ui_type_list: optional_list(&self.ui_types),
+            persistent_app_ui_status: Some(self.status.clone()),
+            author_id: Some(self.author_id.clone()),
+            creation_time: Some(timestamp(self.creation_time)),
+            last_modified_time: Some(timestamp(self.last_modified_time)),
+            last_state_change_reason: self.last_state_change_reason.clone(),
+            tags: optional_list(&self.tags),
+        }
+    }
+
+    /// The URL of this UI's `ui_type` user interface, for the application
+    /// `application_id` when the caller named one.
+    ///
+    /// Derived from the UI itself — its own id under the regional EMR application-UI
+    /// domain, with the UI type as the path — exactly the way a Studio's access URL is
+    /// derived from the studio ([`studio_url`]), so repeated reads of one UI answer the
+    /// same URL rather than a freshly invented one.
+    pub fn presigned_url(&self, ui_type: &str, application_id: Option<&str>) -> String {
+        let mut url = format!(
+            "https://{}.emrappui-prod.{}.amazonaws.com/{}/",
+            self.id,
+            self.region,
+            ui_type.to_lowercase()
+        );
+        // "The application ID associated with the presigned URL."
+        // (`GetPersistentAppUIPresignedURL$ApplicationId` doc): it selects WHICH
+        // application's interface the URL opens, so it is part of the path.
+        if let Some(application_id) = application_id {
+            url.push_str("history/");
+            url.push_str(application_id);
+            url.push('/');
+        }
+        url
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `ListReleaseLabels`: filtering and paging the release catalog
 //
 // The catalog itself is the one above ([`RELEASE_LINES`] / [`APPLICATION_CATALOG`],
@@ -2509,6 +2838,9 @@ pub enum AuditOutcome {
     SecurityConfigurationDeleted,
     /// A cluster (job flow) was launched and persisted, under the id EMR minted for it.
     ClusterLaunched,
+    /// A persistent application user interface was created and persisted, under the id
+    /// EMR minted for it.
+    PersistentAppUICreated,
     /// The request was refused as invalid (400).
     ValidationRefused,
     /// The name is already taken (400 `InvalidRequestException`).
@@ -2528,6 +2860,7 @@ impl AuditOutcome {
             Self::SecurityConfigurationCreated => "security-configuration-created",
             Self::SecurityConfigurationDeleted => "security-configuration-deleted",
             Self::ClusterLaunched => "cluster-launched",
+            Self::PersistentAppUICreated => "persistent-app-ui-created",
             Self::ValidationRefused => "validation-refused",
             Self::Conflict => "conflict",
             Self::QuotaExceeded => "quota-exceeded",

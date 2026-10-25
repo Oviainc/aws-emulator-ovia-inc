@@ -558,6 +558,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // When the bucket's lifecycle configuration aborts this upload, read off the
+        // RECORDED upload so the date is counted from the instant the store initiated it.
+        // "If the bucket has a lifecycle rule configured with an action to abort incomplete
+        // multipart uploads and the prefix in the lifecycle rule matches the object name in
+        // the request, the response includes this header"
+        // (`CreateMultipartUploadOutput$AbortDate`), with "the x-amz-abort-rule-id header
+        // that provides the ID of the lifecycle configuration rule that defines this
+        // action".
+        let abort = {
+            let store = state.lock();
+            store.bucket(&input.bucket).and_then(|bucket| {
+                let upload = bucket.multipart_upload(&upload_id)?;
+                bucket.multipart_upload_abort(&upload.key, upload.initiated_at)
+            })
+        };
+
         Ok(CreateMultipartUploadOutput {
             // "The name of the bucket to which the multipart upload was initiated" and
             // "Object key for which the multipart upload was initiated": the address the
@@ -583,11 +599,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // VALUE is reported anywhere: nothing here computes one.
             checksum_algorithm: input.checksum_algorithm.clone(),
             checksum_type: input.checksum_type.clone(),
+            // "The date when this multipart upload will become eligible for an abort
+            // operation": the instant the matching lifecycle rule aborts it, with that
+            // rule's own identifier beside it. Both are reported exactly when such a rule
+            // is in effect, and neither when none is.
+            abort_date: abort
+                .as_ref()
+                .map(|abort| ::aws_smithy_types::DateTime::from(abort.aborts_at)),
+            abort_rule_id: abort.map(|abort| abort.rule_id),
             // Everything else this output can carry describes something no upload here
-            // has: `AbortDate` and `AbortRuleId` are reported only for a bucket with a
-            // lifecycle rule that aborts incomplete multipart uploads (this emulator
-            // records no lifecycle configuration), the SSE-C members are refused above,
-            // and `RequestCharged` reports a Requester Pays charge nothing here makes.
+            // has: the SSE-C members are refused above, and `RequestCharged` reports a
+            // Requester Pays charge nothing here makes.
             ..CreateMultipartUploadOutput::default()
         })
     }
