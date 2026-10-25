@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What makes a string an address of the BITCOIN chain.
+//! What makes a string an address of a CHAIN this service indexes.
 //!
 //! `ChainAddress` is one Smithy type for every chain this service indexes — its
 //! `^[-A-Za-z0-9]{13,74}$` admits an EVM address, a base58 Bitcoin address and a bech32
-//! one alike — so a member that must carry a Bitcoin address in particular
-//! (`ListFilteredTransactionEvents` "is only supported on the Bitcoin networks") can only
-//! be checked by the operation that requires it, against the two encodings Bitcoin itself
-//! spells an address in. Each encoding fixes the PREFIX, the ALPHABET and the LENGTH a
+//! one alike — so which strings are addresses AT ALL, and of which chain, is a rule only
+//! the service can apply: it checks a member against the encodings the chain the request
+//! names spells an address in ([`is_address_of_network`]), and a member whose operation
+//! fixes the chain itself (`ListFilteredTransactionEvents` "is only supported on the
+//! Bitcoin networks") against that chain's ([`is_bitcoin_address`]).
+//!
+//! # Bitcoin
+//!
+//! Each of the chain's two encodings fixes the PREFIX, the ALPHABET and the LENGTH a
 //! string may have:
 //!
 //! * base58 (BIP-13): a leading character that encodes the version byte — `1` (0x00,
@@ -23,10 +28,19 @@
 //! This decides the SHAPE, not the checksum each encoding also carries: a string shaped
 //! like an address of this chain but mistyped is accepted here and then answered with the
 //! modelled empty page, because the index holds nothing under it — the same answer any
-//! address it does not hold gets. The distinction this operation actually has to draw is
-//! between an address of THIS chain and an address of another chain that `ChainAddress`
-//! equally admits, and that one the alphabet and the prefix draw: an EVM address's `0x`
-//! is outside the base58 alphabet, and `x` is outside bech32's.
+//! address it does not hold gets. The distinction that has to be drawn is between an
+//! address of THIS chain and an address of another chain that `ChainAddress` equally
+//! admits, and that one the alphabet and the prefix draw: an EVM address's `0x` is outside
+//! the base58 alphabet, and `x` is outside bech32's.
+//!
+//! # EVM
+//!
+//! An account on an Ethereum network is the 20 bytes of its address, written as 40 hex
+//! digits with or without the `0x` prefix — both spellings name the same account, which
+//! is why [`super::normalize_contract_address`] keys the ledger by the digits alone. The
+//! letter case of those digits carries no information about the account either (EIP-55
+//! spends it on a checksum over the same 20 bytes), so any case is an address and
+//! [`super::derived::normalize_address`] is what folds the spellings onto one account.
 //!
 //! Nothing here reads the service's state or a recorded value.
 
@@ -58,6 +72,66 @@ const BECH32_ALPHABET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 /// shortest form is the 3-character prefix, a witness version, a 2-byte program and the
 /// six-character checksum.
 const BECH32_LENGTH: std::ops::RangeInclusive<usize> = 14..=74;
+
+/// The prefix an EVM address is usually written with, and the hex digits that carry the
+/// address itself: 20 bytes of account, so 40 digits.
+///
+/// The prefix is PRESENTATION rather than identity — the same 20 bytes with it and
+/// without it name one account, which is why [`super::normalize_contract_address`] keys
+/// the ledger by the digits alone — so a string is read with it or without it.
+const EVM_PREFIX: &str = "0x";
+
+/// See [`EVM_PREFIX`]: the digit count of a 20-byte address.
+const EVM_DIGITS: usize = 40;
+
+/// What this service answers a member that does not carry an address of the chain the
+/// request named, one message per chain.
+///
+/// Request-independent, like every other message this service sends
+/// ([`super::INVALID_PARAMETER_VALUES_MESSAGE`]): the member a rule was violated on is
+/// `ValidationExceptionField$name` and the value that violated it is the caller's own, so
+/// neither is interpolated into the sentence. Only the CHAIN varies, because only the
+/// chain changes what the member had to carry.
+pub const INVALID_BITCOIN_ADDRESS_MESSAGE: &str = "Please provide a valid bitcoin address.";
+
+/// See [`INVALID_BITCOIN_ADDRESS_MESSAGE`].
+pub const INVALID_ETHEREUM_ADDRESS_MESSAGE: &str = "Please provide a valid ethereum address.";
+
+/// Whether `value` is an address of the chain `network` runs — the question an
+/// address-typed member of a request that also names the network has to answer, since
+/// `ChainAddress` admits the other chains' addresses too.
+///
+/// `network` is a `QueryNetwork` value, so it has already been held to the model's value
+/// set by the time this is asked: the two Bitcoin values name the Bitcoin chain and the
+/// rest name an EVM chain.
+pub fn is_address_of_network(network: &str, value: &str) -> bool {
+    if super::is_bitcoin(network) {
+        is_bitcoin_address(value)
+    } else {
+        is_evm_address(value)
+    }
+}
+
+/// What a refusal of an address member says on `network`; see
+/// [`INVALID_BITCOIN_ADDRESS_MESSAGE`].
+pub fn invalid_address_message(network: &str) -> &'static str {
+    if super::is_bitcoin(network) {
+        INVALID_BITCOIN_ADDRESS_MESSAGE
+    } else {
+        INVALID_ETHEREUM_ADDRESS_MESSAGE
+    }
+}
+
+/// Whether `value` is an address of an EVM chain: the [`EVM_DIGITS`] hex digits of a
+/// 20-byte account, in any letter case (EIP-55 spends the case on a checksum over those
+/// same bytes) and with or without [`EVM_PREFIX`].
+pub fn is_evm_address(value: &str) -> bool {
+    let body = value
+        .strip_prefix(EVM_PREFIX)
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    body.len() == EVM_DIGITS && body.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 /// Whether `value` is an address of the Bitcoin chain — in either of the encodings this
 /// module's documentation lists, on either of the networks the model names.
