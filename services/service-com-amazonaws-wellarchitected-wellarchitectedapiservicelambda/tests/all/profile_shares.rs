@@ -37,6 +37,10 @@
 //! its doc), for the reason `Client::record_workload_share` gives: an invitation is offered
 //! to the principal a profile was shared WITH, and a share whose recipient is the caller
 //! has no HTTP path in a single-account emulator.
+//!
+//! Revoking a share is `super::profile_share_deletion`'s suite, which grants the shares it
+//! revokes and reads them back through the helpers below — one spelling of each request for
+//! both suites.
 
 use serde_json::{json, Value};
 
@@ -72,13 +76,13 @@ const SHARE_STATUSES: [&str; 8] = [
 /// deleted" (the create docs) and `PENDING` is the member for exactly that
 /// (`smithy_query(query="shape", shape="ShareStatus")`). Spelled as the literal the model
 /// publishes rather than read back out of the code under test.
-const NEW_SHARE_STATUS: &str = "PENDING";
+pub(crate) const NEW_SHARE_STATUS: &str = "PENDING";
 
 /// Principals a profile can be shared WITH: "The Amazon Web Services account ID,
 /// organization ID, or organizational unit (OU) ID with which the workload, lens, profile,
 /// or review template is shared" (`SharedWith` doc, `@length(12, 2048)` and no pattern), so
 /// the rows span all three kinds rather than only an account id.
-const OTHER_PRINCIPALS: [(&str, &str); 5] = [
+pub(crate) const OTHER_PRINCIPALS: [(&str, &str); 5] = [
     ("another-account", "111122223333"),
     ("a-third-account", "444455556666"),
     ("an-account-of-nines", "999999999999"),
@@ -88,8 +92,15 @@ const OTHER_PRINCIPALS: [(&str, &str); 5] = [
 
 /// `POST /profiles/{ProfileArn}/shares`, the wire form of `CreateProfileShare`. The ARN is
 /// percent-encoded because it is a non-greedy `@httpLabel` carrying `:` and `/` inside ONE
-/// path segment, exactly as an SDK sends it.
-async fn create_share(client: &Client, profile_arn: &str, shared_with: &str, token: &str) -> Answer {
+/// path segment, exactly as an SDK sends it. `pub(crate)` because
+/// `super::profile_share_deletion` grants the shares it revokes through this one spelling of
+/// the request.
+pub(crate) async fn create_share(
+    client: &Client,
+    profile_arn: &str,
+    shared_with: &str,
+    token: &str,
+) -> Answer {
     client
         .send(
             "POST",
@@ -102,7 +113,7 @@ async fn create_share(client: &Client, profile_arn: &str, shared_with: &str, tok
 /// `GET /profiles/{ProfileArn}/shares`, the wire form of `ListProfileShares`, with every
 /// filter and paging member bound to the query string. `query` is passed as sent, empty for
 /// a request that names none.
-async fn list_shares(client: &Client, profile_arn: &str, query: &str) -> Answer {
+pub(crate) async fn list_shares(client: &Client, profile_arn: &str, query: &str) -> Answer {
     let encoded = encode_path_segment(profile_arn);
     let uri = if query.is_empty() {
         format!("/profiles/{encoded}/shares")
@@ -114,7 +125,7 @@ async fn list_shares(client: &Client, profile_arn: &str, query: &str) -> Answer 
 
 /// The `ShareId` a successful `CreateProfileShare` answered with, checked against the
 /// modelled `^[0-9a-f]{32}$` pattern.
-fn created_share_id(answer: &Answer, case: &str) -> String {
+pub(crate) fn created_share_id(answer: &Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected CreateProfileShare 200, got {answer:?}"
@@ -128,7 +139,7 @@ fn created_share_id(answer: &Answer, case: &str) -> String {
 }
 
 /// The `ProfileShareSummaries` of a successful `ListProfileShares`.
-fn summaries(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn summaries(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected ListProfileShares 200, got {answer:?}"
@@ -156,7 +167,7 @@ fn summaries(answer: &Answer, case: &str) -> Vec<Value> {
 /// its invitation moves it, and the invitation of a share the caller created is not the
 /// caller's to answer. The seed records exactly what `CreateProfileShare` records (rules 1
 /// and 2 assert that), and the READ under test still crosses the HTTP boundary.
-fn record_profile_share(
+pub(crate) fn record_profile_share(
     client: &Client,
     profile_arn: &str,
     shared_with: &str,
@@ -192,7 +203,7 @@ fn record_profile_share(
 
 /// Every share the store holds for `profile_arn`, in `ShareId` order — read to prove a
 /// REFUSED request recorded nothing.
-fn stored_share_count(client: &Client, profile_arn: &str) -> usize {
+pub(crate) fn stored_share_count(client: &Client, profile_arn: &str) -> usize {
     let state_handle = client.store();
     let store = state_handle.lock();
     store.profile_shares_of(profile_arn).len()

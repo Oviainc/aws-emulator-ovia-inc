@@ -15,11 +15,13 @@
 //!   list, and `Source` is not updatable at all ("You cannot change this name after you
 //!   create the channel") — and the response and the next `GetChannel` report the same
 //!   record;
-//! * `Channel` is the channel ARN or the bare id CloudTrail minted ("The ARN or ID (the
-//!   ARN suffix) of the channel"), either form addressing the same channel; an `arn:`
-//!   value that is not a channel ARN is `ChannelARNInvalidException`, and any other
-//!   identifier naming no stored channel is `ChannelNotFoundException` (HTTP 400, the
-//!   status the recorded service answers) naming the ARN the identifier addressed;
+//! * `Channel` is the channel ARN or the `UUID` CloudTrail minted as the channel's id
+//!   ("The ARN or ID (the ARN suffix) of the channel"), either form addressing the same
+//!   channel; a value in NEITHER form — an `arn:` value that is not a channel ARN, or a
+//!   bare value that is not written as the modelled `UUID` — is
+//!   `ChannelARNInvalidException`, and an identifier in one of them naming no stored
+//!   channel is `ChannelNotFoundException` (HTTP 400, the status the recorded service
+//!   answers) naming the ARN the identifier addressed;
 //! * a destination the request supplies is checked the way `CreateChannel` checks the
 //!   list it was given — against the event data stores of the channel's own Region —
 //!   and a refused update changes nothing;
@@ -332,12 +334,13 @@ async fn an_identifier_naming_no_channel_is_refused_and_changes_nothing() {
             format!("arn:aws:cloudtrail:{HOME_REGION}:channel/{absent_id}"),
         ),
         (
-            // A bare identifier is read as a channel id whatever its syntax: an id
-            // CloudTrail never minted names no channel, which is an absent channel.
-            "a bare id that is not a minted one",
+            // `Channel` admits two forms, the ARN and the channel's `UUID`
+            // (`@length 36` of `^[a-f0-9\-]+$`): a bare value in neither form can
+            // name no channel, so it is refused by its FORM.
+            "a bare value that is not a channel UUID",
             "not-a-channel".to_string(),
-            "ChannelNotFoundException",
-            expected_channel_arn(HOME_REGION, "not-a-channel"),
+            "ChannelARNInvalidException",
+            "not-a-channel".to_string(),
         ),
         (
             "a well-formed ARN naming no channel",

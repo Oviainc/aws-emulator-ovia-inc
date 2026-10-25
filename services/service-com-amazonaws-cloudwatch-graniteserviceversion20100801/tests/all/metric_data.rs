@@ -195,8 +195,8 @@ async fn each_statistic_is_folded_from_the_stored_datapoints_of_its_window() {
         );
         assert_eq!(
             text(&result, "Label"),
-            format!("Latency {stat}"),
-            "case stat {stat}: an omitted Label defaults to the metric and the statistic, got {result}"
+            "Latency",
+            "case stat {stat}: an omitted Label defaults to the metric, got {result}"
         );
     }
 }
@@ -834,6 +834,77 @@ async fn a_request_outside_the_contract_is_refused() {
     }
 }
 
+/// `StatusCode` reports the PAGE a result came back on: a page that hands back a `NextToken`
+/// reports every result as `PartialData`, and only the page that exhausts the request's
+/// datapoints reports `Complete`.
+///
+/// "PartialData means that an incomplete set of data points were returned. You can use the
+/// NextToken value that was returned and repeat your request to get more data points."
+/// (`MetricDataResult$StatusCode`) — so a client that stops paginating when it sees
+/// `Complete`, which is what the member documents it to mean, cannot truncate the series.
+#[tokio::test]
+async fn every_result_of_a_cut_page_is_partial_until_the_last_page() {
+    let router = build_router();
+    let base = base_time();
+    publish(
+        &router,
+        "Paged",
+        &json!([{"Name": "Service", "Value": "api"}]),
+        "Count",
+        base,
+        &[(0.0, 1.0), (60.0, 2.0), (120.0, 3.0), (180.0, 4.0)],
+    )
+    .await;
+
+    let mut token: Option<String> = None;
+    let mut pages: Vec<(Vec<String>, bool)> = Vec::new();
+    for _ in 0..8 {
+        let mut request = json!({
+            "MetricDataQueries": [
+                metric_stat_query("m1", "Paged", 60, "Sum"),
+                metric_stat_query("m2", "Paged", 60, "Maximum"),
+            ],
+            "StartTime": base,
+            "EndTime": base + 4.0 * MINUTE,
+            "ScanBy": "TimestampAscending",
+            "MaxDatapoints": 3,
+        });
+        if let Some(carried) = token.as_ref() {
+            request["NextToken"] = json!(carried);
+        }
+        let page = ok(&router, "GetMetricData", &request).await;
+        let statuses: Vec<String> = results(&page)
+            .iter()
+            .map(|result| text(result, "StatusCode"))
+            .collect();
+        token = page
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        pages.push((statuses, token.is_some()));
+        if token.is_none() {
+            break;
+        }
+    }
+
+    assert!(
+        pages.len() > 1,
+        "case eight datapoints at MaxDatapoints=3: expected several pages, got {pages:?}"
+    );
+    for (index, (statuses, more)) in pages.iter().enumerate() {
+        let expected = if *more { "PartialData" } else { "Complete" };
+        assert!(
+            !statuses.is_empty() && statuses.iter().all(|status| status == expected),
+            "case page {index} (more to come: {more}): expected every result {expected}, got \
+             {statuses:?}"
+        );
+    }
+    assert!(
+        pages.last().is_some_and(|(_, more)| !more),
+        "case the last page: expected no NextToken, got {pages:?}"
+    );
+}
+
 /// A `NextToken` is a position within ONE enumeration: replayed against a request that asks
 /// for something else, it is refused rather than silently skipping or repeating datapoints.
 #[tokio::test]
@@ -929,6 +1000,13 @@ async fn a_next_token_is_bound_to_the_request_it_was_minted_for() {
             "InvalidNextToken",
             "case {case:?}: expected InvalidNextToken, got {body}"
         );
+        // The refusal carries an EMPTY message, as the recorded one does: neither the token
+        // nor why it was rejected is echoed back.
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(""),
+            "case {case:?}: expected an empty message, got {body}"
+        );
     }
 
     // The same request the token was minted for continues where it left off.
@@ -952,12 +1030,19 @@ async fn a_next_token_is_bound_to_the_request_it_was_minted_for() {
     );
 }
 
-/// A metric math `Expression` is one part of this operation nobody has written yet, so it
-/// answers 501 `NotImplemented` rather than a series nothing computed — and so does a
-/// statistic CloudWatch supports that this store does not fold out of its datapoints. A
-/// `Stat` outside the statistic grammar altogether is a bad parameter value.
+/// Every statistic CloudWatch defines is COMPUTED from the window's own distribution rather
+/// than refused — the interquartile mean and the trimmed / Winsorized / trimmed-count /
+/// percentile-rank families, in both their bare and their spanned form — while a `Stat`
+/// outside the statistic grammar altogether is still a bad parameter value.
+///
+/// Source for the families and their definitions: the "CloudWatch statistics definitions" page
+/// the model's `MetricStreamStatisticsConfiguration$AdditionalStatistics` points at, which this
+/// crate's statistic grammar (`crate::state::is_cloudwatch_statistic`) is written from. The
+/// rows span the families, both forms and both kinds of bound (a percentile of the
+/// distribution and a plain metric value), and the window's two published values make each
+/// definition's arithmetic checkable by hand.
 #[tokio::test]
-async fn a_statistic_this_store_does_not_fold_is_not_answered_as_an_empty_series() {
+async fn every_defined_statistic_is_computed_from_the_windows_distribution() {
     let router = build_router();
     let base = base_time();
     publish(
@@ -970,13 +1055,31 @@ async fn a_statistic_this_store_does_not_fold_is_not_answered_as_an_empty_series
     )
     .await;
 
-    // Statistics CloudWatch documents that nothing here computes: the interquartile mean and
-    // the trimmed / Winsorized / trimmed-count / percentile-rank families, in both their bare
-    // and spanned forms. Source: the "CloudWatch statistics definitions" page the model's
-    // `MetricStreamStatisticsConfiguration$AdditionalStatistics` points at, which this
-    // crate's statistic grammar (`crate::state::is_cloudwatch_statistic`) is written from.
-    for stat in ["IQM", "tm98", "wm90", "TM(10%:90%)", "ts(100:)", "PR(:300)"] {
-        let (status, body) = call(
+    // (the statistic, the value its definition gives over the window's values 10 and 30)
+    let cases: Vec<(&str, f64)> = vec![
+        // "Interquartile mean. The trimmed mean of the interquartile range" — the middle half.
+        ("IQM", 20.0),
+        // "The mean of all values that are between two specified boundaries": the lowest 10%
+        // and the highest 10% of the distribution's weight are removed first.
+        ("TM(10%:90%)", 20.0),
+        // The bare form trims from the top only, 2% of the weight of the larger value.
+        ("tm98", (10.0 + 30.0 * 0.96) / 1.96),
+        // "Values outside of the boundaries are replaced with the values of the boundaries,
+        // then the mean is computed" — so every observation still counts.
+        ("wm90", 20.0),
+        ("WM(0%:100%)", 20.0),
+        // "The number of data points in the chosen range", and the sum of their values.
+        ("TC(0%:100%)", 2.0),
+        ("ts(0%:100%)", 40.0),
+        // A bound without a `%` is a metric VALUE rather than a percentile.
+        ("TM(20:)", 30.0),
+        ("TS(:20)", 10.0),
+        // "Percentile rank. The percentage of values that fall within the specified range."
+        ("PR(:300)", 100.0),
+        ("PR(:20)", 50.0),
+    ];
+    for (stat, expected) in cases {
+        let body = ok(
             &router,
             "GetMetricData",
             &json!({
@@ -986,14 +1089,17 @@ async fn a_statistic_this_store_does_not_fold_is_not_answered_as_an_empty_series
             }),
         )
         .await;
+        let result = single_result(&body);
+        let computed = pairs(&result);
         assert_eq!(
-            status, 501,
-            "case stat {stat}: expected HTTP 501 rather than an empty series, got {status} with {body}"
+            computed.len(),
+            1,
+            "case stat {stat}: expected the window's one value, got {result}"
         );
-        assert_eq!(
-            error_code(&body),
-            "NotImplemented",
-            "case stat {stat}: expected NotImplemented, got {body}"
+        assert!(
+            (computed[0].1 - expected).abs() < 1e-9,
+            "case stat {stat}: expected {expected}, got {:?}",
+            computed[0].1
         );
     }
 
@@ -1020,8 +1126,8 @@ async fn a_statistic_this_store_does_not_fold_is_not_answered_as_an_empty_series
         );
     }
 
-    // The statistics this store DOES fold still answer their windows, so the refusals above
-    // are the grammar and not a blanket rejection.
+    // The statistics folded out of the stored aggregates still answer their windows, so the
+    // rows above are the grammar and not a blanket acceptance.
     for stat in ["Sum", "Average", "Minimum", "Maximum", "SampleCount", "p90"] {
         let body = ok(
             &router,
@@ -1040,31 +1146,4 @@ async fn a_statistic_this_store_does_not_fold_is_not_answered_as_an_empty_series
             "case stat {stat}: expected the window's value, got {result}"
         );
     }
-}
-
-/// A metric math `Expression` is the one part of this operation nobody has written yet, so
-/// it answers 501 `NotImplemented` rather than a series nothing computed.
-#[tokio::test]
-async fn a_metric_math_expression_is_answered_as_not_implemented() {
-    let router = build_router();
-    let base = base_time();
-    let (status, body) = call(
-        &router,
-        "GetMetricData",
-        &json!({
-            "MetricDataQueries": [{"Id": "e1", "Expression": "SUM(METRICS())"}],
-            "StartTime": base,
-            "EndTime": base + MINUTE,
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 501,
-        "case a metric math expression: expected HTTP 501, got {status} with {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "NotImplemented",
-        "case a metric math expression: expected NotImplemented, got {body}"
-    );
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/destination_service_limit.rs"]
 mod destination_service_limit;
+#[path = "all/limit_refusals.rs"]
+mod limit_refusals;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
