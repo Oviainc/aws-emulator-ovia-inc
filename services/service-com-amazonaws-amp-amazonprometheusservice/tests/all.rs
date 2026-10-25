@@ -23,6 +23,8 @@ mod default_scraper_configuration;
 mod kms_key_arn_and_parent_resolution;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
+#[path = "all/logging_configuration_deletion.rs"]
+mod logging_configuration_deletion;
 #[path = "all/map_key_constraints.rs"]
 mod map_key_constraints;
 #[path = "all/query_logging_configuration.rs"]

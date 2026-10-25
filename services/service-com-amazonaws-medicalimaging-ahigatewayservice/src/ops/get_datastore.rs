@@ -6,6 +6,11 @@
 //! it writes nothing of its own, and only materialises the status changes the clock
 //! already owed — see [`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::advance_clock`].
 //!
+//! Every status the model declares is reportable here, `DELETED` included: a deletion
+//! that has landed is reported in that status for as long as its record survives
+//! ([`crate::state::DATASTORE_DELETED_RETENTION`]), and only once the clock has reaped
+//! the record does this answer `ResourceNotFoundException`.
+//!
 //! ---
 //!
 //! # Modeled contract for `GetDatastore`
@@ -129,14 +134,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Reached in the region this request was addressed to: a data store exists in
         // ONE region, so one held in another is not found here at all
-        // (`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::datastore_in`).
-        let datastore = store.datastore_in(&region, &input.datastore_id).ok_or_else(|| {
-            GetDatastoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // Constant, and stated by resource KIND: the requested id is not
-                // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
-                message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
-            })
-        })?;
+        // (`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::reported_datastore_in`).
+        //
+        // REPORTING: a data store whose deletion has landed is read here too, because
+        // `DELETED` is a status this operation reports — for as long as the record
+        // survives the deletion (`crate::state::DATASTORE_DELETED_RETENTION`), after
+        // which the clock has reaped it and this answers `ResourceNotFoundException`.
+        let datastore = store
+            .reported_datastore_in(&region, &input.datastore_id)
+            .ok_or_else(|| {
+                GetDatastoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    // Constant, and stated by resource KIND: the requested id is not
+                    // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                    message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+                })
+            })?;
 
         Ok(GetDatastoreOutput {
             datastore_properties: DatastoreProperties {

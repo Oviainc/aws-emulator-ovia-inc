@@ -66,7 +66,10 @@ pub(crate) fn expected_arn(workspace: &str, name: &str) -> String {
 ///
 /// `dependsOn` is sent only when the node declares dependencies, so a round-trip
 /// comparison is against exactly the members the request carried.
-fn node(name: &str, task: &str, depends_on: &[&str]) -> Value {
+///
+/// `pub(crate)` because the sibling `describe_pipeline_reads` suite writes the
+/// same compute nodes: one definition of them, so the two cannot drift.
+pub(crate) fn node(name: &str, task: &str, depends_on: &[&str]) -> Value {
     let mut value = json!({ "computeNodeName": name, "taskName": task });
     if !depends_on.is_empty() {
         value
@@ -363,7 +366,10 @@ async fn created_pipeline_reads_back_through_describe_for_every_shape() {
 
 /// A `DescribePipeline` body without its lifecycle `status`, which time moves on
 /// its own.
-fn without_status(body: &Value) -> Value {
+///
+/// `pub(crate)` for the reason [`node`] is: the sibling `describe_pipeline_reads`
+/// suite compares the same answers member for member.
+pub(crate) fn without_status(body: &Value) -> Value {
     let mut copy = body.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove("status");

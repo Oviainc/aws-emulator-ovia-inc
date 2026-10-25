@@ -178,6 +178,8 @@ mod update_request_validator;
 mod update_stage_variables;
 #[path = "all/update_vpc_link.rs"]
 mod update_vpc_link;
+#[path = "all/update_documentation_version.rs"]
+mod update_documentation_version;
 #[path = "all/refusal_message_constants.rs"]
 mod refusal_message_constants;
 #[path = "all/delete_documentation_version.rs"]

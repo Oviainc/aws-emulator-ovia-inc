@@ -31,12 +31,12 @@ use crate::approval_team_lifecycle::{encode_label, error_code, text, Harness, RE
 /// `UpdateApprovalTeam`'s output (`smithy_query(query="operation",
 /// operation="DeleteInactiveApprovalTeamVersion")`), so a request may legally carry an id
 /// of exactly this many characters.
-const MAX_VERSION_ID: usize = 1000;
+pub(crate) const MAX_VERSION_ID: usize = 1000;
 
 /// A create body the modelled constraints accept: one approver, one policy, `MofN` with
 /// M = 1. What this suite varies is the stored version's STATUS and the `VersionId`
 /// asked for, so one valid body serves every row.
-fn create_body(name: &str) -> Value {
+pub(crate) fn create_body(name: &str) -> Value {
     json!({
         "Name": name,
         "Description": "inactive version deletion",
@@ -56,7 +56,7 @@ fn create_body(name: &str) -> Value {
 
 /// `DELETE /approval-teams/{Arn}/{VersionId}` — both labels are non-greedy, so both are
 /// percent-encoded into one path segment each.
-async fn delete_version(harness: &Harness, arn: &str, version_id: &str) -> (u16, Value) {
+pub(crate) async fn delete_version(harness: &Harness, arn: &str, version_id: &str) -> (u16, Value) {
     harness
         .call(
             "DELETE",
@@ -88,7 +88,12 @@ fn with_team<R>(
 /// a test without sleeping) or already (a past instant, so the next call materialises the
 /// activation). Only the due instant is moved; the transition itself is the service's,
 /// exactly as `approval_team_lifecycle.rs` moves a deletion window's end.
-fn move_invitation_responses(harness: &Harness, arn: &str, due_in: Duration, future: bool) {
+pub(crate) fn move_invitation_responses(
+    harness: &Harness,
+    arn: &str,
+    due_in: Duration,
+    future: bool,
+) {
     with_team(harness, arn, |team| {
         for approver in &mut team.approvers {
             approver.invitation_response_due = Some(if future {
@@ -101,7 +106,7 @@ fn move_invitation_responses(harness: &Harness, arn: &str, due_in: Duration, fut
 }
 
 /// The stored team's `(Status, VersionId)`, straight out of the store.
-fn stored_status(harness: &Harness, arn: &str) -> Option<(&'static str, String)> {
+pub(crate) fn stored_status(harness: &Harness, arn: &str) -> Option<(&'static str, String)> {
     let store = state::service_state(&*harness.engine).expect("the service store");
     let guard = store.lock();
     guard

@@ -31,6 +31,8 @@ mod emulator;
 mod list_tags_for_resource;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
+#[path = "all/region_scoped_connections.rs"]
+mod region_scoped_connections;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]
