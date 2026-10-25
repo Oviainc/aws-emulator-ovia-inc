@@ -44,6 +44,10 @@
 //! `ops/delete_provisioned_model_throughput.rs` removes, together with the instant each
 //! one's non-terminal `status` is owed its move to `InService`.
 //!
+//! And it holds the account's acknowledged use case for model access — the single form
+//! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
+//! reads back, so the form one request submits is the form the next request gets.
+//!
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
 //! written, because no operation of this service creates a foundation model.
@@ -1028,6 +1032,10 @@ pub struct EnforcedGuardrailConfiguration {
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
 ///
+/// * `use_case_for_model_access` is a single optional form, which a put replaces rather
+///   than appends to, and whose size the model already caps
+///   (`AcknowledgementFormDataBody` is 10..16384 bytes).
+///
 /// So the whole store is bounded by the live resources the quotas admit, and no
 /// sequence of requests — including create/delete cycles with fresh idempotency
 /// tokens — can grow it past them.
@@ -1156,6 +1164,17 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// A FIXED set, not a resource a caller creates: no operation of this service adds a
     /// row to it or takes one away, so it cannot grow the store either.
     pub foundation_models: FoundationModelCatalog,
+    /// The account's acknowledged use case for model access: the `formData` bytes
+    /// `PutUseCaseForModelAccess` last submitted, or `None` while the account has
+    /// submitted none.
+    ///
+    /// ONE record, not a map, for the reason [`Self::model_invocation_logging`] is one:
+    /// the operations that write and read it carry no identifier at all, so there is a
+    /// single account-level form rather than a resource a caller can hold more than one
+    /// of, and a further put REPLACES this field whole. The bytes are kept exactly as the
+    /// put carried them, because the get reports that same `AcknowledgementFormDataBody`
+    /// back.
+    pub use_case_for_model_access: Option<Vec<u8>>,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
