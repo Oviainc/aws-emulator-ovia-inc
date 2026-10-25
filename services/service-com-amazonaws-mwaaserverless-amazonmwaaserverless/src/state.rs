@@ -841,45 +841,73 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
     (token_kind == kind).then(|| key.to_string())
 }
 
-/// The cursor key for a position in a run listing: the two components of a
-/// [`RunListingKey`], zero-padded so the key a cursor carries is fixed-width and
-/// orders the same way the tuple does.
-pub fn format_run_listing_key(key: RunListingKey) -> String {
-    let (nanos, sequence) = key;
-    format!("{nanos:039}.{sequence:020}")
+/// What separates a child-listing cursor key's POSITION from the workflow the
+/// walk it was issued for is scoped to. Neither a zero-padded decimal position
+/// nor a `WorkflowArn` (`^arn:…:workflow/[a-zA-Z0-9.\-_]+$`) can contain it, so
+/// the split is unambiguous.
+const LISTING_KEY_SCOPE_SEPARATOR: char = '@';
+
+/// The cursor key for a position in ONE workflow's child listing: the position of
+/// the last item on the page, and the workflow whose history the walk is over.
+///
+/// A child listing pages the history of exactly one parent, so the parent belongs
+/// in the key: a cursor presented on a walk over ANOTHER workflow's history is
+/// then recognisable as one not issued for that walk, instead of being applied as
+/// a position in a history it says nothing about.
+pub fn format_scoped_listing_key(workflow_arn: &str, position: &str) -> String {
+    format!("{position}{LISTING_KEY_SCOPE_SEPARATOR}{workflow_arn}")
 }
 
-/// Read back a key [`format_run_listing_key`] wrote. `None` for anything else,
-/// which a listing refuses as a `ValidationException` just like a token it did
-/// not issue.
-pub fn parse_run_listing_key(key: &str) -> Option<RunListingKey> {
-    let (nanos, sequence) = key.split_once('.')?;
+/// The POSITION a cursor of `kind` carries, for a walk scoped to `workflow_arn`.
+///
+/// `None` when the token is not one this service issued, when it was issued for
+/// another of this service's lists, when its key is malformed, or when it was
+/// issued on another workflow's history — each of which a listing refuses with
+/// the same `ValidationException` ([`invalid_page_token`]), because none of them
+/// is a position in the walk being asked for.
+pub fn parse_scoped_page_token(kind: &str, token: &str, workflow_arn: &str) -> Option<String> {
+    let key = decode_page_token(kind, token)?;
+    let (position, scope) = key.split_once(LISTING_KEY_SCOPE_SEPARATOR)?;
+    (scope == workflow_arn).then(|| position.to_string())
+}
+
+/// The cursor key for a position in ONE workflow's run listing: the two
+/// components of a [`RunListingKey`], zero-padded so the key a cursor carries is
+/// fixed-width and orders the same way the tuple does, scoped to the workflow the
+/// walk is over.
+pub fn format_run_listing_key(workflow_arn: &str, key: RunListingKey) -> String {
+    let (nanos, sequence) = key;
+    format_scoped_listing_key(workflow_arn, &format!("{nanos:039}.{sequence:020}"))
+}
+
+/// Read back the position part of a key [`format_run_listing_key`] wrote, as
+/// [`parse_scoped_page_token`] hands it over. `None` for anything else, which a
+/// listing refuses as a `ValidationException` just like a token it did not issue.
+pub fn parse_run_listing_key(position: &str) -> Option<RunListingKey> {
+    let (nanos, sequence) = position.split_once('.')?;
     Some((nanos.parse().ok()?, sequence.parse().ok()?))
 }
 
-/// What separates the two parts of a version-listing cursor key. Neither a
-/// decimal sequence nor a `WorkflowArn` (`^arn:…:workflow/[a-zA-Z0-9.\-_]+$`)
-/// can contain it, so the split is unambiguous.
-const VERSION_LISTING_KEY_SEPARATOR: char = '@';
-
 /// The cursor key for a position in ONE workflow's version listing: the
 /// [`WorkflowVersionRecord::sequence`] of the last version on the page,
-/// zero-padded so the key is fixed-width, and the workflow the walk is scoped to.
+/// zero-padded so the key is fixed-width, scoped to the workflow the walk is over.
 ///
 /// The POSITION rather than the version's identifier, so a cursor still resolves
-/// to the same place once the version it was issued at has been deleted; and the
-/// workflow, so a cursor issued while walking another workflow's versions is not
-/// honoured here.
+/// to the same place once the version it was issued at has been deleted.
 pub fn format_version_listing_key(workflow_arn: &str, sequence: u64) -> String {
-    format!("{sequence:020}{VERSION_LISTING_KEY_SEPARATOR}{workflow_arn}")
+    format_scoped_listing_key(workflow_arn, &format!("{sequence:020}"))
 }
 
-/// Read back a key [`format_version_listing_key`] wrote, as
-/// `(sequence, workflow_arn)`. `None` for anything else, which a listing refuses
-/// as a `ValidationException` just like a token it did not issue.
-pub fn parse_version_listing_key(key: &str) -> Option<(u64, &str)> {
-    let (sequence, workflow_arn) = key.split_once(VERSION_LISTING_KEY_SEPARATOR)?;
-    Some((sequence.parse().ok()?, workflow_arn))
+/// Read back the position part of a key [`format_version_listing_key`] wrote, as
+/// [`parse_scoped_page_token`] hands it over. `None` for anything else, which a
+/// listing refuses as a `ValidationException` just like a token it did not issue.
+///
+/// A version listing's position is a single number, so this is only the pair of
+/// [`format_version_listing_key`] — named so the version listing reads its cursor
+/// through the same two steps the run listing does, not because the position has a
+/// format of its own.
+pub fn parse_version_listing_key(position: &str) -> Option<u64> {
+    position.parse().ok()
 }
 
 /// The HTTP status this service answers a resource-lookup miss with.

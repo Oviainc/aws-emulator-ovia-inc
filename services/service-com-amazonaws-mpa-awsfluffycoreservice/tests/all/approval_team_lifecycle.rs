@@ -34,7 +34,13 @@ pub(crate) const REGION: &str = "us-west-2";
 const CLOCK_SLACK: Duration = Duration::from_millis(250);
 
 /// A policy ARN that satisfies `PolicyReference$PolicyArn`'s modelled pattern
-/// `^arn:.{1,63}:mpa:::aws:policy/[a-zA-Z0-9_\.-]{1,1023}/[a-zA-Z0-9_\.-]{1,1023}/(?:[\d]+|\$DEFAULT)$`.
+/// `^arn:.{1,63}:mpa:::aws:policy/[a-zA-Z0-9_\.-]{1,1023}/[a-zA-Z0-9_\.-]{1,1023}/(?:[\d]+|\$DEFAULT)$`
+/// and names a policy version the catalog holds — [`Harness::record_attachable_policies`]
+/// records the entries these tables attach, since an attachment the catalog cannot
+/// resolve is refused.
+///
+/// Row `n` carries version `n` of policy `n` for an odd `n` and `$DEFAULT` for an even
+/// one, the two forms the pattern allows.
 fn policy_arn(n: usize) -> String {
     if n.is_multiple_of(2) {
         format!("arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy{n}/$DEFAULT")
@@ -42,6 +48,10 @@ fn policy_arn(n: usize) -> String {
         format!("arn:aws:mpa:::aws:policy/IdentityCenter/MPAApprovalTeamPolicy{n}/{n}")
     }
 }
+
+/// How many of the policies [`policy_arn`] names the harness records. `Policies` is
+/// `length(1..10)`, so a row can attach at most this many.
+const ATTACHABLE_POLICIES: usize = 10;
 
 /// An approver: `(PrimaryIdentityId, PrimaryIdentitySourceArn)`. `IdentityId` is
 /// `length(1..100)` with no pattern; `PrimaryIdentitySourceArn` is a plain string.
@@ -140,7 +150,40 @@ impl Harness {
         // carry a credential scope so they ROUTE, not a real signature.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        let harness = Self { router, engine };
+        harness.record_attachable_policies();
+        harness
+    }
+
+    /// Record the catalog entries the tables in this crate's suites attach, so every
+    /// reference [`policy_arn`] mints resolves to a policy version the store holds.
+    ///
+    /// No modelled operation mints a policy — the catalog is AWS's — so a table that
+    /// attaches more policies than a fresh store seeds writes them directly, the way
+    /// [`Harness::record_management_account`] records an organization and
+    /// `policy_catalog.rs` grows the catalog. Policy `n` is recorded with versions
+    /// `1..=n`, so an attachment of its version `n` resolves too.
+    fn record_attachable_policies(&self) {
+        let store = state::service_state(&*self.engine).expect("the service store");
+        let mut guard = store.lock();
+        let created = SystemTime::now();
+        for n in 1..=ATTACHABLE_POLICIES {
+            let mut policy = state::CatalogPolicy::with_first_version(
+                "IdentityCenter",
+                &format!("MPAApprovalTeamPolicy{n}"),
+                state::PolicyType::AwsManaged,
+                created,
+            );
+            for version_id in 2..=i32::try_from(n).expect("a small version id") {
+                policy.insert_version(state::CatalogPolicyVersion {
+                    version_id,
+                    status: state::PolicyStatus::Attachable,
+                    creation_time: created,
+                    last_updated_time: created,
+                });
+            }
+            guard.insert_policy(policy);
+        }
     }
 
     /// Record `account_id` as the management account of the organization the store

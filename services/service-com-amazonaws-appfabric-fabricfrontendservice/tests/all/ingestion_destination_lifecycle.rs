@@ -14,9 +14,8 @@
 //!   UUID) at every level of the chain;
 //! * a WRITE naming an ingestion-chain child that does not exist is refused with
 //!   HTTP 400 `ValidationException`, while the READ path answers HTTP 404
-//!   `ResourceNotFoundException` for the same identifier — and that refusal is
-//!   ABOUT the destination the read names, whichever link of the chain is the
-//!   one that does not resolve;
+//!   `ResourceNotFoundException` for the same identifier — naming the FIRST link
+//!   of the chain that does not resolve, whichever level that is;
 //! * a value outside a modelled bound is refused with HTTP 400;
 //! * a DELETE removes exactly the destination it resolves to and leaves every
 //!   sibling and every parent in place; it is `@idempotent` below the app bundle
@@ -677,24 +676,39 @@ async fn a_missing_chain_resource_is_a_validation_failure_on_writes_and_not_foun
     );
 }
 
-/// AppFabric's not-found text for an ingestion destination: a constant naming
-/// the resource kind, which no identifier is interpolated into. The recorded
-/// `appfabric.update-ingestion-destination-changes-prefix-persists` unit asserts
-/// this message for a `GetIngestionDestination` whose parent ingestion does not
-/// resolve, which is what pins BOTH halves of the rule below.
-const DESTINATION_NOT_FOUND_MESSAGE: &str = "The specified ingestion destination does not exist";
+/// AppFabric's reporting-path not-found text: one CONSTANT per resource KIND,
+/// which no identifier is interpolated into (the identifier the caller supplied
+/// travels in the modelled `resourceId` member instead). Each pair is
+/// `(resourceType, message)`, and the three are the ones this crate's state
+/// module holds — the app-bundle sentence is the one `GetAppBundle` answers and
+/// the ingestion sentence the one `ListIngestionDestinations` answers for an
+/// `ingestionIdentifier` that names nothing inside a real bundle, which is the
+/// same chain this operation reads.
+const BUNDLE_NOT_FOUND: (&str, &str) = ("AppBundle", "The app bundle ID was not found.");
+const INGESTION_NOT_FOUND: (&str, &str) = ("Ingestion", "The specified ingestion does not exist");
+const DESTINATION_NOT_FOUND: (&str, &str) = (
+    "IngestionDestination",
+    "The specified ingestion destination does not exist",
+);
 
-/// RULE: the reporting path's refusal is ABOUT THE RESOURCE IT REPORTS ON, so a
-/// `GetIngestionDestination` whose chain does not resolve — at the bundle, at
-/// the ingestion or at the destination itself — answers one and the same HTTP
-/// 404 `ResourceNotFoundException`: `resourceType` `IngestionDestination`,
-/// `resourceId` the destination identifier the caller named, and the constant
-/// message above rather than any identifier reflected back.
+/// One row of the chain table below: the case name, the three identifiers the
+/// read names (bundle, ingestion, destination) and the `(resourceType, message)`
+/// pair the refusal must carry.
+type ChainCase<'a> = (&'a str, &'a str, &'a str, &'a str, (&'a str, &'a str));
+
+/// RULE: a reporting read down a parent/child chain is refused at the FIRST link
+/// whose identifier resolves to nothing, and the refusal NAMES that link: HTTP
+/// 404 `ResourceNotFoundException` whose `resourceType` is the absent resource's
+/// kind, whose `resourceId` is the identifier the caller supplied for THAT link,
+/// and whose message is that kind's constant reporting-path sentence — so a
+/// client can tell which level of the chain it got wrong.
 ///
-/// The table spans which link of the chain is the one that does not resolve, and
-/// both modelled `Identifier` forms of the unresolved identifier.
+/// The table spans what the rule generalises over: which link of the chain does
+/// not resolve, both modelled `Identifier` forms (ARN and bare UUID) of the
+/// unresolved identifier, whether the link never existed or a delete removed it,
+/// and how many links are unresolved at once (the outermost one is reported).
 #[tokio::test]
-async fn a_read_reports_the_destination_as_absent_whichever_link_is_missing() {
+async fn a_read_names_the_link_of_the_chain_that_is_absent() {
     let emulator = Emulator::new();
     let (bundle, ingestion) = emulator.bundle_with_ingestion().await;
     let created = emulator
@@ -708,55 +722,120 @@ async fn a_read_reports_the_destination_as_absent_whichever_link_is_missing() {
         )
         .await;
     let destination = arn_of(&created.body, "ingestionDestination");
+    // A second destination under the same ingestion, removed again, so one row
+    // names a destination that DID exist rather than one no create minted.
+    let deleted = arn_of(
+        &emulator
+            .create_destination(
+                &bundle,
+                &ingestion,
+                json!({
+                    "processingConfiguration": processing("raw", "json"),
+                    "destinationConfiguration": s3_destination("other-audit-bucket", None),
+                }),
+            )
+            .await
+            .body,
+        "ingestionDestination",
+    );
+    let removed = emulator
+        .delete_destination(&bundle, &ingestion, &deleted)
+        .await;
+    assert_eq!(
+        removed.status, 204,
+        "expected HTTP 204 from the delete that sets up the deleted-destination row, \
+         got {} with body {}",
+        removed.status, removed.body
+    );
     let unknown = unknown_uuid();
     let unknown_bundle_arn = format!("arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{unknown}");
+    let unknown_ingestion_arn = format!(
+        "arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{}/ingestion/{unknown}",
+        uuid_of(&bundle)
+    );
     let unknown_destination_arn = format!(
         "arn:aws:appfabric:{REGION}:{ACCOUNT}:appbundle/{}/ingestion/{}/ingestiondestination/{unknown}",
         uuid_of(&bundle),
         uuid_of(&ingestion)
     );
 
-    // (which link does not resolve, bundle, ingestion, destination)
-    let cases: Vec<(&str, &str, &str, &str)> = vec![
+    // (which link does not resolve, bundle, ingestion, destination, the
+    //  (resourceType, message) the refusal must carry)
+    let cases: Vec<ChainCase<'_>> = vec![
         (
             "the bundle, named by bare UUID",
             unknown.as_str(),
             ingestion.as_str(),
             destination.as_str(),
+            BUNDLE_NOT_FOUND,
         ),
         (
             "the bundle, named by ARN",
             unknown_bundle_arn.as_str(),
             ingestion.as_str(),
             destination.as_str(),
+            BUNDLE_NOT_FOUND,
         ),
         (
             "the ingestion, named by bare UUID",
             bundle.as_str(),
             unknown.as_str(),
             destination.as_str(),
+            INGESTION_NOT_FOUND,
+        ),
+        (
+            "the ingestion, named by ARN",
+            bundle.as_str(),
+            unknown_ingestion_arn.as_str(),
+            destination.as_str(),
+            INGESTION_NOT_FOUND,
         ),
         (
             "the destination, named by bare UUID",
             bundle.as_str(),
             ingestion.as_str(),
             unknown.as_str(),
+            DESTINATION_NOT_FOUND,
         ),
         (
             "the destination, named by ARN",
             bundle.as_str(),
             ingestion.as_str(),
             unknown_destination_arn.as_str(),
+            DESTINATION_NOT_FOUND,
         ),
         (
+            "the destination, one a delete removed",
+            bundle.as_str(),
+            ingestion.as_str(),
+            deleted.as_str(),
+            DESTINATION_NOT_FOUND,
+        ),
+        (
+            // Two links unresolved: the OUTERMOST one is the one reported.
             "the ingestion and the destination together",
             bundle.as_str(),
             unknown.as_str(),
             unknown.as_str(),
+            INGESTION_NOT_FOUND,
+        ),
+        (
+            "every level of the chain at once",
+            unknown_bundle_arn.as_str(),
+            unknown.as_str(),
+            unknown.as_str(),
+            BUNDLE_NOT_FOUND,
         ),
     ];
 
-    for (case, bundle_identifier, ingestion_identifier, destination_identifier) in cases {
+    for (case, bundle_identifier, ingestion_identifier, destination_identifier, absent) in cases {
+        let (resource_type, message) = absent;
+        // The identifier the caller supplied for the link the refusal names.
+        let resource_id = match resource_type {
+            "AppBundle" => bundle_identifier,
+            "Ingestion" => ingestion_identifier,
+            _ => destination_identifier,
+        };
         let answer = emulator
             .get_destination(
                 bundle_identifier,
@@ -777,21 +856,20 @@ async fn a_read_reports_the_destination_as_absent_whichever_link_is_missing() {
         );
         assert_eq!(
             answer.body.get("resourceType").and_then(Value::as_str),
-            Some("IngestionDestination"),
-            "case {case:?}: expected the refusal to be about the destination, got {}",
+            Some(resource_type),
+            "case {case:?}: expected the refusal to name {resource_type}, got {}",
             answer.body
         );
         assert_eq!(
             answer.body.get("resourceId").and_then(Value::as_str),
-            Some(destination_identifier),
-            "case {case:?}: expected the named destination in resourceId, got {}",
+            Some(resource_id),
+            "case {case:?}: expected {resource_id:?} in resourceId, got {}",
             answer.body
         );
         assert_eq!(
             answer.body.get("message").and_then(Value::as_str),
-            Some(DESTINATION_NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the constant message \
-             {DESTINATION_NOT_FOUND_MESSAGE:?}, got {}",
+            Some(message),
+            "case {case:?}: expected the constant message {message:?}, got {}",
             answer.body
         );
     }

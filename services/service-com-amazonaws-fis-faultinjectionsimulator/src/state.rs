@@ -348,6 +348,13 @@ pub const TARGET_ACCOUNT_PAGE_TOKEN_PREFIX: &str = "targetAccountConfiguration."
 /// configurations opt into).
 pub const DEFAULT_ACCOUNT_TARGETING: &str = "single-account";
 
+/// The `accountTargeting` of a template whose experiment runs in accounts OTHER than the
+/// caller's own (`AccountTargeting` is modelled `multi-account | single-account`), which is
+/// what target account configurations express. See
+/// [`targets_multiple_accounts`] for the rule both halves of that relationship are read
+/// through.
+pub const MULTI_ACCOUNT_TARGETING: &str = "multi-account";
+
 /// The value FIS applies to `emptyTargetResolutionMode` when the request names none: an
 /// action whose target resolves to nothing fails the experiment rather than being skipped
 /// (`EmptyTargetResolutionMode` is modelled `fail | skip`).
@@ -2258,6 +2265,68 @@ pub fn template_experiment_options_refusal(
             EMPTY_TARGET_RESOLUTION_MODE_VALUES,
         )
     })
+}
+
+/// True when `options` ask for the targeting that runs the experiment in accounts other
+/// than the caller's own ([`MULTI_ACCOUNT_TARGETING`]), reading the documented default
+/// ([`DEFAULT_ACCOUNT_TARGETING`]) for options that name none — so a template created
+/// without experiment options is judged exactly as one that spelled the default out.
+pub fn targets_multiple_accounts(options: &ExperimentTemplateExperimentOptions) -> bool {
+    options
+        .account_targeting
+        .as_deref()
+        .unwrap_or(DEFAULT_ACCOUNT_TARGETING)
+        == MULTI_ACCOUNT_TARGETING
+}
+
+/// `None` when `template` is one FIS can run, as far as its account targeting goes;
+/// otherwise the `ValidationException` that refuses the start.
+///
+/// A template's `experimentOptions.accountTargeting` and the target account configurations
+/// it holds state ONE thing between them — which accounts the experiment runs in — so they
+/// have to agree: "a target account configuration is required when `accountTargeting` of
+/// `experimentOptions` is set to `multi-account`", so a template that targets multiple
+/// accounts and names NONE of them describes a run FIS cannot carry out and is refused
+/// with a 400 `ValidationException`, minting nothing. The relationship is not expressible
+/// in the model — the two members live on different resources — so it is a server-side
+/// rule, and this is the half of it a RUN is judged by. [`target_account_targeting_refusal`]
+/// is the other half.
+pub fn multi_account_configuration_refusal(
+    template: &ExperimentTemplateRecord,
+) -> Option<ValidationException> {
+    if !targets_multiple_accounts(&template.experiment_options)
+        || !template.target_account_configurations.is_empty()
+    {
+        return None;
+    }
+    Some(invalid_input(format!(
+        "experimentOptions.accountTargeting is {MULTI_ACCOUNT_TARGETING}, which requires at \
+         least one target account configuration on the experiment template."
+    )))
+}
+
+/// `None` when `template` is one a target account configuration belongs to; otherwise the
+/// `ValidationException` that refuses the call that would attach one.
+///
+/// The other half of the agreement [`multi_account_configuration_refusal`] describes: a
+/// target account configuration says which role FIS assumes in ANOTHER account, which is
+/// only what a template whose `experimentOptions.accountTargeting` is
+/// [`MULTI_ACCOUNT_TARGETING`] does, so attaching one to a template that targets a single
+/// account is refused with a 400 `ValidationException` and persists nothing. A template's
+/// `accountTargeting` is settled when it is created
+/// (`UpdateExperimentTemplateExperimentOptionsInput` declares no member for it), so a
+/// configuration that EXISTS was created on a template this rule admitted and every later
+/// call on it — a read, an update, a delete — is judged by nothing here.
+pub fn target_account_targeting_refusal(
+    template: &ExperimentTemplateRecord,
+) -> Option<ValidationException> {
+    if targets_multiple_accounts(&template.experiment_options) {
+        return None;
+    }
+    Some(invalid_input(format!(
+        "a target account configuration requires experimentOptions.accountTargeting of the \
+         experiment template to be {MULTI_ACCOUNT_TARGETING}."
+    )))
 }
 
 /// The `actionsMode` an experiment runs under, or the `ValidationException` that refuses

@@ -200,3 +200,8 @@ mod workload_shares;
 // repeatedly refused to merge. Declared last instead, where nothing else is inserting.
 #[path = "all/agent_profile_updates.rs"]
 mod agent_profile_updates;
+
+// Out of alphabetical order for the same reason as the declaration above: the sorted
+// position for an agent suite is the one gap of this list every new agent suite lands in.
+#[path = "all/agent_recommendations.rs"]
+mod agent_recommendations;
