@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::messages::JOB_RUNS_JOB_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED,
     JOB_RUN_STATE_STARTING,
@@ -100,8 +101,7 @@ fn set_start_instants(engine: &Arc<engine::InMemoryEngine>, job_name: &str, offs
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let job = store
-        .jobs
-        .get_mut(job_name)
+        .job_mut(crate::wire::REGION, job_name)
         .unwrap_or_else(|| panic!("the store must hold job {job_name:?}"));
     assert_eq!(
         job.runs.len(),
@@ -119,8 +119,7 @@ fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, job_name: &str, at: Sys
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let job = store
-        .jobs
-        .get_mut(job_name)
+        .job_mut(crate::wire::REGION, job_name)
         .unwrap_or_else(|| panic!("the store must hold job {job_name:?}"));
     for run in &mut job.runs {
         run.settles_at = Some(at);
@@ -412,8 +411,9 @@ async fn a_job_the_store_does_not_hold_is_not_found() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Job {job_name} not found"),
-            "case {case:?}: expected the job miss to name the job asked for, got {body}"
+            JOB_RUNS_JOB_NOT_FOUND,
+            "case {case:?}: expected the wording the corpus records for this listing's job \
+             miss, got {body}"
         );
     }
 

@@ -2,9 +2,12 @@
 
 //! @op GetJobRuns
 //!
-//! Reports every run of one job definition: the records `StartJobRun` wrote in
-//! [`crate::state`], each projected through [`crate::state::JobRunEntry::to_job_run`] —
-//! the SAME projection the single-run read serves — newest run first, in pages.
+//! Reports every run of one job definition OF THE ENDPOINT'S REGION: the records
+//! `StartJobRun` wrote in [`crate::state`], each projected through
+//! [`crate::state::JobRunEntry::to_job_run`] — the SAME projection the single-run read
+//! serves — newest run first, in pages. A `JobName` the endpoint's Region holds no job
+//! definition for is refused with `EntityNotFoundException`: a Glue job exists only in
+//! the Region it was created in, so a job of another Region has no run history here.
 //!
 //! REPORTING, not mutating: the only state it writes is the state changes the CLOCK
 //! already owed this job's runs ([`crate::state::JobEntry::settle_due_runs`]) — changes
@@ -160,9 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Job definitions, and the runs they hold, live in one per-account namespace, so
-        // nothing here depends on the request's Region.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `GetJobRun` reports it.
@@ -183,14 +183,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, MAX_PAGE_SIZE as usize);
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // `JobName` is `@required` with `length 1..255`, so an absent or over-long one is
-        // refused at the boundary: reaching here, the only question is whether this
-        // account holds that job definition.
-        let Some(job) = store.jobs.get_mut(&input.job_name) else {
+        // refused at the boundary: reaching here, the only question is whether THIS Region
+        // holds a job of that name — a job of another Region has no run history here.
+        let Some(job) = store.job_mut(&region, &input.job_name) else {
             return Err(GetJobRunsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!("Job {} not found", input.job_name)),
+                    message: Some(crate::state::messages::JOB_RUNS_JOB_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

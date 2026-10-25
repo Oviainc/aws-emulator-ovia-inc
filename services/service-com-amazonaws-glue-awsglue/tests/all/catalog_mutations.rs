@@ -744,8 +744,10 @@ async fn update_database_moves_the_database_when_the_submitted_name_differs() {
 // ---------------------------------------------------------------------------
 
 /// A mutation that addresses a resource the catalog does not hold is
-/// `EntityNotFoundException` (HTTP 400) and writes nothing. The rows span both axes of
-/// absence (the database and the table) and every mutation of this slice.
+/// `EntityNotFoundException` (HTTP 400) and writes nothing; one that addresses ANOTHER
+/// account's catalog is `AccessDeniedException` (HTTP 400), decided before the lookup.
+/// The rows span both axes of absence (the database and the table) and every mutation of
+/// this slice.
 #[tokio::test]
 async fn mutations_on_absent_resources_answer_the_modelled_error() {
     let router = emulator();
@@ -760,15 +762,6 @@ async fn mutations_on_absent_resources_answer_the_modelled_error() {
             json!({ "DatabaseName": "absent_db", "TablesToDelete": [ "events" ] }),
         ),
         (
-            "BatchDeleteTable in an unknown catalog",
-            "BatchDeleteTable",
-            json!({
-                "CatalogId": "111111111111",
-                "DatabaseName": "present_db",
-                "TablesToDelete": [ "events" ]
-            }),
-        ),
-        (
             "UpdateTable on an absent table",
             "UpdateTable",
             json!({ "DatabaseName": "present_db", "TableInput": { "Name": "absent" } }),
@@ -779,7 +772,27 @@ async fn mutations_on_absent_resources_answer_the_modelled_error() {
             json!({ "DatabaseName": "absent_db", "TableInput": { "Name": "events" } }),
         ),
         (
-            "UpdateTable in an unknown catalog",
+            "UpdateDatabase on an absent database",
+            "UpdateDatabase",
+            json!({ "Name": "absent_db", "DatabaseInput": { "Name": "absent_db" } }),
+        ),
+    ];
+
+    // The same three mutations against a catalog of another account: authorization is
+    // decided before the lookup, so each is refused as unauthorized rather than as a
+    // miss, and none of them writes.
+    let foreign: Vec<(&str, &str, Value)> = vec![
+        (
+            "BatchDeleteTable in another account's catalog",
+            "BatchDeleteTable",
+            json!({
+                "CatalogId": "111111111111",
+                "DatabaseName": "present_db",
+                "TablesToDelete": [ "events" ]
+            }),
+        ),
+        (
+            "UpdateTable in another account's catalog",
             "UpdateTable",
             json!({
                 "CatalogId": "111111111111",
@@ -788,12 +801,7 @@ async fn mutations_on_absent_resources_answer_the_modelled_error() {
             }),
         ),
         (
-            "UpdateDatabase on an absent database",
-            "UpdateDatabase",
-            json!({ "Name": "absent_db", "DatabaseInput": { "Name": "absent_db" } }),
-        ),
-        (
-            "UpdateDatabase in an unknown catalog",
+            "UpdateDatabase in another account's catalog",
             "UpdateDatabase",
             json!({
                 "CatalogId": "111111111111",
@@ -802,6 +810,19 @@ async fn mutations_on_absent_resources_answer_the_modelled_error() {
             }),
         ),
     ];
+
+    for (case, operation, body) in &foreign {
+        let (status, answer) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected 400, got {status} with {answer}"
+        );
+        assert!(
+            error_code(&answer).contains("AccessDeniedException"),
+            "case {case}: expected AccessDeniedException, got {}",
+            error_code(&answer)
+        );
+    }
 
     for (case, operation, body) in &cases {
         let (status, answer) = call(&router, operation, body).await;

@@ -148,7 +148,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `GetJob` reports it.
@@ -161,11 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // `JobName` and `RunId` are both `@required` with `length 1..255`, so an absent
         // or over-long one is refused at the boundary: reaching here, the only question
-        // is whether this account holds that job and that job holds that run.
-        let Some(job) = store.jobs.get_mut(&input.job_name) else {
+        // is whether THIS Region holds that job and that job holds that run.
+        let Some(job) = store.job_mut(&region, &input.job_name) else {
             return Err(not_found(format!("Job {} not found", input.job_name)));
         };
         // The only write a read makes: the state changes the clock had already made due.

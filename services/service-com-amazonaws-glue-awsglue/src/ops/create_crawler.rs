@@ -6,6 +6,13 @@
 //! written, the server-set members (`State`, `Version`, `CreationTime`, `LastUpdated`)
 //! are filled here, and a later `GetCrawler` reports exactly what was stored.
 //!
+//! An S3 target that names an `EventQueueArn` (or the `DlqEventQueueArn` beside it) is
+//! crawled FROM that queue, and the crawl runs as the crawler's `Role`, so the create is
+//! refused with `InvalidInputException` when the policies in force on that role do not
+//! admit the queue operations the crawl makes on that queue — the account's own IAM
+//! records are the authority, and a role nothing can be shown about is not refused (see
+//! [`crate::state::event_queue_refusal`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,6 +239,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // An S3 target that names an `EventQueueArn` is crawled FROM that queue, and the
+        // crawl runs as the crawler's `Role`, so the policies in force on that role have
+        // to admit the queue operations the crawl makes. Glue decides that at CREATE
+        // time, and this refuses only what the account's own IAM records SHOW (see
+        // `crate::state::event_queue_refusal`), so a role nothing can be read about is
+        // not refused.
+        //
+        // The work this costs is bounded on both factors: the number of DISTINCT queues
+        // one request may have decided about (`MAX_CHECKED_EVENT_QUEUES`), and the number
+        // of the role's documents the decision reads (`MAX_ROLE_DOCUMENTS`). The role is
+        // read ONCE, the IAM guard is dropped before anything is parsed, and the
+        // documents are prepared once for every queue rather than once per queue.
+        let event_queues = crate::state::crawl_event_queues(&input.targets);
+        if event_queues.len() > crate::state::MAX_CHECKED_EVENT_QUEUES {
+            return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Targets name {} event queues, more than the {} this crawler \
+                         create resolves",
+                        event_queues.len(),
+                        crate::state::MAX_CHECKED_EVENT_QUEUES
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        if !event_queues.is_empty() {
+            let documents = crate::state::iam_state(&*self.engine).and_then(|iam| {
+                let records = iam.lock();
+                crate::state::role_policy_documents(&input.role, &records)
+            });
+            if let Some(documents) = documents {
+                let prepared = ::service_common::iam_authorization::prepare_documents(&documents);
+                let refusal = event_queues
+                    .iter()
+                    .find_map(|queue| crate::state::event_queue_refusal(&prepared, queue));
+                if let Some(message) = refusal {
+                    return Err(CreateCrawlerErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                }
+            }
         }
 
         let mut store = state.lock();
