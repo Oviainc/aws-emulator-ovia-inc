@@ -25,11 +25,14 @@
 //!   that would create one past [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] is refused, while
 //!   replacing an id already stored creates nothing and is not.
 //! * "The ID has a 64 character limit and can only contain letters, numbers, periods,
-//!   dashes, and underscores" (`MetricsConfiguration$Id`), and the request's `Id` and the
-//!   payload's `Id` identify ONE configuration: a value outside that rule, or two values
-//!   that disagree, is refused with `InvalidArgument` (HTTP 400).
-//! * "The operator must have at least two predicates" (`MetricsFilter$And`): an `And`
-//!   naming fewer is refused with `InvalidArgument` (HTTP 400).
+//!   dashes, and underscores" (`MetricsConfiguration$Id`) and "The operator must have at
+//!   least two predicates" (`MetricsFilter$And`) are part of the schema the API publishes
+//!   for the payload document, and this operation publishes no error of its own for a
+//!   document it cannot take: a payload breaking either rule is refused with `MalformedXML`
+//!   (HTTP 400) carrying that code's fixed published message.
+//! * The request's `Id` query argument and the payload's `Id` identify ONE configuration:
+//!   an argument naming another configuration than the document does is refused with
+//!   `InvalidArgument` (HTTP 400), the code S3 answers a bad argument with.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`. Every refusal leaves the stored configurations exactly as they were.
@@ -37,8 +40,9 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, MAX_METRICS_CONFIGURATIONS_PER_BUCKET, MAX_METRICS_ID_CHARS,
-    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
+    INVALID_ARGUMENT_CODE, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE,
+    MAX_METRICS_CONFIGURATIONS_PER_BUCKET, MAX_METRICS_ID_CHARS, NO_SUCH_BUCKET_CODE,
+    NO_SUCH_CONFIGURATION_CODE, TOO_MANY_CONFIGURATIONS_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -553,39 +557,52 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
         put.status
     );
 
-    // One character past the published ceiling, and one character the member does not
-    // allow — the two ends of the id rule.
+    // One character past the published ceiling, far past it, and characters the member does
+    // not allow — the ends of the id rule, each spelled a different way.
     let too_long = "a".repeat(MAX_METRICS_ID_CHARS + 1);
+    let far_too_long = "b".repeat(MAX_METRICS_ID_CHARS * 4);
 
     // (case, id in the query, payload, expected status, expected code)
+    //
+    // Every row whose PAYLOAD does not satisfy the published schema is a schema refusal
+    // ([`MALFORMED_XML_CODE`], with that code's fixed published message); the one row whose
+    // payload is a valid document but whose `id` query argument names another configuration
+    // is a bad-argument refusal ([`INVALID_ARGUMENT_CODE`]).
     let rows: Vec<(&str, String, String, u16, &str)> = vec![
         (
             "an id one character past the 64-character ceiling",
             too_long.clone(),
             configuration_payload(&too_long, None),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
+        ),
+        (
+            "an id many characters past the 64-character ceiling",
+            far_too_long.clone(),
+            configuration_payload(&far_too_long, None),
+            400,
+            MALFORMED_XML_CODE,
         ),
         (
             "an id carrying a character the member does not allow",
             "not+allowed".to_string(),
             configuration_payload("not+allowed", None),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
+        ),
+        (
+            "an id carrying a path separator, which is no id character either",
+            "not/allowed".to_string(),
+            configuration_payload("not/allowed", None),
+            400,
+            MALFORMED_XML_CODE,
         ),
         (
             "an empty id, which identifies no configuration",
             String::new(),
             configuration_payload("", None),
             400,
-            INVALID_ARGUMENT_CODE,
-        ),
-        (
-            "a payload Id that is not the configuration the request names",
-            "query-id".to_string(),
-            configuration_payload("payload-id", None),
-            400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
         ),
         (
             "an And naming one predicate where the operator takes two",
@@ -595,7 +612,7 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                  <Filter><And><Prefix>only/</Prefix></And></Filter></MetricsConfiguration>"
             ),
             400,
-            INVALID_ARGUMENT_CODE,
+            MALFORMED_XML_CODE,
         ),
         (
             "an And naming no predicate at all",
@@ -604,6 +621,20 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
                 "<MetricsConfiguration xmlns=\"{XMLNS}\"><Id>no-predicate</Id>\
                  <Filter><And></And></Filter></MetricsConfiguration>"
             ),
+            400,
+            MALFORMED_XML_CODE,
+        ),
+        (
+            "a payload Id that is not the configuration the request names",
+            "query-id".to_string(),
+            configuration_payload("payload-id", None),
+            400,
+            INVALID_ARGUMENT_CODE,
+        ),
+        (
+            "an over-long id query argument beside a payload Id the schema takes",
+            too_long.clone(),
+            configuration_payload("payload-id", None),
             400,
             INVALID_ARGUMENT_CODE,
         ),
@@ -624,6 +655,16 @@ async fn a_configuration_s3_cannot_record_is_refused_and_changes_nothing() {
             "case {case:?}: expected the code {code}, got {}",
             answer.error_code()
         );
+        if code == MALFORMED_XML_CODE {
+            // A schema refusal carries the code's own fixed published text, not anything
+            // about the document the request named.
+            assert_eq!(
+                answer.error_message(),
+                MALFORMED_XML_MESSAGE,
+                "case {case:?}: expected the message {MALFORMED_XML_MESSAGE:?}, got {}",
+                answer.error_message()
+            );
+        }
 
         // The refusal recorded nothing: the configuration that WAS stored is unchanged.
         let (reported_id, reported_filter) =
