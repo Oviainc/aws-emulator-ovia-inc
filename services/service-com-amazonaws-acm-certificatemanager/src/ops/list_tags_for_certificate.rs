@@ -180,11 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `Tags` is modelled with a minimum length of 1, so an untagged certificate
-        // answers with the member absent rather than an empty list.
-        let tags = crate::state::tag_list(&certificate.tags);
+        // The whole response IS the stored tag map, so the member is always reported:
+        // a certificate with no tags answers with the EMPTY list, which is what "no
+        // tags" is, rather than with the member missing — a client reading
+        // `response["Tags"]` cannot tell an absent member from an empty set.
         Ok(ListTagsForCertificateOutput {
-            tags: (!tags.is_empty()).then_some(tags),
+            tags: Some(crate::state::tag_list(&certificate.tags)),
         })
     }
 }

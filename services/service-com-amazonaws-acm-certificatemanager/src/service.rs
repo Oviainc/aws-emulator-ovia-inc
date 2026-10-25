@@ -80,6 +80,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+use ::aws_smithy_schema_server::constraints::{
+    ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
+};
+
 /// The error code this service answers an input-constraint violation with: the
 /// modeled `ValidationException` (`@httpError 400`, `com.amazonaws.acm#ValidationException`),
 /// which is also the code the framework's own refusal renderer picks. Restated
@@ -298,23 +302,206 @@ fn echoed_subject(path: &str, submitted: &str) -> String {
 /// Render one constraint violation the way this service states it: the value as
 /// submitted, the input position and the violated constraint — except at a position
 /// whose value ACM withholds ([`withholds_value`]), which names the position alone.
+///
+/// A failure of a collection's ELEMENT is one of those positions: the clause names the
+/// COLLECTION member rather than the index inside it, so the element's own text is not
+/// the value submitted at the position being named and the position is stated alone.
 fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     // A failure of the collection's own ELEMENT is reported against the
-    // collection member, with the element's requirement nested — the position a
-    // caller fixes is the collection it sent, and the index inside it is not part
-    // of the requirement the model declares on the element.
-    let (path, requirement) = match collection_element(&violation.path) {
+    // collection member, with the element's constraint SET nested — the position a
+    // caller fixes is the collection it sent, the index inside it is not part of the
+    // requirement the model declares on the element, and the requirement stated is
+    // everything that element has to satisfy rather than only the clause this one
+    // value tripped over. An element set the model does not describe for that member
+    // (a list nested inside a structure, an element with no constraints of its own)
+    // keeps the single violated requirement, which is never wrong.
+    let (subject, requirement) = match collection_element(&violation.path) {
         Some(collection) => (
-            collection,
-            format!("Member must satisfy constraint: [{requirement}]"),
+            match violation.value {
+                // An element the request left null states that, as an absent member
+                // does: there is no value to withhold.
+                None => format!("{ABSENT_SUBJECT} '{collection}'"),
+                Some(_) => format!("{SUBJECT} '{collection}'"),
+            },
+            format!(
+                "Member must satisfy constraint: [{}]",
+                element_constraint_set(collection).unwrap_or(requirement)
+            ),
         ),
-        None => (violation.path.as_str(), requirement),
+        None => (
+            clause_subject(&violation.path, violation.value.as_deref()),
+            requirement,
+        ),
     };
     Some(format!(
-        "{} failed to satisfy constraint: {requirement}",
-        clause_subject(path, violation.value.as_deref())
+        "{subject} failed to satisfy constraint: {requirement}"
     ))
+}
+
+/// Every constraint the element shape of the top-level list member `name` declares, in
+/// the order ACM lists them, or `None` when this service's model describes no element
+/// constraint set for it.
+///
+/// Read off the model-derived schema: codegen attaches a collection member's element
+/// constraints to that member as an [`ElementConstraintsTrait`], which is where the
+/// validating walk reads them too, so this cannot state a bound the walk does not
+/// enforce. The order is the one ACM reports: the length maximum, the length minimum,
+/// the numeric bounds, the pattern, the value set, and last that an element must not be
+/// null — which every element shape requires and no trait records.
+///
+/// Resolved by member NAME across every operation input, because `override_refusal` is
+/// handed the violations and not the operation they came from (`Refusal::Invalid`
+/// carries no schema). A name two inputs declare with DIFFERENT element constraints is
+/// declined here rather than guessed at, so no refusal can state a bound the operation
+/// being called does not enforce.
+fn element_constraint_set(name: &str) -> Option<String> {
+    if name.contains('.') {
+        // Only a TOP-LEVEL list member can be resolved against an operation's input
+        // schema: a member schema carries its own traits and not the members of the
+        // shape it targets, so a list nested inside a structure is not reachable here.
+        return None;
+    }
+    let mut resolved: Option<String> = None;
+    for input in input_schemas() {
+        let Some(traits) = input
+            .members()
+            .iter()
+            .find(|member| {
+                matches!(member.shape_type(), aws_smithy_schema::ShapeType::List)
+                    && member
+                        .member_name()
+                        .is_some_and(|declared| lower_camel(declared) == name)
+            })
+            .and_then(|member| member.traits())
+            .and_then(|traits| traits.get(&ElementConstraintsTrait::TRAIT_ID))
+            .and_then(|wrapper| wrapper.as_any().downcast_ref::<ElementConstraintsTrait>())
+            .map(ElementConstraintsTrait::inner)
+        else {
+            continue;
+        };
+
+        let mut kinds: Vec<ViolationKind> = Vec::new();
+        if let Some(length) = traits
+            .get(&LengthTrait::TRAIT_ID)
+            .and_then(|found| found.as_any().downcast_ref::<LengthTrait>())
+        {
+            kinds.extend(length.max.map(ViolationKind::MaxLength));
+            kinds.extend(length.min.map(ViolationKind::MinLength));
+        }
+        if let Some(range) = traits
+            .get(&RangeTrait::TRAIT_ID)
+            .and_then(|found| found.as_any().downcast_ref::<RangeTrait>())
+        {
+            kinds.extend(range.max.map(|max| ViolationKind::MaxValue(bound(max))));
+            kinds.extend(range.min.map(|min| ViolationKind::MinValue(bound(min))));
+        }
+        if let Some(pattern) = traits
+            .get(&PatternTrait::TRAIT_ID)
+            .and_then(|found| found.as_any().downcast_ref::<PatternTrait>())
+        {
+            kinds.push(ViolationKind::Pattern(pattern.regex.to_string()));
+        }
+        if let Some(values) = traits
+            .get(&EnumTrait::TRAIT_ID)
+            .and_then(|found| found.as_any().downcast_ref::<EnumTrait>())
+        {
+            kinds.push(ViolationKind::EnumValue(
+                values.values.iter().map(|value| (*value).to_string()).collect(),
+            ));
+        }
+        // An element shape with no constraint of its own has no set to state: its
+        // violations (a `@uniqueItems` failure, say, which bounds the LIST) keep their
+        // own requirement.
+        if kinds.is_empty() {
+            continue;
+        }
+        kinds.push(ViolationKind::MissingRequiredMember);
+        let stated: Vec<String> = kinds.iter().filter_map(requirement).collect();
+        if stated.len() != kinds.len() {
+            continue;
+        }
+        let stated = stated.join(", ");
+        match &resolved {
+            // Two inputs declaring this name with different element constraints: which
+            // one is being validated is not knowable here, so neither is stated.
+            Some(first) if *first != stated => return None,
+            Some(_) => {}
+            None => resolved = Some(stated),
+        }
+    }
+    resolved
+}
+
+/// A numeric `@range` bound as a requirement states it: an integral bound without a
+/// trailing `.0`, a fractional one with its decimals — the rendering the framework uses
+/// for the same bound when it reports the violation itself.
+fn bound(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// A member's name as a message path spells it, which is the spelling the validating
+/// walk writes into a violation's path (`aws_smithy_schema_server::constraints::path`).
+fn lower_camel(member_name: &str) -> String {
+    ::aws_smithy_schema_server::constraints::path::member(member_name)
+}
+
+/// Every operation input shape of this service, as the schemas codegen derives from the
+/// Smithy model — the only runtime source for what a member declares. One entry per
+/// operation file in `src/ops/` that HAS an input shape (`GetAccountConfiguration`
+/// takes `Unit`, so it declares no member and has none).
+///
+/// An operation left out of it loses nothing but the composite element clause for its
+/// own list members, and the suite in `tests/all/validation_message_rendering.rs`
+/// asserts that clause on members of several of them.
+fn input_schemas() -> [&'static aws_smithy_schema::Schema; 39] {
+    use crate::ops::types;
+
+    [
+        types::ADD_TAGS_TO_CERTIFICATE_INPUT_SCHEMA,
+        types::CREATE_ACME_DOMAIN_VALIDATION_INPUT_SCHEMA,
+        types::CREATE_ACME_ENDPOINT_INPUT_SCHEMA,
+        types::CREATE_ACME_EXTERNAL_ACCOUNT_BINDING_INPUT_SCHEMA,
+        types::DELETE_ACME_DOMAIN_VALIDATION_INPUT_SCHEMA,
+        types::DELETE_ACME_ENDPOINT_INPUT_SCHEMA,
+        types::DELETE_ACME_EXTERNAL_ACCOUNT_BINDING_INPUT_SCHEMA,
+        types::DELETE_CERTIFICATE_INPUT_SCHEMA,
+        types::DESCRIBE_ACME_ACCOUNT_INPUT_SCHEMA,
+        types::DESCRIBE_ACME_DOMAIN_VALIDATION_INPUT_SCHEMA,
+        types::DESCRIBE_ACME_ENDPOINT_INPUT_SCHEMA,
+        types::DESCRIBE_ACME_EXTERNAL_ACCOUNT_BINDING_INPUT_SCHEMA,
+        types::DESCRIBE_CERTIFICATE_INPUT_SCHEMA,
+        types::EXPORT_CERTIFICATE_INPUT_SCHEMA,
+        types::GET_ACME_EXTERNAL_ACCOUNT_BINDING_CREDENTIALS_INPUT_SCHEMA,
+        types::GET_CERTIFICATE_INPUT_SCHEMA,
+        types::IMPORT_CERTIFICATE_INPUT_SCHEMA,
+        types::LIST_ACME_ACCOUNTS_INPUT_SCHEMA,
+        types::LIST_ACME_DOMAIN_VALIDATIONS_INPUT_SCHEMA,
+        types::LIST_ACME_ENDPOINTS_INPUT_SCHEMA,
+        types::LIST_ACME_EXTERNAL_ACCOUNT_BINDINGS_INPUT_SCHEMA,
+        types::LIST_CERTIFICATES_INPUT_SCHEMA,
+        types::LIST_CERTIFICATE_DOMAIN_VALIDATIONS_INPUT_SCHEMA,
+        types::LIST_TAGS_FOR_CERTIFICATE_INPUT_SCHEMA,
+        types::LIST_TAGS_FOR_RESOURCE_INPUT_SCHEMA,
+        types::PUT_ACCOUNT_CONFIGURATION_INPUT_SCHEMA,
+        types::REMOVE_TAGS_FROM_CERTIFICATE_INPUT_SCHEMA,
+        types::RENEW_CERTIFICATE_INPUT_SCHEMA,
+        types::REQUEST_CERTIFICATE_INPUT_SCHEMA,
+        types::RESEND_VALIDATION_EMAIL_INPUT_SCHEMA,
+        types::REVOKE_ACME_ACCOUNT_INPUT_SCHEMA,
+        types::REVOKE_ACME_EXTERNAL_ACCOUNT_BINDING_INPUT_SCHEMA,
+        types::REVOKE_CERTIFICATE_INPUT_SCHEMA,
+        types::SEARCH_CERTIFICATES_INPUT_SCHEMA,
+        types::TAG_RESOURCE_INPUT_SCHEMA,
+        types::UNTAG_RESOURCE_INPUT_SCHEMA,
+        types::UPDATE_ACME_DOMAIN_VALIDATION_INPUT_SCHEMA,
+        types::UPDATE_ACME_ENDPOINT_INPUT_SCHEMA,
+        types::UPDATE_CERTIFICATE_OPTIONS_INPUT_SCHEMA,
+    ]
 }
 
 /// The collection member a violation belongs to, when the failing leaf IS one of
@@ -367,12 +554,20 @@ fn one_error_envelope(clause: &str) -> String {
 /// (`N validation error(s) detected: `) over one clause per violation, in the
 /// order the validating walk found them.
 ///
+/// Two violations on the ELEMENTS of one collection member state the SAME clause — the
+/// member's whole element constraint set, reported at the member — so that clause is
+/// stated once and the refusal counts one error, not one per element or per constraint
+/// the elements tripped over.
+///
 /// `None` declines the whole refusal — see [`requirement`].
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let clause = constraint_clause(violation)?;
+        if !clauses.contains(&clause) {
+            clauses.push(clause);
+        }
+    }
     match clauses.len() {
         0 => None,
         1 => Some(one_error_envelope(&clauses[0])),
