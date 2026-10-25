@@ -260,6 +260,12 @@ pub const BUCKET_NOT_FOUND: &str = "The specified vector bucket could not be fou
 /// analogy with it — no recording of this corpus carries the index wording.
 pub const INDEX_NOT_FOUND: &str = "The specified vector index could not be found";
 
+/// See [`BUCKET_NOT_FOUND`]: the same sentence for the third resource kind a
+/// `NotFoundException` can be about — the policy of a vector bucket that exists
+/// but carries none — so a client reads the missing kind from the sentence and a
+/// bucket that is missing cannot be confused with a policy that is.
+pub const POLICY_NOT_FOUND: &str = "The specified vector bucket policy could not be found";
+
 /// Wording for the one failure that is not about the request: the shared engine
 /// did not hand this service's store back. Every operation models
 /// `ServiceUnavailableException`, which is what that answers with.
