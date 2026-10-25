@@ -68,6 +68,9 @@ mod cluster_alerts;
 #[path = "all/cluster_creation.rs"]
 mod cluster_creation;
 
+#[path = "all/cluster_description.rs"]
+mod cluster_description;
+
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
