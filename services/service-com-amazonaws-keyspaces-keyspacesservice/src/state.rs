@@ -2450,20 +2450,17 @@ fn scalable_target_key(
 /// The `PolicyName` of the target-tracking policy this service manages for one capacity.
 ///
 /// A policy's name is its identity under its target, so a service-managed policy needs a
-/// name that is derived from what it steers rather than chosen per call: the metric it
-/// tracks and the resource it tracks it for. That is what makes a second configuration of
-/// the same capacity an UPDATE of the one policy instead of a second policy on one
-/// metric, which Application Auto Scaling refuses.
-fn managed_policy_name(
-    keyspace_name: &str,
-    table_name: &str,
-    capacity: TableCapacity,
-) -> String {
-    format!(
-        "{}:{}",
-        capacity.predefined_metric(),
-        auto_scaling_resource_id(keyspace_name, table_name)
-    )
+/// name derived from the resource it was created FOR rather than chosen per call: that is
+/// what makes a second configuration of the same capacity an UPDATE of the one policy
+/// instead of a second policy on one metric, and what lets a caller address it through
+/// Application Auto Scaling's own API without discovering it first.
+///
+/// This service names it after the table whose capacity it steers — the keyspace, the
+/// table and the `-scaling-policy` suffix — which is one name for BOTH of the table's
+/// capacities: the policy's `ScalableDimension`, not its name, says which capacity it
+/// steers, and a name is unique only under one target.
+fn managed_policy_name(keyspace_name: &str, table_name: &str) -> String {
+    format!("{keyspace_name}-{table_name}-scaling-policy")
 }
 
 /// What one capacity's settings are to be materialised as in Application Auto Scaling, or
@@ -2495,7 +2492,7 @@ fn managed_target(
         // beyond its range is registered at the largest capacity that service can hold.
         min_capacity: i32::try_from(minimum).unwrap_or(i32::MAX),
         max_capacity: i32::try_from(maximum).unwrap_or(i32::MAX),
-        policy_name: managed_policy_name(keyspace_name, table_name, capacity),
+        policy_name: managed_policy_name(keyspace_name, table_name),
         target_tracking:
             application_auto_scaling::ops::types::TargetTrackingScalingPolicyConfiguration {
                 target_value: configuration.target_value,
@@ -2597,7 +2594,7 @@ pub fn reported_auto_scaling<Eng: Send + Sync + 'static>(
     let mut configured = false;
     for capacity in TableCapacity::ALL {
         let key = scalable_target_key(keyspace_name, table_name, capacity);
-        let policy_name = managed_policy_name(keyspace_name, table_name, capacity);
+        let policy_name = managed_policy_name(keyspace_name, table_name);
         let settings = match application_auto_scaling::state::managed_target_settings(
             &store,
             &key,
