@@ -23,7 +23,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::ops::types::{CreateJobInput, JobCommand};
 use service_com_amazonaws_glue_awsglue::state::{
     dpu_per_worker, ComAmazonawsGlueAwsglueState, JobEntry, DEFAULT_GLUE_VERSION,
-    DEFAULT_JOB_MODE, DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5,
+    DEFAULT_JOB_MODE, DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_PYTHON_SHELL_DPUS, DEFAULT_SPARK_DPUS,
+    DEFAULT_SPARK_WORKERS, DEFAULT_SPARK_WORKER_TYPE, DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5,
     DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4, MAX_JOBS, MAX_TIMEOUT_MINUTES,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -86,11 +87,15 @@ async fn created_jobs_are_read_back_from_the_store() {
                 // "The maximum number of concurrent runs allowed for the job. The
                 // default is 1."
                 "ExecutionProperty": { "MaxConcurrentRuns": DEFAULT_MAX_CONCURRENT_RUNS },
-                // The model's own `@default` for the two deprecated/absent integers.
+                // The model's own `@default` for the absent `MaxRetries`.
                 "MaxRetries": 0,
-                "AllocatedCapacity": 0,
-                // No capacity was named and no worker configuration maps to one.
-                "MaxCapacity": Value::Null,
+                // No capacity was named, so the service fills in the documented default
+                // for a Spark job: ten DPUs, which from Glue 2.0 on are ten G.1X
+                // workers.
+                "WorkerType": DEFAULT_SPARK_WORKER_TYPE,
+                "NumberOfWorkers": DEFAULT_SPARK_WORKERS,
+                "MaxCapacity": DEFAULT_SPARK_DPUS,
+                "AllocatedCapacity": DEFAULT_SPARK_WORKERS,
                 "ProfileName": Value::Null,
             }),
         ),
@@ -339,6 +344,167 @@ async fn capacity_is_derived_from_every_documented_worker_type() {
     }
 }
 
+/// A job definition that names NO capacity at all is stored with the capacity the
+/// service documents for its command, and from Glue 2.0 on a Spark job's is expressed as
+/// the worker configuration that version takes — so `GetJob` never reports a job no
+/// runner could size.
+///
+/// Source: `CreateJob$MaxCapacity` ("When you specify an Apache Spark ETL job … or Apache
+/// Spark streaming ETL job, you can allocate from 2 to 100 DPUs. The default is 10 DPUs";
+/// "When you specify a Python shell job … you can allocate either 0.0625 or 1 DPU. The
+/// default is 0.0625 DPU"; "For Glue version 2.0 or later jobs, you cannot specify a
+/// `Maximum capacity`. Instead, you should specify a `Worker type` and the `Number of
+/// workers`") and `CreateJob$WorkerType` ("For the `G.1X` worker type, each worker maps
+/// to 1 DPU").
+///
+/// The rows differ along the command kind and the Glue version — the two things the
+/// documented default turns on — and include a version the issue did not cite (the
+/// default version, and a pre-2.0 one), plus the rows where the request DOES name a
+/// capacity, which no default may overwrite.
+#[tokio::test]
+async fn an_omitted_worker_configuration_takes_the_documented_capacity_defaults() {
+    let router = emulator();
+
+    // (case, the command and version named, expected (WorkerType, NumberOfWorkers,
+    // MaxCapacity))
+    let rows: Vec<(&str, Value, Value, Value, Value)> = vec![
+        (
+            // The recorded case: a Glue 4.0 Spark ETL job with no worker configuration.
+            "glueetl on glue 4.0",
+            json!({ "Command": { "Name": "glueetl" }, "GlueVersion": "4.0" }),
+            json!(DEFAULT_SPARK_WORKER_TYPE),
+            json!(DEFAULT_SPARK_WORKERS),
+            json!(DEFAULT_SPARK_DPUS),
+        ),
+        (
+            // A version the issue did not cite: the one an absent `GlueVersion` resolves
+            // to, which is also past 2.0, so the same worker configuration is filled in.
+            "glueetl on the default glue version",
+            json!({ "Command": { "Name": "glueetl" } }),
+            json!(DEFAULT_SPARK_WORKER_TYPE),
+            json!(DEFAULT_SPARK_WORKERS),
+            json!(DEFAULT_SPARK_DPUS),
+        ),
+        (
+            "gluestreaming on glue 3.0",
+            json!({ "Command": { "Name": "gluestreaming" }, "GlueVersion": "3.0" }),
+            json!(DEFAULT_SPARK_WORKER_TYPE),
+            json!(DEFAULT_SPARK_WORKERS),
+            json!(DEFAULT_SPARK_DPUS),
+        ),
+        (
+            // The published bound of the worker-configuration rule: 2.0 is the first
+            // version that expresses capacity as workers.
+            "gluestreaming on glue 2.0",
+            json!({ "Command": { "Name": "gluestreaming" }, "GlueVersion": "2.0" }),
+            json!(DEFAULT_SPARK_WORKER_TYPE),
+            json!(DEFAULT_SPARK_WORKERS),
+            json!(DEFAULT_SPARK_DPUS),
+        ),
+        (
+            // One version below that bound: the same ten DPUs, as a `MaxCapacity`,
+            // because a pre-2.0 job is sized in DPUs and not in workers.
+            "glueetl on glue 1.0",
+            json!({ "Command": { "Name": "glueetl" }, "GlueVersion": "1.0" }),
+            Value::Null,
+            Value::Null,
+            json!(DEFAULT_SPARK_DPUS),
+        ),
+        (
+            "pythonshell",
+            json!({ "Command": { "Name": "pythonshell" }, "GlueVersion": "3.0" }),
+            Value::Null,
+            Value::Null,
+            json!(DEFAULT_PYTHON_SHELL_DPUS),
+        ),
+        (
+            // A Ray job's default worker configuration is one this service publishes no
+            // figure for, so nothing is filled in rather than a number invented.
+            "glueray",
+            json!({ "Command": { "Name": "glueray" }, "GlueVersion": "4.0" }),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            // A named worker configuration is never overwritten by a default.
+            "glueetl naming its own workers",
+            json!({
+                "Command": { "Name": "glueetl" },
+                "GlueVersion": "4.0",
+                "WorkerType": "G.2X",
+                "NumberOfWorkers": 3,
+            }),
+            json!("G.2X"),
+            json!(3),
+            json!(6.0),
+        ),
+        (
+            // Nor by one derived for a different command.
+            "pythonshell naming its own capacity",
+            json!({ "Command": { "Name": "pythonshell" }, "MaxCapacity": 1.0 }),
+            Value::Null,
+            Value::Null,
+            json!(1.0),
+        ),
+    ];
+
+    for (case, named, worker_type, workers, capacity) in rows {
+        let name = format!("defaults-{}", case.replace(' ', "-"));
+        let mut body = json!({ "Name": name, "Role": ROLE_ARN });
+        let members = body.as_object_mut().expect("the request is a structure");
+        for (member, value) in named.as_object().expect("the named members") {
+            members.insert(member.clone(), value.clone());
+        }
+        ok(&router, "CreateJob", &body).await;
+
+        let job = get_job(&router, &name).await;
+        for (member, expected) in [
+            ("WorkerType", &worker_type),
+            ("NumberOfWorkers", &workers),
+            ("MaxCapacity", &capacity),
+        ] {
+            let actual = job.get(member).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected {member} {expected}, got {actual}"
+            );
+        }
+        // `AllocatedCapacity` is the same quantity in whole DPUs.
+        let expected_allocated = capacity.as_f64().map_or(0, |dpus| dpus as i64);
+        assert_eq!(
+            job.get("AllocatedCapacity").and_then(Value::as_i64),
+            Some(expected_allocated),
+            "case {case:?}: expected AllocatedCapacity {expected_allocated}, got {job}"
+        );
+        // A run of the job inherits the capacity the definition carries, so a client that
+        // sizes a run from the job reads the same numbers back off the run.
+        let started = ok(&router, "StartJobRun", &json!({ "JobName": name })).await;
+        let run_id = started
+            .get("JobRunId")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: StartJobRun must answer a JobRunId"));
+        let run = ok(
+            &router,
+            "GetJobRun",
+            &json!({ "JobName": name, "RunId": run_id }),
+        )
+        .await;
+        let run = &run["JobRun"];
+        for (member, expected) in [
+            ("WorkerType", &worker_type),
+            ("NumberOfWorkers", &workers),
+            ("MaxCapacity", &capacity),
+        ] {
+            let actual = run.get(member).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: the run must carry {member} {expected}, got {actual}"
+            );
+        }
+    }
+}
+
 /// `Timeout` is accepted at each documented bound and refused past the upper one:
 /// "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise, the
 /// jobs will throw an exception", and the model's own `range 1..` bounds it below.
@@ -537,7 +703,7 @@ async fn a_create_past_the_job_ceiling_is_refused() {
                 ..CreateJobInput::default()
             };
             let entry = JobEntry::from_create_input(&input, SystemTime::UNIX_EPOCH);
-            store.jobs.insert(name, entry);
+            store.insert_job(crate::wire::REGION, entry);
         }
     }
 
@@ -555,7 +721,12 @@ async fn a_create_past_the_job_ceiling_is_refused() {
 
     {
         let state = engine.state::<ComAmazonawsGlueAwsglueState>();
-        state.lock().jobs.remove("seeded-0");
+        state
+            .lock()
+            .jobs
+            .get_mut(crate::wire::REGION)
+            .expect("the Region's job definitions")
+            .remove("seeded-0");
     }
     ok(&router, "CreateJob", &job_body("one-too-many")).await;
 }

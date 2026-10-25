@@ -31,6 +31,8 @@ mod data_protection_policy;
 mod deletion_protection;
 #[path = "all/deliveries.rs"]
 mod deliveries;
+#[path = "all/delivery_configuration_updates.rs"]
+mod delivery_configuration_updates;
 #[path = "all/delivery_creation.rs"]
 mod delivery_creation;
 #[path = "all/delivery_destination_enumeration.rs"]

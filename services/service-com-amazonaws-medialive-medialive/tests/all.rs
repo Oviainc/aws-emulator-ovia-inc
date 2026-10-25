@@ -92,6 +92,9 @@ mod cluster_update;
 #[path = "all/deleted_resource_mutation.rs"]
 mod deleted_resource_mutation;
 
+#[path = "all/describe_node_reporting.rs"]
+mod describe_node_reporting;
+
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 

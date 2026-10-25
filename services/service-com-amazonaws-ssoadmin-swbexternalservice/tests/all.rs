@@ -113,6 +113,8 @@ mod ssoadmin_permission_sets;
 mod state_roundtrip;
 #[path = "all/tags_from_creates.rs"]
 mod tags_from_creates;
+#[path = "all/trusted_token_issuer_update.rs"]
+mod trusted_token_issuer_update;
 #[path = "all/trusted_token_issuers.rs"]
 mod trusted_token_issuers;
 #[path = "all/validation_message_wording.rs"]

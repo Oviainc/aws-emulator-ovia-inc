@@ -77,11 +77,11 @@ fn untag_body(arn: &str) -> Value {
 
 /// How one ARN-identified operation is called: its name and the request body it
 /// takes for an `arn`.
-type ArnOperation = (&'static str, fn(&str) -> Value);
+pub(crate) type ArnOperation = (&'static str, fn(&str) -> Value);
 
 /// Every operation that identifies its resource by `AmazonResourceName`, with the
 /// request body each one takes.
-fn arn_operations() -> Vec<ArnOperation> {
+pub(crate) fn arn_operations() -> Vec<ArnOperation> {
     vec![
         ("ListTagsForResource", list_tags_body as fn(&str) -> Value),
         ("TagResource", tag_body as fn(&str) -> Value),
@@ -95,7 +95,7 @@ fn arn_operations() -> Vec<ArnOperation> {
 
 /// The two ways an ARN the model's `@pattern` admits can name no resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Fault {
+pub(crate) enum Fault {
     /// Its partition, Region or account is not the one the request addresses.
     OutOfScope,
     /// Inside the request's scope, naming no stored connection.
@@ -104,7 +104,7 @@ enum Fault {
 
 impl Fault {
     /// The modelled error code this class is reported with.
-    fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             Fault::OutOfScope => "InterconnectValidationException",
             Fault::NoSuchConnection => "InterconnectClientException",

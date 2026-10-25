@@ -401,6 +401,14 @@ pub const MARKER_SCOPE_USER_ATTACHED_POLICIES: &str = "user-attached-policies";
 /// see [`role_policies_marker_scope`].
 pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
 
+/// The marker scope of ONE user's EMBEDDED inline policies, which
+/// `ListUserPolicies` pages over. It is its OWN scope, with the user's key
+/// following it, exactly as the role's inline-policy scope carries the role's, so a
+/// marker issued while paging one user's inline policies names no position in
+/// another user's — nor among that user's ATTACHED managed policies, nor among any
+/// role's inline policies: see [`user_policies_marker_scope`].
+pub const MARKER_SCOPE_USER_POLICIES: &str = "user-policies";
+
 /// The marker scope of the entities ONE managed policy relates to, which
 /// `ListEntitiesForPolicy` pages over. The policy's ARN follows it, so a marker
 /// issued while paging the entities of one policy does not name a position in
@@ -1870,6 +1878,11 @@ pub fn user_attached_policies_marker_scope(user_key: &str) -> String {
 /// The marker scope of the inline-policy set of the role keyed by `role_key`.
 pub fn role_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the inline-policy set of the user keyed by `user_key`.
+pub fn user_policies_marker_scope(user_key: &str) -> String {
+    format!("{MARKER_SCOPE_USER_POLICIES}:{user_key}")
 }
 
 /// The marker scope of the entity collection of the managed policy `policy_arn`

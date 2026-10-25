@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `CreateJob` reports it.
@@ -221,8 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(entry) = store.jobs.get_mut(&input.job_name) else {
+        // A job exists only in the Region it was created in, so an update addressed to
+        // another Region's endpoint names no job.
+        let Some(entry) = store.job_mut(&region, &input.job_name) else {
             return Err(UpdateJobErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(format!("Job {} not found", input.job_name)),

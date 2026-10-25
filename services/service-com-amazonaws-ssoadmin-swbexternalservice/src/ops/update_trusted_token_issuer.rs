@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrustedTokenIssuer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrustedTokenIssuer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrustedTokenIssuer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrustedTokenIssuer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrustedTokenIssuerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrustedTokenIssuer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTrustedTokenIssuerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this update resolves the same
+        // issuer a read at this instant would resolve — an issuer whose instance has
+        // since gone is gone with it.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // Never created, or created under an instance that has since gone — the same
+        // answer either way: there is no such trusted token issuer to update. The same
+        // channel, and the same wording, `DescribeTrustedTokenIssuer` answers an unminted
+        // ARN with.
+        let record = store
+            .trusted_token_issuer_mut(&input.trusted_token_issuer_arn)
+            .ok_or_else(|| {
+                UpdateTrustedTokenIssuerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::trusted_token_issuer_not_found_message(
+                            &input.trusted_token_issuer_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // KMS key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // Only the members the request CARRIES are written: an absent member leaves the
+        // stored value alone, so a caller renaming an issuer cannot silently rewrite its
+        // attribute paths, and a caller re-mapping one path cannot clear the other.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(configuration) = input.trusted_token_issuer_configuration {
+            // `TrustedTokenIssuerUpdateConfiguration` carries ONE settings structure per
+            // issuer type ("the settings that you can provide are determined by the type
+            // of the trusted token issuer that you are updating"), so the update is
+            // applied to the stored configuration of the matching type. The stored type
+            // itself is no member of this request, so it survives the update.
+            match (configuration, &mut record.configuration) {
+                (
+                    TrustedTokenIssuerUpdateConfiguration::OidcJwtConfiguration(update),
+                    TrustedTokenIssuerConfiguration::OidcJwtConfiguration(stored),
+                ) => {
+                    if let Some(claim_attribute_path) = update.claim_attribute_path {
+                        stored.claim_attribute_path = claim_attribute_path;
+                    }
+                    if let Some(identity_store_attribute_path) =
+                        update.identity_store_attribute_path
+                    {
+                        stored.identity_store_attribute_path = identity_store_attribute_path;
+                    }
+                    if let Some(jwks_retrieval_option) = update.jwks_retrieval_option {
+                        stored.jwks_retrieval_option = jwks_retrieval_option;
+                    }
+                    // `OidcJwtUpdateConfiguration` models no `IssuerUrl`, so the stored
+                    // one survives: no member of this request carries another value for
+                    // it.
+                }
+            }
+        }
+        // `client_token` and `request_fingerprint` are deliberately untouched: they record
+        // the CREATE this issuer came from, which is what tells a retry of that create
+        // from the same token carrying a different request.
+
+        // `UpdateTrustedTokenIssuerResponse` models no members: the updated record is read
+        // back through `DescribeTrustedTokenIssuer`.
+        Ok(UpdateTrustedTokenIssuerOutput {})
     }
 }

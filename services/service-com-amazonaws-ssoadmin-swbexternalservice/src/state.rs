@@ -2606,6 +2606,17 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.trusted_token_issuers.get(trusted_token_issuer_arn)
     }
 
+    /// The trusted token issuer `trusted_token_issuer_arn` names, for a handler that
+    /// CHANGES it (an `UpdateTrustedTokenIssuer` writing its name or the attribute paths
+    /// of its configuration). Resolves exactly as [`Self::trusted_token_issuer`], so the
+    /// read and the write never disagree about which issuer an ARN names.
+    pub fn trusted_token_issuer_mut(
+        &mut self,
+        trusted_token_issuer_arn: &str,
+    ) -> Option<&mut TrustedTokenIssuerRecord> {
+        self.trusted_token_issuers.get_mut(trusted_token_issuer_arn)
+    }
+
     /// The trusted token issuer a previous `CreateTrustedTokenIssuer` minted under
     /// `client_token`, if one still exists.
     pub fn trusted_token_issuer_for_client_token(

@@ -41,13 +41,17 @@ pub const ERROR_DETAIL_TAG: &str = "ErrorDetail";
 
 /// A SigV4 `Authorization` header scoped to `glue`: the routing signal the router
 /// reads first. Authentication is off on the test router, so the signature is not
-/// verified — only the scope is read.
-fn authorization() -> String {
+/// verified — only the scope is read, including the Region field below, which is what
+/// the service reads a request's Region from.
+fn authorization_in(region: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential={AKID}/20260101/us-east-1/glue/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={AKID}/20260101/{region}/glue/aws4_request, \
          SignedHeaders=host;x-amz-target, Signature=0000000000000000000000000000000000000000000000000000000000000000"
     )
 }
+
+/// The Region every call made through [`call`] is served in.
+pub const REGION: &str = "us-east-1";
 
 /// An emulator with only this service mounted, on one shared engine, with request
 /// authentication off (the test sends no real signature).
@@ -68,12 +72,23 @@ pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 
 /// Make one awsJson1_1 call and return its HTTP status and parsed body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_in_region(router, REGION, operation, body).await
+}
+
+/// The same, through another Region's endpoint: only the credential scope's Region
+/// changes, which is the Region the service serves the request in.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.1")
         .header("x-amz-target", format!("AWSGlue.{operation}"))
-        .header("authorization", authorization())
+        .header("authorization", authorization_in(region))
         .body(bytes::Bytes::from(body.to_string()))
         .expect("build the request");
 

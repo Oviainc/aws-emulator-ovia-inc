@@ -204,10 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Manual` both needs and accepts a `RuntimeVersionArn`.
         let manual = input.update_runtime_on == crate::state::UPDATE_RUNTIME_ON_MANUAL;
         let refusal = match (manual, input.runtime_version_arn.is_some()) {
-            (true, false) => Some(format!(
-                "RuntimeVersionArn must be specified when UpdateRuntimeOn is {}",
-                crate::state::UPDATE_RUNTIME_ON_MANUAL
-            )),
+            (true, false) => {
+                // The requirement is conditional, so the model cannot express it: the
+                // service's own sentence for the missing member is the contract for what
+                // the caller has to supply.
+                Some(crate::state::RUNTIME_VERSION_ARN_REQUIRED_MESSAGE.to_string())
+            }
             (false, true) => Some(format!(
                 "RuntimeVersionArn can only be specified when UpdateRuntimeOn is {}, not {}",
                 crate::state::UPDATE_RUNTIME_ON_MANUAL, input.update_runtime_on

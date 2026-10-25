@@ -31,6 +31,8 @@ mod enable_control_validation;
 mod enabled_baseline_drift;
 #[path = "all/enabled_baseline_update.rs"]
 mod enabled_baseline_update;
+#[path = "all/enabled_baseline_update_validation.rs"]
+mod enabled_baseline_update_validation;
 #[path = "all/enabled_control_lifecycle.rs"]
 mod enabled_control_lifecycle;
 #[path = "all/enabled_control_reset.rs"]

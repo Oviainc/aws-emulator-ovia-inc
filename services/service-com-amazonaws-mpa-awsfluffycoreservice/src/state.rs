@@ -1462,6 +1462,18 @@ pub fn identity_source_arn(region: &str, seq: u64) -> String {
     )
 }
 
+/// Whether `arn` is an ARN of this service's identity-source resource
+/// ([`is_service_resource_arn`] for [`IDENTITY_SOURCE_RESOURCE`]) — the kind of ARN the
+/// `IdentitySourceArn` members ADDRESS.
+///
+/// A value that is not one names no identity source whatever this store holds, so the
+/// read addressed by it answers the malformed-ARN class ([`invalid_arn`]) rather than
+/// reporting a lookup that found nothing.
+#[must_use]
+pub fn is_identity_source_arn(arn: &str) -> bool {
+    is_service_resource_arn(arn, IDENTITY_SOURCE_RESOURCE)
+}
+
 /// The id of the IAM Identity Center instance an `IdcInstanceArn` names: the segment
 /// after `instance/`, the only resource segment the modelled pattern
 /// `^arn:.+:sso:::instance/(?:sso)?ins-[a-zA-Z0-9-.]{16}$` allows.
@@ -2557,6 +2569,72 @@ pub fn is_well_formed_arn(arn: &str) -> bool {
     let account = fields.next().is_some();
     let resource = fields.next().is_some_and(|field| !field.is_empty());
     prefix && partition && service && region && account && resource
+}
+
+/// Whether `arn` is an ARN of one of THIS service's regional, account-owned resources of
+/// the kind `resource_name` names (`identity-source`, `approval-team`, …).
+///
+/// The grammar is the one every such ARN of this service takes, as `ApprovalTeamArn`'s
+/// own pattern spells it
+/// (`^arn:aws(-[^:]+)?:mpa:[a-z0-9-]{1,20}:[0-9]{12}:approval-team/[a-zA-Z0-9._-]+$`, from
+/// `smithy_query(query="shape",shape="ApprovalTeamArn")`), with the resource name of the
+/// kind asked for in the resource field — the name that kind's own `arn` template and
+/// `@iamResource` carry (`identity-source/{IdentitySourceArn}` on the `IdentitySource`
+/// resource, [`IDENTITY_SOURCE_RESOURCE`]):
+/// `arn:<partition>:mpa:<region>:<account>:<resource_name>/<id>`.
+///
+/// Stricter than [`is_well_formed_arn`], which answers only whether a value is an ARN at
+/// all: this answers whether it is an ARN this service could have minted for that kind of
+/// resource, which is what a member documented to carry one ADDRESSES. An ARN of another
+/// service's namespace, of another resource kind, or with no resource id names no resource
+/// of this kind, so it is refused as malformed ([`invalid_arn`]) rather than looked up.
+#[must_use]
+pub fn is_service_resource_arn(arn: &str, resource_name: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next() != Some("arn") {
+        return false;
+    }
+    if !fields.next().is_some_and(is_arn_partition) {
+        return false;
+    }
+    if fields.next() != Some(SERVICE_ACTION_PREFIX) {
+        return false;
+    }
+    if !fields.next().is_some_and(is_arn_region) {
+        return false;
+    }
+    if !fields.next().is_some_and(is_arn_account_id) {
+        return false;
+    }
+    fields
+        .next()
+        .and_then(|resource| resource.strip_prefix(resource_name))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(is_arn_resource_id)
+}
+
+/// Whether `partition` fits the `aws(-[^:]+)?` partition segment this service's ARN
+/// patterns declare: the `aws` partition, or one of its suffixed partitions.
+fn is_arn_partition(partition: &str) -> bool {
+    partition == "aws"
+        || partition
+            .strip_prefix("aws-")
+            .is_some_and(|suffix| !suffix.is_empty())
+}
+
+/// Whether `account` fits the `[0-9]{12}` account segment this service's ARN patterns
+/// declare.
+fn is_arn_account_id(account: &str) -> bool {
+    account.len() == 12 && account.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `id` fits the `[a-zA-Z0-9._-]+` resource id this service's ARN patterns
+/// declare after the resource name.
+fn is_arn_resource_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-')
 }
 
 /// Whether `arn` names a resource in the caller's own account.

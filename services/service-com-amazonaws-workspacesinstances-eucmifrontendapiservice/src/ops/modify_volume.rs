@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +144,220 @@ impl From<ModifyVolumeErrorModeled> for ModifyVolumeError {
     }
 }
 
+/// The members a `ModifyVolume` may change, at least one of which it must name:
+/// "When you modify a volume, you must specify at least one of these parameters"
+/// (`ModifyVolume`). `VolumeId` is not among them — it names the volume being
+/// modified rather than anything being changed — and `ClientToken` identifies the
+/// request.
+const MODIFIABLE_MEMBERS: [&str; 4] = ["SizeInGB", "VolumeType", "Iops", "Throughput"];
+
+/// The provisioned IOPS a modification targets when it changes the volume's type to
+/// one that provisions IOPS without naming `Iops`.
+///
+/// From the backing Amazon EBS `ModifyVolume$Iops` reference: "Default: The existing
+/// value is retained if you keep the same volume type. If you change the volume type
+/// to io1, io2, or gp3, the default is 3,000." The retained half of that sentence is
+/// what this service's own model documents ("If you don't specify IOPS and keep the
+/// same volume type, the current IOPS rate is retained"); the default is the backing
+/// service's, and it is inside every IOPS range [`crate::state::VOLUME_TYPE_SPECS`]
+/// publishes for a type that takes them.
+const IOPS_ON_TYPE_CHANGE: i32 = 3_000;
+
+/// The throughput, in MiB/s, a modification targets when it changes the volume's type
+/// to one whose throughput is configurable without naming `Throughput`.
+///
+/// From the backing Amazon EBS `ModifyVolume$Throughput` reference: "Default: The
+/// existing value is retained if the source and target volume type is gp3. Otherwise,
+/// the default value is 125." The retained half is again what this service's model
+/// documents for `Throughput`.
+const THROUGHPUT_ON_TYPE_CHANGE: i32 = 125;
+
+/// The configuration ONE `ModifyVolume` targets: what the volume's configuration
+/// becomes once the modification finishes.
+///
+/// Every member is resolved against the volume's CURRENT configuration, because a
+/// member the call leaves out is not a change: "If you don't specify a size, the
+/// current size is retained", and likewise for the type, the IOPS and the throughput
+/// (`ModifyVolume`).
+#[derive(Debug, Clone)]
+struct TargetConfiguration {
+    size_in_gb: Option<i32>,
+    volume_type: String,
+    iops: Option<i32>,
+    throughput: Option<i32>,
+}
+
+/// Resolve what `input` targets for `volume`, or `None` when the target type is one
+/// this service publishes no rules for — which the modelled `VolumeTypeEnum` cannot
+/// admit, so it means the model and [`crate::state::VOLUME_TYPE_SPECS`] have drifted.
+///
+/// A member the call names is the target; a member it leaves out is RETAINED, which
+/// for the performance members holds only while the volume keeps its type: `Iops` and
+/// `Throughput` belong to the type that provisions them, so a change of type takes the
+/// target type's own values — none at all for a type that provisions none, and the
+/// backing service's documented default ([`IOPS_ON_TYPE_CHANGE`],
+/// [`THROUGHPUT_ON_TYPE_CHANGE`]) for one that does.
+/// The target comes back with the per-type rules it was resolved under, so the
+/// caller validates against the same [`crate::state::VolumeTypeSpec`] rather than
+/// looking it up a second time.
+fn target_configuration(
+    input: &ModifyVolumeInput,
+    volume: &crate::state::VolumeRecord,
+) -> Option<(TargetConfiguration, &'static crate::state::VolumeTypeSpec)> {
+    let current_type = volume.effective_volume_type();
+    let volume_type = input.volume_type.as_deref().unwrap_or(current_type).to_string();
+    let type_retained = volume_type == current_type;
+    let spec = crate::state::volume_type_spec(&volume_type)?;
+
+    let iops = match (input.iops, spec.iops) {
+        (Some(iops), _) => Some(iops),
+        // A type that provisions no IOPS targets none, whatever the volume held.
+        (None, None) => None,
+        (None, Some(_)) if type_retained => volume.iops,
+        (None, Some(_)) => Some(IOPS_ON_TYPE_CHANGE),
+    };
+    let throughput = match (input.throughput, spec.throughput_mib) {
+        (Some(throughput), _) => Some(throughput),
+        (None, None) => None,
+        (None, Some(_)) if type_retained => volume.throughput,
+        (None, Some(_)) => Some(THROUGHPUT_ON_TYPE_CHANGE),
+    };
+
+    Some((
+        TargetConfiguration {
+            size_in_gb: input.size_in_gb.or(volume.size_in_gb),
+            volume_type,
+            iops,
+            throughput,
+        },
+        spec,
+    ))
+}
+
+/// The rules the backing Amazon EBS volume service applies to a modification, which
+/// this service's model cannot express — so they are this handler's to apply, exactly
+/// as `CreateVolume`'s are its own.
+///
+/// Each one is a CROSS-FIELD rule: every member already satisfies its own modelled
+/// constraint by the time the handler runs, and what is left is whether the TARGET is
+/// one configuration the service can reach from the volume's current one:
+///
+/// * "The target size must be greater than or equal to the current size of the volume"
+///   (`ModifyVolume$SizeInGB`) — a volume is grown, never shrunk;
+/// * the target size, IOPS and throughput must be ones the TARGET type accepts, per
+///   [`crate::state::VOLUME_TYPE_SPECS`] — so a size the current type allows but the
+///   target type does not is refused, and so is a performance member the target type
+///   takes no value for ("This parameter is valid only for gp3, io1, and io2 volumes",
+///   "valid only for gp3 volumes").
+///
+/// Returns the modelled `ValidationException` naming the ONE member the request is
+/// refused for, echoing no submitted value
+/// ([`crate::state::field_validation_failed`]).
+fn validate_target(
+    input: &ModifyVolumeInput,
+    volume: &crate::state::VolumeRecord,
+    target: &TargetConfiguration,
+    spec: &crate::state::VolumeTypeSpec,
+) -> Result<(), ValidationException> {
+    use crate::state::field_validation_failed;
+
+    let volume_type = &target.volume_type;
+
+    if let (Some(asked), Some(current)) = (input.size_in_gb, volume.size_in_gb) {
+        if asked < current {
+            return Err(field_validation_failed(
+                "SizeInGB",
+                "SizeInGB must be greater than or equal to the current size of the volume",
+            ));
+        }
+    }
+
+    let (size_min, size_max) = spec.size_range();
+    if let Some(size) = target.size_in_gb {
+        if size < size_min || size > size_max {
+            return Err(field_validation_failed(
+                "SizeInGB",
+                format!(
+                    "SizeInGB must be from {size_min} to {size_max} GiB for a \
+                     {volume_type} volume"
+                ),
+            ));
+        }
+    }
+
+    match (input.iops, spec.iops) {
+        (Some(_), None) => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!(
+                    "Iops must be omitted for a {volume_type} volume, which does not \
+                     provision IOPS"
+                ),
+            ));
+        }
+        (_, Some((min, max))) if target.iops.is_some_and(|iops| iops < min || iops > max) => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!("Iops must be from {min} to {max} for a {volume_type} volume"),
+            ));
+        }
+        // A type that requires IOPS must end up with some: the volume keeps its own
+        // while it keeps its type, and a change of type takes the documented default,
+        // so this is the case where neither is available.
+        (None, Some(_)) if spec.iops_required && target.iops.is_none() => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!("Iops is required for a {volume_type} volume"),
+            ));
+        }
+        (_, Some(_)) | (None, None) => {}
+    }
+
+    match (input.throughput, spec.throughput_mib) {
+        (Some(_), None) => {
+            return Err(field_validation_failed(
+                "Throughput",
+                format!(
+                    "Throughput must be omitted for a {volume_type} volume, whose \
+                     throughput is not configurable"
+                ),
+            ));
+        }
+        (_, Some((min, max)))
+            if target
+                .throughput
+                .is_some_and(|throughput| throughput < min || throughput > max) =>
+        {
+            return Err(field_validation_failed(
+                "Throughput",
+                format!(
+                    "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
+                ),
+            ));
+        }
+        (_, Some(_)) | (None, None) => {}
+    }
+
+    Ok(())
+}
+
+/// The response for a modification, read out of the stored record: the id of the
+/// volume it was accepted for and the target configuration it holds. The ONE place
+/// this response is built, so a retry that replays a stored modification and the call
+/// that started it answer identically.
+fn modification_output(
+    volume_id: &str,
+    modification: &crate::state::VolumeModification,
+) -> ModifyVolumeOutput {
+    ModifyVolumeOutput {
+        volume_id: Some(volume_id.to_string()),
+        target_size: modification.target_size_in_gb,
+        target_volume_type: Some(modification.target_volume_type.clone()),
+        target_iops: modification.target_iops,
+        target_throughput: modification.target_throughput,
+    }
+}
+
 /// The `ModifyVolume` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -189,18 +394,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::TokenOutcome;
+
+        // "When you modify a volume, you must specify at least one of these
+        // parameters": a call that names none of them asks for no change at all, and
+        // is refused before the store is reached. No single member is at fault, so the
+        // refusal names them all ([`MODIFIABLE_MEMBERS`], in the same order).
+        let names_no_change = input.size_in_gb.is_none()
+            && input.volume_type.is_none()
+            && input.iops.is_none()
+            && input.throughput.is_none();
+        if names_no_change {
+            return Err(ModifyVolumeErrorModeled::ValidationException(
+                crate::state::members_validation_failed(
+                    &MODIFIABLE_MEMBERS,
+                    format!(
+                        "at least one of {} must be specified",
+                        MODIFIABLE_MEMBERS.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // A regional resource is modifiable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ModifyVolumeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Materialise what the clock already owed before anything is read: among it
+        // every modification that has finished, whose target IS the volume's
+        // configuration from its due instant on — so this call resolves its own target
+        // against the configuration the volume really has by now.
+        let now = std::time::Instant::now();
+        state.settle_all(now);
+
+        // "Specifies the identifier of the volume to modify": an id that satisfies the
+        // modelled `VolumeId` shape but names no volume THIS REGION holds is
+        // `ResourceNotFoundException`, answered through the shared builder so this path
+        // carries the same (status, code) pair as every other not-found here. The
+        // record is copied out so the decisions below are taken from one consistent
+        // read of it.
+        let Some(volume) = state.volume(&region, &input.volume_id).cloned() else {
+            return Err(crate::state::volume_not_found_error(
+                &input.volume_id,
+                ModifyVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+
+        // `@idempotent` + `@idempotencyToken`: "Unique token to ensure idempotent
+        // volume modification, preventing duplicate volume modifications" — a token
+        // identifies ONE request, so a retry carrying a token this service has already
+        // accepted a modification FOR THE SAME PARAMETERS replays that modification's
+        // target and starts nothing, while a call reusing a spent token for different
+        // parameters is refused with the modelled `ConflictException`. Resolved BEFORE
+        // the state refusals below: a retry must replay the answer the first call gave,
+        // not be refused for the modification that first call itself started.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVolume"))
+        // The fingerprint covers every member but the token, `VolumeId` included, so a
+        // token reused against another volume is a parameter mismatch too.
+        let mut parameters = input.clone();
+        parameters.client_token = None;
+        let fingerprint = crate::state::request_fingerprint(&parameters);
+        match crate::state::resolve_client_token(
+            &state.volume_modification_tokens,
+            &region,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            TokenOutcome::Replay(_) => {
+                // The claim names this volume (the fingerprint carries `VolumeId`), so
+                // the modification it was taken for is one of this record's. A claim
+                // whose modification the rolling window has already dropped replays
+                // nothing, and falls through to start a fresh one.
+                if let Some(recorded) = input
+                    .client_token
+                    .as_deref()
+                    .and_then(|token| volume.modification_for_token(token))
+                {
+                    return Ok(modification_output(&volume.id, recorded));
+                }
+            }
+            TokenOutcome::Mismatch(volume_id) => {
+                return Err(ModifyVolumeErrorModeled::ConflictException(
+                    crate::state::idempotent_parameter_mismatch(
+                        &volume_id,
+                        crate::state::VOLUME_RESOURCE_TYPE,
+                    ),
+                )
+                .into())
+            }
+            TokenOutcome::Unclaimed => {}
+        }
+
+        // "You can modify a volume only after any previous modification for that
+        // volume has finished", and a volume takes at most
+        // `VOLUME_MODIFICATIONS_PER_WINDOW` modifications inside
+        // `VOLUME_MODIFICATION_WINDOW` — the two conditions the modelled
+        // `VolumeModificationRateExceededException` (HTTP 429) states. Checked before
+        // the target is resolved: while a modification is running the configuration a
+        // target would be resolved against is not the one the volume is settling to.
+        if volume.modification_in_progress(now) {
+            return Err(
+                ModifyVolumeErrorModeled::VolumeModificationRateExceededException(
+                    crate::state::volume_modification_rate_exceeded(
+                        &volume.id,
+                        crate::state::VOLUME_MODIFICATION_IN_PROGRESS_MESSAGE,
+                    ),
+                )
+                .into(),
+            );
+        }
+        if volume.modifications_in_window(now) >= crate::state::VOLUME_MODIFICATIONS_PER_WINDOW {
+            return Err(
+                ModifyVolumeErrorModeled::VolumeModificationRateExceededException(
+                    crate::state::volume_modification_rate_exceeded(
+                        &volume.id,
+                        crate::state::VOLUME_MODIFICATION_LIMIT_MESSAGE,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let Some((target, spec)) = target_configuration(&input, &volume) else {
+            // Unreachable while the per-type table covers the modelled enum, which its
+            // doc pins; the member is still named rather than the request accepted.
+            return Err(ModifyVolumeErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "VolumeType",
+                    "VolumeType must name a volume type this service provisions",
+                ),
+            )
+            .into());
+        };
+        validate_target(&input, &volume, &target, spec)
+            .map_err(ModifyVolumeErrorModeled::ValidationException)?;
+
+        // Nothing has been written until every refusal above is past. The modification
+        // is what this call persists: it is reported as the target now, it becomes the
+        // volume's configuration once the clock makes it due
+        // (`VOLUME_MODIFICATION_SPAN`), it is what a second modify is refused for until
+        // then, and it is what counts against the rolling limit.
+        let modification = crate::state::VolumeModification {
+            target_size_in_gb: target.size_in_gb,
+            target_volume_type: target.volume_type,
+            target_iops: target.iops,
+            target_throughput: target.throughput,
+            client_token: input.client_token.clone(),
+            started_at: now,
+            completes_at: now + crate::state::VOLUME_MODIFICATION_SPAN,
+        };
+
+        if let Some(token) = input.client_token {
+            state.volume_modification_tokens.insert(
+                (region.clone(), token),
+                crate::state::IdempotencyClaim {
+                    resource_id: input.volume_id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+
+        // The response is built from the record this call stores, before it is stored,
+        // so the success path reaches for nothing that could be missing.
+        let output = modification_output(&input.volume_id, &modification);
+
+        // The lookup above already resolved the id in this Region, so this cannot miss.
+        let Some(record) = state.volume_mut(&region, &input.volume_id) else {
+            return Err(crate::state::volume_not_found_error(
+                &input.volume_id,
+                ModifyVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+        record.modifications.push(modification);
+
+        Ok(output)
     }
 }

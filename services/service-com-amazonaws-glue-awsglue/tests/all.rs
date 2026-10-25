@@ -25,6 +25,8 @@ mod catalog_projections;
 mod column_statistics_task_runs;
 #[path = "all/connection_updates.rs"]
 mod connection_updates;
+#[path = "all/crawler_event_queue.rs"]
+mod crawler_event_queue;
 #[path = "all/crawler_updates.rs"]
 mod crawler_updates;
 #[path = "all/crawlers.rs"]
@@ -51,6 +53,8 @@ mod get_table_entity_not_found;
 mod glossaries;
 #[path = "all/job_listing.rs"]
 mod job_listing;
+#[path = "all/job_regions.rs"]
+mod job_regions;
 #[path = "all/job_run_listing.rs"]
 mod job_run_listing;
 #[path = "all/job_runs.rs"]

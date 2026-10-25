@@ -47,7 +47,7 @@ use crate::ops::types::{
     AccessDeniedException, Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice,
     ExecutionSummary, Instance, InstanceBlockDeviceMapping, InstanceState, InstanceSummary,
     PhysicalNetworkInterface, ResourceNotFoundException, ResourceSummary, SecurityGroupIdentifier,
-    SoftwareInformation, TaskSummary,
+    SoftwareInformation, TaskSummary, ValidationException,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -1700,21 +1700,110 @@ pub fn parse_tagged_resource_arn(resource_arn: &str) -> Result<TaggedResource, A
     })
 }
 
-/// Encode a pagination resume key as a `NextToken`.
+/// The marker every cursor this service mints carries, so a string a caller made up
+/// — or a cursor minted by anything else — does not decode into a position here.
+const CURSOR_MARKER: &str = "snow-device-management:cursor:v1";
+
+/// The enumeration a pagination cursor is a position IN, which is what the cursor is
+/// bound to.
 ///
-/// `NextToken` is modelled `@pattern("[a-zA-Z0-9+/=]*")`, which a raw id does not
-/// satisfy (`smd-…` and `st-…` both carry a `-`), so the key is hex-encoded: the
-/// `hex` crate's alphabet is `[0-9a-f]`, a subset of the modelled one, and the
-/// encoding is reversible, which is what lets a page resume exactly where the
-/// previous one stopped.
-pub fn encode_token(resume_key: &str) -> String {
-    ::hex::encode(resume_key)
+/// A `nextToken` is opaque and service-issued: it names a position in the one
+/// enumeration the call that handed it back was serving, and in no other. The
+/// paginated operations enumerate different records, each Region holds its own set of
+/// them, and a filter decides which records are enumerated at all — so the operation,
+/// the signed Region and the filter values are what a cursor's fingerprint is taken
+/// over, and a cursor only resumes a request they all agree with ([`decode_token`]).
+#[derive(Debug, Clone, Copy)]
+pub struct CursorScope<'a> {
+    /// The operation that minted and reads the cursor (its `Operation::NAME`).
+    pub operation: &'a str,
+    /// The Region the request is signed for, which every record is scoped to.
+    pub region: &'a str,
+    /// The values of the members that NARROW the enumeration — the filters, and the
+    /// resource a sub-list hangs off — in the order the operation models them, with
+    /// `None` for one the request left out.
+    pub filters: &'a [Option<&'a str>],
 }
 
-/// Decode a `NextToken` back into the resume key [`encode_token`] built it from,
-/// or `None` when it is not a token this service issued.
-pub fn decode_token(token: &str) -> Option<String> {
-    String::from_utf8(::hex::decode(token).ok()?).ok()
+impl CursorScope<'_> {
+    /// This enumeration's fingerprint: a fixed-size digest over the marker and every
+    /// value a cursor into it is bound to.
+    ///
+    /// A digest rather than the values themselves, for two reasons. A cursor stays
+    /// within `NextToken`'s modelled `@length(1..1024)` whatever the request named,
+    /// which embedding the values does not: a filter member is bounded in code
+    /// points, and one code point is up to four bytes and eight hex digits. And a
+    /// cursor is opaque — it carries nothing a caller can read a scope out of, and
+    /// nothing that lets one be assembled for an enumeration no call served.
+    fn fingerprint(&self) -> String {
+        let scope = ::serde_json::json!([
+            CURSOR_MARKER,
+            self.operation,
+            self.region,
+            self.filters,
+        ]);
+        ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
+            scope.to_string().as_bytes(),
+        ))
+    }
+
+    /// The cursor payload: this enumeration's fingerprint, then the resume key.
+    fn payload(&self, resume_key: &str) -> ::serde_json::Value {
+        ::serde_json::json!([self.fingerprint(), resume_key])
+    }
+}
+
+/// Encode a pagination resume key as a `NextToken` bound to `scope`.
+///
+/// The payload is hex-encoded because `NextToken` is modelled
+/// `@pattern("[a-zA-Z0-9+/=]*")`, which neither a raw id (`smd-…` and `st-…` both
+/// carry a `-`) nor the payload's own punctuation satisfies: the `hex` crate's
+/// alphabet is `[0-9a-f]`, a subset of the modelled one, and the encoding is
+/// reversible, which is what lets a page resume exactly where the previous one
+/// stopped. The payload holds a fingerprint of fixed size and a resume key this
+/// service minted, so the token it renders always fits [`MAX_NEXT_TOKEN_LENGTH`]: the
+/// payload is `["<64 hex digits>","<resume key>"]`, every resume key is an id this
+/// store mints (`ManagedDeviceId` / `TaskId` / an Amazon EC2 instance id, each modelled
+/// 1..64 and well under it in practice), and hex doubles the lot — about 160 characters
+/// for the longest key this store holds, where the model allows 1024. The debug
+/// assertion below records that arithmetic rather than guarding a reachable case; a
+/// caller's own filter values never reach the token, which is the other half of why a
+/// cursor cannot be made to overflow.
+pub fn encode_token(scope: &CursorScope<'_>, resume_key: &str) -> String {
+    let token = ::hex::encode(scope.payload(resume_key).to_string());
+    debug_assert!(
+        (1..=MAX_NEXT_TOKEN_LENGTH).contains(&token.len()),
+        "a cursor must fit NextToken's modelled @length(1..1024), got {} characters",
+        token.len()
+    );
+    token
+}
+
+/// The resume key `token` names, or `None` when it is not a cursor this service
+/// issued for the enumeration `scope` describes — so neither an arbitrary string, nor
+/// a cursor another operation, Region or filter was served under, is read as a
+/// position in this one.
+pub fn decode_token(token: &str, scope: &CursorScope<'_>) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let payload: ::serde_json::Value = ::serde_json::from_str(&decoded).ok()?;
+    let resume_key = payload.as_array()?.last()?.as_str()?;
+    (payload == scope.payload(resume_key)).then(|| resume_key.to_string())
+}
+
+/// The longest `NextToken` the model allows (`@length(min: 1, max: 1024)`), which a
+/// cursor this service hands back has to fit for a client to be able to send it back.
+const MAX_NEXT_TOKEN_LENGTH: usize = 1024;
+
+/// How a paginated operation words its refusal of a `nextToken` it did not issue for
+/// the request replaying it.
+///
+/// It names the member at fault and the operation that would have issued the cursor,
+/// and echoes neither the value the caller sent nor anything a cursor carries: a
+/// token is opaque on both sides of the wire.
+pub fn invalid_next_token(operation: &str) -> ValidationException {
+    ValidationException {
+        message: format!("nextToken is not a pagination token {operation} issued for this request"),
+    }
 }
 
 /// The page size a list operation serves.

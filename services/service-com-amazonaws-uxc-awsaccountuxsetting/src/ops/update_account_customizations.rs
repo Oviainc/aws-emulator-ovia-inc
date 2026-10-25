@@ -13,6 +13,10 @@
 //! A list setting is stored, echoed and read back in ONE canonical sequence —
 //! its members ascending — whatever sequence the request named them in
 //! (`crate::state::canonical_members`).
+//! A list member the request carried as an explicit JSON `null` RESETS that
+//! setting to its default (unconfigured, reported as an absent member), which is
+//! a different request from omitting the member (stored value unchanged) and from
+//! sending an empty list (the setting configured to name nothing).
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +111,12 @@ use super::types::*;
 /// the identifiers it refused are the caller's own values.
 const INVALID_SERVICES: &str = "Invalid services provided";
 
+/// The two list settings' input members, by the names the model declares
+/// (`smithy_query(query="operation", operation="UpdateAccountCustomizations")`),
+/// as [`crate::service::sent_as_null`] asks about a member of this request.
+const VISIBLE_SERVICES: &str = "visibleServices";
+const VISIBLE_REGIONS: &str = "visibleRegions";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,9 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The write needs no request metadata beyond the calling account.
-        let _ = ctx;
-
         // A body that breaks a modelled shape constraint — an `accountColor`
         // outside the enum, a `visibleServices`/`visibleRegions` element outside
         // its pattern or length, a list longer than its `@length` — is refused by
@@ -188,6 +195,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BadRequestException` before any handler runs. The one admission rule
         // left to this handler is the one the model states in prose, and it is
         // enforced below, under the same guard as the write.
+
+        // "To reset a setting to its default behavior, set the value to null for
+        // visible Regions and visible services": a list member the request
+        // carried as an explicit JSON `null` is a DIFFERENT request from one it
+        // omitted, and the typed `input` above cannot tell them apart (the codec
+        // reads both into the same value). The front door reads that off the
+        // request bytes and carries it here (`crate::service::sent_as_null`).
+        let reset_services = crate::service::sent_as_null(ctx, VISIBLE_SERVICES);
+        let reset_regions = crate::service::sent_as_null(ctx, VISIBLE_REGIONS);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAccountCustomizationsErrorModeled::InternalServerException(
@@ -241,8 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Only the settings that you include in the request body are
             // modified. Omitted settings remain unchanged." At the typed boundary
             // an omitted member arrives as `None`, so `None` leaves the stored
-            // value alone; a colour is reset with the modelled `none` value and a
-            // list by sending it empty.
+            // value alone; a colour is reset with the modelled `none` value, and a
+            // list with the explicit `null` its member doc names.
             let record = guard.customization_mut(account_id);
             if let Some(color) = input.account_color {
                 record.account_color = Some(color);
@@ -252,10 +268,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `GetAccountCustomizations` report the one same sequence. The model
             // fixes no order for either list, so the order is recorded behaviour
             // only; the rule and its evidence live on that function.
-            if let Some(services) = input.visible_services {
+            //
+            // The reset is decided BEFORE the supplied value, because that is the
+            // order of the two request forms: a member carried as `null` supplies
+            // no list at all, so what it leaves behind is the setting's default —
+            // unconfigured, which is not the same state as a stored empty list.
+            if reset_services {
+                record.reset_visible_services();
+            } else if let Some(services) = input.visible_services {
                 record.set_visible_services(services);
             }
-            if let Some(regions) = input.visible_regions {
+            if reset_regions {
+                record.reset_visible_regions();
+            } else if let Some(regions) = input.visible_regions {
                 record.set_visible_regions(regions);
             }
             // Answer from PERSISTED state, read back after the write, rather than

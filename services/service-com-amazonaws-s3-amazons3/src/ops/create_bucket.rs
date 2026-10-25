@@ -297,6 +297,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // before its Object Ownership setting and its ACL are in place.
                 if let Some(bucket) = store.bucket_mut(&input.bucket) {
                     bucket.set_object_ownership(ownership);
+                    // "Specifies whether you want S3 Object Lock to be enabled for the new
+                    // bucket" (`CreateBucketRequest$ObjectLockEnabledForBucket`): a create
+                    // that asks for it brings the bucket into being with an Object Lock
+                    // configuration, which is what lets an object-level Object Lock call on
+                    // it be served at all. `Bucket::enable_object_lock` is what records it,
+                    // together with the versioning state Object Lock needs.
+                    if input.object_lock_enabled_for_bucket == Some(true) {
+                        bucket.enable_object_lock();
+                    }
                     // The `OwnershipControls` subresource is associated with the bucket as
                     // it comes into being, carrying the setting the bucket was created
                     // with: a bucket has an Object Ownership setting from the moment it

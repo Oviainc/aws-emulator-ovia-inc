@@ -107,6 +107,8 @@ mod resource_policy_lifecycle;
 mod resource_tagging;
 #[path = "all/route_analysis.rs"]
 mod route_analysis;
+#[path = "all/site_ids_filter_maximum.rs"]
+mod site_ids_filter_maximum;
 #[path = "all/site_to_site_vpn_attachment_lifecycle.rs"]
 mod site_to_site_vpn_attachment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
