@@ -35,11 +35,11 @@
 //! the ones a test seeds.
 //!
 //! The data transformation job is the fifth: a job record is addressed by its
-//! own `JobId` and `DescribeDataTransformationJob` reports the record held
-//! here. `StartDataTransformationJob` is the operation that MINTS one; it is
-//! still a scaffold stub (its own issue), so until it is written the only
-//! records in [`ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`]
-//! are the ones a test seeds.
+//! own `JobId`, `StartDataTransformationJob` MINTS one in
+//! [`ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`] and
+//! `DescribeDataTransformationJob` reads the SAME record back, so a started job
+//! is observable through it. A transformation job reads and writes Amazon S3
+//! rather than a data store, so no record reaps one.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -95,6 +95,30 @@ pub const EXPORT_JOB_RUN: Duration = Duration::from_millis(500);
 /// — the only quota-shaped refusal that operation declares, the same one
 /// `CreateFHIRDatastore` answers a full registry with.
 pub const MAX_EXPORT_JOBS: usize = 200;
+
+/// How long after the call that starts it a data transformation job's pending
+/// status transition falls due.
+///
+/// AWS documents no duration for a transformation run, so this span is CHOSEN,
+/// for the reason [`EXPORT_JOB_RUN`] is: it is non-zero, so a caller that
+/// describes the job immediately after starting it still observes the
+/// `SUBMITTED` status it was answered with, and short enough that nothing waits
+/// long for the settled one. It is never slept on — the due instant is stored
+/// on the record and materialised by the next call that reads it.
+pub const TRANSFORMATION_JOB_RUN: Duration = Duration::from_millis(500);
+
+/// The most data transformation jobs this emulator holds at once.
+///
+/// A ceiling, not a claim about any AWS quota: it exists so a
+/// `StartDataTransformationJob` loop cannot grow the emulator's heap without
+/// bound, and it also bounds the per-request
+/// [`ComAmazonawsHealthlakeHealthlakeState::settle_transformation_jobs`] walk
+/// and the idempotency walk
+/// [`ComAmazonawsHealthlakeHealthlakeState::transformation_job_for_client_token`]
+/// makes. `StartDataTransformationJob` refuses past it with the
+/// `ThrottlingException` it models — the only quota-shaped refusal that
+/// operation declares.
+pub const MAX_TRANSFORMATION_JOBS: usize = 200;
 
 /// The region stamped into an ARN and an endpoint when the request carries no
 /// SigV4 credential scope to read one from.
@@ -247,6 +271,20 @@ pub const PROFILE_VERSION_NOT_FOUND_MESSAGE: &str =
 /// crate states it through this one constant.
 pub const TRANSFORMATION_JOB_NOT_FOUND_MESSAGE: &str =
     "Could not find specified data transformation job.";
+
+/// Why a started data transformation job ends in the modelled `FAILED` status:
+/// the run has to READ the source files from the input Amazon S3 location and
+/// WRITE the converted output to the destination bucket, and this emulator
+/// opens no connection and reaches no bucket, so neither transfer happens.
+///
+/// The job is therefore reported as having failed, with this sentence saying
+/// why, rather than as having converted files nothing read — and for the same
+/// reason the record carries no `JobProgressReport`: no file was scanned, so
+/// there are no counts to report. Fixed text, quoting nothing from the request,
+/// and within the modelled `Message` length bound (1..2048).
+pub const TRANSFORMATION_NOT_PERFORMED_MESSAGE: &str =
+    "This emulator cannot read the source files from the input Amazon S3 location or write \
+     converted output to the destination Amazon S3 bucket, so no file was transformed.";
 
 /// The most data stores this emulator holds at once.
 ///
@@ -1068,10 +1106,12 @@ pub struct TransformationJob {
     pub name: Option<String>,
     pub status: TransformationJobStatus,
     /// The next transition the clock owes this job, as `(due instant, next
-    /// status)`. `None` when the job is not waiting on the clock. A job that
-    /// moves through several statuses re-arms this as each one falls due, so
-    /// one slot carries one step.
-    pub pending: Option<(Instant, TransformationJobStatus)>,
+    /// status, the message that status comes with)`. `None` when the job is not
+    /// waiting on the clock. A job that moves through several statuses re-arms
+    /// this as each one falls due, so one slot carries one step. The message
+    /// travels WITH the status, like an [`ExportJob`]'s, so a record cannot
+    /// report why it ended while it is still running.
+    pub pending: Option<(Instant, TransformationJobStatus, Option<String>)>,
     /// `SubmitTime`: the instant the job was submitted.
     pub submitted_at: ::aws_smithy_types::DateTime,
     /// `EndTime`: the instant the job reached a terminal status, written ONCE
@@ -1100,6 +1140,15 @@ pub struct TransformationJob {
     /// `JobProgressReport`: the counts the run itself produced. `None` until
     /// there is anything to report — nothing here is derived on read.
     pub progress_report: Option<TransformationJobProgressReport>,
+    /// The `ClientToken` the start call carried, held ON the record so one
+    /// token resolves to the one job it started. `None` on a record that was
+    /// not started through the API.
+    pub client_token: Option<String>,
+    /// A fingerprint of the request that started this job, so
+    /// [`ComAmazonawsHealthlakeHealthlakeState::transformation_job_for_client_token`]
+    /// can tell a repeat of the SAME request from a token reused with a
+    /// different one.
+    pub request_fingerprint: String,
 }
 
 impl TransformationJob {
@@ -1131,14 +1180,17 @@ impl TransformationJob {
     /// reporting operation applying it is the record catching up with the clock
     /// rather than a read with a side effect.
     fn settle(&mut self, now: Instant) {
-        let Some((due, next)) = self.pending else {
-            return;
-        };
-        if now < due {
+        if self.pending.as_ref().is_none_or(|(due, _, _)| now < *due) {
             return;
         }
+        let Some((_, next, message)) = self.pending.take() else {
+            return;
+        };
         self.status = next;
-        self.pending = None;
+        // The `Message` is the one the owed status comes with — including none,
+        // so a status that explains itself cannot inherit an earlier step's
+        // text.
+        self.message = message;
         // `EndTime` is owed once, by the step that reaches a status the job
         // never leaves, and is then stored — never re-derived per read.
         if next.is_terminal() && self.ended_at.is_none() {
@@ -1366,8 +1418,13 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// `DescribeDataTransformationJob` addresses one by. A `BTreeMap` so
     /// `ListDataTransformationJobs` can page in a stable, resumable order once
     /// it is written. A transformation job belongs to no data store, so no
-    /// record reaps one.
+    /// record reaps one. Bounded by [`MAX_TRANSFORMATION_JOBS`], which
+    /// `StartDataTransformationJob` — the only operation that mints one —
+    /// refuses past.
     pub transformation_jobs: BTreeMap<String, TransformationJob>,
+    /// How many data transformation jobs have been started, mixed into the next
+    /// `JobId` so two starts in the same clock tick still get distinct ones.
+    pub transformation_jobs_started: u64,
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
@@ -1510,15 +1567,47 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     /// The companion of [`Self::settle_export_jobs`] for the transformation job
     /// records, and called for the same reason: the transition was owed at this
     /// instant whether or not anybody called, so a reporting operation applying
-    /// it is the record catching up with the clock. The ceiling on how many job
-    /// records there can be belongs with the operation that MINTS them
-    /// (`StartDataTransformationJob`, still a scaffold stub), which is the only
-    /// place a job count can be refused, so none is asserted here.
+    /// it is the record catching up with the clock. The walk is over the job
+    /// records the store holds, which [`MAX_TRANSFORMATION_JOBS`] bounds —
+    /// refused by the operation that MINTS them
+    /// (`StartDataTransformationJob`), the only place a job count can be
+    /// refused — so it costs the same whatever a caller does.
     pub fn settle_transformation_jobs(&mut self) {
         let now = Instant::now();
         for job in self.transformation_jobs.values_mut() {
             job.settle(now);
         }
+    }
+
+    /// Mint an unused data transformation `JobId`: 32 lowercase hex characters,
+    /// which satisfies the modelled `DataTransformationJobId` bounds (len
+    /// 1..32, pattern `^[a-zA-Z0-9-]+$`, which admits hex) and is the form
+    /// every other identifier this service mints takes.
+    pub fn next_transformation_job_id(&mut self, started_at: SystemTime) -> String {
+        loop {
+            self.transformation_jobs_started += 1;
+            let id = mint_hex_id(
+                TRANSFORMATION_JOB_MINT_DOMAIN,
+                self.transformation_jobs_started,
+                started_at,
+            );
+            if !self.transformation_jobs.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The data transformation job one `ClientToken` started, or `None` when no
+    /// held job was started with that token.
+    ///
+    /// The token is held ON the job record, so this is a walk over the jobs
+    /// [`MAX_TRANSFORMATION_JOBS`] bounds rather than a second map to keep in
+    /// step with the first — the same shape
+    /// [`Self::export_job_for_client_token`] takes.
+    pub fn transformation_job_for_client_token(&self, token: &str) -> Option<&TransformationJob> {
+        self.transformation_jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(token))
     }
 
     /// Drop every export job of `datastore_id`, so a job never outlives the
@@ -1684,6 +1773,12 @@ impl ComAmazonawsHealthlakeHealthlakeState {
 /// job has no ARN, so the domain is named here rather than taken from an ARN
 /// prefix.
 const EXPORT_JOB_MINT_DOMAIN: &str = "export-job/";
+
+/// The mint domain a data transformation job's `JobId` is derived under, so it
+/// cannot collide with another resource's id for the same counter and instant.
+/// Like an export job, a transformation job has no ARN, so the domain is named
+/// here rather than taken from an ARN prefix.
+const TRANSFORMATION_JOB_MINT_DOMAIN: &str = "data-transformation-job/";
 
 /// The mint domain a FHIR resource's logical id is derived under, so it cannot
 /// collide with a control-plane resource's id for the same counter and instant.

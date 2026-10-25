@@ -32,17 +32,17 @@ use crate::registry_schema_lifecycle::{
 };
 
 /// An OpenAPI 3 document, which is what a schema's `Content` must be.
-const CONTENT: &str = r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"t"},"paths":{}}"#;
+pub(crate) const CONTENT: &str = r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"t"},"paths":{}}"#;
 
 /// `CreateDiscoverer`'s route.
-const DISCOVERERS_URI: &str = "/v1/discoverers";
+pub(crate) const DISCOVERERS_URI: &str = "/v1/discoverers";
 
 /// Percent-encode one value into a single path segment, the way an SDK encodes a
 /// non-greedy `@httpLabel`: everything outside RFC 3986's unreserved set
 /// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) is escaped, so an ARN's `:` and `/` travel
 /// as `%3A` and `%2F` — a raw `/` would address a different route — and a value carrying
 /// a space or a `%` still makes a well-formed request line.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -61,25 +61,25 @@ fn percent_encode(value: &str) -> String {
 }
 
 /// `ListTagsForResource`'s route for one resource ARN (`GET /tags/{ResourceArn}`).
-fn tags_uri(resource_arn: &str) -> String {
+pub(crate) fn tags_uri(resource_arn: &str) -> String {
     format!("/tags/{}", percent_encode(resource_arn))
 }
 
 /// `DescribeDiscoverer`'s route.
-fn discoverer_uri(discoverer_id: &str) -> String {
+pub(crate) fn discoverer_uri(discoverer_id: &str) -> String {
     format!("/v1/discoverers/id/{discoverer_id}")
 }
 
 /// An event-bus ARN to discover from. One per case, because a source may be discovered
 /// by at most one discoverer.
-fn source_arn(bus: &str) -> String {
+pub(crate) fn source_arn(bus: &str) -> String {
     format!("arn:aws:events:{REGION}:{ACCOUNT}:event-bus/{bus}")
 }
 
 /// The tag map a response reports, from the `tags` member (`Tags` carries
 /// `jsonName: "tags"`). An answer that reports no member at all reads as no tags,
 /// which is what an untagged resource holds.
-fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
     match answer.body.get("tags") {
         None | Some(Value::Null) => BTreeMap::new(),
         Some(Value::Object(map)) => map
@@ -103,7 +103,7 @@ fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
 /// Add a `Tags` member to a create's body, under the `tags` wire name the model binds
 /// it to. An empty set is left OFF the request, which is how a caller creates an
 /// untagged resource.
-fn with_tags(mut body: Value, tags: &BTreeMap<String, String>) -> Value {
+pub(crate) fn with_tags(mut body: Value, tags: &BTreeMap<String, String>) -> Value {
     if !tags.is_empty() {
         body["tags"] = json!(tags);
     }
@@ -118,7 +118,7 @@ struct TagCase {
 }
 
 /// Build a tag map from borrowed pairs, so a row reads as the pairs it is.
-fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -177,26 +177,26 @@ fn tag_cases() -> Vec<TagCase> {
 
 /// The resource types of this service that carry a tag set — the three its ARNs name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Registry,
     Schema,
     Discoverer,
 }
 
 impl Kind {
-    const ALL: [Kind; 3] = [Kind::Registry, Kind::Schema, Kind::Discoverer];
+    pub(crate) const ALL: [Kind; 3] = [Kind::Registry, Kind::Schema, Kind::Discoverer];
 }
 
 /// One created resource: the ARN its create reported, and the URI its own Describe
 /// reads it back on.
 #[derive(Debug)]
-struct Created {
-    arn: String,
-    describe_uri: String,
+pub(crate) struct Created {
+    pub(crate) arn: String,
+    pub(crate) describe_uri: String,
 }
 
 /// Create one resource of `kind`, tagged with `tags`, asserting the create succeeded.
-async fn create_tagged(
+pub(crate) async fn create_tagged(
     emulator: &Emulator,
     case: &str,
     kind: Kind,
@@ -263,7 +263,7 @@ async fn create_tagged(
 }
 
 /// A resource name that is legal for every one of the three types and distinct per row.
-fn resource_name(kind: Kind, row: usize) -> String {
+pub(crate) fn resource_name(kind: Kind, row: usize) -> String {
     let kind = match kind {
         Kind::Registry => "registry",
         Kind::Schema => "schema",
