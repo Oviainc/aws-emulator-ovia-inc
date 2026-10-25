@@ -25,8 +25,9 @@ use crate::ops::types::{
     BlockAction, ChallengeAction, CountAction, IPSet, LabelSummary, ManagedProductDescriptor,
     OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
     Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
-    WAFFeatureNotIncludedInPricingPlanException, WAFInvalidParameterException,
-    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+    WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
+    WAFInvalidParameterException, WAFLimitsExceededException, WAFNonexistentItemException,
+    WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -162,6 +163,24 @@ pub fn feature_not_included_in_pricing_plan_exception()
     WAFFeatureNotIncludedInPricingPlanException {
         message: Some(FEATURE_NOT_INCLUDED_IN_PRICING_PLAN_MESSAGE.to_string()),
         disallowed_features: None,
+    }
+}
+
+/// The sentence `WAFInvalidOperationException` carries: the shape's own documented
+/// sentence (`smithy_query(query="shape",shape="WAFInvalidOperationException")`),
+/// its wrapping whitespace flattened. See [`DUPLICATE_ITEM_MESSAGE`] for why the
+/// wording is a property of the exception type rather than of the call.
+pub const INVALID_OPERATION_MESSAGE: &str = "The operation isn't valid.";
+
+/// `WAFInvalidOperationException` as WAF returns it: nothing but
+/// [`INVALID_OPERATION_MESSAGE`].
+///
+/// This is the refusal for a call an operation's own preconditions forbid on the
+/// resource it names — the request parsed, the resource exists, and the operation
+/// still may not be applied to it.
+pub fn invalid_operation_exception() -> WAFInvalidOperationException {
+    WAFInvalidOperationException {
+        message: Some(INVALID_OPERATION_MESSAGE.to_string()),
     }
 }
 
