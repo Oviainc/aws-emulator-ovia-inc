@@ -32,6 +32,8 @@ mod cross_account_authorizations;
 mod error_wire_contract;
 #[path = "all/readiness_check_lifecycle.rs"]
 mod readiness_check_lifecycle;
+#[path = "all/readiness_summary_shared_rule.rs"]
+mod readiness_summary_shared_rule;
 #[path = "all/recovery_group_lifecycle.rs"]
 mod recovery_group_lifecycle;
 #[path = "all/recovery_group_readiness_summary.rs"]
