@@ -45,13 +45,16 @@ use crate::ephemeris_catalog::{
 use crate::scheduling_loop::{harness_with_engine, send, Reply, ABSENT_UUID};
 
 /// `DescribeEphemeris` for `ephemeris_id`.
-async fn describe(router: &MultiServiceRouter, ephemeris_id: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling `ephemeris_updates.rs` suite reads an ephemeris back
+/// through the same front door rather than standing up a second copy of this call.
+pub(crate) async fn describe(router: &MultiServiceRouter, ephemeris_id: &str) -> Reply {
     send(router, "GET", &format!("/ephemeris/{ephemeris_id}"), None).await
 }
 
 /// `DescribeEphemeris` for `ephemeris_id`, asserting it was answered, and the body it
 /// answered with.
-async fn describe_ok(router: &MultiServiceRouter, case: &str, ephemeris_id: &str) -> Value {
+pub(crate) async fn describe_ok(router: &MultiServiceRouter, case: &str, ephemeris_id: &str) -> Value {
     let reply = describe(router, ephemeris_id).await;
     assert_eq!(
         reply.status, 200,

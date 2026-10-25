@@ -723,7 +723,7 @@ async fn a_filter_outside_the_documented_grammar_is_refused() {
         ),
         RefusalCase::new(
             "value outside the LifecycleState value set",
-            filter_params(0, "LifecycleState", "=", &owned(&["Supported"])),
+            filter_params(0, "LifecycleState", "=", &owned(&["unsupported"])),
             "InvalidParameterValue",
         ),
         RefusalCase::new(
