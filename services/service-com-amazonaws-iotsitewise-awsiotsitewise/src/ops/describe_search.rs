@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSearch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSearch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one search `StartSearch` started, read from `crate::state` under the
+//! workspace and the id the request names: the query it was started from, its search
+//! strategy, the group it was filed under and the status it has reached. A pure READ —
+//! the status is DERIVED from the due instants the start recorded, so polling a search
+//! never changes what a later poll sees.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSearch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `(workspaceName, searchId)` pair no search is stored under is the modelled
+//! `ResourceNotFoundException` (HTTP 404), which is also how a search of ANOTHER
+//! workspace answers: a search is reachable only through the workspace it runs against.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +166,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSearch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSearch"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSearchError::Modeled(DescribeSearchErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        // A search lives in ONE workspace, so a request naming a workspace this
+        // account does not hold addresses nothing: the not-found refusal names the
+        // workspace, the way every other operation scoped to one does (cf.
+        // `DescribeTimeSeries`), rather than the search it could not have held.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+        let record = store
+            .search(&input.workspace_name, &input.search_id)
+            .ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_SEARCH,
+                    &input.search_id,
+                ))
+            })?;
+
+        Ok(DescribeSearchOutput {
+            search_id: record.search_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+            status: record.status(now).to_string(),
+            query_statement: record.query_statement.clone(),
+            search_type: record.search_type.clone(),
+            // "Populated when the search has FAILED": no run of this emulator fails,
+            // so no search reports a reason.
+            status_reason: None,
+            started_at: Some(crate::state::to_date_time(record.started_at)),
+            group_id: record.group_id.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeSearchError {
+    DescribeSearchError::Modeled(DescribeSearchErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
 }

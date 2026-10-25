@@ -41,9 +41,20 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::Emulator;
 use crate::router_outputs::{
-    create_router_output, standard_with_protocol, FLOW_ARN, MEDIALIVE_INPUT_ARN, ROLE_ARN,
-    SECRET_ARN,
+    create_router_output, minted_configuration_targets, standard_with_protocol,
+    ConfigurationTargets, MEDIALIVE_INPUT_ARN, ROLE_ARN, SECRET_ARN,
 };
+
+/// The resources of THIS service the configurations below name: a router output's
+/// configuration must name a router network interface / flow the account HOLDS, so each
+/// suite mints them on its own emulator first.
+async fn mint_targets(emulator: &Emulator) -> ConfigurationTargets {
+    minted_configuration_targets(emulator, "ro-stop").await
+}
+
+/// How many rows [`configuration_rows`] has. The suites below drive one row per emulator, so
+/// they need the count before they have an emulator to mint the targets on.
+const ROW_COUNT: usize = 4;
 
 /// Long enough for a transition the clock owes to be due: twice [`mc::TRANSITION_SPAN`], so
 /// a settled state is never read early.
@@ -139,13 +150,13 @@ struct ConfigurationRow {
 /// configurations — differing also in tier, maximum bitrate, routing scope and Region, so
 /// the stop rule is asserted over the whole class of router outputs rather than over one
 /// configuration.
-fn configuration_rows() -> Vec<ConfigurationRow> {
-    vec![
+fn configuration_rows(targets: &ConfigurationTargets) -> Vec<ConfigurationRow> {
+    let rows = vec![
         ConfigurationRow {
             case: "standard rtp",
             body: json!({
                 "name": "rtp-output",
-                "configuration": standard_with_protocol(json!({
+                "configuration": standard_with_protocol(&targets.interface_arn, json!({
                     "Rtp": {
                         "destinationAddress": "203.0.113.10",
                         "destinationPort": 5004,
@@ -161,7 +172,7 @@ fn configuration_rows() -> Vec<ConfigurationRow> {
             case: "standard srt listener",
             body: json!({
                 "name": "srt-listener-output",
-                "configuration": standard_with_protocol(json!({
+                "configuration": standard_with_protocol(&targets.interface_arn, json!({
                     "SrtListener": {
                         "port": 3100,
                         "minimumLatencyMilliseconds": 120,
@@ -180,7 +191,7 @@ fn configuration_rows() -> Vec<ConfigurationRow> {
                 "name": "flow-output",
                 "configuration": json!({
                     "MediaConnectFlow": {
-                        "flowArn": FLOW_ARN,
+                        "flowArn": targets.flow_arn,
                         "destinationTransitEncryption": {
                             "encryptionKeyType": "SECRETS_MANAGER",
                             "encryptionKeyConfiguration": {
@@ -219,7 +230,14 @@ fn configuration_rows() -> Vec<ConfigurationRow> {
                 "maintenanceConfiguration": { "Default": {} },
             }),
         },
-    ]
+    ];
+    assert_eq!(
+        rows.len(),
+        ROW_COUNT,
+        "ROW_COUNT must be the number of rows, got {}",
+        rows.len()
+    );
+    rows
 }
 
 /// Create the router output `row` describes and return its `(Arn, Name)`.
@@ -266,12 +284,14 @@ async fn stop_moves_the_stored_router_output_through_stopping_into_standby() {
         mc::ROUTER_OUTPUT_STATE_ACTIVE,
         mc::ROUTER_OUTPUT_STATE_ERROR,
     ];
-    let rows = configuration_rows();
-
     for from_state in from_states {
-        for (index, row) in rows.iter().enumerate() {
-            let case = format!("{} stopped from {from_state}", row.case);
+        for index in 0..ROW_COUNT {
             let emulator = Emulator::new();
+            // The targets are minted per emulator, so the rows are rebuilt against them.
+            let targets = mint_targets(&emulator).await;
+            let rows = configuration_rows(&targets);
+            let row = &rows[index];
+            let case = format!("{} stopped from {from_state}", row.case);
 
             // Other router outputs the stop must leave alone; the count varies with the row.
             let mut untouched: Vec<String> = Vec::new();
@@ -377,11 +397,12 @@ async fn stop_moves_the_stored_router_output_through_stopping_into_standby() {
 /// the stop is the modelled `NotFoundException` (404).
 #[tokio::test]
 async fn a_stop_is_refused_while_another_state_change_is_in_flight() {
-    let rows = configuration_rows();
-
-    for row in &rows {
-        let case = row.case;
+    for index in 0..ROW_COUNT {
         let emulator = Emulator::new();
+        let targets = mint_targets(&emulator).await;
+        let rows = configuration_rows(&targets);
+        let row = &rows[index];
+        let case = row.case;
         let (arn, _) = create(&emulator, row).await;
 
         // The create's transition is still in flight, so the stop conflicts with it.
@@ -454,10 +475,11 @@ async fn a_stop_is_refused_while_another_state_change_is_in_flight() {
 #[tokio::test]
 async fn a_stop_refuses_an_arn_that_addresses_no_router_output() {
     let emulator = Emulator::new();
+    let targets = mint_targets(&emulator).await;
 
     // One stored, settled router output, so a refusal is about the ARN rather than an empty
     // store — and the positive control at the end of the test.
-    let rows = configuration_rows();
+    let rows = configuration_rows(&targets);
     let (held, _) = create(&emulator, &rows[0]).await;
     settle_router_output_in(&emulator, &held, mc::ROUTER_OUTPUT_STATE_ACTIVE);
 

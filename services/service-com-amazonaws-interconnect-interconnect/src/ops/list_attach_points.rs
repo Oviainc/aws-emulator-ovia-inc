@@ -140,7 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAttachPointsErrorModeled::InterconnectServerException(
                 InterconnectServerException {
@@ -159,25 +159,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never the connection-scoped 404 and never an empty page, which a caller
         // could not tell from "this environment offers none". @readonly: nothing here
         // writes to this service's store, and Environments are AWS-managed (the model
-        // binds no CreateEnvironment), so there is nothing the clock owes either.
-        let seeded: Vec<AttachPointDescriptor> = {
-            let store = state.lock();
-            if !store.environments.contains_key(&input.environment_id) {
-                return Err(ListAttachPointsErrorModeled::InterconnectClientException(
-                    InterconnectClientException {
-                        message: crate::state::environment_not_found_message(
-                            &input.environment_id,
-                        ),
-                    },
-                )
-                .into());
-            }
-            store
-                .attach_points
-                .get(&input.environment_id)
-                .cloned()
-                .unwrap_or_default()
-        };
+        // binds no CreateEnvironment), so there is nothing the clock owes either. The
+        // guard is dropped before the cross-service read below, so no lock is held
+        // across an await.
+        let environment_is_known = state.lock().environments.contains_key(&input.environment_id);
+        if !environment_is_known {
+            return Err(ListAttachPointsErrorModeled::InterconnectClientException(
+                InterconnectClientException {
+                    message: crate::state::environment_not_found_message(&input.environment_id),
+                },
+            )
+            .into());
+        }
 
         // A cursor this operation did not issue is refused, rather than answered
         // with an empty page the caller cannot tell from "no more results".
@@ -200,14 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The Environment's own attach points, as the catalog holds them. (A Direct
-        // Connect gateway the CALLER owns is also a valid attach point for an
-        // Environment — "Lists all Attach Points the caller has access to", and
-        // `AttachPointType`'s only modelled value is `DirectConnectGateway` — but
-        // reading Direct Connect's gateways from here needs that service's SDK client
-        // on this crate, which is a change to the workspace lockfile this emulator's
-        // merge gate cannot currently land; it is left to its own change.)
-        let descriptors = seeded;
+        // "Lists all Attach Points the caller has access to": `AttachPointType`'s only
+        // modelled value is `DirectConnectGateway` and `AttachPoint$directConnectGateway`
+        // names a gateway by its own id, so the listing IS the account's Direct Connect
+        // gateways — state of the service that owns them, resolved against it rather than
+        // held here. An account that owns none has no attach point, which is an empty
+        // page: a descriptor is never synthesised for a gateway that does not exist.
+        let descriptors = crate::state::direct_connect::attach_points(ctx, &region).await;
 
         // Keyed by `identifier`, which is what identifies an attach point within an
         // environment, and ordered by it so paging walks one stable sequence: a page

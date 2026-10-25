@@ -4,10 +4,13 @@
 //! `crate::emulator` harness (Interconnect and Direct Connect on one engine, as the
 //! assembled emulator mounts them).
 //!
-//! Every assertion here is about a RULE, checked over a table built from the LIVE
-//! seeded Environment catalog rather than from a copy of it: a row differs in the
-//! environment, the provider kind, how many attach points that environment offers,
-//! the page size, and the shape of the identifier the caller sends.
+//! An attach point is a Direct Connect gateway of the account, so every row below
+//! creates its gateways through Direct Connect and then reads them back here. Each
+//! assertion is about a RULE, checked over a table built from the LIVE seeded
+//! Environment catalog and from the LIVE gateways rather than from a copy of either: a
+//! row differs in the environment, the provider kind, the gateway's name and ASN, how
+//! many gateways the account holds, the page size, and the shape of the identifier the
+//! caller sends.
 
 use std::collections::BTreeSet;
 
@@ -19,6 +22,16 @@ use crate::emulator::{text, Emulator, ATTACH_POINT_TYPE};
 /// bounds a page size may take, and 0 / 101 are the first values past them.
 const MAX_RESULTS_BOUNDS: [i64; 2] = [1, 100];
 const MAX_RESULTS_PAST_BOUNDS: [i64; 2] = [0, 101];
+
+/// The gateway rows every suite below builds its account state from: the name's shape
+/// and the `amazonSideAsn` differ per row (absent, and one from each private range
+/// `CreateDirectConnectGatewayRequest$amazonSideAsn` documents), so no assertion can be
+/// keyed to one form of gateway.
+const GATEWAY_ROWS: [(&str, Option<i64>); 3] = [
+    ("ic-attach-default-asn", None),
+    ("ic attach spaced name", Some(64_512)),
+    ("ic-attach-32bit-asn", Some(4_200_000_000)),
+];
 
 /// `DirectConnectGatewayAttachPoint`: length exactly 36 and
 /// `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`.
@@ -35,15 +48,23 @@ fn is_dxgw_identifier(value: &str) -> bool {
             .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// The `identifier`s of a listing, as a set.
+fn identifiers(listed: &[Value]) -> BTreeSet<String> {
+    listed
+        .iter()
+        .map(|descriptor| text(descriptor, "identifier"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The attach points an Environment offers
 // ---------------------------------------------------------------------------
 
-/// RULE: `ListAttachPoints` reports the attach points stored for the Environment the
-/// caller names, each with every member `AttachPointDescriptor` requires, and reading
-/// it changes nothing a later caller sees.
+/// RULE: `ListAttachPoints` reports the Direct Connect gateways the ACCOUNT holds —
+/// nothing while it holds none — each with every member `AttachPointDescriptor`
+/// requires, and reading it changes nothing a later caller sees.
 #[tokio::test]
-async fn every_environment_reports_descriptors_the_model_allows() {
+async fn every_environment_reports_the_accounts_gateways_as_attach_points() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
     assert!(
@@ -51,14 +72,31 @@ async fn every_environment_reports_descriptors_the_model_allows() {
         "case \"catalog\": expected the seeded Environment catalog to be non-empty, got {catalog:?}"
     );
 
-    // One row per environment: they differ in the provider kind, the location and
-    // how many attach points the environment offers.
+    // An account that holds no gateway has nothing to attach a Connection to, so every
+    // environment reports an EMPTY listing rather than a descriptor for a gateway that
+    // does not exist.
+    for environment in &catalog {
+        let id = text(environment, "environmentId");
+        let empty = emulator.attach_points(&id).await;
+        assert!(
+            empty.is_empty(),
+            "case {id:?}: expected no attach point while the account holds no gateway, got {empty:?}"
+        );
+    }
+
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let owned: BTreeSet<String> = gateways.iter().cloned().collect();
+
+    // One row per environment: they differ in the provider kind, the location and the
+    // state. Every one of them reports the SAME account-owned gateways — the set is
+    // account state, not a per-environment catalog.
     for environment in &catalog {
         let id = text(environment, "environmentId");
         let listed = emulator.attach_points(&id).await;
-        assert!(
-            !listed.is_empty(),
-            "case {id:?}: expected the environment's attach points, got {listed:?}"
+        assert_eq!(
+            identifiers(&listed),
+            owned,
+            "case {id:?}: expected the account's own gateways as attach points, got {listed:?}"
         );
 
         // The largest page a caller may ask for is the last one: `nextToken` comes back
@@ -81,7 +119,7 @@ async fn every_environment_reports_descriptors_the_model_allows() {
             one_page["attachPoints"]
         );
 
-        let mut identifiers = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for descriptor in &listed {
             assert_eq!(
                 text(descriptor, "type"),
@@ -100,7 +138,7 @@ async fn every_environment_reports_descriptors_the_model_allows() {
                 descriptor["name"]
             );
             assert!(
-                identifiers.insert(identifier.clone()),
+                seen.insert(identifier.clone()),
                 "case {id:?}: expected distinct identifiers, got {identifier:?} twice"
             );
         }
@@ -114,30 +152,39 @@ async fn every_environment_reports_descriptors_the_model_allows() {
         );
     }
 
-    // Two different environments are two different sets of attach points: the
-    // listing is keyed by the environment the caller names, not shared.
-    let mut per_environment: Vec<(String, Vec<String>)> = Vec::new();
-    for environment in &catalog {
-        let id = text(environment, "environmentId");
-        let identifiers: Vec<String> = emulator
-            .attach_points(&id)
-            .await
+    // Each descriptor's `name` is the gateway's own, as Direct Connect reports it — so
+    // the two services agree about what the attach point is called.
+    let described = emulator
+        .dx_ok("DescribeDirectConnectGateways", json!({}))
+        .await;
+    let names: Vec<(String, String)> = described["directConnectGateways"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|gateway| {
+            (
+                text(gateway, "directConnectGatewayId"),
+                text(gateway, "directConnectGatewayName"),
+            )
+        })
+        .collect();
+    let first_environment = text(&catalog[0], "environmentId");
+    for descriptor in emulator.attach_points(&first_environment).await {
+        let identifier = text(&descriptor, "identifier");
+        let expected = names
             .iter()
-            .map(|descriptor| text(descriptor, "identifier"))
-            .collect();
-        per_environment.push((id, identifiers));
-    }
-    for (left_id, left) in &per_environment {
-        for (right_id, right) in &per_environment {
-            if left_id == right_id {
-                continue;
-            }
-            let shared: Vec<&String> = left.iter().filter(|id| right.contains(id)).collect();
-            assert!(
-                shared.is_empty(),
-                "case {left_id:?}/{right_id:?}: expected each environment's own attach points, got {shared:?} in both"
-            );
-        }
+            .find(|(id, _)| *id == identifier)
+            .map(|(_, name)| name.clone());
+        let expected = expected.unwrap_or_else(|| {
+            panic!("case {identifier:?}: expected Direct Connect to hold the listed gateway, it reports {names:?}")
+        });
+        assert_eq!(
+            text(&descriptor, "name"),
+            expected,
+            "case {identifier:?}: expected the gateway's own name, got {:?}",
+            descriptor["name"]
+        );
     }
 }
 
@@ -146,14 +193,20 @@ async fn every_environment_reports_descriptors_the_model_allows() {
 #[tokio::test]
 async fn attach_point_pages_walk_each_environment_without_repeats_or_gaps() {
     let emulator = Emulator::new();
+    emulator.ready_gateways(&GATEWAY_ROWS).await;
 
     for environment in emulator.environments().await {
         let id = text(&environment, "environmentId");
         let all = emulator.attach_points(&id).await;
+        assert_eq!(
+            all.len(),
+            GATEWAY_ROWS.len(),
+            "case {id:?}: expected one attach point per gateway the account holds, got {all:?}"
+        );
 
         // Rows differ in page size: every size from one item to one past the whole
         // listing, so both the "exactly fits" and the "one page only" cases are
-        // covered however many attach points the environment offers.
+        // covered however many attach points the account holds.
         for page_size in 1..=(all.len() + 1) {
             let mut walked: Vec<Value> = Vec::new();
             let mut token: Option<String> = None;
@@ -318,6 +371,7 @@ async fn unknown_environment_is_refused_rather_than_answered_empty() {
 #[tokio::test]
 async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
     let emulator = Emulator::new();
+    emulator.ready_gateways(&GATEWAY_ROWS).await;
 
     let mut rows = 0;
     for environment in emulator.environments().await {
@@ -336,8 +390,10 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
             continue;
         }
 
+        let before = emulator.attach_points(&id).await;
+
         // One row per (attach point, bandwidth) pair the environment offers.
-        for (index, descriptor) in emulator.attach_points(&id).await.iter().enumerate() {
+        for (index, descriptor) in before.iter().enumerate() {
             let identifier = text(descriptor, "identifier");
             let bandwidth = &available[index % available.len()];
             let attach_point = json!({ "directConnectGateway": identifier });
@@ -395,11 +451,10 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
         }
 
         // Listing attach points is @readonly: creating connections against them does
-        // not add, remove or reorder what the Environment offers.
+        // not add, remove or reorder what the account offers.
         let after = emulator.attach_points(&id).await;
         assert_eq!(
-            after.len(),
-            emulator.attach_points(&id).await.len(),
+            after, before,
             "case {id:?}: expected the attach-point listing to be unchanged by creates, got {after:?}"
         );
     }

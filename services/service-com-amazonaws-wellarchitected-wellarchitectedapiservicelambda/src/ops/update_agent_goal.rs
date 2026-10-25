@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentGoal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentGoal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the members the request carries into the goal the
+//! `(profileArn, id)` pair resolves to — an absent member is left at its stored value,
+//! never nulled — records the identity and instant the change is attributed to, and
+//! answers the stored goal's `GoalSummary`. A `profileArn` that names no stored agent
+//! profile, and an `id` that names no goal OF that profile, are both a
+//! `ResourceNotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentGoal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `clientToken` makes the update idempotent: the same token with the same parameters
+//! answers the stored goal without stamping the modification members a second time.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentGoal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentGoalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The goal is named by the path the request carries and nothing here is minted,
+        // so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentGoalErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly, exactly as
+        // `CreateAgentGoal` applies it: `Pillar` is an enum, so the boundary walk in
+        // `crate::service` already refuses a value outside its published set with this
+        // same 400 before the handler runs. It is kept so a goal is never left STORED
+        // naming a pillar the enum does not publish, and the refusal is built in
+        // `crate::state` so every operation that stores a pillar list words it identically.
+        if let Some(pillars) = input.pillars.as_deref() {
+            if let Some(exception) = crate::state::unpublished_pillar_exception(pillars) {
+                return Err(UpdateAgentGoalErrorModeled::ValidationException(exception).into());
+            }
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "description": &input.description,
+            "id": &input.id,
+            "pillars": &input.pillars,
+            "profileArn": &input.profile_arn,
+            "title": &input.title,
+        }));
+        // The instant this change is recorded at, read once so the record and the summary
+        // it projects carry one reading of the clock.
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: a retry carrying the token of a request that already
+        // completed answers that request's result rather than acting again. The result of
+        // an update IS the stored goal, so the replay re-reads it and answers it as it
+        // stands — carrying the modification members the original update stamped rather
+        // than fresh ones, and reporting any later change to the goal the way a read of it
+        // would. The token is OPTIONAL (the SDKs generate one), so a request carrying none
+        // is served on its own.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentGoal"))
+        // A token re-used with DIFFERENT parameters names a different request, and this
+        // operation models no `ConflictException` to refuse one with, so it is served on
+        // its own merits and the ledger is re-pointed at it below.
+        if let Some(client_token) = input.client_token.as_deref() {
+            let replayed = store
+                .update_agent_goal_tokens
+                .get(client_token)
+                .filter(|recorded| recorded.fingerprint == fingerprint)
+                .map(|recorded| (recorded.profile_arn.clone(), recorded.goal_id.clone()));
+            if let Some((profile_arn, goal_id)) = replayed {
+                if let Some(updated) = store.agent_goal(&profile_arn, &goal_id) {
+                    return Ok(UpdateAgentGoalOutput {
+                        goal: updated.to_summary(),
+                    });
+                }
+                // The token names a goal that is no longer stored, so there is no original
+                // result to answer with: forget the token and let this request be judged
+                // on its own.
+                store.update_agent_goal_tokens.forget(client_token);
+            }
+        }
+
+        // The profile a goal is reached through is resolved first, so a `profileArn` that
+        // names no stored profile is reported as the MISSING PROFILE rather than as a
+        // missing goal — the order `GetAgentGoal` and `DeleteAgentGoal` resolve the pair
+        // in.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(UpdateAgentGoalErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // A goal belongs to ONE profile, so an id that names a goal of another profile is
+        // as absent here as one that names no goal at all — and nothing is written for it.
+        let Some(record) = store.agent_goal_mut(&input.profile_arn, &input.id) else {
+            return Err(UpdateAgentGoalErrorModeled::ResourceNotFoundException(
+                crate::state::agent_goal_not_found(&input.profile_arn, &input.id),
+            )
+            .into());
+        };
+
+        // "Updates the pillars and title of an existing goal": every updatable member is
+        // optional, so the request carries the members it changes and the STORED value
+        // stands for every member it leaves out. The goal's identity — its id, the profile
+        // it belongs to, and who created it when — is not updatable and is untouched.
+        if let Some(pillars) = input.pillars {
+            record.pillars = pillars;
+        }
+        if let Some(title) = input.title {
+            record.title = title;
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        // Every request this emulator serves is attributed to its one account, so that is
+        // the identity the change is recorded under — never a value read off the request.
+        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+        record.last_modified_at = Some(now);
+        let goal = record.to_summary();
+
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.update_agent_goal_tokens.remember(
+                client_token,
+                crate::state::UpdateAgentGoalToken {
+                    profile_arn: input.profile_arn,
+                    goal_id: input.id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(UpdateAgentGoalOutput { goal })
     }
 }

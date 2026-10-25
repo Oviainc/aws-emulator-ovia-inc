@@ -4319,6 +4319,121 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         i32::try_from(associated).unwrap_or(i32::MAX)
     }
 
+    /// Why `arn` names no router network interface this account holds, or `None` when the
+    /// store holds one for it. `member` is the request member that named it, so the refusal
+    /// states which reference did not resolve.
+    ///
+    /// A `RouterNetworkInterfaceArn` names a resource THIS service mints
+    /// ([`is_mintable_router_network_interface_arn`]) and holds in
+    /// [`Self::router_network_interfaces`], so a request that points at one is resolved
+    /// against the store rather than taken on trust: an ARN of the right shape for an
+    /// interface the account never created names nothing. The detail is the sentence the
+    /// refusal's envelope carries ([`validation_failed_message`]).
+    pub fn unknown_router_network_interface_rejection(
+        &self,
+        member: &str,
+        arn: &str,
+    ) -> Option<String> {
+        if self.router_network_interfaces.contains_key(arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a router network interface this account holds."
+        ))
+    }
+
+    /// Why `arn` names no flow source this account holds, or `None` when the store holds
+    /// one for it.
+    ///
+    /// A `FlowSourceArn` names a SOURCE of a flow, and a source lives on the flow record
+    /// ([`StoredFlow::sources`]), so the source is resolved on the flow the same request
+    /// names when it names one, and across the account's flows when it does not. `member`
+    /// is the request member that named it, for the refusal detail.
+    pub fn unknown_flow_source_rejection(
+        &self,
+        member: &str,
+        flow_arn: Option<&str>,
+        arn: &str,
+    ) -> Option<String> {
+        let held = match flow_arn {
+            Some(flow_arn) => self
+                .flows
+                .get(flow_arn)
+                .is_some_and(|flow| flow.sources.iter().any(|source| source.source_arn == arn)),
+            None => self
+                .flows
+                .values()
+                .any(|flow| flow.sources.iter().any(|source| source.source_arn == arn)),
+        };
+        if held {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a flow source this account holds."
+        ))
+    }
+
+    /// Why `arn` names no flow this account holds, or `None` when the store holds one for
+    /// it. `member` is the request member that named it, for the refusal detail.
+    pub fn unknown_flow_rejection(&self, member: &str, arn: &str) -> Option<String> {
+        if self.flows.contains_key(arn) {
+            return None;
+        }
+        Some(format!(
+            "{member} {arn:?} does not name a flow this account holds."
+        ))
+    }
+
+    /// Why the router output configuration `configuration` cannot be stored because a
+    /// resource of THIS service it names does not exist, or `None` when every such
+    /// reference resolves.
+    ///
+    /// A router output's configuration names what the output EGRESSES TO, so a member of it
+    /// that carries the ARN of a resource this service mints and holds must name one the
+    /// account holds: a STANDARD configuration's `NetworkInterfaceArn`
+    /// (`smithy_query(query="shape",shape="StandardRouterOutputConfiguration")`, required, a
+    /// `routerNetworkInterface` ARN) and a MEDIACONNECT FLOW configuration's `FlowArn` /
+    /// `FlowSourceArn` ("the ARN of the flow to connect to this router output" / "the ARN of
+    /// the flow source to connect to this router output"), each optional, because that
+    /// configuration is stored with neither while the output is disconnected. The MEDIALIVE
+    /// INPUT configuration names a resource of ANOTHER service, which this store does not
+    /// hold, so there is nothing here to resolve it against. Every operation that stores a
+    /// configuration (CreateRouterOutput, UpdateRouterOutput) resolves it HERE, so the two
+    /// cannot answer one reference differently.
+    pub fn router_output_configuration_rejection(
+        &self,
+        configuration: &RouterOutputConfiguration,
+    ) -> Option<String> {
+        match configuration {
+            RouterOutputConfiguration::Standard(standard) => self
+                .unknown_router_network_interface_rejection(
+                    "Configuration Standard NetworkInterfaceArn",
+                    &standard.network_interface_arn,
+                ),
+            RouterOutputConfiguration::MediaConnectFlow(flow) => {
+                // Neither member is filtered for emptiness: the modelled `FlowArn` /
+                // `FlowSourceArn` patterns admit no empty string, so the boundary walk
+                // refuses one before a handler runs — and an ARN that somehow arrived empty
+                // names no flow this account holds, which is what the lookups answer.
+                let flow_arn = flow.flow_arn.as_deref();
+                if let Some(arn) = flow_arn {
+                    if let Some(rejection) =
+                        self.unknown_flow_rejection("Configuration MediaConnectFlow FlowArn", arn)
+                    {
+                        return Some(rejection);
+                    }
+                }
+                let source_arn = flow.flow_source_arn.as_deref()?;
+                self.unknown_flow_source_rejection(
+                    "Configuration MediaConnectFlow FlowSourceArn",
+                    flow_arn,
+                    source_arn,
+                )
+            }
+            RouterOutputConfiguration::MediaLiveInput(_) => None,
+        }
+    }
+
     /// The modelled `RouterNetworkInterface` the store holds for `arn`, with both
     /// association counts resolved — the one projection every router network interface
     /// operation answers from, so no two of them can report one interface differently.

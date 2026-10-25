@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsLogGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsLogGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsLogGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags of the log group `logGroupName` names — the group's own tag set
+//! (`crate::state::ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`), the one
+//! `TagLogGroup`, `UntagLogGroup`, `TagResource` and `UntagResource` write and
+//! `ListTagsForResource` reports. Reporting only: it reads that set and changes nothing a
+//! later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsLogGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsLogGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsLogGroup"))
+        // This call names its target by log group name alone, so nothing here is read off
+        // the request metadata `ctx` carries.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsLogGroupError::from(
+                ListTagsLogGroupErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        // The log group's tag set is reached as every tagging operation reaches a resource's,
+        // so this reports the one set the writers wrote.
+        let resource = crate::state::TaggedResource::LogGroup(input.log_group_name.clone());
+
+        // "Lists the tags for the specified log group": there are no tags to list until that
+        // group exists.
+        let Some(tags) = store.resource_tags(&resource) else {
+            return Err(ListTagsLogGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource.kind())),
+                },
+            )
+            .into());
+        };
+
+        // "The tags for the log group": a group carrying none has an EMPTY set of them, which
+        // is what the member reports — the absence of the member would say the service has
+        // nothing to say about the group's tags, and here it does.
+        Ok(ListTagsLogGroupOutput {
+            tags: Some(
+                tags.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
 }

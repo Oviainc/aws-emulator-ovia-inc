@@ -32,15 +32,10 @@ use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::ROUTER_OUTPUT_S
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::Emulator;
+use crate::router_outputs::minted_network_interface;
 
 /// Longer than `mc::TRANSITION_SPAN`, so a transition the clock owes is certainly due.
 const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
-
-/// A `RouterNetworkInterfaceArn` matching the modelled pattern
-/// (`smithy_query(query="shape",shape="RouterNetworkInterfaceArn")`:
-/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
-const NETWORK_INTERFACE_ARN: &str =
-    "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:a1b2c3d4e5f6";
 
 /// An ARN satisfying the modelled `RouterOutputArn` pattern
 /// (`smithy_query(query="shape",shape="RouterOutputArn")`:
@@ -82,14 +77,15 @@ async fn get_router_output(emulator: &Emulator, arn: &str) -> (u16, Option<Strin
         .await
 }
 
-/// A create body for a STANDARD router output; `destination_port` varies so each case
-/// drives a record of its own.
-fn create_body(name: &str, destination_port: u16) -> Value {
+/// A create body for a STANDARD router output on the router network interface
+/// `interface_arn` — a configuration must name an interface this account holds, so the
+/// suites mint one first; `destination_port` varies so each case drives a record of its own.
+fn create_body(interface_arn: &str, name: &str, destination_port: u16) -> Value {
     json!({
         "name": name,
         "configuration": {
             "Standard": {
-                "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                "networkInterfaceArn": interface_arn,
                 "protocolConfiguration": {
                     "Rtp": {
                         "destinationAddress": "198.51.100.90",
@@ -105,9 +101,14 @@ fn create_body(name: &str, destination_port: u16) -> Value {
 }
 
 /// Create a router output over the wire and answer its ARN.
-async fn created_router_output(emulator: &Emulator, name: &str, destination_port: u16) -> String {
+async fn created_router_output(
+    emulator: &Emulator,
+    interface_arn: &str,
+    name: &str,
+    destination_port: u16,
+) -> String {
     let (status, code, created) =
-        create_router_output(emulator, create_body(name, destination_port)).await;
+        create_router_output(emulator, create_body(interface_arn, name, destination_port)).await;
     assert_eq!(
         (status, code.as_deref()),
         (201, None),
@@ -124,11 +125,12 @@ async fn created_router_output(emulator: &Emulator, name: &str, destination_port
 /// record a real create made.
 async fn router_output_in_state(
     emulator: &Emulator,
+    interface_arn: &str,
     name: &str,
     destination_port: u16,
     state: &str,
 ) -> String {
-    let arn = created_router_output(emulator, name, destination_port).await;
+    let arn = created_router_output(emulator, interface_arn, name, destination_port).await;
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
@@ -202,6 +204,7 @@ fn expected_resume_state(state: &str) -> Option<&'static str> {
 #[tokio::test]
 async fn restart_resumes_a_resting_output_and_conflicts_with_a_change_in_flight() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-restart").await;
 
     // The states the rule names are the model's own values: the generated catalog is the
     // source of this table, so a value the model gains or loses shows up here.
@@ -216,8 +219,14 @@ async fn restart_resumes_a_resting_output_and_conflicts_with_a_change_in_flight(
     for (index, state) in ROUTER_OUTPUT_STATE_VALUES.iter().enumerate() {
         let case = *state;
         let port = 5_000 + u16::try_from(index).unwrap_or_default();
-        let arn =
-            router_output_in_state(&emulator, &format!("ro-restart-{case}"), port, case).await;
+        let arn = router_output_in_state(
+            &emulator,
+            &interface_arn,
+            &format!("ro-restart-{case}"),
+            port,
+            case,
+        )
+        .await;
         let before = read_record(&emulator, &arn).await;
         assert_eq!(
             before["state"].as_str(),
@@ -340,7 +349,8 @@ async fn restart_resumes_a_resting_output_and_conflicts_with_a_change_in_flight(
 #[tokio::test]
 async fn a_restart_over_the_wire_waits_for_the_states_the_clock_owes() {
     let emulator = Emulator::new();
-    let arn = created_router_output(&emulator, "ro-restart-wire", 5004).await;
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-restart-wire").await;
+    let arn = created_router_output(&emulator, &interface_arn, "ro-restart-wire", 5004).await;
 
     // The creation is still in flight, so the restart conflicts with it.
     let (status, code, refused) = restart_router_output(&emulator, &arn).await;
@@ -388,13 +398,16 @@ async fn a_restart_over_the_wire_waits_for_the_states_the_clock_owes() {
 #[tokio::test]
 async fn restart_refuses_an_arn_the_store_holds_no_output_for() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-restart-absent").await;
     // One stored output, so each refusal below is about the ARN the request named rather
     // than about an empty store.
-    let stored = created_router_output(&emulator, "ro-restart-present", 5010).await;
+    let stored =
+        created_router_output(&emulator, &interface_arn, "ro-restart-present", 5010).await;
 
     // An output the clock has already taken away is gone as well: DeleteRouterOutput
     // accepts the delete and the removal comes due one transition span later.
-    let deleted = created_router_output(&emulator, "ro-restart-deleted", 5011).await;
+    let deleted =
+        created_router_output(&emulator, &interface_arn, "ro-restart-deleted", 5011).await;
     let (status, code, _) = emulator
         .send("DELETE", &format!("/v1/routerOutput/{deleted}"), None)
         .await;

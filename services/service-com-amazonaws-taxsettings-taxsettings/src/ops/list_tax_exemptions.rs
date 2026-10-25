@@ -191,47 +191,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The page is built while the state lock is held, so the work done under
-        // it is bounded by `page_size` accounts, not by the size of the store;
-        // the guard is released before the response is assembled. Resuming uses
-        // the ordered map's own `range`, so a cursor's page costs a lookup rather
-        // than a scan of everything before it.
+        // The page and its cursor come from the one shared page-builder
+        // ([`crate::state::build_page`]), the same one every listing of this
+        // service pages through. The state lock is held only while the page is
+        // built; the guard is released before the response is assembled.
         let now = ::std::time::SystemTime::now();
-        let (page, more_remain) = {
+        let page = {
             let store = state.lock();
-            let lower = match resume_after.as_deref() {
-                Some(after) => ::std::ops::Bound::Excluded(after),
-                None => ::std::ops::Bound::Unbounded,
-            };
-            let mut remaining = store
-                .exemptions
-                .range::<str, _>((lower, ::std::ops::Bound::Unbounded))
+            crate::state::build_page(
+                &store.exemptions,
+                resume_after.as_deref(),
+                page_size,
                 // An account's entry is created by the write that records its
                 // first exemption, so every entry holds at least one record; the
-                // projection answers `None` for an empty one, which this skips
-                // rather than reporting an account with nothing to report.
-                .filter_map(|(account_id, _)| {
+                // projection answers `None` for an empty one, which the builder
+                // skips rather than reporting an account with nothing to report.
+                |account_id, _| {
                     store
                         .exemption_details(account_id, now)
-                        .map(|details| (account_id.clone(), details))
-                })
-                .peekable();
-            let page: Vec<(String, TaxExemptionDetails)> =
-                remaining.by_ref().take(page_size).collect();
-            let more_remain = remaining.peek().is_some();
-            (page, more_remain)
-        };
-
-        // A cursor is issued only when a further account remains, so the last
-        // page carries none. It names the LAST account of this page, which is the
-        // greatest account id in it because the store is enumerated in order —
-        // the reported map itself is unordered, so the cursor is taken from the
-        // page before it becomes one.
-        let next_token = if more_remain {
-            page.last()
-                .map(|(account_id, _)| crate::state::encode_page_token(account_id))
-        } else {
-            None
+                        .map(|details| (account_id.to_string(), details))
+                },
+            )
         };
 
         Ok(ListTaxExemptionsOutput {
@@ -239,8 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // IS this listing's payload, so an empty map says "no exemptions",
             // while an absent one would leave a client unable to tell that from a
             // response that forgot to answer.
-            tax_exemption_details_map: Some(page.into_iter().collect()),
-            next_token,
+            tax_exemption_details_map: Some(page.items.into_iter().collect()),
+            // The cursor names the LAST account of this page, which is the
+            // greatest account id in it because the store is enumerated in order
+            // — the reported map itself is unordered, so the cursor is taken from
+            // the page before it becomes one.
+            next_token: page.next_token,
         })
     }
 }

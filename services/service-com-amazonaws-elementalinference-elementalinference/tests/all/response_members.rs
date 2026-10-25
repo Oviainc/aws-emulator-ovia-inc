@@ -20,8 +20,8 @@
 //! * an optional output-config member the service resolves itself is MATERIALISED on
 //!   the stored output, so every later read reports the configuration the service
 //!   applied and a `GetFeed` -> `UpdateFeed` round trip cannot drop it;
-//! * a minted id identifies exactly ONE resource: two creates in one run never report
-//!   the same id.
+//! * a minted id identifies exactly ONE resource: two creates that differ in any
+//!   member never report the same id.
 
 use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
 use serde_json::{json, Value};
@@ -458,75 +458,89 @@ async fn update_and_associate_materialise_output_config_defaults_too() {
 // A minted id identifies exactly one resource.
 // ---------------------------------------------------------------------------
 
-/// Repeated creates mint DISTINCT ids, for feeds and for dictionaries alike: an id
-/// addresses one resource, so a second create may never alias the first.
+/// Repeated creates mint DISTINCT ids whenever the requests differ, for feeds and for
+/// dictionaries alike: an id addresses one resource, so a second create may never
+/// alias the first. (Two requests that are identical in every member are ONE create
+/// replayed — both operations are `@idempotent` — and that rule is asserted in
+/// `tests/all/create_replay_is_idempotent.rs`.)
 #[tokio::test]
 async fn repeated_creates_mint_distinct_ids() {
     let router = router();
-    // Several creates per resource kind, including two whose requests are identical
-    // but for the name, and two that are identical in every member the request
-    // carries.
-    let feed_names = ["feed-a", "feed-b", "feed-b"];
+    // Several creates per resource kind: two whose requests differ only in the name,
+    // and two that share a name and differ only in another member.
+    let feed_rows = [
+        ("feed-a", "crop1"),
+        ("feed-b", "crop1"),
+        ("feed-b", "crop2"),
+    ];
+    let feed_labels: Vec<String> = feed_rows
+        .iter()
+        .map(|(name, output)| format!("{name}/{output}"))
+        .collect();
     let mut feed_ids: Vec<String> = Vec::new();
-    for name in feed_names {
+    for ((name, output), label) in feed_rows.iter().zip(&feed_labels) {
         let outputs = json!([
-            {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
+            {"name": output, "outputConfig": output_config("cropping"), "status": "ENABLED"}
         ]);
-        let (id, _) = create_feed(&router, feed_body(name, outputs, None), name).await;
+        let (id, _) = create_feed(&router, feed_body(name, outputs, None), label).await;
         assert!(
             !feed_ids.contains(&id),
-            "case {name:?}: each CreateFeed mints a fresh id, got the already-minted {id:?}"
+            "case {label:?}: each CreateFeed mints a fresh id, got the already-minted {id:?}"
         );
         feed_ids.push(id);
     }
 
-    let dictionary_names = ["dict-a", "dict-b", "dict-b"];
+    let dictionary_rows = [("dict-a", "eng"), ("dict-b", "eng"), ("dict-b", "fra")];
+    let dictionary_labels: Vec<String> = dictionary_rows
+        .iter()
+        .map(|(name, language)| format!("{name}/{language}"))
+        .collect();
     let mut dictionary_ids: Vec<String> = Vec::new();
-    for name in dictionary_names {
+    for ((name, language), label) in dictionary_rows.iter().zip(&dictionary_labels) {
         let (status, created) = call(
             &router,
             "POST",
             "/v1/dictionary",
-            Some(json!({"name": name, "language": "eng"})),
+            Some(json!({"name": name, "language": language})),
         )
         .await;
         assert_eq!(
             status, 202,
-            "case {name:?}: CreateDictionary answers 202, got {status} with {created}"
+            "case {label:?}: CreateDictionary answers 202, got {status} with {created}"
         );
         let id = created["id"]
             .as_str()
-            .unwrap_or_else(|| panic!("case {name:?}: a minted dictionary id: {created}"))
+            .unwrap_or_else(|| panic!("case {label:?}: a minted dictionary id: {created}"))
             .to_string();
         assert!(
             !dictionary_ids.contains(&id),
-            "case {name:?}: each CreateDictionary mints a fresh id, got the already-minted \
+            "case {label:?}: each CreateDictionary mints a fresh id, got the already-minted \
              {id:?}"
         );
         dictionary_ids.push(id);
     }
 
     // The resources are addressable apart: each id reads back the resource it names.
-    for (id, name) in feed_ids.iter().zip(feed_names) {
-        let feed = get_feed(&router, id, name).await;
+    for (id, label) in feed_ids.iter().zip(&feed_labels) {
+        let feed = get_feed(&router, id, label).await;
         assert_eq!(
             feed["id"],
             json!(id),
-            "case {name:?}: the feed read by id reports that id, got {:?}",
+            "case {label:?}: the feed read by id reports that id, got {:?}",
             feed["id"]
         );
     }
-    for (id, name) in dictionary_ids.iter().zip(dictionary_names) {
+    for (id, label) in dictionary_ids.iter().zip(&dictionary_labels) {
         let (status, dictionary) =
             call(&router, "GET", &format!("/v1/dictionary/{id}"), None).await;
         assert_eq!(
             status, 200,
-            "case {name:?}: GetDictionary on the minted id answers 200, got {status}"
+            "case {label:?}: GetDictionary on the minted id answers 200, got {status}"
         );
         assert_eq!(
             dictionary["id"],
             json!(id),
-            "case {name:?}: the dictionary read by id reports that id, got {:?}",
+            "case {label:?}: the dictionary read by id reports that id, got {:?}",
             dictionary["id"]
         );
     }

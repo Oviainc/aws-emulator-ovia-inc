@@ -45,6 +45,8 @@ mod principal_policy_context_keys;
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]
 mod role_deletion;
+#[path = "all/role_description.rs"]
+mod role_description;
 #[path = "all/role_inline_policies.rs"]
 mod role_inline_policies;
 #[path = "all/role_inline_policy_rotation.rs"]

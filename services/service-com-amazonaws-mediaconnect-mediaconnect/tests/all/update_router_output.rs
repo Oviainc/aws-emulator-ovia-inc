@@ -30,16 +30,11 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 use crate::flow_lifecycle::Emulator;
 use crate::router_output_lifecycle::delete_router_output;
 use crate::router_outputs::{
-    batch_get_router_outputs, create_router_output, now_epoch_seconds, reported_timestamp,
-    standard, standard_with_protocol, FLOW_ARN, FLOW_SOURCE_ARN, PERSISTED_MEMBERS, UNKNOWN_ARN,
+    batch_get_router_outputs, create_router_output, minted_configuration_targets,
+    minted_flow_source, now_epoch_seconds, reported_timestamp, standard, standard_with_protocol,
+    PERSISTED_MEMBERS, UNKNOWN_ARN,
 };
 
-/// A second `FlowArn`, so a MEDIACONNECT_FLOW output can be pointed at a different flow
-/// without changing the TYPE of its configuration.
-const OTHER_FLOW_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000b:ro-other";
-/// A second `FlowSourceArn`, for the same reason as [`OTHER_FLOW_ARN`].
-const OTHER_FLOW_SOURCE_ARN: &str =
-    "arn:aws:mediaconnect:us-east-1:000000000000:source:1-0000000b:ro-other-source";
 /// A `RouterInputArn` matching the modelled pattern
 /// (`smithy_query(query="shape",shape="RouterInputArn")`:
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`) — the
@@ -65,12 +60,42 @@ async fn update_router_output(
         .await
 }
 
+/// The targets a router output's configuration may name: the resources of THIS service a
+/// create and an update resolve against the store, minted over the wire so every
+/// configuration below names something the account holds.
+///
+/// The second flow is there so a MEDIACONNECT_FLOW output can be repointed at another flow
+/// without changing the TYPE of its configuration.
+struct Targets {
+    interface_arn: String,
+    flow_arn: String,
+    flow_source_arn: String,
+    other_flow_arn: String,
+    other_flow_source_arn: String,
+}
+
+impl Targets {
+    async fn mint(emulator: &Emulator) -> Self {
+        let primary = minted_configuration_targets(emulator, "ro-update").await;
+        let (other_flow_arn, other_flow_source_arn) =
+            minted_flow_source(emulator, "flow-ro-update-other").await;
+        Self {
+            interface_arn: primary.interface_arn,
+            flow_arn: primary.flow_arn,
+            flow_source_arn: primary.flow_source_arn,
+            other_flow_arn,
+            other_flow_source_arn,
+        }
+    }
+}
+
 /// A STANDARD RTP create at a tier with room to move the bitrate in both directions, which
 /// is what most cases start from.
-fn standard_create(name: &str) -> Value {
+fn standard_create(targets: &Targets, name: &str) -> Value {
     json!({
         "name": name,
-        "configuration": standard(json!({"Rtp": {"destinationAddress": "198.51.100.10",
+        "configuration": standard(&targets.interface_arn, json!({"Rtp": {
+            "destinationAddress": "198.51.100.10",
             "destinationPort": 5004, "forwardErrorCorrection": "ENABLED"}})),
         "maximumBitrate": 100_000_000i64,
         "routingScope": "REGIONAL",
@@ -79,12 +104,12 @@ fn standard_create(name: &str) -> Value {
 }
 
 /// A MEDIACONNECT_FLOW create — the other kind of output the update cases act on.
-fn mediaconnect_flow_create(name: &str) -> Value {
+fn mediaconnect_flow_create(targets: &Targets, name: &str) -> Value {
     json!({
         "name": name,
         "configuration": {"MediaConnectFlow": {
-            "flowArn": FLOW_ARN,
-            "flowSourceArn": FLOW_SOURCE_ARN,
+            "flowArn": targets.flow_arn,
+            "flowSourceArn": targets.flow_source_arn,
             "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
                 "encryptionKeyConfiguration": {"Automatic": {}}},
         }},
@@ -139,7 +164,7 @@ struct UpdateCase {
 /// a STANDARD output reconfigured onto each of the other router output protocols — one that
 /// sends to an address and one that waits for a caller, so the derived `StreamDetails`
 /// moves both ways — and a MEDIACONNECT_FLOW output repointed at another flow.
-fn update_cases() -> Vec<UpdateCase> {
+fn update_cases(targets: &Targets) -> Vec<UpdateCase> {
     let rist = json!({"Rist": {"destinationAddress": "198.51.100.21", "destinationPort": 2030}});
     let srt_listener = json!({"SrtListener": {"port": 3000, "minimumLatencyMilliseconds": 10}});
     let srt_caller = json!({"SrtCaller": {"destinationAddress": "198.51.100.22",
@@ -147,34 +172,35 @@ fn update_cases() -> Vec<UpdateCase> {
     let rtmp_push = json!({"RtmpPush": {"destinationAddress": "198.51.100.23",
         "destinationPort": 1935, "applicationName": "live", "streamName": "primary"}});
     let other_flow = json!({"MediaConnectFlow": {
-        "flowArn": OTHER_FLOW_ARN,
-        "flowSourceArn": OTHER_FLOW_SOURCE_ARN,
+        "flowArn": targets.other_flow_arn,
+        "flowSourceArn": targets.other_flow_source_arn,
         "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
             "encryptionKeyConfiguration": {"Automatic": {}}},
     }});
+    let interface_arn = targets.interface_arn.as_str();
 
     vec![
         UpdateCase {
             case: "Name alone",
-            create: standard_create("ro-update-name"),
+            create: standard_create(targets, "ro-update-name"),
             update: json!({"name": "ro-update-name-renamed"}),
             changed: vec![("name", json!("ro-update-name-renamed"))],
         },
         UpdateCase {
             case: "MaximumBitrate alone, inside the stored tier's ceiling",
-            create: standard_create("ro-update-bitrate"),
+            create: standard_create(targets, "ro-update-bitrate"),
             update: json!({"maximumBitrate": 250_000_000i64}),
             changed: vec![("maximumBitrate", json!(250_000_000i64))],
         },
         UpdateCase {
             case: "Tier alone, raised above the stored bitrate",
-            create: standard_create("ro-update-tier"),
+            create: standard_create(targets, "ro-update-tier"),
             update: json!({"tier": "OUTPUT_500"}),
             changed: vec![("tier", json!("OUTPUT_500"))],
         },
         UpdateCase {
             case: "Tier and MaximumBitrate lowered together",
-            create: standard_create("ro-update-tier-down"),
+            create: standard_create(targets, "ro-update-tier-down"),
             update: json!({"tier": "OUTPUT_20", "maximumBitrate": 20_000_000i64}),
             changed: vec![
                 ("tier", json!("OUTPUT_20")),
@@ -183,13 +209,13 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "RoutingScope alone",
-            create: standard_create("ro-update-scope"),
+            create: standard_create(targets, "ro-update-scope"),
             update: json!({"routingScope": "GLOBAL"}),
             changed: vec![("routingScope", json!("GLOBAL"))],
         },
         UpdateCase {
             case: "MaintenanceConfiguration alone, onto the other union member",
-            create: standard_create("ro-update-maintenance"),
+            create: standard_create(targets, "ro-update-maintenance"),
             update: json!({"maintenanceConfiguration": {"PreferredDayTime": {"day": "TUESDAY",
                 "time": "22:00"}}}),
             changed: vec![
@@ -205,7 +231,7 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "FabricConfiguration alone, on an output with no active route",
-            create: standard_create("ro-update-fabric"),
+            create: standard_create(targets, "ro-update-fabric"),
             update: json!({"fabricConfiguration": {"recoveryLatencyMode": "LOW_LATENCY"}}),
             changed: vec![(
                 "fabricConfiguration",
@@ -214,10 +240,13 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "Configuration onto RIST, which sends to an address",
-            create: standard_create("ro-update-rist"),
-            update: json!({"configuration": standard(rist.clone())}),
+            create: standard_create(targets, "ro-update-rist"),
+            update: json!({"configuration": standard(interface_arn, rist.clone())}),
             changed: vec![
-                ("configuration", standard_with_protocol(rist, "RIST")),
+                (
+                    "configuration",
+                    standard_with_protocol(interface_arn, rist, "RIST"),
+                ),
                 (
                     "streamDetails",
                     json!({"Standard": {"destinationIpAddress": "198.51.100.21"}}),
@@ -226,25 +255,25 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "Configuration onto an SRT listener, which names no destination address",
-            create: standard_create("ro-update-srt-listener"),
-            update: json!({"configuration": standard(srt_listener.clone())}),
+            create: standard_create(targets, "ro-update-srt-listener"),
+            update: json!({"configuration": standard(interface_arn, srt_listener.clone())}),
             changed: vec![
                 (
                     "configuration",
-                    standard_with_protocol(srt_listener, "SRT_LISTENER"),
+                    standard_with_protocol(interface_arn, srt_listener, "SRT_LISTENER"),
                 ),
                 ("streamDetails", json!({"Standard": {}})),
             ],
         },
         UpdateCase {
             case: "Configuration onto an SRT caller, naming the protocol it implies",
-            create: standard_create("ro-update-srt-caller"),
-            update: json!({"configuration": standard_with_protocol(srt_caller.clone(),
-                "SRT_CALLER")}),
+            create: standard_create(targets, "ro-update-srt-caller"),
+            update: json!({"configuration": standard_with_protocol(interface_arn,
+                srt_caller.clone(), "SRT_CALLER")}),
             changed: vec![
                 (
                     "configuration",
-                    standard_with_protocol(srt_caller, "SRT_CALLER"),
+                    standard_with_protocol(interface_arn, srt_caller, "SRT_CALLER"),
                 ),
                 (
                     "streamDetails",
@@ -254,12 +283,12 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "Configuration onto an RTMP push",
-            create: standard_create("ro-update-rtmp-push"),
-            update: json!({"configuration": standard(rtmp_push.clone())}),
+            create: standard_create(targets, "ro-update-rtmp-push"),
+            update: json!({"configuration": standard(interface_arn, rtmp_push.clone())}),
             changed: vec![
                 (
                     "configuration",
-                    standard_with_protocol(rtmp_push, "RTMP_PUSH"),
+                    standard_with_protocol(interface_arn, rtmp_push, "RTMP_PUSH"),
                 ),
                 (
                     "streamDetails",
@@ -269,7 +298,7 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "a MEDIACONNECT_FLOW output repointed at another flow",
-            create: mediaconnect_flow_create("ro-update-flow"),
+            create: mediaconnect_flow_create(targets, "ro-update-flow"),
             update: json!({"configuration": other_flow.clone()}),
             // The stream details of an output that delivers into another AWS resource carry
             // nothing to recompute, so they stay as the model declares them.
@@ -277,10 +306,11 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "every updatable member at once",
-            create: standard_create("ro-update-everything"),
+            create: standard_create(targets, "ro-update-everything"),
             update: json!({
                 "name": "ro-update-everything-renamed",
-                "configuration": standard(json!({"Rtp": {"destinationAddress": "198.51.100.24",
+                "configuration": standard(interface_arn, json!({"Rtp": {
+                    "destinationAddress": "198.51.100.24",
                     "destinationPort": 5006}})),
                 "maximumBitrate": 20_000_000i64,
                 "routingScope": "GLOBAL",
@@ -294,6 +324,7 @@ fn update_cases() -> Vec<UpdateCase> {
                 (
                     "configuration",
                     standard_with_protocol(
+                        interface_arn,
                         json!({"Rtp": {"destinationAddress": "198.51.100.24",
                             "destinationPort": 5006}}),
                         "RTP",
@@ -322,7 +353,7 @@ fn update_cases() -> Vec<UpdateCase> {
         },
         UpdateCase {
             case: "no updatable member at all",
-            create: standard_create("ro-update-nothing"),
+            create: standard_create(targets, "ro-update-nothing"),
             update: json!({}),
             changed: Vec::new(),
         },
@@ -332,13 +363,14 @@ fn update_cases() -> Vec<UpdateCase> {
 #[tokio::test]
 async fn update_router_output_applies_what_it_carries_and_leaves_the_rest() {
     let emulator = Emulator::new();
+    let targets = Targets::mint(&emulator).await;
 
     for UpdateCase {
         case,
         create,
         update,
         changed,
-    } in update_cases()
+    } in update_cases(&targets)
     {
         let (arn, created) = create_output(&emulator, create).await;
 
@@ -395,6 +427,7 @@ async fn update_router_output_applies_what_it_carries_and_leaves_the_rest() {
 #[tokio::test]
 async fn an_updated_output_reports_updating_until_the_clock_settles_it() {
     let emulator = Emulator::new();
+    let targets = Targets::mint(&emulator).await;
 
     // An output whose creation has already settled comes back to the state it was settled
     // in; one that is still being created comes back to the state its CREATE owed it. Both
@@ -403,7 +436,8 @@ async fn an_updated_output_reports_updating_until_the_clock_settles_it() {
         ("an output settled in STANDBY", true),
         ("an output still being created", false),
     ] {
-        let (arn, _) = create_output(&emulator, standard_create("ro-update-lifecycle")).await;
+        let (arn, _) =
+            create_output(&emulator, standard_create(&targets, "ro-update-lifecycle")).await;
         if wait_for_create {
             tokio::time::sleep(past_transition_span()).await;
             let settled = read_output(&emulator, case, &arn).await;
@@ -461,6 +495,7 @@ async fn an_updated_output_reports_updating_until_the_clock_settles_it() {
 #[tokio::test]
 async fn the_tier_bounds_the_maximum_bitrate_an_update_may_set() {
     let emulator = Emulator::new();
+    let targets = Targets::mint(&emulator).await;
 
     // The catalog is `CreateRouterOutput$Tier`'s own documentation
     // (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`), which
@@ -484,7 +519,7 @@ async fn the_tier_bounds_the_maximum_bitrate_an_update_may_set() {
 
         let (arn, created) = create_output(
             &emulator,
-            standard_create(&format!("ro-bound-{}", tier.to_ascii_lowercase())),
+            standard_create(&targets, &format!("ro-bound-{}", tier.to_ascii_lowercase())),
         )
         .await;
 
@@ -563,14 +598,18 @@ struct RefusalCase {
 #[tokio::test]
 async fn refusals_name_the_modelled_error_and_store_nothing() {
     let emulator = Emulator::new();
+    let targets = Targets::mint(&emulator).await;
 
     // Two outputs of DIFFERENT types, so a configuration-type change can be attempted in
     // both directions.
     let (standard_arn, standard_created) =
-        create_output(&emulator, standard_create("ro-refusal-standard")).await;
-    let (flow_arn, flow_created) =
-        create_output(&emulator, mediaconnect_flow_create("ro-refusal-flow")).await;
-    let arns = [standard_arn.clone(), flow_arn.clone()];
+        create_output(&emulator, standard_create(&targets, "ro-refusal-standard")).await;
+    let (flow_output_arn, flow_created) = create_output(
+        &emulator,
+        mediaconnect_flow_create(&targets, "ro-refusal-flow"),
+    )
+    .await;
+    let arns = [standard_arn.clone(), flow_output_arn.clone()];
     let created = [standard_created, flow_created];
 
     let cases = vec![
@@ -586,8 +625,8 @@ async fn refusals_name_the_modelled_error_and_store_nothing() {
             case: "replacing a STANDARD configuration with a MEDIACONNECT_FLOW one",
             output: Some(0),
             body: json!({"configuration": {"MediaConnectFlow": {
-                "flowArn": OTHER_FLOW_ARN,
-                "flowSourceArn": OTHER_FLOW_SOURCE_ARN,
+                "flowArn": targets.other_flow_arn,
+                "flowSourceArn": targets.other_flow_source_arn,
                 "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
                     "encryptionKeyConfiguration": {"Automatic": {}}},
             }}}),
@@ -598,7 +637,7 @@ async fn refusals_name_the_modelled_error_and_store_nothing() {
         RefusalCase {
             case: "replacing a MEDIACONNECT_FLOW configuration with a STANDARD one",
             output: Some(1),
-            body: json!({"configuration": standard(json!({"Rtp": {
+            body: json!({"configuration": standard(&targets.interface_arn, json!({"Rtp": {
                 "destinationAddress": "198.51.100.31", "destinationPort": 5004}}))}),
             status: 400,
             code: "BadRequestException",
@@ -608,6 +647,7 @@ async fn refusals_name_the_modelled_error_and_store_nothing() {
             case: "a Protocol that contradicts the protocol configuration",
             output: Some(0),
             body: json!({"configuration": standard_with_protocol(
+                &targets.interface_arn,
                 json!({"Rtp": {"destinationAddress": "198.51.100.32", "destinationPort": 5004}}),
                 "RIST",
             )}),
@@ -732,7 +772,8 @@ async fn refusals_name_the_modelled_error_and_store_nothing() {
 #[tokio::test]
 async fn an_update_is_refused_while_the_output_is_being_deleted() {
     let emulator = Emulator::new();
-    let (arn, created) = create_output(&emulator, standard_create("ro-deleting")).await;
+    let targets = Targets::mint(&emulator).await;
+    let (arn, created) = create_output(&emulator, standard_create(&targets, "ro-deleting")).await;
 
     let (status, code, deleted) = delete_router_output(&emulator, &arn).await;
     assert_eq!(
@@ -803,7 +844,8 @@ fn set_routed_input(emulator: &Emulator, arn: &str, input_arn: Option<&str>) {
 #[tokio::test]
 async fn the_fabric_configuration_cannot_be_updated_while_the_output_is_routed() {
     let emulator = Emulator::new();
-    let (arn, created) = create_output(&emulator, standard_create("ro-routed")).await;
+    let targets = Targets::mint(&emulator).await;
+    let (arn, created) = create_output(&emulator, standard_create(&targets, "ro-routed")).await;
     set_routed_input(&emulator, &arn, Some(ROUTED_INPUT_ARN));
 
     // "You cannot update the fabric configuration while the output has an active route."

@@ -105,6 +105,16 @@
 //! ([`ComAmazonawsCloudformationCloudformationState::apply_drift_result`]) onto the stack
 //! (`Stack$DriftInformation`) and each resource it covered
 //! (`StackResource$DriftInformation`), where every stack read reports it.
+//!
+//! ## Generated templates
+//!
+//! Beside those it holds this account and Region's GENERATED TEMPLATES
+//! ([`generated_template`]): `CreateGeneratedTemplate` records one and hands back its id,
+//! and `DescribeGeneratedTemplate` reads the progress of its generation back. The
+//! generation rides a clock of its own — answered in flight and concluded
+//! [`generated_template::GENERATION_DELAY`] later — which is also what makes the modelled
+//! cap on CONCURRENT generations transient: it counts the records still in a pending or
+//! in-progress status, so it lifts as those conclude.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -144,6 +154,10 @@ pub mod registry;
 /// The resource schema the registry holds for a resource type: the document that defines
 /// which properties the type has.
 pub mod resource_schema;
+
+/// The generated templates this account and Region holds: what `CreateGeneratedTemplate`
+/// starts and `DescribeGeneratedTemplate` reads the progress of.
+pub mod generated_template;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -1625,6 +1639,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
     /// reclaimed first.
     pub drift_detections: Vec<StoredDriftDetection>,
+    /// Every generated template, in creation order, so `DescribeGeneratedTemplate` reads
+    /// back exactly what `CreateGeneratedTemplate` wrote (see [`generated_template`]). A
+    /// generated template is a record of its own rather than a stack's, so it is neither
+    /// settled on the stack clock nor reclaimed with a stack; its own generation clock is
+    /// what [`Self::settle`] advances, and
+    /// [`generated_template::MAX_GENERATED_TEMPLATES`] is what bounds the list.
+    pub generated_templates: Vec<generated_template::StoredGeneratedTemplate>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -1640,8 +1661,46 @@ impl ComAmazonawsCloudformationCloudformationState {
             change_set.settle(now);
         }
         self.settle_drift_detections(now);
+        for template in &mut self.generated_templates {
+            template.settle(now);
+        }
         self.reclaim_retired_stacks();
         self.reclaim_orphaned_change_sets();
+    }
+
+    /// The generated template `name_or_id` addresses in the request's Region, if this store
+    /// holds it: `GeneratedTemplateName` is "the name or Amazon Resource Name (ARN) of a
+    /// generated template", and nothing outside that Region is addressable.
+    pub fn resolve_generated_template(
+        &self,
+        region: &str,
+        name_or_id: &str,
+    ) -> Option<&generated_template::StoredGeneratedTemplate> {
+        self.generated_templates
+            .iter()
+            .find(|template| template.is_addressed_by(region, name_or_id))
+    }
+
+    /// The generated templates of one Region, in creation order: the set a name has to be
+    /// unique within and the one its quotas are metered over.
+    pub fn generated_templates_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a generated_template::StoredGeneratedTemplate> {
+        self.generated_templates
+            .iter()
+            .filter(move |template| template.region == region)
+    }
+
+    /// How many generations of one Region are in a pending or in-progress status right
+    /// now — the set [`generated_template::MAX_CONCURRENT_GENERATIONS`] meters.
+    ///
+    /// Counted off the stored statuses, so it is accurate only once [`Self::settle`] has
+    /// retired the generations the clock already completed; every caller settles first.
+    pub fn generations_in_flight(&self, region: &str) -> usize {
+        self.generated_templates_in(region)
+            .filter(|template| template.is_in_flight())
+            .count()
     }
 
     /// Materialise every drift-detection STATUS whose due instant has passed.
@@ -2280,6 +2339,21 @@ pub fn new_change_set_id(region: &str, change_set_name: &str) -> String {
         ARN_NAMESPACE,
         region,
         &format!("changeSet/{change_set_name}/{}", new_identifier(change_set_name)),
+    )
+}
+
+/// Mint a generated template's id, which is its ARN: `GeneratedTemplateId` is "the Amazon
+/// Resource Name (ARN) of the generated template. The format is
+/// `arn:${Partition}:cloudformation:${Region}:${Account}:generatedtemplate/${Id}`" — the
+/// same 8-4-4-4-12 id every other identifier this service mints carries.
+pub fn new_generated_template_id(region: &str, generated_template_name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!(
+            "generatedtemplate/{}",
+            new_identifier(generated_template_name)
+        ),
     )
 }
 

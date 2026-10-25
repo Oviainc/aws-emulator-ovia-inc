@@ -154,3 +154,5 @@ mod trial_component_tracking;
 mod hyperpod_cluster_lifecycle;
 #[path = "all/create_cluster_admission.rs"]
 mod create_cluster_admission;
+#[path = "all/hyperpod_cluster_node_listing.rs"]
+mod hyperpod_cluster_node_listing;
