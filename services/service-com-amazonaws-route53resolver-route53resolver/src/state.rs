@@ -264,6 +264,12 @@ pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE: &str = "COMPLETE";
 /// the clock owes, [`PROVISIONING_DELAY`] after the call that started it.
 pub const FIREWALL_DOMAIN_LIST_STATUS_UPDATING: &str = "UPDATING";
 
+/// The `FirewallDomainListStatus` a domain list reports once a delete has been
+/// accepted for it, the model's `DELETING`: `DeleteFirewallDomainList` answers
+/// with "the domain list that you just deleted", which is on its way out and so
+/// is no longer in the settled status it held until that call.
+pub const FIREWALL_DOMAIN_LIST_STATUS_DELETING: &str = "DELETING";
+
 /// The most domains one `UpdateFirewallDomains` request may carry.
 ///
 /// `UpdateFirewallDomains$Domains`'s doc states it: "There is a limit of 1000
