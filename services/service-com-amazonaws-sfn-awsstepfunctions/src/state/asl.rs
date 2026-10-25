@@ -17,16 +17,24 @@
 //! `ItemsPath`, `ResultSelector`, `ResultPath`, `OutputPath`), the context object
 //! (`$$`), the intrinsic functions, `Retry` and `Catch`.
 //!
-//! A `Task` state whose `Resource` is an ACTIVITY ARN is also RUN, as far as this
-//! process can run it: the work belongs to a worker that polls this emulator, so the
-//! state SCHEDULES a task carrying the state's effective input and the walk SUSPENDS
-//! there ([`Run::waiting`]), which is the execution waiting for a worker exactly as it
-//! does on the real service. `GetActivityTask` hands that task out; the worker's reply
-//! closes it.
+//! A `Task` state's work is RUN too, in the one way this process can run each kind:
+//!
+//! * a `Resource` naming a service INTEGRATION is called — the call goes to the
+//!   other service's own handler in this same emulator, with the document the state
+//!   built as that operation's request and the operation's response as the state's
+//!   result (see [`super::integration`], which also states which integrations are
+//!   made and which are not);
+//! * a `Resource` naming an ACTIVITY ARN belongs to a worker that polls this
+//!   emulator, so the state SCHEDULES a task carrying the state's effective input and
+//!   the walk SUSPENDS there ([`Run::waiting`]), which is the execution waiting for a
+//!   worker exactly as it does on the real service. `GetActivityTask` hands that task
+//!   out; the worker's reply closes it.
 //!
 //! What is NOT executed is what cannot be executed inside this process:
 //!
-//! * a `Task` state's service integration, which calls another service;
+//! * an integration [`super::integration::read`] makes no call for — a service whose
+//!   request is not one JSON document, a pattern whose outcome arrives after the
+//!   call, a `Resource` naming no integration at all;
 //! * a Distributed Map's `ItemReader`, `ItemBatcher` and `ResultWriter`, which read
 //!   and write an S3 dataset;
 //! * a JSONata-mode definition (`QueryLanguage: "JSONata"`) and the members that
@@ -108,6 +116,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use serde_json_path::JsonPath;
+
+use super::integration::{Failed, Tasks};
 
 /// The ASL predefined error name for a failure the interpreter itself raises
 /// ("States.Runtime — an execution failed due to some exception that could not be
@@ -292,10 +302,10 @@ pub const MAX_WAIT_SECONDS: u64 = 31_622_400;
 
 /// The state types this emulator executes.
 ///
-/// `Task` is one of them for the ONE kind of task whose work this emulator can carry:
-/// an activity task, which a worker polls for. A `Task` state naming any other
-/// `Resource` still ends the execution with [`RUNTIME_ERROR`], because the
-/// integration it names is a call to another service.
+/// `Task` is one of them for both kinds of work a `Resource` can name: an activity
+/// task, which a worker polls for, and a service-integration call this emulator
+/// makes ([`super::integration`]). A `Resource` naming neither still ends the
+/// execution with [`RUNTIME_ERROR`].
 pub const EXECUTED_STATE_TYPES: &[&str] = &[
     "Choice", "Fail", "Map", "Parallel", "Pass", "Succeed", "Task", "Wait",
 ];
@@ -330,6 +340,11 @@ const DEFAULT_RETRY_BACKOFF_RATE: f64 = 2.0;
 /// The members each executed state type may carry. A state that carries any other
 /// member is not executed: the member changes what the state does, and running the
 /// state while ignoring it would report an outcome the definition does not describe.
+///
+/// A `Task`'s members depend on WHICH work its `Resource` names, so the type alone
+/// does not decide them: this answers the ACTIVITY task's set, and
+/// [`INTEGRATION_TASK_MEMBERS`] the service-integration call's.
+/// [`unexecutable_member`] is what picks between the two.
 fn executable_members(state_type: &str) -> &'static [&'static str] {
     match state_type {
         "Pass" => &[
@@ -448,13 +463,53 @@ fn executable_members(state_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// The members a `Task` state whose `Resource` names a SERVICE INTEGRATION may
+/// carry: the ones that decide the request the call carries, what becomes of its
+/// answer, and how a failed call is handled.
+///
+/// `HeartbeatSeconds`/`HeartbeatSecondsPath` and `Credentials` are deliberately
+/// absent: a heartbeat is owed by an activity or a callback task, whose outcome
+/// arrives after the call this emulator makes, and `Credentials` asks for the call to
+/// be made under another role, which this emulator does not assume.
+const INTEGRATION_TASK_MEMBERS: &[&str] = &[
+    "Type",
+    "Comment",
+    "QueryLanguage",
+    "Resource",
+    "InputPath",
+    "Parameters",
+    "ResultSelector",
+    "ResultPath",
+    "OutputPath",
+    "Retry",
+    "Catch",
+    "TimeoutSeconds",
+    "TimeoutSecondsPath",
+    "Next",
+    "End",
+];
+
 /// The first member of `state` this emulator does not execute, if any.
 fn unexecutable_member(state_type: &str, state: &Map<String, Value>) -> Option<String> {
-    let allowed = executable_members(state_type);
+    let allowed = match state_type {
+        // The two kinds of `Task` work carry different members, and the `Resource`
+        // is what says which kind this state is.
+        "Task" if !super::names_an_activity(task_resource(state)) => INTEGRATION_TASK_MEMBERS,
+        _ => executable_members(state_type),
+    };
     state
         .keys()
         .find(|member| !allowed.contains(&member.as_str()))
         .cloned()
+}
+
+/// The `Resource` a `Task` state names, as the text the language writes it as — the
+/// empty string for a state that carries none, which names no work either way.
+fn task_resource(state: &Map<String, Value>) -> &str {
+    state
+        .get("Resource")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// One history event the walk produced.
@@ -839,6 +894,10 @@ pub const MAX_LOCATION_CHARS: usize = 256;
 
 /// `value` as a diagnostic echoes it: itself when it is short, and its first
 /// [`MAX_ECHOED_CHARS`] characters followed by an ellipsis when it is not.
+///
+/// Public so the one clipping of a quoted caller value serves every cause this
+/// crate words, including the ones [`super::integration`] builds for a `Task`
+/// state's `Resource`.
 pub fn echoed(value: &str) -> String {
     clipped(value, MAX_ECHOED_CHARS)
 }
@@ -1918,8 +1977,27 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
 
 /// Walk `definition` from its `StartAt` state with `input` as the first state's
 /// input, and report what happened.
-pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) -> Run {
-    interpret(definition, input, start, context, Entry::Start, Duration::ZERO).0
+///
+/// `tasks` is what a `Task` state's service integration is performed by: the walk
+/// asks for the call and the operation running the walk makes it
+/// ([`super::integration::interpret`]).
+pub fn run(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &Context,
+    tasks: &dyn Tasks,
+) -> Run {
+    interpret(
+        definition,
+        input,
+        start,
+        context,
+        Entry::Start,
+        Duration::ZERO,
+        tasks,
+    )
+    .0
 }
 
 /// Walk `definition` again from the step a redriven execution did not get past, and
@@ -1933,15 +2011,17 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
 /// a second time and the values those states produced — which `from`'s own input
 /// carries — stand for the redriven attempt.
 ///
-/// The state RUNS: it is the unsuccessful step, so a `Task` state there schedules its
-/// work again rather than being handed a result ([`resume`] is the walk that is handed
-/// one).
+/// The state RUNS: it is the unsuccessful step, so a `Task` state there makes its
+/// service-integration call again, or schedules its activity task again, rather than
+/// being handed a result ([`resume`] is the walk that is handed one). `tasks` is the
+/// same seam [`run`] takes, so that call is made exactly as the first attempt's was.
 pub fn redrive(
     definition: &str,
     input: &str,
     start: SystemTime,
     context: &Context,
     from: &RedriveStep,
+    tasks: &dyn Tasks,
 ) -> Run {
     let state_input = serde_json::from_str(&from.state_input).unwrap_or(Value::Null);
     interpret(
@@ -1951,6 +2031,7 @@ pub fn redrive(
         context,
         Entry::At(from.state_name.clone(), state_input),
         Duration::ZERO,
+        tasks,
     )
     .0
 }
@@ -1973,6 +2054,9 @@ pub fn redrive(
 /// arrives, which is what a definition-level `TimeoutSeconds` bounds: the span a task
 /// spent outstanding is part of the execution's own run.
 ///
+/// `tasks` is the same seam [`run`] takes: the states after the reply may themselves
+/// be service integrations, and they are called exactly as the first attempt's were.
+///
 /// `None` when the definition declares no such state any more, so there is nothing to
 /// continue from.
 pub fn resume(
@@ -1982,6 +2066,7 @@ pub fn resume(
     context: &Context,
     reply: &ActivityReply,
     elapsed: Duration,
+    tasks: &dyn Tasks,
 ) -> Option<Run> {
     let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
     let (run, applied) = interpret(
@@ -1991,6 +2076,7 @@ pub fn resume(
         context,
         Entry::Reply(reply.clone(), state_input),
         elapsed,
+        tasks,
     );
     applied.then_some(run)
 }
@@ -2018,6 +2104,7 @@ enum Entry {
 ///
 /// `elapsed` is the span the execution had already spent before this walk's first
 /// state, which a definition-level `TimeoutSeconds` counts.
+#[allow(clippy::too_many_arguments)]
 fn interpret(
     definition: &str,
     input: &str,
@@ -2025,6 +2112,7 @@ fn interpret(
     context: &Context,
     entry: Entry,
     elapsed: Duration,
+    tasks: &dyn Tasks,
 ) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
         Ok(document) => document,
@@ -2114,6 +2202,7 @@ fn interpret(
         steps: Vec::new(),
         start,
         base_context: context.value(&input_value, start),
+        tasks,
         waiting: None,
         map_runs: Vec::new(),
         reply,
@@ -2410,7 +2499,7 @@ fn measure_payload(value: &Value, built_by: &str) -> Result<usize, Failure> {
 }
 
 /// One walk of one definition.
-struct Interpreter {
+struct Interpreter<'tasks> {
     /// The state transitions still left in [`MAX_STATE_TRANSITIONS`]. Every nested
     /// `Map` iteration and `Parallel` branch spends from the same budget, so the
     /// total work one execution does is bounded however deeply it nests.
@@ -2432,6 +2521,10 @@ struct Interpreter {
     /// against.
     start: SystemTime,
     base_context: Value,
+    /// What a `Task` state's service integration is performed by, for the one walk
+    /// this interpreter is: a nested `Map` iteration or `Parallel` branch runs in
+    /// this same frame, so its tasks are made through the same seam.
+    tasks: &'tasks dyn Tasks,
     /// The activity task a `Task` state scheduled, which SUSPENDED the walk: the
     /// execution waits at that state until a worker answers it. Set at most once,
     /// because the walk stops at the state that set it.
@@ -2470,7 +2563,7 @@ struct MapTally {
     failed: i64,
 }
 
-impl Interpreter {
+impl Interpreter<'_> {
     /// Whether this interpretation has run out of wall-clock time.
     ///
     /// The ceilings on steps, payloads, paths and nesting bound each factor of the
@@ -2729,7 +2822,7 @@ impl Interpreter {
                 Err(Failure { error, cause }.at(at))
             }
             "Map" => self.map_state(name, state, raw, effective, &context, at),
-            "Task" => self.activity_task_state(name, state, &raw, effective, &context, at),
+            "Task" => self.task_state(name, state, raw, effective, &context, at),
             // `Parallel` is the only type left: the list above is exhaustive.
             _ => self.parallel_state(name, state, raw, effective, &context, at),
         }
@@ -2743,8 +2836,9 @@ impl Interpreter {
     /// Functions using the GetActivityTask API action and responds using SendTask*
     /// API actions": the task carries the state's effective input, and the state's
     /// own `TimeoutSeconds`/`HeartbeatSeconds` bound how long it may stay
-    /// outstanding. A `Resource` naming any OTHER integration is a call to another
-    /// service, which this process does not make.
+    /// outstanding. A `Resource` naming any OTHER work is the service-integration
+    /// call [`Interpreter::task_state`] makes, which is what hands this one the
+    /// states it is for.
     ///
     /// A walk CONTINUING from a worker's reply to this state's task applies that reply
     /// here instead of suspending: the reply is the state's result, so the state's own
@@ -2758,7 +2852,7 @@ impl Interpreter {
         context: &Value,
         at: Duration,
     ) -> Result<StateStep, Fault> {
-        let resource = state.get("Resource").and_then(Value::as_str).unwrap_or_default();
+        let resource = task_resource(state);
         if !super::names_an_activity(resource) {
             return Err(runtime(format!(
                 "state '{name}' invokes '{}', a service integration this emulator does not make, \
@@ -3128,6 +3222,129 @@ impl Interpreter {
                 "no choice rule matched the state's input and the state declares no 'Default'"
                     .to_string(),
             )),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task
+    // -----------------------------------------------------------------------
+
+    /// Run a `Task` state: do the work its `Resource` names, and place what came of
+    /// it.
+    ///
+    /// A `Task` state "represents a single unit of work performed by a state
+    /// machine", and the `Resource` says which work. An ACTIVITY belongs to a worker,
+    /// so that one is scheduled and the walk suspends at it
+    /// ([`Interpreter::activity_task_state`]). Every other `Resource` names a service
+    /// INTEGRATION, whose unit of work is one API call: its request is the document
+    /// the state's `Parameters` payload template builds over the state's effective
+    /// input (the effective input itself when it declares none), and the operation's
+    /// response document is the state's RESULT, which the result-side filters then
+    /// place. A call that failed is the state's own failure, so the state's `Retry`
+    /// and `Catch` apply to it exactly as they apply to a `Map`'s or a `Parallel`'s
+    /// work — and what no call is made for is not faked, but reported as the failure
+    /// it is.
+    fn task_state(
+        &mut self,
+        name: &str,
+        state: &Map<String, Value>,
+        raw: Value,
+        effective: Value,
+        context: &Value,
+        at: Duration,
+    ) -> Result<StateStep, Fault> {
+        // The activity task is decided FIRST, before this state's own history event:
+        // that path records its own, and the work there is a worker's rather than a
+        // call this emulator makes.
+        if super::names_an_activity(task_resource(state)) {
+            return self.activity_task_state(name, state, &raw, effective, context, at);
+        }
+        self.push("TaskStateEntered", name, at);
+        let resource = state.get("Resource").and_then(Value::as_str).ok_or_else(|| {
+            runtime(format!(
+                "the 'Task' state '{name}' carries no string 'Resource', so it names no work"
+            ))
+            .at(at)
+        })?;
+        let call = super::integration::read(resource)
+            .map_err(|why| runtime(format!("state '{name}': {why}")).at(at))?;
+        // "TimeoutSeconds […] If the task runs longer than the specified seconds,
+        // this state fails with a States.Timeout error name": the span it bounds is
+        // the call's own, so the member is what the WAIT for the answer is bounded
+        // by (`integration::Tasks::perform`), not merely what the span is compared
+        // with afterwards. A state that declares none leaves the emulator's own
+        // ceiling as the only bound.
+        //
+        // It is read through the SAME reader an activity task's bounds are read
+        // with, which holds the member to the "positive integer" of seconds the
+        // language defines: a figure that is not one is a defect in the definition,
+        // and reading it as a whole number of seconds is what makes converting it to
+        // a `Duration` total for every value a caller can write.
+        let within = self
+            .task_seconds(state, "TimeoutSeconds", &effective, context)
+            .map_err(|failure| failure.at(at))?
+            .map(Duration::from_secs);
+
+        let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
+            // This attempt's own request reads `$$.State.RetryCount`, so the payload
+            // template is rendered with the context of the attempt it is on.
+            let attempt_context = with_retry_count(context, me.retry_count);
+            let request = match state.get("Parameters") {
+                Some(template) => match payload_template(template, &effective, &attempt_context) {
+                    Ok(request) => request,
+                    Err(failure) => return (Err(failure), at),
+                },
+                None => effective.clone(),
+            };
+            // The interpretation's own deadline is consulted HERE as well as at each
+            // transition: the walk blocks inside a call rather than transitioning, so
+            // a run already past its deadline makes no further call (and a `Retry`
+            // cannot keep making them).
+            if let Some(failure) = me.out_of_time() {
+                return (Err(failure), at);
+            }
+            let answered = me.tasks.perform(&call, &request, within);
+            match answered {
+                // The result is a document a state carries, so it is measured
+                // against the same ceiling every state's document is measured
+                // against.
+                Ok(result) => {
+                    match measure_payload(&result, &format!("the 'Task' state '{name}'")) {
+                        Ok(_bytes) => (Ok(result), at),
+                        Err(failure) => (Err(failure), at),
+                    }
+                }
+                Err(Failed { error, cause }) => (
+                    Err(Failure {
+                        error: Some(error),
+                        cause: Some(cause),
+                    }),
+                    at,
+                ),
+            }
+        });
+        match outcome {
+            Ok(result) => {
+                let value = self
+                    .place_result(state, &raw, result, context, true)
+                    .map_err(|failure| failure.at(end))?;
+                self.push("TaskStateExited", name, end);
+                Ok(StateStep {
+                    value,
+                    at: end,
+                    next: self
+                        .next_of(name, state)
+                        .map_err(|failure| failure.at(end))?,
+                })
+            }
+            Err(failure) => self.catch_or_fail(
+                (name, "TaskStateExited"),
+                state,
+                &raw,
+                failure,
+                context,
+                end,
+            ),
         }
     }
 
@@ -5196,8 +5413,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         steps: Vec::new(),
         start: test.start,
         base_context,
-        // `TestState` tests ONE state, with no execution around it to wait: a state
-        // whose work is an invocation is tested through its `mock`.
+        // `TestState` tests ONE state, with no execution around it: a state whose
+        // work is an invocation is tested through its `mock`, so nothing is called
+        // for this walk and there is nowhere for it to wait.
+        tasks: &super::integration::Unserved,
         waiting: None,
         // `TestState` starts nothing: it reports what one state computes, and the
         // Map Runs a Distributed Map starts belong to an execution.
@@ -5210,7 +5429,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
     interpreter.trial(test, &raw, inspection)
 }
 
-impl Interpreter {
+impl Interpreter<'_> {
     /// [`test_state`]'s walk of the one state under test.
     fn trial(&mut self, test: &StateTest<'_>, raw: &Value, mut inspection: Inspection) -> Trial {
         let state = test.state;

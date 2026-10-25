@@ -401,6 +401,13 @@ pub const CLUSTER_ID_MAX_LEN: usize = 50;
 /// alphanumeric characters or hyphens."
 pub const REPLICATION_GROUP_ID_MAX_LEN: usize = 40;
 
+/// The longest a `CacheParameterGroupName` may be: the 255-character bound this
+/// service publishes for its names ("must contain no more than 255 alphanumeric
+/// characters or hyphens"; see [`is_valid_subnet_group_name`]). The member
+/// itself documents only that the value "is stored as a lowercase string", so
+/// the bound is the one the service's names share.
+pub const PARAMETER_GROUP_NAME_MAX_LEN: usize = 255;
+
 /// True when `value` satisfies the name rule ElastiCache documents for every one
 /// of its identifiers — "A name must contain from 1 to `max_len` alphanumeric
 /// characters or hyphens. The first character must be a letter. A name cannot
@@ -499,10 +506,15 @@ pub fn is_tag_character(character: char) -> bool {
 
 /// The sentence a charset refusal carries for `member` ("keys" or "values"),
 /// in the service's own wording; see [`TAG_SYMBOLS`].
+///
+/// The published sentence spells the backslash of the symbol list DOUBLED and
+/// closes with a stray double quote, so it is reproduced here as the service
+/// words it rather than as a tidied transcription: a caller matching the
+/// service's text has nothing else to match against.
 fn tag_charset_message(member: &str) -> String {
     format!(
         "Tag {member} may only contain unicode letters, digits, whitespace, or one of these \
-         symbols: _ . : / = + \\ - @"
+         symbols: _ . : / = + \\\\ - @\""
     )
 }
 
@@ -511,13 +523,12 @@ fn tag_charset_message(member: &str) -> String {
 /// `AddTagsToResource` and `RemoveTagsFromResource` cannot disagree about which
 /// keys a caller owns.
 pub fn tag_key_rejection(key: &str) -> Option<String> {
-    if key.is_empty() {
-        return Some("Invalid value for Tags: a tag's Key may not be null.".to_string());
-    }
-    if key.chars().count() > MAX_TAG_KEY_LEN {
+    // Both bounds of the key's length are the one rule, so the empty key and
+    // the key past the published maximum are refused by the same sentence: it
+    // states the window a key's length has to fall in.
+    if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LEN {
         return Some(format!(
-            "Invalid value {key} for Tags: a tag's Key may contain no more than \
-             {MAX_TAG_KEY_LEN} characters."
+            "Tag keys must be between 1 and {MAX_TAG_KEY_LEN} characters in length."
         ));
     }
     if !key.chars().all(is_tag_character) {
@@ -529,9 +540,10 @@ pub fn tag_key_rejection(key: &str) -> Option<String> {
         .get(..RESERVED_TAG_KEY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
     {
+        // The refusal states the RULE — the prefix a caller may not use — and
+        // not the key that broke it, which is how the service words it.
         return Some(format!(
-            "Invalid value {key} for Tags: a tag's Key may not start with the reserved prefix \
-             {RESERVED_TAG_KEY_PREFIX}."
+            "Tag keys cannot start with the reserved prefix \"{RESERVED_TAG_KEY_PREFIX}\"."
         ));
     }
     None
@@ -542,10 +554,11 @@ pub fn tag_key_rejection(key: &str) -> Option<String> {
 /// "may be null" — and what a non-empty one may contain is the character set
 /// [`TAG_SYMBOLS`] states, which the model puts no `@pattern` on.
 pub fn tag_value_rejection(value: &str) -> Option<String> {
+    // See [`tag_key_rejection`]: the same sentence for the other half of the
+    // pair, whose window starts at zero because the empty value is permitted.
     if value.chars().count() > MAX_TAG_VALUE_LEN {
         return Some(format!(
-            "Invalid value for Tags: a tag's Value may contain no more than \
-             {MAX_TAG_VALUE_LEN} characters."
+            "Tag values must be between 0 and {MAX_TAG_VALUE_LEN} characters in length."
         ));
     }
     (!value.chars().all(is_tag_character)).then(|| tag_charset_message("values"))
@@ -2184,7 +2197,10 @@ pub fn check_parameter_value(parameter: &ParameterRecord, value: &str) -> Result
 /// operation that only names a parameter word the same refusal.
 pub fn check_parameter_modifiable(parameter: &ParameterRecord) -> Result<(), String> {
     if !parameter.is_modifiable || parameter.is_node_type_specific() {
-        return Err(format!("Parameter {} is not modifiable.", parameter.name));
+        return Err(format!(
+            "The parameter {} cannot be modified.",
+            parameter.name
+        ));
     }
     Ok(())
 }
@@ -2498,6 +2514,37 @@ pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
     format!("CacheCluster not found: {cache_cluster_id}")
 }
 
+/// How ElastiCache words a cache parameter group this account does not hold:
+/// `CacheParameterGroup <name> not found.`
+///
+/// One helper, so every surface that resolves a `CacheParameterGroupName` — the
+/// describes, the delete, and the creates and modifies that take a group for a
+/// cluster or a replication group — words its `CacheParameterGroupNotFoundFault`
+/// the one way the service does. The name is reported as the request spelled it,
+/// because the message is built from the request.
+///
+/// The two operations that WRITE parameter values word the same fault the other
+/// way round; see [`parameter_writer_group_not_found_message`].
+pub fn cache_parameter_group_not_found_message(name: &str) -> String {
+    format!("CacheParameterGroup {name} not found.")
+}
+
+/// How `ModifyCacheParameterGroup` and `ResetCacheParameterGroup` word a cache
+/// parameter group this account does not hold: `CacheParameterGroup not found:
+/// <name>`, the form the service's parameter writers answer with (and the form
+/// [`cache_cluster_not_found_message`] carries).
+///
+/// One helper, so the two writers of parameter values cannot disagree about it.
+pub fn parameter_writer_group_not_found_message(name: &str) -> String {
+    format!("CacheParameterGroup not found: {name}")
+}
+
+/// How ElastiCache refuses a change to a family's OWN default parameter group,
+/// whether the request asks to set a value or to put one back: the group's
+/// values are the engine's, so there is no change to make. Stated once, so the
+/// two writers of parameter values cannot disagree about it.
+pub const DEFAULT_PARAMETER_GROUP_IMMUTABLE: &str = "Cannot modify a default parameter group.";
+
 /// How ElastiCache words a snapshot this account does not hold: the name the
 /// request asked for, which is all the service knows about a snapshot that does
 /// not exist.
@@ -2618,10 +2665,7 @@ impl ResourceArnParts<'_> {
     /// answered with: the kind decides which modelled not-found fault the
     /// calling operation lifts it into.
     pub fn not_found(&self) -> TagTargetRejection {
-        TagTargetRejection::NotFound(
-            self.kind,
-            format!("{} {} not found.", self.kind.label(), self.name),
-        )
+        TagTargetRejection::NotFound(self.kind, format!("{} is not present", self.name))
     }
 }
 
@@ -8188,8 +8232,19 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         self.events.retain(|_, event| event.at >= cutoff);
     }
 
-    /// Materialise every status change the clock owes a user group.
+    /// Materialise every change the clock owes a user group: the removal of a
+    /// group whose deletion has fallen due, and then the status (with the
+    /// membership change) of every group still there.
+    ///
+    /// `DeleteUserGroup` answers with the group in [`STATUS_DELETING`] — a
+    /// non-terminal status — and the clock owes its removal
+    /// [`USER_DELETION_TRANSITION`] later, whether or not anybody calls again;
+    /// this is where that change is made, which is why a reporting operation may
+    /// make it. The event the deletion is was recorded by the call that asked for
+    /// it, so nothing is logged here.
     pub fn settle_user_groups(&mut self, now: SystemTime) {
+        self.user_groups
+            .retain(|_, group| group.pending_removal.is_none_or(|due| now < due));
         for group in self.user_groups.values_mut() {
             group.settle(now);
         }
@@ -9413,6 +9468,10 @@ pub struct UserGroupRecord {
     pub status: String,
     /// The status change the clock owes this group, if any.
     pub pending_status: Option<PendingTransition>,
+    /// When the clock owes this group's REMOVAL from the store, set by the
+    /// `DeleteUserGroup` that put it in [`STATUS_DELETING`]; `None` for a group
+    /// nothing has deleted — the same rule a deleted user follows.
+    pub pending_removal: Option<SystemTime>,
     /// The membership change the clock owes this group, as
     /// `ModifyUserGroup` accepted it: the ids to be added and the ids to be
     /// removed, which is what `UserGroup$PendingChanges` reports until
