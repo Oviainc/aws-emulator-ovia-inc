@@ -32,7 +32,7 @@
 //!   refused the same way an identifier that never existed is), and the status
 //!   transition the clock owes is materialised on a later read.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -42,7 +42,7 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
         UNAUTHORIZED_EXCEPTION_CODE, UNAUTHORIZED_EXCEPTION_MESSAGE,
     },
     state::{
-        seed_account_instances, IDENTITY_PROVIDER_NOT_VALID, MAX_RESOURCES_PER_KIND,
+        iso8601, seed_account_instances, IDENTITY_PROVIDER_NOT_VALID, MAX_RESOURCES_PER_KIND,
         MAX_SUBNETS_PER_UPDATE, MAX_TAGS_PER_RESOURCE,
     },
     ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState,
@@ -1272,6 +1272,9 @@ async fn an_association_brings_its_instance_into_the_instance_list() {
         ("another instance, shared directory", 1, "sd-abcdef0123", PRODUCTS[4]),
         ("a second user on the first instance", 0, "d-0123456789", PRODUCTS[0]),
     ];
+    // No instance was in the service's view before this instant, so no status check of one
+    // can predate it.
+    let before_any_association = iso8601(SystemTime::now());
     for (row, (case, instance, directory_id, product)) in rows.iter().enumerate() {
         associate(
             &h,
@@ -1334,9 +1337,21 @@ async fn an_association_brings_its_instance_into_the_instance_list() {
             Some(*directory_id),
             "case {case:?}: the directory the association named must be reported, got {summary:?}"
         );
+        // The instance is in the service's view because its status was established, and
+        // that is the status check the summary reports the date of: an instant inside this
+        // test's lifetime, in the service's ISO-8601 form (the format sorts with the
+        // instants it encodes, so the window is a string comparison).
+        let checked = summary
+            .get("LastStatusCheckDate")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: an instance in view reports its last status check, got {summary:?}")
+            });
+        let now = iso8601(SystemTime::now());
         assert!(
-            summary.get("LastStatusCheckDate").is_none(),
-            "case {case:?}: no status check was performed, so none is reported, got {summary:?}"
+            checked >= before_any_association.as_str() && checked <= now.as_str(),
+            "case {case:?}: expected a status check inside \
+             [{before_any_association}, {now}], got {checked:?}"
         );
     }
 

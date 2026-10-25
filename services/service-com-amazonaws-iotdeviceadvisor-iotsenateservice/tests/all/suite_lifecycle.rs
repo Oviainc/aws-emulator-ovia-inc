@@ -288,7 +288,11 @@ pub(crate) fn definition_rows() -> Vec<(String, Value)> {
 }
 
 /// A suite run configuration for `thing`, with the optional members the table varies.
-fn run_configuration(thing: &str, selected: Option<Vec<&str>>, parallel: Option<bool>) -> Value {
+pub(crate) fn run_configuration(
+    thing: &str,
+    selected: Option<Vec<&str>>,
+    parallel: Option<bool>,
+) -> Value {
     let mut configuration = json!({ "primaryDevice": { "thingArn": thing } });
     if let Some(selected) = selected {
         configuration["selectedTestList"] = json!(selected);
@@ -930,8 +934,10 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             pending.body
         );
 
-        // A second run while one holds the slot is a conflict.
-        let conflict = emulator
+        // A second run while one is in progress is refused unless the configuration asks
+        // for a parallel run; `parallel_runs` asserts that member's rule over its own
+        // table, so here each row is only pinned to the answer ITS configuration earns.
+        let second = emulator
             .call(
                 "POST",
                 &format!("/suiteDefinitions/{definition_id}/suiteRuns"),
@@ -939,13 +945,23 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
                 Some(json!({ "suiteRunConfiguration": configuration })),
             )
             .await;
-        assert_eq!(
-            (conflict.status, conflict.error_code.as_deref()),
-            (400, Some("ConflictException")),
-            "case {case:?}: a second run while one is in progress must conflict, got {} {}",
-            conflict.status,
-            conflict.body
-        );
+        if configuration["parallelRun"] == json!(true) {
+            assert_eq!(
+                second.status, 200,
+                "case {case:?}: a second run asking for a parallel run, alongside one that \
+                 also asked for one, must be accepted, got {} {}",
+                second.status, second.body
+            );
+        } else {
+            assert_eq!(
+                (second.status, second.error_code.as_deref()),
+                (400, Some("ConflictException")),
+                "case {case:?}: a second non-parallel run while one is in progress must \
+                 conflict, got {} {}",
+                second.status,
+                second.body
+            );
+        }
 
         // The clock, not the poll, moves the status: PENDING -> RUNNING -> ERROR, because
         // this emulator has no device test runner to execute the suite with.
@@ -1057,8 +1073,8 @@ async fn stopping_a_run_is_observable_and_never_resurrects_a_terminal_run() {
         stopping.body
     );
 
-    // A run that is STOPPING is still in progress, so it still holds the definition's
-    // single run slot: one run at a time means the stop must complete first.
+    // A run that is STOPPING is still in progress, and neither it nor this request asked
+    // for a parallel run, so it still holds the definition: the stop must complete first.
     let while_stopping = emulator
         .call(
             "POST",

@@ -59,7 +59,7 @@ use crate::ops::types::{
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction, ServiceSoftwareOptions,
     SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, StorageType,
-    StorageTypeLimit, Tag, UseCaseStatus,
+    StorageTypeLimit, Tag, UpgradeHistory, UpgradeStepItem, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
     VOLUME_TYPE_VALUES,
@@ -357,6 +357,10 @@ pub const PROCESSING_STATUS_DELETING: &str = "Deleting";
 /// `DomainProcessingStatusType`'s `UpdatingServiceSoftware`: a service software
 /// deployment is being applied to the domain.
 pub const PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE: &str = "UpdatingServiceSoftware";
+
+/// `DomainProcessingStatusType`'s `UpgradingEngineVersion`: the domain is being moved
+/// onto another engine version.
+pub const PROCESSING_STATUS_UPGRADING_ENGINE_VERSION: &str = "UpgradingEngineVersion";
 
 /// `DeploymentStatus`'s `COMPLETED` value: no service software deployment is in
 /// flight on the domain.
@@ -1384,6 +1388,214 @@ impl ServiceSoftware {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Engine version upgrades
+//
+// `UpgradeDomain` starts a service-managed engine upgrade — or an upgrade
+// eligibility check, which performs none — and `GetUpgradeHistory` reports the runs
+// a domain has had. [`UpgradeRun`] below is the ONE record both reach: the run in
+// flight and the history entry it becomes are the same record, so the two
+// operations cannot disagree about what ran, when it started or how far it got.
+// ---------------------------------------------------------------------------
+
+/// How many upgrade runs a domain keeps: `UpgradeHistory` is the "history of the
+/// last 10 upgrades and upgrade eligibility checks for an Amazon OpenSearch Service
+/// domain", and `GetUpgradeHistory` "retrieves the complete history of the last 10
+/// upgrades performed on" one — so an eleventh run drops the oldest.
+pub const UPGRADE_HISTORY: usize = 10;
+
+/// `UpgradeStep`'s `PRE_UPGRADE_CHECK`, the first of the "three steps that an upgrade
+/// or upgrade eligibility check goes through".
+pub const UPGRADE_STEP_PRE_UPGRADE_CHECK: &str = "PRE_UPGRADE_CHECK";
+
+/// `UpgradeStep`'s `SNAPSHOT`; see [`UPGRADE_STEP_PRE_UPGRADE_CHECK`].
+pub const UPGRADE_STEP_SNAPSHOT: &str = "SNAPSHOT";
+
+/// `UpgradeStep`'s `UPGRADE`; see [`UPGRADE_STEP_PRE_UPGRADE_CHECK`].
+pub const UPGRADE_STEP_UPGRADE: &str = "UPGRADE";
+
+/// The steps an upgrade performs, in the order it performs them.
+const UPGRADE_STEPS: [&str; 3] = [
+    UPGRADE_STEP_PRE_UPGRADE_CHECK,
+    UPGRADE_STEP_SNAPSHOT,
+    UPGRADE_STEP_UPGRADE,
+];
+
+/// The steps an upgrade eligibility check performs: the check alone, because such a
+/// run "does not actually perform the upgrade" — so neither the snapshot an upgrade
+/// takes first nor the upgrade itself runs.
+const UPGRADE_CHECK_STEPS: [&str; 1] = [UPGRADE_STEP_PRE_UPGRADE_CHECK];
+
+/// `UpgradeStatus`'s `IN_PROGRESS`: the run, or the step, is still being performed.
+pub const UPGRADE_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `UpgradeStatus`'s `SUCCEEDED`: the run, or the step, finished.
+///
+/// The other two values the model admits — `SUCCEEDED_WITH_ISSUES` and `FAILED` —
+/// report an upgrade that hit trouble on the real cluster; nothing in this emulator
+/// can make an upgrade it accepted fail, so no run is ever reported in them.
+pub const UPGRADE_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The progress a finished step reports, and the most any step reports.
+const STEP_PROGRESS_COMPLETE: u32 = 100;
+
+/// One upgrade, or one upgrade eligibility check, performed on a domain — as this
+/// emulator persists it.
+///
+/// A run is started by `UpgradeDomain` and completes when the span the clock owes it
+/// has passed ([`PROVISIONING`], the same span a configuration change takes),
+/// materialised by whichever later call reads the record, so nothing sleeps. Its
+/// steps are derived from that span rather than stored, so the step a caller polls
+/// and the overall status beside it cannot disagree.
+#[derive(Debug, Clone)]
+pub struct UpgradeRun {
+    /// `UpgradeDomainResponse$UpgradeId`: "the unique identifier of the domain
+    /// upgrade".
+    pub upgrade_id: String,
+    /// The engine version the domain ran when this run started.
+    pub source_version: String,
+    /// The engine version this run moves the domain onto — or, for an eligibility
+    /// check, the one it was checked against.
+    pub target_version: String,
+    /// `UpgradeDomainRequest$PerformCheckOnly`: "when true, indicates that an upgrade
+    /// eligibility check needs to be performed. Does not actually perform the
+    /// upgrade."
+    pub perform_check_only: bool,
+    /// The advanced options the upgrade applies to the domain when it lands. An
+    /// eligibility check applies none, because it changes nothing.
+    pub advanced_options: BTreeMap<String, String>,
+    /// `UpgradeHistory$StartTimestamp`: "UTC timestamp at which the upgrade API call
+    /// was made".
+    pub started_at: SystemTime,
+    /// When the clock owes this run completion.
+    pub completes_at: SystemTime,
+    /// Whether the version this run moves the domain onto has already been
+    /// materialised on the domain record, so the landing happens exactly once.
+    pub applied: bool,
+}
+
+impl UpgradeRun {
+    /// The steps this run performs, in order: all three for an upgrade, the check
+    /// alone for an eligibility check.
+    pub fn steps(&self) -> &'static [&'static str] {
+        if self.perform_check_only {
+            &UPGRADE_CHECK_STEPS
+        } else {
+            &UPGRADE_STEPS
+        }
+    }
+
+    /// Whether this run is still being performed at `now`.
+    pub fn in_progress(&self, now: SystemTime) -> bool {
+        now < self.completes_at
+    }
+
+    /// `UpgradeHistory$UpgradeStatus`: "the current status of the upgrade".
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.in_progress(now) {
+            UPGRADE_STATUS_IN_PROGRESS
+        } else {
+            UPGRADE_STATUS_SUCCEEDED
+        }
+    }
+
+    /// How long this run has been going at `now`, capped at the span it takes.
+    fn elapsed(&self, now: SystemTime) -> u128 {
+        let total = self.span();
+        now.duration_since(self.started_at)
+            .map(|elapsed| elapsed.as_millis().min(total))
+            .unwrap_or_default()
+    }
+
+    /// The span the clock owes this run, in milliseconds. Never zero, so a caller
+    /// reading straight after the call that started the run still sees it in
+    /// progress.
+    fn span(&self) -> u128 {
+        self.completes_at
+            .duration_since(self.started_at)
+            .unwrap_or(PROVISIONING)
+            .as_millis()
+            .max(1)
+    }
+
+    /// Each step this run has STARTED by `now`, as its place in [`Self::steps`], its
+    /// status and its progress percentage.
+    ///
+    /// The run's span is divided evenly between its steps, so a caller polling a run
+    /// in flight sees the steps advance one after another. A step the run has not
+    /// reached is not reported at all: `UpgradeHistory$StepsList` is "a list of each
+    /// step performed as part of a specific upgrade or upgrade eligibility check".
+    fn step_progress(&self, now: SystemTime) -> Vec<(usize, &'static str, u32)> {
+        let steps = self.steps();
+        let elapsed = self.elapsed(now);
+        let span = self.span();
+        let count = u128::try_from(steps.len()).unwrap_or(1).max(1);
+        (0..steps.len())
+            .filter_map(|index| {
+                let position = u128::try_from(index).unwrap_or(0);
+                let starts_at = span * position / count;
+                let ends_at = span * (position + 1) / count;
+                if elapsed >= ends_at {
+                    return Some((index, UPGRADE_STATUS_SUCCEEDED, STEP_PROGRESS_COMPLETE));
+                }
+                if elapsed < starts_at {
+                    // A step this run has not started performing yet.
+                    return None;
+                }
+                let through = (elapsed - starts_at) * u128::from(STEP_PROGRESS_COMPLETE)
+                    / (ends_at - starts_at).max(1);
+                Some((
+                    index,
+                    UPGRADE_STATUS_IN_PROGRESS,
+                    u32::try_from(through).unwrap_or(STEP_PROGRESS_COMPLETE),
+                ))
+            })
+            .collect()
+    }
+
+    /// `UpgradeHistory$UpgradeName`: "a string that describes the upgrade".
+    ///
+    /// The model declares no form for it, so it is derived from the record rather
+    /// than stored: which engine versions the run went between, and whether it
+    /// performed the upgrade or only checked that it could.
+    pub fn upgrade_name(&self) -> String {
+        let what = if self.perform_check_only {
+            "Upgrade eligibility check"
+        } else {
+            "Upgrade"
+        };
+        format!(
+            "{what} from {} to {}",
+            self.source_version, self.target_version
+        )
+    }
+
+    /// This run as `UpgradeHistory` — one entry of what `GetUpgradeHistory` answers
+    /// with.
+    pub fn to_history(&self, now: SystemTime) -> UpgradeHistory {
+        let steps = self.steps();
+        UpgradeHistory {
+            upgrade_name: Some(self.upgrade_name()),
+            start_timestamp: Some(datetime(self.started_at)),
+            upgrade_status: Some(self.status(now).to_string()),
+            steps_list: Some(
+                self.step_progress(now)
+                    .into_iter()
+                    .map(|(index, status, progress)| UpgradeStepItem {
+                        upgrade_step: steps.get(index).map(|step| (*step).to_string()),
+                        upgrade_step_status: Some(status.to_string()),
+                        // "A list of strings containing detailed information about the
+                        // errors encountered in a particular step": no step of a run
+                        // this emulator performs encounters one.
+                        issues: Some(Vec::new()),
+                        progress_percent: Some(f64::from(progress)),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// One configuration change scheduled on a domain, as this emulator persists it.
 ///
 /// A scheduled action is a record with an identity of its own — an action id, a type,
@@ -1641,6 +1853,11 @@ pub struct Domain {
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
     /// names no `ChangeId`.
     pub changes: VecDeque<ConfigChange>,
+    /// The engine version upgrades and upgrade eligibility checks performed on this
+    /// domain, oldest first, bounded by [`UPGRADE_HISTORY`]: a FIFO, because the cap
+    /// drops the oldest run and the newest is the one still in flight. See
+    /// [`UpgradeRun`].
+    pub upgrades: VecDeque<UpgradeRun>,
     /// The configuration changes scheduled on this domain, keyed by their action id
     /// — unique per domain, so the id IS the key. See [`ScheduledChange`].
     pub scheduled_actions: BTreeMap<String, ScheduledChange>,
@@ -1723,6 +1940,75 @@ impl Domain {
             .find(|change| change.change_id == change_id)
     }
 
+    /// Start the engine version upgrade — or the upgrade eligibility check — a call at
+    /// `now` asked for, and answer the record it created.
+    ///
+    /// An upgrade is a configuration change of the domain like any other: the domain
+    /// goes `UpgradingEngineVersion` and its `EngineVersion` option reports
+    /// `Processing` until the clock makes the run due, and only THEN does the domain
+    /// report the version it was upgraded to ([`Self::settle`]). A check performs no
+    /// upgrade, so it starts no change and moves nothing about the domain.
+    pub fn begin_upgrade(
+        &mut self,
+        target_version: &str,
+        perform_check_only: bool,
+        advanced_options: BTreeMap<String, String>,
+        now: SystemTime,
+    ) -> UpgradeRun {
+        let run = UpgradeRun {
+            upgrade_id: new_upgrade_id(),
+            source_version: self.engine_version.clone(),
+            target_version: target_version.to_string(),
+            perform_check_only,
+            advanced_options,
+            started_at: now,
+            completes_at: now + PROVISIONING,
+            applied: false,
+        };
+        if !perform_check_only {
+            let mut properties = vec![OPT_ENGINE_VERSION];
+            if !run.advanced_options.is_empty() {
+                // "The advanced options configuration for the domain": an upgrade that
+                // carries them changes those too, so they are part of the change it
+                // starts.
+                properties.push(OPT_ADVANCED_OPTIONS);
+            }
+            for option in &properties {
+                self.touch(option, now);
+            }
+            self.begin_change(
+                PROCESSING_STATUS_UPGRADING_ENGINE_VERSION,
+                &properties,
+                now,
+            );
+        }
+        self.upgrades.push_back(run.clone());
+        // The history is bounded: past its cap the oldest run is dropped, so a domain
+        // upgraded forever holds a fixed number of records.
+        while self.upgrades.len() > UPGRADE_HISTORY {
+            self.upgrades.pop_front();
+        }
+        run
+    }
+
+    /// Whether an engine version upgrade is being performed on this domain right now
+    /// — `DomainStatus$UpgradeProcessing`.
+    ///
+    /// Read from the record AFTER [`Self::settle`] has materialised whatever the clock
+    /// owed it, so a run whose span has passed is no longer in flight. An eligibility
+    /// check performs no upgrade, so one in progress is not an upgrade in process.
+    pub fn upgrade_in_flight(&self) -> bool {
+        self.upgrades
+            .back()
+            .is_some_and(|run| !run.perform_check_only && !run.applied)
+    }
+
+    /// The most recent upgrade or upgrade eligibility check, which `GetUpgradeStatus`
+    /// reports on.
+    pub fn latest_upgrade(&self) -> Option<&UpgradeRun> {
+        self.upgrades.back()
+    }
+
     /// Materialise the configuration change the clock owes this domain, if `now` is
     /// past its due instant: the change lands, so the domain stops `Processing` and
     /// its options go `Active`.
@@ -1740,6 +2026,23 @@ impl Domain {
         // same clock, and likewise on its own span.
         for association in self.package_associations.values_mut() {
             association.settle(now);
+        }
+        // An engine version upgrade is owed its completion by the same clock, on the
+        // span the call that started it recorded: once that has passed the domain runs
+        // the version it was upgraded to, and the advanced options that upgrade carried
+        // are the domain's. It lands exactly once, however many callers read the
+        // record afterwards.
+        let landed = self
+            .upgrades
+            .back_mut()
+            .filter(|run| !run.perform_check_only && !run.applied && now >= run.completes_at)
+            .map(|run| {
+                run.applied = true;
+                (run.target_version.clone(), run.advanced_options.clone())
+            });
+        if let Some((target_version, advanced_options)) = landed {
+            self.engine_version = target_version;
+            self.advanced_options.extend(advanced_options);
         }
         let Some(due) = self.processing_until else {
             return;
@@ -1800,8 +2103,10 @@ impl Domain {
             // A domain applying a service software deployment is processing too, even
             // when no configuration change is in flight.
             processing: Some(self.processing || self.service_software.deploying()),
-            // No version upgrade is in flight: `UpgradeDomain` is still a stub.
-            upgrade_processing: Some(false),
+            // An engine version upgrade in flight is reported here rather than as a
+            // configuration change: `UpgradeProcessing` is "true if OpenSearch Service
+            // is in the process of a version upgrade".
+            upgrade_processing: Some(self.upgrade_in_flight()),
             engine_version: Some(self.engine_version.clone()),
             cluster_config: self.cluster_config.clone(),
             ebs_options: self.ebs_options.clone(),
@@ -4102,6 +4407,13 @@ pub fn new_reserved_instance_id() -> String {
     new_guid()
 }
 
+/// `UpgradeDomainResponse$UpgradeId`: "the unique identifier of the domain upgrade",
+/// a `GUID` like every other id this service hands out ([`new_guid`]), so no two
+/// runs share one.
+pub fn new_upgrade_id() -> String {
+    new_guid()
+}
+
 /// `DomainStatus$DomainId`: the account the domain belongs to and its name.
 pub fn domain_id(domain_name: &str) -> String {
     format!("{}/{domain_name}", ::engine::emulator_account_id())
@@ -4322,6 +4634,47 @@ pub fn unknown_insight_entity(entity_type: &str) -> ValidationException {
         message: Some(format!(
             "Entity type {entity_type} is not supported. Supported values are \
              {INSIGHT_ENTITY_ACCOUNT} and {INSIGHT_ENTITY_DOMAIN_NAME}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an upgrade whose `TargetVersion` is not a
+/// version the domain can be upgraded to: it names the version the domain runs, the
+/// one that was asked for and the ones it could have been
+/// ([`compatible_target_versions`]), so the caller can fix the request from the
+/// refusal alone.
+pub fn incompatible_target_version(
+    domain_name: &str,
+    source_version: &str,
+    target_version: &str,
+) -> ValidationException {
+    let targets = compatible_target_versions(source_version);
+    ValidationException {
+        message: Some(if targets.is_empty() {
+            format!(
+                "Domain {domain_name} runs {source_version} and cannot be upgraded to \
+                 {target_version}: there is no version to upgrade it to."
+            )
+        } else {
+            format!(
+                "Domain {domain_name} runs {source_version} and cannot be upgraded to \
+                 {target_version}. Compatible target versions: {}.",
+                targets.join(", ")
+            )
+        }),
+    }
+}
+
+/// The `ResourceAlreadyExistsException` payload for an upgrade asked for while the
+/// domain is still performing one: that run already exists, so the refusal names it
+/// rather than the call starting a second.
+pub fn upgrade_already_in_progress(
+    domain_name: &str,
+    upgrade_id: &str,
+) -> ResourceAlreadyExistsException {
+    ResourceAlreadyExistsException {
+        message: Some(format!(
+            "Domain {domain_name} is already performing upgrade {upgrade_id}."
         )),
     }
 }

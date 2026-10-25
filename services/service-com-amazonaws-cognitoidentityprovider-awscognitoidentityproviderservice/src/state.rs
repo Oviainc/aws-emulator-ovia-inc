@@ -1780,6 +1780,30 @@ impl User {
         self.confirmed_device_keys()
     }
 
+    /// Store `options` as this user's SMS MFA configuration, as of `now`.
+    ///
+    /// The submitted list REPLACES what the user held, so an empty list leaves
+    /// the user with no MFA option at all. SMS MFA is activated exactly while an
+    /// option is stored for it, so `UserMFASettingList` gains
+    /// [`SMS_MFA_SETTING`] with the first option and loses it with the last, and
+    /// a factor that is not activated is not one the user prefers, so a
+    /// preference for SMS MFA goes with it. Every other factor's setting is
+    /// untouched: an `MFAOptionType` configures SMS and nothing else.
+    pub fn set_sms_mfa_options(&mut self, options: Vec<MFAOptionType>, now: SystemTime) {
+        let activated = !options.is_empty();
+        self.mfa_options = options;
+        self.mfa_setting_list
+            .retain(|setting| setting != SMS_MFA_SETTING);
+        if activated {
+            self.mfa_setting_list.push(SMS_MFA_SETTING.to_string());
+        } else if self.preferred_mfa_setting.as_deref() == Some(SMS_MFA_SETTING) {
+            self.preferred_mfa_setting = None;
+        }
+        // A successful call stores the submitted configuration over the one the
+        // user held, which is a change to the user record itself.
+        self.user_last_modified_date = now;
+    }
+
     /// Whether the stored password is a temporary one that has outlived
     /// `validity` as of `now`.
     pub fn temporary_password_expired(&self, validity: Duration, now: SystemTime) -> bool {
@@ -2712,6 +2736,103 @@ pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
         "phone_number" => Some("SMS"),
         _ => None,
     }
+}
+
+/// The `UserMFASettingList` value for SMS message MFA: that member is "the MFA
+/// options that are activated for the user. The possible values in this list are
+/// `SMS_MFA`, `EMAIL_OTP`, and `SOFTWARE_TOKEN_MFA`" (this service's model), and
+/// SMS is the one factor an `MFAOptionType` configures.
+pub const SMS_MFA_SETTING: &str = "SMS_MFA";
+
+/// The only `DeliveryMediumType` an `MFAOptionType` may set:
+/// `MFAOptionType.DeliveryMedium` is "the delivery medium to send the MFA code.
+/// You can use this parameter to set only the `SMS` delivery medium value" (this
+/// service's model).
+pub const MFA_OPTION_DELIVERY_MEDIUM: &str = "SMS";
+
+/// The only attribute an `MFAOptionType` may name:
+/// `MFAOptionType.AttributeName` is "the attribute name of the MFA option type.
+/// The only valid value is `phone_number`" (this service's model).
+pub const MFA_OPTION_ATTRIBUTE: &str = "phone_number";
+
+/// Why a submitted `MFAOptionListType` configures no SMS MFA option
+/// ([`sms_mfa_options`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MfaOptionRejection {
+    /// The submitted delivery medium, which is not the one SMS MFA travels by,
+    /// or `None` where the option set no medium at all.
+    DeliveryMedium(Option<String>),
+    /// The submitted attribute name, which is not the one an MFA option may
+    /// name, or `None` where the option named no attribute at all.
+    AttributeName(Option<String>),
+}
+
+impl MfaOptionRejection {
+    /// What the refusal reports: the member of the submitted option that an SMS
+    /// MFA configuration cannot carry, and the value submitted for it. Only
+    /// submitted values are named, so nothing stored is disclosed.
+    pub fn message(&self) -> String {
+        match self {
+            Self::DeliveryMedium(Some(medium)) => format!(
+                "Invalid DeliveryMedium: {medium}, the only delivery medium an MFA option can \
+                 set is {MFA_OPTION_DELIVERY_MEDIUM}"
+            ),
+            Self::DeliveryMedium(None) => format!(
+                "Invalid MFAOptions: an MFA option must set {MFA_OPTION_DELIVERY_MEDIUM} as its \
+                 DeliveryMedium"
+            ),
+            Self::AttributeName(Some(name)) => format!(
+                "Invalid AttributeName: {name}, the only attribute name an MFA option can name \
+                 is {MFA_OPTION_ATTRIBUTE}"
+            ),
+            Self::AttributeName(None) => format!(
+                "Invalid MFAOptions: an MFA option must name {MFA_OPTION_ATTRIBUTE} as its \
+                 AttributeName"
+            ),
+        }
+    }
+}
+
+/// The SMS MFA configuration a submitted `MFAOptionListType` asks one user to
+/// hold, or the refusal it earns.
+///
+/// `MFAOptions` is a parameter "you can use only to set an SMS configuration
+/// that uses SMS for delivery" (`SetUserSettings` and `AdminSetUserSettings` in
+/// this service's model), so every submitted option has to set SMS delivery of
+/// the one attribute an option may name. A user holds ONE value per attribute,
+/// so the same option submitted twice is still one configuration and the
+/// DISTINCT options are what is stored.
+///
+/// A PURE function of the request: it decides the configuration without reading
+/// or writing stored state, so a request refused here writes nothing. Each
+/// submitted option costs one constant-time check and the configuration it
+/// yields holds at most one option per attribute an option may name, so the
+/// length of the submitted list bounds nothing that is stored.
+pub fn sms_mfa_options(
+    requested: &[MFAOptionType],
+) -> Result<Vec<MFAOptionType>, MfaOptionRejection> {
+    let mut stored: Vec<MFAOptionType> = Vec::new();
+    for option in requested {
+        match option.delivery_medium.as_deref() {
+            Some(MFA_OPTION_DELIVERY_MEDIUM) => {}
+            other => {
+                return Err(MfaOptionRejection::DeliveryMedium(
+                    other.map(str::to_string),
+                ))
+            }
+        }
+        match option.attribute_name.as_deref() {
+            Some(MFA_OPTION_ATTRIBUTE) => {}
+            other => return Err(MfaOptionRejection::AttributeName(other.map(str::to_string))),
+        }
+        if !stored
+            .iter()
+            .any(|kept| kept.attribute_name == option.attribute_name)
+        {
+            stored.push(option.clone());
+        }
+    }
+    Ok(stored)
 }
 
 /// Where a password-reset message for one user goes

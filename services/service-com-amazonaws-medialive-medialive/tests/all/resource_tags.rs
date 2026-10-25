@@ -61,7 +61,7 @@ fn tags_uri(arn: &str) -> String {
 }
 
 /// `CreateTags` on `arn` with `tags` as its body.
-async fn create_tags(router: &MultiServiceRouter, arn: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create_tags(router: &MultiServiceRouter, arn: &str, body: Value) -> (u16, Value) {
     call(router, "POST", &tags_uri(arn), Some(body)).await
 }
 
@@ -72,7 +72,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 
 /// `DeleteTags` on `arn`. `TagKeys` is an `@httpQuery` list, so each key is one
 /// repetition of the `tagKeys` parameter.
-async fn delete_tags(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> (u16, Value) {
+pub(crate) async fn delete_tags(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -> (u16, Value) {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", percent_encoded(key)))
@@ -101,7 +101,7 @@ fn tag_map(case: &str, body: &Value) -> Map<String, Value> {
 
 /// The tags `ListTagsForResource` reports for `arn`, with the read itself
 /// asserted to have succeeded.
-async fn listed_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Map<String, Value> {
+pub(crate) async fn listed_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Map<String, Value> {
     let (status, body) = list_tags(router, arn).await;
     assert_eq!(
         status, 200,
@@ -111,7 +111,7 @@ async fn listed_tags(router: &MultiServiceRouter, case: &str, arn: &str) -> Map<
 }
 
 /// A `Tags` map as a request body carries it.
-fn tags(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> Value {
     Value::Object(
         pairs
             .iter()
@@ -121,7 +121,7 @@ fn tags(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// The same pairs as the map a response must report.
-fn expected(pairs: &[(&str, &str)]) -> Map<String, Value> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> Map<String, Value> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), json!(value)))
@@ -134,7 +134,7 @@ fn expected(pairs: &[(&str, &str)]) -> Map<String, Value> {
 /// Each arm is the kind's own implemented create, so what the tag tests address
 /// is a resource this store really holds. A signal map needs an existing
 /// resource to discover from, so its arm creates the channel it maps.
-async fn create_resource(
+pub(crate) async fn create_resource(
     router: &MultiServiceRouter,
     kind: &str,
     label: &str,
