@@ -475,6 +475,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption: encryption.clone(),
             checksum_algorithm: input.checksum_algorithm.clone(),
             checksum_type: input.checksum_type.clone(),
+            // An initiation records an upload with no part at all: "You must initiate a
+            // multipart upload … before you can upload any part" (`UploadPart`'s own
+            // documentation), so the parts arrive afterwards, through `UploadPart`.
+            parts: ::std::collections::BTreeMap::new(),
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
