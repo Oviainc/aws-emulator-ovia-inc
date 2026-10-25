@@ -45,6 +45,8 @@ mod package_registry;
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
 mod reserved_instances;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/scheduled_actions.rs"]
 mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]

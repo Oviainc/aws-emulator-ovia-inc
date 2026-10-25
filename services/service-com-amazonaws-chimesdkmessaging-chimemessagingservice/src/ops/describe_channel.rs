@@ -170,6 +170,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!("channel {} not found", input.channel_arn)),
             })
         })?;
+        // A ban puts a member outside the channel altogether, and a PRIVATE channel is
+        // its members' to read.
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(DescribeChannelErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(reason.to_string()),
+            })
+            .into());
+        }
 
         Ok(DescribeChannelOutput {
             channel: Some(channel.to_channel()),

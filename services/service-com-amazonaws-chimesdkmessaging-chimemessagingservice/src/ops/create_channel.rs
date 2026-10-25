@@ -8,10 +8,11 @@
 //! see the same record. Replaying the same `ClientRequestToken` answers with the ARN the
 //! first call minted.
 //!
-//! `MemberArns` and `ModeratorArns` are REFUSED rather than accepted: channel
-//! memberships and moderators are resources of their own and every operation that
-//! creates or reads them is still a 501, so accepting them would answer 201 for work
-//! nothing performed.
+//! The caller is the channel's first member and its first moderator, and `MemberArns` /
+//! `ModeratorArns` add the members and moderators the channel starts with — the same
+//! records `CreateChannelMembership` / `CreateChannelModerator` create, read back by
+//! `DescribeChannelMembership`, `ListChannelMemberships`, `DescribeChannelModerator` and
+//! `ListChannelModerators`.
 //!
 //! `ExpirationSettings` is persisted and reported by `DescribeChannel`, which is the
 //! provisioning half of the feature; the automatic deletion that interval owes is NOT
@@ -222,25 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Channel memberships and moderators are resources of their own, created by
-        // `CreateChannelMembership` / `CreateChannelModerator` and read back by
-        // `ListChannelMemberships` / `ListChannelModerators` — every one of which is
-        // still a 501 in this emulator. Accepting these members would answer 201 for
-        // memberships nothing created and no caller could observe, so the request is
-        // refused instead, the same way `SubChannelId` is.
-        if let Some(member_arns) = &input.member_arns {
-            return Err(bad_request(format!(
-                "MemberArns is not supported: this emulator does not serve channel memberships yet, so the {} member ARN(s) in the request would not be added to the channel",
-                member_arns.len()
-            )));
-        }
-        if let Some(moderator_arns) = &input.moderator_arns {
-            return Err(bad_request(format!(
-                "ModeratorArns is not supported: this emulator does not serve channel moderators yet, so the {} moderator ARN(s) in the request would not be added to the channel",
-                moderator_arns.len()
-            )));
-        }
-
         let idempotency_key = (
             input.app_instance_arn.clone(),
             input.client_request_token.clone(),
@@ -249,10 +231,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A replayed @idempotencyToken answers with the result the first request
-        // produced, rather than minting a second channel.
-        if let Some(first) = store.remembered_channel(&idempotency_key) {
+        // produced, rather than minting a second channel — and the same token carrying a
+        // DIFFERENT request is a CONFLICT rather than either of those, which is the same
+        // rule `SendChannelMessage` applies to its own token. The comparison is against
+        // the stored channel, so a token whose channel was since deleted is still
+        // answered with the ARN it first returned.
+        if let Some(first) = store.remembered_channel(&idempotency_key).cloned() {
+            if let Some(existing) = store.channels.get(&first) {
+                let same_request = existing.name == input.name
+                    && existing.mode == mode
+                    && existing.privacy == privacy
+                    && existing.metadata == input.metadata
+                    && input
+                        .channel_id
+                        .as_ref()
+                        .is_none_or(|channel_id| *channel_id == existing.channel_id);
+                if !same_request {
+                    return Err(CreateChannelErrorModeled::ConflictException(ConflictException {
+                        code: Some("Conflict".to_string()),
+                        message: Some(crate::state::TOKEN_CONFLICT_MESSAGE.to_string()),
+                    })
+                    .into());
+                }
+            }
             return Ok(CreateChannelOutput {
-                channel_arn: Some(first.clone()),
+                channel_arn: Some(first),
             });
         }
 
@@ -292,6 +295,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The caller that creates a channel is its first member AND its first moderator:
+        // the model's `Mode` documentation describes "administrators, moderators, and
+        // channel members" adding members, and a creator who was neither could not send
+        // the first message to the channel it just created.
+        let creator = crate::state::identity_of(&input.chime_bearer);
+        let mut memberships = vec![crate::state::ChannelMembershipRecord {
+            member_arn: input.chime_bearer.clone(),
+            r#type: "DEFAULT".to_string(),
+            invited_by: creator.clone(),
+            created_millis: now,
+            last_updated_millis: now,
+        }];
+        let mut moderators = vec![crate::state::ChannelModeratorRecord {
+            moderator_arn: input.chime_bearer.clone(),
+            created_by: creator.clone(),
+            created_millis: now,
+        }];
+        // `MemberArns` and `ModeratorArns` are the members and moderators the channel
+        // starts with, so each becomes the same record `CreateChannelMembership` /
+        // `CreateChannelModerator` would have created, readable through
+        // `ListChannelMemberships` / `ListChannelModerators`. An ARN named twice, or named
+        // beside the creator, is one member: the channel holds a SET of them.
+        for member_arn in input.member_arns.into_iter().flatten() {
+            if memberships.iter().any(|m| m.member_arn == member_arn) {
+                continue;
+            }
+            if memberships.len() >= crate::state::MAX_MEMBERSHIPS_PER_CHANNEL {
+                return Err(resource_limit_exceeded(format!(
+                    "this emulator holds at most {} memberships per channel",
+                    crate::state::MAX_MEMBERSHIPS_PER_CHANNEL
+                )));
+            }
+            memberships.push(crate::state::ChannelMembershipRecord {
+                member_arn,
+                r#type: "DEFAULT".to_string(),
+                invited_by: creator.clone(),
+                created_millis: now,
+                last_updated_millis: now,
+            });
+        }
+        for moderator_arn in input.moderator_arns.into_iter().flatten() {
+            if moderators.iter().any(|m| m.moderator_arn == moderator_arn) {
+                continue;
+            }
+            if moderators.len() >= crate::state::MAX_MODERATORS_PER_CHANNEL {
+                return Err(resource_limit_exceeded(format!(
+                    "this emulator holds at most {} moderators per channel",
+                    crate::state::MAX_MODERATORS_PER_CHANNEL
+                )));
+            }
+            moderators.push(crate::state::ChannelModeratorRecord {
+                moderator_arn,
+                created_by: creator.clone(),
+                created_millis: now,
+            });
+        }
+
         store.channels.insert(
             arn.clone(),
             crate::state::ChannelRecord {
@@ -302,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 mode,
                 privacy,
                 metadata: input.metadata,
-                created_by: crate::state::identity_of(&input.chime_bearer),
+                created_by: creator,
                 created_millis: now,
                 last_updated_millis: now,
                 // No message has been sent yet, so the channel has no last-message time.
@@ -312,6 +372,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 messages: Vec::new(),
                 message_idempotency: std::collections::HashMap::new(),
+                memberships,
+                bans: Vec::new(),
+                moderators,
             },
         );
         store.remember_channel(idempotency_key, arn.clone());
@@ -324,6 +387,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// `ChimeArn`'s modelled maximum length, which the derived channel ARN must respect.
 const CHIME_ARN_MAX_LENGTH: usize = 1600;
+
+/// Refuse the request with the modelled quota error for a collection this emulator caps.
+fn resource_limit_exceeded(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::ResourceLimitExceededException(ResourceLimitExceededException {
+        code: Some("ResourceLimitExceeded".to_string()),
+        message: Some(message),
+    })
+    .into()
+}
 
 /// Refuse the request with this service's own client-input error, HTTP 400.
 fn bad_request(message: String) -> CreateChannelError {

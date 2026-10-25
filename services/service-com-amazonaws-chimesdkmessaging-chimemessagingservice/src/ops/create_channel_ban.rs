@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelBan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelBan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelBan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Bans `MemberArn` from the stored channel and PERSISTS the ban on that channel's
+//! record, so `DescribeChannelBan`, `ListChannelBans` and `CreateChannelMembership` all
+//! read the same set. The model documents both consequences: a banned member cannot be
+//! added back until `DeleteChannelBan` removes the ban, and a member who is banned is
+//! removed from the channel — so the ban drops their membership here.
+//!
+//! Banning is a moderator's action, one of the capabilities the model lists on
+//! `CreateChannelModerator`.
 //!
 //! ## Shape of an operation
 //!
@@ -105,10 +105,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `CreateChannelBanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#CreateChannelBan")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`DescribeChannelBan` lists it) that this operation's own error list omits: a ban on a
+// channel ARN that names no channel has to say the channel is not there, and answering
+// 400 would tell the caller its REQUEST was malformed when it was not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#CreateChannelBan",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateChannelBanErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ResourceLimitExceededException(ResourceLimitExceededException),
@@ -167,20 +175,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelBan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelBanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelBan"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelBanErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            CreateChannelBanErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+
+        if !channel.is_moderator(&input.chime_bearer) {
+            return Err(CreateChannelBanErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // The ban is a SET: banning a member the channel already bans answers with the
+        // ban it already holds rather than recording a second one.
+        if channel.ban(&input.member_arn).is_none() {
+            if channel.bans.len() >= crate::state::MAX_BANS_PER_CHANNEL {
+                return Err(CreateChannelBanErrorModeled::ResourceLimitExceededException(
+                    ResourceLimitExceededException {
+                        code: Some("ResourceLimitExceeded".to_string()),
+                        message: Some(format!(
+                            "this emulator holds at most {} bans per channel",
+                            crate::state::MAX_BANS_PER_CHANNEL
+                        )),
+                    },
+                )
+                .into());
+            }
+            channel.bans.push(crate::state::ChannelBanRecord {
+                member_arn: input.member_arn.clone(),
+                created_by: crate::state::identity_of(&input.chime_bearer),
+                created_millis: now,
+            });
+        }
+        // A banned member is out of the channel, as the model documents.
+        channel.remove_membership(&input.member_arn);
+
+        Ok(CreateChannelBanOutput {
+            channel_arn: Some(channel.arn.clone()),
+            member: Some(crate::state::identity_of(&input.member_arn)),
+        })
     }
 }

@@ -523,8 +523,10 @@ struct MessageCase {
 
 /// RULE: `GetChannelMessage` returns the message `SendChannelMessage` appended to the
 /// channel — its content, type, persistence, metadata, content type and attributes as
-/// sent, its `Sender` the calling bearer, `Redacted` false and `Status.Value` `SENT`;
-/// and only a PERSISTENT message advances the channel's `LastMessageTimestamp`.
+/// sent, its `Sender` the calling bearer, `Redacted` false and `Status.Value` `SENT` —
+/// for a PERSISTENT message. A NON_PERSISTENT message is accepted and NOT persisted, so
+/// nothing reports it afterwards and it does not advance the channel's
+/// `LastMessageTimestamp`.
 ///
 /// The rows cover every combination of the `ChannelMessageType` and
 /// `ChannelMessagePersistenceType` catalogs the model declares, with the optional
@@ -636,6 +638,43 @@ async fn get_channel_message_returns_the_message_that_was_sent() {
             sent.body["Status"]
         );
 
+        // `Persistence` is what the model says controls whether a message is persisted on
+        // the back end, so a NON_PERSISTENT message is not there to be read back.
+        if case.persistence == "NON_PERSISTENT" {
+            let got = emulator.get_message(&channel, &message_id).await;
+            assert_eq!(
+                got.status, 403,
+                "case {:?}: a NON_PERSISTENT message must not be readable, got {} {:?}",
+                case.label, got.status, got.body
+            );
+            assert_eq!(
+                got.error_code(),
+                "ForbiddenException",
+                "case {:?}: wrong error code for a NON_PERSISTENT read-back, body {:?}",
+                case.label,
+                got.body
+            );
+            let listed = emulator.list_messages(&channel, &[]).await;
+            assert_eq!(
+                listed.body["ChannelMessages"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                0,
+                "case {:?}: a NON_PERSISTENT message must not be listed, got {:?}",
+                case.label,
+                listed.body
+            );
+            let described = emulator.describe_channel(&channel).await;
+            let last_message = described.body["Channel"].get("LastMessageTimestamp");
+            assert!(
+                last_message.is_none(),
+                "case {:?}: a NON_PERSISTENT send must not advance LastMessageTimestamp, got {last_message:?}",
+                case.label
+            );
+            continue;
+        }
+
         let got = emulator.get_message(&channel, &message_id).await;
         assert_eq!(
             got.status, 200,
@@ -737,19 +776,11 @@ async fn get_channel_message_returns_the_message_that_was_sent() {
         // message moves the channel's last-message time.
         let described = emulator.describe_channel(&channel).await;
         let last_message = described.body["Channel"].get("LastMessageTimestamp");
-        if case.persistence == "PERSISTENT" {
-            assert!(
-                last_message.is_some_and(Value::is_number),
-                "case {:?}: a PERSISTENT send must advance LastMessageTimestamp, got {last_message:?}",
-                case.label
-            );
-        } else {
-            assert!(
-                last_message.is_none(),
-                "case {:?}: a NON_PERSISTENT send must not advance LastMessageTimestamp, got {last_message:?}",
-                case.label
-            );
-        }
+        assert!(
+            last_message.is_some_and(Value::is_number),
+            "case {:?}: a PERSISTENT send must advance LastMessageTimestamp, got {last_message:?}",
+            case.label
+        );
     }
 }
 
@@ -1169,15 +1200,17 @@ async fn list_channel_messages_honours_the_not_before_and_not_after_bounds() {
 // ListChannels
 // ---------------------------------------------------------------------------
 
-/// RULE: `ListChannels` returns the stored channels of the requested `AppInstanceArn`
-/// only, narrowed by `privacy` when given, paged by `max-results` with a `NextToken`
-/// that resumes the same ordered view.
+/// RULE: `ListChannels` returns the stored PUBLIC channels of the requested
+/// `AppInstanceArn` only, paged by `max-results` with a `NextToken` that resumes the same
+/// ordered view — and a request for `privacy=PRIVATE`, which the model reserves for an
+/// `AppInstanceAdmin`, is refused with the modelled 403 rather than served.
 #[tokio::test]
 async fn list_channels_filters_by_app_instance_and_privacy_and_pages() {
     let emulator = Emulator::new();
     for (index, (app_instance, name, privacy)) in [
         (APP_INSTANCE, "pub-a", "PUBLIC"),
         (APP_INSTANCE, "pub-b", "PUBLIC"),
+        (APP_INSTANCE, "pub-c", "PUBLIC"),
         (APP_INSTANCE, "priv-a", "PRIVATE"),
         (OTHER_APP_INSTANCE, "other", "PUBLIC"),
     ]
@@ -1203,7 +1236,7 @@ async fn list_channels_filters_by_app_instance_and_privacy_and_pages() {
         FilterCase {
             label: "one app instance's channels",
             params: vec![("app-instance-arn", APP_INSTANCE.to_string())],
-            expected: vec!["priv-a", "pub-a", "pub-b"],
+            expected: vec!["pub-a", "pub-b", "pub-c"],
         },
         FilterCase {
             label: "the other app instance's channels",
@@ -1216,15 +1249,7 @@ async fn list_channels_filters_by_app_instance_and_privacy_and_pages() {
                 ("app-instance-arn", APP_INSTANCE.to_string()),
                 ("privacy", "PUBLIC".to_string()),
             ],
-            expected: vec!["pub-a", "pub-b"],
-        },
-        FilterCase {
-            label: "narrowed to PRIVATE",
-            params: vec![
-                ("app-instance-arn", APP_INSTANCE.to_string()),
-                ("privacy", "PRIVATE".to_string()),
-            ],
-            expected: vec!["priv-a"],
+            expected: vec!["pub-a", "pub-b", "pub-c"],
         },
     ];
 
@@ -1248,6 +1273,28 @@ async fn list_channels_filters_by_app_instance_and_privacy_and_pages() {
             "case {label:?}: wrong channels listed"
         );
     }
+
+    // Only an administrator may ask for the private channels, and this service holds
+    // none: the request is refused rather than answered with the private channel it
+    // stores.
+    let private = emulator
+        .list_channels(&[
+            ("app-instance-arn", APP_INSTANCE.to_string()),
+            ("privacy", "PRIVATE".to_string()),
+        ])
+        .await;
+    assert_eq!(
+        private.status, 403,
+        "case {:?}: must be refused with 403, got {} {:?}",
+        "narrowed to PRIVATE", private.status, private.body
+    );
+    assert_eq!(
+        private.error_code(),
+        "ForbiddenException",
+        "case {:?}: wrong error code, body {:?}",
+        "narrowed to PRIVATE",
+        private.body
+    );
 
     // Paged one at a time, the same three channels arrive once each.
     for page_size in [1, 2, 3] {
@@ -1383,15 +1430,19 @@ async fn deleting_a_channel_is_observable_to_every_later_read() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// RULE: a read of a channel or message this service does not hold is a modelled 404
-/// `NotFoundException`, never an empty success.
+/// RULE: a read of a CHANNEL this service does not hold is a modelled 404
+/// `NotFoundException`, never an empty success; a read of a MESSAGE the channel does not
+/// hold is the modelled 403 `ForbiddenException`, which is the only message-level refusal
+/// the model gives the message operations (`RedactChannelMessage`,
+/// `UpdateChannelMessage` and `DeleteChannelMessage` declare no `NotFoundException` at
+/// all).
 #[tokio::test]
-async fn reads_of_a_resource_that_does_not_exist_answer_404() {
+async fn reads_of_a_resource_that_does_not_exist_are_refused() {
     let emulator = Emulator::new();
     let missing = format!("{APP_INSTANCE}/channel/does-not-exist");
     let channel = emulator.channel(APP_INSTANCE, "present", "present-chan").await;
 
-    let cases = [
+    let absent_channel = [
         ("DescribeChannel", emulator.describe_channel(&missing).await),
         (
             "SendChannelMessage",
@@ -1415,14 +1466,10 @@ async fn reads_of_a_resource_that_does_not_exist_answer_404() {
             "GetChannelMessage, unknown channel",
             emulator.get_message(&missing, "whatever").await,
         ),
-        (
-            "GetChannelMessage, unknown message in a known channel",
-            emulator.get_message(&channel, "no-such-message").await,
-        ),
         ("DeleteChannel", emulator.delete_channel(&missing).await),
     ];
 
-    for (label, reply) in cases {
+    for (label, reply) in absent_channel {
         assert_eq!(
             reply.status, 404,
             "case {label:?}: must answer 404, got {} {:?}",
@@ -1431,6 +1478,24 @@ async fn reads_of_a_resource_that_does_not_exist_answer_404() {
         assert_eq!(
             reply.error_code(),
             "NotFoundException",
+            "case {label:?}: wrong error code, body {:?}",
+            reply.body
+        );
+    }
+
+    let absent_message = [(
+        "GetChannelMessage, unknown message in a known channel",
+        emulator.get_message(&channel, "no-such-message").await,
+    )];
+    for (label, reply) in absent_message {
+        assert_eq!(
+            reply.status, 403,
+            "case {label:?}: must answer 403, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "ForbiddenException",
             "case {label:?}: wrong error code, body {:?}",
             reply.body
         );
@@ -1509,31 +1574,6 @@ async fn requests_outside_the_modelled_constraints_are_refused() {
                         "ClientRequestToken": "bad-persistence-token",
                     }),
                 )
-                .await,
-        ),
-        (
-            "MemberArns, which no implemented operation could add",
-            emulator
-                .create_channel(&json!({
-                    "AppInstanceArn": APP_INSTANCE,
-                    "Name": "with-members",
-                    "MemberArns": [format!("{APP_INSTANCE}/user/bob")],
-                    "ClientRequestToken": "members-token",
-                }))
-                .await,
-        ),
-        (
-            "ModeratorArns, which no implemented operation could add",
-            emulator
-                .create_channel(&json!({
-                    "AppInstanceArn": APP_INSTANCE,
-                    "Name": "with-moderators",
-                    "ModeratorArns": [
-                        format!("{APP_INSTANCE}/user/bob"),
-                        format!("{APP_INSTANCE}/user/carol"),
-                    ],
-                    "ClientRequestToken": "moderators-token",
-                }))
                 .await,
         ),
         (
@@ -1796,8 +1836,8 @@ async fn a_channel_keeps_at_most_the_capped_number_of_messages() {
 
     let evicted = emulator.get_message(&channel, &first_message_id).await;
     assert_eq!(
-        evicted.status, 404,
-        "case the evicted message: GetChannelMessage must answer 404, got {} {:?}",
+        evicted.status, 403,
+        "case the evicted message: GetChannelMessage must refuse a message the channel no longer holds, got {} {:?}",
         evicted.status, evicted.body
     );
 }
@@ -1861,8 +1901,8 @@ async fn a_channel_keeps_at_most_the_capped_number_of_message_bytes() {
     );
     let evicted = emulator.get_message(&channel, &first_message_id).await;
     assert_eq!(
-        evicted.status, 404,
-        "case the evicted big message: GetChannelMessage must answer 404, got {} {:?}",
+        evicted.status, 403,
+        "case the evicted big message: GetChannelMessage must refuse a message the channel no longer holds, got {} {:?}",
         evicted.status, evicted.body
     );
 

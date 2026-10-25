@@ -2,10 +2,14 @@
 
 //! @op SendChannelMessage
 //!
-//! APPENDS a message to the stored channel named by `ChannelArn` and answers with the
-//! `MessageId` it minted, so `GetChannelMessage` and `ListChannelMessages` can read the
-//! same record back. A PERSISTENT message also advances the channel's
-//! `LastMessageTimestamp`, which `DescribeChannel` and `ListChannels` report.
+//! APPENDS a PERSISTENT message to the stored channel named by `ChannelArn` and answers
+//! with the `MessageId` it minted, so `GetChannelMessage` and `ListChannelMessages` can
+//! read the same record back, and advances the channel's `LastMessageTimestamp`, which
+//! `DescribeChannel` and `ListChannels` report. A NON_PERSISTENT message is NOT kept:
+//! `Persistence` is what the model says controls whether a message is persisted, so
+//! nothing reports it afterwards.
+//!
+//! Sending is a member's action, and a member the channel banned cannot send.
 //!
 //! `Content` is modelled with no maximum length, and neither `MessageAttributes` nor its
 //! `StringValues` carries a modelled length, so a message larger than
@@ -279,6 +283,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Sending is a MEMBER's action on both a public and a private channel — the rule
+        // the model states on `CreateChannelMembership` — and a moderator of the channel
+        // acts on it the same way.
+        if channel.is_banned(&input.chime_bearer) {
+            // A banned member is out of the channel, so it cannot send to it either, and
+            // the refusal names the ban.
+            return Err(SendChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::BANNED_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        if !channel.is_member(&input.chime_bearer) && !channel.is_moderator(&input.chime_bearer) {
+            return Err(forbidden());
+        }
+
         // A replayed @idempotencyToken answers with the message the first send appended,
         // rather than appending a second copy of it.
         if let Some(message_id) = channel.message_idempotency.get(&input.client_request_token) {
@@ -290,6 +310,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
             })?;
+            // An idempotency token stands for ONE request. The same token carrying
+            // different content is a DIFFERENT request, which cannot be answered with the
+            // first message and must not append a second: it is a conflict.
+            if existing.redacted || existing.content != input.content {
+                return Err(SendChannelMessageErrorModeled::ConflictException(ConflictException {
+                    code: Some("Conflict".to_string()),
+                    message: Some(crate::state::TOKEN_CONFLICT_MESSAGE.to_string()),
+                })
+                .into());
+            }
             return Ok(SendChannelMessageOutput {
                 channel_arn: Some(input.channel_arn.clone()),
                 message_id: Some(existing.message_id.clone()),
@@ -317,14 +347,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let message_id = message.message_id.clone();
         let status = message.status_structure();
-        // Only a PERSISTENT message is kept for a channel's members to read later, so
-        // only a PERSISTENT message moves the channel's last-message time.
+        // `Persistence` is what decides whether the message is kept: a PERSISTENT message
+        // is stored for the channel's readers and advances the channel's last-message
+        // time, a NON_PERSISTENT one is delivered and NOT persisted, so no later
+        // `GetChannelMessage` or `ListChannelMessages` can report it.
         if message.persistence == "PERSISTENT" {
             channel.last_message_millis = Some(now);
+            // `append_message` is what keeps the channel's messages and its per-channel
+            // idempotency records inside their caps, evicting oldest-first.
+            channel.append_message(message, input.client_request_token);
         }
-        // `append_message` is what keeps the channel's messages and its per-channel
-        // idempotency records inside their caps, evicting oldest-first.
-        channel.append_message(message, input.client_request_token);
 
         Ok(SendChannelMessageOutput {
             channel_arn: Some(input.channel_arn),
@@ -340,6 +372,16 @@ fn bad_request(message: String) -> SendChannelMessageError {
     SendChannelMessageErrorModeled::BadRequestException(BadRequestException {
         code: Some("BadRequest".to_string()),
         message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the caller with the modelled 403 for an action its role on the channel does
+/// not carry.
+fn forbidden() -> SendChannelMessageError {
+    SendChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
     })
     .into()
 }
