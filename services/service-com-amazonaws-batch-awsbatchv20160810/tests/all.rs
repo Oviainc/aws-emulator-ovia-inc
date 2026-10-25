@@ -39,6 +39,8 @@ mod refusal_contract;
 mod resource_tags;
 #[path = "all/scheduling_policies.rs"]
 mod scheduling_policies;
+#[path = "all/scheduling_policy_listing.rs"]
+mod scheduling_policy_listing;
 #[path = "all/scheduling_policy_refusal_messages.rs"]
 mod scheduling_policy_refusal_messages;
 #[path = "all/scheduling_policy_teardown_and_conflicts.rs"]

@@ -5378,6 +5378,25 @@ pub fn resource_not_found_message(resource_kind: &str) -> String {
     format!("The specified {resource_kind} does not exist.")
 }
 
+/// The refusal CloudWatch Logs answers when the missing resource is one the request
+/// IDENTIFIES NOTHING OF: a log-group level policy document addressed by the identifier of
+/// the log group it is attached to and by nothing else, which that group does not hold. The
+/// service says nothing about the resource in that case — the text is fixed for the error
+/// class and interpolates neither a log group, nor a name, nor a resource kind — unlike a
+/// request naming a log group or a log stream the account does not hold, which is refused
+/// by [`resource_not_found_message`] naming that resource, and unlike a policy the request
+/// names, which is refused by [`policy_not_found_message`] carrying that name.
+pub const UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Specified resource does not exist!";
+
+/// The refusal CloudWatch Logs answers a resource-policy write or delete with when the
+/// `expectedRevisionId` it presents is not the policy's current revision: the revision the
+/// caller held was superseded, which the service reports as a conflict against the resource
+/// that the caller is to re-read and retry. The text is fixed for the error class — it
+/// interpolates neither the revision presented, nor the stored one, nor the policy's name
+/// or resource.
+pub const POLICY_REVISION_CONFLICT_MESSAGE: &str =
+    "A conflicting operation is currently in progress against this resource. Please try again.";
+
 /// The refusal CloudWatch Logs answers a delivery-destination POLICY operation with when the
 /// `deliveryDestinationName` it names is not one this account holds. The delivery destination
 /// policy operations state that the requested destination is not in the account rather than

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the stored specification of ONE anomaly detector addressed
+//! inside its workspace — the configuration, the evaluation interval, the missing-data
+//! action and the metric labels — moves it to `UPDATING` while the clock owes its
+//! retraining ([`crate::state::TRANSITION_DELAY`]), and answers from the PERSISTED
+//! record. `clientToken` makes a replay of the pending update the same request.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAnomalyDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY handler to touch for this operation; the rules it shares with the
+//! other detector operations live in [`crate::state`].
+//!
+//! The operation's own documentation below calls itself "the single method for creating,
+//! updating, and retraining anomaly detectors", but the MODEL does not let this request
+//! create one: it carries no `alias`, and `alias` is `@required` on both shapes that
+//! report a detector (`AnomalyDetectorDescription`, `AnomalyDetectorSummary`), so a
+//! detector minted here could not be read back. An `anomalyDetectorId` naming no stored
+//! detector is therefore answered the way every other operation on this path answers an
+//! id that resolves to nothing — `ResourceNotFoundException` — and creating a detector
+//! stays with `CreateAnomalyDetector`, which is where `alias` is given. That missing
+//! create-if-absent path is tracked as its own open issue
+//! (`amp-putanomalydetector-does-not-create-an-absent-detector`).
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +106,10 @@
 //! * `ConflictException` (HTTP 409) — The request would cause an inconsistent state.
 //! * `InternalServerException` (HTTP 500) — An unexpected error occurred during the
 //!   processing of the request.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): both path labels name a resource that has to resolve before anything can be
+//!   stored, and the shape is one this SERVICE models (every other operation addressed by
+//!   this path lists it); only this operation's `errors` list omits it.
 //! * `ServiceQuotaExceededException` (HTTP 402) — Completing the request would cause a
 //!   service quota to be exceeded.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
@@ -116,12 +130,24 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-amp-amazonprometheusser
 // here — hence the `PutAnomalyDetectorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amp#PutAnomalyDetector")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`, exactly as
+// `CreateAnomalyDetector` widens it: this operation is addressed by
+// `/workspaces/{workspaceId}/anomalydetectors/{anomalyDetectorId}`, both labels name a
+// resource that has to resolve before anything can be stored, and the shape is one this
+// SERVICE models (`com.amazonaws.amp#ResourceNotFoundException`, @httpError 404, with
+// @required `resourceId` and `resourceType`) and every other operation on that same path
+// lists. Only this operation's own `errors` list omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amp#PutAnomalyDetector",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum PutAnomalyDetectorErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -178,18 +204,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAnomalyDetectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The rules this service enforces on the request's OWN members are checked before
+        // either path label is resolved, so a member the caller got wrong is reported
+        // whatever the addressed resources turn out to be.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAnomalyDetector"))
+        // A map's KEYS carry the key shape's own modelled constraints, and nothing in the
+        // request walk applies them (see the map-keys section of `crate::state`).
+        crate::state::check_map_keys(
+            "labels",
+            input.labels.iter().flat_map(|labels| labels.keys()),
+            &crate::state::PROMETHEUS_METRIC_LABEL_KEY,
+        )
+        .map_err(PutAnomalyDetectorErrorModeled::ValidationException)?;
+        // The configuration's own rule, shared with every operation that stores one.
+        crate::state::check_random_cut_forest_configuration(&input.configuration)
+            .map_err(PutAnomalyDetectorErrorModeled::ValidationException)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // Both path labels name a resource that must resolve before anything is stored:
+        // the detector lives INSIDE the workspace this request addresses, so a workspace
+        // this account does not hold is a not-found, answered the way every other
+        // operation on `/workspaces/{workspaceId}` answers it.
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(not_found(
+                crate::state::WORKSPACE_NOT_FOUND_MESSAGE,
+                &input.workspace_id,
+                crate::state::WORKSPACE_RESOURCE_TYPE,
+            ));
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let workspace_status = workspace.status_code.clone();
+
+        // `anomalyDetectorId` addresses a detector INSIDE that workspace, and this
+        // request carries no `alias` — a member `AnomalyDetectorDescription` and
+        // `AnomalyDetectorSummary` both make @required, so every reader of a detector
+        // reports one. A detector that does not already exist therefore cannot be brought
+        // into existence by this call, whatever id it names: the id is a not-found, just
+        // as it is for the describe and the delete addressed by this same path. Creating a
+        // detector is `CreateAnomalyDetector`, which is where `alias` is given.
+        let Some(detector) = workspace
+            .anomaly_detectors
+            .get_mut(&input.anomaly_detector_id)
+        else {
+            return Err(not_found(
+                crate::state::ANOMALY_DETECTOR_NOT_FOUND_MESSAGE,
+                &input.anomaly_detector_id,
+                crate::state::ANOMALY_DETECTOR_RESOURCE_TYPE,
+            ));
+        };
+
+        // `clientToken` carries `@idempotencyToken`: re-sending the very call that started
+        // the pending retraining is that same call, so it is accepted again and answers
+        // from the record it already wrote, instead of applying the change twice or pushing
+        // the owed settling out. `materialize_due` forgets the token once the update
+        // settles, so a later call reusing it is a new request.
+        let replays_pending_update = input.client_token.is_some()
+            && detector.update_token == input.client_token
+            && detector.status_code == crate::state::STATUS_UPDATING;
+
+        // A detector that is not usable yet — still being created, still settling a
+        // previous retraining, or being deleted — cannot take a new specification, and
+        // neither can one inside a workspace that is not usable: that would leave state
+        // that cannot hold together, which is what `ConflictException` (409) is modelled
+        // for ("The request would cause an inconsistent state"). `ACTIVE` is the one
+        // usable status, as it is for every other resource of this service.
+        if !replays_pending_update {
+            if workspace_status != crate::state::STATUS_ACTIVE {
+                return Err(conflict(
+                    format!(
+                        "The workspace is {workspace_status}; updates are allowed only when \
+                         status is {}",
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    workspace_id,
+                    crate::state::WORKSPACE_RESOURCE_TYPE,
+                ));
+            }
+            if detector.status_code != crate::state::STATUS_ACTIVE {
+                return Err(conflict(
+                    format!(
+                        "The anomaly detector is {}; updates are allowed only when status is {}",
+                        detector.status_code,
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    detector.anomaly_detector_id.clone(),
+                    crate::state::ANOMALY_DETECTOR_RESOURCE_TYPE,
+                ));
+            }
+
+            // The update itself. This operation "serves as the single method for creating,
+            // updating, and retraining anomaly detectors": the request carries the
+            // detector's WHOLE specification, so each stored member is replaced by what it
+            // carries — including the optional ones, which a request that omits them
+            // clears. `configuration` and `evaluationIntervalInSeconds` are modelled
+            // @required (the interval with a default of 60, applied by the request walk),
+            // so both always arrive.
+            //
+            // `alias` and `tags` are not inputs of this operation at all, so the stored
+            // ones are left alone — and the ARN and the creation instant still identify
+            // the same resource. Only `modifiedAt` moves, because this is when the
+            // detector was last changed.
+            detector.configuration = input.configuration;
+            detector.evaluation_interval_in_seconds = input.evaluation_interval_in_seconds;
+            detector.missing_data_action = input.missing_data_action;
+            detector.labels = input.labels.unwrap_or_default().into_iter().collect();
+            detector.modified_at = now;
+            // "Each call to this operation triggers a complete retraining of the detector",
+            // which is why the call is accepted (202) rather than completed: the detector
+            // reports `UPDATING` and the clock owes its move back to `ACTIVE` at
+            // `transition_due`, so a caller reading straight after this call still sees
+            // `UPDATING` and the state refusals that go with it.
+            detector.status_code = crate::state::STATUS_UPDATING.to_string();
+            detector.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            detector.update_token = input.client_token;
+        }
+
+        Ok(response_for(detector))
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a path label that resolves to nothing.
+///
+/// One composition shared by both labels this operation carries, and the one every other
+/// workspace-scoped operation uses: the service's fixed sentence in `message`, the
+/// unresolved id in `resourceId` (which is what that `@required` member is for, so the
+/// message echoes nothing from the request) and the resource's AWS type in
+/// `resourceType`.
+fn not_found(message: &str, resource_id: &str, resource_type: &str) -> PutAnomalyDetectorError {
+    PutAnomalyDetectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: message.to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` for a resource whose status does not allow this
+/// change — the one state refusal this operation makes, built the same way for the
+/// workspace and for the detector.
+fn conflict(message: String, resource_id: String, resource_type: &str) -> PutAnomalyDetectorError {
+    PutAnomalyDetectorErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id,
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The response for the stored detector.
+///
+/// Every member is read back off the persisted record — so `status` reports what the
+/// detector HOLDS, and `tags` reports the tags the detector carries even though this
+/// operation was never given any.
+fn response_for(detector: &crate::state::AnomalyDetector) -> PutAnomalyDetectorOutput {
+    PutAnomalyDetectorOutput {
+        anomaly_detector_id: detector.anomaly_detector_id.clone(),
+        arn: detector.arn.clone(),
+        status: AnomalyDetectorStatus {
+            status_code: detector.status_code.clone(),
+            status_reason: None,
+        },
+        tags: crate::state::tag_map(&detector.tags),
     }
 }

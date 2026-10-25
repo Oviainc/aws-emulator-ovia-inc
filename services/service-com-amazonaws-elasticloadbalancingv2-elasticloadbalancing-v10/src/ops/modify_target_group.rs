@@ -6,8 +6,13 @@
 //! answers with the stored record. Only the members the request carries are changed —
 //! the model documents each one as the new setting for that member alone — and the
 //! members that exist only for an HTTP-semantic health check are re-settled afterwards,
-//! so a group whose check becomes a TCP one stops reporting a path and a matcher and
-//! one whose check becomes HTTP starts reporting their documented defaults.
+//! so a group whose check becomes a TCP one stops reporting a path and a matcher.
+//!
+//! A modify fills in NO default for those two members: a check this call leaves as a
+//! layer-7 one has to end up with both a path and a return code, carried by the request
+//! or already stored, and a modify that would leave either unset is refused before it
+//! writes. Filling their documented defaults belongs to `CreateTargetGroup`, which
+//! describes a whole target group rather than changing members of one.
 //!
 //! ## Shape of an operation
 //!
@@ -254,6 +259,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+        // The matcher the request carries, as the record a health check holds, so the
+        // rule below and the write further down read ONE value.
+        let requested_matcher = input.matcher.as_ref().map(|matcher| crate::state::MatcherRecord {
+            http_code: matcher.http_code.clone(),
+            grpc_code: matcher.grpc_code.clone(),
+        });
+        // A layer-7 health check is only a health check once it has both a destination
+        // and a return code (see [`crate::state::check_layer_7_health_check`]), and a
+        // MODIFY settles neither: filling their documented defaults is what the CREATE
+        // path does, from a request that describes a whole target group, while a modify
+        // changes the members it names on a check that already holds together. So the
+        // check this call would LEAVE BEHIND — what the request carries, else what the
+        // group already stores — has to carry both, and a modify that would strip either
+        // from a layer-7 check is refused before it writes.
+        if health_check_will_be_http {
+            let resulting_path = input
+                .health_check_path
+                .as_deref()
+                .or(group.health_check.path.as_deref());
+            let resulting_matcher = requested_matcher
+                .as_ref()
+                .or(group.health_check.matcher.as_ref());
+            crate::state::check_layer_7_health_check(resulting_path, resulting_matcher)
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
 
         // Each member the request carries replaces the stored one; each it omits keeps
         // the value the target group already had.
@@ -283,11 +313,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(unhealthy) = input.unhealthy_threshold_count {
             group.health_check.unhealthy_threshold = unhealthy;
         }
-        if let Some(matcher) = input.matcher.as_ref() {
-            group.health_check.matcher = Some(crate::state::MatcherRecord {
-                http_code: matcher.http_code.clone(),
-                grpc_code: matcher.grpc_code.clone(),
-            });
+        if let Some(matcher) = requested_matcher {
+            group.health_check.matcher = Some(matcher);
         }
         group.settle_health_check_http_members();
 

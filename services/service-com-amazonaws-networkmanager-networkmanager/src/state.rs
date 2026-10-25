@@ -62,7 +62,8 @@ use crate::ops::types::{
     ConnectPeerSummary,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CustomerGatewayAssociation,
-    CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
+    CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkPolicyVersion,
+    CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
     NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
@@ -923,6 +924,17 @@ pub fn policy_alias_resource_id(core_network_id: &str, alias: &str) -> String {
     format!("{core_network_id}/{alias}")
 }
 
+/// How a paginated listing of a core network's policy versions keys ONE version.
+///
+/// A version id is an `Integer` (`smithy_query shape=CoreNetworkPolicyVersion
+/// member=PolicyVersionId`) while [`paginate`] resumes a page after a STRING key, so the
+/// id is zero-padded to the widest a positive one can be: that keeps the lexicographic
+/// order the page token is compared in the numeric order of the history, so version 10
+/// never sorts before version 2.
+pub fn policy_version_page_key(version_id: i32) -> String {
+    format!("{version_id:010}")
+}
+
 /// A stored global network. `state` is not a field: it is a function of the clock
 /// (see [`GlobalNetworkRecord::state_at`]), so reading one never writes.
 #[derive(Debug, Clone)]
@@ -1251,6 +1263,28 @@ impl CoreNetworkPolicyRecord {
             // member is absent rather than an empty list.
             policy_errors: None,
             policy_document: Some(self.document.clone()),
+        }
+    }
+
+    /// The modelled `CoreNetworkPolicyVersion` for this version, as of `now`, carrying the
+    /// `alias` its core network gives it ([`CoreNetworkRecord::policy_alias_of`]).
+    ///
+    /// The SUMMARY of the version a listing reports: the same members as
+    /// [`Self::to_shape`] without the document and its errors (`smithy_query
+    /// shape=CoreNetworkPolicyVersion`), so a listing and a read of one version agree on
+    /// everything they both report.
+    pub fn to_version_shape(
+        &self,
+        alias: Option<&str>,
+        now: SystemTime,
+    ) -> CoreNetworkPolicyVersion {
+        CoreNetworkPolicyVersion {
+            core_network_id: Some(self.core_network_id.clone()),
+            policy_version_id: Some(self.version_id),
+            alias: alias.map(str::to_string),
+            description: self.description.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            change_set_state: Some(self.change_set_state_at(now).to_string()),
         }
     }
 }
@@ -1614,6 +1648,27 @@ impl CoreNetworkRecord {
         self.policy_versions
             .get(&version_id)
             .map(|version| version.to_shape(alias, now))
+    }
+
+    /// Every policy version this core network holds as of `now`, each keyed by
+    /// [`policy_version_page_key`] so [`paginate`] can page over them.
+    ///
+    /// In the order of the HISTORY — the order of the key the versions are stored under,
+    /// oldest version id first — which is the key order every paginated listing of this
+    /// service reports in and the order its page tokens resume after.
+    pub fn policy_version_entries(
+        &self,
+        now: SystemTime,
+    ) -> Vec<(String, CoreNetworkPolicyVersion)> {
+        self.policy_versions
+            .values()
+            .map(|version| {
+                (
+                    policy_version_page_key(version.version_id),
+                    version.to_version_shape(self.policy_alias_of(version.version_id), now),
+                )
+            })
+            .collect()
     }
 
     /// Store `document` as this core network's next policy version and answer that

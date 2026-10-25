@@ -1888,6 +1888,11 @@ pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
 /// restatement is pinned to the model by
 /// `tests/all/resource_tagging.rs::the_tag_rules_the_handlers_enforce_are_the_models`,
 /// which reads these three values out of `smithy-model/` and fails if they drift.
+///
+/// This is the ONE statement of those rules in this crate: both the tag-map key check
+/// ([`TAG_KEY_TRAITS`]) and the `tagKeys` entry of [`LIST_ELEMENT_CONSTRAINTS`] — which
+/// words `UntagResource`'s refusal for a bad tag key — are built from it, so the rule a
+/// refusal describes is always the rule the handlers enforce.
 pub const TAG_KEY_MIN_LEN: i64 = 1;
 /// See [`TAG_KEY_MIN_LEN`].
 pub const TAG_KEY_MAX_LEN: i64 = 128;
@@ -2441,14 +2446,16 @@ const LIST_ELEMENT_CONSTRAINTS: &[(&str, ElementConstraints)] = &[
             pattern: Some(r"(^(([A-Za-z])+([0-9A-Za-z\-\_])+)$)"),
         },
     ),
-    // `UntagResourceInput$tagKeys` -> `TagKeyList`, element `TagKey`: @length 1..128,
-    // @pattern `^[a-zA-Z0-9 _.:/=+@-]+$`.
+    // `UntagResourceInput$tagKeys` -> `TagKeyList`, element `TagKey`. `TagKey`'s rules
+    // are stated ONCE, by the constants the tag-map key check is also built from
+    // ([`TAG_KEY_MIN_LEN`]), so the refusal this entry words and the rule the handlers
+    // enforce cannot state different bounds.
     (
         "tagKeys",
         ElementConstraints {
-            max_length: Some(128),
-            min_length: Some(1),
-            pattern: Some(r"^[a-zA-Z0-9 _.:/=+@-]+$"),
+            max_length: Some(TAG_KEY_MAX_LEN),
+            min_length: Some(TAG_KEY_MIN_LEN),
+            pattern: Some(TAG_KEY_PATTERN),
         },
     ),
 ];

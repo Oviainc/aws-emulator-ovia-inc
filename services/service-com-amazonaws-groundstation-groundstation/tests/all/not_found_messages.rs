@@ -428,8 +428,8 @@ async fn create_mission_profile_names_the_config_its_lookup_searched_for() {
             config_id: ABSENT_UUIDS[2].to_string(),
             config_type: "tracking",
         },
-        // A dataflow edge joins configs of whatever types the dataflow runs between, so
-        // its endpoints are searched under the type their own ARN names.
+        // An edge's end admits several capability types, so it is searched under the type
+        // its own ARN names rather than under one type the member requires.
         Row {
             case: "absent-edge-source",
             request: profile(json!({"dataflowEdges": [[

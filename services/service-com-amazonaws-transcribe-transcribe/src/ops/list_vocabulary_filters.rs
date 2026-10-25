@@ -170,77 +170,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page cursor, read through this service's own token codec
-        // (`state::page_cursor` / `parse_page_cursor`), so every listing pages the same
-        // way.
-        let resume_below = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(parse_next_token(token)?),
-        };
+        // (`state::resume_after_sequence`), so every listing pages the same way and
+        // refuses a cursor this service never handed out in the same words.
+        let resume_below = crate::state::resume_after_sequence(
+            input.next_token.as_deref(),
+            Self::NAME,
+            |message| -> Self::Error {
+                ListVocabularyFiltersErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
 
-        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
-        // validator has already refused anything outside it; the clamp states that
-        // dependency rather than relying on it silently.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_VOCABULARY_LIST_MAX_RESULTS),
-        )
-        .unwrap_or(crate::state::MAX_LIST_MAX_RESULTS)
-        .clamp(1, crate::state::MAX_LIST_MAX_RESULTS);
-
-        // "The search is not case sensitive" (model doc for
-        // `ListVocabularyFiltersRequest$NameContains`).
-        let name_contains = input.name_contains.as_deref().map(str::to_lowercase);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_VOCABULARY_LIST_MAX_RESULTS,
+        );
 
         let store = state.lock();
         let records = store.vocabulary_filters_newest_first();
 
-        let mut filters: Vec<VocabularyFilterInfo> = Vec::new();
-        let mut next_token = None;
-        let mut last_on_page: Option<(u64, String)> = None;
-        for record in records {
-            if resume_below.is_some_and(|sequence| record.sequence >= sequence) {
-                continue;
-            }
-            if name_contains
-                .as_deref()
-                .is_some_and(|needle| !record.name.to_lowercase().contains(needle))
-            {
-                continue;
-            }
-            if filters.len() == page_size {
-                // A further match exists, so the caller gets a cursor to it.
-                next_token = last_on_page
-                    .as_ref()
-                    .map(|(sequence, name)| crate::state::page_cursor(*sequence, name));
-                break;
-            }
-            filters.push(record.to_info());
-            last_on_page = Some((record.sequence, record.name.clone()));
-        }
+        // The paging rule itself is `state::list_page`: skip what an earlier page
+        // held, keep what the filter selects, and hand out a cursor only when a
+        // further match exists past a full page. This family models no state member,
+        // so its listing publishes no status filter to select on.
+        let page = crate::state::list_page(
+            records,
+            resume_below,
+            page_size,
+            crate::state::ListFilter {
+                status_equals: None,
+                name_contains: input.name_contains.as_deref(),
+            },
+            crate::state::VocabularyFilterRecord::to_info,
+        );
 
         Ok(ListVocabularyFiltersOutput {
-            next_token,
-            vocabulary_filters: Some(filters),
+            next_token: page.next_token,
+            vocabulary_filters: Some(page.items),
         })
     }
-}
-
-/// The creation sequence a `NextToken` resumes after, or this operation's own
-/// modelled refusal for a token this service never handed out.
-///
-/// The token format and what counts as one of this service's own is
-/// `state::parse_page_cursor`; this lifts its `None` into the error channel
-/// `ListVocabularyFilters` models.
-fn parse_next_token(token: &str) -> Result<u64, ListVocabularyFiltersError> {
-    crate::state::parse_page_cursor(token).ok_or_else(|| {
-        ListVocabularyFiltersErrorModeled::BadRequestException(BadRequestException {
-            message: Some(
-                "The NextToken in your request is not valid. Use the NextToken returned \
-                 by your previous ListVocabularyFilters request."
-                    .to_string(),
-            ),
-        })
-        .into()
-    })
 }

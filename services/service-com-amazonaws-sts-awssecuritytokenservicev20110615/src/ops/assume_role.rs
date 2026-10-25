@@ -6,7 +6,8 @@
 //! in this service's session registry under the access key id it was minted with, so
 //! `GetCallerIdentity` signed with it reports the assumed-role identity and
 //! `GetAccessKeyInfo` reports the role's account. The account and the role name come
-//! from the `RoleArn` the request names; the role id is stable per role ARN.
+//! from the `RoleArn` the request names; the role id is the one IAM holds for that
+//! role, so a session can be correlated with the role `CreateRole`/`GetRole` reported.
 //!
 //!
 //! ## Shape of an operation
@@ -412,6 +413,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The role's own id, the one IAM issued when the role was created, is read from
+        // the IAM store below together with the trust policy this assume is decided by.
 
         let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
         // The IAM store is read FIRST, and only the two facts this decision needs are

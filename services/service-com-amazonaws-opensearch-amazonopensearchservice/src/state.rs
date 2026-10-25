@@ -21,7 +21,8 @@
 //! outbound one and the destination owner's inbound one — because they are one
 //! resource sharing a `ConnectionId`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -3065,18 +3066,20 @@ pub fn package_not_available(package_id: &str, status: &str) -> ConflictExceptio
     }
 }
 
-/// The `ConflictException` payload for a call that would change an association which
-/// already has a change in flight: the association is in use by that change until it
-/// lands, and the refusal names the status it is in.
-pub fn association_in_flight(
-    package_id: &str,
-    domain_name: &str,
-    status: &str,
-) -> ConflictException {
+/// The `ConflictException` payload for an associate or dissociate call made while
+/// another change to one of the domain's package associations has not landed yet.
+///
+/// The service runs these changes on a domain ONE at a time, so the refusal is about
+/// the domain rather than about either package, and its wording is the service's own
+/// constant for that condition — a fixed sentence every caller that hits it gets,
+/// carrying no value of the request.
+pub fn concurrent_package_operation() -> ConflictException {
     ConflictException {
-        message: Some(format!(
-            "The association of package {package_id} with domain {domain_name} is {status}."
-        )),
+        message: Some(
+            "Operation not allowed. A concurrent operation (associate/dissociate) is in \
+             progress for this domain."
+                .to_string(),
+        ),
     }
 }
 
@@ -3116,6 +3119,40 @@ pub fn prerequisite_is_self(package_id: &str) -> ValidationException {
             "PrerequisitePackageIDList of package {package_id} names that same package."
         )),
     }
+}
+
+/// What a request asks of ONE association: which package to link to the domain,
+/// the packages that must be linked before it, and the configuration to store with
+/// the link.
+///
+/// Both operations that make an association — the one that links a single package
+/// and the one that links several at once — describe each link they make with this,
+/// so the two cannot ask for different things from the same input.
+#[derive(Debug, Clone)]
+pub struct AssociationRequest {
+    /// The `PackageID` of the package to link, as the request named it.
+    pub package_id: String,
+    /// The request's `PrerequisitePackageIDList`, empty where it carried none.
+    pub prerequisite_package_ids: Vec<String>,
+    /// The request's `AssociationConfiguration`, absent where it carried none.
+    pub association_configuration: Option<PackageAssociationConfiguration>,
+}
+
+/// Why a package cannot be linked to a domain, as the modelled exception payload
+/// the refusal is reported through.
+///
+/// Each operation declares its OWN error enum, so this names the payload and the
+/// handler lifts it into its own channel: the DECISION lives in one place even
+/// though the error channels do not.
+#[derive(Debug)]
+pub enum AssociationRefusal {
+    /// The domain, the package or one of its prerequisites names nothing this
+    /// account holds.
+    NotFound(ResourceNotFoundException),
+    /// The package or the association is in a status that cannot serve the call.
+    Conflict(ConflictException),
+    /// The request is not one the domain can serve as asked.
+    Validation(ValidationException),
 }
 
 /// Per-service state for com-amazonaws-opensearch-amazonopensearchservice. A handler reaches it through [`service_state`].
@@ -3325,6 +3362,141 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn insert_package(&mut self, package: Package) -> &Package {
         let id = package.package_id.clone();
         self.packages.entry(id).or_insert(package)
+    }
+
+    /// Decide whether `request` can be served on `domain_name` and, where it can,
+    /// hand back the stored [`Package`] the association will link to.
+    ///
+    /// Reads ONLY: this is the whole decision for one link, so a caller making
+    /// several of them can decide on all of them before writing any — which is what
+    /// lets a refused request leave the domain's associations exactly as they were.
+    ///
+    /// `associated_by_request` names the packages the SAME request associates, which
+    /// is what satisfies a prerequisite "linked to the domain before or
+    /// simultaneously with the package association"; a request that links a single
+    /// package passes an empty set, because such a call associates nothing else.
+    ///
+    /// Call AFTER [`Self::settle_packages`] and the domain's own settling, so a
+    /// package whose copy has finished and an association whose move has landed are
+    /// judged in the status the clock already left them in.
+    pub fn plan_package_association(
+        &self,
+        domain_name: &str,
+        request: &AssociationRequest,
+        associated_by_request: &BTreeSet<String>,
+    ) -> Result<Package, AssociationRefusal> {
+        let domain = self
+            .domains
+            .get(domain_name)
+            .ok_or_else(|| AssociationRefusal::NotFound(domain_not_found(domain_name)))?;
+        let package = self
+            .packages
+            .get(&request.package_id)
+            .ok_or_else(|| AssociationRefusal::NotFound(package_not_found(&request.package_id)))?;
+
+        // A package can be put on a domain only once its content is in place: until
+        // then there is no version of it to associate, which is the conflict between
+        // the call and the status the package is in.
+        if package.status != PACKAGE_STATUS_AVAILABLE {
+            return Err(AssociationRefusal::Conflict(package_not_available(
+                &request.package_id,
+                &package.status,
+            )));
+        }
+
+        // The service runs one change to a domain's package associations at a time: a
+        // call made while another associate or dissociate on the SAME domain has not
+        // landed yet is refused rather than overtaking it. Once every change has
+        // landed, a package already on the domain is re-associated, which is what
+        // moves the domain onto a newer version of its content.
+        if domain
+            .package_associations
+            .values()
+            .any(PackageAssociation::in_flight)
+        {
+            return Err(AssociationRefusal::Conflict(concurrent_package_operation()));
+        }
+
+        for prerequisite in &request.prerequisite_package_ids {
+            if prerequisite == &request.package_id {
+                return Err(AssociationRefusal::Validation(prerequisite_is_self(
+                    &request.package_id,
+                )));
+            }
+            if !self.packages.contains_key(prerequisite) {
+                return Err(AssociationRefusal::NotFound(package_not_found(
+                    prerequisite,
+                )));
+            }
+            // A prerequisite "must be linked to the domain before or simultaneously
+            // with the package association": one the domain already holds satisfies
+            // the first, one the same call associates the second, and anything else
+            // is a request the domain cannot serve as asked.
+            let satisfied = domain.package_associations.contains_key(prerequisite)
+                || associated_by_request.contains(prerequisite);
+            if !satisfied {
+                return Err(AssociationRefusal::Validation(prerequisite_not_associated(
+                    &request.package_id,
+                    prerequisite,
+                    domain_name,
+                )));
+            }
+        }
+
+        Ok(package.clone())
+    }
+
+    /// Make the association `request` asks for on `domain_name` and hand back the
+    /// stored record as `DomainPackageDetails`.
+    ///
+    /// `package` is the record [`Self::plan_package_association`] resolved, so this
+    /// writes only a link the decision above admitted. `None` only where the domain
+    /// is gone, which the plan already refused.
+    ///
+    /// The association REPLACES any the domain already had with the same package: a
+    /// domain holds one per package, which is also what makes a second call the way a
+    /// newer version of the package's content reaches the domain.
+    pub fn put_package_association(
+        &mut self,
+        domain_name: &str,
+        package: &Package,
+        request: &AssociationRequest,
+        now: SystemTime,
+    ) -> Option<DomainPackageDetails> {
+        let domain = self.domains.get_mut(domain_name)?;
+        let association = PackageAssociation {
+            package_id: package.package_id.clone(),
+            // The package is not on the domain the instant the call returns: it is
+            // being put there, and the clock owes the association the status that
+            // leaves it in once the span has passed.
+            status: DOMAIN_PACKAGE_STATUS_ASSOCIATING.to_string(),
+            owed: Some(OwedStatus {
+                status: DOMAIN_PACKAGE_STATUS_ACTIVE.to_string(),
+                message: None,
+                due: now + PROVISIONING,
+            }),
+            // The version this association puts on the domain is the one the package
+            // has available now, so a package whose content was updated reaches the
+            // domain through THIS call rather than on its own.
+            package_version: package.version.to_string(),
+            // The call's own list, which REPLACES whatever an earlier association of
+            // the same package recorded: the prerequisites belong to the association
+            // this call makes.
+            prerequisite_package_ids: request.prerequisite_package_ids.clone(),
+            association_configuration: request.association_configuration.clone(),
+            last_updated: now,
+        };
+        // Answered from the STORED record, through the projection every read path
+        // reports an association with: the slot the write went into IS the record, so
+        // there is no second lookup and no second way this can fail.
+        let stored = match domain.package_associations.entry(package.package_id.clone()) {
+            Entry::Occupied(mut slot) => {
+                slot.insert(association);
+                slot.into_mut()
+            }
+            Entry::Vacant(slot) => slot.insert(association),
+        };
+        Some(stored.to_details(domain_name, package))
     }
 
     /// The published offering whose `ReservedInstanceOfferingId` is `offering_id`.

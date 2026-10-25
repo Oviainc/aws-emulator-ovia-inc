@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes one DB (instance) parameter group. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `DBParameterGroupName`'s own constraints carry the two refusals: "You can't delete a
+//! default DB parameter group" and "Can't be associated with any DB instances" — each the
+//! modelled `InvalidDBParameterGroupStateFault`. The association is the instance record's
+//! own `DBParameterGroupName`, so the guard reads this service's state rather than trusting
+//! the caller.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBParameterGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteDBParameterGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // An instance whose accepted deletion the clock has already made due is gone, so it
+        // is not a member of the group any more: the transitions due at this instant are
+        // materialised before the association is read.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional, and `DBParameterGroupName` is "stored as a lowercase string", so
+        // the group is looked up by the lowercased name in the region the request was signed
+        // for. A name that matches none is the modelled 404 — the same answer a second
+        // delete of the same group gets, which is what lets a caller tell "deleted" from
+        // "never existed" at the first call.
+        let name = input.db_parameter_group_name.to_ascii_lowercase();
+        let key = (region.clone(), name.clone());
+        if !store.db_parameter_groups.contains_key(&key) {
+            return Err(
+                DeleteDBParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBParameterGroup not found: {}",
+                            input.db_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can't delete a default DB parameter group" — the groups RDS mints per engine
+        // version, named `default.` followed by the family
+        // (`crate::state::default_db_parameter_group_name`). No such group can be in state
+        // today, since `validate_parameter_group_name` admits no `.` in a created name, so
+        // this guard is what makes the rule hold once those groups are materialised rather
+        // than live behaviour.
+        if name.starts_with("default.") {
+            return Err(
+                DeleteDBParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(format!(
+                            "DB parameter group {name} is a default group and cannot be deleted"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Can't be associated with any DB instances." The association is the instance
+        // record's own `DBParameterGroupName`, which carries the name as its create spelled
+        // it while the group is keyed lowercased, so the two are compared without case: both
+        // spellings name the one group.
+        if store.instances_in(&region).into_iter().any(|instance| {
+            instance
+                .db_parameter_group_name
+                .as_deref()
+                .is_some_and(|applied| applied.eq_ignore_ascii_case(&name))
+        }) {
+            return Err(
+                DeleteDBParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(format!(
+                            "One or more database instances are still members of this parameter \
+                             group {name}, so the group cannot be deleted"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.db_parameter_groups.remove(&key);
+
+        Ok(DeleteDBParameterGroupOutput)
     }
 }

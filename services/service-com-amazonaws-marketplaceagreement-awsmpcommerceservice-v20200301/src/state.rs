@@ -999,6 +999,45 @@ pub const SEARCH_FILTER_NAMES: &[&str] = &[
     "LicenseArn",
 ];
 
+/// The one filter name `SearchAgreementsInput$filters` requires every search to
+/// carry: "A proposer can use any combination of the preceding filters along
+/// with `AgreementType`, which is required" — and every combination the same
+/// member lists for `PartyType` `Acceptor` begins with it too, so it is required
+/// whichever party type a search is scoped to.
+pub const REQUIRED_SEARCH_FILTER_NAME: &str = "AgreementType";
+
+/// The filter name a search is scoped to a party type by.
+pub const PARTY_TYPE_FILTER_NAME: &str = "PartyType";
+
+/// The filter names that select on an agreement's end time, which the
+/// combination list of `SearchAgreementsInput$filters` writes `EndTime`: "To
+/// filter by `EndTime`, you can use `BeforeEndTime`, `AfterEndTime`, or both."
+/// Every combination that list names is supported with and without them, so they
+/// are left out of [`ACCEPTOR_FILTER_COMBINATIONS`] rather than doubling it.
+pub const END_TIME_FILTER_NAMES: &[&str] = &["BeforeEndTime", "AfterEndTime"];
+
+/// Every filter-name combination `SearchAgreementsInput$filters` lists as
+/// supported "when the `PartyType` is `Acceptor`", each as the names it carries
+/// BESIDE the three that say nothing about which combination it is: the required
+/// [`REQUIRED_SEARCH_FILTER_NAME`], the [`PARTY_TYPE_FILTER_NAME`] that scoped
+/// the search, and the optional [`END_TIME_FILTER_NAMES`]. Each entry is sorted,
+/// so a request's own names compare against it once sorted and deduplicated.
+///
+/// An acceptor searches on at most one of the four identifying attributes
+/// (`ResourceIdentifier`, `ResourceType`, `OfferId`, `OfferSetId`), and may add
+/// `Status` to all but `ResourceType` — the list does not pair that one with it.
+pub const ACCEPTOR_FILTER_COMBINATIONS: &[&[&str]] = &[
+    &[],
+    &["Status"],
+    &["ResourceIdentifier"],
+    &["ResourceIdentifier", "Status"],
+    &["ResourceType"],
+    &["OfferId"],
+    &["OfferId", "Status"],
+    &["OfferSetId"],
+    &["OfferSetId", "Status"],
+];
+
 /// `PartyType`'s two values, as `SearchAgreementsInput$filters` documents them:
 /// "The party type of the caller. Use `Proposer` or `Acceptor`."
 ///
@@ -2794,6 +2833,65 @@ pub fn party_type_scope(filters: &[Filter]) -> Option<&str> {
             _ => None,
         })
 }
+
+/// The filter names a search carries, in the order it listed them.
+///
+/// A filter [`validate_filters`] would refuse carries no name here: call it
+/// first, so a list this reads is one whose every element names a documented
+/// filter.
+fn filter_names(filters: &[Filter]) -> Vec<&str> {
+    filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| filter_parts(index, filter).ok())
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Refuse a `SearchAgreements` filter LIST whose names, each documented on its
+/// own, are not a combination the service searches on — BEFORE any agreement is
+/// scanned, so the answer does not depend on what the store holds.
+///
+/// `SearchAgreementsInput$filters` states two rules over the list as a whole:
+/// [`REQUIRED_SEARCH_FILTER_NAME`] is required of every search, and a search
+/// scoped to [`PARTY_TYPE_ACCEPTOR`] may add only the names one of the
+/// combinations that member lists adds ([`ACCEPTOR_FILTER_COMBINATIONS`]). A
+/// search scoped to [`PARTY_TYPE_PROPOSER`], or to no party type at all, is
+/// under the first rule only: "a proposer can use any combination of the
+/// preceding filters along with `AgreementType`".
+///
+/// Neither rule is about one member being wrong, so both are stated in the
+/// combination envelope ([`unsupported_filter_combination`]) naming the list.
+/// Call [`validate_filters`] first: a name it would refuse is not part of a
+/// combination.
+pub fn filter_combination_refusal(filters: &[Filter]) -> Option<ValidationException> {
+    let names = filter_names(filters);
+    if !names.contains(&REQUIRED_SEARCH_FILTER_NAME) {
+        return Some(unsupported_filter_combination(FILTERS_PATH));
+    }
+    if party_type_scope(filters) != Some(PARTY_TYPE_ACCEPTOR) {
+        return None;
+    }
+    let mut added: Vec<&str> = names
+        .into_iter()
+        .filter(|name| {
+            *name != REQUIRED_SEARCH_FILTER_NAME
+                && *name != PARTY_TYPE_FILTER_NAME
+                && !END_TIME_FILTER_NAMES.contains(name)
+        })
+        .collect();
+    added.sort_unstable();
+    added.dedup();
+    if ACCEPTOR_FILTER_COMBINATIONS.contains(&added.as_slice()) {
+        None
+    } else {
+        Some(unsupported_filter_combination(FILTERS_PATH))
+    }
+}
+
+/// The dotted request path of the filter list itself, which is the member a rule
+/// over the WHOLE list is about — no single element of it is the wrong one.
+const FILTERS_PATH: &str = "filters";
 
 /// Whether `agreement` matches every filter the search named.
 ///

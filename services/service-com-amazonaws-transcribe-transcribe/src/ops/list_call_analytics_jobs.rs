@@ -180,91 +180,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page cursor: the creation sequence of the last job of the previous page,
-        // read through this service's own token codec (`state::page_cursor` /
-        // `parse_page_cursor`), so every listing pages the same way.
-        let resume_below = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(parse_next_token(token)?),
-        };
+        // read through this service's own token codec
+        // (`state::resume_after_sequence`), so every listing pages the same way and
+        // refuses a cursor this service never handed out in the same words.
+        let resume_below = crate::state::resume_after_sequence(
+            input.next_token.as_deref(),
+            Self::NAME,
+            |message| -> Self::Error {
+                ListCallAnalyticsJobsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
 
-        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
-        // validator has already refused anything outside it; the clamp states that
-        // dependency rather than relying on it silently. "If you do not specify a
-        // value, a default of 5 is used" (model doc for
+        // "If you do not specify a value, a default of 5 is used" (model doc for
         // `ListCallAnalyticsJobsRequest$MaxResults`).
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_LIST_MAX_RESULTS),
-        )
-        .unwrap_or(crate::state::MAX_LIST_MAX_RESULTS)
-        .clamp(1, crate::state::MAX_LIST_MAX_RESULTS);
-
-        // "The search is not case sensitive" (model doc for
-        // `ListCallAnalyticsJobsRequest$JobNameContains`).
-        let name_contains = input.job_name_contains.as_deref().map(str::to_lowercase);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_LIST_MAX_RESULTS,
+        );
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Reporting only: the sole write is each job's clock-owed status transition.
         let records = store.call_analytics_jobs_newest_first(now);
 
-        let mut summaries: Vec<CallAnalyticsJobSummary> = Vec::new();
-        let mut next_token = None;
-        let mut last_on_page: Option<(u64, String)> = None;
-        for record in records {
-            if resume_below.is_some_and(|sequence| record.sequence >= sequence) {
-                continue;
-            }
-            if input
-                .status
-                .as_deref()
-                .is_some_and(|status| status != record.status)
-            {
-                continue;
-            }
-            if name_contains
-                .as_deref()
-                .is_some_and(|needle| !record.name.to_lowercase().contains(needle))
-            {
-                continue;
-            }
-            if summaries.len() == page_size {
-                // A further match exists, so the caller gets a cursor to it.
-                next_token = last_on_page
-                    .as_ref()
-                    .map(|(sequence, name)| crate::state::page_cursor(*sequence, name));
-                break;
-            }
-            summaries.push(record.to_summary());
-            last_on_page = Some((record.sequence, record.name.clone()));
-        }
+        // The paging rule itself is `state::list_page`: skip what an earlier page
+        // held, keep what the filters select, and hand out a cursor only when a
+        // further match exists past a full page.
+        let page = crate::state::list_page(
+            records,
+            resume_below,
+            page_size,
+            crate::state::ListFilter {
+                status_equals: input.status.as_deref(),
+                name_contains: input.job_name_contains.as_deref(),
+            },
+            crate::state::CallAnalyticsJobRecord::to_summary,
+        );
 
         Ok(ListCallAnalyticsJobsOutput {
             // The filter is echoed back, so a paging caller can see which status
             // this page was selected on.
             status: input.status,
-            next_token,
-            call_analytics_job_summaries: Some(summaries),
+            next_token: page.next_token,
+            call_analytics_job_summaries: Some(page.items),
         })
     }
-}
-
-/// The creation sequence a `NextToken` resumes after, or this operation's own
-/// modelled refusal for a token this service never handed out.
-///
-/// The token format and what counts as one of this service's own is
-/// `state::parse_page_cursor`; this lifts its `None` into the error channel
-/// `ListCallAnalyticsJobs` models.
-fn parse_next_token(token: &str) -> Result<u64, ListCallAnalyticsJobsError> {
-    crate::state::parse_page_cursor(token).ok_or_else(|| {
-        ListCallAnalyticsJobsErrorModeled::BadRequestException(BadRequestException {
-            message: Some(
-                "The NextToken in your request is not valid. Use the NextToken returned \
-                 by your previous ListCallAnalyticsJobs request."
-                    .to_string(),
-            ),
-        })
-        .into()
-    })
 }
