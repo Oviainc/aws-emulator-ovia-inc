@@ -812,12 +812,18 @@ impl Probe {
     /// Idempotent, as the modelled operation that calls it is: a probe already
     /// being torn down keeps the instants the first accepted delete set, so a
     /// repeat neither postpones the teardown nor restarts it.
+    ///
+    /// The accepted delete CHANGES this record — the `state` every read of it
+    /// reports, and the teardown instant the clock now owes it — so, exactly as
+    /// for any other accepted change to a probe, `modified_at` moves to the
+    /// instant of the call that made it.
     pub fn start_teardown(&mut self, now: SystemTime) {
         if self.is_being_torn_down() {
             return;
         }
         self.state = PROBE_STATE_DELETING.to_string();
         self.deletes_at = Some(now.checked_add(PROBE_TEARDOWN_STAGE).unwrap_or(now));
+        self.modified_at = now;
     }
 
     /// Whether this probe's teardown has been accepted. Such a probe is still
