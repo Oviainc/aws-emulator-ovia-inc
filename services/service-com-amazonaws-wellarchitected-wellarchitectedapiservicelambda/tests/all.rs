@@ -27,6 +27,11 @@ mod agent_goals;
 #[path = "all/agent_goal_create_limits.rs"]
 mod agent_goal_create_limits;
 
+// Out of alphabetical order for the reason the note above gives: declared after the
+// create-limits suite rather than in the gap every new agent suite sorts into.
+#[path = "all/agent_goal_updates.rs"]
+mod agent_goal_updates;
+
 #[path = "all/agent_profile_lifecycle.rs"]
 mod agent_profile_lifecycle;
 

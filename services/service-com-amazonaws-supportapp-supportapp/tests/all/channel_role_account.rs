@@ -14,6 +14,14 @@
 //! which foreign account the ARN names (one digit off the caller's, a wholly different
 //! id, the all-nines id) and in the role name's form (a plain name, a name under a
 //! path), and the admitted rows differ the same way inside the caller's own account.
+//!
+//! Two further tables pin WHERE the account is read from: a value whose account segment
+//! is foreign is refused even when it mentions the caller's account id inside the role
+//! name, and a value whose account segment is the caller's is admitted even when the
+//! role name reads like another account's id or ARN. A third varies the rest of the
+//! create request — the severity level, which notification flags it carries, whether it
+//! names a channel — because none of that bears on which account a passed role may be
+//! in.
 
 use serde_json::{json, Value};
 
@@ -83,6 +91,57 @@ fn own_role_arns() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// `account` with its FIRST digit changed, so the result is still twelve digits and is
+/// never `account` itself.
+fn first_digit_changed(account: &str) -> String {
+    let mut digits = account.to_string();
+    let first = digits.remove(0);
+    let shifted = if first == '9' { '8' } else { '9' };
+    format!("{shifted}{digits}")
+}
+
+/// Foreign-account role ARNs that MENTION the caller's account id somewhere other than
+/// the ARN's account segment, plus one more foreign account-id form. What settles the
+/// refusal is the account the ARN NAMES, so none of these may be admitted on the
+/// strength of the digits appearing in the value.
+fn foreign_role_arns_mentioning_the_callers_account() -> Vec<(&'static str, String)> {
+    let caller = caller_account();
+    vec![
+        (
+            "the caller's account with its first digit changed",
+            role_arn_in(&first_digit_changed(caller), "SupportAppRole"),
+        ),
+        (
+            "a foreign account, the caller's account id inside the role name",
+            role_arn_in("999999999999", &format!("{caller}-SupportAppRole")),
+        ),
+        (
+            "a foreign account, a whole caller-account role ARN inside the role name",
+            role_arn_in("999999999999", &role_arn("Nested")),
+        ),
+    ]
+}
+
+/// Role ARNs of the caller's OWN account whose ROLE NAME mentions another account id.
+/// The account the ARN names is the caller's, so each is a role this account can pass —
+/// the role name is opaque to the rule.
+fn own_role_arns_mentioning_another_account() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a role name that is a foreign account id",
+            role_arn("999999999999"),
+        ),
+        (
+            "a role name embedding a whole foreign role ARN",
+            role_arn("arn:aws:iam::999999999999:role/Other"),
+        ),
+        (
+            "a role under a path named for a foreign account",
+            role_arn("service-role/999999999999/Support"),
+        ),
+    ]
+}
+
 /// The `(teamId, channelId)` every row configures, and the role the configuration is
 /// created with.
 const TEAM_ID: &str = "T012ABCDEFG";
@@ -97,6 +156,46 @@ fn create_body(role_arn_value: &str) -> Value {
         "notifyOnCreateOrReopenCase": true,
         "channelRoleArn": role_arn_value,
     })
+}
+
+/// One create body per value `NotificationSeverityLevel` admits — `all` | `high` |
+/// `none` (`smithy_query(query="shape",shape="NotificationSeverityLevel")`) — each
+/// satisfying the documented severity/flag rule and each differing in which flags it
+/// carries and whether it names a channel. The role's account is settled whatever else
+/// the request says, so every one of these bodies must answer the same way.
+fn create_bodies_across_severities(role_arn_value: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "severity none, no flags, no channel name",
+            json!({
+                "teamId": TEAM_ID,
+                "channelId": CHANNEL_ID,
+                "notifyOnCaseSeverity": "none",
+                "channelRoleArn": role_arn_value,
+            }),
+        ),
+        (
+            "severity all, resolve flag only, named channel",
+            json!({
+                "teamId": TEAM_ID,
+                "channelId": CHANNEL_ID,
+                "channelName": "aws-support-all",
+                "notifyOnCaseSeverity": "all",
+                "notifyOnResolveCase": true,
+                "channelRoleArn": role_arn_value,
+            }),
+        ),
+        (
+            "severity high, correspondence flag only, no channel name",
+            json!({
+                "teamId": TEAM_ID,
+                "channelId": CHANNEL_ID,
+                "notifyOnCaseSeverity": "high",
+                "notifyOnAddCorrespondenceToCase": true,
+                "channelRoleArn": role_arn_value,
+            }),
+        ),
+    ]
 }
 
 /// Require `reply` to be the modelled pass-role refusal, and that its message states
@@ -263,4 +362,114 @@ async fn a_role_in_the_callers_own_account_is_admitted_on_both_writes() {
             "case {case:?}: expected the updated role ARN to be persisted, got {listed}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_create_refusal_is_keyed_to_the_account_the_arn_names() {
+    // Which account the value NAMES is the ARN's account segment, so a value that
+    // mentions the caller's account id anywhere else is still another account's role,
+    // and a foreign id that differs from the caller's only in its leading digit is one
+    // too.
+    for (case, submitted) in foreign_role_arns_mentioning_the_callers_account() {
+        let emulator = Emulator::new();
+        let reply = emulator
+            .create_in_registered_workspace(create_body(&submitted))
+            .await;
+        assert_pass_role_refusal(case, &reply, &submitted);
+
+        let listed = emulator.listed(TEAM_ID, CHANNEL_ID).await;
+        assert!(
+            listed.is_none(),
+            "case {case:?}: expected no configuration to be recorded, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_role_name_that_mentions_another_account_is_still_the_callers_role() {
+    // The converse: the role NAME is opaque to this rule, so a role of the caller's own
+    // account is created and reported verbatim even when its name reads like another
+    // account's id or ARN.
+    for (case, submitted) in own_role_arns_mentioning_another_account() {
+        let emulator = Emulator::new();
+        let created = emulator
+            .create_in_registered_workspace(create_body(&submitted))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected create to answer HTTP 200, got {} / {}",
+            created.status, created.body
+        );
+        let listed = emulator
+            .listed(TEAM_ID, CHANNEL_ID)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: expected the configuration to be recorded"));
+        assert_eq!(
+            listed.get("channelRoleArn").and_then(Value::as_str),
+            Some(submitted.as_str()),
+            "case {case:?}: expected the created role ARN to be reported, got {listed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_create_refusal_does_not_depend_on_the_rest_of_the_request() {
+    let submitted = role_arn_in("999999999999", "SomeoneElsesRole");
+    for (case, body) in create_bodies_across_severities(&submitted) {
+        let emulator = Emulator::new();
+        let reply = emulator.create_in_registered_workspace(body).await;
+        assert_pass_role_refusal(case, &reply, &submitted);
+
+        let listed = emulator.listed(TEAM_ID, CHANNEL_ID).await;
+        assert!(
+            listed.is_none(),
+            "case {case:?}: expected no configuration to be recorded, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_create_leaves_the_account_exactly_as_it_was() {
+    // A create the pass-role rule refuses writes nothing, so the account it was aimed
+    // at is unchanged: the pair it named is still free to configure, and the refusals
+    // did not count against the documented channel quota.
+    let emulator = Emulator::new();
+    for (case, submitted) in foreign_role_arns() {
+        let reply = emulator
+            .create_in_registered_workspace(create_body(&submitted))
+            .await;
+        assert_pass_role_refusal(case, &reply, &submitted);
+    }
+    let listing = emulator.list(None).await;
+    assert!(
+        listing.configurations().is_empty(),
+        "expected the refused creates to record nothing, got {}",
+        listing.body
+    );
+
+    let own = role_arn("SupportAppRole");
+    let created = emulator
+        .create_in_registered_workspace(create_body(&own))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "expected the pair the refused creates named to still be free, got {} / {}",
+        created.status, created.body
+    );
+
+    // And once the pair IS configured, a create carrying another account's role is
+    // still the pass-role refusal — a fact about the request, settled before the
+    // already-configured conflict — and the stored record is untouched.
+    let submitted = role_arn_in("999999999999", "SomeoneElsesRole");
+    let reply = emulator.create(create_body(&submitted)).await;
+    assert_pass_role_refusal("the pair is already configured", &reply, &submitted);
+    let listed = emulator
+        .listed(TEAM_ID, CHANNEL_ID)
+        .await
+        .expect("expected the configuration to survive");
+    assert_eq!(
+        listed.get("channelRoleArn").and_then(Value::as_str),
+        Some(own.as_str()),
+        "expected the stored role ARN to be unchanged, got {listed}"
+    );
 }

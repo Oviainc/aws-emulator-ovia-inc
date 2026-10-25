@@ -71,14 +71,23 @@ async fn restart_router_input(emulator: &Emulator, arn: &str) -> (u16, Option<St
 
 /// CreateRouterOutput, the operation the router OUTPUT slice owns: a router output is the
 /// resource whose `RoutedInputArn` is what `RouterInput$RoutedOutputs` counts.
-async fn create_router_output(emulator: &Emulator, name: &str, port: i64) -> String {
+///
+/// A router output's configuration must name a router network interface this account HOLDS,
+/// so `interface_arn` is one minted over the wire
+/// (`crate::router_outputs::minted_network_interface`).
+async fn create_router_output(
+    emulator: &Emulator,
+    interface_arn: &str,
+    name: &str,
+    port: i64,
+) -> String {
     let body = json!({
         "name": name,
         "configuration": union(
             "Standard",
             "standard",
             json!({
-                "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+                "networkInterfaceArn": interface_arn,
                 "protocolConfiguration": union(
                     "Rtp",
                     "rtp",
@@ -909,6 +918,8 @@ async fn a_router_input_may_not_exceed_the_bitrate_its_tier_allows() {
 #[tokio::test]
 async fn routed_outputs_counts_the_router_outputs_routed_to_the_input() {
     let emulator = Emulator::new();
+    let output_interface =
+        crate::router_outputs::minted_network_interface(&emulator, "rni-ri-routed").await;
     let (_, _, _, configuration, _) = configuration_rows()
         .into_iter()
         .next()
@@ -927,9 +938,11 @@ async fn routed_outputs_counts_the_router_outputs_routed_to_the_input() {
         .unwrap_or_default()
         .to_string();
 
-    let first_output = create_router_output(&emulator, "ro-counted-1", 5006).await;
-    let second_output = create_router_output(&emulator, "ro-counted-2", 5008).await;
-    let third_output = create_router_output(&emulator, "ro-other", 5010).await;
+    let first_output =
+        create_router_output(&emulator, &output_interface, "ro-counted-1", 5006).await;
+    let second_output =
+        create_router_output(&emulator, &output_interface, "ro-counted-2", 5008).await;
+    let third_output = create_router_output(&emulator, &output_interface, "ro-other", 5010).await;
 
     // TakeRouterInput is the operation that routes an output to an input, and it is still
     // scaffolded, so the relation is set on the stored output records the way that call

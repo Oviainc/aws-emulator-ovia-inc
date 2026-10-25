@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagLogGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagLogGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagLogGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or updates the tags of the log group `logGroupName` names, merging the request's
+//! tags into the set that group already holds: a key it does not carry is added, a key it
+//! does carry takes the new value, and every other key is left where it is. The tag set is
+//! the log group's own
+//! (`crate::state::ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`), the one
+//! `TagResource`, `ListTagsLogGroup`, `ListTagsForResource` and `ListLogGroups`'s
+//! `logGroupTags` filter all read, so this deprecated door and the generic tagging API write
+//! the same truth.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +69,11 @@
 //!
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
+//! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//!   Widened in through `extra_errors` (see below): the model's own `errors` list for this
+//!   operation omits it, and this SERVICE models it.
+//! * `TooManyTagsException` (HTTP 400) — A resource can have no more than 50 tags. Widened
+//!   in through `extra_errors` (see below), for the same reason.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -103,11 +108,23 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagLogGroupOutput {
 // here — hence the `TagLogGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#TagLogGroup")]
+//
+// `ServiceUnavailableException` and `TooManyTagsException` are widened in through
+// `extra_errors`: both are shapes this SERVICE models that this operation's own `errors`
+// list omits, and this handler reaches both conditions — an unreachable shared store, and a
+// merge that would push the group past the documented per-resource tag quota, which is the
+// very quota `TooManyTagsException` states. The generic `TagResource` lists them, so
+// widening is what keeps the two doors onto one tag set answering one condition alike.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#TagLogGroup",
+    extra_errors = ["ServiceUnavailableException", "TooManyTagsException"]
+)]
 #[derive(Debug)]
 pub enum TagLogGroupErrorModeled {
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceUnavailableException(ServiceUnavailableException),
+    TooManyTagsException(TooManyTagsException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +178,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagLogGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagLogGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagLogGroup"))
+        // This call names its target by log group name alone, so nothing here is read off
+        // the request metadata `ctx` carries.
+        let _ = ctx;
+
+        // "The key-value pairs to use for the tags" are the caller's own, and the reserved
+        // namespace is not: a request naming a key in it is "a parameter specified
+        // incorrectly" and assigns nothing. `TagKey`'s `@pattern` admits `:`, so the
+        // boundary validator passes such a key through to here.
+        if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
+            return Err(TagLogGroupErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::RESERVED_TAG_KEY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagLogGroupError::from(TagLogGroupErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // The log group's tag set is reached as every tagging operation reaches a resource's,
+        // so one group holds ONE set however it was written.
+        let resource = crate::state::TaggedResource::LogGroup(input.log_group_name.clone());
+
+        // "Adds or updates the specified tags for the specified log group": there is no tag
+        // set to add to until that group exists.
+        let Some(stored) = store.resource_tags_mut(&resource) else {
+            return Err(TagLogGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource.kind())),
+                },
+            )
+            .into());
+        };
+
+        // "Adds or updates" — a key the group does not carry is added, a key it does carry
+        // takes the new value, and every key the request does not name stays where it is. So
+        // the request's tags are MERGED over the stored set, never a replacement of it.
+        let mut merged = stored.clone();
+        merged.extend(
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+
+        // The per-resource tag quota is on the set the group ENDS UP holding, which is why a
+        // request inside the modelled `Tags` length can still exceed it, and why the MERGED
+        // set is counted: re-tagging a key the group already carries adds nothing to the
+        // total.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagLogGroupErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "a resource can have no more than {} tags",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    // "The name of the resource" — this operation names its resource by log
+                    // group name, so that is what the refusal reports back.
+                    resource_name: Some(input.log_group_name.clone()),
+                },
+            )
+            .into());
+        }
+
+        // Every refusal above leaves the stored set untouched, so a refused call assigns no
+        // tag at all.
+        *stored = merged;
+
+        Ok(TagLogGroupOutput)
     }
 }

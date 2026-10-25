@@ -189,10 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(page_size).unwrap_or(1);
 
         // The cursor is the last key of the previous page: resume strictly after it,
-        // whether or not that domain still exists.
+        // whether or not that domain still exists. A token is used as a resume point
+        // only when it is one THIS listing issued — a fabricated token, or one another
+        // listing minted, is refused rather than answered with a page computed from a
+        // resume point the service never handed out.
+        let scope = crate::state::domains_page_scope(&region);
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_page_token(&scope, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -229,7 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when a matching domain is left after this page.
         let next_token = match (matching.next(), domains.last()) {
-            (Some(_), Some(last)) => Some(crate::state::encode_page_token(&last.domain_id)),
+            (Some(_), Some(last)) => {
+                Some(crate::state::encode_page_token(&scope, &last.domain_id))
+            }
             _ => None,
         };
 

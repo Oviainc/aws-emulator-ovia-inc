@@ -83,6 +83,10 @@ pub struct CreateOutput {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.elementalinference#OutputConfig")]
 #[allow(clippy::large_enum_variant)]
+// `PartialEq` so two output configurations can be compared as DATA: an `@idempotent`
+// create has no idempotency token, so whether a request is one this Region has already
+// served is decided by comparing the request's members with the stored record's
+// (`crate::state::ComAmazonawsElementalinferenceElementalinferenceState::feed_created_from`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputConfig {
     Cropping(CroppingConfig),

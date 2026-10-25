@@ -194,10 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(page_size).unwrap_or(1);
 
         // The cursor is the last key of the previous page: resume strictly after it,
-        // whether or not that subscription still exists.
+        // whether or not that subscription still exists. A token is used as a resume
+        // point only when it is one THIS listing issued for THIS domain — a fabricated
+        // token, or one another listing minted, is refused rather than answered with a
+        // page computed from a resume point the service never handed out.
+        let scope = crate::state::subscriptions_page_scope(&region, &input.domain_id);
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_page_token(&scope, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(ListSubscriptionsErrorModeled::ValidationException(
@@ -246,7 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         // A token only when a subscription is left after this page.
         let next_token = match (matching.next(), subscriptions.last()) {
-            (Some(_), Some(last)) => Some(crate::state::encode_page_token(&last.subscription_id)),
+            (Some(_), Some(last)) => Some(crate::state::encode_page_token(
+                &scope,
+                &last.subscription_id,
+            )),
             _ => None,
         };
 

@@ -237,8 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The tags this job would be stored with have to fit the caps bounding one
-        // record, so a create cannot grow a stored job without bound.
+        // The tags this job would be stored with have to satisfy what a tag entry of this
+        // service must: the characters `Tags` documents, and the caps bounding one
+        // record. So a create cannot mint a job carrying a tag a write would be refused
+        // for, nor grow a stored job without bound.
         let tags = input.tags.clone().unwrap_or_default();
         for (key, value) in &tags {
             crate::state::check_tag_entry(key, value)

@@ -2,11 +2,11 @@
 
 //! Two rules of this service's vocabulary and tagging state, over the wire:
 //!
-//! 1. A delete in the custom-vocabulary family is IDEMPOTENT — a name this account
-//!    holds no such resource under leaves nothing to do, so the call answers the
-//!    operation's ordinary empty success and stores nothing. The only refusal left on
-//!    that path is the documented non-terminal-state one (a `PENDING` vocabulary),
-//!    which `crate::vocabularies` pins.
+//! 1. A delete in the custom-vocabulary family needs the entity to be there — a name
+//!    this account holds no such resource under is refused with this service's
+//!    absent-resource `BadRequestException`, and the call stores nothing. The other
+//!    refusal on that path is the documented non-terminal-state one (a `PENDING`
+//!    vocabulary), which `crate::vocabularies` pins.
 //! 2. A tag set this service REPORTS for a resource it holds is always present:
 //!    `ListTagsForResource` answers an empty `Tags` list for a resource that carries
 //!    no tags, whatever made it carry none, rather than leaving the member out.
@@ -49,12 +49,30 @@ pub(crate) fn succeeded(reply: &Reply, case: &str) {
 /// The status and `__type` of a missing-resource refusal are likewise another issue's
 /// subject (`transcribe-client-errors-answer-the-modeled-httperror-instead`); what
 /// matters here is that the read after a delete does NOT succeed.
-fn refused(reply: &Reply, case: &str) {
+pub(crate) fn refused(reply: &Reply, case: &str) {
     assert!(
         (400..500).contains(&reply.status),
         "case {case:?}: expected a 4xx refusal, got HTTP {} with body {:?}",
         reply.status,
         reply.body
+    );
+}
+
+/// Assert `reply` is this service's absent-resource refusal for a resource of `kind`:
+/// a client error naming `BadRequestException` whose message names the KIND of
+/// resource and echoes nothing from the request.
+pub(crate) fn absent_resource_refusal(reply: &Reply, case: &str, kind: &str) {
+    refused(reply, case);
+    assert_eq!(
+        reply.error_code(),
+        "BadRequestException",
+        "case {case:?}: expected the modelled BadRequestException, got {:?}",
+        reply.body
+    );
+    let message = reply.error_message(case);
+    assert!(
+        message.contains(&format!("The requested {kind} couldn't be found")),
+        "case {case:?}: the refusal must name the {kind:?} kind, got {message:?}"
     );
 }
 
@@ -145,10 +163,10 @@ fn absent_names() -> Vec<(&'static str, String)> {
 }
 
 /// RULE 1: a delete of a custom-vocabulary-family resource this account does not hold
-/// succeeds with an empty body, for every family and every form of name — and stores
-/// nothing, so the listing stays empty.
+/// is REFUSED, for every family and every form of name — and stores nothing, so the
+/// listing stays empty.
 #[tokio::test]
-async fn deleting_a_resource_this_account_does_not_hold_succeeds() {
+async fn deleting_a_resource_this_account_does_not_hold_is_refused() {
     let transcribe = Transcribe::new();
 
     for family in families() {
@@ -157,8 +175,7 @@ async fn deleting_a_resource_this_account_does_not_hold_succeeds() {
             let reply = transcribe
                 .call(family.delete, json!({family.name_member: name}))
                 .await;
-            succeeded(&reply, &case);
-            empty_body(&reply, &case);
+            absent_resource_refusal(&reply, &case, family.kind);
 
             // The delete must not MINT what it did not find: the resource is still
             // absent to a reader afterwards.
@@ -190,14 +207,15 @@ async fn deleting_a_resource_this_account_does_not_hold_succeeds() {
     );
 }
 
-/// RULE 1, the repeat-delete axis: the delete that removed a resource answers the
-/// same success when it is run again, as many times as a caller runs it.
+/// RULE 1, the repeat-delete axis: the delete that removed a resource succeeds ONCE —
+/// every later run of the same call is the absent-resource refusal, however many times
+/// a caller runs it.
 #[tokio::test]
-async fn a_delete_is_idempotent_once_the_resource_is_gone() {
+async fn only_the_first_delete_of_a_resource_succeeds() {
     let transcribe = Transcribe::new();
 
     for family in families() {
-        let name = format!("idempotent-{}", family.kind.replace(' ', "-"));
+        let name = format!("deleted-once-{}", family.kind.replace(' ', "-"));
         let case = format!("{} / repeated delete", family.kind);
         succeeded(
             &transcribe
@@ -216,8 +234,12 @@ async fn a_delete_is_idempotent_once_the_resource_is_gone() {
             let reply = transcribe
                 .call(family.delete, json!({family.name_member: name}))
                 .await;
-            succeeded(&reply, &case);
-            empty_body(&reply, &case);
+            if attempt == 1 {
+                succeeded(&reply, &case);
+                empty_body(&reply, &case);
+            } else {
+                absent_resource_refusal(&reply, &case, family.kind);
+            }
             refused(
                 &transcribe
                     .call(family.read, json!({family.name_member: name}))
@@ -261,16 +283,17 @@ async fn a_delete_only_removes_its_own_resource_family() {
         case,
     );
     // The filter of the same name is untouched, and the now-absent vocabulary delete
-    // still succeeds.
+    // is refused without touching it.
     transcribe
         .call("GetVocabularyFilter", json!({"VocabularyFilterName": shared}))
         .await
         .ok(case);
-    succeeded(
+    absent_resource_refusal(
         &transcribe
             .call("DeleteVocabulary", json!({"VocabularyName": shared}))
             .await,
         case,
+        "vocabulary",
     );
     transcribe
         .call("GetVocabularyFilter", json!({"VocabularyFilterName": shared}))

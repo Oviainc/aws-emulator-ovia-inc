@@ -957,11 +957,13 @@ async fn an_unknown_resource_is_not_found() {
     }
 }
 
-/// RULE: an id outside the modelled `len 1..55, pattern ^[\w-]+:[0-9a-f-]+$` is a bad
-/// input parameter (400 `InvalidParameterException`), while an id that satisfies the
-/// constraint — including at its length bound — is looked up and simply not found.
+/// RULE: an id outside the modelled `len 1..55, pattern ^[\w-]+:[0-9a-f-]+$` never
+/// reaches the operation — the constraint-validation layer ahead of it refuses the
+/// request with 400 `ValidationException`, naming the member and the constraint the
+/// value failed — while an id that satisfies the constraint, including at its length
+/// bound, is looked up and simply not found.
 #[tokio::test]
-async fn an_id_outside_its_modelled_constraint_is_an_invalid_parameter() {
+async fn an_id_outside_its_modelled_constraint_is_a_validation_error() {
     let emulator = Emulator::new();
     // 18 + 1 + 36 = 55 characters: the maximum the model allows.
     let at_max_length = format!("{}:{}", "r".repeat(18), "0".repeat(36));
@@ -990,8 +992,8 @@ async fn an_id_outside_its_modelled_constraint_is_an_invalid_parameter() {
             "case {case:?}: expected HTTP 400 for {identity_pool_id:?}, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidParameterException"),
-            "case {case:?}: expected InvalidParameterException for {identity_pool_id:?}, got {body}"
+            error_code(&body).contains("ValidationException"),
+            "case {case:?}: expected ValidationException for {identity_pool_id:?}, got {body}"
         );
     }
 
@@ -1002,8 +1004,8 @@ async fn an_id_outside_its_modelled_constraint_is_an_invalid_parameter() {
         "an absent IdentityPoolId expected HTTP 400, got {status} with {body}"
     );
     assert!(
-        error_code(&body).contains("InvalidParameterException"),
-        "an absent IdentityPoolId expected InvalidParameterException, got {body}"
+        error_code(&body).contains("ValidationException"),
+        "an absent IdentityPoolId expected ValidationException, got {body}"
     );
 
     // At the bound the constraint is satisfied, so the answer is about the resource.

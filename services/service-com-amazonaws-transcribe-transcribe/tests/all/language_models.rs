@@ -20,9 +20,10 @@
 //! exactly that, and never a `COMPLETED` model.
 //!
 //! THE RULE THIS SUITE IS ABOUT (`DeleteLanguageModel`): a delete removes the named
-//! record and nothing else, refuses a record the service has not finished with
-//! (`BadRequestException`, whose own documentation covers "a non-terminal state (such
-//! as IN PROGRESS)"), and is idempotent for a name the account holds nothing under.
+//! record and nothing else, and refuses both a record the service has not finished
+//! with and a name the account holds nothing under (`BadRequestException`, whose own
+//! documentation covers "the entity you're trying to delete doesn't exist or if it's
+//! in a non-terminal state (such as IN PROGRESS)").
 
 use std::time::Duration;
 
@@ -351,8 +352,8 @@ async fn a_created_language_model_is_in_progress_then_fails_and_describes_back()
 }
 
 /// `DeleteLanguageModel` removes the named record once the service has finished with
-/// it, refuses one it has not, is idempotent for a name the account holds nothing
-/// under, and touches no other record.
+/// it, refuses one it has not, refuses a name the account holds nothing under, and
+/// touches no other record.
 #[tokio::test]
 async fn deleting_a_language_model_removes_exactly_that_record() {
     let transcribe = Transcribe::new();
@@ -409,12 +410,20 @@ async fn deleting_a_language_model_removes_exactly_that_record() {
             .await
             .refused(case, 400, "BadRequestException");
 
-        // A delete is idempotent: the same call again is this operation's ordinary
-        // empty success, not a failure.
-        transcribe
+        // A delete needs the entity: the same call again, now that the record is gone,
+        // is the service's absent-resource refusal, not an empty success.
+        let gone = &format!("{case}, deleted twice");
+        let again = transcribe
             .call("DeleteLanguageModel", json!({"ModelName": name}))
-            .await
-            .ok_status(&format!("{case}, deleted twice"), 200);
+            .await;
+        again.refused(gone, 400, "BadRequestException");
+        assert!(
+            again
+                .error_message(gone)
+                .contains("The requested language model couldn't be found"),
+            "case {gone:?}: the refusal must name the language model kind, got {:?}",
+            again.body
+        );
 
         // Nothing else was removed: every row after this one is still readable.
         for other in &names[index + 1..] {
@@ -433,14 +442,14 @@ async fn deleting_a_language_model_removes_exactly_that_record() {
         }
     }
 
-    // A name this account holds no model under leaves nothing to do, whatever form it
-    // takes: absence is the state the caller asked for. This operation models no
-    // `NotFoundException` at all.
+    // A name this account holds no model under is refused, whatever form it takes: a
+    // delete needs the entity to be there.
     for name in ["never-created", "a", "Mixed.Case_name-9", &"z".repeat(200)] {
+        let case = format!("a delete of {name:?}, which was never created");
         transcribe
             .call("DeleteLanguageModel", json!({"ModelName": name}))
             .await
-            .ok_status(&format!("a delete of {name:?}, which was never created"), 200);
+            .refused(&case, 400, "BadRequestException");
     }
 }
 
@@ -686,5 +695,9 @@ async fn a_create_outside_the_modelled_constraints_stores_nothing() {
     transcribe
         .call("DeleteLanguageModel", json!({"ModelName": "ftp-training"}))
         .await
-        .ok_status("deleting a model whose create was refused", 200);
+        .refused(
+            "deleting a model whose create was refused",
+            400,
+            "BadRequestException",
+        );
 }

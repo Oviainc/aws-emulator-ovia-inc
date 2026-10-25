@@ -175,47 +175,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // The page is built while the state lock is held, so the work done under
-        // it is bounded by `page_size` records, not by the size of the store.
-        let (tax_registrations, more_remain) = {
+        // The page and its cursor come from the one shared page-builder
+        // ([`crate::state::build_page`]), the same one every listing of this
+        // service pages through. The state lock is held only while the page is
+        // built; the guard is released before the response is assembled.
+        let page = {
             let mut store = state.lock();
             // Enumerating the registrations settles the TRN validations the clock
             // has already made due, so the listing reports each record in the
-            // state it was in at that instant whether or not anybody called.
+            // state it was in at that instant whether or not anybody called. This
+            // settles every stored record, so it costs the size of the store
+            // rather than the page.
             store.settle_due(::std::time::Instant::now());
-            let mut remaining = store
-                .supplemental_registrations
-                .iter()
-                .filter(|(authority_id, _)| {
-                    resume_after
-                        .as_ref()
-                        .is_none_or(|after| *authority_id > after)
-                })
-                .peekable();
-            let page: Vec<SupplementalTaxRegistration> = remaining
-                .by_ref()
-                .take(page_size)
-                .map(|(authority_id, stored)| {
-                    stored.to_supplemental_tax_registration(authority_id)
-                })
-                .collect();
-            let more_remain = remaining.peek().is_some();
-            (page, more_remain)
-        };
-
-        // A cursor is issued only when a further record remains, so the last
-        // page carries none.
-        let next_token = if more_remain {
-            tax_registrations
-                .last()
-                .map(|last| crate::state::encode_page_token(&last.authority_id))
-        } else {
-            None
+            crate::state::build_page(
+                &store.supplemental_registrations,
+                resume_after.as_deref(),
+                page_size,
+                // Every stored supplemental registration is reported: one exists
+                // only once a write recorded it under a minted `authorityId`.
+                |authority_id, stored| Some(stored.to_supplemental_tax_registration(authority_id)),
+            )
         };
 
         Ok(ListSupplementalTaxRegistrationsOutput {
-            tax_registrations,
-            next_token,
+            tax_registrations: page.items,
+            next_token: page.next_token,
         })
     }
 }
