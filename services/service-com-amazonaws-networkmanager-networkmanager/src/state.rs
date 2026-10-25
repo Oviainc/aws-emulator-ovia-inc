@@ -38,6 +38,9 @@
 //! Beside that tree a global network holds the telemetry-bearing connections registered
 //! with it (a Connect peer of either kind, a VPN connection), whose session health is what
 //! `GetNetworkTelemetry` reports.
+//! A global network also holds the TRANSIT GATEWAYS registered with it: each registration
+//! is the tie between the global network and one transit gateway of Amazon VPC, with no id
+//! of its own, so it is keyed by that pair like a customer gateway association.
 //! A global network also holds the ROUTE ANALYSES started on it: each is a Route Analyzer
 //! job that analysed the routing path between two attachments against what the global
 //! network held when it was started, and holds the paths it found for `GetRouteAnalysis`
@@ -65,6 +68,7 @@ use crate::ops::types::{
     ResourceNotFoundException, RouteAnalysis, RouteAnalysisCompletion,
     RouteAnalysisEndpointOptions, RouteAnalysisEndpointOptionsSpecification, RouteAnalysisPath,
     ServiceInsertionSegments, Site, SiteToSiteVpnAttachment, Tag, TransitGatewayPeering,
+    TransitGatewayRegistration, TransitGatewayRegistrationStateReason,
     TransitGatewayRouteTableAttachment, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
@@ -137,6 +141,15 @@ pub const LINK_ASSOCIATION_KIND: &str = "link-association";
 /// ([`customer_gateway_association_key`]) and this name is only how a not-found refusal
 /// spells the resource type.
 pub const CUSTOMER_GATEWAY_ASSOCIATION_KIND: &str = "customer-gateway-association";
+/// The resource kind a TRANSIT GATEWAY REGISTRATION reports in a refusal that names it.
+///
+/// Like [`CUSTOMER_GATEWAY_ASSOCIATION_KIND`] this is not an ARN resource type and no id is
+/// minted for it: "Describes the registration of a transit gateway to a global network"
+/// (`smithy_query shape=TransitGatewayRegistration`) carries no id, so the global network
+/// plus the transit gateway's ARN is its identity
+/// ([`transit_gateway_registration_key`]) and this name is only how a not-found refusal
+/// spells the resource type.
+pub const TRANSIT_GATEWAY_REGISTRATION_KIND: &str = "transit-gateway-registration";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -711,6 +724,18 @@ pub const MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: usize = 100;
 /// query="operation" operation="AssociateCustomerGateway"`), so reaching it is answered
 /// with that modelled error (HTTP 402) and stores nothing.
 pub const MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK: usize = 100;
+
+/// How many transit gateways one global network may hold a registration for here.
+///
+/// CHOSEN, like [`MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK`] and for the same
+/// reason: no published number bounds it and the model carries none, so this bound exists
+/// only so that repeated registers — each naming a transit gateway of Amazon VPC, of which
+/// this service holds no inventory — cannot grow the store without end.
+/// `RegisterTransitGateway` models no `ServiceQuotaExceededException` (`smithy_query
+/// query="operation" operation="RegisterTransitGateway"`), so reaching this bound is
+/// refused with the modelled `ValidationException` (HTTP 400) naming the member that asked,
+/// and stores nothing.
+pub const MAX_TRANSIT_GATEWAY_REGISTRATIONS_PER_GLOBAL_NETWORK: usize = 100;
 
 /// How many Connect peers one Connect attachment may hold here, and how many inside CIDR
 /// blocks one Connect peer may peer over.
@@ -1363,6 +1388,84 @@ impl CustomerGatewayAssociationRecord {
 /// would.
 pub fn customer_gateway_association_key(global_network_id: &str, customer_gateway_arn: &str) -> String {
     format!("{global_network_id}/{customer_gateway_arn}")
+}
+
+/// A stored transit gateway registration: the tie between one transit gateway of Amazon VPC
+/// and one global network.
+///
+/// Like [`CustomerGatewayAssociationRecord`] this is NOT a resource of its own: the modelled
+/// `TransitGatewayRegistration` carries the global network, the gateway's ARN and a state
+/// reason, with no id and no ARN of its own (`smithy_query
+/// shape=TransitGatewayRegistration`), so the global network plus the gateway's ARN is its
+/// identity and the store keys it by [`transit_gateway_registration_key`]. Its state is a
+/// function of the clock rather than a field, so reading one never writes.
+#[derive(Debug, Clone)]
+pub struct TransitGatewayRegistrationRecord {
+    pub global_network_id: String,
+    /// The ARN of the transit gateway, as the request carried it: the gateway belongs to
+    /// Amazon VPC, so this service stores the reference and holds no record of the gateway
+    /// itself (see [`ec2_resource_region`]).
+    pub transit_gateway_arn: String,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+}
+
+impl TransitGatewayRegistrationRecord {
+    /// This registration's state as of `now`.
+    ///
+    /// `TransitGatewayRegistrationState` carries PENDING, AVAILABLE, DELETING, DELETED and
+    /// FAILED (`smithy_query shape=TransitGatewayRegistrationState`, mirrored in
+    /// `ops::types::TRANSIT_GATEWAY_REGISTRATION_STATE_VALUES`); the first three are spelled
+    /// exactly as [`STATE_PENDING`], [`STATE_AVAILABLE`] and [`STATE_DELETING`], so this
+    /// slice reuses those constants. A stored registration is one of the first two: nothing
+    /// here fails a registration, and a deregistered one is removed rather than kept.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `TransitGatewayRegistration` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> TransitGatewayRegistration {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `TransitGatewayRegistration` for this record, forcing `state` — used by
+    /// `DeregisterTransitGateway`, which reports the registration it just removed as
+    /// `DELETING`.
+    ///
+    /// `State$Message` is left absent: "The message for the state reason" (`smithy_query
+    /// query="doc" shape="TransitGatewayRegistrationStateReason" member="Message"`) is what
+    /// a service reporting WHY a registration reached its state fills in, and the two states
+    /// a registration of this store reaches are the ordinary ones the code already names.
+    pub fn to_shape_with_state(&self, state: &str) -> TransitGatewayRegistration {
+        TransitGatewayRegistration {
+            global_network_id: Some(self.global_network_id.clone()),
+            transit_gateway_arn: Some(self.transit_gateway_arn.clone()),
+            state: Some(TransitGatewayRegistrationStateReason {
+                code: Some(state.to_string()),
+                message: None,
+            }),
+        }
+    }
+}
+
+/// The key the store holds a transit gateway registration under: the global network it was
+/// made in, then the ARN of the transit gateway registered with it.
+///
+/// Like [`customer_gateway_association_key`], the ARN alone is not the key: the registration
+/// is addressed THROUGH the global network in every one of the three operations' URIs
+/// (`smithy_query query="operation"
+/// operation="RegisterTransitGateway,DeregisterTransitGateway,GetTransitGatewayRegistrations"`).
+/// The same string identifies the registration in a not-found refusal, where no single
+/// resource id would.
+pub fn transit_gateway_registration_key(
+    global_network_id: &str,
+    transit_gateway_arn: &str,
+) -> String {
+    format!("{global_network_id}/{transit_gateway_arn}")
 }
 
 /// A stored connection: the tie between two devices of one global network.
@@ -3143,6 +3246,15 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// resource, so no existing quota bounds how many distinct ARNs a caller can name — and
     /// only ever holding a pair once.
     pub customer_gateway_associations: BTreeMap<String, CustomerGatewayAssociationRecord>,
+    /// Transit gateway registrations by [`transit_gateway_registration_key`], each tying a
+    /// transit gateway of Amazon VPC to the global network the key names.
+    ///
+    /// Bounded per global network by
+    /// [`MAX_TRANSIT_GATEWAY_REGISTRATIONS_PER_GLOBAL_NETWORK`], for the reason the customer
+    /// gateway associations above are: the subject is a gateway of another service rather
+    /// than a stored resource, so no existing quota bounds how many distinct ARNs a caller
+    /// can name — and only ever holding a pair once.
+    pub transit_gateway_registrations: BTreeMap<String, TransitGatewayRegistrationRecord>,
     /// Connections by `ConnectionId`, each carrying the `GlobalNetworkId` that owns it and
     /// the two devices of that global network it ties together.
     pub connections: BTreeMap<String, ConnectionRecord>,
@@ -3205,12 +3317,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// `GetNetworkTelemetry` reports the session health of.
     ///
     /// A connection is registered here by the operation that ties it to the global network:
-    /// `AssociateConnectPeer` for a core network Connect peer,
-    /// `AssociateTransitGatewayConnectPeer` for a transit gateway one, and
-    /// `RegisterTransitGateway` for the VPN connections a registered gateway brings with
-    /// it — the last two still scaffold stubs with their own issues, so an
-    /// emulator nobody has registered a connection with reports the empty telemetry it
-    /// really holds rather than a placeholder. No quota of its own bounds the map: a
+    /// `AssociateConnectPeer` for a core network Connect peer and
+    /// `AssociateTransitGatewayConnectPeer` for a transit gateway one — the second still a
+    /// scaffold stub with its own issue. Registering a transit gateway adds nothing here:
+    /// the connections a registered gateway carries are VPN connections of Amazon VPC, of
+    /// which this service holds no inventory, so an emulator nobody has registered a
+    /// connection with reports the empty telemetry it really holds rather than a
+    /// placeholder. No quota of its own bounds the map: a
     /// registration exists only for a stored global network, which the per-account global
     /// network quota bounds, and only once per resource ARN.
     pub telemetry_resources: BTreeMap<String, TelemetryResourceRecord>,
@@ -3414,6 +3527,15 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many transit gateways `global_network_id` holds a registration for, for the
+    /// per-global-network quota.
+    pub fn transit_gateway_registration_count_of(&self, global_network_id: &str) -> usize {
+        self.transit_gateway_registrations
+            .values()
+            .filter(|registration| registration.global_network_id == global_network_id)
+            .count()
+    }
+
     /// How many managed prefix lists `core_network_id` is associated with, for the
     /// per-core-network quota.
     pub fn prefix_list_association_count_of(&self, core_network_id: &str) -> usize {
@@ -3542,8 +3664,10 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// contributes nothing, not a placeholder. A connection registered with a global
     /// network only for its telemetry lives in a different store
     /// ([`Self::telemetry_resources`]) that [`Self::network_resource_count`] does not count
-    /// either, and every operation that registers one is still a scaffold stub, so the two
-    /// agree on that zero as well.
+    /// either, and nothing registers one yet, so the two agree on that zero as well. A
+    /// transit gateway registered with the global network
+    /// ([`Self::transit_gateway_registrations`]) is a resource of Amazon VPC rather than one
+    /// this service holds, so it is not part of this inventory either.
     pub fn network_resources_of(
         &self,
         global_network_id: &str,
@@ -3717,10 +3841,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory ([`Self::network_resources_of`]) — the same inventory
     /// `GetNetworkResources` reports and `GetNetworkResourceCounts` counts — so a route
     /// analysis and that inventory cannot disagree about which attachments the global
-    /// network holds. An attachment on a transit gateway appears there once the gateway is
-    /// registered with the global network (`RegisterTransitGateway`, still a scaffold stub
-    /// with its own issue), so until then no ARN resolves to one and the analysis reports
-    /// the "cannot find an attachment" it really found rather than a placeholder.
+    /// network holds. An attachment on a transit gateway is a resource of Amazon VPC, of
+    /// which this service holds no inventory — registering the gateway with the global
+    /// network records the registration and no attachment of it — so no such ARN resolves to
+    /// one and the analysis reports the "cannot find an attachment" it really found rather
+    /// than a placeholder.
     fn resolve_route_endpoint(
         &self,
         global_network_id: &str,
@@ -3963,10 +4088,12 @@ pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
 ///
 /// Two members are deliberately left absent, because nothing in the store holds them:
 ///
-/// * `RegisteredGatewayArn` — only a resource reached through a registered gateway carries
-///   one, and the registering operation (`RegisterTransitGateway`) is still a scaffold
-///   stub. Associating a customer gateway with a device does not register one: it ties a
-///   gateway the global network already holds to a device of it.
+/// * `RegisteredGatewayArn` — only a resource reached THROUGH a registered gateway carries
+///   one, and every resource of this inventory is one this service holds in its own right.
+///   Registering a transit gateway with a global network records that registration alone:
+///   the resources reached through the gateway belong to Amazon VPC, of which this service
+///   holds no inventory. Associating a customer gateway with a device does not register one
+///   either: it ties a gateway the global network already holds to a device of it.
 /// * `Metadata` — "The resource metadata" (`smithy_query shape=NetworkResource`) is what
 ///   `UpdateNetworkResourceMetadata` stores, which is still a scaffold stub, so no resource
 ///   has any.
