@@ -437,8 +437,8 @@ async fn a_listener_with_an_endpoint_group_cannot_be_deleted() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case deleted {arn}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case deleted {arn}: expected HTTP 400, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -447,7 +447,7 @@ async fn a_listener_with_an_endpoint_group_cannot_be_deleted() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Endpoint group {arn} not found."),
+            format!("EndpointGroup {arn} does not exist."),
             "case deleted {arn}: expected the refusal to name the endpoint group, got {body}"
         );
     }
@@ -465,7 +465,7 @@ async fn an_endpoint_group_needs_a_listener_the_store_holds() {
     let listener_arn = fixture(&router, "missing").await;
 
     // Rows: an ARN of the right shape that was never minted, and one whose listener was
-    // deleted. Both name no listener, so both are the modelled 404.
+    // deleted. Both name no listener, so both are the modelled not-found error.
     let deleted = listener(
         &router,
         &arn_of(&create_accelerator(&router, "eg-gone", "acc-gone").await),
@@ -482,8 +482,8 @@ async fn an_endpoint_group_needs_a_listener_the_store_holds() {
     ] {
         let (status, body) = create_group(&router, &arn, "us-west-2", case, json!({})).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -506,8 +506,8 @@ async fn an_endpoint_group_needs_a_listener_the_store_holds() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {operation}: expected HTTP 404, got {status} with {body}"
+            status, 400,
+            "case {operation}: expected HTTP 400, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
