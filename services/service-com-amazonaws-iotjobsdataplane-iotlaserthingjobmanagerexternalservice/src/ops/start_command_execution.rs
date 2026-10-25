@@ -260,9 +260,11 @@ fn command_not_found_message(command_name: &str) -> String {
 
 /// The 400 message the service builds when `commandArn` names a command the control
 /// plane has DEPRECATED. Request-derived like the others: it names the command the
-/// ARN named, and says what about it refuses the start.
+/// ARN named, and states the lifecycle state that refuses the start — the command
+/// HAS BEEN deprecated, a write the control plane made, rather than anything about
+/// this request's own values.
 fn command_deprecated_message(command_name: &str) -> String {
-    format!("The command {command_name} is deprecated and cannot be used to start new command executions.")
+    format!("The command {command_name} has been deprecated.")
 }
 
 /// The 400 message the service builds for `parameters` supplied against a command
