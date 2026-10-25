@@ -685,6 +685,176 @@ impl SourceApiAssociationRecord {
     }
 }
 
+/// What a request to associate a source API with a Merged API asks for, in the form
+/// both association creates share.
+///
+/// AppSync creates one and the same link from either side — `AssociateMergedGraphqlApi`
+/// addresses the source API and names the Merged API in the body,
+/// `AssociateSourceGraphqlApi` the other way round — so the two differ only in which
+/// member the path carries and reach [`create_source_api_association`] with the same
+/// request.
+#[derive(Debug, Clone)]
+pub struct SourceApiAssociationRequest {
+    /// The Merged API side, in either accepted form ([`is_api_identifier`]).
+    pub merged_api_identifier: String,
+    /// The source API side, in either accepted form ([`is_api_identifier`]).
+    pub source_api_identifier: String,
+    pub description: Option<String>,
+    /// The `mergeType` the request's `sourceApiAssociationConfig` named, or `None` when
+    /// it named none ([`DEFAULT_MERGE_TYPE`] is then stored).
+    pub merge_type: Option<String>,
+    /// The region the caller addressed, which the minted association ARN carries.
+    pub region: String,
+}
+
+/// Why a source-API association could not be created, as the HTTP answer every
+/// operation that creates one gives it.
+///
+/// Stated independently of the operation so both association creates refuse the same
+/// request the same way; each handler lifts a variant into its own modelled error.
+#[derive(Debug, Clone)]
+pub enum AssociationRefusal {
+    /// The request names something that cannot be associated: `BadRequestException`
+    /// (HTTP 400), carrying this text.
+    BadRequest(String),
+    /// An identifier that names no API this account holds: `NotFoundException`
+    /// (HTTP 404), carrying this text.
+    NotFound(String),
+    /// A modification of the pair's association is still in progress:
+    /// `ConcurrentModificationException` (HTTP 409), carrying this text.
+    ConcurrentModification(String),
+}
+
+/// Create the association `request` asks for and return it as the modelled shape, or
+/// the refusal it meets.
+///
+/// The whole rule both association creates follow, in one place:
+///
+/// * an identifier that is neither an API id nor an ARN names no API at all, so the
+///   request is malformed rather than pointed at a missing resource;
+/// * both sides are resolved from the store in either identifier form, so the stored
+///   association records each API's own id and ARN rather than whatever the request
+///   named it by, and an identifier that resolves to nothing is a not-found;
+/// * an association links a standard GraphQL API (the source) to a Merged API, so an
+///   API on the wrong side of it is a bad request;
+/// * a source API is linked to a Merged API at most once, so a pair that is already
+///   associated leaves the call nothing to create: 409 while the existing
+///   association's merge is still owed, 400 once it has been performed;
+/// * the association's `associationId` is drawn from the state's own counter and its
+///   ARN sits under the Merged API, and creating it SCHEDULES the merge — so it is
+///   stored in the non-terminal [`MERGE_SCHEDULED`] status with the due instant the
+///   clock settles ([`MERGE_SPAN`]).
+///
+/// The answer is projected from the STORED record, so it is the body
+/// `GetSourceApiAssociation` reports for the same association later.
+pub fn create_source_api_association(
+    state: &mut ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState,
+    request: SourceApiAssociationRequest,
+    now: SystemTime,
+) -> Result<SourceApiAssociation, AssociationRefusal> {
+    // Checked on BOTH sides, since either can carry either form.
+    for identifier in [
+        &request.merged_api_identifier,
+        &request.source_api_identifier,
+    ] {
+        if !is_api_identifier(identifier) {
+            return Err(AssociationRefusal::BadRequest(invalid_api_id_message(
+                identifier,
+            )));
+        }
+    }
+
+    // Materialise every merge the clock already owes first, so the decisions below are
+    // taken against the association state of THIS instant rather than the one the last
+    // caller left behind.
+    state.settle_associations(now);
+
+    let Some(merged) = api_by_identifier(&state.graphql_apis, &request.merged_api_identifier)
+    else {
+        return Err(AssociationRefusal::NotFound(
+            API_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    let merged_api_id = merged.api_id.clone();
+    let merged_api_arn = merged.arn.clone();
+    let merged_api_type = merged.api_type.clone();
+
+    let Some(source) = api_by_identifier(&state.graphql_apis, &request.source_api_identifier)
+    else {
+        return Err(AssociationRefusal::NotFound(
+            API_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    let source_api_id = source.api_id.clone();
+    let source_api_arn = source.arn.clone();
+    let source_api_type = source.api_type.clone();
+
+    // "A source API is a GraphQL API that is linked to a merged API"
+    // (`SourceApiAssociation`). An API on the wrong side of that sentence exists and is
+    // named well, so the request is a bad one rather than a not-found.
+    if merged_api_type != MERGED_API_TYPE {
+        return Err(AssociationRefusal::BadRequest(format!(
+            "API {merged_api_id} is not a Merged API; only an API of type {MERGED_API_TYPE} can \
+             be associated with source APIs"
+        )));
+    }
+    if source_api_type != GRAPHQL_API_TYPE {
+        return Err(AssociationRefusal::BadRequest(format!(
+            "API {source_api_id} is not a source API; only an API of type {GRAPHQL_API_TYPE} can \
+             be associated with a Merged API"
+        )));
+    }
+
+    if let Some(existing) = state.association_for_pair(&merged_api_id, &source_api_id) {
+        if existing.merge_pending() {
+            return Err(AssociationRefusal::ConcurrentModification(
+                CONCURRENT_MODIFICATION_MESSAGE.to_string(),
+            ));
+        }
+        return Err(AssociationRefusal::BadRequest(format!(
+            "Source API {source_api_id} is already associated with Merged API {merged_api_id}"
+        )));
+    }
+
+    // The id is drawn from the state's own counter, never from the request, so
+    // associating two different pairs can never collide on it.
+    let mut association_id = state.mint_id();
+    while state.source_api_associations.contains_key(&association_id) {
+        association_id = state.mint_id();
+    }
+    let seq = state.next_seq();
+
+    let record = SourceApiAssociationRecord {
+        seq,
+        association_arn: ::engine::emulator_arn(
+            ARN_SERVICE,
+            &request.region,
+            &format!("apis/{merged_api_id}/sourceApiAssociations/{association_id}"),
+        ),
+        association_id: association_id.clone(),
+        source_api_id,
+        source_api_arn,
+        merged_api_id,
+        merged_api_arn,
+        description: request.description,
+        merge_type: request
+            .merge_type
+            .unwrap_or_else(|| DEFAULT_MERGE_TYPE.to_string()),
+        // Creating the association SCHEDULES the merge; the clock owes its outcome, so
+        // nothing here performs it or waits for it.
+        status: MERGE_SCHEDULED.to_string(),
+        status_detail: MERGE_SCHEDULED_DETAIL.to_string(),
+        last_successful_merge_date: None,
+        merge_due_at: Some(now + MERGE_SPAN),
+    };
+    let association = record.to_source_api_association();
+    state
+        .source_api_associations
+        .insert(association_id, record);
+
+    Ok(association)
+}
+
 /// Per-service state for com-amazonaws-appsync-awsdeepdishcontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
