@@ -224,13 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 status: domain.status.as_wire().to_string(),
                 web_app_url: domain.web_app_url.clone(),
-                web_app_configuration: domain.web_app_configuration.as_ref().map(|config| {
-                    WebAppConfiguration {
-                        ehr_role: config.ehr_role.clone(),
-                        idc_application_id: config.idc_application_id.clone(),
-                        idc_region: config.idc_region.clone(),
-                    }
-                }),
+                web_app_configuration: domain
+                    .web_app_configuration
+                    .as_ref()
+                    .map(crate::state::WebAppConfigurationRecord::projected),
                 created_at: crate::state::to_timestamp(domain.created_at),
                 // A resource with no tags has an EMPTY tag map, not an absent one.
                 tags: Some(tags),

@@ -56,6 +56,9 @@ mod import_file_task_listing;
 #[path = "all/import_status_report.rs"]
 mod import_status_report;
 
+#[path = "all/input_less_reads.rs"]
+mod input_less_reads;
+
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 

@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // directory, because what an instance provides is read from that directory's
         // registrations — so the product this call adds is reported by the very next
         // `ListInstances` instead of waiting for an unrelated later write.
-        state.insert_identity_provider(key, record.clone());
+        state.insert_identity_provider(key, record.clone(), now);
         // The `REGISTERING` -> `REGISTERED` transition the clock now owes, so a later
         // read materialises it without every request sweeping the whole store.
         state.schedule_transition(record.registered_due_at);

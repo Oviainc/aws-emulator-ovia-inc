@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChangeSetHooks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChangeSetHooks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the Hook invocations the change set `CreateChangeSet` persisted
+//! has planned ([`crate::state::change_set_hooks`]) together with the change set's
+//! identity and the status that plan is in, one bounded page at a time, narrowed to one
+//! resource when the request names a `LogicalResourceId`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChangeSetHooks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A change set is addressed by its ARN, or by name plus the stack it belongs to, exactly
+//! as `DescribeChangeSet` addresses one; neither resolving one answers the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +85,31 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::change_set_hooks::StoredChangeSetHook;
+
+/// One planned invocation as the modelled `ChangeSetHook` shape.
+///
+/// `TargetDetails` is "the type of Hook target" and the details of that target: the only
+/// `HookTargetType` the model admits is a resource, so a planned invocation always carries
+/// the resource target details — the resource of the change set it would be evaluated
+/// against, that resource's type and the action the change set would perform on it.
+fn hook_view(stored: &StoredChangeSetHook) -> ChangeSetHook {
+    ChangeSetHook {
+        invocation_point: Some(stored.invocation_point.clone()),
+        failure_mode: Some(stored.failure_mode.clone()),
+        type_name: Some(stored.type_name.clone()),
+        type_version_id: Some(stored.type_version_id.clone()),
+        type_configuration_version_id: stored.type_configuration_version_id.clone(),
+        target_details: Some(ChangeSetHookTargetDetails {
+            target_type: Some(stored.target_type.clone()),
+            resource_target_details: Some(ChangeSetHookResourceTargetDetails {
+                logical_resource_id: Some(stored.logical_resource_id.clone()),
+                resource_type: Some(stored.resource_type.clone()),
+                resource_action: Some(stored.resource_action.clone()),
+            }),
+        }),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +179,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChangeSetHooks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChangeSetHooksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChangeSetHooks"))
+        // "If you specified the name of a change set, specify the stack name or stack ID
+        // (ARN) of the change set": only an ARN names a change set on its own.
+        crate::state::require_stack_for_change_set_name(
+            &input.change_set_name,
+            input.stack_name.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no change set store to read, so
+            // this answers 501 rather than an empty, truthful-looking Hook plan.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeChangeSetHooks",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        let change_set = store
+            .resolve_change_set(&region, &input.change_set_name, input.stack_name.as_deref())
+            .ok_or_else(|| {
+                DescribeChangeSetHooksError::from(
+                    DescribeChangeSetHooksErrorModeled::ChangeSetNotFoundException(
+                        ChangeSetNotFoundException {
+                            message: Some(crate::state::change_set_does_not_exist(
+                                &input.change_set_name,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        // "If specified, lists only the Hooks related to the specified LogicalResourceId":
+        // a filter over the planned invocations, so one that selects none of them is the
+        // empty list rather than a refusal.
+        let selected: Vec<ChangeSetHook> = change_set
+            .hooks
+            .iter()
+            .filter(|hook| {
+                input
+                    .logical_resource_id
+                    .as_deref()
+                    .is_none_or(|logical_resource_id| hook.targets(logical_resource_id))
+            })
+            .map(hook_view)
+            .collect();
+        // `NextToken` is "the token for the next set of items to return", so one response
+        // carries one bounded page of the plan and the token resumes just past it.
+        let (hooks, next_token) = crate::state::paginate(
+            crate::state::PageOf::ChangeSetHooks,
+            selected,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeChangeSetHooksOutput {
+            change_set_id: Some(change_set.change_set_id.clone()),
+            change_set_name: Some(change_set.change_set_name.clone()),
+            stack_id: Some(change_set.stack_id.clone()),
+            stack_name: Some(change_set.stack_name.clone()),
+            // Always present, as an empty element for a change set that plans no
+            // invocation: a client reading the list sees the same shape whether or not
+            // anything was planned.
+            hooks: Some(hooks),
+            // "Provides the status of the change set Hook": the state the change set's own
+            // plan is in, read off the change set rather than off the request.
+            status: Some(change_set.hooks_status().to_string()),
+            next_token,
+        })
     }
 }

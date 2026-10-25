@@ -372,6 +372,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The change this create starts is recorded by `begin_change` below,
             // once every option it set has a revision.
             changes: VecDeque::new(),
+            // A new domain has been through no engine version upgrade and no upgrade
+            // eligibility check; `UpgradeDomain` is what records one.
+            upgrades: VecDeque::new(),
             // Nothing is scheduled on a domain this create has just minted: a
             // scheduled action is put there by the call that schedules the change.
             scheduled_actions: BTreeMap::new(),

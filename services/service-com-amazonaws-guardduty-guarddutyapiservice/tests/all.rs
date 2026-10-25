@@ -21,6 +21,8 @@ mod client_rejections;
 mod client_token_store;
 #[path = "all/coverage_listing.rs"]
 mod coverage_listing;
+#[path = "all/coverage_statistics.rs"]
+mod coverage_statistics;
 #[path = "all/custom_detection_rule_association_listing.rs"]
 mod custom_detection_rule_association_listing;
 #[path = "all/custom_detection_rule_association_update.rs"]

@@ -203,6 +203,10 @@ pub mod bedrock;
 /// role, which it reserves two of its actions for.
 pub mod chime_app_instance_admins;
 pub mod chime_family;
+/// The ONE rule for what a caller-supplied CloudWatch Logs log group NAME may be, for
+/// every service whose API takes one and then writes into the group it names — so two
+/// services asked whether CloudWatch Logs could hold a name cannot answer differently.
+pub mod cloudwatch_logs;
 pub mod db_data_sources;
 /// The ONE reading of a caller-supplied EMAIL ADDRESS, for every service whose model
 /// documents a member as one and targets it at a bare string — so two services asked

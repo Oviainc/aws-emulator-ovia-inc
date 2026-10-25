@@ -596,11 +596,11 @@ fn x509_matches(filter: &X509AttributeFilter, cert: &crate::state::Certificate) 
         X509AttributeFilter::ExtendedKeyUsage(name) => cert.extended_key_usages.contains(name),
         X509AttributeFilter::KeyUsage(name) => cert.key_usages.contains(name),
         X509AttributeFilter::KeyAlgorithm(algorithm) => cert.key_algorithm == *algorithm,
-        // A serial number is minted by the certificate authority that signs an X.509
-        // certificate. This emulator signs none, so no record carries one — the same
-        // reason `DescribeCertificate` reports no `Serial` — and a serial filter keeps
-        // nothing.
-        X509AttributeFilter::SerialNumber(_) => false,
+        // A serial number is assigned by the certificate authority that signs an
+        // X.509 certificate: a record holding a signed certificate carries it (an
+        // imported one's own serial) and a record this emulator signed nothing for
+        // carries none, which no serial filter keeps.
+        X509AttributeFilter::SerialNumber(serial) => cert.serial.as_deref() == Some(serial.as_str()),
         // The validity window exists only once the certificate has been issued; an
         // absent bound is in no range.
         X509AttributeFilter::NotAfter(range) => in_range(cert.not_after, range),
@@ -722,13 +722,12 @@ impl ResultOrder {
             "NOT_AFTER" => instant_key(cert.not_after),
             "NOT_BEFORE" => instant_key(cert.not_before),
             "ISSUED_AT" => instant_key(cert.issued_at),
+            "IMPORTED_AT" => instant_key(cert.imported_at),
             "REVOKED_AT" => instant_key(cert.revoked_at),
-            // A renewal status, an import instant and the ACME members are values no
-            // stored record carries (see [`metadata_matches`]), so sorting on one
-            // leaves every certificate in ARN order.
-            "RENEWAL_STATUS" | "IMPORTED_AT" | "ACME_ENDPOINT_ARN" | "ACME_ACCOUNT_ID" => {
-                String::new()
-            }
+            // A renewal status and the ACME members are values no stored record
+            // carries (see [`metadata_matches`]), so sorting on one leaves every
+            // certificate in ARN order.
+            "RENEWAL_STATUS" | "ACME_ENDPOINT_ARN" | "ACME_ACCOUNT_ID" => String::new(),
             // `CREATED_AT`, the model's default, and the field any value the model adds
             // later falls back to; the boundary validator refuses a value outside the
             // enum before this handler runs.

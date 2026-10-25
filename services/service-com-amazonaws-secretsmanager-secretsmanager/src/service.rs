@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -99,14 +99,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording; a case reworded here replaces BOTH the code and the message,
+        // because a client branches on the code.
+        //
+        // The one case this service words itself: a `SecretIdList` longer than
+        // one batch. Secrets Manager answers that with
+        // `InvalidParameterException` — "the parameter name or value is invalid"
+        // — and a sentence stating the bound, not with the boundary validator's
+        // generic refusal, and a client reading the batched API branches on that
+        // modelled code. `SecretIdList` is the only member of this service's
+        // model under that path, so the rewording reaches nothing else.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let over_long_batch = violations.iter().any(|violation| {
+            violation.path == "secretIdList"
+                && matches!(violation.kind, ViolationKind::MaxLength(_))
+        });
+        over_long_batch.then(|| Refused {
+            code: "InvalidParameterException".to_string(),
+            message: crate::ops::batch_get_secret_value::too_many_ids_message(),
+        })
     }
 
     fn override_routing_error(
