@@ -231,10 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         GetAggregateConfigRuleComplianceSummaryErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
                                 message: Some(
-                                    "the specified NextToken is not valid; use the NextToken \
-                                     a previous GetAggregateConfigRuleComplianceSummary \
-                                     response returned"
-                                        .to_string(),
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                                 ),
                             },
                         )
@@ -267,9 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetAggregateConfigRuleComplianceSummaryErrorModeled::NoSuchConfigurationAggregatorException(
                     NoSuchConfigurationAggregatorException {
-                        message: Some(crate::state::no_such_configuration_aggregator_message(
-                            &input.configuration_aggregator_name,
-                        )),
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

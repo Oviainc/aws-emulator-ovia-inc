@@ -29,6 +29,8 @@ mod custom_policy_context_keys;
 mod entities_for_policy;
 #[path = "all/group_listing.rs"]
 mod group_listing;
+#[path = "all/human_readable_summaries.rs"]
+mod human_readable_summaries;
 #[path = "all/identity_policy_enforcement.rs"]
 mod identity_policy_enforcement;
 #[path = "all/instance_profile_role_binding.rs"]

@@ -6,13 +6,14 @@
 //! Two rules are under test, both one level more general than any single route.
 //!
 //! 1. A failure condition is answered with the status and error code the service answers
-//!    for THAT CONDITION, chosen from the shapes the OPERATION declares — a narrow error
-//!    list is widened with `extra_errors` only where recorded wire behaviour shows the
-//!    service answering a shape the list omits, so `StopAssessment` reports an absent
-//!    assessment with `ResourceNotFoundException` (404) and `GetAssessment` refuses an id
-//!    it was never issued as an invalid parameter (`ValidationException`, 400), while
-//!    `GetLatestAssessmentId`, whose list declares no not-found at all, reports an
-//!    account with no assessment through its own `ValidationException` (400).
+//!    for THAT CONDITION — a narrow error list is widened with `extra_errors` where
+//!    recorded wire behaviour shows the service answering a shape the list omits, so
+//!    `StopAssessment` reports an absent assessment with `ResourceNotFoundException`
+//!    (404) and `GetAssessment` refuses an id it was never issued as an invalid parameter
+//!    (`ValidationException`, 400), while `GetLatestAssessmentId`, which takes no input
+//!    at all and so has no value to refuse, reports an account with no assessment as a
+//!    missing resource (`ResourceNotFoundException`, 404) — the whole input-less class is
+//!    tabled in `input_less_reads.rs`.
 //! 2. A constraint a request member's documentation states in prose that its `@pattern`
 //!    and `@length` cannot express — "the bucket name must begin with
 //!    `migrationhub-strategy-`" — is enforced by the handler, which refuses the request
@@ -125,10 +126,10 @@ async fn an_unresolvable_assessment_id_is_refused_per_operation() {
     );
 }
 
-/// `GetLatestAssessmentId` declares no not-found, so in an account where no assessment
-/// has ever been started the condition is reported through the one client error its list
-/// does declare — `ValidationException` (400) — and the answer is the same however many
-/// times it is asked.
+/// `GetLatestAssessmentId` takes no input, so in an account where no assessment has ever
+/// been started the condition is a missing resource rather than a refusal of anything the
+/// caller sent: it is reported with the service's `ResourceNotFoundException` (404), and
+/// the answer is the same however many times it is asked.
 #[tokio::test]
 async fn an_account_with_no_assessment_reports_the_latest_id_as_absent() {
     let router = emulator();
@@ -136,14 +137,14 @@ async fn an_account_with_no_assessment_reports_the_latest_id_as_absent() {
     for attempt in 1..=3 {
         let answer = get_latest_assessment_id(&router).await;
         assert_eq!(
-            answer.status, 400,
+            answer.status, 404,
             "attempt {attempt}: an account with no assessment has no latest id, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.error_code(),
-            "ValidationException",
-            "attempt {attempt}: expected ValidationException, got {:?}",
+            "ResourceNotFoundException",
+            "attempt {attempt}: expected ResourceNotFoundException, got {:?}",
             answer.body
         );
         assert!(
@@ -171,7 +172,7 @@ async fn an_account_with_no_assessment_reports_the_latest_id_as_absent() {
     );
     assert_eq!(
         get_latest_assessment_id(&router).await.status,
-        400,
+        404,
         "an import is not an assessment, so there is still no latest assessment id"
     );
 }
@@ -393,7 +394,7 @@ async fn a_refused_start_assessment_leaves_no_assessment_behind() {
         );
         assert_eq!(
             get_latest_assessment_id(&router).await.status,
-            400,
+            404,
             "case {case:?}: a refused start must not mint an assessment"
         );
     }

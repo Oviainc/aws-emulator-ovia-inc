@@ -48,7 +48,8 @@ const INVALID_TENANT_TEXT: &str = "Invalid tenant identifier";
 /// See [`NO_PROVIDER_TEXT`].
 const INVALID_CLIENT_TEXT: &str = "Invalid client identifier";
 /// See [`NO_PROVIDER_TEXT`].
-const UNVERIFIABLE_TEXT: &str = "Unable to verify Azure credentials for the connector";
+const UNVERIFIABLE_TEXT: &str =
+    "Unable to verify Azure credentials for the provided tenant configuration.";
 
 /// A GUID in the canonical hyphenated form Microsoft Entra ID (Azure AD) publishes a
 /// directory (tenant) identifier in. The model constrains these identifiers only by

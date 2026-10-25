@@ -83,24 +83,42 @@ impl Emulator {
     /// host store, so a host-backed connection needs a host to exist; it is created
     /// through the API, so what the connection names is a host this service minted.
     pub(crate) async fn create_host(&self, name: &str) -> String {
-        let (status, response) = self
-            .call(
-                "CreateHost",
-                json!({
-                    "Name": name,
-                    "ProviderType": HOST_PROVIDER_TYPE,
-                    "ProviderEndpoint": format!("https://{name}.example.com"),
-                }),
-            )
-            .await;
+        self.create_host_from(
+            name,
+            json!({
+                "Name": name,
+                "ProviderType": HOST_PROVIDER_TYPE,
+                "ProviderEndpoint": format!("https://{name}.example.com"),
+            }),
+        )
+        .await
+    }
+
+    /// [`Self::create_host`] for a suite that has to describe the host itself — a
+    /// `VpcConfiguration`, another `ProviderType`, an endpoint at a published bound: the
+    /// ONE create-and-assert path, so a suite driving a host through the API does not
+    /// grow a copy of it.
+    pub(crate) async fn create_host_from(&self, case: &str, body: Value) -> String {
+        let (status, response) = self.call("CreateHost", body).await;
         assert_eq!(
             status, 200,
-            "host {name:?}: expected CreateHost to answer 200, got {status} {response:?}"
+            "case {case:?}: expected CreateHost to answer 200, got {status} {response:?}"
         );
         response["HostArn"]
             .as_str()
-            .unwrap_or_else(|| panic!("host {name:?}: no HostArn in {response:?}"))
+            .unwrap_or_else(|| panic!("case {case:?}: no HostArn in {response:?}"))
             .to_string()
+    }
+
+    /// `GetHost`, asserting success, and return the reported host — the read every suite
+    /// proves a host write through.
+    pub(crate) async fn get_host(&self, case: &str, host_arn: &str) -> Value {
+        let (status, response) = self.call("GetHost", json!({ "HostArn": host_arn })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetHost to answer 200, got {status} {response:?}"
+        );
+        response
     }
 
     /// Dispatch one awsJson1_0 call naming `target` verbatim in `X-Amz-Target`, so a

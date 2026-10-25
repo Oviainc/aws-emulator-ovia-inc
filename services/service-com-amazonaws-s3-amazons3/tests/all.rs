@@ -35,6 +35,8 @@ mod bucket_lifecycle_configuration;
 mod bucket_location;
 #[path = "all/bucket_metrics_configuration.rs"]
 mod bucket_metrics_configuration;
+#[path = "all/bucket_metrics_configuration_listing.rs"]
+mod bucket_metrics_configuration_listing;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
 #[path = "all/bucket_ownership_controls.rs"]

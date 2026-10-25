@@ -177,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
+        // A tag key in the reserved namespace names a system tag, which is not
+        // the caller's to set, so a request carrying one is refused before
+        // anything is stored rather than creating a resource that claims it.
+        if let Some(key) = crate::state::reserved_tag_key_in(input.tags.as_ref()) {
+            return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::reserved_tag_key_message(key)),
+            })
+            .into());
+        }
+
         // `DryRun` carries no documented semantics in this model (its doc text is
         // the generated placeholder), so what the real service validates — and
         // what it answers — is not knowable from the contract. Refuse it with the

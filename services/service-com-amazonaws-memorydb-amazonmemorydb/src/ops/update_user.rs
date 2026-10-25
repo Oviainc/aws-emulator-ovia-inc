@@ -235,6 +235,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `AccessString` carries the user's permissions as a rule list of the engine's
+        // ACL syntax, so a replacement is PARSED before it is canonicalised and stored,
+        // through the one rule `CreateUser` reads: both write paths of a user's access
+        // string refuse the same values, so a stored user can never hold a rule list
+        // the engine does not define.
+        if let Some(message) = input
+            .access_string
+            .as_deref()
+            .and_then(crate::state::access_string_rejection)
+        {
+            return Err(UpdateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // The authentication rules are checked BEFORE anything is persisted, so a
         // refused request leaves the user untouched. The helper is the one `CreateUser`
         // uses, so a value one operation refuses the other refuses too.

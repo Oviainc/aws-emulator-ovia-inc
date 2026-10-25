@@ -27,6 +27,8 @@ mod logging_configuration;
 mod logging_configuration_deletion;
 #[path = "all/map_key_constraints.rs"]
 mod map_key_constraints;
+#[path = "all/namespace_tag_removal.rs"]
+mod namespace_tag_removal;
 #[path = "all/query_logging_configuration.rs"]
 mod query_logging_configuration;
 #[path = "all/rejection_codes.rs"]

@@ -294,6 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .services
             .retain(|_, service| service.cluster_name != cluster_name);
         guard
+            .task_sets
+            .retain(|_, task_set| task_set.cluster_name != cluster_name);
+        guard
             .container_instances
             .retain(|_, instance| instance.cluster_name != cluster_name);
         // The cluster itself is KEPT as a tombstone: "Clusters with an INACTIVE status

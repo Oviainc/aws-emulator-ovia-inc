@@ -232,11 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        if let Some(message) = crate::state::webhook_build_type_violation(
-            &source_type,
-            input.build_type.as_deref(),
-            &project_arn,
-        ) {
+        if let Some(message) =
+            crate::state::webhook_build_type_violation(&source_type, input.build_type.as_deref())
+        {
             return Err(refuse(
                 Self::NAME,
                 ctx,

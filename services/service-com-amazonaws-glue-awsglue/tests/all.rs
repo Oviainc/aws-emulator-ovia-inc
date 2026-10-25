@@ -53,6 +53,8 @@ mod jobs;
 mod registries;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
+#[path = "all/search_tables.rs"]
+mod search_tables;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]

@@ -309,9 +309,10 @@ async fn a_grant_is_read_back_on_every_resource_kind_the_model_carries() {
 }
 
 #[tokio::test]
-async fn granting_again_updates_the_one_record_instead_of_adding_a_second() {
-    // Rows differ along what the rule generalises over: the same permissions repeated,
-    // a disjoint second set, an overlapping one, and more than two calls.
+async fn granting_again_unions_into_the_records_it_already_holds() {
+    // Rows differ along what the rule generalises over: the same permissions repeated, a
+    // disjoint second set, an overlapping one, more than two calls, and a repeat inside
+    // one call.
     let resource = json!({ "Table": { "DatabaseName": "sales", "Name": "orders" } });
     let cases: Vec<RepeatedGrantCase> = vec![
         // The issue's own case: the same grant twice is exactly one entry.

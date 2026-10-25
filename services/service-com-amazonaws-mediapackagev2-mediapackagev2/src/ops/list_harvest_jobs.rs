@@ -152,13 +152,6 @@ impl<Eng> ListHarvestJobs<Eng> {
     }
 }
 
-/// The smallest `MaxResults` the model's `ListResourceMaxResults` range admits.
-const MAX_RESULTS_MIN: usize = 1;
-/// The largest `MaxResults` that range admits.
-const MAX_RESULTS_MAX: usize = 100;
-/// The `MaxResults` the model defaults the member to.
-const MAX_RESULTS_DEFAULT: usize = 10;
-
 /// A harvest job in the form `ListHarvestJobs` reports it: every member of the stored
 /// record except its tags, which the list does not carry.
 fn list_item(job: &crate::state::HarvestJobRecord) -> HarvestJob {
@@ -227,13 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The model bounds `MaxResults` to 1..100 and defaults it to 10, and the boundary
-        // validator has already refused anything outside that range, so a value outside
-        // it here means the member was absent: fall back to the modelled default.
-        let page_size = match usize::try_from(input.max_results) {
-            Ok(size) if (MAX_RESULTS_MIN..=MAX_RESULTS_MAX).contains(&size) => size,
-            _ => MAX_RESULTS_DEFAULT,
-        };
+        // The page size every paged list in this service resolves through the one shared
+        // resolver, so the bounds and the default cannot drift between two lists.
+        let page_size = crate::state::page_size(input.max_results);
 
         // A token names the job the previous page stopped after, so this page starts
         // strictly beyond it: no job is returned twice and none is skipped.

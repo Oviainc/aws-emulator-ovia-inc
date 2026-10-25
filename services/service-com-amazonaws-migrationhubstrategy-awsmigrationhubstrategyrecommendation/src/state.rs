@@ -2095,21 +2095,23 @@ pub fn application_component_not_found() -> ResourceNotFoundException {
 }
 
 /// `GetLatestAssessmentId`'s answer in an account where no assessment has ever been
-/// started: `ValidationException`, HTTP 400.
+/// started: `ResourceNotFoundException`, HTTP 404.
 ///
-/// The operation's own error list declares no not-found at all (`AccessDeniedException`
-/// 403, `DependencyException` 500, `InternalServerException` 500, `ValidationException`
-/// 400), so the client-side refusal it can answer is that 400 — reporting the condition
-/// as a 404 would put a status and an error code on the wire that the operation never
-/// declares, and this service already answers the neighbouring condition "the assessment
-/// you asked about is not one of this account's" with the same 400 (see
-/// [`assessment_id_not_accepted`]).
+/// The operation takes no input at all, so there is no value a caller could have sent
+/// wrongly and the condition is not a refusal of the request: what is missing is the
+/// resource the report would name. The service answers that with its not-found shape
+/// (HTTP 404, "The specified ID in the request is not found."), which is what the
+/// recorded wire behaviour of `GET /get-latest-assessment-id` shows for an account that
+/// has started nothing — exactly as the sibling input-less read answers an account with
+/// no preferences record (see [`no_portfolio_preferences`]). The operation's own error
+/// list omits the shape, so it is widened into its error channel with `extra_errors`; a
+/// narrow list is not a licence to substitute a different shape.
 ///
 /// The status and the error code are the requirement; the message is this service's
 /// sentence for a report it cannot produce because the resource it would name does not
 /// exist yet ([`NOTHING_TO_REPORT`]), and the operation has no input to echo into it.
-pub fn no_latest_assessment() -> ValidationException {
-    ValidationException {
+pub fn no_latest_assessment() -> ResourceNotFoundException {
+    ResourceNotFoundException {
         message: Some(NOTHING_TO_REPORT.to_string()),
     }
 }

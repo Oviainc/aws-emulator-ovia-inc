@@ -618,41 +618,164 @@ fn like_matches(candidate: &str, pattern: &str) -> bool {
     pattern[at_pattern..].iter().all(|token| *token == '%')
 }
 
-/// Read `expression` as a Config query, or answer why it is not one.
+/// Why an `Expression` is refused, as the message `InvalidExpressionException` carries.
 ///
-/// The message is BUILT FROM THE REQUEST: it states what about the expression cannot be
-/// read, so a caller can fix the query from the refusal alone.
-pub fn read_expression(expression: &str) -> Result<SelectQuery, String> {
+/// The one error code stands for every refusal of a Config query, so the message is what
+/// tells a caller which refusal it got, and the two kinds say different things:
+///
+/// * a command this service cannot READ as a Config query carries the sentence that says
+///   so, with the detail of what about it cannot be read ([`Self::unreadable`]);
+/// * a command that IS read and breaks a RULE of the query language carries the sentence
+///   that rule is worded with ([`Self::broken_rule`]) — the one that names the fields
+///   which broke the GROUP BY coverage rule, and otherwise the single sentence a query
+///   the engine will not run is refused with ([`QUERY_IS_INVALID_MESSAGE`]).
+#[derive(Debug, Clone)]
+pub struct ExpressionRefusal(String);
+
+impl ExpressionRefusal {
+    /// The refusal of a command that cannot be read as a Config query at all: `detail`
+    /// says what about it cannot be read, under the one sentence that says it is not a
+    /// query.
+    fn unreadable(detail: &str) -> Self {
+        Self(format!(
+            "The expression is not a valid Config query: {detail}."
+        ))
+    }
+
+    /// The refusal of a command that is read and breaks a rule of the query language:
+    /// `message` is the whole sentence that rule is refused with.
+    fn broken_rule(message: String) -> Self {
+        Self(message)
+    }
+
+    /// The message the refusal is answered with.
+    pub fn message(self) -> String {
+        self.0
+    }
+}
+
+/// A detail of what cannot be READ is the common case, so `?` lifts one into the
+/// refusal it is worded under.
+impl From<String> for ExpressionRefusal {
+    fn from(detail: String) -> Self {
+        Self::unreadable(&detail)
+    }
+}
+
+/// How Config words the GROUP BY coverage rule of the query language.
+///
+/// A query that aggregates answers one row per GROUP, so a property it selects that the
+/// GROUP BY list does not carry has no single value to answer for a group. The message
+/// names the RULE and is BUILT FROM THE REQUEST: it lists the selected fields the GROUP
+/// BY list does not carry, in the order the query selected them, so a caller knows which
+/// fields to group by or to drop.
+fn ungrouped_selected_fields_message(fields: &[String]) -> String {
+    format!(
+        "when a GROUP BY clause or Aggregate Function (AVG|COUNT|MAX|MIN|SUM) is present, \
+         selected fields ({}) must appear in the GROUP BY field list",
+        fields.join(", ")
+    )
+}
+
+/// The members a configuration item carries, by the name a Config query selects them
+/// with (`smithy_query(query="shape", shape="ConfigurationItem")`).
+///
+/// NOT ONE of them is a number: the shape declares strings, enums, timestamps, a map and
+/// two lists, and the `configuration` member is a JSON-encoded document whose own members
+/// the resource type defines rather than this model. The numbers an arithmetic aggregate
+/// can compute over are therefore only ever INSIDE that document, never one of these
+/// members.
+const CONFIGURATION_ITEM_MEMBERS: [&str; 20] = [
+    "accountId",
+    "arn",
+    "availabilityZone",
+    "awsRegion",
+    "configuration",
+    "configurationItemCaptureTime",
+    "configurationItemDeliveryTime",
+    "configurationItemMD5Hash",
+    "configurationItemStatus",
+    "configurationStateId",
+    "recordingFrequency",
+    "relatedEvents",
+    "relationships",
+    "resourceCreationTime",
+    "resourceId",
+    "resourceName",
+    "resourceType",
+    "supplementaryConfiguration",
+    "tags",
+    "version",
+];
+
+/// The ONE sentence Config refuses a query it READ but will not RUN with.
+///
+/// Fixed, and it carries no part of the request: a rule of the query language that AWS
+/// words itself ([`ungrouped_selected_fields_message`]) says which fields broke it, and
+/// every other rule of the language carries no more than this.
+const QUERY_IS_INVALID_MESSAGE: &str = "Query is invalid.";
+
+/// How Config words a selected item that names no field of the configuration item.
+///
+/// A field is named by a path of member names, so a selected item that is not one is read
+/// as a field NAME carrying characters a name cannot carry — the brackets of a function
+/// the language does not have, for instance. BUILT FROM THE REQUEST: it quotes the item
+/// as the query wrote it, which is the only way a caller can tell which of several
+/// selected items it has to fix.
+fn invalid_field_name_message(name: &str) -> String {
+    format!("field name {name} contains invalid characters")
+}
+
+/// Whether the schema of a configuration item declares `path` as something other than a
+/// number — which it does for every member it declares at all
+/// ([`CONFIGURATION_ITEM_MEMBERS`]).
+///
+/// A path THROUGH a member (a tag, a member of the `configuration` document) is one the
+/// schema does not type, so nothing is known about it here and nothing is refused for it:
+/// those are exactly the properties a resource type's own configuration carries numbers
+/// in.
+fn declared_non_numeric(path: &[String]) -> bool {
+    matches!(path, [member] if CONFIGURATION_ITEM_MEMBERS.contains(&member.as_str()))
+}
+
+/// Read `expression` as a Config query, or answer why it is not one
+/// ([`ExpressionRefusal`]).
+pub fn read_expression(expression: &str) -> Result<SelectQuery, ExpressionRefusal> {
     if nesting_depth(expression) > MAX_EXPRESSION_DEPTH {
         return Err(format!(
             "the expression nests more than {MAX_EXPRESSION_DEPTH} levels of brackets"
-        ));
+        )
+        .into());
     }
     if token_count(expression) > MAX_EXPRESSION_TOKENS {
         return Err(format!(
             "the expression carries more than {MAX_EXPRESSION_TOKENS} tokens"
-        ));
+        )
+        .into());
     }
 
     let statements = Parser::parse_sql(&GenericDialect {}, expression)
         .map_err(|error| format!("the expression is not a SQL SELECT command: {error}"))?;
     let [Statement::Query(query)] = statements.as_slice() else {
         return Err(
-            "the expression must be exactly one SQL SELECT command and nothing else".to_string(),
+            "the expression must be exactly one SQL SELECT command and nothing else"
+                .to_string()
+                .into(),
         );
     };
     read_query(query)
 }
 
 /// Read one parsed SQL query as a Config query.
-fn read_query(query: &Query) -> Result<SelectQuery, String> {
+fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
     if query.with.is_some() {
-        return Err("a Config query carries no WITH clause".to_string());
+        return Err("a Config query carries no WITH clause".to_string().into());
     }
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(
             "a Config query is a single SELECT, not a set operation or a parenthesised query"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     };
     let select: &Select = select.as_ref();
@@ -660,14 +783,15 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
         return Err(
             "a Config query selects from the resources Config has recorded, so it carries no \
              FROM clause"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     if select.having.is_some() {
-        return Err("a Config query carries no HAVING clause".to_string());
+        return Err("a Config query carries no HAVING clause".to_string().into());
     }
     if select.distinct.is_some() {
-        return Err("a Config query carries no DISTINCT clause".to_string());
+        return Err("a Config query carries no DISTINCT clause".to_string().into());
     }
 
     let mut fields: Vec<Field> = Vec::new();
@@ -675,7 +799,9 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
         fields.push(read_field(item)?);
     }
     if fields.is_empty() {
-        return Err("a Config query selects at least one property".to_string());
+        return Err("a Config query selects at least one property"
+            .to_string()
+            .into());
     }
 
     let group_by = match &select.group_by {
@@ -689,9 +815,9 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
             grouped
         }
         _ => {
-            return Err(
-                "a Config query groups by properties of the configuration item".to_string(),
-            )
+            return Err("a Config query groups by properties of the configuration item"
+                .to_string()
+                .into())
         }
     };
 
@@ -708,22 +834,53 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
             .iter()
             .any(|field| matches!(field, Field::Aggregated { .. }));
     if aggregates {
-        for field in &fields {
-            match field {
-                Field::Everything => {
-                    return Err(
-                        "a Config query that aggregates selects properties it groups by, not *"
-                            .to_string(),
-                    )
-                }
+        // A query that aggregates answers one row per group, and `*` is every member of
+        // an ITEM: there is no group whose members it could name.
+        if fields
+            .iter()
+            .any(|field| matches!(field, Field::Everything))
+        {
+            return Err(ExpressionRefusal::broken_rule(
+                QUERY_IS_INVALID_MESSAGE.to_string(),
+            ));
+        }
+        // Every property this query selects has to be one it groups by, and the refusal
+        // names ALL of those that are not, in the order they were selected: the rule is
+        // about the projection as a whole, so a caller fixing one field at a time would
+        // need one refusal per field to learn the same thing.
+        let ungrouped: Vec<String> = fields
+            .iter()
+            .filter_map(|field| match field {
                 Field::Property(path) if !group_by.iter().any(|grouped| grouped == path) => {
-                    return Err(format!(
-                        "the property '{}' is selected beside an aggregate, so the query must \
-                         group by it",
-                        path.join(".")
-                    ))
+                    Some(path.join("."))
                 }
-                _ => {}
+                _ => None,
+            })
+            .collect();
+        if !ungrouped.is_empty() {
+            return Err(ExpressionRefusal::broken_rule(
+                ungrouped_selected_fields_message(&ungrouped),
+            ));
+        }
+
+        // AVG and SUM compute over NUMBERS, so a field the configuration item schema
+        // declares as something else carries nothing either of them can add up: that
+        // query is refused rather than answered with a group the function is simply
+        // missing from. COUNT counts values of any type and MIN and MAX order them, so
+        // neither is bound by this.
+        for field in &fields {
+            if let Field::Aggregated {
+                function,
+                property: Some(path),
+            } = field
+            {
+                if matches!(function, Aggregate::Avg | Aggregate::Sum)
+                    && declared_non_numeric(path)
+                {
+                    return Err(ExpressionRefusal::broken_rule(
+                        QUERY_IS_INVALID_MESSAGE.to_string(),
+                    ));
+                }
             }
         }
     }
@@ -735,9 +892,8 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
         for key in &order_by {
             let path = key.property.join(".");
             if !group_by.contains(&key.property) && !names.contains(&path) {
-                return Err(format!(
-                    "the ORDER BY property '{path}' is neither grouped by nor selected by this \
-                     query"
+                return Err(ExpressionRefusal::broken_rule(
+                    QUERY_IS_INVALID_MESSAGE.to_string(),
                 ));
             }
         }
@@ -753,25 +909,27 @@ fn read_query(query: &Query) -> Result<SelectQuery, String> {
 }
 
 /// Read one selected item as a field of a Config query.
-fn read_field(item: &SelectItem) -> Result<Field, String> {
+fn read_field(item: &SelectItem) -> Result<Field, ExpressionRefusal> {
     match item {
         SelectItem::Wildcard(_) => Ok(Field::Everything),
         SelectItem::UnnamedExpr(expression) => read_field_expression(expression),
         SelectItem::ExprWithAlias { .. } => Err(
             "a Config query selects properties of the configuration item, which carry no alias"
-                .to_string(),
+                .to_string()
+                .into(),
         ),
         SelectItem::QualifiedWildcard(..) => Err(
             "a Config query selects properties of one configuration item, so a qualified \
              wildcard names nothing"
-                .to_string(),
+                .to_string()
+                .into(),
         ),
     }
 }
 
 /// Read one selected expression: a property of the configuration item, or an aggregate
 /// over the items the query matched.
-fn read_field_expression(expression: &Expr) -> Result<Field, String> {
+fn read_field_expression(expression: &Expr) -> Result<Field, ExpressionRefusal> {
     if let Expr::Function(function) = expression {
         let name = function
             .name
@@ -781,16 +939,18 @@ fn read_field_expression(expression: &Expr) -> Result<Field, String> {
             .collect::<Vec<String>>()
             .join(".");
         let Some(aggregate) = Aggregate::parse(&name) else {
-            return Err(format!(
-                "'{name}' is not one of the functions a Config query selects (AVG, COUNT, MAX, \
-                 MIN, SUM)"
-            ));
+            // The language has no such function, so what was selected is not a call at
+            // all: it is a FIELD NAME, and a field is named by a path of member names,
+            // which the brackets of the call are not part of.
+            return Err(ExpressionRefusal::broken_rule(invalid_field_name_message(
+                &expression.to_string(),
+            )));
         };
         let FunctionArguments::List(arguments) = &function.args else {
-            return Err(format!("{name} takes one argument"));
+            return Err(format!("{name} takes one argument").into());
         };
         let [argument] = arguments.args.as_slice() else {
-            return Err(format!("{name} takes exactly one argument"));
+            return Err(format!("{name} takes exactly one argument").into());
         };
         let property = match argument {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
@@ -802,24 +962,24 @@ fn read_field_expression(expression: &Expr) -> Result<Field, String> {
             _ => {
                 return Err(format!(
                     "{name} takes a property of the configuration item, or * for COUNT"
-                ))
+                )
+                .into())
             }
         };
         if property.is_none() && aggregate != Aggregate::Count {
-            return Err(format!("{name} takes a property, not *"));
+            return Err(format!("{name} takes a property, not *").into());
         }
         return Ok(Field::Aggregated {
             function: aggregate,
             property,
         });
     }
-    property_of(expression)
-        .map(Field::Property)
-        .ok_or_else(|| {
-            "a Config query selects properties of the configuration item, aggregates over them, \
-             or *"
-                .to_string()
-        })
+    property_of(expression).map(Field::Property).ok_or_else(|| {
+        "a Config query selects properties of the configuration item, aggregates over them, \
+         or *"
+            .to_string()
+            .into()
+    })
 }
 
 /// The words the Config query language's own grammar is written with — the clause

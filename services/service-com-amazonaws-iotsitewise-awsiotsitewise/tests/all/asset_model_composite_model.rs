@@ -914,7 +914,7 @@ async fn the_preconditions_are_evaluated_against_the_models_entity_tag() {
             vec![("If-None-Match", "*"), ("Match-For-Version-Type", "LATEST")],
         ),
         (
-            "If-Match against the ACTIVE version while the model is UPDATING",
+            "If-Match with the latest version's tag against the ACTIVE version",
             vec![
                 ("If-Match", updated_tag.as_str()),
                 ("Match-For-Version-Type", "ACTIVE"),
@@ -935,22 +935,41 @@ async fn the_preconditions_are_evaluated_against_the_models_entity_tag() {
         );
     }
 
-    // While the model is UPDATING it has no ACTIVE version, so If-None-Match *
-    // against that version passes.
+    // While the model is UPDATING, the version the write superseded is still its
+    // ACTIVE one: `If-None-Match *` against that version is refused, because the
+    // version it asks not to exist does exist, and `If-Match` carrying the tag
+    // THAT version reported is accepted.
     let (status, answered, _) = call_with_headers(
         &router,
         "POST",
         &uri,
-        Some(body("NoActiveYet")),
+        Some(body("AgainstTheActiveVersion")),
         &[("If-None-Match", "*"), ("Match-For-Version-Type", "ACTIVE")],
     )
     .await;
     assert_eq!(
+        status, 412,
+        "case \"If-None-Match * against the ACTIVE version, which exists\": expected 412, got \
+         {status} {answered}"
+    );
+    let (status, answered, _) = call_with_headers(
+        &router,
+        "POST",
+        &uri,
+        Some(body("AgainstTheActiveVersion")),
+        &[
+            ("If-Match", settled_tag.as_str()),
+            ("Match-For-Version-Type", "ACTIVE"),
+        ],
+    )
+    .await;
+    assert_eq!(
         status, 202,
-        "case \"If-None-Match * with no ACTIVE version\": expected 202, got {status} {answered}"
+        "case \"If-Match with the ACTIVE version's own tag\": expected 202, got {status} {answered}"
     );
 
-    // Once it settles, that same request is refused: the ACTIVE version is there.
+    // Once it settles the latest version IS the active one, and the same
+    // `If-None-Match *` is still refused: that version exists either way.
     tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
     let (status, answered, _) = call_with_headers(
         &router,

@@ -51,6 +51,8 @@ mod medical_scribe_jobs;
 mod medical_scribe_settings_references;
 #[path = "all/medical_transcription_job_listing.rs"]
 mod medical_transcription_job_listing;
+#[path = "all/medical_transcription_job_name_lifetime.rs"]
+mod medical_transcription_job_name_lifetime;
 #[path = "all/medical_transcription_jobs.rs"]
 mod medical_transcription_jobs;
 #[path = "all/medical_vocabularies.rs"]

@@ -2,11 +2,11 @@
 
 //! @op GrantPermissions
 //!
-//! Records one explicit grant in
+//! Records what one explicit grant is held as in
 //! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
 //! keyed by the (catalog, principal, resource, condition) tuple
 //! [`crate::state::grant_key`] renders — so granting again on the same resource to the
-//! same principal UNIONS the permissions into the one record it already has, and
+//! same principal UNIONS the permissions into the record it already has, and
 //! `ListPermissions` answers exactly one entry for it. `RevokePermissions` is what
 //! releases it.
 //!

@@ -211,6 +211,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The `aws:` namespace holds the tags Amazon Web Services creates, so a
+        // caller may name no key inside it — on the change set it starts or on
+        // the entities its changes tag. A rule about the REQUEST: nothing of the
+        // store is needed to judge it, so it is judged before the store is read
+        // and a change set carrying such a key is never started.
+        if let Some(tags) = input.change_set_tags.as_deref() {
+            if let Some(reserved) = crate::state::first_reserved_tag(tags) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::reserved_tag_key("ChangeSetTags", reserved),
+                )
+                .into());
+            }
+        }
+
         // The changes are judged for their SHAPE first, over the whole change
         // set: every member the service publishes a syntax for, and the rule
         // that the change set may not contradict itself. Nothing here reads the
@@ -233,6 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::invalid_entity_type(&change.entity.r#type),
                 )
                 .into());
+            }
+            // The same reserved namespace, for the tags this change would put on
+            // its entity.
+            if let Some(tags) = change.entity_tags.as_deref() {
+                if let Some(reserved) = crate::state::first_reserved_tag(tags) {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::reserved_tag_key("ChangeSet.EntityTags", reserved),
+                    )
+                    .into());
+                }
             }
             // `Entity$Identifier` has two published forms, both wider than the
             // modelled `Identifier` pattern, so it too is judged here — and

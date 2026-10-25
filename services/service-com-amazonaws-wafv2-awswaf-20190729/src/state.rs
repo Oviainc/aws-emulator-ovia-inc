@@ -26,8 +26,8 @@ use crate::ops::types::{
     OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleAction, RuleGroup, RuleSummary,
     Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
     WAFFeatureNotIncludedInPricingPlanException, WAFInvalidOperationException,
-    WAFInvalidParameterException, WAFLimitsExceededException, WAFNonexistentItemException,
-    WAFOptimisticLockException, WebACL,
+    WAFInvalidParameterException, WAFInvalidPermissionPolicyException, WAFLimitsExceededException,
+    WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -184,6 +184,30 @@ pub fn invalid_operation_exception() -> WAFInvalidOperationException {
     }
 }
 
+/// The sentence `WAFInvalidPermissionPolicyException` carries: the sentence the model
+/// documents for the shape
+/// (`smithy_query(query="shape",shape="WAFInvalidPermissionPolicyException")` — "The
+/// operation failed because the specified policy isn't in the proper format"), its
+/// wrapping whitespace flattened. See [`DUPLICATE_ITEM_MESSAGE`] for why the wording
+/// is a property of the exception type rather than of the call: the rest of that
+/// shape's documentation is the list of restrictions every request is judged against,
+/// not a detail of one call, so the body names neither the policy that was rejected
+/// nor which restriction it broke.
+pub const INVALID_PERMISSION_POLICY_MESSAGE: &str =
+    "The operation failed because the specified policy isn't in the proper format.";
+
+/// `WAFInvalidPermissionPolicyException` as WAF returns it: nothing but
+/// [`INVALID_PERMISSION_POLICY_MESSAGE`].
+///
+/// This is the ONE refusal for a permission policy outside the restrictions
+/// `PutPermissionPolicy` documents, whichever of them the document breaks (see
+/// [`permission_policy_is_valid`]).
+pub fn invalid_permission_policy_exception() -> WAFInvalidPermissionPolicyException {
+    WAFInvalidPermissionPolicyException {
+        message: Some(INVALID_PERMISSION_POLICY_MESSAGE.to_string()),
+    }
+}
+
 /// A WebACL as stored: the modelled shape plus the bookkeeping WAFv2 keeps beside
 /// it.
 #[derive(Debug, Clone)]
@@ -236,6 +260,16 @@ pub struct RuleGroupEntry {
     pub lock_token: String,
     /// Tags given at create time (`ListTagsForResource` is a separate gap issue).
     pub tags: Vec<Tag>,
+    /// The IAM policy `PutPermissionPolicy` attached to this rule group, as the
+    /// caller wrote it, or `None` while none is attached.
+    ///
+    /// A rule group carries at most one: "you can attach only one policy with each
+    /// PutPermissionPolicy request" and the policy is addressed by the rule group's
+    /// own ARN, so attaching replaces whatever was attached. The document is stored
+    /// as the request wrote it, byte for byte — a policy is opaque to WAF beyond the
+    /// restrictions [`permission_policy_is_valid`] checks — so
+    /// `GetPermissionPolicy` answers the caller's own text.
+    pub permission_policy: Option<String>,
 }
 
 /// An API key as stored: the encrypted key value, the token domains it carries
@@ -811,6 +845,36 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     pub fn holds_rule_group(&self, arn: &str) -> bool {
         arn_resource_kind(arn) == Some(RULE_GROUP_ARN_KIND)
             && matches!(self.arn_index.get(arn), Some(ResourceRef::RuleGroup { .. }))
+    }
+
+    /// The rule group `arn` names, or `None` when it names no rule group this
+    /// service holds.
+    ///
+    /// The by-ARN counterpart of [`Self::rule_group`], resolving through
+    /// [`Self::arn_index`] exactly as [`Self::web_acl_by_arn`] does, so an ARN of
+    /// another kind and an ARN that was never minted here both name nothing — and so
+    /// does a rule group ARN carrying another Region, since the index holds each
+    /// resource under the one ARN it was minted with.
+    pub fn rule_group_by_arn(&self, arn: &str) -> Option<&RuleGroupEntry> {
+        match self.arn_index.get(arn)? {
+            ResourceRef::RuleGroup { scope, id } => {
+                self.rule_groups.get(&(scope.clone(), id.clone()))
+            }
+            ResourceRef::WebAcl { .. }
+            | ResourceRef::IpSet { .. }
+            | ResourceRef::RegexPatternSet { .. } => None,
+        }
+    }
+
+    /// [`Self::rule_group_by_arn`], for a caller that writes to the entry.
+    pub fn rule_group_by_arn_mut(&mut self, arn: &str) -> Option<&mut RuleGroupEntry> {
+        let (scope, id) = match self.arn_index.get(arn)? {
+            ResourceRef::RuleGroup { scope, id } => (scope.clone(), id.clone()),
+            ResourceRef::WebAcl { .. }
+            | ResourceRef::IpSet { .. }
+            | ResourceRef::RegexPatternSet { .. } => return None,
+        };
+        self.rule_groups.get_mut(&(scope, id))
     }
 
     /// The live web ACL whose rule tree references `arn`, if any.
@@ -1995,6 +2059,173 @@ fn statement_references_arn(statement: &Statement, arn: &str, depth_budget: u32)
     nested_statements(statement)
         .into_iter()
         .any(|nested| statement_references_arn(nested, arn, depth_budget - 1))
+}
+
+// ---------------------------------------------------------------------------
+// RuleGroup permission policies
+//
+// `PutPermissionPolicy` attaches an IAM policy to the rule group its `ResourceArn`
+// names and `GetPermissionPolicy` reports it back; the attached document itself
+// lives on [`RuleGroupEntry::permission_policy`], so one copy serves every reader.
+// The restrictions checked below are the ones `PutPermissionPolicy` and
+// `WAFInvalidPermissionPolicyException` document, nothing wider: the document is
+// only CHECKED here, never rewritten.
+// ---------------------------------------------------------------------------
+
+/// The IAM policy language version a permission policy must declare.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "The policy must be composed
+/// using IAM Policy version 2012-10-17."
+pub const PERMISSION_POLICY_VERSION: &str = "2012-10-17";
+
+/// The one `Effect` a permission policy statement may carry.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "`Effect` must specify
+/// `Allow`."
+pub const PERMISSION_POLICY_EFFECT: &str = "Allow";
+
+/// Every `Action` a permission policy has to grant.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "`Action` must specify
+/// `wafv2:CreateWebACL`, `wafv2:UpdateWebACL`, and
+/// `wafv2:PutFirewallManagerRuleGroups`."
+pub const PERMISSION_POLICY_REQUIRED_ACTIONS: &[&str] = &[
+    "wafv2:CreateWebACL",
+    "wafv2:UpdateWebACL",
+    "wafv2:PutFirewallManagerRuleGroups",
+];
+
+/// The `Action`s a permission policy may grant BESIDES
+/// [`PERMISSION_POLICY_REQUIRED_ACTIONS`], and the only ones.
+///
+/// Source: `PutPermissionPolicy`'s own documentation — "… and may optionally specify
+/// `wafv2:GetRuleGroup`. WAF rejects any extra actions or wildcard actions in the
+/// policy."
+pub const PERMISSION_POLICY_OPTIONAL_ACTIONS: &[&str] = &["wafv2:GetRuleGroup"];
+
+/// Whether `action` is one a permission policy may grant.
+///
+/// The two lists hold the literal actions the documentation names, so an action
+/// outside them is refused — including any form carrying a `*`, which is never one
+/// of the literals and so is rejected as the documentation requires, however wide or
+/// narrow the wildcard is.
+fn permission_policy_action_is_allowed(action: &str) -> bool {
+    PERMISSION_POLICY_REQUIRED_ACTIONS.contains(&action)
+        || PERMISSION_POLICY_OPTIONAL_ACTIONS.contains(&action)
+}
+
+/// Whether `policy` is a permission policy WAF accepts: a JSON object declaring IAM
+/// policy version [`PERMISSION_POLICY_VERSION`] whose `Statement` — one statement
+/// object, or a non-empty list of them — every entry of satisfies
+/// [`permission_policy_statement_actions`], and which between them grant every
+/// [`PERMISSION_POLICY_REQUIRED_ACTIONS`] entry.
+///
+/// Source: the restrictions `PutPermissionPolicy` and
+/// `WAFInvalidPermissionPolicyException` document. What gets stored is the caller's
+/// own text, byte for byte.
+pub fn permission_policy_is_valid(policy: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let Some(document) = document.as_object() else {
+        return false;
+    };
+    if document
+        .get("Version")
+        .and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_VERSION)
+    {
+        return false;
+    }
+    let statements: Vec<&::serde_json::Value> = match document.get("Statement") {
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
+        Some(::serde_json::Value::Array(list)) => list.iter().collect(),
+        // A policy with no `Statement`, or one that is neither a statement nor a
+        // list of statements, carries no `Effect`, `Action` or `Principal` at all.
+        _ => return false,
+    };
+    if statements.is_empty() {
+        return false;
+    }
+    let mut granted: Vec<&str> = Vec::new();
+    for statement in statements {
+        match permission_policy_statement_actions(statement) {
+            Some(actions) => granted.extend(actions),
+            None => return false,
+        }
+    }
+    // The required actions are required of the POLICY: a document may spread them
+    // over several statements, so they are counted once every statement has been
+    // found to be within the restrictions.
+    PERMISSION_POLICY_REQUIRED_ACTIONS
+        .iter()
+        .all(|required| granted.contains(required))
+}
+
+/// The actions one `Statement` of a permission policy grants, or `None` when the
+/// statement is outside the documented restrictions: it must carry an `Effect` of
+/// [`PERMISSION_POLICY_EFFECT`], a non-empty `Principal`, an `Action` — one action or
+/// a non-empty list of them — naming only actions
+/// [`permission_policy_action_is_allowed`] admits, and no `Resource`.
+///
+/// `NotAction`, `NotPrincipal` and `NotResource` are refused with the member they
+/// negate: a statement carrying one names no `Action` or `Principal`, or names a
+/// resource the policy "must not include".
+fn permission_policy_statement_actions(statement: &::serde_json::Value) -> Option<Vec<&str>> {
+    let statement = statement.as_object()?;
+    if statement.contains_key("Resource") || statement.contains_key("NotResource") {
+        return None;
+    }
+    if statement.get("Effect").and_then(::serde_json::Value::as_str)
+        != Some(PERMISSION_POLICY_EFFECT)
+    {
+        return None;
+    }
+    if statement.contains_key("NotPrincipal") || statement.contains_key("NotAction") {
+        return None;
+    }
+    if !permission_policy_principal_is_present(statement.get("Principal")) {
+        return None;
+    }
+    let actions: Vec<&::serde_json::Value> = match statement.get("Action")? {
+        action @ ::serde_json::Value::String(_) => vec![action],
+        ::serde_json::Value::Array(list) => list.iter().collect(),
+        _ => return None,
+    };
+    if actions.is_empty() {
+        return None;
+    }
+    actions
+        .into_iter()
+        .map(|action| {
+            let action = action.as_str()?;
+            permission_policy_action_is_allowed(action).then_some(action)
+        })
+        .collect()
+}
+
+/// Whether a statement names a `Principal`: a non-blank string, or a map of
+/// principal kinds (`AWS`, `Service`, …) whose every entry carries a non-blank value
+/// or a non-empty list of them.
+fn permission_policy_principal_is_present(principal: Option<&::serde_json::Value>) -> bool {
+    match principal {
+        Some(::serde_json::Value::String(value)) => !value.trim().is_empty(),
+        Some(::serde_json::Value::Object(kinds)) => {
+            !kinds.is_empty() && kinds.values().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
+}
+
+/// Whether one entry of a `Principal` map names a principal.
+fn permission_policy_principal_value(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(value) => !value.trim().is_empty(),
+        ::serde_json::Value::Array(values) => {
+            !values.is_empty() && values.iter().all(permission_policy_principal_value)
+        }
+        _ => false,
+    }
 }
 
 /// A modelled timestamp as milliseconds since the Unix epoch, so a `TimeWindow`

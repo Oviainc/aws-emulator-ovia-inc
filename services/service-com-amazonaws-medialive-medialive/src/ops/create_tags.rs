@@ -191,6 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and a key the resource already carries takes the request's value. Keys
         // the request does not name are left alone — this is not a replacement of
         // the resource's tag set, so a request carrying no tags changes nothing.
+        // A key in the reserved namespace is none of the caller's to write, so
+        // that is a bad request rather than a tag.
         let requested = input.tags.unwrap_or_default();
         state
             .insert_resource_tags(&input.resource_arn, requested)
@@ -201,6 +203,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "Resource",
                             &input.resource_arn,
                         )),
+                    })
+                }
+                crate::state::TagRefusal::ReservedKeyPrefix { key } => {
+                    CreateTagsErrorModeled::BadRequestException(BadRequestException {
+                        message: Some(crate::state::reserved_tag_key_message(&key)),
                     })
                 }
                 crate::state::TagRefusal::TooManyTags { merged } => {
