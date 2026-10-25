@@ -102,9 +102,11 @@ const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specif
 /// The members this emulator has nothing to report for are absent rather than invented:
 ///
 /// * `ResourceStatusReason` — "Success/failure message associated with the resource":
-///   the reason a resource was not created is reported on the STACK (its
-///   `StackStatusReason` and its events), which is where this service records what the
-///   owning service refused.
+///   reported for a resource whose work is UNDER WAY, which is the message CloudFormation
+///   records when it has initiated it ([`crate::state::DeployedResource::status_reason`]),
+///   and absent for one whose status speaks for itself. The reason a resource was not
+///   created at all is reported on the STACK (its `StackStatusReason` and its events),
+///   which is where this service records what the owning service refused.
 /// * `Description` — "User defined description associated with the resource": a resource
 ///   description is not one of the resource attributes CloudFormation names (the model's
 ///   `ResourceAttribute` enum lists `CreationPolicy`, `DeletionPolicy`, `Metadata`,
@@ -125,7 +127,10 @@ fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> Stac
         resource_type: deployed.resource.resource_type.clone(),
         timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        resource_status_reason: None,
+        // "Success/failure message associated with the resource": what the record carries,
+        // which is the "work started" message for a resource whose operation is under way
+        // and nothing for one whose status speaks for itself.
+        resource_status_reason: deployed.status_reason.clone(),
         description: None,
         drift_information: crate::state::resource_drift_information(deployed),
         module_info: None,
@@ -255,8 +260,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader yields a template's resources in the parsed object's iteration order,
         // which is the declaration order only where `serde_json`'s `preserve_order`
         // feature is enabled somewhere in the build.
-        let mut reported: Vec<&DeployedResource> = stack
-            .resources
+        let all = stack.reported_resources();
+        let mut reported: Vec<&DeployedResource> = all
             .iter()
             // "In addition, you can specify LogicalResourceId to filter the returned
             // result": a filter over the stack's resources, so one that matches nothing
