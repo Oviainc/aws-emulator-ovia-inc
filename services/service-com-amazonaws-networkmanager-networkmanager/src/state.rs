@@ -56,8 +56,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-// The two shapes a core network change event is reported through, imported on their own
-// so this slice's shape list below stays exactly as the rest of the service shares it.
+// The two shapes a core network change event is reported through, and the two a change of
+// a change set is reported through, imported on their own so this slice's shape list below
+// stays exactly as the rest of the service shares it.
+use crate::ops::types::{CoreNetworkChange, CoreNetworkChangeValues};
 use crate::ops::types::{CoreNetworkChangeEvent, CoreNetworkChangeEventValues};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
@@ -1280,6 +1282,22 @@ impl CoreNetworkPolicyRecord {
                     change.to_change_event(status, event_time),
                 )
             })
+            .collect()
+    }
+
+    /// The changes of this version's change set, each keyed by its `IdentifierPath` — in
+    /// that key's order, which is the order [`policy_changes`] records the changes in.
+    ///
+    /// The SAME stored changes [`Self::change_events_at`] reports as the events of this
+    /// version's execution, reported instead as the change set itself: what each change
+    /// does to the object it names, with the values that object held under the policy this
+    /// version was submitted against and the ones this version's document gives it. Unlike
+    /// an event, a change carries no status and no instant, so this answer is independent
+    /// of the clock: the change set is a property of the version, not of its execution.
+    pub fn change_set(&self) -> Vec<(String, CoreNetworkChange)> {
+        self.changes
+            .iter()
+            .map(|change| (change.identifier_path(), change.to_core_network_change()))
             .collect()
     }
 
@@ -5449,6 +5467,24 @@ fn policy_error(code: &str, message: String, path: &str) -> CoreNetworkPolicyErr
     }
 }
 
+/// Check one edge-location string of a policy document, at the JSON path `path`: a location
+/// is reported through `ExternalRegionCode` (len 1..63, `smithy_query
+/// shape=ExternalRegionCode`), so one outside that length is refused. The same rule holds
+/// wherever a document names a location — the configuration's own `edge-locations`, and the
+/// list a segment or network function group restricts itself to — so both walks use this.
+fn check_policy_location(path: &str, location: &str, errors: &mut Vec<CoreNetworkPolicyError>) {
+    let length = location.chars().count();
+    if length == 0 || length > MAX_POLICY_LOCATION_CHARS {
+        errors.push(policy_error(
+            POLICY_ERROR_INVALID_VALUE,
+            format!(
+                "a {POLICY_LOCATION:?} must be 1 to {MAX_POLICY_LOCATION_CHARS} characters, but {length} were given"
+            ),
+            path,
+        ));
+    }
+}
+
 /// Check the structure of a policy document a request asks to store.
 ///
 /// Only the document's SHAPE is judged here, which is what every operation that accepts a
@@ -5599,18 +5635,7 @@ pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPol
                 ),
                 &path,
             )),
-            Some(location) => {
-                let length = location.chars().count();
-                if length == 0 || length > MAX_POLICY_LOCATION_CHARS {
-                    errors.push(policy_error(
-                        POLICY_ERROR_INVALID_VALUE,
-                        format!(
-                            "a {POLICY_LOCATION:?} must be 1 to {MAX_POLICY_LOCATION_CHARS} characters, but {length} were given"
-                        ),
-                        &path,
-                    ));
-                }
-            }
+            Some(location) => check_policy_location(&path, location, &mut errors),
         }
     }
 
@@ -5641,6 +5666,47 @@ pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPol
                     ),
                     &format!("$.{key}[{index}].{POLICY_NAME}"),
                 ));
+            }
+            // An entry may restrict itself to some of the core network's edge locations,
+            // and THAT list is what the entry is expanded over — once per edge location it
+            // names, in the derived topology and in the change set of the policy version.
+            // So it is capped exactly like the configuration's own edge-location list, in
+            // entries and in characters: without the cap a document carrying a bounded
+            // number of entries could still name an unbounded number of locations in each
+            // and expand into an unbounded topology.
+            let path = format!("$.{key}[{index}].{POLICY_EDGE_LOCATIONS}");
+            let locations = entry
+                .get(POLICY_EDGE_LOCATIONS)
+                .and_then(::serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            if locations.len() > MAX_POLICY_EDGE_LOCATIONS {
+                errors.push(policy_error(
+                    POLICY_ERROR_TOO_MANY_ENTRIES,
+                    format!(
+                        "{path} carries {} entries, but at most {MAX_POLICY_EDGE_LOCATIONS} are allowed",
+                        locations.len()
+                    ),
+                    &path,
+                ));
+            }
+            // Enumerated BEFORE the entries are read, so the index a refusal reports is the
+            // entry's own position in the document, and an entry that is not a string is
+            // reported rather than passed over — the same order the configuration's own
+            // edge-location walk above uses.
+            for (position, location) in locations.iter().enumerate().take(MAX_POLICY_EDGE_LOCATIONS)
+            {
+                let path = format!("{path}[{position}]");
+                let Some(location) = location.as_str() else {
+                    errors.push(policy_error(
+                        POLICY_ERROR_INVALID_TYPE,
+                        format!(
+                            "every entry of {POLICY_EDGE_LOCATIONS:?} must be a {POLICY_LOCATION:?} string"
+                        ),
+                        &path,
+                    ));
+                    continue;
+                };
+                check_policy_location(&path, location, &mut errors);
             }
         }
     }
@@ -6251,6 +6317,51 @@ pub struct PolicyChange {
     pub edge_location: Option<String>,
     /// The changed segment's or network function group's name, for a kind that has one.
     pub name: Option<String>,
+    /// How the policy in force configured the EDGE this change acts on, for a change that
+    /// replaces or removes one and `None` for every other change: the only values a
+    /// reported change carries that its own identity does not already name, so the only
+    /// ones the diff has to keep.
+    pub previous_edge: Option<EdgeConfiguration>,
+    /// How the submitted policy configures that edge, for a change that adds or replaces
+    /// one. See [`Self::previous_edge`].
+    pub new_edge: Option<EdgeConfiguration>,
+}
+
+/// How one policy document configures one edge, beyond the edge location that identifies
+/// it: the ASN that edge peers with and the inside CIDR blocks it carries.
+///
+/// Compared for equality to decide whether two documents configure the same edge
+/// differently, and reported as the values a change to that edge replaces or puts in place.
+/// An edge the document gives no inside CIDR blocks carries none, which is why the list is
+/// held flat rather than as an absent option: "no blocks" and "an empty list of blocks"
+/// configure the edge the same way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeConfiguration {
+    /// The edge's ASN, or `None` where the document assigns it none.
+    pub asn: Option<i64>,
+    /// The edge's inside CIDR blocks, empty where the document gives it none.
+    pub inside_cidr_blocks: Vec<String>,
+}
+
+impl EdgeConfiguration {
+    /// How `edge` is configured.
+    fn of(edge: &CoreNetworkEdge) -> Self {
+        Self {
+            asn: edge.asn,
+            inside_cidr_blocks: edge.inside_cidr_blocks.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The modelled change values for an edge configured this way at `edge_location`.
+    fn to_change_values(&self, edge_location: &str) -> CoreNetworkChangeValues {
+        CoreNetworkChangeValues {
+            edge_locations: Some(vec![edge_location.to_string()]),
+            asn: self.asn,
+            inside_cidr_blocks: (!self.inside_cidr_blocks.is_empty())
+                .then(|| self.inside_cidr_blocks.clone()),
+            ..CoreNetworkChangeValues::default()
+        }
+    }
 }
 
 impl PolicyChange {
@@ -6271,6 +6382,65 @@ impl PolicyChange {
             path.push_str(segment);
         }
         path
+    }
+
+    /// The resource this change acts on: the changed segment's or network function group's
+    /// own name, the edge location for an edge, and nothing for a change to an object none
+    /// of a policy's named entries identifies (the `attachment-policies` block as a whole).
+    fn identifier(&self) -> Option<String> {
+        self.name.clone().or_else(|| self.edge_location.clone())
+    }
+
+    /// The values the object this change acts on holds under one of the two policies: the
+    /// edge configuration `edge` describes where this change acts on an edge, and the
+    /// identity of the named entry otherwise. `None` for a change to an object no member of
+    /// the shape names, as [`Self::to_change_event`] reports no values for one.
+    fn to_change_values(&self, edge: Option<&EdgeConfiguration>) -> Option<CoreNetworkChangeValues> {
+        match (self.change_type, self.edge_location.as_deref(), self.name.as_deref()) {
+            (CHANGE_TYPE_CORE_NETWORK_EDGE, Some(location), _) => {
+                // An edge change always carries the configuration of the side it reports —
+                // the policy that configured the edge is the side that has one — so a side
+                // with none reports no values rather than an edge configured with nothing.
+                edge.map(|held| held.to_change_values(location))
+            }
+            (CHANGE_TYPE_CORE_NETWORK_SEGMENT, Some(location), Some(name)) => {
+                Some(CoreNetworkChangeValues {
+                    segment_name: Some(name.to_string()),
+                    edge_locations: Some(vec![location.to_string()]),
+                    ..CoreNetworkChangeValues::default()
+                })
+            }
+            (CHANGE_TYPE_NETWORK_FUNCTION_GROUP, Some(location), Some(name)) => {
+                Some(CoreNetworkChangeValues {
+                    network_function_group_name: Some(name.to_string()),
+                    edge_locations: Some(vec![location.to_string()]),
+                    ..CoreNetworkChangeValues::default()
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The modelled `CoreNetworkChange` for this change: what it does to the object it
+    /// names, the values that object held under the policy in force (`PreviousValues`) and
+    /// the ones the submitted policy gives it (`NewValues`).
+    ///
+    /// Nothing precedes an addition and nothing follows a removal, so an
+    /// [`CHANGE_ACTION_ADD`] carries no previous values and a [`CHANGE_ACTION_REMOVE`] no
+    /// new ones; a [`CHANGE_ACTION_MODIFY`] carries both.
+    pub fn to_core_network_change(&self) -> CoreNetworkChange {
+        CoreNetworkChange {
+            r#type: Some(self.change_type.to_string()),
+            action: Some(self.action.to_string()),
+            identifier: self.identifier(),
+            previous_values: (self.action != CHANGE_ACTION_ADD)
+                .then(|| self.to_change_values(self.previous_edge.as_ref()))
+                .flatten(),
+            new_values: (self.action != CHANGE_ACTION_REMOVE)
+                .then(|| self.to_change_values(self.new_edge.as_ref()))
+                .flatten(),
+            identifier_path: Some(self.identifier_path()),
+        }
     }
 
     /// The modelled `CoreNetworkChangeEvent` for this change, in `status` as of
@@ -6336,10 +6506,14 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
     let edges_before = edges_by_location(in_force);
     let edges_after = edges_by_location(submitted);
     for location in edges_before.keys().chain(edges_after.keys()).collect::<BTreeSet<_>>() {
-        let action = match (edges_before.get(location), edges_after.get(location)) {
+        // An edge is configured by its ASN and its inside CIDR blocks, so a difference in
+        // either is what makes the change a modification rather than no change.
+        let previous_edge = edges_before.get(location).map(|edge| EdgeConfiguration::of(edge));
+        let new_edge = edges_after.get(location).map(|edge| EdgeConfiguration::of(edge));
+        let action = match (&previous_edge, &new_edge) {
             (None, Some(_)) => CHANGE_ACTION_ADD,
             (Some(_), None) => CHANGE_ACTION_REMOVE,
-            (Some(before), Some(after)) if !same_edge(before, after) => CHANGE_ACTION_MODIFY,
+            (Some(held), Some(given)) if held != given => CHANGE_ACTION_MODIFY,
             _ => continue,
         };
         changes.push(PolicyChange {
@@ -6347,6 +6521,8 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
             action,
             edge_location: Some((*location).to_string()),
             name: None,
+            previous_edge,
+            new_edge,
         });
     }
 
@@ -6374,6 +6550,8 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
                     action,
                     edge_location: Some(location.clone()),
                     name: Some(name.clone()),
+                    previous_edge: None,
+                    new_edge: None,
                 });
             }
         }
@@ -6392,6 +6570,8 @@ pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> 
             },
             edge_location: None,
             name: None,
+            previous_edge: None,
+            new_edge: None,
         });
     }
 
@@ -6407,15 +6587,6 @@ fn edges_by_location(topology: &PolicyTopology) -> BTreeMap<&str, &CoreNetworkEd
         .iter()
         .filter_map(|edge| edge.edge_location.as_deref().map(|location| (location, edge)))
         .collect()
-}
-
-/// Whether two edges of the same location are configured the same way: an edge carries its
-/// ASN and its inside CIDR blocks, so a difference in either is what makes the change a
-/// modification rather than no change.
-fn same_edge(left: &CoreNetworkEdge, right: &CoreNetworkEdge) -> bool {
-    left.asn == right.asn
-        && left.inside_cidr_blocks.as_deref().unwrap_or_default()
-            == right.inside_cidr_blocks.as_deref().unwrap_or_default()
 }
 
 /// Derive the reported topology of a core network from its policy document.
@@ -6483,11 +6654,15 @@ pub fn policy_topology(document: &str) -> PolicyTopology {
         })
         .collect();
 
-    let named = |key: &str| -> Vec<NamedGroup> {
+    let named = |key: &str, cap: usize| -> Vec<NamedGroup> {
         root.get(key)
             .and_then(::serde_json::Value::as_array)
             .map_or(&[][..], Vec::as_slice)
             .iter()
+            // Both counts are already capped where the document is accepted; the `take`s
+            // here keep the derived topology bounded for any document that reaches the
+            // deriver, so no caller can make one entry expand without limit.
+            .take(cap)
             .filter_map(|entry| {
                 let name = entry
                     .get(POLICY_NAME)
@@ -6500,14 +6675,19 @@ pub fn policy_topology(document: &str) -> PolicyTopology {
                     edge_locations: entry
                         .get(POLICY_EDGE_LOCATIONS)
                         .and_then(::serde_json::Value::as_array)
-                        .map(|listed| strings_of(listed)),
+                        .map(|listed| {
+                            strings_of(
+                                &listed[..listed.len().min(MAX_POLICY_EDGE_LOCATIONS)],
+                            )
+                        }),
                 })
             })
             .collect()
     };
 
-    let segments = named(POLICY_SEGMENTS);
-    let network_function_groups = named(POLICY_NETWORK_FUNCTION_GROUPS);
+    let segments = named(POLICY_SEGMENTS, MAX_POLICY_SEGMENTS);
+    let network_function_groups =
+        named(POLICY_NETWORK_FUNCTION_GROUPS, MAX_POLICY_NETWORK_FUNCTION_GROUPS);
     // The segment actions are read LAST, because an action is only kept where the segments
     // and groups it names are ones the document declares.
     let (shares, service_insertions) = segment_actions(root, &segments, &network_function_groups);
