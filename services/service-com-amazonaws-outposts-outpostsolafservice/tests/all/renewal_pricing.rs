@@ -41,8 +41,9 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{
     PAYMENT_OPTION_VALUES, PAYMENT_TERM_VALUES,
 };
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    CURRENCY_USD, PAYMENT_OPTION_UPFRONT_SHARE, PAYMENT_TERM_MONTHS, PRICING_RESULT_PRICED,
-    PRICING_RESULT_UNABLE_TO_PRICE, QUOTE_PRICING_TYPE_SUBSCRIPTION, RENEWAL_PRICE_PER_VCPU_MONTH,
+    CURRENCY_USD, ORDER_STATUS_COMPLETED, PAYMENT_OPTION_UPFRONT_SHARE, PAYMENT_TERM_MONTHS,
+    PRICING_RESULT_PRICED, PRICING_RESULT_UNABLE_TO_PRICE, QUOTE_PRICING_TYPE_SUBSCRIPTION,
+    RENEWAL_PRICE_PER_VCPU_MONTH,
 };
 
 use crate::quote_lifecycle::{create_quote, request as quote_request};
@@ -163,6 +164,27 @@ fn cancel_order(outposts: &Outposts, order_id: &str, case: &str) {
         .get_mut(order_id)
         .unwrap_or_else(|| panic!("case {case:?}: the create persisted order {order_id}"));
     record.order.status = Some(ORDER_CANCELLED.to_string());
+}
+
+/// Let every order placed on `outpost_id` FINISH, through the same store seam as
+/// [`cancel_order`]: an Outpost an order is still outstanding on cannot be deleted at
+/// all (`crate::delete_conflicts`), and the clock does not carry an order to a
+/// terminal status on its own. A finished order still subscribes the hardware it
+/// bought, so what the row using this asserts is unchanged.
+fn finish_orders_on(outposts: &Outposts, outpost_id: &str, case: &str) {
+    let store = outposts.store();
+    let mut store = store.lock();
+    let mut finished = 0usize;
+    for record in store.orders.values_mut() {
+        if record.order.outpost_id.as_deref() == Some(outpost_id) {
+            record.order.status = Some(ORDER_STATUS_COMPLETED.to_string());
+            finished += 1;
+        }
+    }
+    assert!(
+        finished > 0,
+        "case {case:?}: expected at least one order of {outpost_id} to finish, got {finished}"
+    );
 }
 
 /// Place every order a case describes on `outpost_id`, over the wire.
@@ -613,6 +635,11 @@ async fn an_absent_outpost_is_not_found_and_a_malformed_identifier_is_refused() 
         "deleted",
     )
     .await;
+    // The hardware arrives and the order is complete, so nothing is outstanding on the
+    // Outpost any more and the delete goes through; the finished order stays behind,
+    // still subscribing the capacity it bought, which is what makes the row below a
+    // statement about the deleted Outpost rather than about an empty store.
+    finish_orders_on(&outposts, &deleted, "deleted");
     outposts
         .ok("DELETE", &format!("/outposts/{deleted}"), None)
         .await;

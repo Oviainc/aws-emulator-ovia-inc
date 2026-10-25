@@ -136,6 +136,160 @@ impl<Eng> CreateConnection<Eng> {
     }
 }
 
+/// What this service's own store says about a `CreateConnection` request.
+enum StoreVerdict {
+    /// The request's `clientToken` already created this connection, so it is replayed.
+    Replay(Connection),
+    /// Nothing the store holds refuses the request: this is the Environment the
+    /// connection would be created across.
+    Create(Environment),
+}
+
+/// Judge a request against everything this service's OWN store answers: the idempotent
+/// replay, the Environment, its state, the bandwidth it offers, the identifying
+/// information it asks for, the tag set, and the `arn` attach point.
+///
+/// Called under the lock BOTH before the cross-service resolution and again at the
+/// instant the connection is minted, so a verdict is never acted on from a store that
+/// has since moved: check and insert happen under one lock. Running the whole
+/// judgement twice is deliberate — it is all map lookups over a few hundred records,
+/// and the alternative, a phase-A subset, would be two rules to keep in step.
+fn judge_against_store(
+    store: &crate::state::ComAmazonawsInterconnectInterconnectState,
+    input: &CreateConnectionInput,
+) -> Result<StoreVerdict, CreateConnectionError> {
+    // @idempotencyToken: a retry carrying a client token that already created a
+    // connection replays THAT connection instead of allocating a second one —
+    // but only when it is the SAME request. A token reused with different
+    // parameters names a different connection than the one it created, so it is
+    // refused, naming the token, rather than answered with an unrelated record.
+    if let Some(token) = input.client_token.as_deref() {
+        if let Some(created) = store.idempotency_tokens.get(token) {
+            if !created.matches(
+                &input.environment_id,
+                &input.bandwidth,
+                &input.attach_point,
+                input.description.as_ref(),
+                input.tags.as_ref(),
+            ) {
+                return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+                    InterconnectValidationException {
+                        message: format!(
+                            "clientToken '{token}' was already used to create connection '{}' with different parameters",
+                            created.connection_id
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(stored) = store.connections.get(&created.connection_id) {
+                return Ok(StoreVerdict::Replay(stored.connection.clone()));
+            }
+        }
+    }
+
+    // The Environment dictates the partner, the location and the product type,
+    // none of which the request carries. An unknown environment has nothing to
+    // create a connection across, and naming one is this service's own client
+    // fault: the 400 `InterconnectClientException` every environment-resolving
+    // operation gives, with the message built from the requested id.
+    let Some(environment) = store.environments.get(&input.environment_id).cloned() else {
+        return Err(CreateConnectionErrorModeled::InterconnectClientException(
+            InterconnectClientException {
+                message: crate::state::environment_not_found_message(&input.environment_id),
+            },
+        )
+        .into());
+    };
+
+    // `EnvironmentState`: only an environment that is not `unavailable` can take
+    // new connections ("available: the environment is available and new
+    // Connection objects can be requested" / "unavailable: the environment is
+    // currently unavailable").
+    if environment.state == "unavailable" {
+        return Err(CreateConnectionErrorModeled::InterconnectClientException(
+            InterconnectClientException {
+                message: format!(
+                    "environment '{}' is {} and cannot take new connections",
+                    environment.environment_id, environment.state
+                ),
+            },
+        )
+        .into());
+    }
+
+    // `Environment$bandwidths.available` is "the list of currently available
+    // bandwidths": a bandwidth outside it cannot be allocated, even when the
+    // environment `supported`s it (which is exactly what `limited` means).
+    let available = environment.bandwidths.available.clone().unwrap_or_default();
+    if !available.contains(&input.bandwidth) {
+        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+            InterconnectValidationException {
+                message: format!(
+                    "bandwidth '{}' is not available on environment '{}'; available bandwidths are [{}]",
+                    input.bandwidth,
+                    environment.environment_id,
+                    available.join(", ")
+                ),
+            },
+        )
+        .into());
+    }
+
+    // `Environment$remoteIdentifierType` is the kind of identifying information the
+    // partner of THIS Environment verifies the remote side by, so an Environment
+    // that declares one asks every create on it for a `remoteAccount` carrying that
+    // kind, and one that declares none asks for nothing.
+    if let Some(message) =
+        crate::state::remote_account_violation(&environment, input.remote_account.as_ref())
+    {
+        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into());
+    }
+
+    // The tag set the new connection would carry, judged by the one rule every
+    // writer of a connection's tags uses: each entry inside the lengths the model
+    // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its
+    // own system tags, and no more entries than a resource holds.
+    // A resource created with tags is therefore bounded the same way one tagged
+    // later is, so neither path can store a set the other would refuse.
+    if let Some(message) = input
+        .tags
+        .as_ref()
+        .and_then(|tags| crate::state::tag_write_violation(None, tags))
+    {
+        return Err(CreateConnectionErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into());
+    }
+
+    // `AttachPoint$arn` "identifies an attach point by full ARN", and the pattern
+    // that member carries is an Interconnect CONNECTION ARN: the attach point is a
+    // connection of the account, resolved against the store the way every
+    // ARN-addressed operation here resolves one — in full, so an ARN whose Region or
+    // account is not the stored one names no resource this account holds. An ARN that
+    // resolves to nothing has no attach point behind it, so there is nothing to
+    // provision the connection onto.
+    if let AttachPoint::Arn(arn) = &input.attach_point {
+        if store.connection_by_arn(arn).is_none() {
+            return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::attach_point_not_valid_message(
+                        arn,
+                        &environment.environment_id,
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+
+    Ok(StoreVerdict::Create(environment))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateConnection<Eng>
 {
@@ -164,111 +318,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Every ARN this call mints carries the region the request was signed for.
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::Instant::now();
 
-        let mut store = state.lock();
-        store.materialise_due_transitions(now);
-
-        // @idempotencyToken: a retry carrying a client token that already created a
-        // connection replays THAT connection instead of allocating a second one —
-        // but only when it is the SAME request. A token reused with different
-        // parameters names a different connection than the one it created, so it is
-        // refused, naming the token, rather than answered with an unrelated record.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(created) = store.idempotency_tokens.get(token) {
-                if !created.matches(
-                    &input.environment_id,
-                    &input.bandwidth,
-                    &input.attach_point,
-                    input.description.as_ref(),
-                    input.tags.as_ref(),
-                ) {
-                    return Err(CreateConnectionErrorModeled::InterconnectValidationException(
-                        InterconnectValidationException {
-                            message: format!(
-                                "clientToken '{token}' was already used to create connection '{}' with different parameters",
-                                created.connection_id
-                            ),
-                        },
-                    )
-                    .into());
-                }
-                let replay = store
-                    .connections
-                    .get(&created.connection_id)
-                    .map(|stored| stored.connection.clone());
-                if let Some(connection) = replay {
+        // Everything this service's OWN store answers is judged first, under one
+        // lock, which is dropped before the cross-service resolution below — so no
+        // lock is held across an await. The same judgement is made again where the
+        // connection is minted, so what lands is judged against the store as it is
+        // THEN.
+        let environment = {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::Instant::now());
+            match judge_against_store(&store, &input)? {
+                StoreVerdict::Replay(connection) => {
                     return Ok(CreateConnectionOutput {
                         connection: Some(connection),
-                    });
+                    })
+                }
+                StoreVerdict::Create(environment) => environment,
+            }
+        };
+
+        // `AttachPoint$directConnectGateway` "identifies an DirectConnect Gateway
+        // attach point by DirectConnectGatewayID" — a resource of the service that
+        // OWNS those gateways, so it is resolved against that service, through the
+        // same walk `ListAttachPoints` answers from. A gateway the account does not
+        // hold, or one not ready for use, is not among the attach points valid for
+        // the Environment, and a Connection is never provisioned onto one; an
+        // account whose gateways could not be read at all is a different answer
+        // again, because then nothing is known about the identifier either way.
+        if let AttachPoint::directConnectGateway(gateway) = &input.attach_point {
+            match crate::state::direct_connect::resolve_attach_point(ctx, &region, gateway).await {
+                crate::state::direct_connect::AttachPointResolution::Valid => {}
+                crate::state::direct_connect::AttachPointResolution::NotAnAttachPoint => {
+                    return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::attach_point_not_valid_message(
+                                gateway,
+                                &environment.environment_id,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+                crate::state::direct_connect::AttachPointResolution::Unresolvable => {
+                    return Err(CreateConnectionErrorModeled::InterconnectServerException(
+                        InterconnectServerException {
+                            message: "the attach points of this account could not be resolved, \
+                                      so the requested attach point could not be validated"
+                                .to_string(),
+                        },
+                    )
+                    .into())
                 }
             }
         }
 
-        // The Environment dictates the partner, the location and the product type,
-        // none of which the request carries. An unknown environment has nothing to
-        // create a connection across, and naming one is this service's own client
-        // fault: the 400 `InterconnectClientException` every environment-resolving
-        // operation gives, with the message built from the requested id.
-        let Some(environment) = store.environments.get(&input.environment_id).cloned() else {
-            return Err(CreateConnectionErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::environment_not_found_message(&input.environment_id),
-                },
-            )
-            .into());
+        // The resource is minted under a fresh lock, and judged against the store
+        // once more under THAT lock: the store may have moved while the attach point
+        // above was being resolved, so check and insert happen together. This
+        // Environment, not the one phase A read, is what the record is built from —
+        // phase A's copy served only the refusal message above.
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.materialise_due_transitions(now);
+        let environment = match judge_against_store(&store, &input)? {
+            StoreVerdict::Replay(connection) => {
+                return Ok(CreateConnectionOutput {
+                    connection: Some(connection),
+                })
+            }
+            StoreVerdict::Create(environment) => environment,
         };
-
-        // `EnvironmentState`: only an environment that is not `unavailable` can take
-        // new connections ("available: the environment is available and new
-        // Connection objects can be requested" / "unavailable: the environment is
-        // currently unavailable").
-        if environment.state == "unavailable" {
-            return Err(CreateConnectionErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: format!(
-                        "environment '{}' is {} and cannot take new connections",
-                        environment.environment_id, environment.state
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // `Environment$bandwidths.available` is "the list of currently available
-        // bandwidths": a bandwidth outside it cannot be allocated, even when the
-        // environment `supported`s it (which is exactly what `limited` means).
-        let available = environment.bandwidths.available.clone().unwrap_or_default();
-        if !available.contains(&input.bandwidth) {
-            return Err(CreateConnectionErrorModeled::InterconnectValidationException(
-                InterconnectValidationException {
-                    message: format!(
-                        "bandwidth '{}' is not available on environment '{}'; available bandwidths are [{}]",
-                        input.bandwidth,
-                        environment.environment_id,
-                        available.join(", ")
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // The tag set the new connection would carry, judged by the one rule every
-        // writer of a connection's tags uses: each entry inside the lengths the model
-        // gives `TagKey` and `TagValue`, no key in the namespace AWS reserves for its
-        // own system tags, and no more entries than a resource holds.
-        // A resource created with tags is therefore bounded the same way one tagged
-        // later is, so neither path can store a set the other would refuse.
-        if let Some(message) = input
-            .tags
-            .as_ref()
-            .and_then(|tags| crate::state::tag_write_violation(None, tags))
-        {
-            return Err(CreateConnectionErrorModeled::InterconnectValidationException(
-                InterconnectValidationException { message },
-            )
-            .into());
-        }
 
         // The account's connection quota, which counts the connections the account
         // HOLDS: a quota is about live resources, so a record already in the

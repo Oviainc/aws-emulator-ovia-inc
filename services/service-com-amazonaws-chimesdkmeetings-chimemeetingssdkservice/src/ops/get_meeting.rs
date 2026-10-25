@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(stored) = store.meetings.get(&input.meeting_id) else {
             return Err(GetMeetingErrorModeled::NotFoundException(
-                crate::state::meeting_not_found(&input.meeting_id),
+                store.meeting_absent(&input.meeting_id),
             )
             .into());
         };

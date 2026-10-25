@@ -9,6 +9,10 @@
 //! never creates one, so an unknown id is answered with the modelled
 //! `ResourceNotFoundException` (HTTP 404).
 //!
+//! An application's name addresses it within the account, so a rename onto a name
+//! another application already holds is refused with the modelled `BadRequestException`
+//! (HTTP 400) and patches nothing — the same invariant `CreateApplication` enforces.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,6 +156,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // The rename this request asks for, if any, resolved against the account's other
+        // applications BEFORE the record is reached for writing — the lookup needs the
+        // whole store, which the record's own mutable borrow would rule out. The same
+        // invariant `CreateApplication` enforces holds over a patch, because an
+        // application's name addresses it within the account and a rename onto a name
+        // another application holds would leave two answering to one name. Renaming a
+        // record to the name it already carries collides with nothing.
+        let name_held_by = input.name.as_deref().and_then(|name| {
+            store
+                .application_named(name, Some(&input.application_id))
+                .map(|holder| (name, holder.id.clone()))
+        });
+
         // The application the path names must exist: this call patches a record, it never
         // creates one.
         let Some(application) = store.applications.get_mut(&input.application_id) else {
@@ -165,6 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Refused before any member is written, so a rejected rename leaves the record
+        // exactly as it was, and after the 404 above, so an unknown application is a miss
+        // rather than a conflict.
+        if let Some((name, holder_id)) = name_held_by {
+            return Err(UpdateApplicationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::application_name_taken(name, &holder_id)),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        }
 
         // A PATCH over the stored record: a member the request carries replaces the stored
         // one, a member it omits leaves the stored one alone. The empty string is a value

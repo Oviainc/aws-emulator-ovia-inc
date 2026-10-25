@@ -655,7 +655,7 @@ async fn a_create_refuses_the_same_tag_pairs_tag_resource_refuses() {
         String::from_utf8_lossy(&version.body)
     );
 
-    for (case, key, value, expected) in tag_pair_rows() {
+    for (index, (case, key, value, expected)) in tag_pair_rows().into_iter().enumerate() {
         // One environment per row: a deployment needs an environment nothing is already
         // deploying into.
         let environment = create_environment(&router, &application, "create-tags-env").await;
@@ -664,7 +664,9 @@ async fn a_create_refuses_the_same_tag_pairs_tag_resource_refuses() {
             (
                 "CreateApplication",
                 "/applications".to_string(),
-                json!({ "Name": "tagged-at-create", "Tags": tags }),
+                // One application name per row: an application's name addresses it within
+                // the account, so a row that is STORED takes the name it used.
+                json!({ "Name": format!("tagged-at-create-{index}"), "Tags": tags }),
             ),
             (
                 "CreateEnvironment",

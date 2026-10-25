@@ -7,9 +7,10 @@
 //! named, every source and every output projected into its modelled shape, and a state
 //! the clock moves — so that DescribeBridge afterwards reports the same bridge. The cases
 //! below vary what that rule generalises over: the bridge type (egress / ingress), the
-//! kind of each source (flow / network), how many sources and outputs one request carries
-//! (from one up to the per-request bound), which protocol an entry names, and whether the
-//! request carries a failover config and a recovery window.
+//! kind of each source the bridge's direction admits (flow / network), how many sources
+//! the bridge's failover state allows (a single source, a failover pair) and how many
+//! outputs one request carries (up to the per-request bound), which protocol an entry
+//! names, and whether the request carries a failover config and a recovery window.
 //!
 //! The harness is the one `flow_lifecycle` owns (one router, one shared engine), so every
 //! case here drives the same request path a MediaConnect client reaches: routing,
@@ -177,17 +178,15 @@ fn create_cases() -> Vec<CreateCase> {
     let flow_a = minted_flow_arn(2, "flow-a");
     let flow_b = minted_flow_arn(3, "flow-b");
 
-    // The bound row: one request carrying the most sources and the most outputs a create
-    // may carry (`mc::MAX_BRIDGE_SOURCES` / `mc::MAX_BRIDGE_OUTPUTS`). One past each bound
-    // is in the refusal table below.
+    // The bound row: one request carrying the most sources a bridge can ingest — the
+    // failover pair `mc::MAX_BRIDGE_SOURCES` allows, which needs the failover state that
+    // allows it — and the most outputs a create may carry (`mc::MAX_BRIDGE_OUTPUTS`). One
+    // past each bound is in the refusal table below.
     let full_sources: Vec<Value> = (0..mc::MAX_BRIDGE_SOURCES)
         .map(|index| {
-            json!({ "networkSource": {
-                "multicastIp": format!("224.0.1.{index}"),
+            json!({ "flowSource": {
+                "flowArn": minted_flow_arn(10 + index as u64, &format!("flow-{index}")),
                 "name": format!("src-{index}"),
-                "networkName": "net-1",
-                "port": 5000 + index as i64,
-                "protocol": "rtp",
             }})
         })
         .collect();
@@ -205,7 +204,7 @@ fn create_cases() -> Vec<CreateCase> {
         .collect();
     let full_projected_sources: Vec<Value> = full_sources
         .iter()
-        .map(|source| json!({ "networkSource": source["networkSource"].clone() }))
+        .map(|source| json!({ "flowSource": source["flowSource"].clone() }))
         .collect();
     let full_projected_outputs: Vec<Value> = full_outputs
         .iter()
@@ -258,19 +257,13 @@ fn create_cases() -> Vec<CreateCase> {
             source_failover_config: Value::Null,
         },
         CreateCase {
-            case: "egress bridge, one network source, one network output",
+            case: "egress bridge, one flow source, one network output",
             name: "bridge-egress-1",
             body: json!({
                 "name": "bridge-egress-1",
                 "placementArn": placement,
                 "egressGatewayBridge": { "maxBitrate": 20_000_000 },
-                "sources": [{ "networkSource": {
-                    "multicastIp": "224.0.0.1",
-                    "name": "net-src",
-                    "networkName": "net-1",
-                    "port": 5000,
-                    "protocol": "rtp-fec",
-                }}],
+                "sources": [{ "flowSource": { "flowArn": flow_b, "name": "flow-src" } }],
                 "outputs": [{ "networkOutput": {
                     "ipAddress": "10.0.0.5",
                     "name": "net-out",
@@ -281,13 +274,7 @@ fn create_cases() -> Vec<CreateCase> {
                 }}],
             }),
             bridge_type: ("egressGatewayBridge", json!({ "maxBitrate": 20_000_000 })),
-            sources: json!([{ "networkSource": {
-                "multicastIp": "224.0.0.1",
-                "name": "net-src",
-                "networkName": "net-1",
-                "port": 5000,
-                "protocol": "rtp-fec",
-            }}]),
+            sources: json!([{ "flowSource": { "flowArn": flow_b, "name": "flow-src" } }]),
             outputs: json!([{ "networkOutput": {
                 "ipAddress": "10.0.0.5",
                 "name": "net-out",
@@ -410,20 +397,24 @@ fn create_cases() -> Vec<CreateCase> {
             source_failover_config: json!({ "state": "DISABLED", "recoveryWindow": 3_000 }),
         },
         CreateCase {
-            case: "egress bridge at the per-request bound: the most sources and the most \
-                   outputs one create may carry",
+            case: "egress bridge at both bounds: the failover pair of sources a bridge can \
+                   ingest and the most outputs one create may carry",
             name: "bridge-full",
             body: json!({
                 "name": "bridge-full",
                 "placementArn": placement,
                 "egressGatewayBridge": { "maxBitrate": 1 },
                 "sources": full_sources,
+                "sourceFailoverConfig": { "state": "ENABLED" },
                 "outputs": full_outputs,
             }),
             bridge_type: ("egressGatewayBridge", json!({ "maxBitrate": 1 })),
             sources: json!(full_projected_sources),
             outputs: json!(full_projected_outputs),
-            source_failover_config: Value::Null,
+            source_failover_config: json!({
+                "state": "ENABLED",
+                "recoveryWindow": mc::ASSIGNED_RECOVERY_WINDOW_MS,
+            }),
         },
     ]
 }
@@ -547,18 +538,46 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
     let placement = minted_gateway_arn(1, "gw-protocols");
 
     for protocol in PROTOCOL_VALUES {
+        // The source side, on the bridge whose sources originate at the premises: a
+        // ground-to-cloud bridge, which is the kind a network source belongs on.
         let (status, code, created) = create_bridge(
             &emulator,
             json!({
-                "name": format!("bridge-{}", protocol.replace('-', "")),
+                "name": format!("bridge-src-{}", protocol.replace('-', "")),
                 "placementArn": placement,
-                "egressGatewayBridge": { "maxBitrate": 10_000 },
+                "ingressGatewayBridge": { "maxBitrate": 10_000, "maxOutputs": 1 },
                 "sources": [{ "networkSource": {
                     "multicastIp": "224.0.0.2",
                     "name": "src",
                     "networkName": "net-1",
                     "port": 5000,
                     "protocol": protocol,
+                }}],
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_deref()),
+            (201, None),
+            "case {protocol:?}: create expected 201, got {status} {code:?}: {created}"
+        );
+        assert_eq!(
+            created["bridge"]["sources"][0]["networkSource"]["protocol"].as_str(),
+            Some(*protocol),
+            "case {protocol:?}: the source keeps the protocol the request named, got {created}"
+        );
+
+        // The output side, on the bridge whose outputs are delivered to the premises: a
+        // cloud-to-ground bridge, whose own source is the cloud flow it carries.
+        let (status, code, created) = create_bridge(
+            &emulator,
+            json!({
+                "name": format!("bridge-out-{}", protocol.replace('-', "")),
+                "placementArn": placement,
+                "egressGatewayBridge": { "maxBitrate": 10_000 },
+                "sources": [{ "flowSource": {
+                    "flowArn": minted_flow_arn(20, "flow-protocols"),
+                    "name": "src",
                 }}],
                 "outputs": [{ "networkOutput": {
                     "ipAddress": "10.0.0.8",
@@ -577,11 +596,6 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
             "case {protocol:?}: create expected 201, got {status} {code:?}: {created}"
         );
         assert_eq!(
-            created["bridge"]["sources"][0]["networkSource"]["protocol"].as_str(),
-            Some(*protocol),
-            "case {protocol:?}: the source keeps the protocol the request named, got {created}"
-        );
-        assert_eq!(
             created["bridge"]["outputs"][0]["networkOutput"]["protocol"].as_str(),
             Some(*protocol),
             "case {protocol:?}: the output keeps the protocol the request named, got {created}"
@@ -594,7 +608,7 @@ async fn every_modelled_protocol_is_stored_on_a_bridge_source_and_output() {
         json!({
             "name": "bridge-bad-protocol",
             "placementArn": placement,
-            "egressGatewayBridge": { "maxBitrate": 10_000 },
+            "ingressGatewayBridge": { "maxBitrate": 10_000, "maxOutputs": 1 },
             "sources": [{ "networkSource": {
                 "multicastIp": "224.0.0.2",
                 "name": "src",
@@ -635,7 +649,14 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
     }});
     let ingress = json!({ "maxBitrate": 10_000, "maxOutputs": 2 });
     let egress = json!({ "maxBitrate": 10_000 });
-    // One source / output past each per-request bound, the row beside the bound row above.
+    // The source each bridge type admits: a cloud-to-ground (egress) bridge's content
+    // "comes from an existing MediaConnect flow", a ground-to-cloud (ingress) bridge's
+    // "originates at your premises" — so an egress row carries a flow source and an
+    // ingress row a network source. The mismatched pairings are
+    // `crate::bridge_source_admission`'s own table.
+    let flow_src = json!({ "flowSource": { "flowArn": flow, "name": "src" } });
+    // One source past the bound a bridge's failover state sets, and one output past the
+    // per-request bound — the rows beside the bound row above.
     let too_many_sources: Vec<Value> = (0..=mc::MAX_BRIDGE_SOURCES)
         .map(|index| {
             let mut entry = source.clone();
@@ -660,7 +681,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "one source past the per-request bound",
+            "one source past the bound the bridge's failover state sets",
             json!({
                 "name": "b", "placementArn": placement,
                 "ingressGatewayBridge": ingress, "sources": too_many_sources,
@@ -670,7 +691,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "one output past the per-request bound",
             json!({
                 "name": "b", "placementArn": placement,
-                "egressGatewayBridge": egress, "sources": [source],
+                "egressGatewayBridge": egress, "sources": [flow_src],
                 "outputs": too_many_outputs,
             }),
         ),
@@ -705,7 +726,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "two outputs with one name: an output name must be unique in a bridge",
             json!({
                 "name": "b", "placementArn": placement,
-                "egressGatewayBridge": egress, "sources": [source],
+                "egressGatewayBridge": egress, "sources": [flow_src],
                 "outputs": [output, output],
             }),
         ),
@@ -731,7 +752,7 @@ fn refusal_cases() -> Vec<(&'static str, Value)> {
             "an output entry naming no network output",
             json!({
                 "name": "b", "placementArn": placement,
-                "egressGatewayBridge": egress, "sources": [source], "outputs": [{}],
+                "egressGatewayBridge": egress, "sources": [flow_src], "outputs": [{}],
             }),
         ),
         (

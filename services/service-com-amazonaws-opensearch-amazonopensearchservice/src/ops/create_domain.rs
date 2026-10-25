@@ -375,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is scheduled on a domain this create has just minted: a
             // scheduled action is put there by the call that schedules the change.
             scheduled_actions: BTreeMap::new(),
+            // A domain this create has just minted holds no insight either: the
+            // service raises an insight from what it observes of a running domain.
+            insights: BTreeMap::new(),
         };
 
         // Every option the new domain holds a value for starts at revision 1, so

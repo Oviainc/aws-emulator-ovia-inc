@@ -339,6 +339,14 @@ mod store_ceilings;
 // of this file — and this one lost repeated serialized squash merges to exactly that.
 #[path = "all/traffic_mirror_filters.rs"]
 mod traffic_mirror_filters;
+// What `CreateCapacityReservation` reserves and what every reader of a Capacity
+// Reservation then reports. Declared LAST rather than in sorted position, for the reason
+// the note at the top of this file records: a new ec2 suite lands every few minutes and
+// inserts its two lines in sorted order, so the sorted neighbourhood of this suite is the
+// contended region of this file — and these two lines have already lost repeated
+// serialized squash merges there.
+#[path = "all/capacity_reservations.rs"]
+mod capacity_reservations;
 // What `CancelExportTask` cancels, what it refuses and what it leaves alone. Declared LAST
 // rather than in sorted position, for the reason the header records: a suite's own sorted
 // neighbourhood is where every new ec2 suite inserts its lines.

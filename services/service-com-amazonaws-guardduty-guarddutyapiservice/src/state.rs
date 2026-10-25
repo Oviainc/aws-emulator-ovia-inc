@@ -510,6 +510,51 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .is_some()
     }
 
+    /// Take out of the inbox `region`'s endpoint serves the invitation each account
+    /// in `account_ids` sent, reporting the accounts the inbox held none from as the
+    /// `UnprocessedAccounts` the caller answers with.
+    ///
+    /// The write the two operations that END a pending invitation without accepting
+    /// it SHARE: an invited account "can either accept or decline the invitation"
+    /// (`smithy_query(query="doc",shape="InviteMembers")`), so declining is an ANSWER
+    /// and takes the invitation out of the pending inbox exactly as
+    /// [`Detector::accept_invitation`] does, and deleting one discards it from the
+    /// same inbox. Both leave the inbox holding nothing from that account, so neither
+    /// can be followed by an acceptance, and both report per-account rather than
+    /// refusing. They are one write under two names, the way `AcceptInvitation` and
+    /// `AcceptAdministratorInvitation` are, so neither operation can drift from the
+    /// other on which accounts it acts on or reports.
+    ///
+    /// `AccountIds` is a SET of accounts: one account's invitation is taken once, so
+    /// a repeated id is reported at most once. The reports keep the order the request
+    /// named the accounts in, so a caller can read them against its own list.
+    ///
+    /// Each account resolves through [`Self::delete_received_invitation_in`], which
+    /// is where the Region and the writes-nothing-for-a-miss rules live.
+    pub fn take_received_invitations_in(
+        &mut self,
+        region: &str,
+        account_ids: &[String],
+    ) -> Vec<crate::ops::types::shared_types::UnprocessedAccount> {
+        let mut unprocessed = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for account_id in account_ids {
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            if !self.delete_received_invitation_in(region, account_id) {
+                // Nothing to take: this account has sent the current one no
+                // invitation, or the one it sent has already been answered or
+                // deleted. Reported, and nothing is persisted for it.
+                unprocessed.push(crate::ops::types::shared_types::UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: NO_INVITATION_FROM_ACCOUNT_MESSAGE.to_string(),
+                });
+            }
+        }
+        unprocessed
+    }
+
     /// The Malware Protection plan `region`'s endpoint serves for `id`, if any.
     ///
     /// Regional for the same reason a detector is: a plan is created through one
@@ -2165,10 +2210,10 @@ pub struct Detector {
     /// report are a lookup: an invitation this store holds is accepted by one and
     /// reported by the other, read through [`Self::received_invitations_in`] and
     /// projected through [`invitation_view`]. `GetInvitationsCount` reports the
-    /// SIZE of that same inbox, through the same reader. `DeleteInvitations` DROPS
-    /// one through [`Self::delete_received_invitation_in`], so an invitation this
-    /// store holds leaves the inbox either answered or deleted;
-    /// `DeclineInvitations` is a scaffold with an issue of its own.
+    /// SIZE of that same inbox, through the same reader. `DeleteInvitations` and
+    /// `DeclineInvitations` both TAKE one out, through
+    /// [`Self::take_received_invitations_in`], so an invitation this store holds
+    /// leaves the inbox accepted, declined or deleted and never twice.
     ///
     /// BOUNDED by [`MAX_INVITATIONS_PER_DETECTOR`], so a future writer cannot
     /// grow it without limit: the key is an account id, which is request-chosen.

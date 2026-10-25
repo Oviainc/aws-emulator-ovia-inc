@@ -3,7 +3,9 @@
 //! @op DeleteOutpost
 //! IMPLEMENTED: removes the stored Outpost the `OutpostId` names, and with it the
 //! capacity tasks that exist only as tasks of that Outpost, so every later call
-//! observes it gone. Absent id -> `NotFoundException` (404).
+//! observes it gone. An Outpost with work still outstanding on it -> the modelled
+//! `ConflictException` (409) naming the resource the conflict is about, with
+//! nothing removed. Absent id -> `NotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -154,9 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // The statuses the checks below read are the ones the records hold at this
+        // instant: a task the clock has already completed, a quote whose expiry has
+        // passed and an order the clock has moved on are what each of them is at the
+        // instant of this call, finished work holding nothing up.
+        store.settle_capacity_tasks();
+        store.settle_quotes();
+        store.settle_orders();
         // Removing nothing is not a delete: an id this region's inventory does not
         // hold is the not-found error this operation models, not an empty success.
-        if store.remove_outpost(&region, &outpost_id).is_none() {
+        // The record is looked up rather than removed here, so the conflict below
+        // can refuse the request with the Outpost still in place.
+        if store.outpost(&region, &outpost_id).is_none() {
             return Err(DeleteOutpostErrorModeled::NotFoundException(NotFoundException {
                 // The identifier echo, of the value AS SUPPLIED — not of
                 // `outpost_id`, which is the bare id an ARN resolved to.
@@ -167,10 +178,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // Work still outstanding on the Outpost is what the modelled
+        // `ConflictException` ("Updating or deleting this resource can cause an
+        // inconsistent state") is for: removing the Outpost would destroy a
+        // capacity task nothing cancelled or completed, and orphan an order still
+        // outstanding on it. The refusal names the resource causing the conflict in
+        // `ResourceId` / `ResourceType` and leaves every record exactly as it was.
+        if let Some(outstanding) = store.unfinished_work_on_outpost(&region, &outpost_id) {
+            return Err(DeleteOutpostErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::unfinished_work_conflict(
+                    &outpost_id,
+                    &outstanding.work,
+                )),
+                resource_id: Some(outstanding.resource_id),
+                resource_type: Some(outstanding.resource_type.to_string()),
+            })
+            .into());
+        }
+        store.remove_outpost(&region, &outpost_id);
         // A capacity task exists only as a task OF an Outpost, so the Outpost going
         // away takes its tasks with it: nothing can name them any more (every
         // capacity-task route resolves the Outpost first), and leaving the records
-        // behind would let a later Outpost's calls trip over them.
+        // behind would let a later Outpost's calls trip over them. Every task left
+        // here is finished work — an unfinished one is the conflict above.
         store
             .capacity_tasks
             .retain(|_, task| task.outpost_id != outpost_id);

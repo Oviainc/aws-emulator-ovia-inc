@@ -212,18 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(&input.bridge_arn));
         };
 
-        // The bound is on the STORED bridge, so it counts the sources already stored plus
-        // the ones this request would add (see `crate::state::MAX_BRIDGE_SOURCES`).
+        // Which sources a bridge ingests at all is decided by the direction it carries
+        // content in, read off the STORED bridge's own type (see
+        // `crate::state::bridge_source_kind_rejection`).
+        let bridge_type = bridge.bridge_type();
         let held = bridge.sources.len();
-        if held + input.sources.len() > crate::state::MAX_BRIDGE_SOURCES {
-            return Err(bad_request(format!(
-                "A bridge can hold at most {} sources; bridge {} already has {held} and \
-                 this request adds {}.",
-                crate::state::MAX_BRIDGE_SOURCES,
-                input.bridge_arn,
-                input.sources.len()
-            )));
-        }
+        let failover = bridge.source_failover_config.clone();
 
         // Each entry configures ONE kind of source, and a source is addressed by its name:
         // `AddBridgeNetworkSourceRequest$Name` / `AddBridgeFlowSourceRequest$Name` "is used
@@ -252,7 +246,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      is already in use."
                 )));
             }
+            if let Some(detail) = crate::state::bridge_source_kind_rejection(bridge_type, &source) {
+                return Err(bad_request(detail));
+            }
             added.push(source);
+        }
+
+        // How many sources a bridge may hold is its own FAILOVER state's rule, not a
+        // generic collection bound: "if the state is inactive, [it] can have only one
+        // source. If the state is active, [it] can have one or two sources"
+        // (`FailoverConfig$State`, which `CreateBridgeRequest$SourceFailoverConfig`
+        // targets). The bound is on the STORED bridge, so it counts the sources already
+        // stored plus the ones this request would add (see
+        // `crate::state::max_bridge_sources`).
+        if let Some(detail) =
+            crate::state::bridge_source_bound_rejection(failover.as_ref(), held, added.len())
+        {
+            return Err(bad_request(format!(
+                "{detail} The request addresses bridge {}.",
+                input.bridge_arn
+            )));
         }
 
         // Nothing above wrote anything, so a refused request leaves the bridge exactly as

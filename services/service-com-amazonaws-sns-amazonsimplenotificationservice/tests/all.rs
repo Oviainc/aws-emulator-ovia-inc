@@ -20,6 +20,9 @@ mod error_envelope;
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 
+#[path = "all/platform_endpoint_deletion.rs"]
+mod platform_endpoint_deletion;
+
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
 

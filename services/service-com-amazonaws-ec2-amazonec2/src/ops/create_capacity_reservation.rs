@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityReservation
-//! IMPLEMENTED: reserves capacity for immediate use and stores it in [`crate::state`], so
-//! every reader of a Capacity Reservation reports what this wrote. A request for a
-//! FUTURE-DATED reservation, one on an Outpost or one in a cluster placement group is
-//! answered with a 501 naming that shape — this emulator holds no state for any of them.
+//! IMPLEMENTED: reserves capacity in one Availability Zone of the Region the request was
+//! signed for and stores it in [`crate::state`], so every reader of a Capacity Reservation
+//! reports what this wrote. Capacity for immediate use is reserved `active` — it is usable
+//! as soon as the request is accepted — while a FUTURE-DATED request (one naming a
+//! `StartDate`, with the `CommitmentDuration` and `DeliveryPreference` that go with it) is
+//! stored `assessing` with the move to `scheduled` owed to the clock, and is delivered
+//! (`active`) when its start date arrives. A request on an Outpost or in a cluster placement
+//! group is answered with a 501 naming that shape — this emulator holds no state for either.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -232,19 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Request shapes this emulator holds no state for at all, so a 501 ("nobody has
         // written this yet") is the honest answer rather than a refusal that blames the
         // caller — the same treatment `CreateSubnet` gives an IPAM-allocated block or an
-        // Outpost. A future-dated reservation is a delivery schedule and a commitment
-        // (`StartDate`, `CommitmentDuration`, `DeliveryPreference`, and the `scheduled` /
-        // `delayed` / `payment-pending` states that go with them); there is no Outpost
-        // resource to create a reservation on; and a cluster placement group reservation is
-        // capacity inside a group, which nothing here holds.
-        if input.start_date.is_some()
-            || input.commitment_duration.is_some()
-            || input.delivery_preference.is_some()
-        {
-            return Err(Scaffolded::not_implemented(
-                "CreateCapacityReservation for a future-dated Capacity Reservation",
-            ));
-        }
+        // Outpost. There is no Outpost resource to create a reservation on, and a cluster
+        // placement group reservation is capacity inside a group, which nothing here holds.
+
         if input.outpost_arn.is_some() {
             return Err(Scaffolded::not_implemented(
                 "CreateCapacityReservation on an Outpost",
@@ -320,6 +315,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The wall clock every date on this reservation is written against and compared
+        // with, read ONCE so every check below and the record itself see one instant.
+        let now = ::std::time::SystemTime::now();
+
+        // "Required for future-dated Capacity Reservations only. To create a Capacity
+        // Reservation for immediate use, omit this parameter" (`CommitmentDuration`,
+        // `DeliveryPreference`): the requested start date is what makes a reservation
+        // future-dated — "The date and time at which the future-dated Capacity Reservation
+        // should become available for use" (`StartDate`) — and those two are required with
+        // it and meaningless without it.
+        let future_dated = input.start_date.is_some();
+        if !future_dated && input.commitment_duration.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "commitmentDuration is supported for future-dated Capacity Reservations only, \
+                 which are the ones that specify startDate",
+            ));
+        }
+        if !future_dated && input.delivery_preference.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "deliveryPreference is supported for future-dated Capacity Reservations only, \
+                 which are the ones that specify startDate",
+            ));
+        }
+
+        // "You can request a future-dated Capacity Reservation between 5 and 120 days in
+        // advance" (`StartDate`). `None` is capacity for immediate use, which starts the
+        // moment it is reserved.
+        let start_date = match input.start_date {
+            None => None,
+            Some(start_date) => {
+                let start_date = ::std::time::SystemTime::try_from(start_date).map_err(|_| {
+                    Scaffolded::invalid_parameter_value(
+                        "Invalid value for startDate: it is not a representable date and time",
+                    )
+                })?;
+                // Checked arithmetic: both spans are this crate's own small constants, so
+                // neither can overflow in practice, but an instant the clock type could not
+                // hold is reported rather than panicked on.
+                let window = now
+                    .checked_add(state::ONE_DAY * state::MIN_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS)
+                    .zip(now.checked_add(
+                        state::ONE_DAY * state::MAX_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS,
+                    ));
+                let Some((earliest, latest)) = window else {
+                    return Err(Scaffolded::internal_error(
+                        "the lead time of a future-dated Capacity Reservation falls outside \
+                         the range this service's clock can represent",
+                    ));
+                };
+                if start_date < earliest || start_date > latest {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{}' for startDate: a future-dated Capacity \
+                         Reservation starts between {} and {} days from now",
+                        state::iso8601_utc(start_date),
+                        state::MIN_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS,
+                        state::MAX_FUTURE_CAPACITY_RESERVATION_LEAD_DAYS,
+                    )));
+                }
+                Some(start_date)
+            }
+        };
+
         // "You must provide an EndDate value if EndDateType is limited. Omit EndDate if
         // EndDateType is unlimited" (`EndDate`), with `unlimited` the end type of a request
         // that names neither: "The Capacity Reservation remains active until you explicitly
@@ -328,7 +385,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .end_date_type
             .as_deref()
             .unwrap_or(state::END_DATE_TYPE_UNLIMITED);
-        let now = ::std::time::SystemTime::now();
         let end_date = match (end_date_type, input.end_date) {
             (state::END_DATE_TYPE_UNLIMITED, Some(_)) => {
                 return Err(Scaffolded::invalid_parameter_combination(
@@ -401,6 +457,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ebs_optimized = input.ebs_optimized.unwrap_or(false);
         let ephemeral_storage = input.ephemeral_storage.unwrap_or(false);
 
+        // Everything only a future-dated reservation is held to: the match criteria it must
+        // carry, the commitment it must make, the delivery method AWS supports and the
+        // instance families it may reserve.
+        let commitment = if future_dated {
+            // "If you are requesting a future-dated Capacity Reservation, you must specify
+            // `targeted`" (`InstanceMatchCriteria`). The modelled enum has already refused
+            // any spelling outside it.
+            if instance_match_criteria != state::INSTANCE_MATCH_CRITERIA_TARGETED {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{instance_match_criteria}' for instanceMatchCriteria: a \
+                     future-dated Capacity Reservation requires '{}'",
+                    state::INSTANCE_MATCH_CRITERIA_TARGETED
+                )));
+            }
+            // "You can request future-dated Capacity Reservations for instance types in the
+            // C, M, R, I, T, and G instance families only" (`InstanceType`). The family is
+            // the letters the type starts with, so `inf1` and `trn1` are families of their
+            // own rather than the `i` and `t` they begin with.
+            let family = state::family_letters_of_instance_type(&input.instance_type);
+            if !state::FUTURE_CAPACITY_RESERVATION_INSTANCE_FAMILIES.contains(&family.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{}' for instanceType: a future-dated Capacity \
+                     Reservation reserves instance types in the {} instance families only",
+                    input.instance_type,
+                    state::FUTURE_CAPACITY_RESERVATION_INSTANCE_FAMILIES
+                        .iter()
+                        .map(|family| family.to_ascii_uppercase())
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                )));
+            }
+            // "Required for future-dated Capacity Reservations only"
+            // (`CommitmentDuration`) — so required for this one.
+            let Some(duration_seconds) = input.commitment_duration else {
+                return Err(Scaffolded::missing_parameter(
+                    "commitmentDuration must be specified for a future-dated Capacity \
+                     Reservation",
+                ));
+            };
+            // The modelled `@range 1..200000000` on
+            // `CapacityReservationCommitmentDuration`, enforced here because the generated
+            // input member is a plain `Option<i64>`: without it an unbounded number would
+            // reach the arithmetic that derives the commitment's end date, and a negative
+            // one would be stored as a commitment that runs backwards.
+            if !(state::MIN_CAPACITY_RESERVATION_COMMITMENT_SECONDS
+                ..=state::MAX_CAPACITY_RESERVATION_COMMITMENT_SECONDS)
+                .contains(&duration_seconds)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{duration_seconds}' for commitmentDuration: a commitment \
+                     runs from {} to {} seconds",
+                    state::MIN_CAPACITY_RESERVATION_COMMITMENT_SECONDS,
+                    state::MAX_CAPACITY_RESERVATION_COMMITMENT_SECONDS,
+                )));
+            }
+            match input.delivery_preference.as_deref() {
+                None => {
+                    return Err(Scaffolded::missing_parameter(
+                        "deliveryPreference must be specified for a future-dated Capacity \
+                         Reservation",
+                    ));
+                }
+                // "The only supported value is incremental" (`DeliveryPreference`).
+                Some(preference)
+                    if preference
+                        != state::CAPACITY_RESERVATION_DELIVERY_PREFERENCE_INCREMENTAL =>
+                {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{preference}' for deliveryPreference: the only \
+                         supported value is '{}'",
+                        state::CAPACITY_RESERVATION_DELIVERY_PREFERENCE_INCREMENTAL
+                    )));
+                }
+                Some(_) => {}
+            }
+            // "The commitment duration is a minimum duration for which you commit to having
+            // the future-dated Capacity Reservation in the active state in your account
+            // AFTER IT HAS BEEN DELIVERED" (`CommitmentDuration`), so the commitment runs
+            // from the start date, which a future-dated request always carries — it is what
+            // makes it one. Computed once, with checked arithmetic: the duration is bounded
+            // above, so this cannot overflow, and an instant the clock type could not hold
+            // is reported rather than panicked on.
+            let Some(commitment_start) = start_date else {
+                return Err(Scaffolded::internal_error(
+                    "a future-dated Capacity Reservation reached the commitment with no \
+                     start date",
+                ));
+            };
+            // The duration is a positive number of seconds by the range check above; that
+            // invariant is re-stated HERE through the conversion rather than assumed, so a
+            // negative value could never be read as a huge positive span if the check moved.
+            let commitment_seconds = u64::try_from(duration_seconds).map_err(|_| {
+                Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{duration_seconds}' for commitmentDuration: a commitment \
+                     runs forwards from the reservation's start date"
+                ))
+            })?;
+            let Some(commitment_end_date) =
+                commitment_start.checked_add(::std::time::Duration::from_secs(commitment_seconds))
+            else {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{duration_seconds}' for commitmentDuration: the \
+                     commitment would end further ahead than this service can represent"
+                )));
+            };
+            // "If you are requesting a future-dated Capacity Reservation, you can't specify
+            // an end date and time that is within the commitment duration" (`EndDate`).
+            if let Some(inside) = end_date.filter(|end_date| *end_date < commitment_end_date) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{}' for endDate: it falls inside the commitment \
+                     duration, which ends at {}",
+                    state::iso8601_utc(inside),
+                    state::iso8601_utc(commitment_end_date),
+                )));
+            }
+            Some(state::CapacityReservationCommitment {
+                duration_seconds,
+                end_date: commitment_end_date,
+            })
+        } else {
+            None
+        };
+
+        // Where the create leaves the reservation, and what the clock then owes it: capacity
+        // for immediate use is "available for use" at once, while a future-dated request is
+        // one "Amazon EC2 is assessing" (`CapacityReservation$State`) until it is approved
+        // and so "scheduled for delivery on the requested start date" — one TRANSITION_DELAY
+        // later, on the same monotonic clock as every other move this crate owes.
+        let (initial_state, initial_pending) = if future_dated {
+            (
+                state::CAPACITY_RESERVATION_STATE_ASSESSING,
+                Some(state::CapacityReservationTransition::starting_now(
+                    state::CapacityReservationMove::Scheduled,
+                )),
+            )
+        } else {
+            (state::CAPACITY_RESERVATION_STATE_ACTIVE, None)
+        };
+
         let payload_bytes = state::tag_list_bytes(&tags)
             .saturating_add(input.instance_type.len())
             .saturating_add(input.client_token.as_deref().map_or(0, str::len));
@@ -416,11 +611,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replay: what the first request stored is compared against this one member by
         // member, and a difference is answered with `IdempotentParameterMismatch`. A token
         // whose reservation the store no longer holds is a MISS, not a mismatch: there is
-        // nothing left to answer with, so the request is served as a fresh create.
+        // nothing left to answer with, so the request is served as a fresh create. The token
+        // is read under the Region the create was signed for, which is the scope an
+        // idempotency key has.
         let replayed = input
             .client_token
             .as_deref()
-            .and_then(|token| store.capacity_reservation_client_tokens.get(token).cloned())
+            .and_then(|token| {
+                store
+                    .capacity_reservation_client_tokens
+                    .get(&(region.clone(), token.to_string()))
+                    .cloned()
+            })
             .filter(|first_id| store.capacity_reservations.contains_key(first_id));
         if let Some(first_id) = replayed.as_deref() {
             let timestamp = |at: Option<::aws_smithy_types::DateTime>| {
@@ -443,6 +645,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         && view.ephemeral_storage == Some(ephemeral_storage)
                         && timestamp(view.end_date)
                             == timestamp(end_date.map(state::system_time_to_date_time))
+                        // The members only a future-dated request names: a replay that asks
+                        // for a different commitment or delivery method is a different
+                        // request under a token already in use, not a replay — and those
+                        // two are also what tells a stored future-dated reservation from
+                        // one created for immediate use, whose stored start date is the
+                        // instant it was created rather than a date any request named.
+                        && view
+                            .commitment_info
+                            .as_ref()
+                            .and_then(|commitment| commitment.commitment_duration)
+                            == input.commitment_duration
+                        && view.delivery_preference.as_deref()
+                            == input.delivery_preference.as_deref()
+                        // So the start date is compared where a request names one at all.
+                        && (!future_dated
+                            || timestamp(view.start_date)
+                                == timestamp(start_date.map(state::system_time_to_date_time)))
                         && state::tag_pairs(view.tags.as_deref().unwrap_or_default())
                             == state::tag_pairs(&tags)
                 });
@@ -485,7 +704,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         instance_platform: input.instance_platform.clone(),
                         availability_zone: zone.zone_name.clone(),
                         availability_zone_id: zone.zone_id.clone(),
-                        region,
+                        region: region.clone(),
                         tenancy,
                         instance_count: input.instance_count,
                         ebs_optimized,
@@ -493,18 +712,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         end_date,
                         instance_match_criteria,
                         created_at: now,
+                        // The requested delivery date of a future-dated reservation, and
+                        // what it committed to; `None` for capacity for immediate use,
+                        // which starts the moment it is reserved and commits to nothing.
+                        start_date,
+                        commitment,
+                        delivery_preference: input.delivery_preference.clone(),
                         // Capacity for immediate use: the reservation is usable as soon as
                         // the request is accepted, so "the capacity is available for use"
                         // (`CapacityReservationState`'s `active`) is where it starts and
-                        // the clock owes it nothing. Its `expired` move is a fact of its
-                        // end date, derived on read.
-                        state: state::CAPACITY_RESERVATION_STATE_ACTIVE,
+                        // the clock owes it nothing. A future-dated request is one "Amazon
+                        // EC2 is assessing", with the move to `scheduled` owed to the
+                        // clock. Either one's `expired` move is a fact of its end date,
+                        // derived on read.
+                        state: initial_state,
                         tags,
                         // Allocated from nothing: this is a reservation of its own, not
                         // capacity taken out of another one.
                         interruption_info: None,
                         zero_size_preference: None,
-                        pending: None,
+                        pending: initial_pending,
                     })
                 else {
                     // The store refused the write at one of its own ceilings: a quota, not
@@ -522,7 +749,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(token) = input.client_token.clone() {
                     store
                         .capacity_reservation_client_tokens
-                        .insert(token, capacity_reservation_id.clone());
+                        .insert((region, token), capacity_reservation_id.clone());
                 }
                 capacity_reservation_id
             }

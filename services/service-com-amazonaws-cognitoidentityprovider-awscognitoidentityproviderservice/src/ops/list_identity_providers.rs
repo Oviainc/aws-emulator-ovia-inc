@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIdentityProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIdentityProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIdentityProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, from stored state, the third-party identity providers of the user pool
+//! named by `UserPoolId`: each entry rendered from the STORED provider, in
+//! ascending provider-name order, a page of at most `MaxResults` entries at a
+//! time, where a non-final page's `NextToken` resumes the listing strictly after
+//! the last provider that page served. This operation is a READ: it persists
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +163,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIdentityProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIdentityProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIdentityProviders"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The pool's stored providers, keyed by `ProviderName` in ascending order
+        // — the stable order the pagination token indexes into. The model
+        // documents no order for this listing.
+        let provider_names: Vec<String> = pool.identity_providers.keys().cloned().collect();
+
+        // The page size this request gets: the crate's shared rule for a
+        // listing's limit — a request that asks for none, or for `0`, takes the
+        // maximum — bounded by the most this operation's result list can hold.
+        // That rule answers at most the modelled limit maximum, so the conversion
+        // cannot fall back, and its fallback is the bound applied next anyway.
+        let page_limit = i32::try_from(crate::state::page_size(input.max_results))
+            .unwrap_or(MAX_PROVIDERS_PER_PAGE)
+            .min(MAX_PROVIDERS_PER_PAGE);
+
+        // The listing a pagination token belongs to: this operation over the
+        // identity providers of this pool, so a token one pool's listing issued
+        // names no page of another pool's listing or of another operation's.
+        let scope = format!("{}|{}", Self::NAME, pool.id);
+        let page = crate::state::page_of(
+            &scope,
+            &provider_names,
+            Some(page_limit),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(invalid_next_token)?;
+
+        // Rendered from the STORED providers: this read changes nothing.
+        let providers: Vec<ProviderDescription> = page
+            .keys
+            .iter()
+            .filter_map(|provider_name| pool.identity_providers.get(provider_name))
+            .map(to_provider_description)
+            .collect();
+
+        // `Providers` is a REQUIRED member, so it is present and empty when the
+        // pool holds no identity provider — which is what a paginating client
+        // reads.
+        Ok(ListIdentityProvidersOutput {
+            providers,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// `ProvidersListType`, the list `Providers` is modelled as, has a maximum length
+/// of 50 while `MaxResults`' range reaches 60
+/// (`smithy_query(query="operation",operation="ListIdentityProviders")`), so one
+/// page serves at most 50 providers however many the caller asks for.
+const MAX_PROVIDERS_PER_PAGE: i32 = 50;
+
+/// The listing's view of one STORED provider. `ProviderDescription` carries the
+/// provider's name and type beside the instants it was created and last modified,
+/// and none of the trust-relationship detail a single-provider read renders.
+fn to_provider_description(provider: &crate::state::IdentityProvider) -> ProviderDescription {
+    ProviderDescription {
+        provider_name: Some(provider.provider_name.clone()),
+        provider_type: Some(provider.provider_type.clone()),
+        creation_date: Some(crate::state::to_date_time(provider.creation_date)),
+        last_modified_date: Some(crate::state::to_date_time(provider.last_modified_date)),
+    }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListIdentityProvidersError {
+    ListIdentityProvidersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `NextToken` that names no
+/// page of this listing.
+fn invalid_next_token() -> ListIdentityProvidersError {
+    ListIdentityProvidersErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "NextToken is not a pagination token this operation issued for this user pool"
+                .to_string(),
+        ),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListIdentityProvidersError {
+    ListIdentityProvidersErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

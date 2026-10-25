@@ -21,6 +21,8 @@ mod alarm_history;
 mod alarm_history_data;
 #[path = "all/composite_alarms.rs"]
 mod composite_alarms;
+#[path = "all/dashboards.rs"]
+mod dashboards;
 #[path = "all/datasets.rs"]
 mod datasets;
 #[path = "all/ec2_alarm_actions.rs"]

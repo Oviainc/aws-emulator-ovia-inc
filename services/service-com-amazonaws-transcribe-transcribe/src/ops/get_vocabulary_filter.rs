@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetVocabularyFilterErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -174,8 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: a regional endpoint reports only the
+        // filters created through it.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let Some(record) = store.vocabulary_filters.get(&input.vocabulary_filter_name) else {
+        let Some(record) = store
+            .vocabulary_filters
+            .get(&region, &input.vocabulary_filter_name)
+        else {
             // As `GetVocabulary`: this service reports a resource it does not hold
             // with `BadRequestException`, not the modelled `NotFoundException`.
             return Err(GetVocabularyFilterErrorModeled::BadRequestException(
