@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectInstanceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectInstanceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectInstanceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the Campaigns configuration of one Connect instance: the record the
+//! instance's onboarding wrote, and everything held on that configuration — the
+//! instance-wide communication limits it carries and the instance's integrations — so
+//! the instance is no longer onboarded, `GetConnectInstanceConfig` reports no config
+//! for it and `CreateCampaign` no longer treats it as a campaign target. An instance
+//! with no configuration at the instant of the call (never onboarded, onboarding not
+//! finished, or configuration already deleted) is HTTP 404 and nothing is written.
+//!
+//! The request's `campaignDeletionPolicy` decides what the delete enacts on the
+//! campaigns of that instance, as the model documents the enum: `DELETE_ALL` removes
+//! them along with the configuration, `RETAIN_ALL` leaves them exactly as they are,
+//! and a request naming no policy enacts nothing on them either — a caller that did
+//! not ask for its campaigns to go keeps them. Campaigns of every OTHER instance are
+//! untouched whichever policy is named.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +178,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectInstanceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectInstanceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectInstanceConfig"))
+        // A `campaignDeletionPolicy` outside the model's own `CampaignDeletionPolicy`
+        // catalog names no policy to enact on the instance's campaigns, so there is no
+        // deletion it could ask for. A backstop rather than the first line of defence:
+        // the member targets a modelled enum, so the boundary validator refuses an
+        // off-catalog value before `handle` runs — but only this check keeps the
+        // handler's own contract if that walk ever widens. Answered before the instance
+        // is looked up: a request this malformed is a bad request whether or not the
+        // instance holds a configuration.
+        let policy = input.campaign_deletion_policy.as_deref();
+        if let Some(unknown) =
+            policy.filter(|named| !CAMPAIGN_DELETION_POLICY_VALUES.contains(named))
+        {
+            return Err(
+                DeleteConnectInstanceConfigErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "campaignDeletionPolicy: {unknown} is not a supported campaign deletion \
+                         policy; supported policies are {}",
+                        CAMPAIGN_DELETION_POLICY_VALUES.join(", ")
+                    ),
+                    x_amz_error_type: None,
+                })
+                .into(),
+            );
+        }
+        // Only the one policy that names a deletion removes the instance's campaigns;
+        // `RETAIN_ALL` and a request carrying no policy both retain them.
+        let delete_campaigns = policy == Some(crate::state::CAMPAIGN_DELETION_POLICY_DELETE_ALL);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteConnectInstanceConfigErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the ConnectCampaignsV2 instance store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One guard spans the existence check and every removal, so a concurrent
+        // delete of the same configuration cannot have both calls report success, and
+        // a campaign created against the instance meanwhile is either fully stored or
+        // not stored at all.
+        let now = ::std::time::SystemTime::now();
+        let deleted = state
+            .lock()
+            .delete_instance_config(&input.connect_instance_id, delete_campaigns, now);
+
+        if !deleted {
+            // The instance holds no configuration at `now` — the same predicate
+            // `GetConnectInstanceConfig` projects through, so the two cannot disagree
+            // about an instance this service holds no config for — and a refusal wrote
+            // nothing.
+            return Err(
+                DeleteConnectInstanceConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::instance_config_not_found_message(
+                            &input.connect_instance_id,
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The call changed what this service holds for the instance, so it leaves the
+        // same audit record the other instance mutators leave: the caller, the
+        // instance and the outcome, and nothing of what was stored.
+        crate::state::audit_onboarding_change(
+            ctx.parts(),
+            Self::NAME,
+            &input.connect_instance_id,
+            "accepted",
+        );
+
+        Ok(DeleteConnectInstanceConfigOutput)
     }
 }

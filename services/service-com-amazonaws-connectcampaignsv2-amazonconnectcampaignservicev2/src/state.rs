@@ -28,6 +28,12 @@
 //! integration the instance holds, keyed by the kind and resource ARN that identify
 //! it, `ListConnectInstanceIntegrations` projects those records and
 //! `DeleteConnectInstanceIntegration` removes the one its identifier names.
+//!
+//! `DeleteConnectInstanceConfig` is the other end of onboarding: it removes an
+//! instance's record from the onboarding store together with everything held on that
+//! configuration — its communication limits and its integrations — so the instance is
+//! no longer onboarded and no reader reports a configuration for it. The campaigns of
+//! the instance go with it only when the request's campaign deletion policy says so.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -876,6 +882,18 @@ pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
 /// campaign: that operation's message is composed from the request.)
 pub const CAMPAIGN_NOT_FOUND_MESSAGE: &str = "CampaignId not found.";
 
+/// The `CampaignDeletionPolicy` value that has `DeleteConnectInstanceConfig` remove
+/// the instance's existing campaigns along with its configuration, as the model's
+/// catalog declares it (see `CAMPAIGN_DELETION_POLICY_VALUES` in
+/// [`crate::ops::types`]).
+pub const CAMPAIGN_DELETION_POLICY_DELETE_ALL: &str = "DELETE_ALL";
+
+/// The `CampaignDeletionPolicy` value that retains the instance's existing
+/// campaigns, from the same catalog: the policy that enacts nothing on them, and so
+/// also how a request that names no policy at all is served — the conservative
+/// reading, since a caller that did not ask for the campaigns to go keeps them.
+pub const CAMPAIGN_DELETION_POLICY_RETAIN_ALL: &str = "RETAIN_ALL";
+
 /// What this service answers when a `connectInstanceId` names no Connect instance
 /// onboarded to Campaigns: there is no instance configuration to report, nor any to
 /// configure.
@@ -1605,6 +1623,56 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         }
         self.instance_onboarding.remove(connect_instance_id);
         DeleteOnboardingOutcome::Deleted
+    }
+
+    /// Remove every campaign of `connect_instance_id` from the store, in creation
+    /// order, leaving every other instance's campaigns where they are.
+    ///
+    /// Each record goes through [`Self::remove_campaign`], so the creation order
+    /// loses exactly the entries the map does and a later page walks what is left.
+    fn remove_instance_campaigns(&mut self, connect_instance_id: &str) {
+        let ids: Vec<String> = self
+            .campaigns_in_order()
+            .filter(|(_, campaign)| campaign.connect_instance_id == connect_instance_id)
+            .map(|(_, campaign)| campaign.id.clone())
+            .collect();
+        for id in &ids {
+            self.remove_campaign(id);
+        }
+    }
+
+    /// Delete the instance configuration of `connect_instance_id`, and report
+    /// whether there was one to delete.
+    ///
+    /// `false` means the instance holds no configuration at `now` — it was never
+    /// onboarded, its onboarding job has not finished, or its configuration is
+    /// already gone — so nothing was written, and the caller answers as not found.
+    ///
+    /// Deleting the configuration takes with it everything held ON that
+    /// configuration: the instance's onboarding record (so the instance is no longer
+    /// a campaign target and no reader reports a config for it), the instance-wide
+    /// communication limits that record carries, and the instance's integrations —
+    /// which belong to the configured instance, so an instance onboarded again later
+    /// starts out holding none.
+    ///
+    /// `delete_campaigns` is what the request's campaign deletion policy decided for
+    /// the campaigns of the instance: `true` removes them with the configuration,
+    /// `false` retains them exactly as they are.
+    pub fn delete_instance_config(
+        &mut self,
+        connect_instance_id: &str,
+        delete_campaigns: bool,
+        now: SystemTime,
+    ) -> bool {
+        if self.onboarded_instance(connect_instance_id, now).is_none() {
+            return false;
+        }
+        if delete_campaigns {
+            self.remove_instance_campaigns(connect_instance_id);
+        }
+        self.instance_onboarding.remove(connect_instance_id);
+        self.instance_integrations.remove(connect_instance_id);
+        true
     }
 
     /// Put `config` as an integration of `connect_instance_id`, and hand back the
