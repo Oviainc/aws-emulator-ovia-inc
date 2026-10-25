@@ -31,5 +31,7 @@ mod environment_unit_count_ranges;
 mod environment_update_status_sequence;
 #[path = "all/rejection_contract.rs"]
 mod rejection_contract;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

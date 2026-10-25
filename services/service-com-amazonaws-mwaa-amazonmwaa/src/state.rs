@@ -61,6 +61,52 @@ pub const MAX_ENVIRONMENTS: usize = 1_000;
 /// How many tags one environment can carry, from `TagMap`'s own `@length(1, 50)`.
 pub const MAX_TAGS: usize = 50;
 
+/// The tag-key namespace Amazon Web Services keeps for the tags it applies itself.
+///
+/// A tag whose key opens with it belongs to AWS, not to the caller: a caller may neither
+/// create, change nor remove one, so every operation that WRITES this service's tag maps
+/// — `CreateEnvironment`'s `Tags`, `TagResource` and `UntagResource` — refuses a request
+/// that names such a key, in either direction. `TagKey`'s modelled `@pattern`
+/// (`smithy_query(query="shape",shape="TagKey")`:
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) admits the colon, so the boundary validator cannot
+/// express the rule and each writer enforces it through [`is_reserved_tag_key`].
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Compared WITHOUT regard to case, because the namespace is reserved rather than one
+/// spelling of it. It is a PREFIX test: a key that merely contains the prefix later on, or
+/// opens with `aws` and no colon, is an ordinary caller-owned key. `get(..)` rather than
+/// slicing, so a key whose prefix-length byte boundary falls inside a multi-byte character
+/// (which `TagKey`'s pattern admits through `\p{L}`) is simply not reserved instead of
+/// panicking.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys` that [`is_reserved_tag_key`], in the order given, or `None`
+/// when the request names none. The one place the tag writers ask the question, so a key
+/// is judged the same way whichever operation carries it.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// Why a request naming the reserved tag key `key` in member `member` is refused: the
+/// message of the `ValidationException` (HTTP 400) the tag writers answer with. It names
+/// the member, the offending key and the constraint, so the caller can fix the request
+/// from the sentence alone.
+pub fn reserved_tag_key_message(member: &str, key: &str) -> String {
+    format!(
+        "{member} names the tag key {key}, which begins with the reserved \
+         {RESERVED_TAG_KEY_PREFIX} prefix: that namespace holds the tags Amazon Web \
+         Services applies itself, and a caller can neither create, edit nor delete one"
+    )
+}
+
 /// How many Apache Airflow variables this emulator holds for ONE environment, and how
 /// many pools.
 ///
