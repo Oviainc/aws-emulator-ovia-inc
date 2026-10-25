@@ -1298,6 +1298,34 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         Some(task)
     }
 
+    /// The export tasks `region` holds, in task-id order, resuming after `after_id`
+    /// when a pagination token named a position, and restricted to the tasks that read
+    /// one graph when `of_graph` names one: the listing `ListExportTasks` pages over.
+    ///
+    /// The same shape as [`Self::snapshots_in`], for the same reason: `export_tasks` is
+    /// a `BTreeMap`, so one stable total order underlies every page and a token can name
+    /// a position in it. `of_graph` is matched against the task's stored
+    /// `source_graph_id`, so a task stays listed under the graph it read even once that
+    /// graph is gone.
+    pub fn export_tasks_in<'store>(
+        &'store self,
+        region: &'store str,
+        of_graph: Option<&'store str>,
+        after_id: Option<&str>,
+    ) -> impl Iterator<Item = &'store ExportTask> {
+        let lower = match after_id {
+            Some(id) => ::std::ops::Bound::Excluded(id.to_string()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.export_tasks
+            .range((lower, ::std::ops::Bound::Unbounded))
+            .map(|(_, task)| task)
+            .filter(move |task| {
+                task.is_in(region)
+                    && of_graph.is_none_or(|graph_id| task.source_graph_id == graph_id)
+            })
+    }
+
     /// A free `snapshotName` for the FINAL snapshot of the graph named `graph_name`
     /// IN `region`, satisfying the modelled `SnapshotName` constraints
     /// (`@length(1..63)`, pattern `^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`).
@@ -2588,7 +2616,8 @@ import_task_record_output!(
 /// The `*Output` shapes that carry a whole export-task record differ only in the
 /// members they add, so the members they SHARE are rendered by one macro rather than
 /// one hand-copied field list per operation, which could drift apart. The listing
-/// projection (`ExportTaskSummary`) joins this list with the operation that reports it;
+/// projection (`ExportTaskSummary`) is rendered here too, so a listed task cannot drift
+/// from what a single-task read answers;
 /// `GetExportTaskOutput` is built by [`ExportTask::get_output`] instead, because it also
 /// carries the `exportTaskDetails` that are derived from the clock.
 ///
@@ -2623,6 +2652,10 @@ export_task_record_output!(
     // `CancelExportTaskOutput` carries only the shared members: the model gives it no
     // `exportFilter`.
     CancelExportTaskOutput(task) {},
+    // `ExportTaskSummary`, the entry `ListExportTasks` reports, is exactly the shared
+    // member set (`smithy_query(query="shape",shape="ExportTaskSummary")`), so a listed
+    // task cannot differ from what a read of it answers.
+    ExportTaskSummary(task) {},
 );
 
 /// The shapes that carry a whole private-graph-endpoint record are structurally

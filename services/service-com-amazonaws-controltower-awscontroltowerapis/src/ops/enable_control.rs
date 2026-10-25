@@ -180,71 +180,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `EnabledControlParameters` carries no modelled length, so the count and the
-        // weight of what a caller sends are bounded HERE, before any per-parameter work
-        // runs: both caps are refused with this operation's own `ValidationException`,
-        // naming the member and the bound.
-        let supplied = input.parameters.unwrap_or_default();
-        if supplied.len() > crate::state::MAX_ENABLED_CONTROL_PARAMETERS {
-            return Err(EnableControlErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "parameters carries {} entries, more than the {} a control may be \
-                         configured with",
-                        supplied.len(),
-                        crate::state::MAX_ENABLED_CONTROL_PARAMETERS
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // One pass over a set of the keys already seen, so detecting a repeat costs
-        // O(n log n) in the entry count rather than O(n^2). The model declares no
-        // uniqueness constraint on `EnabledControlParameters`, so this refusal is CHOSEN:
-        // a parameter is addressed by its `key`, so a request carrying one key twice does
-        // not describe one configuration.
-        let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-        let mut weight = 0usize;
-        for parameter in &supplied {
-            if !seen.insert(parameter.key.as_str()) {
-                return Err(EnableControlErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "parameters carries key {} more than once; each control \
-                             parameter key may be given at most once",
-                            parameter.key
-                        ),
-                    },
-                )
-                .into());
-            }
-            // The budget left for this value, so the whole list is measured once and the
-            // walk stops at the first node that takes it past the cap.
-            let budget = crate::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES
-                .saturating_sub(weight.saturating_add(parameter.key.len()));
-            let Some(value_weight) = crate::state::document_weight_within(&parameter.value, budget)
-            else {
-                return Err(EnableControlErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "parameters weighs more than the {} bytes a control \
-                             configuration may hold",
-                            crate::state::MAX_ENABLED_CONTROL_PARAMETER_BYTES
-                        ),
-                    },
-                )
-                .into());
-            };
-            weight = weight
-                .saturating_add(parameter.key.len())
-                .saturating_add(value_weight);
-        }
-
-        let parameters: Vec<(String, ::aws_smithy_types::Document)> = supplied
+        // `EnabledControlParameters` carries no modelled length and no uniqueness
+        // constraint, so the count, the keys and the weight of what a caller sends are
+        // bounded HERE, before any per-parameter work runs, by the same rule
+        // `UpdateEnabledControl` applies to the configuration it is given: a list outside
+        // it is refused with this operation's own `ValidationException`, naming the member
+        // and the bound.
+        let parameters: Vec<(String, ::aws_smithy_types::Document)> = input
+            .parameters
+            .unwrap_or_default()
             .into_iter()
             .map(|parameter| (parameter.key, parameter.value))
             .collect();
+
+        if let Some(message) = crate::state::unacceptable_control_parameters_message(&parameters) {
+            return Err(
+                EnableControlErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -338,6 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 inheritance_drift_status: crate::state::DriftStatus::Unknown,
                 resource_drift_status: crate::state::DriftStatus::Unknown,
                 due_at: now + crate::state::OPERATION_SETTLE_AFTER,
+                // Nothing is queued against a control being enabled; `UpdateEnabledControl`
+                // is what parks a configuration here.
+                pending_update: None,
             },
         );
 

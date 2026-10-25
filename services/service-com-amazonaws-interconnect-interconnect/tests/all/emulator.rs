@@ -7,8 +7,14 @@
 //! `X-Amz-Target: Interconnect.<Operation>` on `awsJson1_0`, through the same
 //! `MultiServiceRouter::dispatch` the socket front door uses — so the mounting rules
 //! live here once rather than in each suite.
+//!
+//! Direct Connect is mounted beside Interconnect on the SAME engine, as the assembled
+//! emulator mounts them: an attach point IS a Direct Connect gateway of the account, so
+//! a suite that needs one creates it through that service ([`Emulator::dx`]) and then
+//! reads it back through `ListAttachPoints`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -17,12 +23,27 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The signing name the model gives this service; also its ARN namespace.
 pub(crate) const SIGNING_NAME: &str = "interconnect";
 
+/// The signing name and `endpointPrefix` the Direct Connect model gives that service
+/// (`smithy_query(query="service_info")` on its model: sigv4Name `directconnect`), whose
+/// `awsJson1_1` target prefix is its service shape name, `OvertureService`.
+pub(crate) const DIRECT_CONNECT_SIGNING_NAME: &str = "directconnect";
+pub(crate) const DIRECT_CONNECT_TARGET_PREFIX: &str = "OvertureService";
+
+/// How long a wait for a Direct Connect gateway to reach `available` runs before the
+/// case fails. That service owes the clock a `pending` -> `available` transition, so a
+/// freshly created gateway becomes a valid attach point a moment later.
+pub(crate) const GATEWAY_READY_BUDGET: Duration = Duration::from_secs(5);
+
+/// How often that wait re-reads.
+pub(crate) const GATEWAY_READY_INTERVAL: Duration = Duration::from_millis(20);
+
 /// The ONLY value `AttachPointType` models
 /// (`smithy_query(query="shape",shape="AttachPointType")` -> values:
 /// ["DirectConnectGateway"]), so it is the only `type` a descriptor can report.
 pub(crate) const ATTACH_POINT_TYPE: &str = "DirectConnectGateway";
 
-/// One emulator: a router with this service mounted over one shared engine.
+/// One emulator: a router with this service and Direct Connect mounted over one shared
+/// engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -35,7 +56,14 @@ impl Emulator {
         // Authorization header below is still what carries the credential scope.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(engine),
+            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        // An attach point is a Direct Connect gateway, so the service that owns those
+        // gateways is mounted on the same engine the way the assembled router mounts it.
+        router.register_service(
+            service_com_amazonaws_directconnect_overtureservice::EmulatedService::new(engine),
         );
         Self { router }
     }
@@ -96,6 +124,91 @@ impl Emulator {
             "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
         );
         decoded
+    }
+
+    /// One Direct Connect operation (`awsJson1_1`), as a `(status, body)` pair.
+    pub(crate) async fn dx(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            DIRECT_CONNECT_SIGNING_NAME,
+            &format!("{DIRECT_CONNECT_TARGET_PREFIX}.{operation}"),
+            "1.1",
+            body,
+        )
+        .await
+    }
+
+    /// One Direct Connect operation, required to succeed.
+    pub(crate) async fn dx_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.dx(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// Create one Direct Connect gateway and answer its `directConnectGatewayId`.
+    ///
+    /// `amazon_side_asn` is left to the caller so a table's rows can differ in it; the
+    /// id is the server-minted one, never a value the test chose.
+    pub(crate) async fn create_gateway(&self, name: &str, amazon_side_asn: Option<i64>) -> String {
+        let mut request = Map::new();
+        request.insert("directConnectGatewayName".to_string(), json!(name));
+        if let Some(asn) = amazon_side_asn {
+            request.insert("amazonSideAsn".to_string(), json!(asn));
+        }
+        let created = self
+            .dx_ok("CreateDirectConnectGateway", Value::Object(request))
+            .await;
+        text(
+            &created["directConnectGateway"],
+            "directConnectGatewayId",
+        )
+    }
+
+    /// The `directConnectGatewayState` Direct Connect reports for `gateway_id`, or `""`
+    /// once it reports the gateway no longer exists.
+    pub(crate) async fn gateway_state(&self, gateway_id: &str) -> String {
+        let (status, body) = self
+            .dx(
+                "DescribeDirectConnectGateways",
+                json!({ "directConnectGatewayId": gateway_id }),
+            )
+            .await;
+        if status != 200 {
+            return String::new();
+        }
+        body["directConnectGateways"]
+            .as_array()
+            .and_then(|gateways| gateways.first().cloned())
+            .map(|gateway| text(&gateway, "directConnectGatewayState"))
+            .unwrap_or_default()
+    }
+
+    /// Create `names.len()` gateways and wait until Direct Connect reports each one
+    /// `available` — the state its own documentation calls "ready for use" — answering
+    /// their ids in the order created.
+    pub(crate) async fn ready_gateways(&self, names: &[(&str, Option<i64>)]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (name, asn) in names {
+            ids.push(self.create_gateway(name, *asn).await);
+        }
+        for id in &ids {
+            let started = Instant::now();
+            loop {
+                let state = self.gateway_state(id).await;
+                if state == "available" {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < GATEWAY_READY_BUDGET,
+                    "setup {id:?}: expected the gateway to become available within \
+                     {GATEWAY_READY_BUDGET:?}, it is still {state:?}"
+                );
+                tokio::time::sleep(GATEWAY_READY_INTERVAL).await;
+            }
+        }
+        ids
     }
 
     /// Every seeded Environment, as `ListEnvironments` reports it.

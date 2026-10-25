@@ -1104,6 +1104,49 @@ pub fn dns_sort_key(name: &str) -> DnsNameKey {
     }
 }
 
+/// The most octets one DNS label may carry.
+///
+/// The DNS domain name format every `DNSName` member's documentation points at:
+/// "The maximum length of each label is 63 characters." The octets are counted
+/// AFTER the presentation escapes are resolved, because an escape code spells
+/// one octet however many characters it is written with.
+pub const MAX_DNS_LABEL_OCTETS: usize = 63;
+
+/// The most octets a whole DNS name may carry, counting the dot after each
+/// label.
+///
+/// The same documented format: "The total DNS name can't exceed 255
+/// characters", dots included.
+pub const MAX_DNS_NAME_OCTETS: usize = 255;
+
+/// Why `name` is no DNS name Route 53 can hold, or `None` when it is one.
+///
+/// The modelled `@length` on a `DNSName` member bounds the REQUEST field (up to
+/// 1024 characters), which is far looser than what DNS itself allows, so a name
+/// that satisfies every modelled constraint can still be unusable as a domain
+/// name — and that is the refusal `InvalidDomainName` names. The two bounds are
+/// the documented label and whole-name lengths; both are measured in resolved
+/// OCTETS, so a name spelled with escape codes is judged by the name it spells.
+pub fn dns_name_problem(name: &str) -> Option<String> {
+    let labels = dns_labels(name);
+    if let Some(label) = labels.iter().find(|label| label.len() > MAX_DNS_LABEL_OCTETS) {
+        return Some(format!(
+            "a label may carry at most {MAX_DNS_LABEL_OCTETS} octets, and this name has one of {}",
+            label.len()
+        ));
+    }
+    // Every label is followed by the dot that ends it, the root dot included,
+    // which is the canonical form the name is stored and compared in.
+    let octets: usize = labels.iter().map(|label| label.len() + 1).sum();
+    if octets > MAX_DNS_NAME_OCTETS {
+        return Some(format!(
+            "a domain name may carry at most {MAX_DNS_NAME_OCTETS} octets including the dots, \
+             and this one carries {octets}"
+        ));
+    }
+    None
+}
+
 /// Whether `name` is inside `zone_name` — the same name, or a subdomain of it.
 ///
 /// `ChangeResourceRecordSets` only accepts records for the zone it is called

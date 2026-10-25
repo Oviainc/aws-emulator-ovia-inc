@@ -4,7 +4,8 @@
 //!
 //! IMPLEMENTED. Reports the enrollment configuration `UpdateEnrollmentConfiguration`
 //! persisted for the calling account, or the unenrolled default (`Inactive`) when it
-//! has never configured one. `@readonly`: it stores nothing.
+//! has never configured one, together with the organization rule mode the account's
+//! association leaves it in. `@readonly`: it stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -161,10 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let stored = state.lock().enrollment(&crate::state::caller_account_id());
+        // `organizationRuleMode` "Specifies whether the management account can
+        // create Automation rules that implement optimization actions for this
+        // account" — a permission that is in one of the enum's two states for
+        // every account, whether or not anything has written it, so the read
+        // reports the mode the store holds and the unassociated one while it
+        // holds none. Same derivation as the listing's, so both readers report
+        // one account's mode identically.
+        let organization_rule_mode = stored.reported_organization_rule_mode();
         Ok(GetEnrollmentConfigurationOutput {
             status: stored.status,
             status_reason: stored.status_reason,
-            organization_rule_mode: stored.organization_rule_mode,
+            organization_rule_mode: Some(organization_rule_mode),
             last_updated_timestamp: stored.last_updated_timestamp,
         })
     }

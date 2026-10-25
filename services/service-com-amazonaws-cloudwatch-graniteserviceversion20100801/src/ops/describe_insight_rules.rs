@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInsightRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInsightRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInsightRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Contributor Insights rules this service's store holds, a page at a time.
+//! Implemented here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -84,9 +77,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DescribeInsightRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DescribeInsightRules")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as an invalid token the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DescribeInsightRules",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeInsightRulesErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidNextToken(InvalidNextToken),
 }
 
@@ -141,18 +144,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInsightRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInsightRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInsightRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInsightRulesErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // "The maximum number of results to return in one operation. If you omit this
+        // parameter, the default of 500 is used." (`DescribeInsightRulesInput$MaxResults`) —
+        // which is also the member's modelled 1..500 range, so the boundary validator has
+        // already refused anything outside it. A value that somehow arrives outside that
+        // range is read at the nearest modelled bound rather than at the default, so a zero
+        // can never make the page empty and the paging non-terminating.
+        const DEFAULT_MAX_RESULTS: usize = 500;
+        const MIN_MAX_RESULTS: usize = 1;
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MIN_MAX_RESULTS)
+                .clamp(MIN_MAX_RESULTS, DEFAULT_MAX_RESULTS),
+        };
+
+        // "Include this value, if it was returned by the previous operation, to get the next
+        // set of rules." (`DescribeInsightRulesInput$NextToken`) — a token this service did
+        // not issue is the `InvalidNextToken` this operation models.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeInsightRulesErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some("NextToken is not a token this service issued".into()),
+                })
+            })?),
+        };
+
+        let store = state.lock();
+        // Ordered by rule name so paging is stable and a token can simply name the rule the
+        // next page starts at.
+        let mut names: Vec<&String> = store.insight_rules.keys().collect();
+        names.sort_unstable();
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => names.partition_point(|name| name.as_str() < cursor),
+        };
+        let page = names.get(from..).unwrap_or_default();
+        let next_token = page
+            .get(page_size)
+            .map(|name| crate::state::encode_page_token(name));
+
+        let insight_rules: Vec<InsightRule> = page
+            .iter()
+            .take(page_size)
+            .filter_map(|name| store.insight_rules.get(*name))
+            .map(|stored| stored.rule.clone())
+            .collect();
+
+        Ok(DescribeInsightRulesOutput {
+            insight_rules: Some(insight_rules),
+            next_token,
+        })
     }
 }

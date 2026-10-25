@@ -1,36 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpnConnectionRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpnConnectionRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpnConnectionRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one static route to a Site-to-Site VPN connection this account holds.
+//!
+//! The route is stored ON the connection, in the `Routes` member of the modelled
+//! `VpnConnection` the store keeps ([`crate::state::VpnConnectionRecord`]), through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::put_vpn_static_route`] - so what a later
+//! `DescribeVpnConnections` reports is this write itself and not a second copy of it. A
+//! route of a connection is identified by its destination CIDR block, so repeating the
+//! request leaves ONE route; a route this call adds is `pending`, the non-terminal
+//! `VpnState` of a route being brought up, with the clock owing it `available`.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `CreateVpnConnectionRoute::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::require_service_state`] and read and write it through the
+//! guard it hands back.
 //!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
-//!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only -
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,7 +37,7 @@
 //! # Modeled contract for `CreateVpnConnectionRoute`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
+//! stripped and long entries are clipped at ` ...`. For the FULL text of any one item,
 //! ask the model rather than reading the raw JSON:
 //!
 //! ```text
@@ -57,9 +52,9 @@
 //!
 //! ## Input
 //!
-//! * `DestinationCidrBlock` (String) **required** — The CIDR block associated with the local
+//! * `DestinationCidrBlock` (String) **required** - The CIDR block associated with the local
 //!   subnet of the customer network.
-//! * `VpnConnectionId` (VpnConnectionId) **required** — The ID of the VPN connection.
+//! * `VpnConnectionId` (VpnConnectionId) **required** - The ID of the VPN connection.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -150,18 +145,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpnConnectionRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpnConnectionRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpnConnectionRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it - a VPN
+        // connection is named by id, which is unique across Regions in this store. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Both members are modelled `@required` AND `@clientOptional`, so an EMPTY value
+        // reaches the handler rather than being refused at the boundary. EC2 answers that
+        // with `MissingParameter`, which is a different claim from "no such connection".
+        if input.vpn_connection_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter vpnConnectionId",
+            ));
+        }
+        if input.destination_cidr_block.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter destinationCidrBlock",
+            ));
+        }
+
+        // "The CIDR block associated with the local subnet of the customer network"
+        // (`CreateVpnConnectionRouteRequest$DestinationCidrBlock`): a value that is not a
+        // CIDR block of either family at all is refused before the connection is looked
+        // up, and the block is stored in the canonical form this service stores every CIDR
+        // member in, which is what makes it identify ONE route of the connection.
+        let destination_cidr_block = state::canonical_vpn_static_route_cidr(
+            &input.destination_cidr_block,
+        )
+        .map_err(|_: state::CidrProblem| {
+            state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter destinationCidrBlock is invalid. \
+                 This is not a valid CIDR block.",
+                requested = input.destination_cidr_block,
+            ))
+        })?;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this call is allowed to apply: each was due at its instant
+        // whether or not anybody called, so a route that has reached `available` is
+        // reported and counted as `available` here too.
+        store.materialize_due_transitions();
+
+        let Some(record) = store.vpn_connection(&input.vpn_connection_id) else {
+            return Err(state::invalid_vpn_connection_id(&input.vpn_connection_id));
+        };
+
+        // A connection on its way out cannot take a new route: `deleting` and `deleted` are
+        // the `VpnState` members of a connection whose tunnels are being, or have been,
+        // torn down, so there is nothing left for a static route to be programmed into.
+        if matches!(
+            record.state(),
+            state::VPN_STATE_DELETING | state::VPN_STATE_DELETED
+        ) {
+            return Err(state::incorrect_state(format!(
+                "The VPN connection '{vpn_connection_id}' is in state '{connection_state}', \
+                 which is not a state in which a static route can be created",
+                vpn_connection_id = input.vpn_connection_id,
+                connection_state = record.state(),
+            )));
+        }
+
+        // This store holds a finite number of routes per connection. A request for a block
+        // the connection ALREADY has adds none, so the ceiling never refuses one.
+        if record.route(&destination_cidr_block).is_none()
+            && record.routes().len() >= state::MAX_VPN_STATIC_ROUTES
+        {
+            return Err(state::vpn_route_limit_exceeded(&input.vpn_connection_id));
+        }
+
+        // The write itself. The lookup above has already established the connection is
+        // there, so `None` here would mean the store changed under the lock; it is answered
+        // with the same refusal rather than reported as a success that wrote nothing.
+        if store
+            .put_vpn_static_route(&input.vpn_connection_id, &destination_cidr_block)
+            .is_none()
+        {
+            return Err(state::invalid_vpn_connection_id(&input.vpn_connection_id));
+        }
+
+        // The operation's modelled output shape is `Unit`, so a success carries nothing
+        // beyond the status.
+        Ok(CreateVpnConnectionRouteOutput)
     }
 }

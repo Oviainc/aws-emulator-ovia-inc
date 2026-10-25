@@ -39,6 +39,8 @@ mod regex_pattern_set_updates;
 mod resource_tags;
 #[path = "all/rule_deletion.rs"]
 mod rule_deletion;
+#[path = "all/rule_group_activated_rules.rs"]
+mod rule_group_activated_rules;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
 #[path = "all/rule_lifecycle.rs"]

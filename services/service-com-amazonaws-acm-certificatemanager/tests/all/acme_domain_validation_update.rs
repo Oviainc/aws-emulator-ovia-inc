@@ -14,7 +14,7 @@
 //! already carries, or that names no `PrevalidationOptions` at all, changes nothing (the
 //! operation is `@idempotent`); an ARN with no record behind it is refused
 //! `ResourceNotFoundException`, and a validation ACM is itself still working through (a
-//! status other than the settled `VALID`/`INVALID`) is refused `ConflictException`.
+//! status other than the settled `VALID`/`INVALID`) is refused `ValidationException`.
 //!
 //! Every write goes through `UpdateAcmeDomainValidation` and every read through
 //! `DescribeAcmeDomainValidation` or `ListTagsForResource`, so a response that is not
@@ -530,11 +530,11 @@ async fn update_of_an_unknown_validation_is_not_found() {
 
 /// RULE: a validation ACM is itself still working through — a status other than the
 /// settled `VALID` and `INVALID`, which for a freshly created validation is the
-/// `VALIDATING` its prevalidation has not yet left — is refused `ConflictException`
+/// `VALIDATING` its prevalidation has not yet left — is refused `ValidationException`
 /// (HTTP 400) and keeps the configuration it carries; once the prevalidation falls due
 /// the very same update is accepted.
 #[tokio::test]
-async fn update_of_an_unsettled_validation_is_a_conflict() {
+async fn update_of_an_unsettled_validation_is_refused() {
     let (router, engine) = router_with_engine();
     let endpoint_arn = create_endpoint(&router, "conflict host", &endpoint_body()).await;
 
@@ -583,8 +583,8 @@ async fn update_of_an_unsettled_validation_is_a_conflict() {
         );
         assert_eq!(
             error_code(&response),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {response}"
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response}"
         );
         assert!(
             error_message(&response).contains(state::ACME_DOMAIN_VALIDATION_STATUS_VALIDATING),

@@ -15,6 +15,8 @@
 mod access_log_group_names;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/dash_live_manifest_defaults.rs"]
+mod dash_live_manifest_defaults;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_envelope.rs"]

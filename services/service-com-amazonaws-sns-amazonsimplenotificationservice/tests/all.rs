@@ -23,6 +23,9 @@ mod resource_tags;
 #[path = "all/set_subscription_attributes.rs"]
 mod set_subscription_attributes;
 
+#[path = "all/sms_sandbox_phone_numbers.rs"]
+mod sms_sandbox_phone_numbers;
+
 #[path = "all/sqs_subscription_delivery.rs"]
 mod sqs_subscription_delivery;
 

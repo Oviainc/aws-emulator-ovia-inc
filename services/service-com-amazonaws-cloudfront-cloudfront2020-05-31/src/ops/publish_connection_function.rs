@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishConnectionFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishConnectionFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishConnectionFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a publish COPIES the `DEVELOPMENT` stage of the connection function the
+//! `Id` names into its `LIVE` stage — guarded by an `If-Match` against the version token of
+//! the stage it reads — and reports the summary of the stage it wrote, read back from
+//! `crate::state`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +70,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,20 +144,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishConnectionFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishConnectionFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishConnectionFunction"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The stage a publish READS and copies from is the one a connection function is
+        // created in, so the version token the precondition is checked against is that
+        // stage's: `IfMatch` is "The current version (ETag value) of the connection
+        // function", which a describe of that stage hands back.
+        let published_from = crate::state::DEFAULT_FUNCTION_STAGE;
+
+        // "The connection function ID": this operation addresses the resource by the id its
+        // create minted, which is the key the record is held under — an id no connection
+        // function answers to names no resource to publish, and is answered before the
+        // precondition, which can only be checked against a stored version.
+        let Some(current_etag) = store
+            .connection_functions
+            .get(&input.id)
+            .map(|function| function.development.etag.clone())
+        else {
+            return Err(PublishConnectionFunctionErrorModeled::EntityNotFound(
+                crate::state::connection_function_not_found(&input.id, published_from),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so a publish only copies
+        // the stage its caller actually read: a token that is not a version token at all is
+        // "missing or not valid", and a well-formed token that is not the current one is a
+        // failed precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(PublishConnectionFunctionErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(PublishConnectionFunctionErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // The copy itself, and the projection of the stage it wrote. The record this answers
+        // from is the one the store now holds, so a later describe of the LIVE stage reports
+        // the same configuration, status, stage and timestamps.
+        let Some(summary) = store.publish_connection_function(&input.id, now) else {
+            return Err(PublishConnectionFunctionErrorModeled::EntityNotFound(
+                crate::state::connection_function_not_found(&input.id, published_from),
+            )
+            .into());
+        };
+
+        Ok(PublishConnectionFunctionOutput {
+            // "The connection function summary" — the projection of the stage just written.
+            connection_function_summary: Some(summary),
+        })
     }
 }

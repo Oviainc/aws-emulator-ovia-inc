@@ -826,6 +826,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-directconnect"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "454af46294fde0b011c49845a69b73f72d8fb409cc6603608e2be5f8ff808a42"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ec2"
 version = "1.271.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8596,7 +8621,14 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "percent-encoding",
  "serde_json",
+ "service-com-amazonaws-apigateway-backplanecontrolservice",
+ "service-com-amazonaws-cloudfront-cloudfront2020-05-31",
+ "service-com-amazonaws-ec2-amazonec2",
+ "service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7",
+ "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
+ "service-com-amazonaws-networkfirewall-networkfirewall-20201112",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -9255,6 +9287,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-directconnect",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -9262,6 +9295,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-directconnect-overtureservice",
  "sha2 0.10.9",
  "tokio",
  "tracing",

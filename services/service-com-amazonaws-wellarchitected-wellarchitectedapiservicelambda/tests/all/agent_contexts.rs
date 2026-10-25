@@ -71,7 +71,11 @@ const MAX_RESULTS_MAX: i64 = 1_000;
 /// `POST /api/v1/agent-profiles/{profileArn}/contexts`: the ARN is a non-greedy
 /// `@httpLabel`, so it travels percent-encoded in one path segment, exactly as an SDK
 /// sends it.
-async fn create_context(client: &Client, profile_arn: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because a context is recorded by exactly ONE operation, so the suite
+/// about the read (`super::get_agent_context`) resolves contexts this helper created
+/// rather than building the same request again.
+pub(crate) async fn create_context(client: &Client, profile_arn: &str, body: Value) -> Answer {
     client
         .send(
             "POST",
@@ -85,7 +89,7 @@ async fn create_context(client: &Client, profile_arn: &str, body: Value) -> Answ
 }
 
 /// `GET /api/v1/agent-profiles/{profileArn}/contexts/{id}`.
-async fn get_context(client: &Client, profile_arn: &str, id: &str) -> Answer {
+pub(crate) async fn get_context(client: &Client, profile_arn: &str, id: &str) -> Answer {
     client
         .send(
             "GET",
@@ -126,7 +130,7 @@ fn absent_profile_arn(resource: &str) -> String {
 
 /// The `ContextSummary` a context answer carries, under the member the operation names
 /// it (`context` on the single-context operations).
-fn summary(answer: &Answer) -> &Value {
+pub(crate) fn summary(answer: &Answer) -> &Value {
     answer
         .body
         .get("context")
@@ -143,7 +147,7 @@ fn items(answer: &Answer) -> &[Value] {
         .unwrap_or_else(|| panic!("expected an items list in {answer:?}"))
 }
 
-fn id_of(value: &Value) -> String {
+pub(crate) fn id_of(value: &Value) -> String {
     value
         .get("id")
         .and_then(Value::as_str)
@@ -199,7 +203,7 @@ fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
 /// carries (none, one, several), which published `applicationType` / `criticality` the
 /// content names — including values the issue did not cite — and titles at the modelled
 /// `SensitiveString` `@length(1, 1000)` bounds.
-fn context_rows() -> Vec<(&'static str, Value)> {
+pub(crate) fn context_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "bare-content",
@@ -281,7 +285,12 @@ fn context_rows() -> Vec<(&'static str, Value)> {
 
 /// Assert one `ContextSummary` reports exactly what `request` asked for plus the members
 /// the SERVICE owns.
-fn assert_summary_matches(value: &Value, request: &Value, profile_arn: &str, case: &str) {
+pub(crate) fn assert_summary_matches(
+    value: &Value,
+    request: &Value,
+    profile_arn: &str,
+    case: &str,
+) {
     assert_uuid(&id_of(value), case);
     for member in ["title", "contextType", "content"] {
         assert_eq!(

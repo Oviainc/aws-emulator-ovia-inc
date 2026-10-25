@@ -39,6 +39,15 @@ pub const FALLBACK_REGION: &str = "us-east-1";
 /// `FlexibleTimeWindowMode` value that asks for a window.
 const FLEXIBLE_TIME_WINDOW_MODE_FLEXIBLE: &str = "FLEXIBLE";
 
+/// The modelled name of the `FlexibleTimeWindow` member a cross-member refusal
+/// is about (`com.amazonaws.scheduler#FlexibleTimeWindow$MaximumWindowInMinutes`).
+const MAXIMUM_WINDOW_MEMBER: &str = "MaximumWindowInMinutes";
+
+/// The modelled name of the enum that carries the mode such a refusal conflicts
+/// with (`com.amazonaws.scheduler#FlexibleTimeWindowMode`), which is what the
+/// service reports rather than the `Mode` member that targets it.
+const FLEXIBLE_TIME_WINDOW_MODE_SHAPE: &str = "FlexibleTimeWindowMode";
+
 /// The `ScheduleGroupState` a usable group reports.
 ///
 /// `ScheduleGroupState` is modelled `ACTIVE | DELETING`, and AWS returns a
@@ -402,6 +411,15 @@ pub fn group_does_not_exist(name: &str) -> String {
     format!("Schedule group {name} does not exist.")
 }
 
+/// The `ResourceNotFoundException` message for a schedule the addressed group
+/// does not hold.
+///
+/// It names the schedule the request named and nothing else: the group is how
+/// the schedule was addressed, not a second resource the refusal reports.
+pub fn schedule_does_not_exist(name: &str) -> String {
+    format!("Schedule {name} does not exist.")
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -598,21 +616,22 @@ fn role_is_absent(
 /// a `MaximumWindowInMinutes`" — the `FlexibleTimeWindow` reference). The bound
 /// on the value itself (1..1440) is modelled, so the boundary validator has
 /// already refused anything outside it by the time a handler runs.
+///
+/// The refusal names the offending member and the mode it conflicts with by the
+/// names the model gives them — the member `MaximumWindowInMinutes` of
+/// `FlexibleTimeWindow` and the enum `FlexibleTimeWindowMode` carrying the mode
+/// the request sent — and no emulator-invented field path.
 pub fn flexible_time_window_violation(window: &FlexibleTimeWindow) -> Option<String> {
     let flexible = window.mode == FLEXIBLE_TIME_WINDOW_MODE_FLEXIBLE;
-    match (flexible, window.maximum_window_in_minutes) {
-        (true, None) => Some(
-            "FlexibleTimeWindow.MaximumWindowInMinutes is required when \
-             FlexibleTimeWindow.Mode is FLEXIBLE"
-                .to_string(),
-        ),
-        (false, Some(_)) => Some(format!(
-            "FlexibleTimeWindow.MaximumWindowInMinutes must not be set when \
-             FlexibleTimeWindow.Mode is {}",
-            window.mode
-        )),
-        _ => None,
-    }
+    let obligation = match (flexible, window.maximum_window_in_minutes) {
+        (true, None) => "must be provided",
+        (false, Some(_)) => "must not be provided",
+        _ => return None,
+    };
+    Some(format!(
+        "{MAXIMUM_WINDOW_MEMBER} {obligation} when {FLEXIBLE_TIME_WINDOW_MODE_SHAPE} is set to {}.",
+        window.mode
+    ))
 }
 
 /// Encode a `ListSchedules` page token for the last `(group, name)` returned.

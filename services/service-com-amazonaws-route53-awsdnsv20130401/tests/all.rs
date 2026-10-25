@@ -27,6 +27,8 @@ mod hosted_zone_config;
 mod hosted_zone_count;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
+#[path = "all/hosted_zones_by_name.rs"]
+mod hosted_zones_by_name;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
 #[path = "all/record_name_canonical_form.rs"]

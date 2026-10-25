@@ -16,7 +16,7 @@
 //! else is written.
 //!
 //! The firewall-policy inventory is seeded through the store (as the
-//! `GetProtectionStatus` and `ListDiscoveredResources` suites seed theirs): a
+//! `GetProtectionStatus` suite seeds its attacks): a
 //! third-party firewall policy is created in the VENDOR's console or API and no
 //! Firewall Manager operation creates one, so the only honest source of one is
 //! something that put it in the store. The vendor associations are seeded the

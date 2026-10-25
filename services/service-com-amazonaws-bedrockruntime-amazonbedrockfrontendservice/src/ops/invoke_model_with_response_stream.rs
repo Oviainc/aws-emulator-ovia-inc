@@ -4,16 +4,23 @@
 //!
 //! `POST /model/{modelId}/invoke-with-response-stream -> 200`. Serves the same
 //! inference `InvokeModel` serves — the same model resolution, the same body and
-//! guardrail validation, the same tokenizer and the same model-family response
-//! envelope, all from [`crate::state`] — and returns it as a
-//! `vnd.amazon.eventstream` body of `ResponseStream` `chunk` events, with the MIME
-//! type of the payload those chunks carry reported in the modelled, required
-//! `X-Amzn-Bedrock-Content-Type` response header.
+//! guardrail validation, the same tokenizer and the same generated turn, all from
+//! [`crate::state`] — and returns it as a `vnd.amazon.eventstream` body of
+//! `ResponseStream` `chunk` events, with the MIME type of the payload those chunks
+//! carry reported in the modelled, required `X-Amzn-Bedrock-Content-Type` response
+//! header.
+//!
+//! Each `chunk` carries ONE event of the invoked model family's own streaming
+//! protocol — not the unary `InvokeModel` response body, which belongs to that
+//! operation and never to a `ResponseStream` chunk. The sequences are per family
+//! (see [`crate::state::invoke_model_stream_chunks`]), and the terminal chunk
+//! additionally carries the per-invocation accounting the service itself measures
+//! ([`crate::state::INVOCATION_METRICS_FIELD`]).
 //!
 //! No language model runs in this emulator, so the completion is produced in one
-//! step (see [`crate::state::emulated_completion_text`]) and the response payload
-//! is therefore carried by one `chunk` event. Nothing here invents a per-family
-//! incremental streaming envelope, and nothing is echoed back from the request.
+//! step (see [`crate::state::emulated_completion_text`]) and therefore arrives as
+//! one content delta; nothing here splits it into fabricated increments, and
+//! nothing is echoed back from the request.
 //!
 //! This operation is hand-authored rather than generated: its output is a
 //! `@streaming` union, which the op-stub generator declines
@@ -118,6 +125,7 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
         protocol: &dyn ServerHttpProtocol,
         req: &Request,
     ) -> Result<Response, InvokeModelWithResponseStreamErrorModeled> {
+        let started = std::time::Instant::now();
         let input: InvokeModelWithResponseStreamInput =
             deserialize_request(protocol, req, &InvokeModelWithResponseStreamInput::SCHEMA)
                 .map_err(validation)?;
@@ -183,11 +191,11 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
         .map_err(validation)?;
 
         // The same inference `InvokeModel` serves, so the two surfaces cannot
-        // drift; here the payload is the `bytes` of a `chunk` event rather than
-        // the response body.
+        // drift; here the turn is delivered as the model family's own streaming
+        // events rather than as the unary response body.
         let turn = crate::state::invoke_turn(&model, family, body);
-        let payload = serde_json::to_vec(&turn.response)
-            .map_err(|error| internal(format!("could not render the inference response: {error}")))?;
+        let first_byte_latency_ms =
+            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
         state
             .lock()
@@ -199,15 +207,36 @@ impl<Eng: Send + Sync + 'static> InvokeModelWithResponseStream<Eng> {
                 at_millis: crate::state::now_millis(),
             });
 
-        let frames = frame_padded_event(
-            protocol,
-            "chunk",
-            &PayloadPart {
-                bytes: Some(payload),
+        // One `chunk` event per streaming event of the model's own protocol, in
+        // the order the family emits them.
+        let chunks = crate::state::invoke_model_stream_chunks(
+            family,
+            &model.model_id,
+            &turn,
+            crate::state::InvocationMetrics {
+                input_tokens: turn.input_tokens,
+                output_tokens: turn.output_tokens,
+                invocation_latency_ms: i64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(i64::MAX),
+                first_byte_latency_ms,
             },
-            &PayloadPart::SCHEMA,
-        )
-        .map_err(|error| internal(format!("the chunk event could not be framed: {error}")))?;
+        );
+        let mut frames = Vec::new();
+        for chunk in &chunks {
+            let payload = serde_json::to_vec(chunk).map_err(|error| {
+                internal(format!("could not render the inference response: {error}"))
+            })?;
+            let frame = frame_padded_event(
+                protocol,
+                "chunk",
+                &PayloadPart {
+                    bytes: Some(payload),
+                },
+                &PayloadPart::SCHEMA,
+            )
+            .map_err(|error| internal(format!("the chunk event could not be framed: {error}")))?;
+            frames.extend_from_slice(&frame);
+        }
 
         event_stream_response(
             protocol,

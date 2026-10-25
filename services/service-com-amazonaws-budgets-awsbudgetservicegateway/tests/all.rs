@@ -55,6 +55,8 @@ mod notification_alert_delivery;
 mod notification_deletion;
 #[path = "all/notification_lifecycle.rs"]
 mod notification_lifecycle;
+#[path = "all/notification_update.rs"]
+mod notification_update;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/service_owned_budget_members.rs"]
