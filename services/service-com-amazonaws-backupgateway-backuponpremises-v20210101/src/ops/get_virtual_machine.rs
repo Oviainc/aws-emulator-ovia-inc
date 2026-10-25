@@ -4,10 +4,11 @@
 //! Returns the virtual machine an ARN names, built from the record persisted in
 //! [`crate::state`] — the same record `ListVirtualMachines` pages over, plus the VMware
 //! tags only a read of a single machine reports. `@readonly`: it writes nothing, and a
-//! machine reaches the store as part of a hypervisor's inventory
-//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::record_virtual_machine`]),
-//! never through a read, so an ARN the store holds no machine under is refused rather
-//! than minting one. This is the ONLY file to touch for this operation.
+//! machine reaches the store as part of a hypervisor's inventory, which the hypervisor's
+//! METADATA SYNC records
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
+//! never a read — so an ARN the store reports no machine under is refused rather than
+//! minting one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,8 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceArn`'s length and pattern are refused by the boundary validator before
         // `handle` runs, so reaching here means the ARN is well formed; whether it names a
-        // virtual machine is a fact of the STORE, which is what this lookup asks.
-        let Some(machine) = state.virtual_machine(&input.resource_arn) else {
+        // virtual machine this service reports is a fact of the STORE and the clock, which
+        // is what this lookup asks: a machine is part of its hypervisor's inventory from
+        // the instant the sync that discovered it fell due, the same instant the listing
+        // that hands a client its ARN starts reporting it.
+        let Some(machine) =
+            state.virtual_machine_as_of(&input.resource_arn, ::std::time::SystemTime::now())
+        else {
             // This operation resolves exactly one resource type, so an ARN it cannot
             // resolve is a missing VIRTUAL MACHINE whatever else the ARN spells — and
             // this service answers that with the modelled `ResourceNotFoundException` at

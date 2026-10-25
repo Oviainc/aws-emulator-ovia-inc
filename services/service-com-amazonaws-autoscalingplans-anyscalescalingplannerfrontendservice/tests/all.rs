@@ -21,6 +21,8 @@ mod error_message_wording;
 mod forecast_data;
 #[path = "all/forecast_datapoints.rs"]
 mod forecast_datapoints;
+#[path = "all/forecast_window_precision.rs"]
+mod forecast_window_precision;
 #[path = "all/scaling_instruction_validation.rs"]
 mod scaling_instruction_validation;
 #[path = "all/scaling_plan_lifecycle.rs"]

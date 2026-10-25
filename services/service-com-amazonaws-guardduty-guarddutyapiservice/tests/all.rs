@@ -105,6 +105,8 @@ mod member_detector_configuration;
 mod member_invitation;
 #[path = "all/member_monitoring.rs"]
 mod member_monitoring;
+#[path = "all/member_monitoring_restart.rs"]
+mod member_monitoring_restart;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
 #[path = "all/negative_class_rejections.rs"]

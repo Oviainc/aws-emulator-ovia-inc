@@ -39,6 +39,8 @@ mod flow_entitlements;
 mod flow_identity_and_description;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
+#[path = "all/flow_listing_default_page.rs"]
+mod flow_listing_default_page;
 #[path = "all/flow_media_streams.rs"]
 mod flow_media_streams;
 #[path = "all/flow_ndi_sizing.rs"]

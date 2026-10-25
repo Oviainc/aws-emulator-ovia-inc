@@ -218,6 +218,8 @@ mod describe_pipeline_reads;
 // declaration of its own, and each append there collided with this one.
 #[path = "all/describe_search_reads.rs"]
 mod describe_search_reads;
+#[path = "all/describe_storage_configuration_reads.rs"]
+mod describe_storage_configuration_reads;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 #[path = "all/execute_query_follows_the_store.rs"]

@@ -202,10 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tag restrictions the member's documentation points at, checked against
         // the tag set this call would LEAVE the queue with, BEFORE anything is stored:
         // a refused request changes nothing, and no sequence of calls grows one queue's
-        // tag map past the bound. This operation models no error for a malformed
-        // member, hence the 400 `ValidationException` channel rather than a 501.
+        // tag map past the bound. A tag the restrictions do not accept is a parameter
+        // VALUE this service does not take, which is what `InvalidParameterValue`
+        // reports; the empty map above is a different refusal — the member names nothing
+        // at all.
         if let Some(why) = state::tag_refusal(&queue.tags, &input.tags) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
         }
 
         // An UPSERT, never a replace: "A new tag with a key identical to that of an

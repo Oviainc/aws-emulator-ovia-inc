@@ -28,13 +28,19 @@ pub const AI_RECOMMENDATION_JOB_QUOTA: usize = 1_000;
 
 /// `AIRecommendationJobStatus`'s members this emulator moves a recommendation job
 /// through (`smithy_query(query="shape",shape="AIRecommendationJobStatus")` answers
-/// `InProgress`, `Completed`, `Failed`, `Stopping` and `Stopped`; the `Completed` and
-/// stop states are not reached by creating one). A separate pair from
+/// `InProgress`, `Completed`, `Failed`, `Stopping` and `Stopped`; `Completed` is not
+/// reached, because nothing here analyses a model). A separate set from
 /// [`super::AI_BENCHMARK_STATUS_IN_PROGRESS`], which names `AIBenchmarkJobStatus`'s
 /// members, so neither enum's members are compared against the other's.
 pub const AI_RECOMMENDATION_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`AI_RECOMMENDATION_STATUS_IN_PROGRESS`].
 pub const AI_RECOMMENDATION_STATUS_FAILED: &str = "Failed";
+/// See [`AI_RECOMMENDATION_STATUS_IN_PROGRESS`]: the transient status
+/// `StopAIRecommendationJob` moves a running job into.
+pub const AI_RECOMMENDATION_STATUS_STOPPING: &str = "Stopping";
+/// See [`AI_RECOMMENDATION_STATUS_IN_PROGRESS`]: the terminal status the clock owes a
+/// job the caller asked to stop.
+pub const AI_RECOMMENDATION_STATUS_STOPPED: &str = "Stopped";
 
 /// How long after `CreateAIRecommendationJob` the clock owes the job's move out of
 /// `InProgress` into its terminal status.
@@ -45,6 +51,15 @@ pub const AI_RECOMMENDATION_STATUS_FAILED: &str = "Failed";
 /// observes `InProgress`, and one that waits observes the terminal status, so a waiter
 /// terminates.
 pub const AI_RECOMMENDATION_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
+
+/// How long after `StopAIRecommendationJob` the clock owes the job's `Stopping` ->
+/// `Stopped` move.
+///
+/// Chosen on the same terms as [`AI_RECOMMENDATION_JOB_ENDS_AFTER`] (AWS documents no
+/// duration for the stop either) and inside the same band: never zero, so a caller that
+/// describes the job straight after asking it to stop still observes the transient
+/// `Stopping`, and one that waits observes `Stopped`, so a waiter terminates.
+pub const AI_RECOMMENDATION_JOB_STOPS_AFTER: Duration = Duration::from_millis(300);
 
 /// What `OptimizeModel` means when a `CreateAIRecommendationJob` request omits it:
 /// "Whether to allow model optimization techniques such as quantization, speculative
@@ -71,11 +86,27 @@ pub const NO_RECOMMENDATION_RUNTIME_REASON: &str =
     "This emulator serves no inference data plane and runs no model optimization or \
      benchmarking tool, so the recommendation job's run was never started";
 
-/// Why a reader or the delete could not resolve an AI recommendation job, named once here
-/// so `DescribeAIRecommendationJob` and `DeleteAIRecommendationJob` refuse an unknown
-/// name with the same sentence, naming the ARN they could not resolve.
-pub fn ai_recommendation_job_not_found(arn: &str) -> String {
-    format!("Could not find AI recommendation job \"{arn}\".")
+/// Why a reader, the stop or the delete could not resolve an AI recommendation job, named
+/// once here so `DescribeAIRecommendationJob`, `StopAIRecommendationJob` and
+/// `DeleteAIRecommendationJob` refuse an unknown name with the same sentence: the one the
+/// service words for a job it cannot resolve, quoting the name the request presented.
+pub fn ai_recommendation_job_not_found(name: &str) -> String {
+    format!("Job '{name}' not found.")
+}
+
+/// Why a stop of a job that is no longer running is refused, naming the job and the
+/// status it had already reached.
+///
+/// `StopAIRecommendationJob` stops "a running AI recommendation job"
+/// (`smithy_query(query="doc",shape="StopAIRecommendationJob")`), so a job that has
+/// already reached a status nothing leaves on its own has no run to stop. The operation
+/// models only `ResourceNotFound`, and the job IS found, so the refusal is a 400
+/// `ValidationException` carrying this sentence.
+pub fn ai_recommendation_job_not_running(name: &str, status: &str) -> String {
+    format!(
+        "The AI recommendation job \"{name}\" is {status} and is not running, so there is \
+         nothing to stop."
+    )
 }
 
 /// An AI recommendation job created by `CreateAIRecommendationJob`, as
@@ -117,7 +148,7 @@ pub struct AIRecommendationJob {
 }
 
 impl AIRecommendationJob {
-    /// Materialise the move out of `InProgress` the clock already owes.
+    /// Materialise the move out of a non-terminal status the clock already owes.
     ///
     /// The one write a reporting operation may make, exactly as
     /// [`super::AIBenchmarkJob::settle_status`] does it: the move was due at `ends_at`
@@ -125,21 +156,63 @@ impl AIRecommendationJob {
     /// the result, and `EndTime` takes the instant the move was due rather than "now", so
     /// it is stable across later reads.
     ///
-    /// The terminal status is [`AI_RECOMMENDATION_STATUS_FAILED`] with
+    /// A job left to run ends in [`AI_RECOMMENDATION_STATUS_FAILED`] with
     /// [`NO_RECOMMENDATION_RUNTIME_REASON`]: nothing analysed the model, so no
-    /// `Completed` status, no `StartTime` and no recommendation is invented for it.
+    /// `Completed` status, no `StartTime` and no recommendation is invented for it. A job
+    /// the caller asked to stop ends in [`AI_RECOMMENDATION_STATUS_STOPPED`] with no
+    /// failure reason instead: stopping is what the caller asked for, not a failure.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == AI_RECOMMENDATION_STATUS_IN_PROGRESS && now >= self.ends_at {
-            self.status = AI_RECOMMENDATION_STATUS_FAILED.to_string();
-            self.failure_reason = Some(NO_RECOMMENDATION_RUNTIME_REASON.to_string());
-            // The instant the service gave up on the run, which is when the job ended.
-            // No start time is recorded beside it: the run never started.
-            self.end_time = Some(self.ends_at);
-            return true;
+        if now < self.ends_at {
+            return false;
         }
-        false
+        match self.status.as_str() {
+            AI_RECOMMENDATION_STATUS_IN_PROGRESS => {
+                self.status = AI_RECOMMENDATION_STATUS_FAILED.to_string();
+                self.failure_reason = Some(NO_RECOMMENDATION_RUNTIME_REASON.to_string());
+            }
+            AI_RECOMMENDATION_STATUS_STOPPING => {
+                self.status = AI_RECOMMENDATION_STATUS_STOPPED.to_string();
+            }
+            // Already terminal: nothing is owed and nothing moves.
+            _ => return false,
+        }
+        // The instant the run ended, which is when the move was due rather than "now", so
+        // it is stable across later reads. No start time is recorded beside it: the run
+        // never started.
+        self.end_time = Some(self.ends_at);
+        true
+    }
+
+    /// Whether the job has reached a status nothing leaves on its own, i.e. one of
+    /// `AIRecommendationJobStatus`'s terminal members.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            AI_RECOMMENDATION_STATUS_FAILED
+                | AI_RECOMMENDATION_STATUS_STOPPED
+                | super::STATUS_COMPLETED
+        )
+    }
+
+    /// Whether a stop the caller already asked for is still in flight, i.e. the job sits
+    /// in the transient `Stopping` status.
+    pub fn is_stopping(&self) -> bool {
+        self.status == AI_RECOMMENDATION_STATUS_STOPPING
+    }
+
+    /// Record that the caller asked this job to stop: it moves to the transient
+    /// `Stopping` now, and the clock owes it `Stopped` at
+    /// [`AI_RECOMMENDATION_JOB_STOPS_AFTER`]. The span is never zero, so the transient
+    /// status is observable.
+    pub fn request_stop(&mut self, now: SystemTime) {
+        self.status = AI_RECOMMENDATION_STATUS_STOPPING.to_string();
+        // The run is being abandoned on request, not failing, so any reason a previous
+        // status carried is cleared rather than reported beside `Stopped`.
+        self.failure_reason = None;
+        self.end_time = None;
+        self.ends_at = now + AI_RECOMMENDATION_JOB_STOPS_AFTER;
     }
 }
 

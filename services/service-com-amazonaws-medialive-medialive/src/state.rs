@@ -22,8 +22,9 @@
 //! The MediaLive Anywhere network lives here too: one [`NetworkRecord`] per
 //! created network, its own id counter and its own token map. A network's
 //! `State` is the one lifecycle member it owes the clock (`CREATING` until the
-//! creation comes due, then `ACTIVE`; `DELETING` until an accepted delete comes
-//! due, then the terminal `DELETED`) and its `AssociatedClusterIds` are derived
+//! creation comes due, then `ACTIVE`; `UPDATING` until an accepted settings
+//! change comes due, then `ACTIVE` again; `DELETING` until an accepted delete
+//! comes due, then the terminal `DELETED`) and its `AssociatedClusterIds` are derived
 //! from the rest of the state on every read, never recorded at create time.
 //!
 //! The INPUT DEVICES this account has claimed live here as well: one
@@ -427,16 +428,19 @@ pub mod sdi_source_state {
 /// CREATE_FAILED | ACTIVE | DELETING | IDLE | IN_USE | UPDATING | DELETE_FAILED |
 /// DELETED).
 ///
-/// Only the states the create and the delete lifecycles reach are named here.
+/// Only the states the create, the update and the delete lifecycles reach are
+/// named here.
 /// `CreateNetwork` is asynchronous — `State` is documented "The current state of
 /// the Network. Only MediaLive Anywhere can change the state" — so a network
 /// starts `CREATING` and the clock owes it `ACTIVE`, the one state the enum names
-/// for a network that exists, has not failed and nothing has deleted. The delete
-/// is asynchronous for the same reason, so an accepted `DeleteNetwork` puts the
-/// network in `DELETING` and the clock owes it the terminal `DELETED` the record
-/// then keeps ([`begin_delete_network`]). The rest belong to operations no
-/// handler implements yet: `UPDATING` to `UpdateNetwork`, and the two `*_FAILED`
-/// states to failures this emulator does not inject. `IDLE` and `IN_USE` are the
+/// for a network that exists, has not failed and nothing has deleted. Changing a
+/// network's settings is asynchronous for the same reason, so an accepted
+/// `UpdateNetwork` puts the network in `UPDATING` and the clock owes it `ACTIVE`
+/// again ([`NetworkRecord::begin_update`]). The delete is asynchronous too, so an
+/// accepted `DeleteNetwork` puts the network in `DELETING` and the clock owes it
+/// the terminal `DELETED` the record then keeps ([`begin_delete_network`]). The
+/// two `*_FAILED` states belong to failures this emulator does not inject.
+/// `IDLE` and `IN_USE` are the
 /// two the model documents nothing about for a network (`State` carries the one
 /// sentence above and no member says what puts a network in either), so this
 /// emulator never claims one: a network's attachments are reported through its
@@ -446,6 +450,7 @@ pub mod sdi_source_state {
 pub mod network_state {
     pub const CREATING: &str = "CREATING";
     pub const ACTIVE: &str = "ACTIVE";
+    pub const UPDATING: &str = "UPDATING";
     pub const DELETING: &str = "DELETING";
     pub const DELETED: &str = "DELETED";
 }
@@ -1571,8 +1576,9 @@ pub struct NetworkRecord {
     pub tags: HashMap<String, String>,
     /// The `NetworkState` this network is in.
     state: String,
-    /// The instant the creation becomes due, so `CREATING` settles into
-    /// `ACTIVE`. Stored, never slept on.
+    /// The instant the creation — or a later accepted settings change — becomes
+    /// due, so `CREATING` and `UPDATING` settle into `ACTIVE`. Stored, never
+    /// slept on.
     active_due: SystemTime,
     /// The instant an accepted deletion becomes due, so `DELETING` settles into
     /// the terminal `DELETED`. `None` until a delete is accepted, and `None`
@@ -1606,7 +1612,21 @@ impl NetworkRecord {
         self.is_deleting() || self.is_deleted()
     }
 
-    /// Materialise the creation or the deletion the clock has already made due,
+    /// Accept a settings change for this network: it moves into `UPDATING` and
+    /// owes `ACTIVE` once [`TRANSIENT_STATE_SPAN`] has passed.
+    ///
+    /// `State` is documented "The current state of the Network. Only MediaLive
+    /// Anywhere can change the state" and the model's `NetworkState` declares
+    /// `UPDATING`, so applying a network's new settings is asynchronous just as
+    /// its creation is: the caller polls `DescribeNetwork` for `ACTIVE` again.
+    /// The due instant is stored, never slept on.
+    fn begin_update(&mut self, now: SystemTime) {
+        self.state = network_state::UPDATING.to_string();
+        self.active_due = now + TRANSIENT_STATE_SPAN;
+    }
+
+    /// Materialise the creation, the settings change or the deletion the clock
+    /// has already made due,
     /// answering whether THIS call is the one that settled the deletion. Each is
     /// owed at its stored instant whether or not anybody called, so applying it
     /// in a reporting operation changes nothing a later caller would have seen.
@@ -1617,11 +1637,46 @@ impl NetworkRecord {
             self.state = network_state::DELETED.to_string();
             return true;
         }
-        if self.state == network_state::CREATING && now >= self.active_due {
+        if (self.state == network_state::CREATING || self.state == network_state::UPDATING)
+            && now >= self.active_due
+        {
             self.state = network_state::ACTIVE.to_string();
         }
         false
     }
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::apply_network_changes`] changed
+/// nothing. Each variant is one refusal `UpdateNetwork` answers with, and each
+/// leaves the stored network exactly as it was.
+#[derive(Debug)]
+pub enum NetworkUpdateRefusal {
+    /// The `NetworkId` names no network this store has ever held.
+    NoSuchNetwork,
+    /// The store still holds the network — a delete keeps the record readable —
+    /// but that delete has been accepted, so the id names nothing a caller may
+    /// still change.
+    AlreadyDeleted,
+    /// Another live network of the account already carries the new `Name`.
+    NameTaken,
+}
+
+/// What an `UpdateNetwork` request asks to change.
+///
+/// Each member is `Some` only when the request carried it — "Include this
+/// parameter only if you want to change …" on all three — so an omitted member
+/// leaves that setting exactly as it was, and a member carrying an empty list
+/// clears it. The two CIDR lists arrive already validated into the shapes the
+/// store keeps ([`network_ip_pools`], [`network_routes`]), so a refused list
+/// never reaches the store at all. One struct rather than three positional
+/// `Option`s on
+/// [`ComAmazonawsMedialiveMedialiveState::apply_network_changes`], so a handler
+/// cannot pass the pools where the routes belong.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkChanges {
+    pub name: Option<String>,
+    pub ip_pools: Option<Vec<IpPool>>,
+    pub routes: Option<Vec<Route>>,
 }
 
 /// The message a request whose `IpPools` are not all valid IPv4 CIDR blocks is
@@ -1646,9 +1701,9 @@ pub fn too_many_network_entries_message(member: &str) -> String {
 /// The `IpPools` a request asks for, validated into the pools the store keeps,
 /// or the message a list that is not all valid IPv4 CIDR blocks is refused with.
 ///
-/// Takes the CIDRs rather than the request shape, so the one rule serves every
-/// operation that writes a network's pools (`CreateNetwork` today,
-/// `UpdateNetwork` when its own issue lands) even though the model gives each of
+/// Takes the CIDRs rather than the request shape, so the one rule serves both
+/// operations that write a network's pools (`CreateNetwork` and `UpdateNetwork`)
+/// even though the model gives each of
 /// them its own request shape (`IpPoolCreateRequest`, `IpPoolUpdateRequest`)
 /// carrying the same single member. The whole list is checked before the caller
 /// writes anything, so a refused request leaves the store untouched rather than
@@ -1745,8 +1800,8 @@ pub fn begin_delete_network(network: &mut NetworkRecord, now: SystemTime) {
 
 /// Project a [`DescribeNetworkSummary`] onto one of the structurally identical
 /// per-operation network output shapes (`CreateNetworkOutput`,
-/// `DescribeNetworkOutput`, `DeleteNetworkOutput`; `UpdateNetworkOutput` carries
-/// the same seven members, for when its own issue lands).
+/// `DescribeNetworkOutput`, `DeleteNetworkOutput`, `UpdateNetworkOutput`, which
+/// all carry the same seven members).
 ///
 /// One macro rather than a hand-written copy of the same seven-member move per
 /// operation, so the operations that report a network cannot drift from each
@@ -2364,6 +2419,68 @@ impl ComAmazonawsMedialiveMedialiveState {
             .map(|network| network.id.as_str())
     }
 
+    /// Apply an `UpdateNetwork` request's changes to the network `id` names, or
+    /// refuse.
+    ///
+    /// Every refusal is checked BEFORE the first write, so a refused update
+    /// leaves the stored network exactly as it was. A member the request omitted
+    /// is not changed ("Include this parameter only if you want to change …" on
+    /// `Name`, `IpPools` and `Routes`), and neither is a member no update request
+    /// carries at all: the id, the ARN, the tags and the derived
+    /// `AssociatedClusterIds` are not something this operation can move.
+    ///
+    /// The id is resolved through the LIVE record, like every other mutation of
+    /// this service: a delete keeps the record readable, but an id whose delete
+    /// has been accepted names nothing a caller may still change. The documented
+    /// account-wide name uniqueness is the create's own rule, resolved through
+    /// the same lookup ([`Self::network_named`]) so a rename cannot store a name
+    /// a create could not, while re-sending the network's own name is not a
+    /// clash with itself.
+    ///
+    /// An accepted change puts the network in `UPDATING` and leaves the clock
+    /// owing it `ACTIVE` ([`NetworkRecord::begin_update`]), because `State` is
+    /// "The current state of the Network. Only MediaLive Anywhere can change the
+    /// state": the settings are applied to the stored record at once and the
+    /// lifecycle member a caller polls follows the clock.
+    pub fn apply_network_changes(
+        &mut self,
+        id: &str,
+        changes: NetworkChanges,
+        now: SystemTime,
+    ) -> Result<(), NetworkUpdateRefusal> {
+        let Some(network) = self.networks.get(id) else {
+            return Err(NetworkUpdateRefusal::NoSuchNetwork);
+        };
+        if network.is_delete_accepted() {
+            return Err(NetworkUpdateRefusal::AlreadyDeleted);
+        }
+        // Decided while the borrow is still shared, so the write below needs one
+        // lookup rather than a second fallible one.
+        if changes
+            .name
+            .as_deref()
+            .and_then(|name| self.network_named(name))
+            .is_some_and(|holder| holder != id)
+        {
+            return Err(NetworkUpdateRefusal::NameTaken);
+        }
+
+        let Some(network) = self.networks.get_mut(id) else {
+            return Err(NetworkUpdateRefusal::NoSuchNetwork);
+        };
+        if let Some(name) = changes.name {
+            network.name = Some(name);
+        }
+        if let Some(ip_pools) = changes.ip_pools {
+            network.ip_pools = ip_pools;
+        }
+        if let Some(routes) = changes.routes {
+            network.routes = routes;
+        }
+        network.begin_update(now);
+        Ok(())
+    }
+
     /// The ids of the clusters currently attached to the network `network_id` —
     /// what `AssociatedClusterIds` reports, and what `DeleteNetwork` refuses a
     /// delete on when it is not empty. Derived from the cluster store on
@@ -2410,7 +2527,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// when no network has that id.
     ///
     /// The ONE projection every operation that reports a network
-    /// (`CreateNetwork`, `DescribeNetwork`, `DeleteNetwork`, `ListNetworks`)
+    /// (`CreateNetwork`, `DescribeNetwork`, `UpdateNetwork`, `DeleteNetwork`,
+    /// `ListNetworks`)
     /// answers from, so none
     /// of them can drift from the others: the summary shape a listing reports
     /// carries exactly the members the flat describe output does

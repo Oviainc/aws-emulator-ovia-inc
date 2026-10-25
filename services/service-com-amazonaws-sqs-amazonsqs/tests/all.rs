@@ -29,6 +29,8 @@ mod message_plane;
 mod queue_configuration;
 #[path = "all/queue_does_not_exist.rs"]
 mod queue_does_not_exist;
+#[path = "all/queue_lifecycle.rs"]
+mod queue_lifecycle;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
 #[path = "all/receive_message_attribute_names.rs"]

@@ -275,19 +275,19 @@ async fn a_listing_naming_no_queue_or_asking_outside_the_result_range_is_refused
             "MaxResults of zero, one below the lower bound",
             json!({"SourceArn": dead_letter_arn, "MaxResults": 0}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a negative MaxResults",
             json!({"SourceArn": dead_letter_arn, "MaxResults": -1}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "MaxResults of 11, one past the upper limit",
             json!({"SourceArn": dead_letter_arn, "MaxResults": 11}),
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "a SourceArn no queue of this account answers to",

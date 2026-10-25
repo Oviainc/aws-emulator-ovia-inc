@@ -186,9 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.fairshare_policy.as_ref(),
             input.quota_share_policy.as_ref(),
         )
-        .map_err(|detail| {
+        // Each refusal already carries the envelope AWS words it with, so the handler
+        // only lifts it into this operation's error channel.
+        .map_err(|refusal| {
             CreateSchedulingPolicyError::from(CreateSchedulingPolicyErrorModeled::ClientException(
-                batch::client_exception(detail),
+                refusal,
             ))
         })?;
 

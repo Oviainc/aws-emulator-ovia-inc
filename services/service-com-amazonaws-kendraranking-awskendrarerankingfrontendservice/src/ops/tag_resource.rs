@@ -185,15 +185,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled per-request `TagList` length bounds no accumulated set): a request
         // that would take this plan past the ceiling is refused WHOLE, before any tag
         // is written, with the modelled `ValidationException` — the only
-        // constraint-refusal error this operation declares. The sentence names the
-        // ceiling that was exceeded and nothing the request carried, like every other
-        // constraint refusal this service states (see `crate::state`).
+        // constraint-refusal error this operation declares. The sentence is built by
+        // `crate::state::constraint_report`, the crate's ONE renderer for a constraint
+        // the model cannot express itself, exactly as the other handler-stated list
+        // ceiling (`Rescore`'s batch size) is: the clause names the member the tags
+        // arrived in and the length it had to satisfy, and renders neither the tags nor
+        // any count derived from the request.
         if plan.tag_count_after(&input.tags) > crate::state::MAX_TAGS_PER_PLAN {
             return Err(TagResourceErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "A rescore execution plan can carry at most {} tags.",
-                        crate::state::MAX_TAGS_PER_PLAN
+                    message: Some(crate::state::constraint_report(
+                        TAGS_MEMBER,
+                        ::smithy_server_runtime::ViolationKind::MaxLength(
+                            crate::state::MAX_TAGS_PER_PLAN as i64,
+                        ),
                     )),
                 },
             )

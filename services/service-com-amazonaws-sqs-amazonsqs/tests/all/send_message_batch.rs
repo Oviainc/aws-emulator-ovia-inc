@@ -67,17 +67,8 @@ async fn receive(router: &MultiServiceRouter, url: &str, max: usize) -> Vec<Valu
 
 /// How many messages the queue at `url` holds, visible and in flight.
 async fn held(router: &MultiServiceRouter, url: &str) -> (i64, i64) {
-    let attributes = support::all_attributes(router, url).await;
-    let read = |name: &str| {
-        attributes
-            .get(name)
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or_else(|| panic!("no {name} in {attributes:?}"))
-    };
-    (
-        read("ApproximateNumberOfMessages"),
-        read("ApproximateNumberOfMessagesNotVisible"),
-    )
+    let (available, _delayed, in_flight) = support::message_counts(router, url).await;
+    (available, in_flight)
 }
 
 /// Every entry of an acceptable batch is enqueued and reported under its own id, with the

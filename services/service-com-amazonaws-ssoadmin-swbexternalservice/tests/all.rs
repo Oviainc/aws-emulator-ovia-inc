@@ -103,6 +103,8 @@ mod permissions_boundary;
 mod permissions_boundary_delete;
 #[path = "all/policy_attach_conflict.rs"]
 mod policy_attach_conflict;
+#[path = "all/region_list.rs"]
+mod region_list;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/ssoadmin_permission_sets.rs"]

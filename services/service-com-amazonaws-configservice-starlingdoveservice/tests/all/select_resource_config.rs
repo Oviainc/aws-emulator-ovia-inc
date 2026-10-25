@@ -155,6 +155,29 @@ fn select(expression: &str) -> Value {
     json!({ "Expression": expression })
 }
 
+/// `Limit`'s published maximum — "The maximum number of query results returned on each
+/// page", `Limit` range 0..100 from
+/// `smithy_query(query="operation", operation="SelectResourceConfig")`.
+const MAX_LIMIT: i32 = 100;
+
+/// Every aggregate function the Config query language has, from the Query Components
+/// section of the Config Developer Guide, which lists AVG, COUNT, MAX, MIN and SUM.
+///
+/// Each entry is the field as a query selects it, paired with what the function computes
+/// over [`inventory`]: the sizes the recorded configuration documents carry are 100
+/// (`vol-0001`), 500 (`vol-0002`) and 20 (`orders`), while the two resources whose
+/// configuration carries no size contribute nothing to a function over that property —
+/// and `COUNT(*)` counts the matched ITEMS rather than the values of one property, so it
+/// counts all five resources whose deletion is not recorded.
+const AGGREGATES: [(&str, &str, f64); 6] = [
+    ("the average of the sizes", "AVG(configuration.size)", 620.0 / 3.0),
+    ("the values of a property", "COUNT(configuration.size)", 3.0),
+    ("the matched items", "COUNT(*)", 5.0),
+    ("the largest size", "MAX(configuration.size)", 500.0),
+    ("the smallest size", "MIN(configuration.size)", 20.0),
+    ("the total of the sizes", "SUM(configuration.size)", 620.0),
+];
+
 /// The results of a select response, each parsed back out of the JSON document it is.
 fn results(case: &str, body: &Value) -> Vec<Value> {
     body["Results"]
@@ -513,7 +536,7 @@ async fn a_query_pages_its_results_at_the_limit_the_request_asks_for() {
     // enforces the modelled range before the handler runs, and the handler answers its
     // own `InvalidLimitException` for a limit that reaches it, so either code is the
     // refusal this bound produces.
-    for (case, limit) in [("one past the maximum", 101), ("a negative limit", -1)] {
+    for (case, limit) in [("one past the maximum", MAX_LIMIT + 1), ("a negative limit", -1)] {
         let mut request = select(expression);
         request["Limit"] = json!(limit);
         let (status, code) = emulator.refused("SelectResourceConfig", &request).await;
@@ -523,4 +546,173 @@ async fn a_query_pages_its_results_at_the_limit_the_request_asks_for() {
              {status} {code}"
         );
     }
+
+    // The published maximum itself is INSIDE the range, so a request asking for it is
+    // served, with a page holding every matched resource.
+    let mut request = select(expression);
+    request["Limit"] = json!(MAX_LIMIT);
+    let body = emulator.ok("SelectResourceConfig", &request).await;
+    assert_eq!(
+        results("the published maximum", &body).len(),
+        5,
+        "case {:?}: a limit of {MAX_LIMIT} is the published maximum and carries every matched \
+         resource in one page, got {body}",
+        "the published maximum"
+    );
+    assert!(
+        body["NextToken"].is_null(),
+        "case {:?}: a page carrying every matched resource answers no next token, got {body}",
+        "the published maximum"
+    );
+}
+
+#[tokio::test]
+async fn an_aggregate_is_computed_over_the_configuration_items_the_query_matched() {
+    // Rows differ along WHICH function of the language is selected ([`AGGREGATES`],
+    // every entry of the documented catalog — the issue's units cite COUNT alone), over a
+    // numeric property of the recorded configuration document. A query that aggregates
+    // without grouping has one group holding every matched item, so each row is one
+    // result.
+    let emulator = emulator_holding_inventory().await;
+    for (case, field, expected) in AGGREGATES {
+        let body = emulator
+            .ok("SelectResourceConfig", &select(&format!("SELECT {field}")))
+            .await;
+        let rows = results(case, &body);
+        assert_eq!(
+            rows.len(),
+            1,
+            "case {case:?}: an ungrouped aggregate answers exactly one result, got {body}"
+        );
+        let actual = rows[0][field].as_f64();
+        assert!(
+            actual.is_some_and(|value| (value - expected).abs() < 1e-9),
+            "case {case:?}: expected {field} over the recorded inventory to be {expected}, got \
+             {:?}",
+            rows[0]
+        );
+
+        // The field is reported under the function applied to the property, in
+        // `QueryInfo` as well as in the result document.
+        let fields: Vec<String> = body["QueryInfo"]["SelectFields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected QueryInfo.SelectFields, got {body}"))
+            .iter()
+            .map(|selected| selected["Name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![field.to_string()],
+            "case {case:?}: expected the selected field {field:?}, got {body}"
+        );
+    }
+
+    // Grouped, the function computes over the items of ITS OWN group only, and a group
+    // whose items carry no value for the property carries no aggregate at all — which is
+    // a different answer from a group whose aggregate is zero.
+    let body = emulator
+        .ok(
+            "SelectResourceConfig",
+            &select("SELECT resourceType, MAX(configuration.size) GROUP BY resourceType"),
+        )
+        .await;
+    assert_eq!(
+        Value::Array(results("an aggregate per group", &body)),
+        json!([
+            { "resourceType": DYNAMODB_TABLE, "MAX(configuration.size)": 20 },
+            { "resourceType": EC2_VOLUME, "MAX(configuration.size)": 500 },
+            { "resourceType": LAMBDA_FUNCTION },
+            { "resourceType": S3_BUCKET },
+        ]),
+        "case {:?}: expected the largest size of each resource type's own items, got {body}",
+        "an aggregate per group"
+    );
+
+    // An aggregate over resources nothing matched is still one row: COUNT of no items is
+    // zero, not an absent result.
+    let body = emulator
+        .ok(
+            "SelectResourceConfig",
+            &select(&format!(
+                "SELECT COUNT(*) WHERE resourceType = '{RDS_INSTANCE}'"
+            )),
+        )
+        .await;
+    assert_eq!(
+        Value::Array(results("a group of no items", &body)),
+        json!([{ "COUNT(*)": 0 }]),
+        "case {:?}: expected the count of nothing to be zero, got {body}",
+        "a group of no items"
+    );
+}
+
+#[tokio::test]
+async fn a_limit_the_expression_carries_bounds_the_rows_the_query_answers() {
+    // Rows differ along the bound the expression itself names, against a query matching
+    // the five resources whose deletion is not recorded: no bound, fewer rows than
+    // matched, exactly as many, more than matched, and no rows at all.
+    let cases: [(&str, Option<usize>, usize); 5] = [
+        ("no bound in the expression", None, 5),
+        ("fewer rows than matched", Some(2), 2),
+        ("exactly the rows matched", Some(5), 5),
+        ("more rows than matched", Some(50), 5),
+        ("no rows at all", Some(0), 0),
+    ];
+
+    let emulator = emulator_holding_inventory().await;
+    for (case, limit, expected) in cases {
+        let expression = match limit {
+            None => "SELECT resourceId".to_string(),
+            Some(rows) => format!("SELECT resourceId LIMIT {rows}"),
+        };
+        // The request asks for the largest page the model allows, so the only bound left
+        // on the answer is the one the expression carries.
+        let mut request = select(&expression);
+        request["Limit"] = json!(MAX_LIMIT);
+        let body = emulator.ok("SelectResourceConfig", &request).await;
+        let rows = results(case, &body);
+        assert_eq!(
+            rows.len(),
+            expected,
+            "case {case:?}: expected {expression:?} to answer {expected} result(s), got {body}"
+        );
+        assert!(
+            body["NextToken"].is_null(),
+            "case {case:?}: every row the expression allows fits in this page, so no next token \
+             is answered, got {body}"
+        );
+    }
+
+    // The expression's bound holds ACROSS pages too: a request asking for one result per
+    // page walks exactly the rows the expression allowed, never the whole match. The
+    // walk is CAPPED rather than driven by the tokens alone: a page carries at least one
+    // row whenever one remains, so a walk that takes more steps than the largest page
+    // the model allows is a token that stopped advancing, which must fail the test
+    // rather than spin it.
+    let mut seen: Vec<Value> = Vec::new();
+    let mut next_token: Option<String> = None;
+    for _ in 0..=MAX_LIMIT {
+        let mut request = select("SELECT resourceId LIMIT 3");
+        request["Limit"] = json!(1);
+        if let Some(token) = &next_token {
+            request["NextToken"] = json!(token);
+        }
+        let body = emulator.ok("SelectResourceConfig", &request).await;
+        seen.extend(results("paged under the expression's bound", &body));
+        next_token = body["NextToken"].as_str().map(str::to_string);
+        if next_token.is_none() {
+            break;
+        }
+    }
+    assert!(
+        next_token.is_none(),
+        "case {:?}: the walk must end at a page answering no next token, got {next_token:?}",
+        "paged under the expression's bound"
+    );
+    assert_eq!(
+        seen.len(),
+        3,
+        "case {:?}: paging answers the three rows the expression allowed, got {seen:?}",
+        "paged under the expression's bound"
+    );
 }
