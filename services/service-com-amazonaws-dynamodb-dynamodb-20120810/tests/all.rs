@@ -64,6 +64,9 @@ mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/stream_enabled_table_round_trip.rs"]
+mod stream_enabled_table_round_trip;
+
 #[path = "all/stream_specification_with_other_members.rs"]
 mod stream_specification_with_other_members;
 

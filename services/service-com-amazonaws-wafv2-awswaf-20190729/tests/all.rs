@@ -25,6 +25,8 @@ mod exception_messages;
 mod firewall_manager_rule_groups;
 #[path = "all/get_web_acl_for_resource.rs"]
 mod get_web_acl_for_resource;
+#[path = "all/ip_set_listing.rs"]
+mod ip_set_listing;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
 #[path = "all/list_resources_for_web_acl.rs"]

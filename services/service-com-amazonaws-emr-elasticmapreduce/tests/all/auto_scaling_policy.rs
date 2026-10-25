@@ -17,6 +17,11 @@
 //! service holds no record for, a group that cluster does not carry, a group whose role
 //! nothing scales, and a policy whose capacity boundaries cannot hold together are
 //! refused with HTTP 400 `ValidationException` and persist nothing.
+//!
+//! AND: `RemoveAutoScalingPolicy` takes the policy off the group the request names and
+//! nothing else, answering no members; a cluster the service holds no record for, a group
+//! that cluster does not carry, and a group that carries no policy to remove are refused
+//! with HTTP 400 `ValidationException` and change nothing.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -445,6 +450,326 @@ async fn an_attaching_policy_attaches_when_the_clock_makes_it_due() {
             "case \"re-put\": the listing must report the re-attach, got {}",
             reattaching[group_id]
         );
+    }
+}
+
+/// THE RULE: `RemoveAutoScalingPolicy` takes the policy off the instance group the request
+/// names and nothing else — the group reports none from there on, every other group keeps
+/// what it carried, and the response carries no members — whatever policy the group held
+/// and whether the attach was still due or had come through. The table spans the group
+/// role a policy may be attached to, the rule count and capacity boundaries of the policy
+/// removed, and both sides of the clock-owed attach span.
+#[tokio::test]
+async fn remove_auto_scaling_policy_takes_the_policy_off_the_group_it_names() {
+    struct Case {
+        label: &'static str,
+        role: &'static str,
+        min: i64,
+        max: i64,
+        rules: Vec<Value>,
+        /// Whether to let the clock make the attach due before removing the policy.
+        past_attach: bool,
+    }
+
+    let emr = Emr::new();
+    let cases = vec![
+        Case {
+            label: "one rule on the core group, removed while attaching",
+            role: "CORE",
+            min: 1,
+            max: 10,
+            rules: vec![rule(
+                "scale-out",
+                ADJUSTMENT_TYPES[0],
+                1,
+                COMPARISON_OPERATORS[2],
+            )],
+            past_attach: false,
+        },
+        Case {
+            label: "two rules on the core group, removed once attached",
+            role: "CORE",
+            min: 2,
+            max: 20,
+            rules: vec![
+                rule("grow", ADJUSTMENT_TYPES[1], 25, COMPARISON_OPERATORS[3]),
+                rule("pin", ADJUSTMENT_TYPES[2], 6, COMPARISON_OPERATORS[1]),
+            ],
+            past_attach: true,
+        },
+        Case {
+            label: "equal boundaries on the task group, removed while attaching",
+            role: "TASK",
+            min: 5,
+            max: 5,
+            rules: vec![rule(
+                "hold",
+                ADJUSTMENT_TYPES[2],
+                5,
+                COMPARISON_OPERATORS[0],
+            )],
+            past_attach: false,
+        },
+        Case {
+            label: "a zero lower boundary and every optional member on the task group",
+            role: "TASK",
+            min: 0,
+            max: 100,
+            rules: vec![
+                detailed_rule("spot-burst", MARKET_TYPES[1]),
+                detailed_rule("on-demand-burst", MARKET_TYPES[0]),
+            ],
+            past_attach: true,
+        },
+        Case {
+            label: "every rule the chosen bound allows, removed once attached",
+            role: "CORE",
+            min: 1,
+            max: 40,
+            rules: (0..MAX_SCALING_RULES)
+                .map(|index| {
+                    rule(
+                        &format!("rule-{index}"),
+                        ADJUSTMENT_TYPES[index % ADJUSTMENT_TYPES.len()],
+                        1 + index as i64,
+                        COMPARISON_OPERATORS[index % COMPARISON_OPERATORS.len()],
+                    )
+                })
+                .collect(),
+            past_attach: false,
+        },
+    ];
+
+    for case in &cases {
+        let label = case.label;
+        // A cluster of its own per row, so what one removal left behind cannot be read as
+        // the next row's outcome.
+        let cluster_id = emr.run_job_flow(launch(label)).await;
+        let ids = group_ids(&emr, label, &cluster_id).await;
+        let target = ids
+            .get(case.role)
+            .unwrap_or_else(|| panic!("case {label:?}: the launch must carry a {} group", case.role))
+            .clone();
+        // A SECOND group carries a policy too, so the removal is shown to take off only
+        // the one the request names.
+        let bystander_role = if case.role == "CORE" { "TASK" } else { "CORE" };
+        let bystander = ids
+            .get(bystander_role)
+            .unwrap_or_else(|| panic!("case {label:?}: the launch must carry a {bystander_role} group"))
+            .clone();
+        let bystander_policy = policy(
+            3,
+            30,
+            vec![rule(
+                "left-alone",
+                ADJUSTMENT_TYPES[0],
+                2,
+                COMPARISON_OPERATORS[1],
+            )],
+        );
+
+        emr.ok(
+            "PutAutoScalingPolicy",
+            json!({
+                "ClusterId": cluster_id,
+                "InstanceGroupId": bystander,
+                "AutoScalingPolicy": bystander_policy,
+            }),
+        )
+        .await;
+        emr.ok(
+            "PutAutoScalingPolicy",
+            json!({
+                "ClusterId": cluster_id,
+                "InstanceGroupId": target,
+                "AutoScalingPolicy": policy(case.min, case.max, case.rules.clone()),
+            }),
+        )
+        .await;
+
+        if case.past_attach {
+            tokio::time::sleep(PAST_TRANSITION).await;
+        }
+
+        let out = emr
+            .ok(
+                "RemoveAutoScalingPolicy",
+                json!({ "ClusterId": cluster_id, "InstanceGroupId": target }),
+            )
+            .await;
+        let members = out.as_object().map(serde_json::Map::len).unwrap_or(0);
+        assert_eq!(
+            members, 0,
+            "case {label:?}: the removal answers no members, got {out}"
+        );
+
+        let listed = groups_by_id(&emr, label, &cluster_id).await;
+        assert_eq!(
+            listed.len(),
+            ids.len(),
+            "case {label:?}: the cluster must still report every group, got {listed:?}"
+        );
+        let removed_from = listed
+            .get(&target)
+            .unwrap_or_else(|| panic!("case {label:?}: group {target:?} must still be reported"));
+        assert_eq!(
+            reported_policy(removed_from),
+            None,
+            "case {label:?}: the named group must report no policy, got {removed_from}"
+        );
+        let untouched = listed
+            .get(&bystander)
+            .unwrap_or_else(|| panic!("case {label:?}: group {bystander:?} must still be reported"));
+        assert_eq!(
+            reported_policy(untouched),
+            Some((3, 30, vec!["left-alone".to_string()])),
+            "case {label:?}: the other group must keep the policy it carries, got {untouched}"
+        );
+
+        // Reading the listing again reports the same groups: a read moves nothing, and the
+        // removal is not undone by looking.
+        let again = groups_by_id(&emr, label, &cluster_id).await;
+        assert_eq!(
+            again, listed,
+            "case {label:?}: a second read must report the same groups"
+        );
+
+        // A put after a removal attaches a policy again from the start, which is what
+        // makes the removal a state change rather than a hidden flag.
+        let re_put = emr
+            .ok(
+                "PutAutoScalingPolicy",
+                json!({
+                    "ClusterId": cluster_id,
+                    "InstanceGroupId": target,
+                    "AutoScalingPolicy": policy(case.min, case.max, case.rules.clone()),
+                }),
+            )
+            .await;
+        assert_eq!(
+            reported_state(&re_put),
+            "ATTACHING",
+            "case {label:?}: a policy put after a removal is ATTACHING again, got {re_put}"
+        );
+        let restored = groups_by_id(&emr, label, &cluster_id).await;
+        assert!(
+            reported_policy(&restored[&target]).is_some(),
+            "case {label:?}: the group must carry the re-attached policy, got {}",
+            restored[&target]
+        );
+    }
+}
+
+/// THE RULE: a removal the service cannot carry out is refused with HTTP 400
+/// `ValidationException` — never a 501 and never an empty success — and changes nothing:
+/// an unknown cluster, a group that cluster does not carry, a group that carries no policy
+/// (one never given a policy, the group that runs the primary node, and a group whose
+/// policy a previous call already took off, so the removal is not idempotent).
+#[tokio::test]
+async fn remove_auto_scaling_policy_refuses_what_it_cannot_remove() {
+    let emr = Emr::new();
+    let cluster_id = emr.run_job_flow(launch("remove-refusals")).await;
+    let ids = group_ids(&emr, "remove-refusals", &cluster_id).await;
+    let core_id = ids.get("CORE").expect("the launch carries a core group");
+    let task_id = ids.get("TASK").expect("the launch carries a task group");
+    let master_id = ids.get("MASTER").expect("the launch carries a master group");
+
+    // The task group is the one group that carries a policy throughout, so every refused
+    // removal can be shown to have left it alone.
+    emr.ok(
+        "PutAutoScalingPolicy",
+        json!({
+            "ClusterId": cluster_id,
+            "InstanceGroupId": task_id,
+            "AutoScalingPolicy": policy(1, 10, vec![rule(
+                "scale-out",
+                ADJUSTMENT_TYPES[0],
+                1,
+                COMPARISON_OPERATORS[2],
+            )]),
+        }),
+    )
+    .await;
+
+    // A group whose policy was just removed carries none, so removing it again is refused
+    // exactly like a group that never had one.
+    emr.ok(
+        "PutAutoScalingPolicy",
+        json!({
+            "ClusterId": cluster_id,
+            "InstanceGroupId": core_id,
+            "AutoScalingPolicy": policy(2, 8, vec![rule(
+                "scale-in",
+                ADJUSTMENT_TYPES[0],
+                -1,
+                COMPARISON_OPERATORS[1],
+            )]),
+        }),
+    )
+    .await;
+    emr.ok(
+        "RemoveAutoScalingPolicy",
+        json!({ "ClusterId": cluster_id, "InstanceGroupId": core_id }),
+    )
+    .await;
+
+    // `(case, request, the group id the message must name)` — `None` where the refusal is
+    // about the cluster or the group id itself rather than a missing policy.
+    let mut cases: Vec<(String, Value, Option<String>)> = Vec::new();
+    for unknown in UNKNOWN_CLUSTER_IDS {
+        cases.push((
+            format!("unknown cluster {unknown:?}"),
+            json!({ "ClusterId": unknown, "InstanceGroupId": core_id }),
+            None,
+        ));
+    }
+    for unknown in UNKNOWN_GROUP_IDS {
+        cases.push((
+            format!("unknown instance group {unknown:?}"),
+            json!({ "ClusterId": cluster_id, "InstanceGroupId": unknown }),
+            None,
+        ));
+    }
+    cases.push((
+        "the master group, which nothing scales".to_string(),
+        json!({ "ClusterId": cluster_id, "InstanceGroupId": master_id }),
+        Some(master_id.clone()),
+    ));
+    cases.push((
+        "a group whose policy was already removed".to_string(),
+        json!({ "ClusterId": cluster_id, "InstanceGroupId": core_id }),
+        Some(core_id.clone()),
+    ));
+
+    for (label, request, names_group) in &cases {
+        let (status, payload) = emr.call("RemoveAutoScalingPolicy", request.clone()).await;
+        assert_refused(label, status, &payload, "ValidationException");
+        let message = crate::input_refusals::error_message(&payload);
+        assert!(
+            !message.is_empty(),
+            "case {label:?}: the refusal must say what was wrong, got {payload}"
+        );
+        if let Some(group_id) = names_group {
+            assert_eq!(
+                message,
+                format!("Auto Scaling policy was not found for instance group '{group_id}'."),
+                "case {label:?}: the refusal must name the group that carries no policy, \
+                 got {message:?}"
+            );
+        }
+
+        // A refused removal changes nothing: the group that carries a policy still does,
+        // and the groups that carry none still report none.
+        let listed = groups_by_id(&emr, label, &cluster_id).await;
+        for (id, group) in &listed {
+            let expected_policy = id == task_id;
+            assert_eq!(
+                reported_policy(group).is_some(),
+                expected_policy,
+                "case {label:?}: a refused removal must change nothing, and group {id:?} \
+                 reports {group}"
+            );
+        }
     }
 }
 

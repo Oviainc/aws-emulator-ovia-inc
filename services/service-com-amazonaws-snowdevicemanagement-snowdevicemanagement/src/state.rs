@@ -29,6 +29,10 @@
 //! ones are forgotten
 //! ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_task_history`]) —
 //! a quota is about what is held now, and nothing here deletes a record on request.
+//! Each of the two is also counted over EVERY Region at once
+//! ([`STORE_IN_FLIGHT_TASK_QUOTA`], [`STORE_TASK_HISTORY_LIMIT`]), because the Region
+//! a record is partitioned by is the one the request was signed for: a bound on one
+//! partition is not a bound on what the process holds.
 //!
 //! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
 //! Management reports "all devices on your Amazon Web Services account that have
@@ -78,11 +82,46 @@ pub const IN_FLIGHT_TASK_QUOTA: usize = 1_000;
 /// HISTORY behind it, which nothing else would: a task record is only ever added by
 /// a request, and this API models no operation that deletes one. Past this many
 /// records in a Region, the oldest TERMINAL ones make room for the new task
-/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_task_history`]),
-/// so the store cannot grow for as long as the emulator runs. It is the emulator's
-/// own retention bound, set far above the history any workflow it serves reads back,
-/// and it refuses nothing.
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_task_history`]).
+/// It is the emulator's own retention bound, set far above the history any workflow
+/// it serves reads back, and it refuses nothing.
 pub const TASK_HISTORY_LIMIT: usize = 10_000;
+
+/// How many tasks the WHOLE store may have in flight, and how many task records it
+/// keeps, over every Region at once.
+///
+/// The two bounds above are per Region, the way a quota and a Region's history are,
+/// and the Region a record is partitioned by is the one the request was signed for —
+/// a value the caller chooses. A per-Region bound therefore bounds a partition and
+/// not the store: a caller naming a Region it has never used gets another empty one.
+/// These are the same two bounds counted over everything held at once, so the number
+/// of partitions cannot multiply what the process keeps: `CreateTask` refuses past
+/// the first ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::tasks_in_flight`]),
+/// and the oldest terminal records are forgotten past the second
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_store_task_history`]).
+pub const STORE_IN_FLIGHT_TASK_QUOTA: usize = IN_FLIGHT_TASK_QUOTA * REGION_ALLOWANCE;
+
+/// The store-wide counterpart of [`TASK_HISTORY_LIMIT`], for the reason
+/// [`STORE_IN_FLIGHT_TASK_QUOTA`] states.
+pub const STORE_TASK_HISTORY_LIMIT: usize = TASK_HISTORY_LIMIT * REGION_ALLOWANCE;
+
+/// How many `clientToken` entries the store indexes, over every Region at once.
+///
+/// A token is an index into the task it created, so the index cannot usefully hold
+/// more entries than the store holds records
+/// ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::trim_idempotency`]
+/// forgets the rest, oldest first). Both halves of an entry's key come from the
+/// request, so this bound is store-wide like the two above.
+pub const IDEMPOTENCY_LIMIT: usize = STORE_TASK_HISTORY_LIMIT;
+
+/// How many Regions' worth of records the store holds at once: the factor between
+/// each per-Region bound and its store-wide counterpart.
+///
+/// More than one, so a Region sitting at its own bound still leaves room for the
+/// records of the other Regions a workflow spans — what one Region holds is not what
+/// another holds — and a small multiple rather than an open one, so what the process
+/// keeps does not grow with the number of Regions a caller names.
+const REGION_ALLOWANCE: usize = 4;
 
 /// The EARLIEST an execution leaves the queue: how long it stays `QUEUED` before
 /// the clock owes it `IN_PROGRESS` on a device that is not performing another one.
@@ -98,8 +137,12 @@ pub const TASK_HISTORY_LIMIT: usize = 10_000;
 pub const EXECUTION_START_SPAN: Duration = Duration::from_millis(400);
 
 /// How long an execution stays `IN_PROGRESS` before the clock owes it
-/// `SUCCEEDED` and applies the command to the target device. Chosen for the same
-/// reason as [`EXECUTION_START_SPAN`].
+/// `SUCCEEDED`. Chosen for the same reason as [`EXECUTION_START_SPAN`].
+///
+/// This is also how long the target device is performing the command for, so a
+/// caller polling the device record observes the state the command is in while it
+/// runs (an unlock in flight reports `UNLOCKING`) before the state it leaves
+/// behind.
 pub const EXECUTION_FINISH_SPAN: Duration = Duration::from_millis(400);
 
 /// How long an Amazon EC2 instance stays in a state that names work ALREADY
@@ -189,6 +232,56 @@ pub enum TaskCommand {
     Unlock,
     /// `Command$reboot` — "Reboots the device."
     Reboot,
+}
+
+/// How far a device has got with the command one execution gave it.
+///
+/// A device performs a command over the span its execution is `IN_PROGRESS` for,
+/// so there are two instants at which its own record changes: the one it takes
+/// the command at and the one it finishes. Which of the two a settling execution
+/// reports is what lets the device carry the state the command is IN while it
+/// runs, instead of moving from the state before it straight to the state after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceCommandPhase {
+    /// The device has been given the command and is performing it: the
+    /// execution just became `IN_PROGRESS`.
+    Begun,
+    /// The device has performed the command: the execution just became
+    /// `SUCCEEDED`.
+    Finished,
+}
+
+impl DeviceCommandPhase {
+    /// Which phase a device applies first when one command ENDS at the same instant
+    /// the next one BEGINS on the same device, which is exactly what happens when a
+    /// queued execution is waiting for the one running: the end comes first, so the
+    /// device is left reporting the command it is now performing rather than the one
+    /// it just finished. Stated here rather than left to the order the records
+    /// happen to be held in.
+    fn settles_first(self) -> u8 {
+        match self {
+            Self::Finished => 0,
+            Self::Begun => 1,
+        }
+    }
+}
+
+/// One instant at which a device's own record changes because of the command an
+/// execution gave it: what the device was told, how far it has got, and when.
+///
+/// The effects of a settling pass are applied in `at` order, so the commands one
+/// device performs reach its record in CLOCK order rather than in the order the
+/// execution map happens to hold their records in.
+#[derive(Debug, Clone)]
+struct DeviceEffect {
+    /// The instant the clock owed this change at.
+    at: SystemTime,
+    /// The device the command was given to.
+    managed_device_id: String,
+    /// What the device was told to do.
+    command: TaskCommand,
+    /// How far the device has got with it.
+    phase: DeviceCommandPhase,
 }
 
 /// One Amazon Web Services Snow Family device this account manages.
@@ -635,6 +728,15 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             .count()
     }
 
+    /// How many tasks are still in flight in the WHOLE store: the consumption
+    /// [`STORE_IN_FLIGHT_TASK_QUOTA`] bounds.
+    ///
+    /// Counted over every partition, because the partition a record lands in is
+    /// chosen by the request and the process holds all of them.
+    pub fn tasks_in_flight(&self) -> usize {
+        self.tasks.values().filter(|task| task.is_in_flight()).count()
+    }
+
     /// Drop the oldest terminal tasks of `region` until it keeps no more than
     /// `keep` records, answering how many were dropped.
     ///
@@ -646,10 +748,67 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// that named it — a token whose task is gone names nothing, and a create
     /// carrying it mints a new task.
     pub fn trim_task_history(&mut self, region: &str, keep: usize) -> usize {
+        self.trim_tasks(Some(region), keep)
+    }
+
+    /// Drop the oldest terminal tasks of EVERY Region until the store keeps no more
+    /// than `keep` records in total, answering how many were dropped.
+    ///
+    /// The same retention bound as [`Self::trim_task_history`], over everything the
+    /// process holds rather than over one partition of it: the Region a record is
+    /// partitioned by comes from the request, so trimming only the partition the
+    /// request named leaves the total unbounded.
+    pub fn trim_store_task_history(&mut self, keep: usize) -> usize {
+        self.trim_tasks(None, keep)
+    }
+
+    /// Forget the `clientToken` entries that index no task the store still holds,
+    /// and then the entries of the oldest tasks until no more than `keep` remain,
+    /// answering how many were forgotten.
+    ///
+    /// The index is only ever added to by a request — a `CreateTask` carrying a
+    /// token — so it needs the same kind of bound the task history has, counted over
+    /// every Region for the same reason: both halves of an entry's key come from the
+    /// request. An entry whose task is gone indexes nothing and goes first; past the
+    /// bound the entries of the oldest tasks go, so the recent token a client retries
+    /// with outlives the forgotten one. A token the store has forgotten names no
+    /// task, which is what an unused token does: the create carrying it mints one.
+    pub fn trim_idempotency(&mut self, keep: usize) -> usize {
+        let before = self.idempotency.len();
+        let held: HashSet<String> = self.tasks.keys().cloned().collect();
+        self.idempotency
+            .retain(|_, task_id| held.contains(task_id));
+
+        let excess = self.idempotency.len().saturating_sub(keep);
+        if excess > 0 {
+            // The task's instant orders the entries, and the key breaks a tie, so
+            // which entries go is not left to the map's iteration.
+            let mut oldest_first: Vec<(SystemTime, (String, String))> = self
+                .idempotency
+                .iter()
+                .map(|(key, task_id)| {
+                    let created_at = self
+                        .tasks
+                        .get(task_id)
+                        .map_or(SystemTime::UNIX_EPOCH, |task| task.created_at);
+                    (created_at, key.clone())
+                })
+                .collect();
+            oldest_first.sort();
+            for (_, key) in oldest_first.into_iter().take(excess) {
+                self.idempotency.remove(&key);
+            }
+        }
+        before - self.idempotency.len()
+    }
+
+    /// Drop the oldest terminal tasks until no more than `keep` records remain in
+    /// the scope: one Region, or the whole store when `region` is `None`.
+    fn trim_tasks(&mut self, region: Option<&str>, keep: usize) -> usize {
         let mut oldest_first: Vec<(SystemTime, String)> = self
             .tasks
             .values()
-            .filter(|task| task.region == region)
+            .filter(|task| region.is_none_or(|region| task.region == region))
             .map(|task| (task.created_at, task.task_id.clone()))
             .collect();
         let excess = oldest_first.len().saturating_sub(keep);
@@ -681,9 +840,11 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         for task_id in &dropped {
             self.tasks.remove(task_id);
         }
-        self.executions.retain(|(execution_region, execution_task, _), _| {
-            execution_region.as_str() != region || !dropped.contains(execution_task)
-        });
+        // A task id is minted from the store's own counter, so it names one record
+        // whatever partition it sits in: the executions and the `clientToken`
+        // entries of a dropped task go with it.
+        self.executions
+            .retain(|(_, execution_task, _), _| !dropped.contains(execution_task));
         self.idempotency
             .retain(|_, task_id| !dropped.contains(task_id));
         dropped.len()
@@ -844,8 +1005,14 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// Materialise every state change the clock already owes.
     ///
     /// An execution the span has elapsed on moves `QUEUED` -> `IN_PROGRESS` ->
-    /// `SUCCEEDED`; the second of those applies the task's command to the target
-    /// device. One device performs ONE execution at a time, so the executions of
+    /// `SUCCEEDED`, and EACH of those two transitions reports the task's command on
+    /// the target device: the first that the device BEGAN it
+    /// ([`DeviceCommandPhase::Begun`]), the second that it FINISHED it
+    /// ([`DeviceCommandPhase::Finished`]), so a device carries whatever state the
+    /// command is in while it performs it rather than jumping from the state before
+    /// it to the state after it.
+    ///
+    /// One device performs ONE execution at a time, so the executions of
     /// one device are a QUEUE rather than a set that advances independently: one
     /// whose device is still performing another stays `QUEUED` however long its own
     /// dispatch span has been elapsed, and leaves the queue once that one is
@@ -864,9 +1031,9 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// instant even if nobody had.
     pub fn settle(&mut self, now: SystemTime) {
         let tasks = &self.tasks;
-        // What the finished executions ask of their devices, applied after the
+        // What the settling executions report to their devices, applied after the
         // loop so the executions and the devices are never borrowed at once.
-        let mut effects: Vec<(String, TaskCommand)> = Vec::new();
+        let mut effects: Vec<DeviceEffect> = Vec::new();
         // Per device, the instant it stops being occupied by the execution it is
         // already performing. A device with no entry is performing nothing.
         let mut occupied_until: HashMap<&str, SystemTime> = HashMap::new();
@@ -887,7 +1054,8 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
             }
             let mut occupied = occupied;
             while let Some(due) = execution.due {
-                match execution.state.as_str() {
+                // What this transition reports to the device, and when.
+                let effect = match execution.state.as_str() {
                     "QUEUED" => {
                         // The command leaves the queue once its dispatch span has
                         // passed AND the device has finished what it was already
@@ -905,6 +1073,8 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                         execution.started_at = Some(starts);
                         execution.last_updated_at = starts;
                         execution.due = Some(starts + EXECUTION_FINISH_SPAN);
+                        // The device has the command from the instant it starts.
+                        Some((starts, DeviceCommandPhase::Begun))
                     }
                     "IN_PROGRESS" => {
                         if now < due {
@@ -916,14 +1086,23 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                         execution.last_updated_at = due;
                         execution.due = None;
                         occupied = Some(due);
-                        if let Some(task) = tasks.get(&execution.task_id) {
-                            effects.push((execution.managed_device_id.clone(), task.command));
-                        }
+                        Some((due, DeviceCommandPhase::Finished))
                     }
                     // A terminal execution carries no due instant, so this is
                     // unreachable; clearing it keeps the invariant true rather
                     // than looping forever on a record that broke it.
-                    _ => execution.due = None,
+                    _ => {
+                        execution.due = None;
+                        None
+                    }
+                };
+                if let (Some((at, phase)), Some(task)) = (effect, tasks.get(&execution.task_id)) {
+                    effects.push(DeviceEffect {
+                        at,
+                        managed_device_id: execution.managed_device_id.clone(),
+                        command: task.command,
+                        phase,
+                    });
                 }
             }
             if let Some(occupied) = occupied {
@@ -935,38 +1114,55 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
         // work in flight resolves to the state that work ends in once its own
         // instant has passed ([`Ec2Instance::settle`]). This is owed whoever calls
         // and whether or not any task ran, so it is materialised for every device,
-        // ahead of what a finished execution asks of its own device below.
+        // ahead of what a settling execution reports to its own device below.
         for device in self.devices.values_mut() {
             for instance in device.ec2_instances.values_mut() {
                 instance.settle(now);
             }
         }
 
-        for (managed_device_id, command) in effects {
+        effects.sort_by_key(|effect| (effect.at, effect.phase.settles_first()));
+        for DeviceEffect {
+            at,
+            managed_device_id,
+            command,
+            phase,
+        } in effects
+        {
             let Some(device) = self.devices.get_mut(&managed_device_id) else {
                 continue;
             };
-            // The device answered the command, so it checked in.
-            device.last_reached_out_at = now;
-            match command {
-                // "Unlocks the device." — `UnlockState` is the member that
-                // reports whether a device is unlocked.
-                TaskCommand::Unlock => {
-                    if device.device_state != "UNLOCKED" {
-                        device.device_state = "UNLOCKED".to_string();
-                        device.last_updated_at = now;
-                    }
-                }
-                // "Reboots the device." The device restarted, so it brought the
-                // compute environment its instances run in back up and reported
-                // that whole set afresh: the cloud-side cache this account reads is
-                // the one the restart produced ([`Ec2Instance::restart`]). Nothing
-                // else about the device record changes — a reboot is not an unlock,
-                // and `UnlockState` is unaffected by one.
-                TaskCommand::Reboot => {
-                    for instance in device.ec2_instances.values_mut() {
-                        instance.restart(now);
-                    }
+            // The device took the command, or answered it, so it checked in.
+            device.last_reached_out_at = at;
+            // What the device's `UnlockState` reports while this command runs on
+            // it, and once it is done — `None` for a command no value of that
+            // enum reports.
+            let reported = match (command, phase) {
+                // "Unlocks the device." Unlocking a Snow Family device is a
+                // transition the caller polls through, which is what the enum's
+                // third value is for: the device reports it from the moment it
+                // starts unlocking until it is unlocked.
+                (TaskCommand::Unlock, DeviceCommandPhase::Begun) => Some("UNLOCKING"),
+                (TaskCommand::Unlock, DeviceCommandPhase::Finished) => Some("UNLOCKED"),
+                // "Reboots the device." A reboot leaves no member of the device
+                // record different afterwards, and `UnlockState` has no value
+                // that reports one in flight; only the check-in above, and the
+                // instances the restart brings back up below, record that it
+                // happened.
+                (TaskCommand::Reboot, _) => None,
+            };
+            if let Some(reported) = reported.filter(|state| device.device_state != *state) {
+                device.device_state = reported.to_string();
+                device.last_updated_at = at;
+            }
+            // The device restarted, so it brought the compute environment its
+            // instances run in back up and reported that whole set afresh: the
+            // cloud-side cache this account reads is the one the restart produced
+            // ([`Ec2Instance::restart`]). That is what the device has DONE, so it
+            // is applied when the reboot finished, not when it began.
+            if command == TaskCommand::Reboot && phase == DeviceCommandPhase::Finished {
+                for instance in device.ec2_instances.values_mut() {
+                    instance.restart(now);
                 }
             }
         }

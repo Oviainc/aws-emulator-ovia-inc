@@ -30,12 +30,12 @@ use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 /// The whole modelled `ShareMethod` catalog
 /// (`smithy_query(query="shape",shape="ShareMethod")`), every value of which a directory
 /// can be shared with.
-const SHARE_METHOD_CATALOG: [&str; 2] = ["ORGANIZATIONS", "HANDSHAKE"];
+pub(crate) const SHARE_METHOD_CATALOG: [&str; 2] = ["ORGANIZATIONS", "HANDSHAKE"];
 
 /// The whole modelled `TargetType` catalog
 /// (`smithy_query(query="shape",shape="TargetType")`): the one kind of identifier a
 /// `ShareTarget$Id` can be.
-const TARGET_TYPE_CATALOG: [&str; 1] = ["ACCOUNT"];
+pub(crate) const TARGET_TYPE_CATALOG: [&str; 1] = ["ACCOUNT"];
 
 /// The `ShareStatus` a handshake share rests at until the consumer account answers: the
 /// `PendingAcceptance` value of the modelled `ShareStatus` enum.
@@ -63,7 +63,7 @@ const SHARE_GUARD: usize = 50;
 
 /// A consumer account id of the shape the modelled `CustomerId` pattern `^(\d{12})$`
 /// demands, derived from `nth` so a table row can ask for a fresh one.
-fn consumer_account(nth: usize) -> String {
+pub(crate) fn consumer_account(nth: usize) -> String {
     format!("{:012}", 100_000_000_000_u64 + nth as u64)
 }
 
@@ -74,7 +74,12 @@ fn notes_of_length(len: usize) -> String {
 
 /// A `ShareDirectory` body: the owner directory, the consumer account as an `ACCOUNT`
 /// target, the share method and, when given, the notes.
-fn share_body(directory_id: &str, account_id: &str, method: &str, notes: Option<&str>) -> Value {
+pub(crate) fn share_body(
+    directory_id: &str,
+    account_id: &str,
+    method: &str,
+    notes: Option<&str>,
+) -> Value {
     let mut body = json!({
         "DirectoryId": directory_id,
         "ShareTarget": { "Id": account_id, "Type": TARGET_TYPE_CATALOG[0] },
@@ -88,7 +93,7 @@ fn share_body(directory_id: &str, account_id: &str, method: &str, notes: Option<
 
 /// `ShareDirectory` with `body`, asserting it was accepted and returning the minted
 /// `SharedDirectoryId`.
-async fn share(router: &MultiServiceRouter, body: Value, case: &str) -> String {
+pub(crate) async fn share(router: &MultiServiceRouter, body: Value, case: &str) -> String {
     let answer = ok(router, "ShareDirectory", body, case).await;
     let shared_id = string(&answer, "SharedDirectoryId", case);
     assert_directory_id(&shared_id, case);
@@ -107,7 +112,7 @@ fn assert_directory_id(id: &str, case: &str) {
 
 /// One `DescribeSharedDirectories` page for `owner`, with `extra` members merged into the
 /// request.
-async fn describe_shares(
+pub(crate) async fn describe_shares(
     router: &MultiServiceRouter,
     owner: &str,
     extra: Vec<(&str, Value)>,
@@ -121,7 +126,7 @@ async fn describe_shares(
 }
 
 /// The `SharedDirectories` of a page, in the order the service reported them.
-fn share_list(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn share_list(body: &Value, case: &str) -> Vec<Value> {
     body["SharedDirectories"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a SharedDirectories list, got {body}"))
@@ -129,7 +134,7 @@ fn share_list(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// The `SharedDirectoryId`s of a page, in the order the service reported them.
-fn shared_ids(body: &Value, case: &str) -> Vec<String> {
+pub(crate) fn shared_ids(body: &Value, case: &str) -> Vec<String> {
     share_list(body, case)
         .iter()
         .map(|share| {
@@ -142,7 +147,7 @@ fn shared_ids(body: &Value, case: &str) -> Vec<String> {
 }
 
 /// The single share `owner` holds for `shared_id`, read back through the listing.
-async fn describe_one_share(
+pub(crate) async fn describe_one_share(
     router: &MultiServiceRouter,
     owner: &str,
     shared_id: &str,

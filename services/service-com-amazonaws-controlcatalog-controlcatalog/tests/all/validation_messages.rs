@@ -119,7 +119,10 @@ async fn refusal_message(
 /// member `message`; the service's modeled `ValidationException`, which a handler
 /// returns, spells it `Message` — both are read, so a refusal cannot hide from these
 /// tests by travelling through the other channel.
-fn message_of(response: &serde_json::Value) -> Option<String> {
+///
+/// `pub(crate)` so the sibling suite covering the refusals a HANDLER words
+/// (`refusal_wording`) reads a message the same way rather than rolling its own.
+pub(crate) fn message_of(response: &serde_json::Value) -> Option<String> {
     ["message", "Message"]
         .into_iter()
         .find_map(|member| response.get(member).and_then(serde_json::Value::as_str))

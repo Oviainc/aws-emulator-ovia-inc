@@ -149,6 +149,8 @@ mod threat_intel_sets;
 mod trusted_entity_set_delete;
 #[path = "all/trusted_entity_set_lifecycle.rs"]
 mod trusted_entity_set_lifecycle;
+#[path = "all/trusted_entity_set_listing.rs"]
+mod trusted_entity_set_listing;
 #[path = "all/trusted_entity_set_update.rs"]
 mod trusted_entity_set_update;
 #[path = "all/usage_statistics.rs"]

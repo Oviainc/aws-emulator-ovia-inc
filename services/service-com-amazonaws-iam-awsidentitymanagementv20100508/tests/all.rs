@@ -101,6 +101,8 @@ mod saml_providers;
 mod service_linked_roles;
 #[path = "all/service_provisioned_roles.rs"]
 mod service_provisioned_roles;
+#[path = "all/service_specific_credential_status.rs"]
+mod service_specific_credential_status;
 #[path = "all/service_specific_credentials.rs"]
 mod service_specific_credentials;
 #[path = "all/state_roundtrip.rs"]

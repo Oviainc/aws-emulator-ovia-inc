@@ -14,6 +14,11 @@
 //! `ReturnValues=ALL_OLD` reports the replaced item.
 //! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
+//! A put that LANDS on a table whose stream is enabled publishes one record on that
+//! stream before this call answers — `INSERT` for a key that held no item, `MODIFY`
+//! for one that did — through [`crate::state::publish_item_changes`], the seam every
+//! item-write path in this crate hands its changes to.
+//!
 //! Every number the item carries is stored CANONICALLY — "DynamoDB treats them as
 //! number type attributes" (`AttributeValue$N`), so the store keeps the number each
 //! `N` denotes, not the lexeme that spelled it, whether it sits at the top level,
@@ -450,6 +455,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let capacity = table.write_capacity(replaced.as_ref(), Some(&item));
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&item));
+        // The change this write made reaches the table's stream before the response
+        // does, so a consumer that reads the stream after seeing this answer sees it.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(PutItemOutput {
             attributes: if return_old { replaced } else { None },

@@ -39,7 +39,7 @@ const SIGNED_SCOPE: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=abc";
 
 /// `UnlockState`'s values, from `smithy_query(query="shape",shape="UnlockState")`.
-const UNLOCK_STATES: &[&str] = &["UNLOCKED", "LOCKED", "UNLOCKING"];
+pub(crate) const UNLOCK_STATES: &[&str] = &["UNLOCKED", "LOCKED", "UNLOCKING"];
 
 /// `TaskState`'s values, from `smithy_query(query="shape",shape="TaskState")`.
 const TASK_STATES: &[&str] = &["IN_PROGRESS", "CANCELED", "COMPLETED"];

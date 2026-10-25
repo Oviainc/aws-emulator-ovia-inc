@@ -13,6 +13,10 @@
 //! before or after the write, whole or projected to the attributes the update touched.
 //! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
+//! An update that LANDS on a table whose stream is enabled publishes one record on
+//! that stream before this call answers — `INSERT` where it created the item,
+//! `MODIFY` where it edited one ([`crate::state::publish_item_changes`]).
+//!
 //! A key attribute cannot be updated, and the stored result is held to the documented
 //! item bounds (400 KB, 32 levels of nesting) before it lands. The expression language
 //! itself lives in [`crate::state`], which is where `PutItem` and `DeleteItem` reach
@@ -456,6 +460,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let capacity = table.write_capacity(before.as_ref(), Some(&item));
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&item));
+        // The change this write made reaches the table's stream before the response
+        // does, so a consumer that reads the stream after seeing this answer sees it.
+        crate::state::publish_item_changes(&*self.engine, &mut store, now);
 
         Ok(UpdateItemOutput {
             attributes: crate::state::projected_return_values(
