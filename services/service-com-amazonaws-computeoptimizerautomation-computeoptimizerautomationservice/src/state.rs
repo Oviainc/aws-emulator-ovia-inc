@@ -750,6 +750,25 @@ impl Default for EnrollmentConfig {
 }
 
 impl EnrollmentConfig {
+    /// The `OrganizationRuleMode` every reader reports for this configuration:
+    /// the mode the store holds, and [`ORGANIZATION_RULE_MODE_NONE_ALLOWED`]
+    /// while it holds none.
+    ///
+    /// The mode "Specifies whether the management account can create Automation
+    /// rules that implement optimization actions for this account", and an
+    /// association is exactly what grants that permission
+    /// (`AssociateAccounts`: the member account's "organization rule mode is
+    /// automatically set to \"Any allowed\""), so an account no association has
+    /// touched is in the other of the enum's two states rather than in no state
+    /// at all. Deriving it HERE is what makes every reader of one account —
+    /// `GetEnrollmentConfiguration` for the caller, `ListAccounts` for any
+    /// account — report the same mode for it.
+    pub fn reported_organization_rule_mode(&self) -> String {
+        self.organization_rule_mode
+            .clone()
+            .unwrap_or_else(|| ORGANIZATION_RULE_MODE_NONE_ALLOWED.to_string())
+    }
+
     /// This stored configuration as the `AccountInfo` a listing reports for
     /// `account_id`: its enrollment status ("The enrollment status of the
     /// account"), the reason that explains it, its organization rule mode and
@@ -761,7 +780,8 @@ impl EnrollmentConfig {
     /// that holds none:
     ///
     /// * no rule mode means the account carries no association, which is
-    ///   [`ORGANIZATION_RULE_MODE_NONE_ALLOWED`];
+    ///   [`ORGANIZATION_RULE_MODE_NONE_ALLOWED`]
+    ///   ([`Self::reported_organization_rule_mode`]);
     /// * `at` stands in for a missing update instant. Every call that writes a
     ///   configuration stamps one, so a stored entry without one is not
     ///   reachable over the wire; this keeps the required member present rather
@@ -774,10 +794,7 @@ impl EnrollmentConfig {
         AccountInfo {
             account_id: account_id.to_string(),
             status: self.status.clone(),
-            organization_rule_mode: self
-                .organization_rule_mode
-                .clone()
-                .unwrap_or_else(|| ORGANIZATION_RULE_MODE_NONE_ALLOWED.to_string()),
+            organization_rule_mode: self.reported_organization_rule_mode(),
             status_reason: self.status_reason.clone(),
             last_updated_timestamp: self.last_updated_timestamp.unwrap_or(at),
         }
@@ -2775,13 +2792,12 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// Association is what that rule mode records: `AssociateAccounts` sets it
     /// to "Any allowed", which is what "permits the management account to create
     /// Automation rules that automatically apply actions to that account". An
-    /// account that has never been associated has no rule mode at all, so it is
-    /// not associated.
+    /// account that has never been associated reports the other mode
+    /// ([`EnrollmentConfig::reported_organization_rule_mode`]), so it is not
+    /// associated.
     pub fn is_associated(&self, account_id: &str) -> bool {
-        self.enrollment(account_id)
-            .organization_rule_mode
-            .as_deref()
-            == Some(ORGANIZATION_RULE_MODE_ANY_ALLOWED)
+        self.enrollment(account_id).reported_organization_rule_mode()
+            == ORGANIZATION_RULE_MODE_ANY_ALLOWED
     }
 
     /// How many of `account_ids` the enrollment store does not hold an entry for

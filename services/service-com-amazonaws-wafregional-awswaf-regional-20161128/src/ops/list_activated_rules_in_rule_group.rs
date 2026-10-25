@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListActivatedRulesInRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListActivatedRulesInRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListActivatedRulesInRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one page of the `ActivatedRule`s a stored `RuleGroup` holds — the
+//! activations `UpdateRuleGroup` wrote, in the priority order the record keeps them —
+//! and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +126,18 @@ impl From<ListActivatedRulesInRuleGroupErrorModeled> for ListActivatedRulesInRul
     }
 }
 
+/// The modelled `WAFNonexistentItemException`: this service holds no `RuleGroup` to
+/// list the activations of. "The operation failed because the referenced object doesn't
+/// exist."
+fn nonexistent_item() -> ListActivatedRulesInRuleGroupError {
+    ListActivatedRulesInRuleGroupErrorModeled::WAFNonexistentItemException(
+        WAFNonexistentItemException {
+            message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
+        },
+    )
+    .into()
+}
+
 /// The `ListActivatedRulesInRuleGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -167,18 +174,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListActivatedRulesInRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListActivatedRulesInRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListActivatedRulesInRuleGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListActivatedRulesInRuleGroupErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+                },
+            )
+        })?;
+        // A read: it walks the activations the named rule group holds and writes nothing.
+        let state = state.lock();
+
+        // `RuleGroupId` is "the RuleGroupId of the RuleGroup for which you want to get a
+        // list of ActivatedRule objects", so a request naming none, and one naming a
+        // rule group this service does not hold, both ask for the activations of a rule
+        // group that does not exist.
+        let Some(stored) = input
+            .rule_group_id
+            .as_deref()
+            .and_then(|rule_group_id| state.rule_groups.get(rule_group_id))
+        else {
+            return Err(nonexistent_item());
+        };
+
+        // The pagination rule every AWS WAF Classic paginated read follows, held once in
+        // `crate::state`: `Limit` bounds the page (0, the model's declared default, asks
+        // for the service's own page size), the marker a previous page handed back is the
+        // `RuleId` this page starts at, and the returned marker is the first activation
+        // AFTER this page, so `NextMarker` is present exactly when one remains.
+        let Some((activated_rules, next_marker)) = crate::state::page_activated_rules(
+            &stored.rules,
+            input.limit,
+            input.next_marker.as_deref(),
+        ) else {
+            // A marker naming no activation of this rule group is not one a previous
+            // page handed back: "You specified an invalid value."
+            return Err(
+                ListActivatedRulesInRuleGroupErrorModeled::WAFInvalidParameterException(
+                    WAFInvalidParameterException {
+                        field: Some("NEXT_MARKER".to_string()),
+                        parameter: input.next_marker.clone(),
+                        reason: Some("ILLEGAL_ARGUMENT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListActivatedRulesInRuleGroupOutput {
+            activated_rules: Some(activated_rules),
+            next_marker,
+        })
     }
 }
+

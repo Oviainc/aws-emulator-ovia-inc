@@ -14,16 +14,18 @@
 //! is the call's own modelled error. It is `@idempotent`, so a resource the item holds
 //! no association for is already disassociated and its element succeeds unchanged. A
 //! request that names no `BillingPeriodRange` disassociates the resource in every
-//! billing period, so the association is dropped; one that names a range takes effect
-//! from its inclusive start, so the association keeps the earlier periods and ENDS
-//! there — the `EndBillingPeriod` a read reports — and is dropped when it would then
-//! cover no period at all. What is left is what
-//! `ListResourcesAssociatedToCustomLineItem` reports back.
+//! billing period, so the association is dropped; one that names a range disassociates
+//! it ONLY in the billing periods that half-open range covers, so the association keeps
+//! every period outside it — the earlier ones it applied in, and the ones from the
+//! range's exclusive end on — and is dropped when it would then cover no period at all.
+//! What is left is what `ListResourcesAssociatedToCustomLineItem` reports back, with the
+//! `EndBillingPeriod` of the association as it stands in the period the read asks about.
 //!
 //! The rows differ along the class of the resource (billing group / custom line item),
 //! the form the caller names it in (full ARN / bare id), the number of resources in one
 //! request, the way a resource fails, and where the disassociation's billing period
-//! falls relative to the association's own range — never along a renaming.
+//! range falls relative to the association's own range (inside it, overlapping either
+//! end, covering it, disjoint on either side) — never along a renaming.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -225,7 +227,31 @@ impl Emulator {
     /// The `EndBillingPeriod` a read reports for one associated resource, and whether
     /// the association is reported at all.
     async fn end_billing_period(&self, target: &str, resource: &str) -> Option<Option<String>> {
-        let (status, body) = self.associated(target, json!({})).await;
+        self.in_period(target, resource, json!({})).await
+    }
+
+    /// Whether a read of `target` for one billing period reports `resource` at all —
+    /// `None` when it does not — and, when it does, the `EndBillingPeriod` it carries
+    /// there.
+    async fn in_billing_period(
+        &self,
+        target: &str,
+        resource: &str,
+        billing_period: &str,
+    ) -> Option<Option<String>> {
+        self.in_period(target, resource, json!({ "BillingPeriod": billing_period }))
+            .await
+    }
+
+    /// The reported-ness and `EndBillingPeriod` of one resource in whatever read the
+    /// `extra` members describe.
+    async fn in_period(
+        &self,
+        target: &str,
+        resource: &str,
+        extra: Value,
+    ) -> Option<Option<String>> {
+        let (status, body) = self.associated(target, extra).await;
         assert_eq!(
             status, 200,
             "case read of {target}: expected HTTP 200, got {status} with {body}"
@@ -805,6 +831,371 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                     if *in_effect { "in effect" } else { "gone" }
                 );
             }
+        }
+    }
+}
+
+/// One row of the bounded-range table: the billing periods the association was made
+/// over, the half-open range the disassociation names, and what a read of each probed
+/// billing period reports afterwards.
+struct BoundedRow {
+    case: &'static str,
+    /// The `BillingPeriodRange` of the ASSOCIATING call, if any — `None` associates the
+    /// resource in every billing period.
+    associated: Option<Value>,
+    /// `InclusiveStartBillingPeriod` of the DISASSOCIATING call.
+    disassociated_from: &'static str,
+    /// `ExclusiveEndBillingPeriod` of the DISASSOCIATING call — the bound this table is
+    /// about.
+    disassociated_until: &'static str,
+    /// Per billing period: `None` when a read of that period does not report the
+    /// resource at all, `Some(end)` when it does, carrying that `EndBillingPeriod`.
+    probes: &'static [(&'static str, Option<Option<&'static str>>)],
+    /// Is the resource still associated AT ALL, i.e. does a read that names no billing
+    /// period report it?
+    left: bool,
+}
+
+/// A disassociation bounded by a `BillingPeriodRange` applies ONLY to the billing
+/// periods that half-open range covers: the association keeps every period outside it,
+/// so it resumes at the range's `ExclusiveEndBillingPeriod`, and it is dropped only when
+/// nothing of it is left.
+///
+/// The rows differ along where the request's window falls relative to the association's
+/// own range — strictly inside it, overlapping either end, covering it, disjoint on
+/// either side — along the association's own bounds (open, open-ended, bounded), along
+/// the width of the window (one period, several, across the turn of a year) and along
+/// the spelling of the months (`2026-4` / `2026-04`), with each row run for a billing
+/// group named by full ARN and a custom line item named by bare id in ONE request.
+#[tokio::test]
+async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
+    let rows: [BoundedRow; 11] = [
+        BoundedRow {
+            case: "an open association, a window inside it",
+            associated: None,
+            disassociated_from: "2026-1",
+            disassociated_until: "2026-3",
+            probes: &[
+                ("2025-12", Some(Some("2026-1"))),
+                ("2026-1", None),
+                ("2026-2", None),
+                ("2026-3", Some(None)),
+                ("2026-4", Some(None)),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "an open-ended association, a window inside it",
+            associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-1" })),
+            disassociated_from: "2026-3",
+            disassociated_until: "2026-5",
+            probes: &[
+                ("2025-12", None),
+                ("2026-1", Some(Some("2026-3"))),
+                ("2026-2", Some(Some("2026-3"))),
+                ("2026-3", None),
+                ("2026-4", None),
+                ("2026-5", Some(None)),
+                ("2026-11", Some(None)),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a bounded association, a window inside it",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": "2026-1",
+                "ExclusiveEndBillingPeriod": "2026-6",
+            })),
+            disassociated_from: "2026-2",
+            disassociated_until: "2026-4",
+            probes: &[
+                ("2026-1", Some(Some("2026-2"))),
+                ("2026-2", None),
+                ("2026-3", None),
+                ("2026-4", Some(Some("2026-6"))),
+                ("2026-5", Some(Some("2026-6"))),
+                ("2026-6", None),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window overlapping the association's start",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": "2026-3",
+                "ExclusiveEndBillingPeriod": "2026-9",
+            })),
+            disassociated_from: "2026-1",
+            disassociated_until: "2026-5",
+            probes: &[
+                ("2026-2", None),
+                ("2026-3", None),
+                ("2026-4", None),
+                ("2026-5", Some(Some("2026-9"))),
+                ("2026-8", Some(Some("2026-9"))),
+                ("2026-9", None),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window overlapping the association's end",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": "2026-3",
+                "ExclusiveEndBillingPeriod": "2026-9",
+            })),
+            disassociated_from: "2026-7",
+            disassociated_until: "2026-12",
+            probes: &[
+                ("2026-3", Some(Some("2026-7"))),
+                ("2026-6", Some(Some("2026-7"))),
+                ("2026-7", None),
+                ("2026-8", None),
+                ("2026-11", None),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window covering the whole association",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": "2026-3",
+                "ExclusiveEndBillingPeriod": "2026-5",
+            })),
+            disassociated_from: "2026-1",
+            disassociated_until: "2026-9",
+            probes: &[
+                ("2026-1", None),
+                ("2026-3", None),
+                ("2026-4", None),
+                ("2026-9", None),
+            ],
+            left: false,
+        },
+        BoundedRow {
+            case: "a window entirely before the association",
+            associated: Some(json!({ "InclusiveStartBillingPeriod": "2026-5" })),
+            disassociated_from: "2026-1",
+            disassociated_until: "2026-3",
+            probes: &[
+                ("2026-1", None),
+                ("2026-4", None),
+                ("2026-5", Some(None)),
+                ("2026-9", Some(None)),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window entirely after the association ends",
+            associated: Some(json!({
+                "InclusiveStartBillingPeriod": "2026-1",
+                "ExclusiveEndBillingPeriod": "2026-3",
+            })),
+            disassociated_from: "2026-6",
+            disassociated_until: "2026-8",
+            probes: &[
+                ("2026-1", Some(Some("2026-3"))),
+                ("2026-2", Some(Some("2026-3"))),
+                ("2026-3", None),
+                ("2026-6", None),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window in the padded spelling of its months",
+            associated: None,
+            disassociated_from: "2026-04",
+            disassociated_until: "2026-06",
+            probes: &[
+                ("2026-3", Some(Some("2026-04"))),
+                ("2026-03", Some(Some("2026-04"))),
+                ("2026-4", None),
+                ("2026-04", None),
+                ("2026-5", None),
+                ("2026-6", Some(None)),
+                ("2026-06", Some(None)),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window of one billing period",
+            associated: None,
+            disassociated_from: "2026-5",
+            disassociated_until: "2026-6",
+            probes: &[
+                ("2026-4", Some(Some("2026-5"))),
+                ("2026-5", None),
+                ("2026-6", Some(None)),
+            ],
+            left: true,
+        },
+        BoundedRow {
+            case: "a window across the turn of the year",
+            associated: None,
+            disassociated_from: "2025-12",
+            disassociated_until: "2026-2",
+            probes: &[
+                ("2025-11", Some(Some("2025-12"))),
+                ("2025-12", None),
+                ("2026-1", None),
+                ("2026-2", Some(None)),
+            ],
+            left: true,
+        },
+    ];
+
+    for row in rows {
+        let emulator = Emulator::new();
+        let home = emulator.billing_group("home").await;
+        let target = emulator.percentage_item(&home, "target").await;
+        // Both classes of resource an association can name, each in one of the two
+        // forms the member admits, disassociated in ONE request.
+        let group = emulator.billing_group("resource").await;
+        let child = emulator.percentage_item(&home, "child").await;
+        let requested = vec![group.clone(), bare_id(&child)];
+        emulator
+            .associate(&target, &requested, row.associated.clone())
+            .await;
+
+        // The same bounded disassociation TWICE: `@idempotent`, so the second call
+        // leaves exactly what the first one did.
+        for attempt in 1..=2 {
+            let case = format!("{} (attempt {attempt})", row.case);
+            let (status, body) = emulator
+                .disassociate(
+                    &target,
+                    &requested,
+                    Some(json!({
+                        "InclusiveStartBillingPeriod": row.disassociated_from,
+                        "ExclusiveEndBillingPeriod": row.disassociated_until,
+                    })),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {body}"
+            );
+            assert_eq!(
+                reported(&body, "SuccessfullyDisassociatedResources"),
+                requested,
+                "case {case:?}: expected both resources reported disassociated as the caller \
+                 named them, got {body}"
+            );
+
+            for resource in [&group, &child] {
+                let whole = emulator.end_billing_period(&target, resource).await;
+                assert_eq!(
+                    whole.is_some(),
+                    row.left,
+                    "case {case:?} ({resource}): expected the association to be {} after the \
+                     bounded disassociation, got {whole:?}",
+                    if row.left { "left" } else { "dropped" }
+                );
+
+                for (period, expected) in row.probes {
+                    let reported_back = emulator
+                        .in_billing_period(&target, resource, period)
+                        .await;
+                    assert_eq!(
+                        reported_back,
+                        expected.map(|end| end.map(str::to_string)),
+                        "case {case:?} ({resource}) in {period}: expected {expected:?}, got \
+                         {reported_back:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The `BillingPeriod` a month index names, in the form the modelled pattern admits
+/// (`^\d{4}-(0?[1-9]|1[012])$`): consecutive indices are consecutive months, so a
+/// window `[period(k), period(k + 1))` is exactly one billing period.
+fn period(month_index: usize) -> String {
+    format!("{}-{}", 2000 + month_index / 12, month_index % 12 + 1)
+}
+
+/// Each bounded disassociation can carve one more separate stretch of billing periods
+/// out of an association, and a caller decides how many to make — so the store holds at
+/// most `MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION` of them, and the call that would
+/// carve one too many fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED`
+/// reason and writes nothing, rather than growing without bound or coarsening what a
+/// later read reports.
+#[tokio::test]
+async fn the_separate_ranges_of_one_association_are_bounded() {
+    use service_com_amazonaws_billingconductor_awsbillingconductor::state::MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION as MAX_RANGES;
+
+    let emulator = Emulator::new();
+    let home = emulator.billing_group("home").await;
+    let target = emulator.percentage_item(&home, "target").await;
+    let resource = emulator.billing_group("resource").await;
+    // Open-ended, so it starts as ONE stretch of billing periods.
+    emulator
+        .associate(&target, std::slice::from_ref(&resource), None)
+        .await;
+
+    // Every other month is removed, so each call punches a hole strictly inside a
+    // stretch the association already has and splits it in two: the call made while the
+    // association is in effect over `n` stretches would leave it in `n + 1`, so the one
+    // that would take it past `MAX_RANGES` is refused.
+    for hole in 0..MAX_RANGES {
+        let start = period(hole * 2);
+        let end = period(hole * 2 + 1);
+        let at_limit = hole + 2 > MAX_RANGES;
+        let case = format!("hole {hole} ({start}..{end})");
+        let (status, body) = emulator
+            .disassociate(
+                &target,
+                std::slice::from_ref(&resource),
+                Some(json!({
+                    "InclusiveStartBillingPeriod": start,
+                    "ExclusiveEndBillingPeriod": end,
+                })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        if at_limit {
+            assert_eq!(
+                failures(&body, "FailedDisassociatedResources"),
+                vec![(resource.clone(), "SERVICE_LIMIT_EXCEEDED".to_string())],
+                "case {case:?}: expected the resource past the bound of {MAX_RANGES} ranges to \
+                 fail with the modelled reason, got {body}"
+            );
+            assert!(
+                reported(&body, "SuccessfullyDisassociatedResources").is_empty(),
+                "case {case:?}: expected no resource reported disassociated, got {body}"
+            );
+            // Nothing was written, so the period the refused call named is still one
+            // the association is in effect in.
+            let reported_back = emulator.in_billing_period(&target, &resource, &start).await;
+            assert_eq!(
+                reported_back,
+                Some(None),
+                "case {case:?}: expected the refused call to write nothing, got {reported_back:?}"
+            );
+        } else {
+            assert_eq!(
+                reported(&body, "SuccessfullyDisassociatedResources"),
+                vec![resource.clone()],
+                "case {case:?}: expected the resource reported disassociated, got {body}"
+            );
+            assert!(
+                failures(&body, "FailedDisassociatedResources").is_empty(),
+                "case {case:?}: expected no failed resource, got {body}"
+            );
+            let removed = emulator.in_billing_period(&target, &resource, &start).await;
+            assert_eq!(
+                removed, None,
+                "case {case:?}: expected the hole's own period to be disassociated, got \
+                 {removed:?}"
+            );
+            let kept = emulator.in_billing_period(&target, &resource, &end).await;
+            assert_eq!(
+                kept,
+                Some(None),
+                "case {case:?}: expected the association to resume at the hole's exclusive end, \
+                 got {kept:?}"
+            );
         }
     }
 }

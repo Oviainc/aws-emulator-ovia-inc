@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNotification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNotification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNotification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces one notification of the budget that `(AccountId, BudgetName)` names with
+//! another: `OldNotification` names the notification to change by VALUE
+//! ([`crate::state::same_notification`]) — a notification carries no id — and
+//! `NewNotification` is what it becomes. The notification keeps its place in the
+//! budget's notification list and keeps the subscribers held with it, since neither is
+//! named by this call. A budget or notification this account does not hold is a
+//! `NotFoundException`, and a `NewNotification` that names a DIFFERENT notification the
+//! same budget already holds is a `DuplicateRecordException`: what a notification alerts
+//! on is its identity, so a budget cannot end up holding two of the same one. An
+//! `AccountId` that is not the caller's own account is refused with the modelled 403
+//! before anything is read or written, like every other operation of this service.
+//!
+//! A notification this write leaves in alarm owes the alert it exists to deliver to the
+//! subscribers still attached to it ([`crate::state::alerts`]), decided from the state
+//! this call leaves behind and published once the store's lock is released.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +160,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNotification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNotificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNotification"))
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read or written (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(UpdateNotificationErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateNotificationErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The alerts this write leaves owed, decided under the lock and published once it
+        // is released, so no delivery is made while the store is held.
+        let alerts = {
+            // The one door into the store (`crate::state::store_at`): the deletions the
+            // clock already owes — a budget past its end date, with everything held inside
+            // it — are materialised before this call resolves anything, so a notification
+            // of an expired budget is as absent here as it is to every read.
+            let now = ::std::time::SystemTime::now();
+            let mut store = crate::state::store_at(&state, now);
+            // A notification lives inside the budget that owns it, so the budget is
+            // resolved by the same `(AccountId, BudgetName)` identity every other
+            // operation uses.
+            let stored = store
+                .budgets
+                .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+                .ok_or_else(|| {
+                    UpdateNotificationErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(format!(
+                            "Unable to update notification: {} - the budget doesn't exist.",
+                            input.budget_name
+                        )),
+                    })
+                })?;
+
+            // A notification carries no id: the caller names the one to change by value,
+            // and `crate::state::same_notification` holds which members that identity is
+            // made of (the service-owned alarm state is not one of them). Its POSITION is
+            // resolved once here: the replacement goes back in the same place, and the
+            // collision scan below has to know which held notification is the one being
+            // updated.
+            let found = stored.notifications.iter().position(|held| {
+                crate::state::same_notification(&held.notification, &input.old_notification)
+            });
+            let Some(index) = found else {
+                return Err(UpdateNotificationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Unable to update notification: {} - the notification doesn't exist.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            };
+
+            // What a notification alerts on identifies it, so a budget cannot hold two of
+            // the same one: a `NewNotification` that names one of the budget's OTHER
+            // notifications is the duplicate record, not a merge of the two. Naming the
+            // notification being updated is not a collision with itself — that call
+            // changes only the members outside the identity, and stays accepted.
+            let collides = stored
+                .notifications
+                .iter()
+                .enumerate()
+                .any(|(position, held)| {
+                    position != index
+                        && crate::state::same_notification(
+                            &held.notification,
+                            &input.new_notification,
+                        )
+                });
+            if collides {
+                return Err(UpdateNotificationErrorModeled::DuplicateRecordException(
+                    DuplicateRecordException {
+                        message: Some(format!(
+                            "Unable to update notification: {} - the notification already exists.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // Read before the notification is replaced, because an alert names the budget
+            // the notification belongs to.
+            let source = crate::state::alerts::source(&input.account_id, &stored.budget);
+            // Replaced IN PLACE at the position just resolved, so the budget's
+            // notifications keep their relative order (the order a paginated read indexes
+            // into) and the subscribers held with this notification stay attached to it —
+            // this call names none, and "each notification must have at least one
+            // subscriber", so dropping them would leave a notification that cannot exist.
+            let held = &mut stored.notifications[index];
+            let mut notification = input.new_notification;
+            // `NotificationState` "specifies whether this notification is in alarm" — a
+            // member the SERVICE owns and moves as spend crosses the threshold, and not
+            // part of what names a notification. An update that does not carry it
+            // therefore leaves the alarm state the notification already had rather than
+            // clearing it, so a read after this call reports the state the service last
+            // computed.
+            if notification.notification_state.is_none() {
+                notification.notification_state = held.notification.notification_state.clone();
+            }
+            // ... and a notification that carries no alarm state at all is out of alarm,
+            // the same stamp the create path applies.
+            crate::state::stamp_notification(&mut notification);
+            held.notification = notification;
+            // A notification this write leaves in alarm has passed its threshold, so it
+            // owes the alert it exists to deliver to every subscriber still attached to
+            // it — decided from the state this call leaves behind, the way every other
+            // write that establishes such a pairing decides it.
+            crate::state::alerts::owed(&source, &held.notification, &held.subscribers)
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
+
+        Ok(UpdateNotificationOutput {})
     }
 }

@@ -1106,6 +1106,29 @@ pub struct DestinationRecord {
 }
 
 impl DestinationRecord {
+    /// Whether this destination refers to the resource `arn` of THIS endpoint's store.
+    ///
+    /// The members a destination configuration names such a resource with: the encoder
+    /// configuration of a channel destination (`ChannelDestinationConfiguration$encoderConfigurationArn`),
+    /// and the storage configuration and encoder configurations of an S3 one
+    /// (`S3DestinationConfiguration$storageConfigurationArn` and `$encoderConfigurationArns`).
+    /// `channelArn` is deliberately not one of them: it names a low-latency channel of
+    /// the sibling endpoint, which this store does not hold — the same boundary
+    /// `StartComposition` draws when it resolves these references.
+    pub fn references(&self, arn: &str) -> bool {
+        let channel_reference = self.configuration.channel.as_ref().is_some_and(|channel| {
+            channel.encoder_configuration_arn.as_deref() == Some(arn)
+        });
+        let s3_reference = self.configuration.s3.as_ref().is_some_and(|s3| {
+            s3.storage_configuration_arn == arn
+                || s3
+                    .encoder_configuration_arns
+                    .iter()
+                    .any(|encoder_configuration_arn| encoder_configuration_arn == arn)
+        });
+        channel_reference || s3_reference
+    }
+
     /// The modelled `Destination` this record reports.
     pub fn to_destination(&self) -> Destination {
         Destination {
@@ -1304,6 +1327,25 @@ impl CompositionRecord {
     /// down yet cannot change the answer.
     pub fn is_running(&self) -> bool {
         self.state == COMPOSITION_STATE_STARTING || self.state == COMPOSITION_STATE_ACTIVE
+    }
+
+    /// Whether this composition is still using the resources its destinations name, so a
+    /// delete of one of them would leave it composing against a resource that is gone.
+    ///
+    /// Every state on this side of a FINISHED stop: the model tells a caller that wants
+    /// to delete such a resource to "first use StopComposition and wait for it to
+    /// complete", so a composition that is starting, composing or still stopping is using
+    /// them, and one whose stop has completed is not.
+    pub fn is_using_resources(&self) -> bool {
+        self.is_running() || self.state == COMPOSITION_STATE_STOPPING
+    }
+
+    /// Whether any destination of this composition refers to the resource `arn` — see
+    /// [`DestinationRecord::references`].
+    pub fn references(&self, arn: &str) -> bool {
+        self.destinations
+            .iter()
+            .any(|destination| destination.references(arn))
     }
 
     /// Begin the stop of this composition at `now`: the composition and every destination
@@ -2154,6 +2196,23 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         self.compositions
             .values()
             .find(|composition| composition.idempotency_token.as_deref() == Some(token))
+    }
+
+    /// The composition using the resource `arn` right now, if this store holds one: the
+    /// first one started among those whose destinations refer to it
+    /// ([`CompositionRecord::references`]) and whose stop has not completed
+    /// ([`CompositionRecord::is_using_resources`]).
+    ///
+    /// The ONE lookup for "is a composition using this resource", so what a delete of an
+    /// encoder or storage configuration refuses over is exactly what the compositions
+    /// `GetComposition` reports say. Call it after
+    /// [`Self::materialize_due_compositions`], so a composition whose stop the clock has
+    /// already finished holds nothing back.
+    pub fn composition_using(&self, arn: &str) -> Option<&CompositionRecord> {
+        self.compositions
+            .values()
+            .filter(|composition| composition.is_using_resources() && composition.references(arn))
+            .min_by_key(|composition| composition.sequence)
     }
 }
 
@@ -3025,6 +3084,21 @@ pub fn replication_already_active_message(
         "Resource: participant {participant_id} of {source_stage_arn} is already \
          replicated to {destination_stage_arn}"
     )
+}
+
+/// How this service states a delete of a resource a composition is still using: it names
+/// the resource, the composition using it and the state that composition is in, so the
+/// caller can see what has to stop before the delete can succeed.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request and the store, the way every other refusal of this service is.
+pub fn resource_in_use_by_composition_message(
+    arn: &str,
+    composition_arn: &str,
+    composition_state: &str,
+) -> String {
+    format!("Resource: {arn} is in use: composition {composition_arn} is {composition_state}")
 }
 
 /// How this service states a request to delete an ingest configuration a publisher is

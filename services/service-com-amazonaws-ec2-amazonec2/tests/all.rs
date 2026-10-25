@@ -193,6 +193,8 @@ mod modify_subnet_attribute;
 mod nat_gateway_addresses;
 #[path = "all/network_insights_access_scope_analyses.rs"]
 mod network_insights_access_scope_analyses;
+#[path = "all/network_insights_access_scopes.rs"]
+mod network_insights_access_scopes;
 #[path = "all/network_interfaces.rs"]
 mod network_interfaces;
 #[path = "all/network_performance_data.rs"]

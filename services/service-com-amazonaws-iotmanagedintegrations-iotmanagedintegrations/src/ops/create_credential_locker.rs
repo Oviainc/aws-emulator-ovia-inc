@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCredentialLocker
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCredentialLocker`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCredentialLocker::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +128,21 @@ pub struct CreateCredentialLocker<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the locker was created in, and how the
+/// call ended. No `Name`, no `Tags` and no ARN: both of those members are `@sensitive` and a
+/// log sink needs none of them to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateCredentialLocker",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> CreateCredentialLocker<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -163,18 +169,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCredentialLocker` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCredentialLockerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCredentialLocker"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this locker belongs to.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            CreateCredentialLockerErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the credential-locker store is unavailable".to_string()),
+            })
+        })?;
+
+        // Every modelled constraint on this request (the `@length` and `@pattern` of
+        // `Name` and `ClientToken`, the `TagsMap` size) is refused at the boundary, so
+        // reaching here means there is nothing left to check.
+        let mut store = state.lock();
+        let created_at = ::std::time::SystemTime::now();
+
+        // Retire the idempotency records the clock already made due, before anything
+        // reads them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action. The token is scoped to the region that minted the
+        // record, as the record itself is.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::CREDENTIAL_LOCKER_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|id| store.credential_locker_in(&region, &id)) {
+            let replay = CreateCredentialLockerOutput {
+                id: Some(created.id.clone()),
+                arn: Some(created.arn.clone()),
+                created_at: Some(crate::state::timestamp(created.created_at)),
+            };
+            drop(store);
+            audit(&akid, &region, "replayed");
+            return Ok(replay);
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into, so a caller cannot make this emulator's memory grow without end. This
+        // operation models a quota error, which is what "this account may not have another
+        // one" is.
+        if store.credential_lockers.len() >= crate::state::MAX_CREDENTIAL_LOCKERS {
+            drop(store);
+            audit(&akid, &region, "refused");
+            return Err(
+                CreateCredentialLockerErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this service holds the maximum of {} credential lockers; delete \
+                             one before creating another",
+                            crate::state::MAX_CREDENTIAL_LOCKERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let sequence = store.take_sequence();
+        // `CredentialLockerId` is `^[a-zA-Z0-9]*$`, len 1..64, and the resource segment of
+        // `CredentialLockerArn` is `[0-9a-zA-Z]+`, which the lowercase-hex opaque id
+        // satisfies.
+        let id = crate::state::opaque_id(sequence);
+        let arn = crate::state::credential_locker_arn(&region, &id);
+        let locker = crate::state::CredentialLocker {
+            id: id.clone(),
+            arn: arn.clone(),
+            region: region.clone(),
+            name: input.name,
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            sequence,
+        };
+
+        if let Some(token) = input.client_token {
+            store.record_idempotency_token(
+                crate::state::CREDENTIAL_LOCKER_RESOURCE_TYPE,
+                &token,
+                &id,
+                created_at,
+            );
+        }
+        store.credential_locker_order.push(id.clone());
+        store.credential_lockers.insert(id.clone(), locker);
+        drop(store);
+
+        audit(&akid, &region, "created");
+        Ok(CreateCredentialLockerOutput {
+            id: Some(id),
+            arn: Some(arn),
+            created_at: Some(crate::state::timestamp(created_at)),
+        })
     }
 }

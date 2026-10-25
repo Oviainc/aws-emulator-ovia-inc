@@ -2217,6 +2217,26 @@ pub struct Bucket {
     /// Private, like `tags` and `encryption`, so the accessor pair below is the only way in
     /// or out.
     replication: Option<crate::ops::types::ReplicationConfiguration>,
+    /// The bucket's CloudWatch request-metrics configurations, by the id each one is
+    /// identified by: "Sets a metrics configuration (specified by the metrics configuration
+    /// ID) for the bucket" (`PutBucketMetricsConfiguration`'s own documentation).
+    ///
+    /// A MAP rather than one value, because a bucket carries MANY of them — "You can have
+    /// up to 1,000 metrics configurations per bucket" (same documentation,
+    /// [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`]) — each addressable on its own by the id
+    /// the request named it with, which is what a read, a replacement and a delete of one
+    /// configuration leave the others untouched by. A `BTreeMap`, so iterating it is
+    /// ascending id order and a listing needs no sort step. Empty for a bucket no metrics
+    /// configuration has been put on, which is the state a bucket is created in.
+    ///
+    /// The MODELLED container is stored whole, the way [`Self::replication`] is: that is
+    /// exactly what the put takes as its payload and what `GetBucketMetricsConfiguration`
+    /// reports back, so a read answers the configuration the bucket actually carries rather
+    /// than a re-derived copy of it.
+    ///
+    /// Private, like `tags` and `replication`, so the accessor pair below is the only way
+    /// in or out.
+    metrics_configurations: BTreeMap<String, crate::ops::types::MetricsConfiguration>,
     /// The S3 Intelligent-Tiering configurations the bucket carries, by the id each one is
     /// identified by — empty while the bucket carries none, which is the state it is
     /// created in.
@@ -2505,6 +2525,50 @@ impl Bucket {
         configuration: crate::ops::types::ReplicationConfiguration,
     ) {
         self.replication = Some(configuration);
+    }
+
+    /// The metrics configuration the bucket carries under `id`, or `None` when it carries
+    /// none under that id — the state every bucket starts in, and what makes a read answer
+    /// [`NO_SUCH_CONFIGURATION_CODE`].
+    pub fn metrics_configuration(
+        &self,
+        id: &str,
+    ) -> Option<&crate::ops::types::MetricsConfiguration> {
+        self.metrics_configurations.get(id)
+    }
+
+    /// Associate `configuration` with the bucket under `id`, and report what that did.
+    ///
+    /// A full replacement of the configuration of that id, and of that one only: "If you're
+    /// updating an existing metrics configuration, note that this is a full replacement of
+    /// the existing metrics configuration. If you don't include the elements you want to
+    /// keep, they are erased" (`PutBucketMetricsConfiguration`'s own documentation). Every
+    /// other id the bucket carries is left exactly as it was.
+    ///
+    /// The ceiling is checked HERE, where the bucket's configuration count is, so a put
+    /// cannot reach past [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`]; replacing an id the
+    /// bucket already carries adds no configuration and so is never refused for it.
+    pub fn put_metrics_configuration(
+        &mut self,
+        id: String,
+        configuration: crate::ops::types::MetricsConfiguration,
+    ) -> MetricsConfigurationWrite {
+        // The ceiling is read BEFORE the entry is taken, because taking it borrows the map.
+        let at_the_ceiling =
+            self.metrics_configurations.len() >= MAX_METRICS_CONFIGURATIONS_PER_BUCKET;
+        match self.metrics_configurations.entry(id) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.insert(configuration);
+                MetricsConfigurationWrite::Replaced
+            }
+            std::collections::btree_map::Entry::Vacant(_) if at_the_ceiling => {
+                MetricsConfigurationWrite::QuotaReached
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(configuration);
+                MetricsConfigurationWrite::Stored
+            }
+        }
     }
 
     /// Every S3 Intelligent-Tiering configuration the bucket carries, in ascending id
@@ -4175,9 +4239,16 @@ pub enum IntelligentTieringWrite {
 /// The code S3 answers a put that would take a bucket past the configuration limit with:
 /// "TooManyConfigurations … You are attempting to create a new configuration but have
 /// already reached the 1,000-configuration limit"
-/// (`PutBucketIntelligentTieringConfiguration`'s own special errors), under "HTTP 400 Bad
+/// (`PutBucketIntelligentTieringConfiguration`'s and `PutBucketMetricsConfiguration`'s own
+/// special errors, which publish the same code and text), under "HTTP 400 Bad
 /// Request Error".
 pub const TOO_MANY_CONFIGURATIONS_CODE: &str = "TooManyConfigurations";
+
+/// See [`TOO_MANY_CONFIGURATIONS_CODE`] — the description AWS documents for that code,
+/// nothing of which comes from the request.
+pub const TOO_MANY_CONFIGURATIONS_MESSAGE: &str =
+    "You are attempting to create a new configuration but have already reached the \
+     1,000-configuration limit";
 
 /// The HTTP status [`TOO_MANY_CONFIGURATIONS_CODE`] is rendered with: 400, from that same
 /// special-errors list.
@@ -4194,6 +4265,66 @@ pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
 /// The HTTP status [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] is rendered with: 404,
 /// from the same list.
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
+
+/// How many metrics configurations one bucket may hold, and so how many entries one
+/// bucket's metrics record can ever carry.
+///
+/// AWS publishes the bound on the operation itself: "You can have up to 1,000 metrics
+/// configurations per bucket" (`PutBucketMetricsConfiguration`'s own documentation), which
+/// also names the refusal past it ([`TOO_MANY_CONFIGURATIONS_CODE`]). A put past it is
+/// refused rather than recorded, so a caller looping on fresh ids cannot grow one bucket's
+/// record without end.
+pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
+
+/// The most characters a metrics configuration id may carry.
+///
+/// From the member's own documentation: "The ID has a 64 character limit and can only
+/// contain letters, numbers, periods, dashes, and underscores" (`MetricsConfiguration$Id`).
+/// The model constrains `MetricsId` no further — `smithy_query(query="shape",
+/// shape="MetricsId")` reports a plain string with no `length` or `pattern` — so nothing
+/// refuses a longer or oddly spelled id before [`is_valid_metrics_id`] does.
+pub const MAX_METRICS_ID_CHARS: usize = 64;
+
+/// Whether `value` is an id a metrics configuration may be identified by: at most
+/// [`MAX_METRICS_ID_CHARS`] characters, every one of them a letter, a number, a period, a
+/// dash or an underscore — the rule quoted on that constant.
+///
+/// An EMPTY id identifies no configuration, so it is not one either.
+pub fn is_valid_metrics_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_METRICS_ID_CHARS
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+}
+
+/// The code S3 answers a read that names a bucket subresource configuration the bucket
+/// carries none of under that id: "NoSuchConfiguration - The specified configuration does
+/// not exist." (Amazon S3 "Error responses", list of error codes), with HTTP 404 — the
+/// subresource-not-there case for a configuration a put identifies by an id, answered the
+/// way [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] answers it for the one a bucket carries
+/// at most one of.
+pub const NO_SUCH_CONFIGURATION_CODE: &str = "NoSuchConfiguration";
+/// See [`NO_SUCH_CONFIGURATION_CODE`] — the fixed text S3 publishes for that code, nothing
+/// of which comes from the request.
+pub const NO_SUCH_CONFIGURATION_MESSAGE: &str = "The specified configuration does not exist.";
+/// The HTTP status [`NO_SUCH_CONFIGURATION_CODE`] is rendered with: 404, from the same
+/// list.
+pub const NO_SUCH_CONFIGURATION_STATUS: u16 = 404;
+
+/// What [`Bucket::put_metrics_configuration`] did, so the caller answers each outcome
+/// without re-deriving it — and cannot reach the stored cases without having gone through
+/// the per-bucket ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsConfigurationWrite {
+    /// The bucket carried no configuration under that id; this one was recorded.
+    Stored,
+    /// A configuration of that id was already there and this one replaced it IN FULL.
+    Replaced,
+    /// The bucket already holds [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] configurations
+    /// and this put would add one more; NOTHING was written.
+    QuotaReached,
+}
 
 /// The HTTP status [`INVALID_REQUEST_CODE`] is rendered with: 400, from Amazon S3's "Error
 /// responses" list of error codes. It is the status the replication prerequisite is refused

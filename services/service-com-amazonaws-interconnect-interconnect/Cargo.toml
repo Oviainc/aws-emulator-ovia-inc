@@ -21,10 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The Direct Connect client `ListAttachPoints` resolves the account's Direct Connect
+# gateways through, over the in-process callback into this same emulator (no network
+# client feature is enabled: the transport is the emulator's own). An attach point IS a
+# Direct Connect gateway, which that service owns.
+aws-sdk-directconnect = { version = "1", default-features = false }
 # v4 UUIDs for the server-owned `Connection$sharedId` / `activationKey` and the
-# random suffix of a `ConnectionId`; v5 for the derived, stable Direct Connect
-# gateway ids of the seeded attach points.
-uuid = { version = "1", features = ["v4", "v5"] }
+# random suffix of a `ConnectionId`.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -32,6 +36,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Interconnect tests mount the Direct Connect service beside Interconnect on one
+# engine, because an attach point is one of that service's gateways: `ListAttachPoints`
+# reports what Direct Connect holds, so the suites create the gateways there.
+service-com-amazonaws-directconnect-overtureservice = { workspace = true }
 # `tokio::time::sleep`, which only the integration suite needs: it waits out a
 # connection's provisioning span to observe the clock-owed transition. No handler
 # sleeps, so the runtime dependency above stays without the `time` feature.

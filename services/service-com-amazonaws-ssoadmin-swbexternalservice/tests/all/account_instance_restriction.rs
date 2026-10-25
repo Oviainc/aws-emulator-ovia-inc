@@ -7,9 +7,13 @@
 //! instance (the instance of a single standalone account, which is what `CreateInstance`
 //! creates) every operation of the permission-set / account-assignment surface is refused
 //! with the modelled `ValidationException` (HTTP 400), BEFORE any resource-existence
-//! check; on an organization instance the same requests are served, and an `InstanceArn`
-//! the account holds no instance under remains a missing resource rather than this
-//! refusal.
+//! check; on the organization instance the account discovers through `ListInstances` the
+//! same requests are served, and an `InstanceArn` the account holds no instance under
+//! remains a missing resource rather than this refusal.
+//!
+//! The account instance is reached the way a client reaches one — a `CreateInstance` on an
+//! account whose Identity Center is not enabled yet — not by writing a record into the
+//! store.
 //!
 //! The table spans what the rule generalises over: every operation of the surface, and —
 //! since the refusal depends on the INSTANCE and on nothing else — rows that vary the
@@ -24,7 +28,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, organization_router, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, call, error_code, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
 };
 
 /// One call of the withdrawn surface.
@@ -207,13 +211,12 @@ async fn permission_sets_enabled(router: &MultiServiceRouter, instance_arn: &str
 /// permission-set / account-assignment surface answers 400 `ValidationException`.
 #[tokio::test]
 async fn the_withdrawn_surface_is_refused_on_an_account_instance() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
     assert_eq!(
         permission_sets_enabled(&router, &instance_arn).await,
         Value::Bool(false),
-        "the account's instance is an account instance, so it reports permission sets \
-         disabled"
+        "an instance created through CreateInstance is an account instance, so it reports \
+         permission sets disabled"
     );
 
     for variant in VARIANTS {
@@ -250,8 +253,7 @@ async fn the_withdrawn_surface_is_refused_on_an_account_instance() {
 /// still a missing resource, because the restriction belongs to a RESOLVED instance.
 #[tokio::test]
 async fn the_restriction_precedes_the_existence_checks() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
     let variant = &VARIANTS[0];
 
     // Nothing was ever created on this instance, so every resource these calls name is
@@ -294,13 +296,14 @@ async fn the_restriction_precedes_the_existence_checks() {
     }
 }
 
-/// The same surface on an ORGANIZATION instance: it is SERVED. This is what makes the
-/// refusal above a property of the instance type rather than of the operations — and an
-/// operation whose target resource is absent answers a not-found here, not the
-/// restriction.
+/// The same surface on the ORGANIZATION instance the account discovers through
+/// `ListInstances`: it is SERVED. This is what makes the refusal above a property of the
+/// instance type rather than of the operations — and an operation whose target resource is
+/// absent answers a not-found here, not the restriction.
 #[tokio::test]
 async fn the_same_surface_is_served_on_an_organization_instance() {
-    let (router, instance_arn) = organization_router();
+    let router = router();
+    let instance_arn = seeded_instance_arn(&router).await;
     assert_eq!(
         permission_sets_enabled(&router, &instance_arn).await,
         Value::Bool(true),
@@ -415,8 +418,7 @@ async fn the_same_surface_is_served_on_an_organization_instance() {
 /// instance exactly as it was and a later caller sees no trace of it.
 #[tokio::test]
 async fn a_refused_call_changes_nothing() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
 
     let (status, before) = call(&router, "ListInstances", &json!({})).await;
     assert_eq!(status, 200, "ListInstances expected 200, got {status} {before}");

@@ -29,6 +29,8 @@ mod instance_profile_role_binding;
 mod instance_profile_role_removal;
 #[path = "all/instance_profile_roles.rs"]
 mod instance_profile_roles;
+#[path = "all/instance_profile_tags.rs"]
+mod instance_profile_tags;
 #[path = "all/instance_profiles.rs"]
 mod instance_profiles;
 #[path = "all/login_profiles.rs"]
@@ -43,6 +45,8 @@ mod principal_policy_context_keys;
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]
 mod role_deletion;
+#[path = "all/role_description.rs"]
+mod role_description;
 #[path = "all/role_inline_policies.rs"]
 mod role_inline_policies;
 #[path = "all/role_inline_policy_rotation.rs"]

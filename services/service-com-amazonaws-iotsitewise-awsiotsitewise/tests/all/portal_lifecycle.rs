@@ -688,8 +688,9 @@ async fn a_tag_key_outside_the_modelled_bounds_is_refused_by_the_handler() {
 
     // `TagMap`'s KEYS target `TagKey` (@length 1..128), a bound the framework's
     // constraint walk does not reach — it validates a map's values only — so these
-    // are the HANDLER's own refusals and their error code is pinned. The rows walk
-    // the bound: both published ends, and one character past each.
+    // are the HANDLER's own refusals, answered with the client-input error this
+    // operation models, and their error code is pinned. The rows walk the bound:
+    // both published ends, and one character past each.
     let cases: Vec<(&str, String, bool)> = vec![
         ("the empty key, one below the minimum", String::new(), false),
         ("a key at the minimum length", "k".to_string(), true),
@@ -740,7 +741,7 @@ async fn a_tag_key_outside_the_modelled_bounds_is_refused_by_the_handler() {
         } else {
             assert_eq!(
                 (status, error_code(&answer)),
-                (400, "ValidationException"),
+                (400, "InvalidRequestException"),
                 "case {case:?}: a key outside the bound must be refused, got {status} {answer}"
             );
             // A refused create stores nothing.

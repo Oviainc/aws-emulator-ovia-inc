@@ -305,52 +305,67 @@ async fn an_arn_naming_a_pool_that_is_not_stored_is_not_found() {
 
 /// RULE: a `ResourceArn` that is not an identity-pool ARN of this service names no
 /// resource at all, so it is a bad input parameter (400 `InvalidParameterException`) and
-/// not a missing resource.
+/// not a missing resource — while an ARN outside the bounds the MODEL states for
+/// `ARNString` never reaches the operation: the constraint-validation layer ahead of it
+/// refuses the request with 400 `ValidationException`.
 #[tokio::test]
 async fn an_arn_that_names_no_identity_pool_is_an_invalid_parameter() {
     let emulator = Emulator::new();
     let pool_id = tagged_pool(&emulator, "malformed-arns", None).await;
 
-    let cases: Vec<(&str, String)> = vec![
+    // The third column is the code the row is refused with: the handler's own
+    // `InvalidParameterException` for an ARN it can read and that names nothing of this
+    // service, and `ValidationException` where the value is outside a modelled bound and
+    // so is refused before the handler runs.
+    let cases: Vec<(&str, String, &str)> = vec![
         (
             "not an ARN at all",
             "this-is-not-an-arn-at-all".to_string(),
+            "InvalidParameterException",
         ),
         (
             "another service's ARN namespace",
             format!("arn:aws:cognito-idp:{REGION}:000000000000:userpool/{REGION}_abcdefghi"),
+            "InvalidParameterException",
         ),
         (
             "another resource type in this namespace",
             format!("arn:aws:cognito-identity:{REGION}:000000000000:identity/{pool_id}"),
+            "InvalidParameterException",
         ),
         (
             "no pool id after the resource type",
             format!("arn:aws:cognito-identity:{REGION}:000000000000:identitypool/"),
+            "InvalidParameterException",
         ),
         (
             "an account id that is not twelve digits",
             pool_arn("aws", REGION, "12345", &pool_id),
+            "InvalidParameterException",
         ),
         (
             "an empty region",
             pool_arn("aws", "", engine::emulator_account_id(), &pool_id),
+            "InvalidParameterException",
         ),
         (
             "an empty partition",
             pool_arn("", REGION, engine::emulator_account_id(), &pool_id),
+            "InvalidParameterException",
         ),
         (
             "too few ARN fields",
             format!("arn:aws:cognito-identity:identitypool/{pool_id}"),
+            "InvalidParameterException",
         ),
         (
             "shorter than ARNString's modelled minimum of 20 characters",
             "arn:aws:cognito".to_string(),
+            "ValidationException",
         ),
     ];
 
-    for (case, arn) in cases {
+    for (case, arn, expected_code) in cases {
         let (status, body) = emulator
             .call("ListTagsForResource", &json!({"ResourceArn": arn.clone()}))
             .await;
@@ -359,20 +374,21 @@ async fn an_arn_that_names_no_identity_pool_is_an_invalid_parameter() {
             "case {case:?} ({arn}): expected HTTP 400, got {status} with {body}"
         );
         assert!(
-            error_code(&body).contains("InvalidParameterException"),
-            "case {case:?} ({arn}): expected InvalidParameterException, got {body}"
+            error_code(&body).contains(expected_code),
+            "case {case:?} ({arn}): expected {expected_code}, got {body}"
         );
     }
 
-    // A required member that is absent is the same class of refusal.
+    // A required member that is absent is the same class of refusal as a value outside a
+    // modelled bound: the request never reaches the operation.
     let (status, body) = emulator.call("ListTagsForResource", &json!({})).await;
     assert_eq!(
         status, 400,
         "an absent ResourceArn expected HTTP 400, got {status} with {body}"
     );
     assert!(
-        error_code(&body).contains("InvalidParameterException"),
-        "an absent ResourceArn expected InvalidParameterException, got {body}"
+        error_code(&body).contains("ValidationException"),
+        "an absent ResourceArn expected ValidationException, got {body}"
     );
 }
 

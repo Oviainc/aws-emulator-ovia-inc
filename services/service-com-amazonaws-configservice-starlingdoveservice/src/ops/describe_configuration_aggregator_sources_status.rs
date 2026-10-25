@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConfigurationAggregatorSourcesStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConfigurationAggregatorSourcesStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConfigurationAggregatorSourcesStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the sync status of the aggregation sources the named configuration
+//! aggregator in [`crate::state`] takes in, a page at a time: one record per (source,
+//! Region) pair, narrowed to the status types the request filters on.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConfigurationAggregatorSourcesStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConfigurationAggregatorSourcesStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "Filters the status type": the published `AggregatedSourceStatusType` values,
+        // which the request boundary already holds the member to, so a request that
+        // reaches here filters on statuses a source can be in — or, when it carries
+        // none, on nothing at all, and is served every source.
+        let update_status = input.update_status.unwrap_or_default();
+
+        // "The default is maximum. If you specify 0, Config uses the default." Any
+        // value outside the modelled 0..100 range is refused before this handler runs.
+        let page_size = if input.limit == 0 {
+            crate::state::DESCRIBE_CONFIGURATION_AGGREGATOR_SOURCES_STATUS_PAGE_SIZE
+        } else {
+            input.limit
+        };
+        let page_size = usize::try_from(page_size).unwrap_or_default();
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_aggregated_source_status_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeConfigurationAggregatorSourcesStatusErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken a \
+                                     previous DescribeConfigurationAggregatorSourcesStatus \
+                                     response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // This store stands for ONE account in ONE Region: the account an organization
+        // aggregation source is named by, and the Region a source that aggregates every
+        // Region resolves to.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                DescribeConfigurationAggregatorSourcesStatusErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(crate::state::no_such_configuration_aggregator_message(
+                            &input.configuration_aggregator_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Page over the (source, Region) pairs in that order, so a token holds the pair
+        // the next page resumes at and survives sources added to or taken off the
+        // aggregator between pages.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConfigurationAggregatorSourcesStatus"))
+        // The walk costs ONE PAGE, whatever the aggregator holds: the status filter is
+        // decided once, before any pair is looked at, so a filter these sources are not
+        // in is answered with an empty page rather than a scan; the resume point is
+        // found by binary search over the two sorted lists rather than scanned for; and
+        // a record is built only for a pair that goes into the page.
+        let sources = aggregator
+            .aggregated_sources(account_id, &region)
+            .filter(|sources| {
+                update_status.is_empty()
+                    || update_status
+                        .iter()
+                        .any(|named| named == sources.last_update_status)
+            });
+        let mut page = Vec::new();
+        let mut next_token = None;
+        if let Some(sources) = sources.as_ref() {
+            let (resume_source, resume_region) = match resume_at.as_ref() {
+                Some((resume_source, resume_region)) => {
+                    (Some(resume_source.as_str()), Some(resume_region.as_str()))
+                }
+                None => (None, None),
+            };
+            // The pairs are ordered by source id and then by Region, so the resume point
+            // is the first source at or after the one the token names and, within that
+            // source, the first Region at or after the one it names.
+            let first_source = sources
+                .source_ids
+                .partition_point(|source_id| resume_source.is_some_and(|resume| *source_id < resume));
+            let first_region = sources
+                .aws_regions
+                .partition_point(|aws_region| resume_region.is_some_and(|resume| *aws_region < resume));
+            'sources: for &source_id in sources.source_ids.iter().skip(first_source) {
+                // Only the source the token names starts part way through the Regions;
+                // every later one (and the next source, when the one the token named is
+                // no longer a source) starts at its first Region.
+                let skip_regions = if resume_source == Some(source_id) {
+                    first_region
+                } else {
+                    0
+                };
+                for &aws_region in sources.aws_regions.iter().skip(skip_regions) {
+                    if page.len() == page_size {
+                        next_token = Some(crate::state::encode_aggregated_source_status_token(
+                            source_id, aws_region,
+                        ));
+                        break 'sources;
+                    }
+                    page.push(aggregator.source_status(
+                        source_id,
+                        sources.source_type,
+                        aws_region,
+                    ));
+                }
+            }
+        }
+
+        Ok(DescribeConfigurationAggregatorSourcesStatusOutput {
+            aggregated_source_status_list: Some(page),
+            next_token,
+        })
     }
 }

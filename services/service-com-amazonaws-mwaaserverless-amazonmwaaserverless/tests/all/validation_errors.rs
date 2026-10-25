@@ -698,7 +698,11 @@ fn every_shadow_member_schema_carries_the_model_s_own_constraints() {
 
 /// This service's Smithy model, the source every shadow schema is checked
 /// against.
-fn smithy_model() -> serde_json::Value {
+///
+/// `pub(crate)` so another suite that must read what the model declares (an
+/// operation's own error set, say) reads the same file rather than loading a
+/// second copy of it.
+pub(crate) fn smithy_model() -> serde_json::Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("smithy-model/com-amazonaws-mwaaserverless-amazonmwaaserverless.json");
     let text = std::fs::read_to_string(&path)
@@ -932,16 +936,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "ListTagsForResource",
             serde_json::json!({"ResourceArn": arn.clone()}),
         ),
-        // A paginated listing resolves its parent workflow the same way: an absent one
-        // is a lookup miss, not an empty page.
-        (
-            "ListWorkflowRuns",
-            serde_json::json!({"WorkflowArn": arn.clone()}),
-        ),
-        (
-            "ListWorkflowVersions",
-            serde_json::json!({"WorkflowArn": arn.clone()}),
-        ),
     ];
     for (operation, body) in implemented_cases {
         let (status, answered) = harness.call(operation, body).await;
@@ -950,6 +944,37 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             Some("ResourceNotFoundException"),
             "case {operation:?}: a well-formed but unknown ARN must be a lookup miss, not a \
              validation failure, got {status} {answered:?}"
+        );
+    }
+
+    // A paginated child listing declares no not-found error of its own
+    // (`smithy_query(query="operation", operation="ListWorkflowRuns,ListWorkflowVersions")`),
+    // so a well-formed ARN naming no stored workflow is the empty page it models — still
+    // not a validation failure. `child_listing_error_set` carries that rule in full.
+    let listing_cases: Vec<(&str, serde_json::Value, &str)> = vec![
+        (
+            "ListWorkflowRuns",
+            serde_json::json!({"WorkflowArn": arn.clone()}),
+            "WorkflowRuns",
+        ),
+        (
+            "ListWorkflowVersions",
+            serde_json::json!({"WorkflowArn": arn.clone()}),
+            "WorkflowVersions",
+        ),
+    ];
+    for (operation, body, items) in listing_cases {
+        let (status, answered) = harness.call(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?}: a well-formed but unknown ARN must be an empty page, not a \
+             validation failure, got {status} {answered:?}"
+        );
+        assert_eq!(
+            answered[items].as_array().map(Vec::len),
+            Some(0),
+            "case {operation:?}: expected an empty {items} list, got {:?}",
+            answered[items]
         );
     }
 

@@ -15,6 +15,8 @@
 mod arn_addressed_tag_refusals;
 #[path = "all/batch_and_transact_items.rs"]
 mod batch_and_transact_items;
+#[path = "all/batch_execute_statement.rs"]
+mod batch_execute_statement;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
 #[path = "all/emulator.rs"]
