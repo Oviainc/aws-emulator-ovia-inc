@@ -9,9 +9,11 @@
 //! dictates — the terminal status, the `output` and the `error`/`cause` follow from
 //! the states, the data-flow members, the context object and the intrinsic functions
 //! the definition uses — and only a state or member whose semantics need something
-//! outside this process (a `Task`'s service integration, a Distributed Map's S3
-//! `ItemReader`, a JSONata definition) ends the execution `FAILED` with ASL's
-//! `States.Runtime` and a cause that says what was not run.
+//! outside this process (a `Task` whose `Resource` names no integration call this
+//! emulator makes, a Distributed Map's S3 `ItemReader`, a JSONata definition) ends
+//! the execution `FAILED` with ASL's `States.Runtime` and a cause that says what was
+//! not run. The integration calls that ARE made are
+//! `tests/all/task_integrations.rs`.
 //!
 //! Each table below spans one class of that rule: the recorded Distributed Map that
 //! this suite's issue was filed about is ONE row of the first one.
@@ -380,7 +382,7 @@ async fn the_data_flow_members_decide_what_a_state_reads_and_writes() {
 async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
     let cases = [
         RunCase {
-            case: "a Task state's service integration",
+            case: "a Task state whose Resource names no integration call",
             definition: r#"{"StartAt":"T","States":{"T":{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}}}"#,
             input: "{}",
             expected: Expected::Failure("States.Runtime"),

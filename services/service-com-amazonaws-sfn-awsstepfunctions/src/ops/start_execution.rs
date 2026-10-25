@@ -178,6 +178,35 @@ impl From<StartExecutionErrorModeled> for StartExecutionError {
     }
 }
 
+/// What this operation answers for an execution the store already holds under the
+/// ARN this request would mint: the first request's own response for the documented
+/// idempotent hit, and the modelled `ExecutionAlreadyExists` otherwise.
+///
+/// WHICH of the two it is, is [`crate::state::ComAmazonawsSfnAwsstepfunctionsState::started_already`];
+/// this is how the operation words each, so both places it is asked answer the same.
+fn already_started(
+    already: crate::state::StartedAlready,
+    execution_arn: &str,
+) -> Result<StartExecutionOutput, StartExecutionError> {
+    match already {
+        crate::state::StartedAlready::Idempotent { start_date } => Ok(StartExecutionOutput {
+            execution_arn: execution_arn.to_string(),
+            start_date: crate::state::to_date_time(start_date),
+        }),
+        crate::state::StartedAlready::NameTaken => {
+            Err(StartExecutionErrorModeled::ExecutionAlreadyExists(
+                ExecutionAlreadyExists {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::EXECUTION_ALREADY_EXISTS,
+                        execution_arn,
+                    )),
+                },
+            )
+            .into())
+        }
+    }
+}
+
 /// The `StartExecution` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -287,10 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let started = crate::state::now();
 
-        // Phase 1, under the lock: resolve the state machine and read what the run
-        // needs. The lock is released before the walk, so no other request waits on
-        // an interpretation.
-        let (target, execution_name) = {
+        // Phase 1, under the lock: resolve the state machine, read what the run
+        // needs, and answer a start this execution has already had. The lock is
+        // released before the walk, so no other request waits on an interpretation.
+        let (target, execution_name, arn) = {
             let mut store = state.lock();
             store.settle(started);
             // "The `stateMachineArn` parameter accepts one of the following inputs:
@@ -337,7 +366,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(name) => name,
                 None => store.fresh_execution_name(),
             };
-            (target, execution_name)
+            // The execution ARN is built in the state machine's OWN region, so the
+            // two ARNs always agree however the request was signed.
+            let execution_arn = crate::state::execution_arn(
+                &crate::state::arn_region(&target.state_machine_arn),
+                &target.name,
+                &execution_name,
+            );
+            // An execution the store already holds under that ARN is decided HERE,
+            // before the definition is interpreted: a `Task` state's integration is
+            // a call to another service, and the repeat of an idempotent start must
+            // not make it a second time. The same decision is re-made with the
+            // admitting lock held below, because the name could be taken while the
+            // walk runs.
+            let standard = target.sm_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
+            if let Some(already) =
+                store.started_already(&execution_arn, standard, &execution_input)
+            {
+                return already_started(already, &execution_arn);
+            }
+            (target, execution_name, execution_arn)
         };
         let crate::state::RunTarget {
             state_machine_arn: machine_arn,
@@ -349,10 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             alias_arn,
         } = target;
 
-        // The execution ARN is built in the state machine's OWN region, so the two
-        // ARNs always agree however the request was signed.
         let region = crate::state::arn_region(&machine_arn);
-        let arn = crate::state::execution_arn(&region, &machine_name, &execution_name);
 
         // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here. The walk is
         // bounded by its own step budget, but it is the expensive part of this call,
@@ -375,18 +420,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The walk is CPU work a caller's definition sizes, so it runs on a blocking
         // thread rather than on an async worker: an interpretation that reaches its
         // own deadline (`asl::MAX_INTERPRET_DURATION`) then ends there instead of
-        // holding a worker the runtime needs for health, timeouts and shutdown.
+        // holding a worker the runtime needs for health, timeouts and shutdown. The
+        // service-integration call each `Task` state makes is asynchronous, so it is
+        // made HERE, on this request's own task, with the walk waiting for its answer
+        // (`state::integration::interpret`); the calls go out in the state machine's
+        // own Region, which is the Region its execution reports.
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::state::integration::interpret(ctx, &region, move |tasks| {
                 crate::state::plan_run(
-                    &definition,
-                    &execution_input,
-                    started,
-                    &context,
-                    crate::state::EVENT_EXECUTION_STARTED,
-                    0,
+                    &crate::state::RunAttempt {
+                        definition: &definition,
+                        input: &execution_input,
+                        start: started,
+                        context: &context,
+                        opening: crate::state::EVENT_EXECUTION_STARTED,
+                        previous_event_id: 0,
+                    },
+                    tasks,
                 )
             })
             .await
@@ -469,24 +521,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there is no such hit, and serving a second run under a reused name needs the
         // Express execution ARN's own unique id, which this model does not describe —
         // so rather than overwrite the stored execution, the reused name is refused
-        // with this operation's modelled error.
+        // with this operation's modelled error. The ONE reading of that is
+        // `state::started_already`, asked again here because the name could have been
+        // taken while the walk ran.
         let standard = machine_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
-        if let Some(existing) = store.executions.get(&arn) {
-            if !standard || existing.is_terminal() || existing.input != execution_input {
-                return Err(StartExecutionErrorModeled::ExecutionAlreadyExists(
-                    ExecutionAlreadyExists {
-                        message: Some(crate::state::resource_error_message(
-                            crate::state::EXECUTION_ALREADY_EXISTS,
-                            &arn,
-                        )),
-                    },
-                )
-                .into());
-            }
-            return Ok(StartExecutionOutput {
-                execution_arn: existing.arn.clone(),
-                start_date: crate::state::to_date_time(existing.start_date),
-            });
+        if let Some(already) = store.started_already(&arn, standard, &execution_input) {
+            return already_started(already, &arn);
         }
 
         // The store's caps are in records AND in bytes: an execution retains its
