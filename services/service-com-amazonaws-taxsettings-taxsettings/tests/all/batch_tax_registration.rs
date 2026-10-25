@@ -17,6 +17,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     STATUS_PENDING,
 };
 
+use crate::declared_member_defaults::address_as_stored;
 use crate::tax_registration_lifecycle::{
     call, emulator, emulator_with_engine, hold_validations_open, make_validations_due,
 };
@@ -79,13 +80,16 @@ pub(crate) fn entries() -> Vec<(&'static str, Value)> {
 
 /// The members a submitted entry and the registration a read reports share
 /// verbatim.
+///
+/// `legalAddress` is NOT among them: two of its members declare a default the
+/// write materialises, so it is asserted through
+/// `crate::declared_member_defaults::address_as_stored`.
 const ECHOED_MEMBERS: &[&str] = &[
     "registrationId",
     "registrationType",
     "legalName",
     "sector",
     "certifiedEmailId",
-    "legalAddress",
 ];
 
 /// RULE: a batch write stores the submitted entry as the tax registration of
@@ -150,6 +154,18 @@ async fn a_batch_write_registers_every_account_it_names() {
                         read.body
                     );
                 }
+                // The legal address is what was submitted, with the defaults the
+                // model declares for `addressLine1` and `city` materialised.
+                let submitted_address = entry
+                    .get("legalAddress")
+                    .expect("every entry submits a legal address");
+                assert_eq!(
+                    read.body.pointer("/taxRegistration/legalAddress"),
+                    Some(&address_as_stored(submitted_address)),
+                    "case {case:?}: {account_id}'s legalAddress must be what was submitted with \
+                     the model's declared defaults materialised, got {:?}",
+                    read.body
+                );
                 assert_eq!(
                     read.body
                         .pointer("/taxRegistration/status")
@@ -265,6 +281,15 @@ async fn a_batch_write_replaces_a_record_the_account_already_holds() {
             read.body
         );
     }
+    let rewritten_address = second
+        .get("legalAddress")
+        .expect("the rewriting entry submits a legal address");
+    assert_eq!(
+        read.body.pointer("/taxRegistration/legalAddress"),
+        Some(&address_as_stored(rewritten_address)),
+        "case \"rewrite\": legalAddress must be the rewritten address, got {:?}",
+        read.body
+    );
     let listed = call(&router, "ListTaxRegistrations", &json!({})).await;
     assert_eq!(
         listed.get("accountDetails").as_array().map(Vec::len),

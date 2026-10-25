@@ -206,12 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store is keyed; an identifier naming no stored gateway is the
         // modelled 404 rather than an empty envelope.
         let record = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
-            GetGatewayErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "no gateway with identifier {} exists in this account",
-                    input.gateway_identifier
-                )),
-            })
+            GetGatewayErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+                crate::state::ACTION_RETRIEVE,
+                crate::state::RESOURCE_GATEWAY,
+            ))
         })?;
 
         Ok(record.get_output(now))

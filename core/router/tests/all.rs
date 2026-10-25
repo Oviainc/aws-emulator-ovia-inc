@@ -45,6 +45,8 @@ mod aws_marketplace_signing_name_routing;
 // appended region at the end of this file is where every concurrent suite lands, so a
 // line added there conflicts with every other suite in the same window. Here the
 // neighbouring lines are stable.
+#[path = "all/bedrock_agentcore_execution_role.rs"]
+mod bedrock_agentcore_execution_role;
 #[path = "all/bedrock_agentcore_gateway_lambda_target.rs"]
 mod bedrock_agentcore_gateway_lambda_target;
 #[path = "all/bedrock_agentcore_gateway_mcp_endpoint.rs"]

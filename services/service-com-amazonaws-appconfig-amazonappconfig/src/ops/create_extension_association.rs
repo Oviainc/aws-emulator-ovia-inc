@@ -241,11 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // marked Required must be entered for this field." Both halves are checked
         // against the version's own declaration: a name it does not declare is not a
         // parameter of this extension, and a required one it declares must be given.
+        // The refusal names the extension by its resolved id — the identifier AppConfig
+        // puts in the sentence — whichever form the request addressed it by.
         let parameters = input.parameters.unwrap_or_default();
         if let Some(reason) = crate::state::parameter_value_rejection(
             &version.parameters,
             &parameters,
-            &extension.name,
+            &extension.id,
             version.version_number,
         ) {
             return Err(bad_request(reason));
