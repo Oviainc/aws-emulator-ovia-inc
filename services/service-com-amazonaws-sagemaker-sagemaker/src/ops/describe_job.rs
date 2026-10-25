@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the job `CreateJob` persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +161,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let store = state.lock();
+        // A read, and only a read: a job this emulator accepted stays `InProgress` for as
+        // long as it is held (`crate::state::JOB_STATUS_IN_PROGRESS`), because the work
+        // that would move it is the rollouts the caller's own harness drives — so there
+        // is no transition the clock owes and nothing for this call to materialise.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeJob"))
+        // The pair the request names must BOTH match: `JobCategory` is part of a job's
+        // identity (it is the segment its ARN carries before the name), so a name held
+        // under another category names no job.
+        let Some(job) = store.job(&input.job_category, &input.job_name) else {
+            return Err(DescribeJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                // Worded by the crate's one helper, so every operation that fails to
+                // resolve a reference states the same fact the same way, quoting the
+                // identifier as the caller sent it.
+                message: Some(crate::state::could_not_find(
+                    crate::state::JOB_KIND_LABEL,
+                    &input.job_name,
+                )),
+            })
+            .into());
+        };
+
+        Ok(DescribeJobOutput {
+            job_name: job.name.clone(),
+            job_arn: job.arn.clone(),
+            role_arn: job.role_arn.clone(),
+            job_category: job.category.clone(),
+            job_config_schema_version: job.config_schema_version.clone(),
+            job_config_document: Some(job.config_document.clone()),
+            creation_time: crate::state::timestamp(job.creation_time),
+            last_modified_time: crate::state::timestamp(job.last_modified_time),
+            // A job that is still running has not ended, so there is no `EndTime`, and
+            // nothing has failed, so there is no `FailureReason`.
+            end_time: None,
+            job_status: job.status.clone(),
+            secondary_status: job.secondary_status.clone(),
+            // "Jobs progress through multiple secondary statuses during execution"
+            // (`JobSecondaryStatusTransition`): the history is the statuses this job has
+            // actually been in, which is the one it was accepted in. Its transition has
+            // not ended, so it carries no `EndTime`.
+            secondary_status_transitions: vec![JobSecondaryStatusTransition {
+                status: job.secondary_status.clone(),
+                start_time: crate::state::timestamp(job.creation_time),
+                end_time: None,
+                status_message: None,
+            }],
+            failure_reason: None,
+            tags: Some(job.tags.clone()),
+        })
     }
 }

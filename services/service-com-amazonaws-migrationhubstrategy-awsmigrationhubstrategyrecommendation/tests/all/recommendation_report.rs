@@ -45,7 +45,7 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{at, call, emulator, Answer};
+use crate::import_and_assess::{at, call, emulator, Answer, TEST_REGION};
 
 /// Every value `OutputFormat` admits, from
 /// `smithy_query(query="shape",shape="OutputFormat")`.
@@ -152,11 +152,13 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-/// How many report generation tasks the store holds.
+/// How many report generation tasks the store holds in the Region the calls are signed
+/// for.
 fn stored_task_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     engine
         .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>()
         .lock()
+        .region(TEST_REGION)
         .recommendation_reports
         .len()
 }
@@ -169,8 +171,9 @@ fn emulator_with(servers: Vec<ServerRecord>) -> MultiServiceRouter {
         let state = engine
             .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
         let mut store = state.lock();
+        let portfolio = store.region_entry(TEST_REGION);
         for record in servers {
-            store.servers.insert(record.id.clone(), record);
+            portfolio.servers.insert(record.id.clone(), record);
         }
     }
     let mut router = MultiServiceRouter::new();
@@ -643,9 +646,10 @@ async fn a_start_call_past_the_quota_is_refused() {
         let state = engine
             .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
         let mut store = state.lock();
+        let portfolio = store.region_entry(TEST_REGION);
         for index in 0..REPORT_QUOTA {
             let id = format!("seeded-report-{index:012x}");
-            store.recommendation_reports.insert(
+            portfolio.recommendation_reports.insert(
                 id.clone(),
                 RecommendationReport {
                     id,

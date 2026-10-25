@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIntegrationResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIntegrationResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIntegrationResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +155,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIntegrationResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIntegrationResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIntegrationResponse"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIntegrationResponse",
+            ));
+        };
+        // A reporting operation: it reads the store and writes nothing.
+        let store = state.lock();
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(not_found("API", &input.api_id));
+        };
+        let Some(integration) = api.integrations.get(&input.integration_id) else {
+            return Err(not_found("Integration", &input.integration_id));
+        };
+        // An integration response is resolvable only through the integration that owns
+        // it, so an id another integration minted names nothing here.
+        let Some(record) = integration
+            .integration_responses
+            .get(&input.integration_response_id)
+        else {
+            return Err(not_found(
+                "IntegrationResponse",
+                &input.integration_response_id,
+            ));
+        };
+
+        let stored = record.to_wire();
+        Ok(GetIntegrationResponseOutput {
+            content_handling_strategy: stored.content_handling_strategy,
+            integration_response_id: stored.integration_response_id,
+            integration_response_key: Some(stored.integration_response_key),
+            response_parameters: stored.response_parameters,
+            response_templates: stored.response_templates,
+            template_selection_expression: stored.template_selection_expression,
+        })
     }
+}
+
+/// This operation's refusal of a request naming a resource no record holds: the modelled
+/// `NotFoundException` ("The resource specified in the request was not found"), whose
+/// message names the resource and the identifier the request carried.
+fn not_found(resource: &str, id: &str) -> GetIntegrationResponseError {
+    GetIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::invalid_identifier_message(resource, id)),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

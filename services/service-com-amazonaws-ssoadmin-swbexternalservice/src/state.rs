@@ -415,6 +415,30 @@ pub const ABAC_ENABLE_SPAN: Duration = Duration::from_millis(500);
 /// completion the clock has already made due.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
+/// `ProvisioningStatus::LATEST_PERMISSION_SET_PROVISIONED` — the provisioning status of
+/// an account whose copy of a permission set is the permission set's CURRENT definition
+/// ([`PermissionSetRecord::definition_revision`]).
+pub const PROVISIONING_STATUS_LATEST_PROVISIONED: &str = "LATEST_PERMISSION_SET_PROVISIONED";
+
+/// `ProvisioningStatus::LATEST_PERMISSION_SET_NOT_PROVISIONED` — the provisioning status
+/// of an account that holds the permission set, but a copy of an EARLIER definition of
+/// it: the permission set has changed since it was provisioned there, so the account does
+/// not yet have the latest one.
+pub const PROVISIONING_STATUS_LATEST_NOT_PROVISIONED: &str =
+    "LATEST_PERMISSION_SET_NOT_PROVISIONED";
+
+/// The refusal a `ProvisioningStatus` outside the model's enum earns, as the message of
+/// the caller's own `ValidationException`. BUILT from the member the request got wrong
+/// and the values the model declares for it
+/// ([`crate::ops::types::PROVISIONING_STATUS_VALUES`]), so the caller can fix the request
+/// from this text alone.
+pub fn provisioning_status_unknown_message(provisioning_status: &str) -> String {
+    format!(
+        "ProvisioningStatus must be one of {}, got {provisioning_status}",
+        crate::ops::types::PROVISIONING_STATUS_VALUES.join(", ")
+    )
+}
+
 /// `StatusValues::IN_PROGRESS` — the NON-TERMINAL status an assignment operation carries
 /// from the call that starts it until the instant its completion falls due (see
 /// [`ASSIGNMENT_OPERATION_SPAN`]).
@@ -1539,6 +1563,57 @@ impl PermissionSetRecord {
             .collect()
     }
 
+    /// A fingerprint of the permission set's DEFINITION as it stands now: everything a
+    /// provisioning of it copies into an account.
+    ///
+    /// Two records whose access this permission set grants is identical share a revision,
+    /// and any change to that access — its name, its description, its session duration,
+    /// its relay state, an attached AWS managed policy, an attached customer managed
+    /// policy reference, its inline policy, its permissions boundary — produces a
+    /// different one. `tags` are NOT part of it: they label the permission set itself and
+    /// change nothing about the access an account's copy of it grants.
+    ///
+    /// It is DERIVED from the stored fields on every call rather than stamped on a
+    /// change, so it cannot drift from the definition it describes however the record was
+    /// reached, and the operations that change a permission set need no bookkeeping of
+    /// their own. Each list is preceded by its own section marker and its length, and
+    /// [`request_fingerprint`] length-prefixes every part, so two different definitions
+    /// cannot render alike.
+    pub fn definition_revision(&self) -> String {
+        let mut parts: Vec<String> = vec![
+            self.name.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.session_duration.clone().unwrap_or_default(),
+            self.relay_state.clone().unwrap_or_default(),
+        ];
+        let mut managed_policies = self.managed_policies.clone();
+        managed_policies.sort();
+        managed_policies.dedup();
+        parts.push("managedPolicies".to_string());
+        parts.push(managed_policies.len().to_string());
+        parts.extend(managed_policies);
+        parts.push("customerManagedPolicies".to_string());
+        parts.push(self.customer_managed_policies.len().to_string());
+        parts.extend(self.customer_managed_policies.keys().cloned());
+        parts.push("inlinePolicy".to_string());
+        parts.push(self.inline_policy.clone().unwrap_or_default());
+        match &self.permissions_boundary {
+            None => parts.push("noBoundary".to_string()),
+            Some(PermissionsBoundaryRecord::ManagedPolicy { managed_policy_arn }) => {
+                parts.push("boundary/managed".to_string());
+                parts.push(managed_policy_arn.clone());
+            }
+            Some(PermissionsBoundaryRecord::CustomerManagedPolicy { name, path }) => {
+                parts.push("boundary/customer".to_string());
+                parts.push(name.clone());
+                parts.push(path.clone());
+            }
+        }
+        // The crate's one digest helper, so a revision is built exactly as every other
+        // fingerprint of this service is.
+        request_fingerprint(&parts)
+    }
+
     /// This record as the modeled `PermissionSet` shape — what both
     /// `CreatePermissionSet` and `DescribePermissionSet` return, so a describe answers
     /// byte-identically to the create that stored it.
@@ -1599,6 +1674,16 @@ pub struct AccountAssignmentRecord {
     /// that create answers from the SAME stored status record instead of writing a
     /// second one for work that was already done.
     pub request_id: String,
+    /// The permission set's definition revision ([`PermissionSetRecord::definition_revision`])
+    /// as it stood when this assignment PROVISIONED the permission set into the account.
+    ///
+    /// Granting an account assignment provisions the permission set into the target
+    /// account, so the account then holds the definition that was current at that
+    /// instant. Keeping that revision beside the row is what lets a later read tell an
+    /// account holding the permission set's LATEST definition from one whose copy has
+    /// since been left behind by a change to the permission set, without having to
+    /// re-derive what the account was given.
+    pub provisioned_revision: String,
 }
 
 impl AccountAssignmentRecord {
@@ -2249,6 +2334,47 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
                 && row.principal_type == principal_type
                 && row.principal_id == principal_id
         })
+    }
+
+    /// Every account the permission set `permission_set_arn` names is PROVISIONED into,
+    /// with the provisioning status each of them is in, keyed by account id.
+    ///
+    /// An account holds a permission set once it has been provisioned there — which is
+    /// what granting an account assignment on that account does — however many principals
+    /// were assigned through it, so an account appears at most once. The copy in place is
+    /// the one the LAST provisioning put there, so a provisioning that followed a change
+    /// to the permission set brings the account back up to date.
+    ///
+    /// The status is COMPUTED, by comparing the revision each provisioning recorded
+    /// ([`AccountAssignmentRecord::provisioned_revision`]) against the permission set's
+    /// revision now: equal means the account holds the latest definition
+    /// ([`PROVISIONING_STATUS_LATEST_PROVISIONED`]), and anything else means the
+    /// permission set has changed since
+    /// ([`PROVISIONING_STATUS_LATEST_NOT_PROVISIONED`]). A permission set no instance
+    /// holds under `instance_arn` is provisioned nowhere, so the answer is empty.
+    pub fn provisioned_accounts(
+        &self,
+        instance_arn: &str,
+        permission_set_arn: &str,
+    ) -> BTreeMap<String, &'static str> {
+        let Some(permission_set) = self.permission_set(instance_arn, permission_set_arn) else {
+            return BTreeMap::new();
+        };
+        let revision = permission_set.definition_revision();
+        let mut provisioned: BTreeMap<String, &'static str> = BTreeMap::new();
+        for row in &self.account_assignments {
+            if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
+                continue;
+            }
+            let status = if row.provisioned_revision == revision {
+                PROVISIONING_STATUS_LATEST_PROVISIONED
+            } else {
+                PROVISIONING_STATUS_LATEST_NOT_PROVISIONED
+            };
+            // Later rows were provisioned later, so the copy in place is the last one's.
+            provisioned.insert(row.account_id.clone(), status);
+        }
+        provisioned
     }
 
     /// The status record of the assignment operation `request_id` names, WITHIN
@@ -3027,6 +3153,13 @@ pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> 
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
 }
 
+/// Cursor scope of a `ListApplicationGrants` enumeration: the operation and the
+/// application whose grants it walks, since the key (the grant's type) only
+/// distinguishes rows WITHIN one application.
+pub fn cursor_application_grants(application_arn: &str) -> String {
+    format!("applicationGrants|{application_arn}")
+}
+
 /// Cursor scope of a `ListTagsForResource` enumeration: the operation and the resource
 /// whose tags it walks, which is the whole filter that selected the rows.
 pub fn cursor_tags(resource_arn: &str) -> String {
@@ -3041,6 +3174,21 @@ pub fn cursor_account_assignments(
     permission_set_arn: &str,
 ) -> String {
     format!("accountAssignments|{instance_arn}|{account_id}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListAccountsForProvisionedPermissionSet` enumeration: the operation
+/// and the whole filter that selected the rows — the instance, the permission set whose
+/// provisioned accounts it walks and the `ProvisioningStatus` it was filtered by, since
+/// the key (an account id) only distinguishes rows within one such filter.
+pub fn cursor_accounts_for_provisioned_permission_set(
+    instance_arn: &str,
+    permission_set_arn: &str,
+    provisioning_status: Option<&str>,
+) -> String {
+    format!(
+        "accountsForProvisionedPermissionSet|{instance_arn}|{permission_set_arn}|{}",
+        provisioning_status.unwrap_or_default()
+    )
 }
 
 /// The refusal a `NextToken` this service did not issue earns, as the message of the

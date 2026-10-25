@@ -19,6 +19,8 @@ mod account_assignment_creation_status;
 mod account_assignment_delete;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
+#[path = "all/accounts_for_provisioned_permission_set.rs"]
+mod accounts_for_provisioned_permission_set;
 #[path = "all/application_access_scope_limits.rs"]
 mod application_access_scope_limits;
 #[path = "all/application_access_scopes.rs"]
@@ -35,6 +37,8 @@ mod application_create;
 mod application_create_providers;
 #[path = "all/application_grants.rs"]
 mod application_grants;
+#[path = "all/application_grants_list.rs"]
+mod application_grants_list;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

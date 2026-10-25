@@ -14,16 +14,15 @@
 //!   `Quotas` list, because the code exists;
 //! * the ARN of an AWS DEFAULT quota carries no account segment, while the APPLIED
 //!   quota of the same pair carries the account;
-//! * a QUOTA listing called with no `MaxResults` returns ONE BOUNDED page, with a
-//!   `NextToken` while items remain, and the same items come back however the
-//!   listing is paged (the integrated-service inventory is served whole unasked,
+//! * a QUOTA listing called with no `MaxResults` returns the service's WHOLE quota
+//!   list in one page with no `NextToken`, and the same items come back however the
+//!   listing is paged (the integrated-service inventory is served whole unasked too,
 //!   which `catalog_pagination.rs` pins).
 //!
 //! The harness (`client`, `walk_pages`, `ACCOUNT`) is the one `quota_workflow.rs`
 //! already uses, so both suites speak to the emulator the same way.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_servicequotas_servicequotasv20190624::state::UNASKED_PAGE_SIZE;
 
 use crate::quota_workflow::{client, emulator, walk_pages, Client, ACCOUNT};
 
@@ -321,18 +320,18 @@ async fn an_aws_default_quota_arn_names_no_account_and_the_applied_one_does() {
     }
 }
 
-/// A QUOTA listing called with no `MaxResults` returns ONE BOUNDED page — the page
-/// size the listing applies, with a `NextToken` while items remain — and a caller
-/// that names a page size gets that page size, with the walk yielding the same items.
-/// (`ListServices` serves its whole inventory unasked instead; `catalog_pagination.rs`
-/// pins that.)
+/// A QUOTA listing called with no `MaxResults` returns the WHOLE listing in one page
+/// with no `NextToken` — `MaxResults` bounds what a caller may ask for, not what the
+/// listing serves when none is named — and a caller that names a page size gets that
+/// page size, with the walk yielding the same items. (`ListServices` serves its whole
+/// inventory unasked the same way; `catalog_pagination.rs` pins that.)
 #[tokio::test]
-async fn a_quota_listing_with_no_page_size_returns_one_bounded_page() {
+async fn a_quota_listing_with_no_page_size_returns_the_whole_listing() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
-    // Rows: seeded quota sets of several lengths, including one shorter than a single
-    // unasked page and one longer than it.
+    // Rows: seeded quota sets of several lengths, including one of a handful of rows
+    // and one of several dozen.
     let listings = [
         (
             "ListAWSDefaultServiceQuotas",
@@ -352,27 +351,23 @@ async fn a_quota_listing_with_no_page_size_returns_one_bounded_page() {
     ];
 
     for (operation, body, items) in &listings {
-        // The whole listing, as the token chain yields it.
-        let whole = walk_pages(&client, operation, body, items, None).await;
+        // The whole listing, as the token chain yields it at an asked page size.
+        let whole = walk_pages(&client, operation, body, items, Some(1)).await;
         let unasked = client.ok(operation, body.clone()).await;
         let page = unasked[items]
             .as_array()
             .unwrap_or_else(|| panic!("case {operation}: expected a {items} list, got {unasked}"))
             .clone();
-        let expected = UNASKED_PAGE_SIZE.min(whole.len());
         assert_eq!(
-            page.len(),
-            expected,
-            "case {operation}: an unasked listing is one page of at most {UNASKED_PAGE_SIZE} \
-             items, expected {expected}, got {}",
+            page, whole,
+            "case {operation}: an unasked listing carries the whole listing of {} items, got {}",
+            whole.len(),
             page.len()
         );
-        assert_eq!(
-            unasked["NextToken"].is_string(),
-            whole.len() > UNASKED_PAGE_SIZE,
-            "case {operation}: a NextToken is present exactly while items remain ({} items), \
-             got {unasked}",
-            whole.len()
+        assert!(
+            unasked["NextToken"].is_null(),
+            "case {operation}: the whole listing is the last page, so no NextToken follows it, \
+             got {unasked}"
         );
 
         // Paging it yields exactly the same items, in the same order.

@@ -404,7 +404,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|token| crate::state::ClientToken::minted(token, now)),
             request_fingerprint: fingerprint,
             next_status_due: Some((
-                now + crate::state::TRANSITION_DELAY,
+                crate::state::due_at(now, crate::state::TRANSITION_DELAY),
                 owed_status,
                 owed_message,
             )),

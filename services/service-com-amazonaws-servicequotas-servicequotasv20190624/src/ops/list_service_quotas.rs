@@ -13,10 +13,11 @@
 //!   `RESOURCE` lists one record per resource context a value has been applied to,
 //!   and `ALL` lists both;
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
-//!   issue is `InvalidPaginationTokenException`. `MaxResults` "defaults to a value
-//!   appropriate to the operation", so a caller that names none is served
-//!   [`crate::state::UNASKED_PAGE_SIZE`] rows and a `NextToken` for as long as rows
-//!   remain. The quotas come back in the order the catalog publishes them.
+//!   issue is `InvalidPaginationTokenException`. `MaxResults` bounds what a CALLER may
+//!   ask for, not what this listing serves when none is named: a caller that names no
+//!   `MaxResults` is served the service's WHOLE applied-quota list in one page with no
+//!   `NextToken` ([`crate::state::UNASKED_PAGE_SIZE`]). The quotas come back in the
+//!   order the catalog publishes them.
 //!
 //! Before answering it materialises the increase decisions the clock has already made
 //! due, so the value listed here is the value in force at the instant of the call and
@@ -25,7 +26,8 @@
 //! The listing is the service's WHOLE applied-quota list (every quota the catalog
 //! seeded in [`crate::state`] publishes for the service, with any approved increase
 //! laid over it), which for a service such as EC2 runs past the largest page the
-//! model allows, so a walk takes many `NextToken`-chained pages.
+//! model allows, so a walk with a caller-named page size takes many
+//! `NextToken`-chained pages.
 //!
 //! ---
 //!

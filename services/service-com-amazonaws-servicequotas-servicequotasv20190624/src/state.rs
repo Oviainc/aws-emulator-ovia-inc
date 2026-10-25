@@ -217,57 +217,33 @@ pub const REQUEST_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 
 pub const MAX_PAGE_SIZE: usize = 100;
 
 /// The page size a listing of this service applies when the caller names no
+/// `MaxResults`: the WHOLE listing, in one page.
+///
+/// `MaxResults` bounds what a CALLER may ask for and NOT what a listing serves a
+/// caller that asks for no page size. Its documentation — the same paragraph on every
+/// paginated input of this service — fixes no value: "If you do not include this
+/// parameter, it defaults to a value appropriate to the operation. If additional items
+/// exist beyond those included in the current response, the `NextToken` response
+/// element is present" (`smithy_query(query="doc", shape="ListServiceQuotasRequest",
+/// member="MaxResults")`). What fixes it is OBSERVED behaviour: a recorded listing
+/// called with no `MaxResults` answers with its whole set in a single body and no
+/// `NextToken` — a service's default-quota set whole (dozens of `ServiceQuota`
+/// records for one service, eleven for another), and the integrated-service inventory
+/// `ListServices` enumerates whole, past [`MAX_PAGE_SIZE`] entries, which is more than
+/// the largest page a caller may ask for. So the value appropriate to a listing of
+/// this service is the listing itself, no "additional items exist beyond those
+/// included", and a `NextToken` follows only a page a CALLER cut short with
 /// `MaxResults`.
 ///
-/// `MaxResults`'s own documentation — the same paragraph on every paginated input of
-/// this service — is what makes this a service-side page size rather than "no
-/// limit": "If you do not include this parameter, it defaults to a value appropriate
-/// to the operation. If additional items exist beyond those included in the current
-/// response, the `NextToken` response element is present" (`smithy_query(query="doc",
-/// shape="ListServiceQuotasRequest", member="MaxResults")`), and its note adds that
-/// "An API operation can return fewer results than the maximum even when there are
-/// more results available". So an unasked listing comes back one PAGE at a time, with
-/// a `NextToken` for as long as rows remain, and a caller that wants the whole
-/// listing walks it — which is what every AWS SDK paginator does.
+/// It is `usize::MAX` rather than any listing's length because it is a page LIMIT and
+/// the listings grow as more services, quotas and requests are seeded or made: no
+/// limit means "the whole listing, however long it is".
 ///
-/// The number itself is CHOSEN: the documentation names a default per operation but
-/// not its value, and a recorded `NextToken` is opaque, so nothing published fixes
-/// it. WHY TEN, rather than any other number inside the model's `MaxResults` range:
-///
-/// * it has to be well below the shortest listing this service publishes that is
-///   worth paging, or the `NextToken` path is dead for every caller that names no
-///   `MaxResults` — at [`MAX_PAGE_SIZE`] (100) a service's quota set would come back
-///   whole and no unasked listing would ever report a next page;
-/// * it has to be large enough to be a page rather than a trickle, so a client that
-///   reads one page sees a useful slice of the listing;
-/// * ten is the smallest round decade that satisfies both, and being a round decade
-///   is all the justification there is — the value is a page size, not data, so a
-///   client that cares reads `MaxResults` and the token instead of assuming one.
-///
-/// It is ONE number for every listing whose own unasked page size nothing published
-/// distinguishes. Two listings of this service are NOT governed by it, because their
-/// own page size IS known: `GetQuotaUtilizationReport` keeps the default of 1,000 its
-/// model states outright ([`UTILIZATION_REPORT_PAGE_SIZE`]), and `ListServices` serves
-/// the integrated-service inventory whole ([`SERVICE_CATALOG_UNASKED_PAGE_SIZE`]).
-pub const UNASKED_PAGE_SIZE: usize = 10;
-
-/// The page size `ListServices` applies when the caller names no `MaxResults`: the
-/// WHOLE integrated-service inventory, in one page.
-///
-/// Unlike the quota listings, this listing's unasked page size is OBSERVED rather
-/// than chosen: the recorded answer to `ListServices` with an empty body carries the
-/// integrated-service list in a single body, past 100 entries — more than the largest
-/// page a caller may ask for ([`MAX_PAGE_SIZE`], the ceiling of the model's
-/// `MaxResults` @range 1..100). So `MaxResults` bounds what a CALLER may ask for and
-/// not what this listing returns unasked, and the inventory — the documented way to
-/// discover a `ServiceCode` before any other call — comes back whole, with no
-/// `NextToken`, to a caller that names no page size. A caller that DOES name
-/// `MaxResults` still gets that page size and a `NextToken` while entries remain.
-///
-/// It is `usize::MAX` rather than the catalog's length because it is a page LIMIT and
-/// the catalog grows as more services are seeded: no limit means "the whole listing,
-/// however long it is".
-pub const SERVICE_CATALOG_UNASKED_PAGE_SIZE: usize = usize::MAX;
+/// It is ONE limit for every listing this service paginates. The one listing NOT
+/// governed by it is the one whose own page size IS published:
+/// `GetQuotaUtilizationReport` keeps the default of 1,000 its model states outright
+/// ([`UTILIZATION_REPORT_PAGE_SIZE`]).
+pub const UNASKED_PAGE_SIZE: usize = usize::MAX;
 
 /// `ReportStatus` member `PENDING`: the status a report carries from the call that
 /// initiates it until its generation starts.
@@ -1753,13 +1729,11 @@ pub struct InvalidPageToken;
 /// alphabet, so it matches the modelled `NextToken` pattern
 /// `^[a-zA-Z0-9/+]*={0,2}$` and tells a caller nothing it should be reading.
 ///
-/// A caller that names NO `MaxResults` is served [`UNASKED_PAGE_SIZE`] items, with a
-/// `NextToken` for as long as items remain: `MaxResults` "defaults to a value
-/// appropriate to the operation", so an unasked listing is a PAGE and not the whole
-/// listing. A listing whose own unasked page size is known goes through
-/// [`paginate_bounded`] with it instead (`GetQuotaUtilizationReport` with the 1,000
-/// its model declares, `ListServices` with the whole inventory the recorded answer
-/// carries).
+/// A caller that names NO `MaxResults` is served [`UNASKED_PAGE_SIZE`] items — the
+/// WHOLE listing, in one page with no `NextToken`: `MaxResults` bounds what a caller
+/// may ask for, not what a listing serves when none is asked for. A listing whose own
+/// unasked page size IS published goes through [`paginate_bounded`] with it instead
+/// (`GetQuotaUtilizationReport`, with the 1,000 its model declares).
 pub fn paginate<T>(
     listing: &str,
     all: Vec<T>,
@@ -1780,15 +1754,13 @@ pub fn paginate<T>(
 ///
 /// `caller_page_limit` is the ceiling a caller's `MaxResults` is clamped to, and
 /// `unasked_page_limit` the page size a caller that names no `MaxResults` gets, so
-/// each listing pages at the bounds ITS contract fixes: the quota listings carry
-/// `MaxResults` (1..100) whose default is documented only as "a value appropriate to
-/// the operation", so they take [`UNASKED_PAGE_SIZE`] through [`paginate`];
-/// `GetQuotaUtilizationReport` carries
-/// `MaxResultsUtilization` (1..1000) and documents 1,000 as both the default and the
-/// maximum, which is also the most records `QuotaUtilizationInfoList` may hold, so
-/// its pages are bounded either way; and `ListServices` serves its unasked page from
-/// [`SERVICE_CATALOG_UNASKED_PAGE_SIZE`], the whole inventory, while still clamping
-/// an asked `MaxResults` to [`MAX_PAGE_SIZE`].
+/// each listing pages at the bounds ITS contract fixes: the listings carrying
+/// `MaxResults` (1..100), whose default is documented only as "a value appropriate to
+/// the operation" and observed to be the whole listing, take [`UNASKED_PAGE_SIZE`]
+/// through [`paginate`] while clamping an asked `MaxResults` to [`MAX_PAGE_SIZE`];
+/// `GetQuotaUtilizationReport` carries `MaxResultsUtilization` (1..1000) and documents
+/// 1,000 as both the default and the maximum, which is also the most records
+/// `QuotaUtilizationInfoList` may hold, so its pages are bounded either way.
 pub fn paginate_bounded<T>(
     listing: &str,
     all: Vec<T>,
@@ -1844,8 +1816,8 @@ fn decode_page_token(listing: &str, token: &str) -> Result<usize, InvalidPageTok
 #[derive(Debug, Clone)]
 struct QuotaRow {
     /// AWS's own `QuotaCode`, where this catalog carries it; otherwise `None`, and
-    /// the code is derived from the service code and the quota name (see
-    /// [`derived_quota_code`]).
+    /// the code is the quota name's descriptive one (see
+    /// [`descriptive_quota_code`]).
     code: Option<String>,
     /// `QuotaName`, as AWS publishes it.
     name: String,
@@ -1996,7 +1968,7 @@ fn service(code: &'static str, name: &'static str, quotas: Vec<QuotaRow>) -> Cat
 /// code at all) would be the wrong answer.
 ///
 /// The `QuotaCode` of a row is AWS's own where the table carries it, else the
-/// derived one ([`derived_quota_code`]).
+/// descriptive one ([`descriptive_quota_code`]).
 fn seed_default_quotas() -> Vec<DefaultQuota> {
     let mut default_quotas: Vec<DefaultQuota> = Vec::new();
     for entry in seed_quota_catalog() {
@@ -2004,12 +1976,12 @@ fn seed_default_quotas() -> Vec<DefaultQuota> {
             let code = row
                 .code
                 .clone()
-                .unwrap_or_else(|| derived_quota_code(entry.code, &row.name));
+                .unwrap_or_else(|| descriptive_quota_code(&row.name));
             // A pair identifies a quota, so a repeated QuotaCode within one service
             // would make one of the two rows unreachable through
             // `GetServiceQuota`. A new table row that collides — with another row's
-            // code or with a derived one — fails here, at the source, rather than in
-            // a listing far away.
+            // code or with a descriptive one — fails here, at the source, rather than
+            // in a listing far away.
             debug_assert!(
                 !default_quotas
                     .iter()
@@ -2026,18 +1998,39 @@ fn seed_default_quotas() -> Vec<DefaultQuota> {
 /// The `QuotaCode` of a catalog row whose published code this catalog does not
 /// carry.
 ///
-/// AWS mints an opaque `L-` code for every quota it publishes. Where this catalog
-/// does not carry AWS's own code, the code is DERIVED from the service code and the
-/// quota's published name: 8 uppercase hex characters after the `L-`, the shape
-/// AWS's codes have and one the modelled `QuotaCode` pattern
-/// `^[a-zA-Z][a-zA-Z0-9-]{1,128}$` accepts. It is the same on every run, in every
-/// region, and unique per (service, quota name) — never derived from a request, and
-/// never from the clock.
-fn derived_quota_code(service_code: &str, quota_name: &str) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let digest = Sha256::digest(format!("{service_code}:{quota_name}"));
-    format!("L-{}", hex::encode_upper(&digest[..4]))
+/// AWS mints an opaque `L-` code of its own for every quota it publishes, and that
+/// namespace is AWS's ALONE to mint into: an `L-` code is what a client reads out of
+/// AWS's published catalog and then looks a quota up by, so a code of that form this
+/// emulator made up would resolve a quota AWS never published. Where this catalog
+/// cannot cite AWS's code for a quota, the code is therefore DESCRIPTIVE — the
+/// quota's own published name with its words joined, the same form the `b2bi` row
+/// below carries because that service's own refusal reports its limit under it.
+///
+/// It is the same on every run, in every region, and unique per quota name within a
+/// service (quota names are unique there, and [`seed_default_quotas`] asserts the
+/// pair) — never derived from a request, and never from the clock — and it satisfies
+/// the modelled `QuotaCode` pattern `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`
+/// (`smithy_query(query="shape", shape="ServiceQuota")`).
+pub fn descriptive_quota_code(quota_name: &str) -> String {
+    let mut code = String::new();
+    for word in quota_name.split(|char: char| !char.is_ascii_alphanumeric()) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            code.push(first.to_ascii_uppercase());
+            code.extend(chars);
+        }
+    }
+    // The pattern wants a leading letter and at least two characters, which a name
+    // that starts with a digit or carries fewer than two alphanumerics would not
+    // give on its own.
+    if !code.starts_with(|char: char| char.is_ascii_alphabetic()) {
+        code.insert_str(0, "Quota");
+    }
+    if code.len() < 2 {
+        code.push_str("Quota");
+    }
+    code.truncate(128);
+    code
 }
 
 /// The seeded quota catalog: the quotas each service publishes, and (for a service
@@ -2059,11 +2052,36 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
     vec![
         service(
             "access-analyzer",
-            "IAM Access Analyzer",
+            // The display name AWS's own integrated-service inventory reports for
+            // this code, which is not the console's product name.
+            "Access Analyzer",
             vec![
                 quota("Analyzers per Region", 1.0).fixed(),
-                quota("Archive rules per analyzer", 100.0),
+                quota("Archive rules per analyzer", 100.0)
+                    .code("L-1E51937C")
+                    // The `Description`s on the rows below are this catalog's own
+                    // wording, in the form AWS's published quota descriptions take
+                    // ("The maximum number of <what the quota counts>."): the
+                    // service's own published text is not among the data available
+                    // here, and no rule in the model derives one.
+                    .describe("The maximum number of archive rules per analyzer."),
+                // A quota measured in DAYS of CloudTrail history, which AWS
+                // publishes as not adjustable.
+                quota("Policy generation CloudTrail time range", 90.0)
+                    .code("L-96F55078")
+                    .fixed()
+                    .describe(
+                        "The maximum CloudTrail time range that you can select in days when \
+                         you generate a policy.",
+                    ),
             ],
+        ),
+        service(
+            "account-access",
+            "Account access manager",
+            vec![quota("Group entitlements per role", 20.0)
+                .code("L-42A1D874")
+                .describe("The maximum number of group entitlements per role.")],
         ),
         service(
             "acm",
@@ -2071,17 +2089,95 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![
                 quota("ACM certificates", 2500.0),
                 quota("Imported certificates", 2500.0),
+                // An API REQUEST-RATE quota: AWS publishes these over a one-second
+                // window and measures them with the `AWS/Usage` `CallCount` metric
+                // of the API the quota throttles (see [`call_count_metric`]).
+                quota("Rate of ListAcmeDomainValidations API requests", 50.0)
+                    .code("L-DD60D132")
+                    .period(1, "SECOND")
+                    .metric(call_count_metric("ACM", "ListAcmeDomainValidations"))
+                    .describe(
+                        "The maximum number of ListAcmeDomainValidations API requests per \
+                         second.",
+                    ),
             ],
         ),
         service(
             "acm-pca",
             "AWS Private Certificate Authority",
-            vec![quota("Certificate authorities", 200.0)],
+            vec![
+                quota("Certificate authorities", 200.0),
+                quota("Rate of CreateCertificateAuthority requests", 1.0)
+                    .code("L-01B8608D")
+                    .fixed()
+                    .period(1, "SECOND")
+                    .describe(
+                        "The maximum number of CreateCertificateAuthority requests per second.",
+                    ),
+            ],
+        ),
+        service(
+            "aco-automation",
+            "AWS Compute Optimizer Automation",
+            vec![quota("Throttle rate limit for ListAutomationRules", 5.0)
+                .code("L-1501440B")
+                .fixed()
+                .period(1, "SECOND")
+                .describe("The maximum number of ListAutomationRules requests per second.")],
+        ),
+        service(
+            "agent-registry",
+            "AWS Agent Registry",
+            vec![quota("InvokeRegistryMcp requests per second", 10.0)
+                .code("L-7F384C37")
+                .unit("Count/Second")
+                .period(1, "SECOND")
+                .metric(call_count_metric("AgentRegistry", "InvokeRegistryMcp"))
+                .describe("The maximum number of InvokeRegistryMcp requests per second.")],
+        ),
+        service(
+            "aidevops",
+            "AWS DevOps Agent",
+            vec![quota("concurrent-evaluations-per-agent-space", 1.0)
+                .code("L-4FF187E6")
+                .unit("Count")
+                .fixed()
+                .describe(
+                    "The maximum number of concurrent evaluations per agent space.",
+                )],
+        ),
+        service(
+            "aiops",
+            "Amazon AI Operations",
+            vec![quota("Concurrent active investigations", 2.0)
+                .code("L-EF31E0C4")
+                .metric(usage_metric(
+                    "AIOps",
+                    &[
+                        ("Class", "None"),
+                        ("Resource", "ConcurrentActiveInvestigations"),
+                        ("Type", "Resource"),
+                    ],
+                ))
+                .describe("The maximum number of concurrent active investigations.")],
         ),
         service(
             "airflow",
             "Amazon Managed Workflows for Apache Airflow",
-            vec![quota("Environments per Region", 10.0)],
+            vec![
+                quota(
+                    "Environments per account per Region (small, medium, large)",
+                    10.0,
+                )
+                .code("L-67D41C6B")
+                .describe(
+                    "The maximum number of environments per account per Region for small, \
+                     medium and large environment classes.",
+                ),
+                quota("Web servers per environment", 5.0)
+                    .code("L-52DCDA32")
+                    .describe("The maximum number of web servers per environment."),
+            ],
         ),
         service(
             "amplify",
@@ -2447,21 +2543,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon EMR Serverless",
             vec![quota("Applications per account", 100.0)],
         ),
-        service(
-            "es",
-            "Amazon OpenSearch Service",
-            vec![
-                quota("Domains per Region", 100.0),
-                // The quota `QuotaContextInfo`'s own documentation uses as its worked
-                // example of a RESOURCE-level quota: the instance count is applied per
-                // OpenSearch Service domain, and can also be set account-wide, so AWS
-                // publishes it as adjustable at either level. The scope type names the
-                // resource type the per-resource plane applies to, which for the `es`
-                // service code is its domain resource.
-                quota("Instances per domain", 80.0)
-                    .adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain"),
-            ],
-        ),
+        service("es", "Amazon OpenSearch Service", es_quotas()),
         service(
             "events",
             "Amazon EventBridge (CloudWatch Events)",
@@ -2610,9 +2692,9 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 // page carries, which is why the rate quotas come first. A
                 // `QuotaCode` IDENTIFIES one quota, so a row claims AWS's code only
                 // where the recorded response for that pair says which quota the code
-                // names; every other row takes the derived code
-                // ([`derived_quota_code`]) rather than a pairing this catalog would
-                // be guessing at.
+                // names; every other row takes the descriptive code
+                // ([`descriptive_quota_code`]) rather than a pairing this catalog
+                // would be guessing at.
                 //
                 // Most of the API request-rate quotas AWS publishes as not
                 // adjustable, each with its own `Period`: so many requests per second.
@@ -2732,7 +2814,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 // published list runs well past one page, which is what makes a
                 // `ListServiceQuotas("lambda")` walk take more than one: a page stops
                 // at the page size and a `NextToken` resumes it. None of them carries
-                // AWS's own `QuotaCode` here, so each takes its derived one.
+                // AWS's own `QuotaCode` here, so each takes its descriptive one.
                 //
                 // Their `Description`s are this catalog's own wording — the quotas
                 // page publishes the limit, not a Service Quotas description string —
@@ -2858,15 +2940,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "AWS Application Migration Service",
             vec![quota("Source servers per account", 3000.0)],
         ),
-        service(
-            "monitoring",
-            "Amazon CloudWatch",
-            vec![
-                quota("Alarms per Region", 5000.0),
-                quota("Dashboards per account", 5000.0),
-                quota("Metric streams per account", 100.0),
-            ],
-        ),
+        service("monitoring", "Amazon CloudWatch", monitoring_quotas()),
         service(
             "mq",
             "Amazon MQ",
@@ -3295,23 +3369,26 @@ fn vcpu_usage_metric(class: &str) -> MetricInfo {
 /// `ListServices` pages it in `ServiceCode` order whatever order this table is in.
 const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("AWSCloudMap", "AWS Cloud Map"),
-    ("access-analyzer", "IAM Access Analyzer"),
+    ("access-analyzer", "Access Analyzer"),
     ("acm", "AWS Certificate Manager (ACM)"),
     ("acm-pca", "AWS Private Certificate Authority"),
     ("airflow", "Amazon Managed Workflows for Apache Airflow"),
     ("amplify", "AWS Amplify"),
-    ("amplifyuibuilder", "AWS Amplify UI Builder"),
+    ("amplifyuibuilder", "Amplify UI Builder"),
     ("aoss", "Amazon OpenSearch Serverless"),
     ("apigateway", "Amazon API Gateway"),
+    ("app-integrations", "Amazon Connect Application Integrations"),
     ("appconfig", "AWS AppConfig"),
     ("appflow", "Amazon AppFlow"),
     ("application-autoscaling", "Application Auto Scaling"),
     ("application-signals", "Amazon CloudWatch Application Signals"),
     ("appmesh", "AWS App Mesh"),
     ("apprunner", "AWS App Runner"),
-    ("appstream2", "Amazon AppStream 2.0"),
+    // AppStream 2.0 is listed under the product name it was renamed to.
+    ("appstream2", "Amazon WorkSpaces Applications"),
     ("appstudio", "AWS App Studio"),
     ("appsync", "AWS AppSync"),
+    ("aps", "Amazon Managed Prometheus"),
     ("athena", "Amazon Athena"),
     ("auditmanager", "AWS Audit Manager"),
     ("autoscaling", "Amazon EC2 Auto Scaling"),
@@ -3574,16 +3651,18 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("workspaces", "Amazon WorkSpaces"),
     ("workspaces-web", "Amazon WorkSpaces Secure Browser"),
     ("xray", "AWS X-Ray"),
+    // Recent launches, listed under the display names AWS's own integrated-service
+    // inventory reports for them.
+    ("account-access", "Account access manager"),
+    ("aco-automation", "AWS Compute Optimizer Automation"),
+    ("agent-registry", "AWS Agent Registry"),
+    ("aidevops", "AWS DevOps Agent"),
+    ("aiops", "Amazon AI Operations"),
     // AWS's catalog reports these service codes too, but this emulator has no
     // published display name it can cite for them (they are recent launches). The
     // code is reported as the name rather than inventing one: `ServiceCode` — the
     // member every other operation keys on, and the one the model constrains — stays
     // exactly AWS's, and nothing downstream reads `ServiceName`.
-    ("account-access", "account-access"),
-    ("aco-automation", "aco-automation"),
-    ("agent-registry", "agent-registry"),
-    ("aidevops", "aidevops"),
-    ("aiops", "aiops"),
     ("airflow-serverless", "airflow-serverless"),
     ("aws-mcp", "aws-mcp"),
     ("axis", "axis"),
@@ -3684,9 +3763,44 @@ fn vpc_quotas() -> Vec<QuotaRow> {
     ]
 }
 
+/// Amazon CloudWatch's published quota catalog, under the `ServiceCode` its API
+/// endpoint uses.
+fn monitoring_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Alarms per Region", 5000.0),
+        quota("Dashboards per account", 5000.0),
+        quota("Metric streams per account", 100.0),
+    ]
+}
+
+/// Amazon OpenSearch Service's published quota catalog, under the `ServiceCode` its
+/// API endpoint uses.
+fn es_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Domains per Region", 100.0),
+        // The quota `QuotaContextInfo`'s own documentation uses as its worked
+        // example of a RESOURCE-level quota: the instance count is applied per
+        // OpenSearch Service domain, and can also be set account-wide, so AWS
+        // publishes it as adjustable at either level. The scope type names the
+        // resource type the per-resource plane applies to, which for this service is
+        // its domain resource.
+        quota("Instances per domain", 80.0).adjustable_at(LEVEL_ALL, "AWS::Elasticsearch::Domain"),
+    ]
+}
+
 /// A `UsageMetric` in the `AWS/Usage` namespace, the one Service Quotas reports for
 /// a quota CloudWatch publishes usage for.
-fn usage_metric(service: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
+///
+/// Every `AWS/Usage` metric carries the `Service` the usage belongs to beside the
+/// dimensions the caller names, so that one is added here rather than at each call
+/// site; `metric_name` and `statistic` are what distinguish a resource count from a
+/// call count.
+fn aws_usage_metric(
+    metric_name: &str,
+    statistic: &str,
+    service: &str,
+    dimensions: &[(&str, &str)],
+) -> MetricInfo {
     let mut metric_dimensions = std::collections::HashMap::new();
     metric_dimensions.insert("Service".to_string(), service.to_string());
     for (name, value) in dimensions {
@@ -3694,10 +3808,39 @@ fn usage_metric(service: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
     }
     MetricInfo {
         metric_namespace: Some("AWS/Usage".to_string()),
-        metric_name: Some("ResourceCount".to_string()),
+        metric_name: Some(metric_name.to_string()),
         metric_dimensions: Some(metric_dimensions),
-        metric_statistic_recommendation: Some("Maximum".to_string()),
+        metric_statistic_recommendation: Some(statistic.to_string()),
     }
+}
+
+/// The `UsageMetric` of a quota counted as a number of RESOURCES in use: the largest
+/// count seen over the metric's period is the one that matters, so `Maximum` is the
+/// statistic recommended for it.
+fn usage_metric(service: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
+    aws_usage_metric("ResourceCount", "Maximum", service, dimensions)
+}
+
+/// The `UsageMetric` of an API REQUEST-RATE quota: the `AWS/Usage` `CallCount`
+/// metric of one API.
+///
+/// `AWS/Usage` identifies a call count by the usage `Type` (`API` for a call count,
+/// against `Resource` for a resource count), the `Resource` the count is published
+/// under (the API's own name) and the `Class` of usage (`None` where the service
+/// publishes no class), beside the `Service` every `AWS/Usage` metric carries. Its
+/// statistic is `Sum`, because a rate is the calls ADDED UP over the quota's
+/// `Period`, not the largest one seen in it.
+fn call_count_metric(service: &str, api_name: &str) -> MetricInfo {
+    aws_usage_metric(
+        "CallCount",
+        "Sum",
+        service,
+        &[
+            ("Class", "None"),
+            ("Resource", api_name),
+            ("Type", "API"),
+        ],
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

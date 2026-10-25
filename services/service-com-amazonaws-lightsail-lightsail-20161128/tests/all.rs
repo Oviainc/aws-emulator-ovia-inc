@@ -33,6 +33,8 @@ mod bundle_catalog;
 mod contact_method_notifications;
 #[path = "all/container_image_registry.rs"]
 mod container_image_registry;
+#[path = "all/container_image_registry_login.rs"]
+mod container_image_registry_login;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_metric_data.rs"]
@@ -131,6 +133,8 @@ mod relational_database_snapshot_read;
 mod relational_database_start_stop;
 #[path = "all/relational_database_update.rs"]
 mod relational_database_update;
+#[path = "all/resource_add_ons.rs"]
+mod resource_add_ons;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/setup_history_reporting.rs"]

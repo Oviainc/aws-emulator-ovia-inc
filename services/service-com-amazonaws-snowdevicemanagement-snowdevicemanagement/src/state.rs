@@ -912,6 +912,17 @@ pub fn tag_violation(
     None
 }
 
+/// The `ValidationException` message a request whose `tags` breaks [`tag_violation`] is
+/// refused with.
+///
+/// AWS's validation refusals count the failed constraints and then state each one, so a
+/// single unacceptable tag reads `1 validation error detected: <the violation>`. Every
+/// operation that takes a `TagMap` builds its message here, so the same unacceptable map
+/// is answered the same way whichever one carried it.
+pub fn tag_validation_message(violation: &str) -> String {
+    format!("1 validation error detected: {violation}")
+}
+
 /// The region this request was signed for — what a minted ARN names.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)

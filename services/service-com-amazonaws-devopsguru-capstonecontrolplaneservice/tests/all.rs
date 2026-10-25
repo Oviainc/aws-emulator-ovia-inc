@@ -43,10 +43,14 @@ mod notification_channel_conflict;
 mod organization_health;
 #[path = "all/organization_insight_listing.rs"]
 mod organization_insight_listing;
+#[path = "all/organization_insight_search.rs"]
+mod organization_insight_search;
 #[path = "all/organization_overview.rs"]
 mod organization_overview;
 #[path = "all/organization_resource_collection_health.rs"]
 mod organization_resource_collection_health;
+#[path = "all/recommendations.rs"]
+mod recommendations;
 #[path = "all/resource_collection_health.rs"]
 mod resource_collection_health;
 #[path = "all/state_roundtrip.rs"]

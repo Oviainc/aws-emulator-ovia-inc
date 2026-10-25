@@ -20,7 +20,7 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     AccountInfo, AutomationEvent, AutomationEventFilter, AutomationEventStep, AutomationRule,
     Criteria,
-    DoubleCriteriaCondition, EbsVolumeConfiguration, EstimatedMonthlySavings, Filter,
+    DoubleCriteriaCondition, EbsVolume, EbsVolumeConfiguration, EstimatedMonthlySavings, Filter,
     IntegerCriteriaCondition,
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
     RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
@@ -913,12 +913,13 @@ impl RuleStore {
 /// with the by-id lookup `StartAutomationEvent` needs.
 ///
 /// Compute Optimizer's own analysis is what produces a recommended action, so no
-/// operation of THIS API creates one: the store holds the modelled
-/// `RecommendedAction` as recorded, and `ListRecommendedActions` reports entries
-/// straight out of it, never from the request. It reads like the map it replaces
-/// — `insert(id, action)` / `get(id)` — while also keeping the record order a
-/// paginated list has to page over. `insert` is the only writer, so the order and
-/// the index cannot drift apart.
+/// request CARRIES one: the store holds the modelled `RecommendedAction` as the
+/// service recorded it (see [`recommended_action_inventory`], which is what the
+/// enrollment of an account records), and `ListRecommendedActions` reports
+/// entries straight out of it, never from the request. It reads like the map it
+/// replaces — `insert(id, action)` / `get(id)` — while also keeping the record
+/// order a paginated list has to page over. `insert` is the only writer, so the
+/// order and the index cannot drift apart.
 #[derive(Debug, Default)]
 pub struct RecommendedActionStore {
     /// `recommendedActionId`s in record order, so a list pages over a stable
@@ -942,6 +943,11 @@ impl RecommendedActionStore {
         self.by_id.get(recommended_action_id)
     }
 
+    /// Is an action recorded under `recommended_action_id`?
+    pub fn contains(&self, recommended_action_id: &str) -> bool {
+        self.by_id.contains_key(recommended_action_id)
+    }
+
     /// Every recorded action, in record order.
     pub fn iter_in_order(&self) -> impl Iterator<Item = &RecommendedAction> {
         self.order.iter().filter_map(|id| self.by_id.get(id))
@@ -955,6 +961,325 @@ impl RecommendedActionStore {
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
+}
+
+/// The EBS volume type an upgrade recommendation moves a volume TO.
+///
+/// `RecommendedActionType` names the two actions this service automates
+/// (`smithy_query(query="shape",shape="RecommendedActionType")`), and
+/// `UpgradeEbsVolumeType`'s automation is the `ModifyEbsVolume` step
+/// ([`step_types_for_event_type`]) — a volume-type change. The target is the
+/// current-generation general-purpose SSD, which `EbsVolumeConfiguration$type`
+/// lists among the volume types this service works with ("gp2, gp3, io1, io2,
+/// st1, or sc1").
+const UPGRADE_TARGET_VOLUME_TYPE: &str = "gp3";
+
+/// The IOPS a gp3 volume carries without provisioning any: the baseline every
+/// gp3 volume has.
+const UPGRADE_TARGET_IOPS: i32 = 3_000;
+
+/// The throughput in MiB/s a gp3 volume carries without provisioning any.
+/// `EbsVolumeConfiguration$throughput` is "The throughput in MiB/s provisioned
+/// for the volume (applicable to gp3, io1, and io2bx volumes)", so the upgraded
+/// configuration is the one that names it.
+const UPGRADE_TARGET_THROUGHPUT: i32 = 125;
+
+/// The currency every estimate of this emulator's price list is denominated in.
+const ESTIMATE_CURRENCY: &str = "USD";
+
+/// Per-GiB-month storage rate of each EBS volume type, in thousandths of a
+/// currency unit.
+///
+/// A price list is what turns a configuration into an `estimatedMonthlySavings`,
+/// so the emulator carries one: integral thousandths, so an estimate is the same
+/// number on every platform, over the volume types
+/// `EbsVolumeConfiguration$type` names ("gp2, gp3, io1, io2, st1, or sc1"). A
+/// type outside the list has no rate, so no saving is estimated for it rather
+/// than a guessed one.
+const EBS_STORAGE_RATES_PER_GIB_MONTH: &[(&str, i64)] = &[
+    ("gp2", 100),
+    ("gp3", 80),
+    ("io1", 125),
+    ("io2", 125),
+    ("st1", 45),
+    ("sc1", 15),
+];
+
+/// The per-GiB-month rate of the snapshot a `SnapshotAndDeleteUnattachedEbsVolume`
+/// automation leaves behind: deleting the volume stops paying for the volume and
+/// starts paying for the snapshot, so the saving is the difference.
+const SNAPSHOT_STORAGE_RATE_PER_GIB_MONTH: i64 = 50;
+
+/// How much of an estimated saving a discount takes off it, in percent.
+///
+/// `EstimatedMonthlySavings` requires BOTH a `beforeDiscountSavings` and an
+/// `afterDiscountSavings`, so the price list needs one discount to tell them
+/// apart: the after-discount saving of a discounted rate is proportionally
+/// smaller than the on-demand one.
+const ESTIMATE_DISCOUNT_PERCENT: i64 = 10;
+
+/// The `SavingsEstimationMode` the inventory's estimates are computed in. The
+/// figures are derived from a discounted rate, which is what
+/// [`SAVINGS_MODE_AFTER_DISCOUNT`] names.
+const INVENTORY_SAVINGS_ESTIMATION_MODE: &str = SAVINGS_MODE_AFTER_DISCOUNT;
+
+/// One EBS volume of an account's analysed inventory: the volume as the analysis
+/// found it, plus which of the two automations it recommends for it.
+///
+/// The analysis output is the same shape for every account, so the volumes are
+/// described ONCE here and [`recommended_action_inventory`] renders them per
+/// account.
+#[derive(Debug)]
+struct AnalysedVolume {
+    /// The Region the volume is in, which is the action's `region`.
+    region: &'static str,
+    /// The volume's current `EbsVolumeConfiguration$type`.
+    volume_type: &'static str,
+    /// Its current `sizeInGib`.
+    size_in_gib: i32,
+    /// Its current `iops`.
+    iops: i32,
+    /// How many days of history the recommendation was drawn from.
+    look_back_period_in_days: i32,
+    /// Which `RecommendedActionType` the analysis recommends for it.
+    recommended_action_type: &'static str,
+    /// The tags the volume carries, which the `ResourceTagsKey` /
+    /// `ResourceTagsValue` filters and the `resourceTag` criteria select on.
+    resource_tags: &'static [(&'static str, &'static str)],
+}
+
+/// The EBS volumes this emulator's analysis reports for an enrolled account.
+///
+/// One row per volume the analysis has a recommendation for, spanning both
+/// `RecommendedActionType`s, several Regions, several volume types and sizes and
+/// several look-back periods, so every filter, criteria condition and summary
+/// group of this service has something to select over for an account that has
+/// done nothing but opt in.
+const ANALYSED_VOLUMES: &[AnalysedVolume] = &[
+    AnalysedVolume {
+        region: "us-east-1",
+        volume_type: "gp2",
+        size_in_gib: 500,
+        iops: 1_500,
+        look_back_period_in_days: 14,
+        recommended_action_type: EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE,
+        resource_tags: &[("environment", "production"), ("team", "payments")],
+    },
+    AnalysedVolume {
+        region: "us-east-1",
+        volume_type: "io1",
+        size_in_gib: 200,
+        iops: 5_000,
+        look_back_period_in_days: 32,
+        recommended_action_type: EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE,
+        resource_tags: &[("environment", "production")],
+    },
+    AnalysedVolume {
+        region: "eu-west-1",
+        volume_type: "gp2",
+        size_in_gib: 150,
+        iops: 450,
+        look_back_period_in_days: 93,
+        recommended_action_type: EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE,
+        resource_tags: &[],
+    },
+    AnalysedVolume {
+        region: "us-west-2",
+        volume_type: "io2",
+        size_in_gib: 300,
+        iops: 8_000,
+        look_back_period_in_days: 14,
+        recommended_action_type: EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE,
+        resource_tags: &[("environment", "staging"), ("team", "search")],
+    },
+    AnalysedVolume {
+        region: "us-east-1",
+        volume_type: "gp2",
+        size_in_gib: 1_000,
+        iops: 3_000,
+        look_back_period_in_days: 93,
+        recommended_action_type: EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME,
+        resource_tags: &[("environment", "sandbox")],
+    },
+    AnalysedVolume {
+        region: "eu-west-1",
+        volume_type: "io1",
+        size_in_gib: 80,
+        iops: 2_400,
+        look_back_period_in_days: 32,
+        recommended_action_type: EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME,
+        resource_tags: &[],
+    },
+];
+
+/// The recommended actions this service holds for `account_id` once that account
+/// is enrolled, as `(recommendedActionId, action)` pairs in analysis order.
+///
+/// Compute Optimizer analyses an account's resources once the account is opted
+/// in to Automation, and a recommended action is what that analysis produces, so
+/// the inventory belongs to the ENROLLED account rather than to the process: the
+/// operations that enroll an account record it through
+/// [`ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceState::ensure_recommended_action_inventory`],
+/// and every read path and `StartAutomationEvent` then compute from the one
+/// store.
+///
+/// It is a PURE function of the account id and [`ANALYSED_VOLUMES`]: the same
+/// account always gets the same ids, resources, configurations and estimates,
+/// and two accounts never share an entry, because the identifiers are derived
+/// from the account id and the volume's position in the analysis.
+pub fn recommended_action_inventory(account_id: &str) -> Vec<(String, RecommendedAction)> {
+    ANALYSED_VOLUMES
+        .iter()
+        .enumerate()
+        .map(|(index, volume)| {
+            // Two disjoint runs of one digest: the modelled `^[0-9A-Za-z]{16}$`
+            // id, and the EBS volume id the resource is named by.
+            let digest = hex::encode(Sha256::digest(
+                format!("recommended-action:{account_id}:{index}").as_bytes(),
+            ));
+            let action_id: String = digest.chars().take(MINTED_ID_LEN).collect();
+            let volume_id: String = format!(
+                "vol-0{}",
+                digest
+                    .chars()
+                    .skip(MINTED_ID_LEN)
+                    .take(MINTED_ID_LEN)
+                    .collect::<String>()
+            );
+            let upgrade = volume.recommended_action_type == EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE;
+            let action = RecommendedAction {
+                recommended_action_id: Some(action_id.clone()),
+                // `ResourceArn`'s pattern carries the ARN's own account
+                // segment, and a member account's volume belongs to THAT
+                // account, so the segment is the action's account rather than
+                // the one `engine::emulator_arn` fixes.
+                resource_arn: Some(format!(
+                    "arn:aws:ec2:{}:{account_id}:volume/{volume_id}",
+                    volume.region
+                )),
+                resource_id: Some(volume_id),
+                account_id: Some(account_id.to_string()),
+                region: Some(volume.region.to_string()),
+                // `ResourceType` models exactly one value, and every volume of
+                // the analysis is one.
+                resource_type: Some(RESOURCE_TYPE_EBS_VOLUME.to_string()),
+                look_back_period_in_days: Some(volume.look_back_period_in_days),
+                recommended_action_type: Some(volume.recommended_action_type.to_string()),
+                current_resource_summary: Some(volume_summary(
+                    volume.volume_type,
+                    volume.size_in_gib,
+                )),
+                current_resource_details: Some(ebs_details(
+                    volume.volume_type,
+                    volume.size_in_gib,
+                    volume.iops,
+                    None,
+                )),
+                // An upgrade leaves a volume behind, so it has a recommended
+                // configuration; a snapshot-and-delete leaves none, so it has
+                // no recommended resource to describe.
+                recommended_resource_summary: upgrade.then(|| {
+                    volume_summary(UPGRADE_TARGET_VOLUME_TYPE, volume.size_in_gib)
+                }),
+                recommended_resource_details: upgrade.then(|| {
+                    ebs_details(
+                        UPGRADE_TARGET_VOLUME_TYPE,
+                        volume.size_in_gib,
+                        UPGRADE_TARGET_IOPS,
+                        Some(UPGRADE_TARGET_THROUGHPUT),
+                    )
+                }),
+                // Neither automation stops the resource it acts on: a
+                // volume-type change is applied to the volume in place, and the
+                // volume a snapshot-and-delete removes is an UNATTACHED one.
+                restart_needed: Some(false),
+                estimated_monthly_savings: estimated_monthly_savings(volume),
+                resource_tags: Some(
+                    volume
+                        .resource_tags
+                        .iter()
+                        .map(|(key, value)| Tag {
+                            key: (*key).to_string(),
+                            value: (*value).to_string(),
+                        })
+                        .collect(),
+                ),
+            };
+            (action_id, action)
+        })
+        .collect()
+}
+
+/// The one `ResourceType` the model declares
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+pub const RESOURCE_TYPE_EBS_VOLUME: &str = "EbsVolume";
+
+/// A volume configuration's one-line `currentResourceSummary` /
+/// `recommendedResourceSummary`: the type and the provisioned size.
+fn volume_summary(volume_type: &str, size_in_gib: i32) -> String {
+    format!("{volume_type} {size_in_gib} GiB")
+}
+
+/// A volume configuration as the `ResourceDetails` union carries it.
+fn ebs_details(
+    volume_type: &str,
+    size_in_gib: i32,
+    iops: i32,
+    throughput: Option<i32>,
+) -> ResourceDetails {
+    ResourceDetails::ebsVolume(EbsVolume {
+        configuration: Some(EbsVolumeConfiguration {
+            r#type: Some(volume_type.to_string()),
+            size_in_gib: Some(size_in_gib),
+            iops: Some(iops),
+            throughput,
+        }),
+    })
+}
+
+/// What an analysed volume's recommendation saves per month, computed from the
+/// volume's own configuration and the emulator's price list: the monthly cost of
+/// what the account pays for now, less the monthly cost of what it would pay for
+/// after the action.
+///
+/// `None` for a volume whose type the price list has no rate for, and for a
+/// recommendation that would cost no less than the current configuration: an
+/// estimate is a figure this service computed, so there is none rather than a
+/// zero that looks computed.
+fn estimated_monthly_savings(volume: &AnalysedVolume) -> Option<EstimatedMonthlySavings> {
+    let current_rate = ebs_storage_rate_per_gib_month(volume.volume_type)?;
+    let recommended_rate = match volume.recommended_action_type {
+        EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE => {
+            ebs_storage_rate_per_gib_month(UPGRADE_TARGET_VOLUME_TYPE)?
+        }
+        // The volume is gone and its snapshot is what the account keeps paying
+        // for.
+        EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME => {
+            SNAPSHOT_STORAGE_RATE_PER_GIB_MONTH
+        }
+        _ => return None,
+    };
+    let saved_per_gib = current_rate.checked_sub(recommended_rate)?;
+    let before_thousandths = i64::from(volume.size_in_gib).checked_mul(saved_per_gib)?;
+    if before_thousandths <= 0 {
+        return None;
+    }
+    let after_thousandths = before_thousandths * (100 - ESTIMATE_DISCOUNT_PERCENT) / 100;
+    Some(EstimatedMonthlySavings {
+        currency: ESTIMATE_CURRENCY.to_string(),
+        before_discount_savings: before_thousandths as f64 / 1_000.0,
+        after_discount_savings: after_thousandths as f64 / 1_000.0,
+        savings_estimation_mode: INVENTORY_SAVINGS_ESTIMATION_MODE.to_string(),
+    })
+}
+
+/// The price list's monthly rate for one provisioned GiB of `volume_type`, in
+/// thousandths of a currency unit, or `None` for a type it has no rate for.
+fn ebs_storage_rate_per_gib_month(volume_type: &str) -> Option<i64> {
+    EBS_STORAGE_RATES_PER_GIB_MONTH
+        .iter()
+        .find(|(listed, _)| *listed == volume_type)
+        .map(|(_, rate)| *rate)
 }
 
 /// This action as the `PreviewResult` `ListAutomationRulePreview` reports. The
@@ -2353,12 +2678,13 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     /// The recommended actions this service can automate, by
     /// `recommendedActionId` and in record order.
     ///
-    /// A recommended action is produced by Compute Optimizer's analysis of the
-    /// account's resources, which this emulator does not perform, so nothing in
-    /// this API populates it: `StartAutomationEvent` resolves every id against
-    /// this ONE store, `ListRecommendedActions` pages over it and
-    /// `ListAutomationRulePreview` previews it, so no two of them read two
-    /// copies of one resource.
+    /// A recommended action is produced by the analysis of an account's
+    /// resources that follows the account's enrollment, so the operations that
+    /// enroll an account record that account's inventory here through
+    /// [`Self::ensure_recommended_action_inventory`]. No request carries an
+    /// action: `StartAutomationEvent` resolves every id against this ONE store,
+    /// `ListRecommendedActions` pages over it and `ListAutomationRulePreview`
+    /// previews it, so no two of them read two copies of one resource.
     pub recommended_actions: RecommendedActionStore,
     /// Every automation event, in creation order. Written by the operations
     /// that start and roll back an event; read by the event readers.
@@ -2509,6 +2835,31 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
             enrollment.last_updated_timestamp = Some(at);
         }
         changed
+    }
+
+    /// Record the recommended actions the analysis of `account_id`'s resources
+    /// produces, for an account this service now holds as enrolled.
+    ///
+    /// Compute Optimizer analyses an account's resources once it is opted in to
+    /// Automation, and `ListRecommendedActions`, the two preview lists and
+    /// `StartAutomationEvent` all read that output, so an enrolled account has
+    /// an inventory to list, preview and automate without any call having
+    /// supplied one. Called from the operations that ENROLL an account — never
+    /// from a read path, so what a reader sees does not depend on who read
+    /// before it.
+    ///
+    /// Idempotent: the inventory of an account is a pure function of its id
+    /// ([`recommended_action_inventory`]), and an entry already recorded is left
+    /// exactly as it is, so opting out and back in neither duplicates an action
+    /// nor rewrites one. The store therefore holds at most
+    /// [`ANALYSED_VOLUMES`]`.len()` actions per account, and the accounts
+    /// themselves are capped by [`MAX_ENROLLED_ACCOUNTS`].
+    pub fn ensure_recommended_action_inventory(&mut self, account_id: &str) {
+        for (action_id, action) in recommended_action_inventory(account_id) {
+            if !self.recommended_actions.contains(&action_id) {
+                self.recommended_actions.insert(action_id, action);
+            }
+        }
     }
 
     /// A fresh `ruleId` matching the model's `^[0-9A-Za-z]{16}$`, retried in the

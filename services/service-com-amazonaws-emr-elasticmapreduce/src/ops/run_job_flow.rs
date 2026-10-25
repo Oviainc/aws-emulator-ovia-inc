@@ -406,6 +406,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // "Also called instance profile and Amazon EC2 role. An IAM role for an Amazon
+        // EMR cluster. The Amazon EC2 instances of the cluster assume this role."
+        // (`RunJobFlow$JobFlowRole`.) EMR resolves that profile in IAM at launch time
+        // and refuses the launch when it does not exist — before any cluster state is
+        // written, so a refused request leaves nothing for `ListClusters` to report. The
+        // refusal goes through `refuse`, so this branch leaves the same audit record
+        // every other returning branch of this handler does.
+        if let Some(job_flow_role) = input.job_flow_role.as_deref() {
+            if let Some(message) =
+                crate::state::instance_profile_violation(ctx, &region, job_flow_role).await
+            {
+                return Err(refuse(message));
+            }
+        }
+
         // "The specified managed scaling policy for an Amazon EMR cluster."
         // (RunJobFlow$ManagedScalingPolicy doc.) A policy attached at creation is the
         // same attachment `PutManagedScalingPolicy` makes, so it is persisted on the

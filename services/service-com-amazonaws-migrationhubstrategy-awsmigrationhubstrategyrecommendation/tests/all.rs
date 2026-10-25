@@ -20,6 +20,9 @@ mod application_component_config;
 #[path = "all/application_component_details.rs"]
 mod application_component_details;
 
+#[path = "all/application_component_strategies.rs"]
+mod application_component_strategies;
+
 #[path = "all/assessment_error_paths.rs"]
 mod assessment_error_paths;
 
@@ -55,6 +58,9 @@ mod recommendation_report;
 
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+
+#[path = "all/regional_isolation.rs"]
+mod regional_isolation;
 
 #[path = "all/server_config.rs"]
 mod server_config;

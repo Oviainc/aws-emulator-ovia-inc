@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/completed_deletion.rs"]
+mod completed_deletion;
 #[path = "all/dictionary_lifecycle.rs"]
 mod dictionary_lifecycle;
 #[path = "all/dictionary_listing.rs"]
@@ -27,6 +29,8 @@ mod feed_association;
 mod feed_lifecycle;
 #[path = "all/feed_policy.rs"]
 mod feed_policy;
+#[path = "all/feed_reconfiguration_status.rs"]
+mod feed_reconfiguration_status;
 #[path = "all/feed_release_retry.rs"]
 mod feed_release_retry;
 #[path = "all/feed_usable_on_create.rs"]
