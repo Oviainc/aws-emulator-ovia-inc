@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcPeeringAuthorizations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcPeeringAuthorizations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcPeeringAuthorizations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports every VPC peering authorization this store holds — "all valid VPC peering
+//! operations for the current Amazon Web Services account" — from the records
+//! `CreateVpcPeeringAuthorization` persisted, oldest first. An authorization whose 24-hour
+//! validity the clock has already run out is no longer valid, so it is retired by the
+//! state tick this read runs rather than reported here; this read changes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +139,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcPeeringAuthorizations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcPeeringAuthorizationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcPeeringAuthorizations"))
+        // This operation models no input members, and its response names no region: it
+        // reports the whole collection, so neither the input nor `ctx` selects anything.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeVpcPeeringAuthorizationsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the GameLift emulator state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        state.tick(::std::time::SystemTime::now());
+
+        Ok(DescribeVpcPeeringAuthorizationsOutput {
+            vpc_peering_authorizations: Some(
+                state
+                    .vpc_peering_authorizations_in_order()
+                    .iter()
+                    .map(|authorization| authorization.to_modelled())
+                    .collect(),
+            ),
+        })
     }
 }

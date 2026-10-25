@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .terms_for_client(&input.client_id, &input.terms_name)
             .is_some()
         {
-            return Err(terms_exists(&input.terms_name));
+            return Err(terms_exists(&input.terms_name, &input.client_id));
         }
 
         let terms_id = crate::state::new_uuid();
@@ -275,12 +275,11 @@ fn client_not_found(client_id: &str) -> CreateTermsError {
 }
 
 /// This operation's `TermsExistsException` for a name the app client already
-/// holds terms documents under.
-fn terms_exists(terms_name: &str) -> CreateTermsError {
+/// holds terms documents under, worded as
+/// [`crate::state::terms_exists_message`].
+fn terms_exists(terms_name: &str, client_id: &str) -> CreateTermsError {
     CreateTermsErrorModeled::TermsExistsException(TermsExistsException {
-        message: Some(format!(
-            "Terms documents named {terms_name} already exist for this app client."
-        )),
+        message: Some(crate::state::terms_exists_message(terms_name, client_id)),
     })
     .into()
 }
