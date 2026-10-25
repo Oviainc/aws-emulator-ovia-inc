@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttachedUserPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttachedUserPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttachedUserPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +169,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttachedUserPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttachedUserPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttachedUserPolicies"))
+        // `ctx` carries request metadata only; what this reports comes from the
+        // store and the request's own paging members.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAttachedUserPoliciesErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A read: it reports the attachments the account holds and writes nothing.
+        let store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the case-folded name
+        // is the identity; a name the account holds no user under "referenced a
+        // resource entity that does not exist".
+        let user_key = crate::state::name_key(&input.user_name);
+        if !store.users.contains_key(&user_key) {
+            return Err(ListAttachedUserPoliciesErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The page resumes strictly after the POSITION the marker names in this
+        // user's attachment order, so a token this service did not issue while
+        // paging THIS user's attachments is refused as an "invalid … value …
+        // supplied for an input parameter" rather than read as "start again".
+        let scope = crate::state::user_attached_policies_marker_scope(&user_key);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListAttachedUserPoliciesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "Invalid Marker: the value is not a marker this service issued \
+                                 for this user's attached policies"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // "If it is not included, it defaults to a slash (/), listing all policies."
+        let path_prefix = input
+            .path_prefix
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A user with no attachment at all lists an empty page, exactly as one whose
+        // attachments all fall outside the path prefix does: "if there are no
+        // policies attached to the specified [user] (or none that match the
+        // specified path prefix), the operation returns an empty list".
+        let empty = ::std::collections::BTreeSet::new();
+        let attachments = store
+            .user_attached_policies
+            .get(&user_key)
+            .unwrap_or(&empty);
+        let tail = attachments.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+
+        let mut attached_policies = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for arn in tail {
+            // Both members of `AttachedPolicy` are carried by the ARN the
+            // attachment was made with: a managed policy's ARN ends in its path and
+            // friendly name, which is what the list reports it under.
+            let Some(policy) = crate::state::parse_policy_arn(arn) else {
+                continue;
+            };
+            if !policy.path.starts_with(&path_prefix) {
+                continue;
+            }
+            if attached_policies.len() == page_size {
+                // There is at least one more matching attachment, so the caller
+                // needs another page to see it.
+                is_truncated = true;
+                break;
+            }
+            attached_policies.push(AttachedPolicy {
+                policy_name: Some(policy.policy_name),
+                policy_arn: Some(arn.clone()),
+            });
+            last_key = Some(arn.clone());
+        }
+
+        Ok(ListAttachedUserPoliciesOutput {
+            attached_policies: Some(attached_policies),
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key
+                        .as_deref()
+                        .map(|key| crate::state::encode_marker(&scope, key))
+                })
+                .flatten(),
+        })
     }
 }
