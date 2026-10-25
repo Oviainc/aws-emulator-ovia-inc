@@ -65,6 +65,8 @@ mod pull_through_cache_rule_deletion;
 mod pull_through_cache_rule_validation;
 #[path = "all/pull_through_cache_rules.rs"]
 mod pull_through_cache_rules;
+#[path = "all/pull_time_update_exclusion_quota.rs"]
+mod pull_time_update_exclusion_quota;
 #[path = "all/pull_time_update_exclusion_removal.rs"]
 mod pull_time_update_exclusion_removal;
 #[path = "all/pull_time_update_exclusions.rs"]

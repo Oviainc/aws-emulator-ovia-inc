@@ -953,14 +953,46 @@ pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task def
 pub const DAEMON_TASK_DEFINITION_NOT_FOUND_MESSAGE: &str =
     "Unable to describe daemon task definition.";
 
-/// `ClientException$message` for a `taskDefinition` that names a revision this store
-/// holds in a status that cannot run new work — the `DeregisterTaskDefinition` doc: "You
-/// can't use an `INACTIVE` task definition to run new tasks or create new services, and
-/// you can't update an existing service to reference an `INACTIVE` task definition."
+/// `InvalidParameterException$message` for a `taskDefinition` that names a revision this
+/// store holds in a status that cannot run new work — the `DeregisterTaskDefinition` doc:
+/// "You can't use an `INACTIVE` task definition to run new tasks or create new services,
+/// and you can't update an existing service to reference an `INACTIVE` task definition."
 ///
 /// A condition that names no resource, so like its neighbours above it is ONE sentence
 /// whatever family and revision the request named.
-pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive.";
+pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive";
+
+/// Why a `taskDefinition` reference a call would put to WORK cannot be used — the two
+/// conditions `usable_revision` tells apart, each with the sentence it carries.
+///
+/// They are two DIFFERENT faults, so they are two different modelled errors: a reference
+/// that resolves to nothing names an identifier this store knows nothing about, while one
+/// that resolves to a revision the store HOLDS but may no longer run names an existing
+/// resource in a status this call cannot accept — a parameter whose value is wrong for the
+/// call, not an unknown identifier. A caller branches on the error code to decide what to
+/// do next (register the family, or point the request at a live revision), which is why
+/// the two never collapse onto one code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDefinitionRefusal {
+    /// The reference resolves to no stored revision at all: `ClientException`, with
+    /// [`TASK_DEFINITION_NOT_FOUND_MESSAGE`].
+    NotFound,
+    /// The reference resolves to a stored revision whose status is not
+    /// [`TASK_DEFINITION_ACTIVE`]: `InvalidParameterException`, with
+    /// [`TASK_DEFINITION_INACTIVE_MESSAGE`].
+    Inactive,
+}
+
+impl TaskDefinitionRefusal {
+    /// The sentence this refusal carries, the same one whichever operation resolved the
+    /// reference.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => TASK_DEFINITION_NOT_FOUND_MESSAGE,
+            Self::Inactive => TASK_DEFINITION_INACTIVE_MESSAGE,
+        }
+    }
+}
 
 /// `ClientException$message` for a `nextToken` a paginated read cannot resume from: a
 /// value the operation never minted. Like its neighbours above it is ONE fixed sentence
@@ -2769,10 +2801,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// WORK — run a task of it, or point a service at it — or the `ClientException`
     /// message that refuses the reference.
     ///
-    /// Two conditions, one per message constant. A reference that resolves to no stored
-    /// revision is [`TASK_DEFINITION_NOT_FOUND_MESSAGE`]; one that resolves to a revision
-    /// whose status is not [`TASK_DEFINITION_ACTIVE`] is
-    /// [`TASK_DEFINITION_INACTIVE_MESSAGE`], because "you can't use an `INACTIVE` task
+    /// Two conditions, one per [`TaskDefinitionRefusal`]. A reference that resolves to no
+    /// stored revision is [`TaskDefinitionRefusal::NotFound`]; one that resolves to a
+    /// revision whose status is not [`TASK_DEFINITION_ACTIVE`] is
+    /// [`TaskDefinitionRefusal::Inactive`], because "you can't use an `INACTIVE` task
     /// definition to run new tasks or create new services, and you can't update an
     /// existing service to reference an `INACTIVE` task definition" — a deregistered
     /// revision stays readable (`DescribeTaskDefinition` keeps describing it) but is no
@@ -2787,15 +2819,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &self,
         family: &str,
         revision: Option<i32>,
-    ) -> Result<&TaskDefinitionRecord, &'static str> {
+    ) -> Result<&TaskDefinitionRecord, TaskDefinitionRefusal> {
         match revision {
             None => self
                 .latest_active_revision(family)
-                .ok_or(TASK_DEFINITION_NOT_FOUND_MESSAGE),
+                .ok_or(TaskDefinitionRefusal::NotFound),
             Some(revision) => match self.task_definitions.get(&(family.to_string(), revision)) {
-                None => Err(TASK_DEFINITION_NOT_FOUND_MESSAGE),
+                None => Err(TaskDefinitionRefusal::NotFound),
                 Some(record) if record.status != TASK_DEFINITION_ACTIVE => {
-                    Err(TASK_DEFINITION_INACTIVE_MESSAGE)
+                    Err(TaskDefinitionRefusal::Inactive)
                 }
                 Some(record) => Ok(record),
             },
@@ -4860,6 +4892,44 @@ pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
          {resource_arn:?}",
         kinds.join(", ")
     )
+}
+
+/// The prefix Amazon Web Services keeps for its OWN tags, so no caller-supplied tag may
+/// carry it: the `Tag` doc — "Do not use `aws:`, `AWS:`, or any upper or lowercase
+/// combination of such as a prefix for either keys or values as it is reserved for Amazon
+/// Web Services use. You cannot edit or delete tag keys or values with this prefix."
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// The refusal a request's `tags` list earns when one of its entries would write into the
+/// reserved namespace above, or `None` when every entry is the caller's own to write.
+///
+/// The restriction is the service's, not the model's: `TagKey`'s pattern admits ':', so a
+/// reserved key is a well-formed value the SERVICE refuses — which is why every operation
+/// that takes a `tags` list checks it here, and reports it as the bad parameter it is.
+/// "any upper or lowercase combination of such", so the prefix compares without regard to
+/// case, and it is checked on "either keys or values".
+///
+/// The message names the MEMBER of the entry that failed and the prefix it may not carry,
+/// so a caller is pointed at the one thing to change; like the other fixed refusals in
+/// this module it carries none of the request's values, since the condition is about the
+/// prefix and not about what follows it.
+pub fn reserved_tag_prefix_violation(tags: &[Tag]) -> Option<String> {
+    tags.iter().find_map(|tag| {
+        [("key", tag.key.as_deref()), ("value", tag.value.as_deref())]
+            .into_iter()
+            .find_map(|(member, value)| {
+                starts_with_reserved_tag_prefix(value.unwrap_or_default()).then(|| {
+                    format!("Tag {member} must not start with {RESERVED_TAG_PREFIX}")
+                })
+            })
+    })
+}
+
+/// Whether `value` carries [`RESERVED_TAG_PREFIX`], in any combination of cases.
+fn starts_with_reserved_tag_prefix(value: &str) -> bool {
+    value
+        .get(..RESERVED_TAG_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_PREFIX))
 }
 
 /// Associate `requested` with the tag set `stored`, the way a tagging write does:

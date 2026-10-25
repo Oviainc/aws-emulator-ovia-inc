@@ -413,8 +413,8 @@ async fn a_next_token_this_service_did_not_issue_is_refused_as_an_invalid_parame
 
 /// Every other refusal this slice answers carries the same error class, so a client
 /// has ONE error type to switch on for "this request was not acceptable". The rows
-/// are a feature list the service refuses, an unevaluable finding-criteria attribute
-/// and an unevaluable sort attribute.
+/// are a feature list the service refuses, a criterion key that names no field of a
+/// finding and a sort attribute that names none either.
 #[tokio::test]
 async fn every_client_rejection_carries_the_same_error_class() {
     let router = new_router();
@@ -448,12 +448,12 @@ async fn every_client_rejection_carries_the_same_error_class() {
 
     for (case, request) in [
         (
-            "an unevaluable finding-criteria attribute",
-            json!({"findingCriteria": {"criterion": {"service.action.actionType": {"equals": ["DNS_REQUEST"]}}}}),
+            "a criterion key that names no finding field",
+            json!({"findingCriteria": {"criterion": {"service.actionType": {"equals": ["DNS_REQUEST"]}}}}),
         ),
         (
-            "an unevaluable sort attribute",
-            json!({"sortCriteria": {"attributeName": "resource.instanceDetails.instanceId"}}),
+            "a sort attribute that names a detail document rather than a field in it",
+            json!({"sortCriteria": {"attributeName": "resource.instanceDetails"}}),
         ),
     ] {
         let (status, body) = call(

@@ -3,8 +3,9 @@
 //! Managed Blockchain is a REGIONAL service: every resource belongs to the Region the call
 //! that created it was signed for, and a request addressed to any other Region resolves
 //! none of it — an id-addressed read, create-on, update or delete answers the modelled
-//! `ResourceNotFoundException` (`ListNodes`, whose model declares none, refuses the member
-//! scope as an invalid request instead), and a listing reports none of it.
+//! `ResourceNotFoundException` (an operation whose model declares none — `ListMembers`,
+//! `ListNodes`, `ListProposalVotes` — refuses the scope as an invalid request instead),
+//! and a listing reports none of it.
 //!
 //! The tables span the classes that rule generalises over:
 //!
@@ -98,12 +99,14 @@ struct Case {
     refusal: (u16, &'static str),
 }
 
-/// The modelled refusal for a resource a Region does not hold: the same answer as an id
-/// that was never created.
+/// The modelled refusal for a resource a Region does not hold, for an operation whose own
+/// error list declares `ResourceNotFoundException`: the same answer as an id that was never
+/// created.
 const NOT_FOUND: (u16, &str) = (404, "ResourceNotFoundException");
 
-/// `ListNodes` models no `ResourceNotFoundException` at all, so an unresolvable scope is
-/// refused as an invalid request — which is what a `NetworkId` of another Region is.
+/// `ListMembers`, `ListNodes` and `ListProposalVotes` model no `ResourceNotFoundException`
+/// at all, so an unresolvable scope is refused as an invalid request — which is what a
+/// `NetworkId` of another Region is.
 const INVALID_REQUEST: (u16, &str) = (400, "InvalidRequestException");
 
 /// The id-addressed READS and listings of one Region's resources: safe to send to any
@@ -158,7 +161,7 @@ fn read_cases(held: &Held) -> Vec<Case> {
             method: "GET",
             path: format!("/networks/{network_id}/members"),
             body: None,
-            refusal: NOT_FOUND,
+            refusal: INVALID_REQUEST,
         },
         Case {
             name: "ListNodes".to_string(),
@@ -179,9 +182,6 @@ fn read_cases(held: &Held) -> Vec<Case> {
             method: "GET",
             path: format!("/networks/{network_id}/proposals/{proposal_id}/votes"),
             body: None,
-            // Like `ListNodes`, this operation's model declares no
-            // `ResourceNotFoundException`, so it refuses an unresolvable proposal as an
-            // invalid request — which is what a proposal of another Region is.
             refusal: INVALID_REQUEST,
         },
         Case {

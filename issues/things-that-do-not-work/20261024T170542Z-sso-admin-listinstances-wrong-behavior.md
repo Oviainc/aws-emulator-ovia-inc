@@ -11,6 +11,17 @@ _Operation: ListInstances | Class: wrong-behavior_
 
 ## Description
 
+> **Superseded, do not fix as written.** The behavioral ground truth recorded for this
+> service (checks `sso-admin.abac-configuration-lifecycle` and
+> `sso-admin.account-assignment-full-lifecycle`) shows the opposite: in the recorded
+> account the instance `ListInstances` hands out IS an account instance, and the
+> permission-set / account-assignment / ABAC surface is refused on it with HTTP 400
+> `ValidationException`. The seeding this issue asks for was applied and has since been
+> reverted to match that recording; `UpdateInstance {PermissionSetsEnabled: true}` is the
+> documented call that makes the surface reachable over the wire on that instance, which
+> `tests/all/discovered_instance_surface.rs` now pins end to end. Flipping the seed back
+> would re-break the two recorded checks.
+
 The single instance this emulator reports for the account is seeded as an IAM Identity Center *account* instance (`state::SEED_INSTANCE_TYPE = InstanceType::Account`), i.e. `DescribeInstance`/`ListInstances` report it with `PermissionSetsEnabled: false`. Because `InstanceType::permission_sets_enabled()` is only true for `Organization`, `ComAmazonawsSsoadminSwbexternalserviceState::permission_set_surface_withdrawn` / `abac_surface_withdrawn` return true for that instance, and EVERY implemented operation of the permission-set surface refuses it up front with HTTP 400 `ValidationException` ("This operation is not supported for account instances of IAM Identity Center.") before any lookup.
 
 Expected (real AWS, and the normal client workflow): `ListInstances` -> take the returned `InstanceArn` -> `CreatePermissionSet` -> `DescribePermissionSet` -> `CreateAccountAssignment` -> `ListAccountAssignments` all succeed with 200. In recorded AWS environments for these operations the instance returned by `ListInstances` is an organization instance with `PermissionSetsEnabled: true`.

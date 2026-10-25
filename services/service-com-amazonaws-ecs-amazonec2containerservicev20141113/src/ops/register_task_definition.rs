@@ -440,6 +440,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(RegisterTaskDefinitionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let mut guard = state.lock();
 

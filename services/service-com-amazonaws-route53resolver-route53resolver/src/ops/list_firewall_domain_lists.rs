@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallDomainLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallDomainLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallDomainLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Pages over the DNS Firewall domain lists this
+//! account can see — the lists DNS Firewall publishes itself
+//! ([`crate::state::MANAGED_FIREWALL_DOMAIN_LISTS`]) and the records
+//! `CreateFirewallDomainList` persisted — one `@paginated` page at a time. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +159,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallDomainLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallDomainListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallDomainLists"))
+        // The engine is reachable from `&self` (constructor-injected); `ctx`
+        // carries the request metadata the ARNs are rooted in.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFirewallDomainListsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // "Retrieves the firewall domain lists that you have defined": a pure
+        // read. The page is cut out of the published catalog followed by the
+        // stored records in creation order, and the cursor is a pure function of
+        // the offset, so nothing a later caller sees changes.
+        let page = {
+            let store = state.lock();
+            // The lists DNS Firewall publishes itself are visible to every
+            // account in every region, so they are part of what this operation
+            // reports, ahead of the account's own records: that keeps them a
+            // FIXED prefix of the collection, so a create while a caller is
+            // paging only ever appends past the page it already read.
+            let all: Vec<FirewallDomainListMetadata> = crate::state::MANAGED_FIREWALL_DOMAIN_LISTS
+                .iter()
+                .map(|managed| managed.to_metadata(&region))
+                .chain(
+                    store
+                        .firewall_domain_lists_in_creation_order()
+                        .into_iter()
+                        .map(|record| record.to_metadata()),
+                )
+                .collect();
+            crate::state::paginate(
+                all,
+                crate::state::FIREWALL_DOMAIN_LIST_LIST_SCOPE,
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            // This operation models no `InvalidNextTokenException`, so a cursor
+            // this service did not mint for this collection is refused with the
+            // `ValidationException` it does model, rather than being read as
+            // "start from the beginning" and silently repeating page one.
+            return Err(ListFirewallDomainListsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "The NextToken you provided was not issued by this service for this query"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListFirewallDomainListsOutput {
+            // "A list of the domain lists that you have defined": a page is
+            // always reported as a list, so a caller iterating it needs no
+            // special case for an account that has defined none.
+            firewall_domain_lists: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

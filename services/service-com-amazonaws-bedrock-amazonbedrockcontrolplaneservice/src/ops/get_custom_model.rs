@@ -201,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let record = record.clone();
+        // The members a model customization JOB fills are read off THAT job — the one
+        // record holding the hyperparameters, the datasets and the output location the
+        // customization ran with — so this read and `GetModelCustomizationJob` report the
+        // same values. A model created from artifacts was produced by no such job
+        // (`jobArn` says so itself: "For models that you create with the CreateCustomModel
+        // API operation, this is NULL"), so for it there is nothing of the kind to report.
+        let job = record
+            .job_arn
+            .as_ref()
+            .and_then(|arn| store.model_customization_jobs.get(arn));
 
         Ok(GetCustomModelOutput {
             model_arn: record.arn.clone(),
@@ -210,22 +221,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             model_kms_key_arn: record.model_kms_key_arn.clone(),
             creation_time: crate::state::date_time(record.created_at),
             model_status: Some(record.status.to_string()),
-            // The members a model customization JOB fills. A model created from artifacts
-            // was produced by no such job — `jobArn` says so itself ("For models that you
-            // create with the CreateCustomModel API operation, this is NULL") — so there
-            // is no job identity, no training or validation dataset, no output location,
-            // no hyperparameters and no metrics to report for it.
-            job_name: None,
-            job_arn: None,
-            hyper_parameters: None,
-            training_data_config: None,
-            validation_data_config: None,
-            output_data_config: None,
+            job_name: job.map(|job| job.name.clone()),
+            job_arn: record.job_arn.clone(),
+            hyper_parameters: job.and_then(|job| job.hyper_parameters.clone()),
+            training_data_config: job.map(|job| job.training_data_config.clone()),
+            validation_data_config: job.map(|job| job.validation_data_config.clone()),
+            output_data_config: job.map(|job| job.output_data_config.clone()),
+            customization_config: job.and_then(|job| job.customization_config.clone()),
+            // The training and validation metrics are computed BY the customization run;
+            // this emulator runs none, so neither is reported rather than reported as a
+            // fabricated loss.
             training_metrics: None,
             validation_metrics: None,
-            customization_config: None,
             // "A failure message for any issues that occurred when creating the custom
-            // model": nothing here makes an accepted create fail, so there is none.
+            // model": nothing here makes an accepted create or customization fail, so there
+            // is none.
             failure_message: None,
         })
     }

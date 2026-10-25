@@ -31,7 +31,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
     call, create_monitor, create_probe, error_code, get_monitor, probes_of, router, source_arn,
-    string_at, ACCOUNT, PAST_ACTIVATION, REGION,
+    string_at, ACCOUNT, PAST_ACTIVATION, PAST_TEARDOWN, REGION,
 };
 
 /// Every value the model's `ProbeState` enum admits
@@ -829,9 +829,9 @@ async fn modified_at_moves_only_when_a_stored_value_changed() {
 /// `ResourceNotFoundException`, and stores nothing.
 ///
 /// The table spans a monitor that never existed, a stored monitor whose probe
-/// id nothing minted, a probe that was deleted, and a probe id of another
-/// monitor — all at the shortest and longest spellings the modelled `ProbeId`
-/// pattern (`^probe-[a-z0-9A-Z-]{21,64}$`) admits.
+/// id nothing minted, a probe whose teardown has finished, and a probe id of
+/// another monitor — all at the shortest and longest spellings the modelled
+/// `ProbeId` pattern (`^probe-[a-z0-9A-Z-]{21,64}$`) admits.
 #[tokio::test]
 async fn an_update_of_an_unknown_probe_is_not_found() {
     let router = router();
@@ -840,7 +840,8 @@ async fn an_update_of_an_unknown_probe_is_not_found() {
     let (other, other_probe, _) = probe_fixture(&router, "other-monitor", probe).await;
 
     // A probe of `present-monitor`, deleted again: its id is well-formed and was
-    // minted, and nothing is stored under it any more.
+    // minted, and once the teardown that delete started has run its course
+    // nothing is stored under it any more.
     let (status, deleted) = call(
         &router,
         "DELETE",
@@ -849,6 +850,7 @@ async fn an_update_of_an_unknown_probe_is_not_found() {
     )
     .await;
     assert_eq!(status, 200, "setup DeleteProbe expected 200, got {deleted:?}");
+    std::thread::sleep(PAST_TEARDOWN);
 
     let shortest = format!("probe-{}", "a".repeat(21));
     // 63 characters after the prefix, inside the pattern's 21..64.
@@ -871,7 +873,7 @@ async fn an_update_of_an_unknown_probe_is_not_found() {
             longest,
         ),
         (
-            "the id of a probe that was deleted",
+            "the id of a probe whose teardown has finished",
             present.clone(),
             present_probe,
         ),

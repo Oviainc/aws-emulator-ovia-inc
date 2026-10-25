@@ -170,47 +170,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own cursors. Anything that does not decode to one was never issued here — a bare
         // customer-agreement id included — and is refused with the service's one fixed
         // invalid-token text, the same as every other token member.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => match crate::state::parse_customer_agreements_page_token(token) {
-                Some(position) => position,
-                None => {
-                    return Err(ListCustomerAgreementsErrorModeled::ValidationException(
-                        crate::state::invalid_token(),
-                    )
-                    .into())
-                }
-            },
-        };
+        let resume_at = crate::state::resume_position(
+            input.next_token.as_deref(),
+            crate::state::parse_customer_agreements_page_token,
+        )
+        .map_err(ListCustomerAgreementsErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
-        let mut customer_agreements = Vec::new();
-        let mut next_token = None;
-        let mut position = 0usize;
-        for agreement in store.customer_agreements.values() {
-            // "List active customer-agreements applicable to calling identity": a
-            // terminated agreement is persisted but not reported. Filtering BEFORE the
-            // page-size check is what keeps a `nextToken` pointing at an agreement the
-            // next page will actually report.
-            if !agreement.is_active() {
-                continue;
-            }
-            // Resume at the cursor's position in this operation's own reported order, so
-            // a page is still served when the agreement it was cut after left the set.
-            if position < resume_at {
-                position += 1;
-                continue;
-            }
-            if customer_agreements.len() >= page_size {
-                next_token = Some(crate::state::customer_agreements_page_token(position));
-                break;
-            }
-            customer_agreements.push(agreement.to_summary(&region));
-            position += 1;
-        }
+        // "List active customer-agreements applicable to calling identity": a terminated
+        // agreement is persisted but not reported. Filtered BEFORE the walk is what keeps
+        // a `nextToken` pointing at an agreement the next page will actually report.
+        let reported = store
+            .customer_agreements
+            .values()
+            .filter(|agreement| agreement.is_active());
+        // The service's one page-walk rule: resume at the cursor's position in this
+        // operation's own reported order — so a page is still served when the agreement it
+        // was cut after left the set — and cut the page at `maxResults`.
+        let (customer_agreements, next_token) = crate::state::walk_page(
+            reported,
+            resume_at,
+            page_size,
+            crate::state::customer_agreements_page_token,
+            |agreement| agreement.to_summary(&region),
+        );
 
         Ok(ListCustomerAgreementsOutput {
             customer_agreements,

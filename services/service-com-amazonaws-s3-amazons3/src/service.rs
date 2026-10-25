@@ -25,7 +25,9 @@
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   wording; THIS service rewords exactly one member (see `abac_status_refusal`)
+//!   and keeps that wording for everything else. See the inline note on that
+//!   method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -50,6 +52,8 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 use wire::UnwrappedXmlRestXml;
 
@@ -90,6 +94,39 @@ fn addresses_peer_path(parts: &http::request::Parts, peer_segments: &[&str]) -> 
         // The ROOT path (`GET /?x-id=ListBuckets`) is S3's own; no peer claims it.
         None => false,
     }
+}
+
+/// The dotted boundary-validation path of `PutBucketAbacRequest$AbacStatus$Status`.
+///
+/// The validator reports a violation by the trail of Smithy member names from the
+/// operation input inwards, each segment lowerCamel-ed — so the `Status` inside the
+/// `AbacStatus` container `PutBucketAbac` carries as its payload is this. `AbacStatus` is
+/// reached by no other INPUT in this service
+/// (`smithy_query(query="shape",shape="AbacStatus")` is referenced by
+/// `PutBucketAbacRequest` and by `GetBucketAbacOutput`, and an output is not validated),
+/// so the path names that one member.
+const ABAC_STATUS_STATUS_PATH: &str = "abacStatus.status";
+
+/// Reword a boundary refusal of the `Status` inside a `PutBucketAbac` payload as the code
+/// S3 answers a document that does not validate against its published schema with.
+///
+/// `AbacStatus$Status` targets an `enum` shape, so a value outside `BucketAbacStatus` is
+/// refused by the boundary validator before the handler runs, and the framework's generic
+/// code for that is `ValidationException`. S3 answers a payload that does not match the
+/// schema it publishes with `MalformedXML` instead — which is also what
+/// [`crate::ops::put_bucket_abac`] answers the same payload naming no `Status` at all with,
+/// so without this reword one operation would report one logical failure under two codes.
+/// Nothing else is reworded: every other operation and member keeps the framework's
+/// wording.
+fn abac_status_refusal(violation: &Violation) -> Option<Refused> {
+    matches!(
+        (violation.path.as_str(), &violation.kind),
+        (ABAC_STATUS_STATUS_PATH, ViolationKind::EnumValue(_))
+    )
+    .then(|| Refused {
+        code: crate::state::MALFORMED_XML_CODE.to_string(),
+        message: crate::state::MALFORMED_XML_MESSAGE.to_string(),
+    })
 }
 
 /// The `com-amazonaws-s3-amazons3` emulated service: the generated [`ServiceDefinition`] plus
@@ -159,15 +196,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. S3 keeps the framework's generic `ValidationException`
+        // report for all but one member: the `Status` inside a `PutBucketAbac`
+        // payload, where the boundary's refusal and the handler's own would
+        // otherwise answer one logical failure under two codes. See
+        // [`abac_status_refusal`]; every other operation and member is declined, so
+        // the framework's wording stays in place for them.
+        match refusal {
+            Refusal::Invalid(violations) => violations.iter().find_map(abac_status_refusal),
+            // Authentication refusals, and any refusal kind added later, keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

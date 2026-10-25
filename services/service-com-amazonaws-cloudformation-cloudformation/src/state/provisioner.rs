@@ -405,12 +405,13 @@ impl Provisioner {
     /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
     /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
     /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
-    /// half of a pair.
+    /// half of a pair, and so does Amazon ECS's `CreateCluster`.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
             Self::IamRole
                 | Self::CodePipelinePipeline
+                | Self::EcsCluster
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
@@ -2399,7 +2400,8 @@ const ECS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
 ///
 /// The cluster carries the tags the declaration asks for plus the ones CloudFormation gives
 /// the resource ([`tags_of`]), as the list Amazon ECS's own `Tag` shape spells in lower
-/// camel case.
+/// camel case — less the `aws:cloudformation:*` ones, which `CreateCluster` refuses to a
+/// caller like the other reserved-namespace APIs ([`Provisioner::applicable_tags`]).
 async fn create_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,

@@ -16,7 +16,10 @@
 //! * "You can't use an `INACTIVE` task definition to run new tasks or create new
 //!   services, and you can't update an existing service to reference an `INACTIVE` task
 //!   definition. ... Existing services that reference an `INACTIVE` task definition can
-//!   still scale up or down by modifying the service's desired count."
+//!   still scale up or down by modifying the service's desired count." Such a reference
+//!   RESOLVES — the revision is held, in a status the call may not use — so it is refused
+//!   as the bad parameter it is, while a reference that resolves to no revision at all is
+//!   the unknown identifier it is; the two conditions keep two distinct error codes.
 //!
 //! Every case drives the emulator through the shared wire harness in [`crate::ecs_wire`],
 //! the same front door a client uses, so nothing reaches into the state struct and a
@@ -504,9 +507,14 @@ async fn an_inactive_revision_cannot_be_used_to_run_new_work() {
             let case = format!("{operation} on the INACTIVE revision as {reference:?}");
             let (code, message) =
                 refusal(&router, operation, request_for(operation, reference, slot), &case).await;
+            // A reference that RESOLVES to a revision this service holds, in a status
+            // this call may not use, is a parameter whose value is wrong for the call —
+            // not an unknown identifier, which is what the family-with-no-ACTIVE-revision
+            // rows further down report as a ClientException.
             assert_eq!(
-                code, "ClientException",
-                "case {case:?}: expected a ClientException, got {code} with {message:?}"
+                code, "InvalidParameterException",
+                "case {case:?}: expected an InvalidParameterException, got {code} with \
+                 {message:?}"
             );
             refusals.push((case, code, message));
         }

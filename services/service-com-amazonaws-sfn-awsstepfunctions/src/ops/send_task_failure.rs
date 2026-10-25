@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendTaskFailure
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendTaskFailure`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendTaskFailure::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! A worker that polled `GetActivityTask` holds the `taskToken` of ONE outstanding
+//! activity task, and this is how it reports that the task FAILED. The task is closed
+//! and the execution waiting at the state that scheduled it fails with the `error` and
+//! `cause` the worker sent: that state declares no `Retry` and no `Catch` in the
+//! definitions this emulator runs, so there is nothing to retry it at and no catcher
+//! to hand the failure to — see [`crate::state::plan_task_failure`]. The outcome is
+//! owed to the clock exactly as the outcome a successful reply continues to is, and
+//! one token answers one task, so no later reply resolves it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendTaskFailure` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendTaskFailureErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendTaskFailure"))
+        // `taskToken` (1..2048), `error` (0..256) and `cause` (0..32768) are modelled,
+        // so the centralized walk has already refused anything outside them. Neither
+        // payload member is required: "a caller can mark a task as fail without using
+        // any KMS permissions in the execution role if the caller provides a null value
+        // for both error and cause fields", so a reply that carries neither reports the
+        // same failure as one that carries both. Whether the token is one this service
+        // issued is not modelled, so it is checked here. `ctx` carries no value this
+        // operation reads: a task token names its task, its execution and its region on
+        // its own.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is read BEFORE the store is consulted, exactly as every ARN here
+        // is: a value that is not a token this service mints is a defect in the
+        // REQUEST, which `InvalidToken` reports, and not a task that has been closed.
+        // The token NAMES the activity its task belongs to, which is what a refusal
+        // about a task the store no longer holds says.
+        let Some(token_activity) = crate::state::read_task_token(&input.task_token) else {
+            return Err(SendTaskFailureErrorModeled::InvalidToken(InvalidToken {
+                message: Some(crate::state::invalid_token_message()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // Settle first: a task whose own bound the clock already made due is closed —
+        // and the execution waiting at it failed — before this call decides whether
+        // the token still answers anything.
+        store.settle(now);
+
+        let Some(task) = store.activity_tasks.get(&input.task_token) else {
+            return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                message: Some(crate::state::task_timed_out_message(&token_activity)),
+            })
+            .into());
+        };
+        let activity_arn = task.activity_arn.clone();
+        let execution_arn = task.execution_arn.clone();
+        let state_name = task.state_name.clone();
+        // The activity this task is queued under can be DELETED while the task is
+        // outstanding, which leaves the task with no activity to be answered for: the
+        // modelled `TaskDoesNotExist`, whose own documentation is "the activity does
+        // not exist".
+        if !store.activities.contains_key(&activity_arn) {
+            return Err(
+                SendTaskFailureErrorModeled::TaskDoesNotExist(TaskDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::ACTIVITY_DOES_NOT_EXIST,
+                        &activity_arn,
+                    )),
+                })
+                .into(),
+            );
+        }
+        // A task whose execution is no longer running is answered by nobody: it was
+        // stopped, or the clock closed an earlier bound of it, so the token names a
+        // task that has already been closed.
+        let Some(execution) = store
+            .executions
+            .get(&execution_arn)
+            .filter(|execution| !execution.is_terminal())
+        else {
+            return Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                message: Some(crate::state::task_timed_out_message(&token_activity)),
+            })
+            .into());
+        };
+
+        // Nothing is interpreted: the state that scheduled the task declares no
+        // `Retry` and no `Catch`, so the failure the worker reported is the
+        // execution's, and what is recorded is the two events that failure writes and
+        // the outcome the clock then owes.
+        let planned = crate::state::plan_task_failure(
+            &state_name,
+            now,
+            input.error,
+            input.cause,
+            execution.last_event_id(),
+        );
+        match store.answer_activity_task(&input.task_token, planned.opening, planned.pending, 0) {
+            Ok(()) => Ok(SendTaskFailureOutput {}),
+            Err(crate::state::TaskReplyRejection::Gone) => {
+                Err(SendTaskFailureErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into())
+            }
+            // The failure's own events and outcome are what the execution would grow
+            // by, so a reply the store has no room for is refused rather than retained
+            // past its ceiling. This operation models no limit error, so the refusal is
+            // the standard 400 validation envelope.
+            Err(crate::state::TaskReplyRejection::NoRoom) => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "failing execution {execution_arn} would take the store past the {} bytes \
+                     this emulator retains",
+                    crate::state::MAX_STORE_BYTES
+                )))
+            }
+        }
     }
 }
+

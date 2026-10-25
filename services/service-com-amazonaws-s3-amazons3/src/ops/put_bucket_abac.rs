@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketAbac
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketAbac`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketAbac::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the attribute-based access control (ABAC) property of an existing general purpose
+//! bucket: the `AbacStatus` the request carries as its payload becomes the bucket's ABAC
+//! status and the operation answers 200 with an empty body, so `GetBucketAbac` reports
+//! exactly what was last put. A container naming no `BucketAbacStatus` value is refused,
+//! and a bucket this emulator does not hold is `NoSuchBucket` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -107,14 +104,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketAbacOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketAbacError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketAbac")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketAbac")` reports `errors: []`), but
+// `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and AWS
+// answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketAbac",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketAbacErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -168,18 +173,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketAbac` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketAbacErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketAbac"))
+        // A write needs nothing from the request beyond its deserialized input: the
+        // expected owner travels as a member, not as a raw header.
+        let _ = ctx;
+
+        // The expected bucket owner is judged the way every other bucket-scoped operation
+        // judges it (`PutBucketVersioning`, `HeadObject`): this emulator serves one
+        // account, so that account owns every bucket it holds, and a request naming a
+        // different owner is refused with 403 `AccessDenied`.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketAbac",
+            ));
+        };
+
+        // "Sets the attribute-based access control (ABAC) property of the general purpose
+        // bucket" (this operation's own documentation) from the `AbacStatus` container it
+        // carries as its whole payload. `AbacStatus$Status` is NOT a required member
+        // (`smithy_query(query="shape",shape="AbacStatus")`), so a request can carry a
+        // container that names no state to set — a payload that does not validate against
+        // the schema the API publishes, which is what `MalformedXML` reports (HTTP 400), a
+        // code this model declares no shape for. A value OUTSIDE `BucketAbacStatus` never
+        // reaches here: `Status` targets an enum shape, so the boundary validator refuses
+        // it with 400 before this handler runs.
+        let Some(status) = input
+            .abac_status
+            .status
+            .as_deref()
+            .filter(|status| BUCKET_ABAC_STATUS_VALUES.contains(status))
+        else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                // The documented sentence for the code, naming the member and the value
+                // set it is judged against; the rejected value is NOT echoed back, so a
+                // refusal reflects nothing the request carried.
+                format!(
+                    "{}: AbacStatus.Status must name one of {BUCKET_ABAC_STATUS_VALUES:?}",
+                    crate::state::MALFORMED_XML_MESSAGE
+                ),
+            ));
+        };
+
+        // The payload is judged BEFORE the store is touched, so a refused request leaves
+        // the bucket's current ABAC status exactly as it was.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketAbacErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        bucket.set_abac_status(status);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketAbacOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;

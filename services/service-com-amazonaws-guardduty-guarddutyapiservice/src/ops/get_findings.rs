@@ -165,12 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter_map(|id| detector.findings.get(id))
             .collect();
-        crate::state::sort_findings(&mut found, input.sort_criteria.as_ref()).map_err(|path| {
-            bad_request(format!(
-                "sortCriteria.attributeName: '{path}' is not a finding attribute this service can sort on. Supported attributes are {}.",
-                crate::state::FINDING_ATTRIBUTES.join(", ")
-            ))
-        })?;
+        crate::state::sort_findings(&mut found, input.sort_criteria.as_ref())
+            .map_err(|rejection| bad_request(rejection.message(SORT_ATTRIBUTE_MEMBER)))?;
 
         Ok(GetFindingsOutput {
             findings: found.iter().map(|record| finding(record)).collect(),
@@ -184,6 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn bad_request(message: impl Into<String>) -> GetFindingsError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
+
+/// The wire path of the member a sort attribute arrives under
+/// (`smithy_query(operation="GetFindings")`), as a refusal names it.
+const SORT_ATTRIBUTE_MEMBER: &str = "sortCriteria.attributeName";
 
 /// The wire `Finding` for a stored record.
 ///
@@ -219,7 +219,7 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
             // `event_last_seen_millis` rather than from its `UpdatedAt`.
             event_last_seen: Some(crate::state::iso8601(record.event_last_seen_millis)),
             resource_role: Some(record.resource_role.clone()),
-            service_name: Some(GUARDDUTY_SERVICE_NAME.to_string()),
+            service_name: Some(crate::state::GUARDDUTY_SERVICE_NAME.to_string()),
             // "Feedback that was submitted about the finding"
             // (`smithy_query(shape="Service")`) — what `UpdateFindingsFeedback`
             // last recorded for this finding, absent while none has been
@@ -247,10 +247,6 @@ fn finding(record: &crate::state::FindingRecord) -> Finding {
         custom_detection_rule_name: None,
     }
 }
-
-/// The value `Service.ServiceName` carries: "The name of the Amazon Web Services
-/// service (GuardDuty) that generated a finding" (`smithy_query(shape="Service")`).
-const GUARDDUTY_SERVICE_NAME: &str = "guardduty";
 
 /// The `Service.AdditionalInfo.Type` a finding carries when `AdditionalInfo` is the
 /// service's own additional-information document rather than a typed projection of

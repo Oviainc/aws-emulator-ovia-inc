@@ -677,6 +677,18 @@
 //! is account-wide because this store is per ACCOUNT and not per Region (see "The default
 //! VPC's default subnets" below).
 //!
+//! ## The Spot Instance data feed
+//!
+//! [`ComAmazonawsEc2Amazonec2State::spot_datafeed_subscription`] is a single
+//! [`SpotDatafeedSubscription`] rather than a map, because the resource is a SINGLETON:
+//! "You can create one data feed per Amazon Web Services account"
+//! (`CreateSpotDatafeedSubscription`). It is a resource and not a setting, though — an
+//! account that has never created one HAS none, which is why the field is an `Option` and
+//! why the reporting operation refuses with
+//! [`INVALID_SPOT_DATAFEED_NOT_FOUND`] instead of answering a default. The one record is
+//! stored as the modelled shape the three operations report, so a create answers exactly
+//! what a later describe does.
+//!
 //! ## Longer-ID (17-character ID) format settings
 //!
 //! [`ComAmazonawsEc2Amazonec2State::id_format_overrides`] holds the longer-ID preference
@@ -1073,7 +1085,7 @@ use crate::ops::types::{
     RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
-    SnapshotTaskDetail, SpotPlacementScore, StateReason,
+    SnapshotTaskDetail, SpotDatafeedSubscription, SpotPlacementScore, StateReason,
     Subnet, SubnetAssociation, SubnetCidrReservation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment, TransitGatewayConnect,
@@ -2725,6 +2737,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The account's Spot Instance data feed subscription, and `None` when it holds none —
+    /// see the module docs.
+    ///
+    /// Stored as the MODELLED [`SpotDatafeedSubscription`] shape every operation that reports
+    /// one answers with, so `CreateSpotDatafeedSubscription` and
+    /// `DescribeSpotDatafeedSubscription` cannot describe one feed two ways. ONE value rather
+    /// than a map because the resource is a singleton: "You can create one data feed per
+    /// Amazon Web Services account" (`CreateSpotDatafeedSubscription`). Read it through
+    /// [`Self::spot_datafeed_subscription`] and write it through
+    /// [`Self::set_spot_datafeed_subscription`] /
+    /// [`Self::remove_spot_datafeed_subscription`], so the byte charge the one record makes
+    /// is taken and given back in one place.
+    spot_datafeed_subscription: Option<SpotDatafeedSubscription>,
     /// The Regions this account has EBS encryption by default turned ON in.
     ///
     /// The setting is an account-level fact OF A REGION — "whether EBS encryption by
@@ -2906,6 +2931,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // A fresh account has no Spot Instance data feed: one is created by
+            // `CreateSpotDatafeedSubscription` and by nothing else.
+            spot_datafeed_subscription: None,
             // No Region has EBS encryption by default turned on until something enables
             // it there, so a fresh account holds the empty set.
             ebs_encryption_by_default_regions: BTreeSet::new(),
@@ -27229,6 +27257,171 @@ pub fn allowed_images_settings_full<E>(region: &str, full: AllowedImagesSettings
              it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Spot Instance data feed: one subscription per account
+// ---------------------------------------------------------------------------
+//
+// See the module docs for why the account's data feed is ONE stored record rather than a
+// map, and why its absence is a refusal rather than a default.
+
+/// "`Active`" — the `DatafeedSubscriptionState` member a data feed that is delivering sits
+/// in (`smithy_query(query="shape",shape="DatafeedSubscriptionState")`), and the one a
+/// create leaves it in: nothing has to be provisioned for a feed, so it is active as soon
+/// as it exists. The whole catalog is the generated
+/// [`crate::ops::types::DATAFEED_SUBSCRIPTION_STATE_VALUES`].
+pub const DATAFEED_SUBSCRIPTION_STATE_ACTIVE: &str = "Active";
+
+/// "`Inactive`" — the catalog's other member: the state AWS puts a feed into when delivery
+/// itself has failed, which is the case `SpotDatafeedSubscription$Fault` reports ("the fault
+/// codes for the Spot Instance request, if any").
+///
+/// No operation of this API moves a feed into it — a caller cannot ask for an inactive feed
+/// and nothing inside this emulator writes to an S3 bucket to fail at — so this emulator
+/// never stores it. It is named here so the word exists once, beside the member a create
+/// does store.
+pub const DATAFEED_SUBSCRIPTION_STATE_INACTIVE: &str = "Inactive";
+
+/// The code EC2 answers a request about a Spot data feed the account does not have:
+/// `InvalidSpotDatafeed.NotFound` — "you have no data feed for Spot Instances" (AWS's EC2
+/// error-code reference entry).
+pub const INVALID_SPOT_DATAFEED_NOT_FOUND: &str = "InvalidSpotDatafeed.NotFound";
+
+/// Refuse a request about a Spot Instance data feed the account holds none of, the way EC2
+/// does: HTTP 400 [`INVALID_SPOT_DATAFEED_NOT_FOUND`].
+///
+/// The message takes no argument because the condition takes none: the feed is a singleton
+/// with no id, so there is nothing of the request to name in it, and the sentence is the
+/// fixed one the real service answers for this condition.
+pub fn invalid_spot_datafeed_not_found<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SPOT_DATAFEED_NOT_FOUND,
+        400,
+        "Spot datafeed subscription does not exist.",
+    )
+}
+
+/// The most BYTES a data feed `Prefix` may carry.
+///
+/// "The prefix for the data feed file names" (`CreateSpotDatafeedSubscriptionRequest$Prefix`)
+/// is the leading part of the S3 object keys the feed writes, and "the name for a key is a
+/// sequence of Unicode characters whose UTF-8 encoding is at most 1,024 bytes long" (Amazon
+/// S3 User Guide, "Creating object key names"), so a prefix whose encoding is longer than a
+/// whole key cannot name one. BYTES and not characters, because that is the unit the rule is
+/// stated in: a 1,024-character prefix of multi-byte characters is up to four times a whole
+/// key. The model puts no `@length` on the member, so this is the only place it can be
+/// enforced — and it is also what bounds the one stored record.
+pub const MAX_SPOT_DATAFEED_PREFIX_BYTES: usize = 1024;
+
+/// The caller-chosen bytes the one stored data feed subscription holds, plus the fixed
+/// overhead the record itself costs.
+///
+/// Only the bucket and the prefix are the caller's: the owner id and the state come from
+/// this module. The ONE definition of that charge, so the charge a write takes and the one a
+/// delete gives back cannot drift.
+pub fn spot_datafeed_payload_bytes(bucket: &str, prefix: Option<&str>) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(bucket.len())
+        .saturating_add(prefix.map_or(0, str::len))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's Spot Instance data feed subscription right now, and `None` when it has
+    /// none.
+    ///
+    /// A pure read: a data feed has no clock-owed move — [`DATAFEED_SUBSCRIPTION_STATE_ACTIVE`]
+    /// is where a create leaves it and no operation of this API moves it anywhere — so
+    /// nothing about it changes with time.
+    pub fn spot_datafeed_subscription(&self) -> Option<SpotDatafeedSubscription> {
+        self.spot_datafeed_subscription.clone()
+    }
+
+    /// Store the account's data feed over whatever it held before, and answer it as it was
+    /// stored.
+    ///
+    /// `Err` means the store had no room for it and NOTHING was stored; it carries the
+    /// GROWTH that would not fit, which is what [`spot_datafeed_store_full`] states. "You can
+    /// create one data feed per Amazon Web Services account", so this REPLACES rather than
+    /// adding: the bytes the record it replaces held are given back and the new ones charged,
+    /// so an account that writes its feed over and over does not drift.
+    pub fn set_spot_datafeed_subscription(
+        &mut self,
+        bucket: String,
+        prefix: Option<String>,
+    ) -> Result<SpotDatafeedSubscription, usize> {
+        let requested = spot_datafeed_payload_bytes(&bucket, prefix.as_deref());
+        let released = self.spot_datafeed_charge();
+        // Only the GROWTH has to fit: the record this one replaces gives its bytes back.
+        let growth = requested.saturating_sub(released);
+        if self.would_exceed_stored_bytes(growth) {
+            return Err(growth);
+        }
+        let subscription = SpotDatafeedSubscription {
+            bucket: Some(bucket),
+            prefix,
+            // "The Amazon Web Services account ID of the account"
+            // (`SpotDatafeedSubscription$OwnerId`) — this emulator's one account.
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            state: Some(DATAFEED_SUBSCRIPTION_STATE_ACTIVE.to_string()),
+            // "The fault codes for the Spot Instance request, IF ANY"
+            // (`SpotDatafeedSubscription$Fault`): a feed that was just stored has had nothing
+            // go wrong with it, so there is no fault to report.
+            fault: None,
+        };
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(requested);
+        self.spot_datafeed_subscription = Some(subscription.clone());
+        Ok(subscription)
+    }
+
+    /// Drop the account's data feed, giving its bytes back, and answer whether it had one.
+    ///
+    /// What `DeleteSpotDatafeedSubscription` needs. `false` means the account had no feed and
+    /// nothing changed. No operation of this emulator calls it yet — the delete is still a
+    /// scaffold, and is its own issue — so it has no call site, the way
+    /// [`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`] has none: it is here so that
+    /// the delete removes the record and releases the charge the create took in ONE place,
+    /// rather than reaching into the field itself.
+    pub fn remove_spot_datafeed_subscription(&mut self) -> bool {
+        let released = self.spot_datafeed_charge();
+        let had_one = self.spot_datafeed_subscription.take().is_some();
+        self.release_stored_bytes(released);
+        had_one
+    }
+
+    /// The bytes the data feed now stored is charged, or 0 when there is none.
+    ///
+    /// Private, so the charge is only ever computed from the record that is actually stored:
+    /// every writer above gives back exactly this.
+    fn spot_datafeed_charge(&self) -> usize {
+        self.spot_datafeed_subscription
+            .as_ref()
+            .map_or(0, |stored| {
+                spot_datafeed_payload_bytes(
+                    stored.bucket.as_deref().unwrap_or_default(),
+                    stored.prefix.as_deref(),
+                )
+            })
+    }
+}
+
+/// Refuse a data feed this emulator has no room for: HTTP 400, EC2's
+/// `InvalidParameterValue`.
+///
+/// A bad request rather than a server error, for the reason
+/// [`allowed_images_settings_full`] gives: the bucket and the prefix are values of the
+/// request, and a retry of the same request would be refused the same way.
+///
+/// `requested` is what [`ComAmazonawsEc2Amazonec2State::set_spot_datafeed_subscription`]
+/// needed room for — the GROWTH over the record it would have replaced, which is what that
+/// writer gates on, not the whole record's charge — so the message states the quantity that
+/// was actually refused.
+pub fn spot_datafeed_store_full<E>(requested: usize) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "The data feed subscription needs {requested} more bytes, which this emulator has no \
+         room for: it stores at most {MAX_STORED_BYTES} bytes of caller-supplied data"
+    ))
 }
 
 // =============================================================================

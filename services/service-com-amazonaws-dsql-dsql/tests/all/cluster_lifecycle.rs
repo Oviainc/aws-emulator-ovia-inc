@@ -992,12 +992,12 @@ fn the_bookkeeping_stores_stay_bounded() {
 }
 
 /// A `ClusterId`-shaped identifier for case `n`: 26 characters from `[a-z0-9]`.
-fn cluster_id_for(n: usize) -> String {
+pub fn cluster_id_for(n: usize) -> String {
     format!("{n:026}")
 }
 
 /// A stored cluster whose deletion is already due, so one `settle` retires it.
-fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
+pub fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
     Cluster {
         identifier: identifier.to_string(),
         arn: expected_arn("us-east-1", identifier),
@@ -1016,7 +1016,6 @@ fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
             due_at,
             next_status: STATUS_DELETED,
         }),
-        delete_client_token: Some("retire-me".to_string()),
     }
 }
 

@@ -3202,6 +3202,21 @@ pub struct Bucket {
     /// while the bucket has no versioning state — the state a bucket is created in, and
     /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
     pub versioning: Option<BucketVersioning>,
+    /// The attribute-based access control (ABAC) status `PutBucketAbac` last set on the
+    /// bucket, or `None` while no put has set one.
+    ///
+    /// `None` is NOT a third state: ABAC is a PROPERTY every general purpose bucket has,
+    /// and `BucketAbacStatus` names both of the states it can be in — `Enabled` or
+    /// `Disabled` (`smithy_query(query="shape",shape="BucketAbacStatus")`). A bucket is
+    /// created without ABAC (`CreateBucket` carries no member for it) and the API publishes
+    /// neither a delete for the subresource nor a "there is none" error for a read of it,
+    /// so a bucket no put has touched carries [`DEFAULT_BUCKET_ABAC_STATUS`]. Keeping that
+    /// case as `None` rather than as a stored copy of the default is what lets a read of a
+    /// never-configured bucket report it without writing — the same distinction
+    /// [`Self::encryption`] keeps.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    abac: Option<String>,
     /// The Block Public Access settings `PutPublicAccessBlock` last set on the bucket, or
     /// `None` while no `PublicAccessBlockConfiguration` is associated with it — the state a
     /// bucket is created in, and what makes `GetPublicAccessBlock` answer
@@ -3466,6 +3481,25 @@ impl Bucket {
         self.versioning
             .as_ref()
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
+    /// The ABAC status the bucket carries: the one `PutBucketAbac` last set, or
+    /// [`DEFAULT_BUCKET_ABAC_STATUS`] for a bucket no put has set one on.
+    ///
+    /// A pure read — the default is DERIVED here rather than stored, so reporting it
+    /// writes nothing and a later caller sees exactly what this one saw.
+    pub fn abac_status(&self) -> &str {
+        self.abac.as_deref().unwrap_or(DEFAULT_BUCKET_ABAC_STATUS)
+    }
+
+    /// Set the bucket's ABAC status from the `AbacStatus` a `PutBucketAbac` request
+    /// carried.
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Bucket::set_versioning`] replaces
+    /// the versioning state: the request carries the complete `AbacStatus` container as
+    /// its payload, so the state the bucket is in afterwards is the one it names.
+    pub fn set_abac_status(&mut self, status: &str) {
+        self.abac = Some(status.to_string());
     }
 
     /// The bucket's Block Public Access settings, or `None` when no
@@ -5391,6 +5425,17 @@ pub const MALFORMED_XML_CODE: &str = "MalformedXML";
 pub const MALFORMED_XML_MESSAGE: &str =
     "The XML you provided was not well-formed or did not validate against our published \
      schema";
+
+/// The ABAC status a general purpose bucket carries until a `PutBucketAbac` sets one.
+///
+/// `BucketAbacStatus` names the two states the property can be in — `Enabled` and
+/// `Disabled` (`smithy_query(query="shape",shape="BucketAbacStatus")`) — and a bucket
+/// comes into being in neither of them by request: `CreateBucket` carries no ABAC member
+/// (`smithy_query(query="operation",operation="CreateBucket")`), and ABAC takes effect
+/// only once it is enabled ("If ABAC is enabled on your bucket, you can use tags on the
+/// bucket for access control", `GetBucketAbac`'s own documentation). So the state a
+/// never-configured bucket is in is the other one.
+pub const DEFAULT_BUCKET_ABAC_STATUS: &str = "Disabled";
 
 /// How many ownership control rules this emulator records for one bucket.
 ///
