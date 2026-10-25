@@ -1751,6 +1751,15 @@ pub struct InvokeTurn {
     /// The response body in the model family's own envelope, as
     /// [`invoke_model_response_body`] renders it.
     pub response: serde_json::Value,
+    /// The generated text this turn is, which the family's response envelope and
+    /// its streaming events both carry.
+    pub text: String,
+    /// The server-generated completion id the family's envelope reports, where it
+    /// reports one.
+    pub completion_id: String,
+    /// Whether generation ended at the request's token cap rather than on its
+    /// own, which is what picks the family's terminal stop reason.
+    pub stopped_at_token_cap: bool,
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
@@ -1758,9 +1767,10 @@ pub struct InvokeTurn {
 /// Serve one invoke-API inference from the body that was actually supplied.
 ///
 /// `InvokeModel` and `InvokeModelWithResponseStream` both call this, so the
-/// payload the two answer for identical input agrees by construction; the only
-/// difference between them is whether that payload is the response body or the
-/// `bytes` of a `chunk` event. `family` is the model's own response family,
+/// inference the two answer for identical input agrees by construction: the
+/// unary surface returns [`InvokeTurn::response`] as its body, and the streaming
+/// one renders the SAME turn as the family's own incremental events (see
+/// [`invoke_model_stream_chunks`]). `family` is the model's own response family,
 /// which the caller has already resolved (a model this emulator renders no
 /// envelope for is refused before any inference is served).
 pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> InvokeTurn {
@@ -1805,6 +1815,9 @@ pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> Invo
             output_tokens,
             truncated,
         ),
+        text,
+        completion_id,
+        stopped_at_token_cap: truncated,
         input_tokens,
         output_tokens,
     }
@@ -1966,6 +1979,7 @@ pub fn invoke_model_response_body(
     output_tokens: u32,
     stop_reason_is_max_tokens: bool,
 ) -> serde_json::Value {
+    let stop_reason = family_stop_reason(family, stop_reason_is_max_tokens);
     match family {
         ModelFamily::AnthropicMessages => serde_json::json!({
             "id": format!("msg_{completion_id}"),
@@ -1973,7 +1987,7 @@ pub fn invoke_model_response_body(
             "role": "assistant",
             "model": model_id,
             "content": [{ "type": "text", "text": text }],
-            "stop_reason": if stop_reason_is_max_tokens { "max_tokens" } else { "end_turn" },
+            "stop_reason": stop_reason,
             "stop_sequence": serde_json::Value::Null,
             "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens },
         }),
@@ -1982,33 +1996,24 @@ pub fn invoke_model_response_body(
             "results": [{
                 "tokenCount": output_tokens,
                 "outputText": text,
-                "completionReason": if stop_reason_is_max_tokens { "LENGTH" } else { "FINISH" },
+                "completionReason": stop_reason,
             }],
         }),
         ModelFamily::Nova => serde_json::json!({
             "output": { "message": { "role": "assistant", "content": [{ "text": text }] } },
-            "stopReason": if stop_reason_is_max_tokens { "max_tokens" } else { "end_turn" },
-            "usage": {
-                "inputTokens": input_tokens,
-                "outputTokens": output_tokens,
-                "totalTokens": input_tokens + output_tokens,
-                // Nova reports its prompt-cache accounting on every
-                // invocation. This emulator caches no prompt, so no token was
-                // ever read from or written to a cache.
-                "cacheReadInputTokenCount": 0,
-                "cacheWriteInputTokenCount": 0,
-            },
+            "stopReason": stop_reason,
+            "usage": nova_usage(input_tokens, output_tokens),
         }),
         ModelFamily::Llama => serde_json::json!({
             "generation": text,
             "prompt_token_count": input_tokens,
             "generation_token_count": output_tokens,
-            "stop_reason": if stop_reason_is_max_tokens { "length" } else { "stop" },
+            "stop_reason": stop_reason,
         }),
         ModelFamily::Mistral => serde_json::json!({
             "outputs": [{
                 "text": text,
-                "stop_reason": if stop_reason_is_max_tokens { "length" } else { "stop" },
+                "stop_reason": stop_reason,
             }],
         }),
         ModelFamily::CohereCommand => serde_json::json!({
@@ -2016,8 +2021,225 @@ pub fn invoke_model_response_body(
             "generations": [{
                 "id": format!("gen_{completion_id}"),
                 "text": text,
-                "finish_reason": if stop_reason_is_max_tokens { "MAX_TOKENS" } else { "COMPLETE" },
+                "finish_reason": stop_reason,
             }],
         }),
     }
+}
+
+/// The token accounting Amazon Nova reports, in the shape its response envelope
+/// and its `metadata` streaming event both carry.
+///
+/// Nova reports its prompt-cache accounting on every invocation. This emulator
+/// caches no prompt, so no token was ever read from or written to a cache.
+fn nova_usage(input_tokens: u32, output_tokens: u32) -> serde_json::Value {
+    serde_json::json!({
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "totalTokens": input_tokens.saturating_add(output_tokens),
+        "cacheReadInputTokenCount": 0,
+        "cacheWriteInputTokenCount": 0,
+    })
+}
+
+/// The stop reason `family` reports for a turn that ended on its own, and for one
+/// that ended at the request's generation cap — in the family's own vocabulary.
+///
+/// Per family as documented in "Inference request parameters and response fields
+/// for foundation models" in the Amazon Bedrock User Guide. The unary response
+/// envelope and the streaming events read it from here, so the two cannot report
+/// a turn as having ended differently.
+pub fn family_stop_reason(family: ModelFamily, stopped_at_token_cap: bool) -> &'static str {
+    match (family, stopped_at_token_cap) {
+        (ModelFamily::AnthropicMessages | ModelFamily::Nova, true) => "max_tokens",
+        (ModelFamily::AnthropicMessages | ModelFamily::Nova, false) => "end_turn",
+        (ModelFamily::TitanText, true) => "LENGTH",
+        (ModelFamily::TitanText, false) => "FINISH",
+        (ModelFamily::Llama | ModelFamily::Mistral, true) => "length",
+        (ModelFamily::Llama | ModelFamily::Mistral, false) => "stop",
+        (ModelFamily::CohereCommand, true) => "MAX_TOKENS",
+        (ModelFamily::CohereCommand, false) => "COMPLETE",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response streaming
+// ---------------------------------------------------------------------------
+
+/// The key Amazon Bedrock itself adds to the LAST chunk of a response stream,
+/// beside the model's own terminal event: the per-invocation accounting the
+/// service measured. It is not a member of any model's streaming schema and not a
+/// modelled member of `PayloadPart`, which is why it travels inside the chunk's
+/// payload rather than as a modelled field.
+pub const INVOCATION_METRICS_FIELD: &str = "amazon-bedrock-invocationMetrics";
+
+/// The accounting [`INVOCATION_METRICS_FIELD`] carries: the tokens the invocation
+/// actually counted and the latencies it actually measured.
+#[derive(Debug, Clone, Copy)]
+pub struct InvocationMetrics {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// How long serving the whole invocation took.
+    pub invocation_latency_ms: i64,
+    /// How long it took until the stream's first chunk was ready.
+    pub first_byte_latency_ms: i64,
+}
+
+impl InvocationMetrics {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "inputTokenCount": self.input_tokens,
+            "outputTokenCount": self.output_tokens,
+            "invocationLatency": self.invocation_latency_ms,
+            "firstByteLatency": self.first_byte_latency_ms,
+        })
+    }
+}
+
+/// The payloads the `chunk` events of one `InvokeModelWithResponseStream` body
+/// carry, in order: ONE incremental event of `family`'s own streaming protocol per
+/// chunk, with [`INVOCATION_METRICS_FIELD`] added to the terminal one.
+///
+/// The event sequences are each family's own, as documented per family in
+/// "Inference request parameters and response fields for foundation models" in the
+/// Amazon Bedrock User Guide: a message-opening event where the family has one,
+/// then the incremental content events, then the family's terminal event carrying
+/// the stop reason and the invocation's token accounting. The streamed text and
+/// the stop reason are the ones [`invoke_turn`] served, so the streaming surface
+/// and the unary one cannot report different inference for the same request.
+///
+/// No language model runs in this emulator, so the turn's text is produced in one
+/// step (see [`emulated_completion_text`]) and therefore arrives as one content
+/// delta: nothing here splits it into fabricated increments.
+pub fn invoke_model_stream_chunks(
+    family: ModelFamily,
+    model_id: &str,
+    turn: &InvokeTurn,
+    metrics: InvocationMetrics,
+) -> Vec<serde_json::Value> {
+    let text = turn.text.as_str();
+    let completion_id = turn.completion_id.as_str();
+    let stop_reason = family_stop_reason(family, turn.stopped_at_token_cap);
+    let input_tokens = turn.input_tokens;
+    let output_tokens = turn.output_tokens;
+
+    let mut chunks = match family {
+        // The Anthropic Claude Messages API's own server-sent event types, each
+        // carried in its `type` member.
+        ModelFamily::AnthropicMessages => vec![
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": format!("msg_{completion_id}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model_id,
+                    "content": [],
+                    "stop_reason": serde_json::Value::Null,
+                    "stop_sequence": serde_json::Value::Null,
+                    "usage": { "input_tokens": input_tokens, "output_tokens": 0 },
+                },
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" },
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": text },
+            }),
+            serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null },
+                "usage": { "output_tokens": output_tokens },
+            }),
+            serde_json::json!({ "type": "message_stop" }),
+        ],
+        // Amazon Titan Text streams its result as output-text chunks; the
+        // terminal one reports the completion reason and the token counts.
+        ModelFamily::TitanText => vec![
+            serde_json::json!({
+                "outputText": text,
+                "index": 0,
+                "totalOutputTextTokenCount": serde_json::Value::Null,
+                "completionReason": serde_json::Value::Null,
+                "inputTextTokenCount": input_tokens,
+            }),
+            serde_json::json!({
+                "outputText": "",
+                "index": 0,
+                "totalOutputTextTokenCount": output_tokens,
+                "completionReason": stop_reason,
+                "inputTextTokenCount": input_tokens,
+            }),
+        ],
+        // Amazon Nova's body is Converse-shaped, so its streaming events are the
+        // Converse stream's: the message opens, each content block is delivered
+        // as deltas and closed, the message stops, and the turn's usage and
+        // measured latency follow as metadata.
+        ModelFamily::Nova => vec![
+            serde_json::json!({ "messageStart": { "role": "assistant" } }),
+            serde_json::json!({
+                "contentBlockDelta": { "contentBlockIndex": 0, "delta": { "text": text } },
+            }),
+            serde_json::json!({ "contentBlockStop": { "contentBlockIndex": 0 } }),
+            serde_json::json!({ "messageStop": { "stopReason": stop_reason } }),
+            serde_json::json!({
+                "metadata": {
+                    "usage": nova_usage(input_tokens, output_tokens),
+                    "metrics": { "latencyMs": metrics.invocation_latency_ms },
+                },
+            }),
+        ],
+        // Meta Llama streams generation chunks whose terminal one carries the
+        // stop reason and the prompt and generation token counts.
+        ModelFamily::Llama => vec![
+            serde_json::json!({
+                "generation": text,
+                "prompt_token_count": serde_json::Value::Null,
+                "generation_token_count": output_tokens,
+                "stop_reason": serde_json::Value::Null,
+            }),
+            serde_json::json!({
+                "generation": "",
+                "prompt_token_count": input_tokens,
+                "generation_token_count": output_tokens,
+                "stop_reason": stop_reason,
+            }),
+        ],
+        // Mistral AI streams its `outputs` envelope, the terminal chunk carrying
+        // the stop reason.
+        ModelFamily::Mistral => vec![
+            serde_json::json!({
+                "outputs": [{ "text": text, "stop_reason": serde_json::Value::Null }],
+            }),
+            serde_json::json!({
+                "outputs": [{ "text": "", "stop_reason": stop_reason }],
+            }),
+        ],
+        // Cohere Command streams typed events, ending with the stream-end event
+        // that repeats the whole response.
+        ModelFamily::CohereCommand => vec![
+            serde_json::json!({
+                "is_finished": false,
+                "event_type": "text-generation",
+                "text": text,
+            }),
+            serde_json::json!({
+                "is_finished": true,
+                "event_type": "stream-end",
+                "finish_reason": stop_reason,
+                "response": turn.response.clone(),
+            }),
+        ],
+    };
+
+    // The service's own accounting, on the terminal chunk and nowhere else.
+    if let Some(last) = chunks.last_mut().and_then(serde_json::Value::as_object_mut) {
+        last.insert(INVOCATION_METRICS_FIELD.to_string(), metrics.to_json());
+    }
+    chunks
 }

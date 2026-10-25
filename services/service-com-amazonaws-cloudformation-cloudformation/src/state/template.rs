@@ -3360,7 +3360,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
 /// of its declared or generated name, which any deployment recomputes identically.
 ///
-/// Six types this emulator provisions are in that position: an experiment template's id
+/// Seven types this emulator provisions are in that position: an experiment template's id
 /// is minted by FIS (`Ref` returns it, and the type has no name property at all), an AWS
 /// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
 /// an Amazon Managed Grafana workspace's id is minted by `CreateWorkspace` (`Ref` returns
@@ -3368,8 +3368,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// create asks for, an Amazon EMR cluster's is the `j-` job-flow id `RunJobFlow` mints
 /// ("Ref returns the cluster ID"), where the type's `Name` is only the name the flow runs
 /// under, a GuardDuty detector's is minted by `CreateDetector`, which takes no identifier
-/// at all, and an OpenSearch Serverless collection's `Ref` is the `CollectionId` its create
-/// mints — a template declares the collection's NAME, never that id.
+/// at all, an OpenSearch Serverless collection's `Ref` is the `CollectionId` its create
+/// mints — a template declares the collection's NAME, never that id — and an ACM ACME
+/// endpoint's is the `AcmeEndpointArn` `CreateAcmeEndpoint` mints, that type declaring no
+/// name or identifier property either.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
@@ -3377,6 +3379,7 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == EMR_CLUSTER
         || resource_type == GUARDDUTY_DETECTOR
         || resource_type == AOSS_COLLECTION
+        || resource_type == ACM_ACME_ENDPOINT
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3513,6 +3516,14 @@ pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
 /// identifier and MINTS one — so the id a stack's output reports for it is the one that
 /// service answered with.
 pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// An AWS Certificate Manager ACME endpoint's resource type (the ACM model:
+/// `cloudFormationName: CertificateManager`). This is a type `super::provisioning`
+/// creates in ACM itself, and the identifier the provider reports for it is the
+/// `AcmeEndpointArn` ACM minted — an ARN `CreateAcmeEndpoint` ASSIGNS, which no naming
+/// rule could compute — so the identifier a stack reports for the resource is the value
+/// `acm DescribeAcmeEndpoint` resolves.
+pub const ACM_ACME_ENDPOINT: &str = "AWS::CertificateManager::AcmeEndpoint";
 
 /// An Amazon EventBridge rule's resource type (the EventBridge model:
 /// `cloudFormationName: Events`). This is a type `super::provisioning` creates in

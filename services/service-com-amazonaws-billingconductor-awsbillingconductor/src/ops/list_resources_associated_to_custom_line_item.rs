@@ -220,7 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListResourcesAssociatedToCustomLineItemResponseElement {
                     arn: Some(association.arn.clone()),
                     relationship: Some(association.relationship().to_string()),
-                    end_billing_period: association.exclusive_end_billing_period.clone(),
+                    // "The end billing period of the custom line item association" —
+                    // of the period the request asks about, when it names one.
+                    end_billing_period: association
+                        .end_billing_period(input.billing_period.as_deref()),
                 },
             ));
         }

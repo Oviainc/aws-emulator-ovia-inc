@@ -170,6 +170,23 @@ pub(crate) fn enum_value_refusal(path: &str, allowed: &[&str]) -> String {
     ))
 }
 
+/// The `ValidationException` message for an ARN input member that names a resource of
+/// ANOTHER account, where `resource_type` is the ARN resource type that member addresses
+/// (`acme-endpoint`, …).
+///
+/// A cross-account ARN is a fact about the REQUEST rather than about the store, so ACM
+/// states it as a validation error of the resource IDENTIFIER the request carried: the
+/// resource type the member's own `@pattern` fixes, and what was wrong with the
+/// identifier — an ARN of the caller's own account was expected and one of another
+/// account arrived. The ARN itself is not echoed; the resource type is not a value the
+/// caller chose, since the member's pattern admits exactly one.
+pub(crate) fn cross_account_arn_refusal(resource_type: &str) -> String {
+    format!(
+        "Resource identifier for {resource_type} has a validation error: Same account ARN \
+         expected but got cross-account ARN"
+    )
+}
+
 /// The subject a violation's clause opens with: the absent-member form for a
 /// member the request never sent, else the value-withholding form.
 fn subject(kind: &ViolationKind) -> &'static str {

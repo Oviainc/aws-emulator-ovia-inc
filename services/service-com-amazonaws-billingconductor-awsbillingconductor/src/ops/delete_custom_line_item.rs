@@ -294,7 +294,10 @@ fn remaining_span(
         .and_then(crate::state::billing_period_key);
 
     // Two half-open spans share a billing period only when each one starts before the
-    // other ends.
+    // other ends. The half-open bound ordering is the store's
+    // ([`crate::state::billing_period_precedes`]): an absent start is the unbounded
+    // past and an absent end the unbounded future, so either one absent orders.
+    let precedes = crate::state::billing_period_precedes;
     if !precedes(item_start, delete_end) || !precedes(delete_start, item_end) {
         return Remaining::Unchanged;
     }
@@ -313,15 +316,6 @@ fn remaining_span(
         };
     }
     Remaining::Gone
-}
-
-/// Does the half-open bound `start` come strictly before `end`? An absent `start` is the
-/// unbounded past and an absent `end` the unbounded future, so either one absent orders.
-fn precedes(start: Option<i64>, end: Option<i64>) -> bool {
-    match (start, end) {
-        (Some(start), Some(end)) => start < end,
-        _ => true,
-    }
 }
 
 /// Refuse the request with this operation's modelled 400 `ValidationException`, naming

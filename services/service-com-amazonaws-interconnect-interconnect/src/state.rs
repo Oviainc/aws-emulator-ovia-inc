@@ -12,16 +12,22 @@
 //! * **Connections** — caller-created. `CreateConnection` allocates one and every
 //!   other connection operation reads or mutates that stored record.
 //!
+//! Attach points are NOT held here: an attach point is a Direct Connect gateway of the
+//! account, so `ListAttachPoints` resolves them against the service that owns them
+//! ([`direct_connect`]) rather than reading a catalog of this service's own.
+//!
 //! Server-owned fields (`id`, `arn`, `sharedId`, `activationKey`, `ownerAccount`,
 //! `provider`, `location`, `type`, `billingTier`, `state`) are computed here or in
 //! the handler, never copied from the request.
+
+pub mod direct_connect;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    AttachPoint, AttachPointDescriptor, Bandwidths, Connection, ConnectionSummary, Environment,
-    Provider, RemoteAccountIdentifier,
+    AttachPoint, Bandwidths, Connection, ConnectionSummary, Environment, Provider,
+    RemoteAccountIdentifier,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -199,11 +205,6 @@ impl IdempotentCreate {
 pub struct ComAmazonawsInterconnectInterconnectState {
     /// The seeded Environment catalog, keyed by `environmentId`.
     pub environments: BTreeMap<String, Environment>,
-    /// The attach points the CATALOG gives each Environment, keyed by
-    /// `environmentId`. `ListAttachPoints` reads this and merges the Direct Connect
-    /// gateways the caller owns into it, so a gateway the caller creates becomes a
-    /// valid attach point without this seed being rewritten.
-    pub attach_points: BTreeMap<String, Vec<AttachPointDescriptor>>,
     /// The live connections, keyed by `id`. A deleted connection is kept in the
     /// `deleted` state rather than dropped straight away, so a later
     /// `GetConnection` reports the terminal state instead of a 404 — and is
@@ -227,10 +228,8 @@ pub struct ComAmazonawsInterconnectInterconnectState {
 impl Default for ComAmazonawsInterconnectInterconnectState {
     fn default() -> Self {
         let environments = seed_environments();
-        let attach_points = seed_attach_points(&environments);
         Self {
             environments,
-            attach_points,
             connections: BTreeMap::new(),
             idempotency_tokens: BTreeMap::new(),
             activation_keys: BTreeMap::new(),
@@ -951,53 +950,9 @@ fn seed_environments() -> BTreeMap<String, Environment> {
         .collect()
 }
 
-/// The `AttachPointType` every seeded descriptor carries.
+/// The `AttachPointType` every descriptor carries.
 ///
 /// `AttachPointType` is an enum whose ONLY modelled value is
 /// `DirectConnectGateway`, so it is the only type a descriptor can report even
 /// though `AttachPointDescriptor$type`'s prose also mentions an ARN form.
 pub const ATTACH_POINT_TYPE_DIRECT_CONNECT_GATEWAY: &str = "DirectConnectGateway";
-
-/// How many attach points the n-th seeded Environment offers.
-///
-/// AWS publishes no count — an Environment offers whatever gateways the caller has
-/// access to — so the shape of the seed is emulator-chosen. It varies with the
-/// environment's position in the catalog (1, 2 or 3) so the catalog spans
-/// environments whose attach points fit in one page and environments whose do not,
-/// rather than making every `ListAttachPoints` page trivially the last one.
-fn seeded_attach_point_count(index: usize) -> usize {
-    1 + index % 3
-}
-
-/// The attach points each seeded Environment offers.
-///
-/// `AttachPointType`'s only modelled value is `DirectConnectGateway`, so each entry
-/// names a Direct Connect gateway by the UUID that
-/// `AttachPoint$directConnectGateway` requires. The UUID is DERIVED from the
-/// environment id and the entry's ordinal (a name-based v5 UUID), so the seed cannot
-/// fall out of step with the catalog however many environments it holds, and it is
-/// stable across runs the way an AWS-owned resource id is.
-fn seed_attach_points(
-    environments: &BTreeMap<String, Environment>,
-) -> BTreeMap<String, Vec<AttachPointDescriptor>> {
-    environments
-        .keys()
-        .enumerate()
-        .map(|(index, environment_id)| {
-            let descriptors = (0..seeded_attach_point_count(index))
-                .map(|ordinal| {
-                    let gateway = uuid::Uuid::new_v5(
-                        &uuid::Uuid::NAMESPACE_OID,
-                        format!("{environment_id}#{ordinal}").as_bytes(),
-                    );
-                    AttachPointDescriptor {
-                        r#type: ATTACH_POINT_TYPE_DIRECT_CONNECT_GATEWAY.to_string(),
-                        identifier: gateway.to_string(),
-                        name: format!("dxgw-{ordinal}-for-{environment_id}"),
-                    }
-                })
-                .collect();
-            (environment_id.clone(), descriptors)
-        })
-        .collect()
-}
