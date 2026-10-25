@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // Reading one uniquely named element out of an awsQuery XML body already has a
 // helper in this test crate, so this suite imports it instead of hand-rolling a
 // third copy.
-use crate::iam_role_id_agrees_with_sts::xml_element;
+use crate::query_wire::element;
 
 /// A SigV4 `Authorization` header whose credential scope names `service`. The
 /// signature is never checked: the router here runs with request authentication
@@ -70,7 +70,7 @@ async fn caller_identity_arn(router: &MultiServiceRouter) -> String {
         status, 200,
         "expected HTTP 200 from GetCallerIdentity, got {status} with body {payload}"
     );
-    xml_element(&payload, "Arn").unwrap_or_else(|| panic!("no <Arn> in {payload}"))
+    element(&payload, "Arn")
 }
 
 /// Send one Billing awsJson1_0 call and return its status and decoded body.

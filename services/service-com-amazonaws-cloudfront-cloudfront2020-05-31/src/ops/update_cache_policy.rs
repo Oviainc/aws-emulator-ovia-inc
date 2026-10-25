@@ -223,6 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // A policy AWS published belongs to AWS, so this account cannot write over the
+        // configuration AWS gave it: the update is refused for what the REQUEST asked for
+        // — a change to a service-owned resource — the same rule a delete of one is
+        // refused by, and the policy keeps serving the configuration a read reports.
+        if crate::state::managed_cache_policy(&input.id).is_some() {
+            return Err(UpdateCachePolicyErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_managed_policy(),
+            )
+            .into());
+        }
+
         // The policy being updated is looked up first: every refusal below is about the
         // record this id names, and nothing is minted for an id the store does not hold.
         let Some(current_etag) = store.cache_policy(&input.id).map(|stored| stored.etag.clone())

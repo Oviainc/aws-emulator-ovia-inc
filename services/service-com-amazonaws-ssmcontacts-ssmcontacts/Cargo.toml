@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that digest, and the opaque `NextToken` payload, as printable text.
 hex = { workspace = true }
+# `service-common` carries the workspace's ONE caller-supplied-ARN parse, which the tagging
+# operations read their unpatterned `ResourceARN` against before resolving it.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

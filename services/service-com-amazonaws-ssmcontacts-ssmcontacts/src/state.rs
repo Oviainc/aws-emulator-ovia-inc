@@ -1467,7 +1467,8 @@ pub const CONTACT_TARGET_WITHOUT_CONTACT_ID_MESSAGE: &str =
      must carry contactId";
 
 /// `Ok` with `key`'s value when `tag` carries a key, else the `ValidationException` message
-/// saying so.///
+/// saying so.
+///
 /// The modelled `Tag` makes both members optional, but a tag with no `Key` names nothing to
 /// store, read back or remove, so it is refused rather than persisted.
 pub fn require_tag_key(tag: &Tag) -> Result<&str, String> {

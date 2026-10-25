@@ -5,6 +5,10 @@
 //! into [`crate::state`] and answers from it. A monitor created with no probe
 //! has nothing to aggregate, so it is stored (and reported) `INACTIVE`; one
 //! created with probes is `PENDING` until the clock makes its activation due.
+//! The probes created inline are probes of the monitor, so they are bounded per
+//! source subnet like any other
+//! ([`crate::state::check_probes_per_subnet`]): a request asking for more probes
+//! than one subnet of a monitor may hold is refused and stores nothing.
 //! A second create naming a monitor that already exists is a RETRY only when it
 //! repeats the stored `clientToken`; any other repeat is refused with
 //! `ConflictException`. A retry REPORTS the monitor the token already minted, so
@@ -144,8 +148,10 @@ impl From<CreateMonitorErrorModeled> for CreateMonitorError {
 /// This service's `ValidationException` (HTTP 400), carrying `message`.
 ///
 /// Used for the rules the model documents in prose but its constraints cannot
-/// express — the `aggregationPeriod` value list, and the probe rules in
-/// [`crate::state::build_probe`].
+/// express — the `aggregationPeriod` value list, the probe rules in
+/// [`crate::state::build_probe`], and the probe-count limits
+/// ([`crate::state::check_probes_per_subnet`]), which AWS refuses as a
+/// validation failure rather than as the quota failure the model also declares.
 fn validation(message: String) -> CreateMonitorError {
     CreateMonitorErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -294,17 +300,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if specs.len() > crate::state::MAX_PROBES_PER_MONITOR {
-            return Err(CreateMonitorErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this emulator keeps at most {} probes per monitor, got {}",
-                        crate::state::MAX_PROBES_PER_MONITOR,
-                        specs.len()
-                    )),
-                },
-            )
-            .into());
+            return Err(validation(
+                crate::state::PROBES_PER_MONITOR_MESSAGE.to_string(),
+            ));
         }
+        // Each requested probe has to satisfy the probe rules on its own before
+        // the request is judged on how many probes it asks for, so a malformed
+        // probe is refused for what it says rather than for the company it
+        // keeps. `crate::state::build_probe` below applies the same rules when
+        // it writes each record.
+        for (position, spec) in specs.iter().enumerate() {
+            crate::state::validate_probe_spec(
+                spec,
+                &crate::state::element_path("probes", position + 1),
+            )
+            .map_err(validation)?;
+        }
+        // The probes this request creates inline are probes of this monitor, so
+        // they are bounded per source subnet exactly as `CreateProbe`'s are —
+        // here against each other, since the monitor being created holds none
+        // yet. Checked before any probe id is minted, so a refused create
+        // leaves the store as it found it.
+        crate::state::check_probes_per_subnet(
+            None,
+            specs.iter().map(|spec| spec.source_arn.as_str()),
+        )
+        .map_err(validation)?;
 
         let mut probes = ::std::collections::BTreeMap::new();
         for (position, spec) in specs.into_iter().enumerate() {

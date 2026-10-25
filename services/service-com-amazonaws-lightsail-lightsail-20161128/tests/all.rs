@@ -169,5 +169,7 @@ mod setup_history_reporting;
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
 mod static_ip_allocation;
+#[path = "all/tagged_resource_coverage.rs"]
+mod tagged_resource_coverage;
 #[path = "all/vpc_peering.rs"]
 mod vpc_peering;

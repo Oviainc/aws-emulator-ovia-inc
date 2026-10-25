@@ -184,25 +184,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A page cursor: the name of the last category of the previous page, read
-        // through this service's own token codec, so a token this service never handed
-        // out is refused rather than silently restarting from the top.
-        let resume_after = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(parse_next_token(token)?.to_string()),
-        };
+        // through this service's own token codec (`state::resume_after_name`), so a
+        // token this service never handed out is refused — in the same words every
+        // other listing of this service refuses one with — rather than silently
+        // restarting from the top.
+        let resume_after = crate::state::resume_after_name(
+            input.next_token.as_deref(),
+            Self::NAME,
+            |message| -> Self::Error {
+                ListCallAnalyticsCategoriesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into()
+            },
+        )?
+        .map(str::to_string);
 
         // "If you do not specify a value, a default of 5 is used" (model doc for
-        // `ListCallAnalyticsCategoriesRequest$MaxResults`). `MaxResults` is modelled
-        // `@range(min: 1, max: 100)`, so the boundary validator has already refused
-        // anything outside it; the clamp states that dependency rather than relying on
-        // it silently.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_CATEGORY_LIST_MAX_RESULTS),
-        )
-        .unwrap_or(crate::state::MAX_LIST_MAX_RESULTS)
-        .clamp(1, crate::state::MAX_LIST_MAX_RESULTS);
+        // `ListCallAnalyticsCategoriesRequest$MaxResults`).
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_CATEGORY_LIST_MAX_RESULTS,
+        );
 
         let store = state.lock();
         let start = match resume_after.as_deref() {
@@ -237,23 +242,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             categories: Some(page.iter().map(|record| record.to_properties()).collect()),
         })
     }
-}
-
-/// The category name a `NextToken` resumes after, or this operation's own modelled
-/// refusal for a token this service never handed out.
-///
-/// The token format and what counts as one of this service's own is
-/// `state::parse_name_page_cursor`; this lifts its `None` into the error channel
-/// `ListCallAnalyticsCategories` models.
-fn parse_next_token(token: &str) -> Result<&str, ListCallAnalyticsCategoriesError> {
-    crate::state::parse_name_page_cursor(token).ok_or_else(|| {
-        ListCallAnalyticsCategoriesErrorModeled::BadRequestException(BadRequestException {
-            message: Some(
-                "The NextToken in your request is not valid. Use the NextToken returned \
-                 by your previous ListCallAnalyticsCategories request."
-                    .to_string(),
-            ),
-        })
-        .into()
-    })
 }
