@@ -30,12 +30,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
+use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
-    ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
-    HostedZoneFeatures, KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone,
-    NoSuchTrafficPolicy, ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES,
-    V_P_C_REGION_VALUES,
+    ChangeInfo, ConflictingDomainExists, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone,
+    HostedZoneConfig, HostedZoneFeatures, InvalidPaginationToken, InvalidTrafficPolicyDocument,
+    KeySigningKey, NoSuchDelegationSet, NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy,
+    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -1743,8 +1744,26 @@ pub fn no_such_traffic_policy(requested_id: &str, requested_version: i32) -> NoS
     }
 }
 
-/// The `RRType` a traffic policy document records, or the reason the document
-/// is not a valid one (`InvalidTrafficPolicyDocument`, HTTP 400).
+/// The modelled `InvalidTrafficPolicyDocument` (HTTP 400) for a document the
+/// traffic policy document format does not define.
+///
+/// A document is checked against EVERY structural constraint of the format and
+/// the refusal enumerates every one it violates — one clause per violated
+/// constraint, in the order the format declares them, joined with `;` — so a
+/// caller authoring a document learns all of its faults from one request
+/// instead of one fault per round trip. The ONE place this service words that
+/// refusal, so every operation that takes a document (the create, and the
+/// version create built on the same validator) reports a faulty one
+/// identically.
+pub fn invalid_traffic_policy_document(violations: &[String]) -> InvalidTrafficPolicyDocument {
+    InvalidTrafficPolicyDocument {
+        message: Some(violations.join(";")),
+    }
+}
+
+/// The `RRType` a traffic policy document records, or every constraint of the
+/// document format the document violates (`InvalidTrafficPolicyDocument`,
+/// HTTP 400).
 ///
 /// The document is the traffic policy's definition, and `TrafficPolicy$Type` is
 /// "the DNS type of the resource record sets that Amazon Route 53 creates when
@@ -1756,113 +1775,148 @@ pub fn no_such_traffic_policy(requested_id: &str, requested_version: i32) -> NoS
 /// route to, and exactly one entry point — `StartEndpoint`, naming one of those
 /// endpoints, or `StartRule`, naming one of the `Rules`.
 ///
-/// Every refusal names the member that was wrong and what was wrong with it, so
-/// the caller can act on it; the document itself is never quoted back.
-pub fn traffic_policy_record_type(document: &str) -> Result<String, String> {
-    let parsed: serde_json::Value = serde_json::from_str(document)
-        .map_err(|error| format!("the traffic policy document is not valid JSON: {error}"))?;
-    let Some(root) = parsed.as_object() else {
-        return Err("the traffic policy document must be a JSON object".to_string());
+/// `Err` carries ONE CLAUSE PER VIOLATED CONSTRAINT rather than stopping at the
+/// first: a document can break several of these rules at once and a caller
+/// validating a document by submitting it has to learn about all of them.
+/// Each clause states the constraint that was broken (and, where a value was
+/// the problem, that value); the document itself is never quoted back. The two
+/// faults a document can have before anything else can be checked — it is not
+/// JSON, or it is JSON that is not an object — are the whole refusal on their
+/// own, because no constraint below them can be evaluated at all.
+pub fn traffic_policy_record_type(document: &str) -> Result<String, Vec<String>> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
+        return Err(vec![
+            "The traffic policy document must be declared as valid JSON.".to_string(),
+        ]);
     };
+    let Some(root) = parsed.as_object() else {
+        return Err(vec![
+            "The traffic policy document must be declared as a JSON object.".to_string(),
+        ]);
+    };
+
+    let mut violations: Vec<String> = Vec::new();
 
     match root
         .get("AWSPolicyFormatVersion")
         .and_then(serde_json::Value::as_str)
     {
         Some(TRAFFIC_POLICY_FORMAT_VERSION) => {}
-        Some(other) => {
-            return Err(format!(
-                "AWSPolicyFormatVersion {other} is not a traffic policy document format version; \
-                 the supported version is {TRAFFIC_POLICY_FORMAT_VERSION}"
-            ))
-        }
-        None => {
-            return Err(
-                "the traffic policy document must carry AWSPolicyFormatVersion as a string"
-                    .to_string(),
-            )
-        }
+        Some(other) => violations.push(format!(
+            "AWSPolicyFormatVersion {other} is not a supported traffic policy document format \
+             version, the supported version is {TRAFFIC_POLICY_FORMAT_VERSION}."
+        )),
+        None => violations.push("AWSPolicyFormatVersion must be declared.".to_string()),
     }
 
     let record_type = match root.get("RecordType").and_then(serde_json::Value::as_str) {
-        Some(value) if R_R_TYPE_VALUES.contains(&value) => value.to_string(),
+        Some(value) if R_R_TYPE_VALUES.contains(&value) => Some(value.to_string()),
         Some(other) => {
-            return Err(format!(
-                "RecordType {other} is not a DNS record type a traffic policy can create"
-            ))
+            violations.push(format!(
+                "RecordType {other} is not a DNS record type a traffic policy can create."
+            ));
+            None
         }
         None => {
-            return Err(
-                "the traffic policy document must carry RecordType as a string".to_string()
-            )
+            violations.push("RecordType must be declared.".to_string());
+            None
         }
     };
 
-    let endpoints = root
-        .get("Endpoints")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            "the traffic policy document must carry Endpoints as a JSON object".to_string()
-        })?;
-    if endpoints.is_empty() {
-        return Err("the traffic policy document must define at least one endpoint in Endpoints"
-            .to_string());
-    }
-    if let Some(name) = named_entry_that_is_not_an_object(endpoints) {
-        return Err(format!("the endpoint {name} in Endpoints must be a JSON object"));
+    // A document declares the endpoints it can route to in `Endpoints`, which
+    // maps an endpoint's name to its definition. A block that is absent or
+    // empty declares no endpoint at all, which is the same violation however
+    // it is spelled.
+    let endpoints = match root.get("Endpoints") {
+        None => {
+            violations.push("At least one endpoint must be declared.".to_string());
+            None
+        }
+        Some(value) => match value.as_object() {
+            Some(endpoints) => {
+                if endpoints.is_empty() {
+                    violations.push("At least one endpoint must be declared.".to_string());
+                }
+                Some(endpoints)
+            }
+            None => {
+                violations.push("Endpoints must be declared as a JSON object.".to_string());
+                None
+            }
+        },
+    };
+    for name in named_entries_that_are_not_objects(endpoints) {
+        violations.push(format!(
+            "The endpoint {name} must be declared as a JSON object."
+        ));
     }
 
+    // Exactly one entry point: the document starts at one endpoint or at one
+    // rule, never at both and never at neither.
     let start_endpoint = root
         .get("StartEndpoint")
         .and_then(serde_json::Value::as_str);
     let start_rule = root.get("StartRule").and_then(serde_json::Value::as_str);
-    match (start_endpoint, start_rule) {
-        (Some(_), Some(_)) => Err("the traffic policy document must carry exactly one of \
-                                   StartEndpoint and StartRule, not both"
-            .to_string()),
-        (None, None) => Err("the traffic policy document must carry either StartEndpoint or \
-                             StartRule as a string"
-            .to_string()),
-        (Some(endpoint), None) => {
-            if endpoints.contains_key(endpoint) {
-                Ok(record_type)
-            } else {
-                Err(format!(
-                    "StartEndpoint {endpoint} names no endpoint in Endpoints"
-                ))
+    if matches!((start_endpoint, start_rule), (Some(_), Some(_)) | (None, None)) {
+        violations.push(
+            "Either StartRule or StartEndpoint must be declared, but not both".to_string(),
+        );
+    }
+
+    // An entry point names the endpoint or rule the document starts at, so the
+    // document has to declare the one it names. A block that is not an object
+    // declares nothing, and has already been reported as the fault it is, so
+    // the reference is checked against the entries the document really
+    // declares.
+    let undeclared_start_endpoint = start_endpoint
+        .filter(|name| endpoints.is_some_and(|endpoints| !endpoints.contains_key(*name)));
+    if let Some(name) = undeclared_start_endpoint {
+        violations.push(format!(
+            "StartEndpoint {name} does not reference a declared endpoint."
+        ));
+    }
+    let rules = match root.get("Rules") {
+        None => None,
+        Some(value) => match value.as_object() {
+            Some(rules) => Some(rules),
+            None => {
+                violations.push("Rules must be declared as a JSON object.".to_string());
+                None
             }
-        }
-        (None, Some(rule)) => {
-            let rules = root
-                .get("Rules")
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| {
-                    "a traffic policy document with a StartRule must carry Rules as a JSON object"
-                        .to_string()
-                })?;
-            if let Some(name) = named_entry_that_is_not_an_object(rules) {
-                return Err(format!("the rule {name} in Rules must be a JSON object"));
-            }
-            if rules.contains_key(rule) {
-                Ok(record_type)
-            } else {
-                Err(format!("StartRule {rule} names no rule in Rules"))
-            }
-        }
+        },
+    };
+    for name in named_entries_that_are_not_objects(rules) {
+        violations.push(format!("The rule {name} must be declared as a JSON object."));
+    }
+    let undeclared_start_rule =
+        start_rule.filter(|name| rules.is_none_or(|rules| !rules.contains_key(*name)));
+    if let Some(name) = undeclared_start_rule {
+        violations.push(format!(
+            "StartRule {name} does not reference a declared rule."
+        ));
+    }
+
+    match record_type {
+        // Every branch that leaves the record type unread pushes a clause of
+        // its own, so the `Err` arm always carries at least one.
+        Some(record_type) if violations.is_empty() => Ok(record_type),
+        _ => Err(violations),
     }
 }
 
-/// The name of the first entry of a traffic policy document's `Endpoints` or
-/// `Rules` block that is not itself a JSON object, if there is one: both blocks
-/// map a name to a definition, so an entry that is not an object defines
-/// nothing.
-fn named_entry_that_is_not_an_object(
-    entries: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&String> {
+/// The names of the entries of a traffic policy document's `Endpoints` or
+/// `Rules` block that are not themselves JSON objects: both blocks map a name
+/// to a definition, so an entry that is not an object defines nothing. Every
+/// such entry is its OWN violated constraint, so every one is named.
+fn named_entries_that_are_not_objects(
+    entries: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Vec<&String> {
     entries
-        .iter()
-        .find(|(_, definition)| !definition.is_object())
+        .into_iter()
+        .flatten()
+        .filter(|(_, definition)| !definition.is_object())
         .map(|(name, _)| name)
+        .collect()
 }
 
 /// The endpoint host a `Location` URL falls back to when the request carried no
@@ -1889,6 +1943,66 @@ pub fn resource_location(
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_ENDPOINT_HOST);
     format!("https://{host}/2013-04-01/{path}")
+}
+
+/// The modelled `VPCAssociationAuthorizationNotFound` (HTTP 404) for a
+/// `(hosted zone, VPC)` pair the zone's authorization ledger does not hold.
+///
+/// REQUEST-DERIVED, and worded for the LEDGER it reports on: an authorization
+/// entry is identified by the VPC's id together with the region that VPC was
+/// created in, so the refusal names the zone, the id and the region the request
+/// asked about and states that no authorization exists for them — which is what
+/// tells a caller "this VPC was never authorized for this zone" apart from "this
+/// association attempt is not authorized". The zone id is reported BARE, as
+/// [`normalize_zone_id`] resolves it, for the same reason
+/// [`no_such_hosted_zone`] reports it bare.
+pub fn vpc_association_authorization_not_found(
+    requested_zone_id: &str,
+    vpc_id: &str,
+    vpc_region: &str,
+) -> VPCAssociationAuthorizationNotFound {
+    VPCAssociationAuthorizationNotFound {
+        message: Some(format!(
+            "No authorization exists for hosted zone: {} and vpc: {vpc_id}, {vpc_region}",
+            normalize_zone_id(requested_zone_id)
+        )),
+    }
+}
+
+/// The modelled `ConflictingDomainExists` (HTTP 400) for an association that
+/// would leave one VPC resolving one DNS name through two hosted zones.
+///
+/// Built from the request plus the conflict the store resolved: the VPC's id and
+/// the region it was created in come from the request, and
+/// `conflicting_zone_id` is the zone ALREADY associated with that VPC under the
+/// same name. The conflicting zone's id is the actionable half — the caller
+/// already knows the name it asked for, and what it does not know is which zone
+/// holds the VPC — so the refusal names the zone rather than the name.
+pub fn conflicting_domain_exists(
+    vpc_id: &str,
+    vpc_region: &str,
+    conflicting_zone_id: &str,
+) -> ConflictingDomainExists {
+    ConflictingDomainExists {
+        message: Some(format!(
+            "The VPC {vpc_id} in region {vpc_region} has already been associated with the hosted \
+             zone {conflicting_zone_id} with the same domain name."
+        )),
+    }
+}
+
+/// The modelled `InvalidPaginationToken` (HTTP 400) for a `NextToken` that
+/// identifies no page of results.
+///
+/// The ONE place this service words that refusal, so every paginated operation
+/// answers a token it did not mint identically. REQUEST-DERIVED from the token
+/// ALONE: the sentence names the token that arrived and makes no claim about
+/// what a token stands for, because what a token encodes is the service's own
+/// business and a caller can only act on which token it sent.
+pub fn invalid_pagination_token(token: &str) -> InvalidPaginationToken {
+    InvalidPaginationToken {
+        message: Some(format!("Invalid pagination token: {token}")),
+    }
 }
 
 /// The modelled `NoSuchHostedZone` (HTTP 404) for a zone id that names no zone

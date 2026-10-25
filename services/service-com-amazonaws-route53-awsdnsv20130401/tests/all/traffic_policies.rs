@@ -56,7 +56,10 @@ const VERSION_MIN: i64 = 1;
 const VERSION_MAX: i64 = 1000;
 
 /// A traffic policy document whose entry point is a single endpoint.
-fn document_with_start_endpoint(record_type: &str, value: &str) -> String {
+///
+/// `pub(crate)` so the suite asserting the document refusal's TEXT builds its
+/// well-formed documents the same way this one does.
+pub(crate) fn document_with_start_endpoint(record_type: &str, value: &str) -> String {
     format!(
         "{{\"AWSPolicyFormatVersion\":\"{TRAFFIC_POLICY_FORMAT_VERSION}\",\
          \"RecordType\":\"{record_type}\",\"StartEndpoint\":\"only\",\
@@ -78,7 +81,7 @@ fn document_with_start_rule(record_type: &str, primary: &str, secondary: &str) -
 }
 
 /// Create a traffic policy. `comment` of `None` sends no `Comment` element.
-async fn create_policy(
+pub(crate) async fn create_policy(
     router: &MultiServiceRouter,
     name: &str,
     document: &str,
