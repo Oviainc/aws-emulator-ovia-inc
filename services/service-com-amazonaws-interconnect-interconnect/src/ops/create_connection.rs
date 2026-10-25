@@ -468,10 +468,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             shared_id: crate::state::new_shared_id(),
             // `billingTier` is OPTIONAL and the rule AWS assigns it by is not
             // published anywhere — not in the model, which gives only the
-            // `@range(min: 0, max: 8)` ordinal, and not in the service's docs. A
-            // tier invented here would be plausible and wrong for every real
-            // input, so the member is left unset rather than synthesised; the day
-            // the rule is known it is computed from the bandwidth here.
+            // `@range(min: 0, max: 8)` ordinal and the sentence "the billing tier
+            // this connection is currently assigned", and not in the service's docs.
+            // The model's own worked examples agree that the member is not always
+            // sent: every example output that returns a Connection
+            // (AcceptConnectionProposal, CreateConnection, GetConnection,
+            // DeleteConnection) returns one with no `billingTier` at all. A tier
+            // invented here would be plausible and wrong for every real input, so the
+            // member is left unset rather than synthesised; the day the rule is known
+            // it is computed from the record here.
             billing_tier: None,
             owner_account: ::emulator_server::emulator_account_id().to_string(),
             activation_key: activation_key.clone(),

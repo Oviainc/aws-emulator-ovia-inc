@@ -1,15 +1,48 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetECSServiceRecommendationProjectedMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetECSServiceRecommendationProjectedMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetECSServiceRecommendationProjectedMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the projected metrics of Amazon ECS service recommendations.
+//!
+//! A REPORTING operation: it reads the Amazon ECS service the request names and the
+//! utilization published for it, computes the recommendation option that service's analysis
+//! arrives at, and writes nothing. Compute Optimizer invents nothing about a workload, so
+//! this handler invents no recommendation and no observation either: every value it reports
+//! is computed from the SAME analysis `GetECSServiceRecommendations` reports — the ECS
+//! store's service record and its task definition's task-level CPU/memory
+//! ([`crate::state::ecs_service_config`]), the `AWS/ECS` `CPUUtilization` /
+//! `MemoryUtilization` observations of the effective look-back period
+//! ([`crate::state::ecs_observed_utilization`]), and the Fargate task size those observed
+//! peaks are sized to ([`crate::state::ecs_recommended_task_size`]).
+//!
+//! ## The projection
+//!
+//! "To determine the performance difference between your current Amazon ECS service and the
+//! recommended option, compare the metric data of your service against its projected metric
+//! data" (`ECSServiceRecommendedOptionProjectedMetric`): a projected metric is the OBSERVED
+//! metric as it would read on the recommended task size. Both analysed metrics measure a
+//! percentage of what the task size sizes — "`Cpu` — The percentage of allocated compute
+//! units that are currently in use on the service tasks", and the same for `Memory` — so
+//! each is scaled by the ratio of the current and recommended sizes of the dimension it
+//! measures, because the same work on half the capacity runs at twice the utilization
+//! ([`crate::state::ecs_projected_utilization_metrics`], which is also what the
+//! recommendation reader reports the option's projected utilization from, so the two readers
+//! of one analysis cannot disagree).
+//!
+//! The analysis folds ONE figure per metric and statistic out of the look-back window, so
+//! the series reported over the requested window carries that one projected value at each of
+//! its data points: nothing finer-grained was observed, and a varying series would be
+//! invented rather than computed. The projection is a single value, so a data point's upper
+//! and lower bound are both that value — a wider interval would claim a spread the
+//! observation does not carry. `stat` ("The statistic of the projected metrics") selects
+//! WHICH observations are projected: a metric the analysis observed under another statistic
+//! is not reported under the requested one.
+//!
+//! A service this endpoint has no analysis for — one the ECS store holds no active record of,
+//! one that does not run on Fargate, one whose task definition sets no task size, or one with
+//! no observation inside the look-back window — has no recommendation option to project onto,
+//! and this operation models no per-resource error list, so it is "a resource that is required
+//! for the action doesn't exist".
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +123,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +201,256 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetECSServiceRecommendationProjectedMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetECSServiceRecommendationProjectedMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Compute Optimizer is a REGIONAL service, and the region of a request is the one
+        // its SigV4 credential scope names ([`crate::state::request_region`]). An Amazon ECS
+        // service belongs to the region its own ARN names, so only that region's services
+        // are analysed at this endpoint.
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal(
+                "The Compute Optimizer preference store is unavailable.",
+            ));
+        };
+        let Some(inventory) = ecs::state::service_state(&*self.engine) else {
+            return Err(internal(
+                "The Amazon ECS service inventory an Amazon ECS service recommendation is \
+                 computed over is unavailable.",
+            ));
+        };
+        let Some(observations) = cloudwatch::state::service_state(&*self.engine) else {
+            return Err(internal(
+                "The CloudWatch metric store an Amazon ECS service recommendation is computed \
+                 from is unavailable.",
+            ));
+        };
+
+        // A malformed request is refused BEFORE any store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in this service's other readers.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetECSServiceRecommendationProjectedMetrics"))
+        // `serviceArn` is "The ARN that identifies the Amazon ECS service", in the form the
+        // member documents; anything else cannot identify a service to project for. WHICH
+        // service it names is not checked here: a well-formed ARN this endpoint has no
+        // analysis for is reported as a missing resource below, not refused. An ARN whose
+        // ACCOUNT field names another account asks about a service this service cannot report
+        // on, so it is refused with the crate's cross-account message rather than selecting
+        // nothing.
+        let Some(reference) = crate::state::parse_ecs_service_arn(&input.service_arn) else {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter serviceArn is not valid: {} is not the \
+                 Amazon Resource Name (ARN) of an Amazon ECS service, which has the form \
+                 arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name.",
+                input.service_arn
+            )));
+        };
+        if crate::state::is_foreign_account(&reference.account_id) {
+            return Err(invalid_parameter(
+                crate::state::CROSS_ACCOUNT_MESSAGE.to_string(),
+            ));
+        }
+        // `period` is "The granularity, in seconds, of the projected metrics data points", so
+        // it is a span of time: the member's modelled default `0` — which a request omitting
+        // it carries — divides the window into no data points at all.
+        if input.period <= 0 {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: the granularity of the \
+                 projected metrics data points must be a positive number of seconds, not {}.",
+                input.period
+            )));
+        }
+        // `startTime` is "the first projected metrics data point to return" and `endTime`
+        // "the last", so the window runs forwards and holds at least one data point.
+        let start = input.start_time.as_secs_f64();
+        let end = input.end_time.as_secs_f64();
+        if end <= start {
+            return Err(invalid_parameter(
+                "The value supplied for parameter startTime is not valid: it must be earlier \
+                 than endTime."
+                    .to_string(),
+            ));
+        }
+        // The data points of the window, at the requested granularity. Capped at
+        // `MAX_PROJECTED_METRIC_DATA_POINTS`, so no number a request carries can size the
+        // response or the allocation that builds it.
+        let Some(timestamps) =
+            crate::state::projected_metric_timestamps(start, end, f64::from(input.period))
+        else {
+            return Err(invalid_parameter(format!(
+                "The value supplied for parameter period is not valid: a window of {} seconds \
+                 at a granularity of {} seconds covers more than {} projected metrics data \
+                 points; ask for a coarser period or a shorter window.",
+                end - start,
+                input.period,
+                crate::state::MAX_PROJECTED_METRIC_DATA_POINTS
+            )));
+        };
+
+        // The enrollment gate, ahead of every read of another service's store: "The account
+        // is not opted in to Compute Optimizer" — the service analyses an account's resources
+        // only once it has opted in, so an account that never did, or that opted back out,
+        // reads no recommendation and no projection of one. The look-back period in force for
+        // the service comes from the same store, by the scope precedence every preference read
+        // of this service uses.
+        let look_back_period = {
+            let preferences = state.lock();
+            if !preferences.enrollment.is_opted_in() {
+                return Err(
+                    GetECSServiceRecommendationProjectedMetricsErrorModeled::OptInRequiredException(
+                        OptInRequiredException {
+                            message: Some(
+                                "The account is not opted in to Compute Optimizer.".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            preferences
+                .effective_preferences_for(
+                    &reference.arn,
+                    crate::state::RESOURCE_TYPE_ECS_SERVICE,
+                    &reference.account_id,
+                )
+                .look_back_period
+        };
+
+        // What the ECS store holds for the service, at the endpoint the request addressed: a
+        // service of another region is none of this endpoint's, exactly as it is none of the
+        // recommendation reader's sweep.
+        let config = (reference.region == region)
+            .then(|| crate::state::ecs_service_config(&inventory.lock(), &reference))
+            .flatten();
+        let Some(config) = config else {
+            return Err(no_recommendation(
+                "no Amazon ECS service with that Amazon Resource Name (ARN) exists",
+            ));
+        };
+        // "Compute Optimizer generates recommendations for Amazon ECS services on Fargate."
+        if crate::state::ecs_launch_type_of(&config)
+            != Some(crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE)
+        {
+            return Err(no_recommendation(format!(
+                "Compute Optimizer generates Amazon ECS service recommendations for services \
+                 on {} only, and that service does not run on it",
+                crate::state::ECS_SERVICE_LAUNCH_TYPE_FARGATE
+            )));
+        }
+        // A Fargate task definition carries task-level CPU and memory ("This field is required
+        // for Fargate"); without them there is no current size to project a utilization off.
+        let (Some(current_cpu), Some(current_memory)) = (config.cpu_units, config.memory_mib)
+        else {
+            return Err(no_recommendation(
+                "the task definition of that service sets no task-level cpu and memory, so its \
+                 utilization cannot be sized",
+            ));
+        };
+        if current_cpu <= 0 || current_memory <= 0 {
+            return Err(no_recommendation(format!(
+                "the task definition of that service sets a task-level cpu of {current_cpu} and \
+                 memory of {current_memory}, which is not a Fargate task size"
+            )));
+        }
+
+        // The utilization the analysis observed over the look-back period in force, and the
+        // Fargate task size those observed peaks are sized to: the ONE recommendation option
+        // an ECS service recommendation carries.
+        let now = cloudwatch::state::now_secs();
+        let observed = crate::state::ecs_observed_utilization(
+            &observations.lock(),
+            &reference,
+            &look_back_period,
+            now,
+        );
+        let Some((cpu, memory)) = observed.both() else {
+            return Err(no_recommendation(format!(
+                "no {} observation of it falls in the {look_back_period} look-back period, so \
+                 there is no utilization to analyse",
+                observed.missing_series().unwrap_or_default(),
+            )));
+        };
+        let (option_cpu, option_memory) = crate::state::ecs_recommended_task_size(
+            current_cpu,
+            current_memory,
+            cpu.maximum,
+            memory.maximum,
+        );
+
+        // Each observed statistic as it would read on that task size, reported as a series
+        // over the requested window.
+        let projected: Vec<ECSServiceProjectedMetric> =
+            crate::state::ecs_projected_utilization_metrics(
+                cpu,
+                memory,
+                (current_cpu, current_memory),
+                (option_cpu, option_memory),
+            )
+            .into_iter()
+            // `stat` is "The statistic of the projected metrics": the observations projected
+            // are the ones the analysis folded under that statistic.
+            .filter(|metric| metric.statistic.as_deref() == Some(input.stat.as_str()))
+            .map(|metric| ECSServiceProjectedMetric {
+                name: metric.name,
+                timestamps: Some(timestamps.clone()),
+                // The analysis folded ONE figure per metric and statistic out of the window,
+                // so the series carries its projection at every data point.
+                upper_bound_values: Some(vec![metric.upper_bound_value; timestamps.len()]),
+                lower_bound_values: Some(vec![metric.lower_bound_value; timestamps.len()]),
+            })
+            .collect();
+
+        Ok(GetECSServiceRecommendationProjectedMetricsOutput {
+            recommended_option_projected_metrics: Some(vec![
+                ECSServiceRecommendedOptionProjectedMetric {
+                    recommended_cpu_units: option_cpu,
+                    recommended_memory_size: option_memory,
+                    // Where the analysis observed nothing under the requested statistic there
+                    // is no series to report, rather than an empty one.
+                    projected_metrics: (!projected.is_empty()).then_some(projected),
+                },
+            ]),
+        })
     }
+}
+
+/// This operation's modelled `InternalServerException`, carrying `message`.
+fn internal(message: impl Into<String>) -> GetECSServiceRecommendationProjectedMetricsError {
+    GetECSServiceRecommendationProjectedMetricsErrorModeled::InternalServerException(
+        InternalServerException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
+/// value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> GetECSServiceRecommendationProjectedMetricsError {
+    GetECSServiceRecommendationProjectedMetricsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The 404 `ResourceNotFoundException` for a request whose service has no recommendation to
+/// project metrics onto, stating `reason`.
+///
+/// This operation reports ONE resource's projection and models no per-resource error list
+/// (the `errors` channel `GetECSServiceRecommendations` reports the same reasons through), so
+/// a service the analysis has no input for is "a resource that is required for the action
+/// doesn't exist" here.
+fn no_recommendation(
+    reason: impl Into<String>,
+) -> GetECSServiceRecommendationProjectedMetricsError {
+    GetECSServiceRecommendationProjectedMetricsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(format!(
+                "Compute Optimizer has no Amazon ECS service recommendation for the resource \
+                 this identifier names: {}.",
+                reason.into()
+            )),
+        },
+    )
+    .into()
 }

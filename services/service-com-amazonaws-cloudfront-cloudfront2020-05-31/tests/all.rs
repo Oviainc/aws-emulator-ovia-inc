@@ -101,6 +101,8 @@ mod origin_request_policy_list;
 mod public_key_lifecycle;
 #[path = "all/realtime_log_config_lifecycle.rs"]
 mod realtime_log_config_lifecycle;
+#[path = "all/realtime_log_config_list.rs"]
+mod realtime_log_config_list;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
 #[path = "all/staging_config_promotion.rs"]

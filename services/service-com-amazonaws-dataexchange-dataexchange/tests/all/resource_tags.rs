@@ -634,10 +634,10 @@ async fn an_arn_addressing_nothing_stored_is_a_404() {
 
     // Rows differ along WHICH part of the ARN addresses nothing: the data set id, the
     // revision id, the region, the account, the partition, the vendor, and the kind of
-    // resource named — a job (whose create carries no `Tags`), an event action and a
-    // data grant (taggable per the model, but minted by operations that are still
-    // scaffolds, so this emulator stores none), and resource paths that name no id at
-    // all or go deeper than any resource this service holds.
+    // resource named — a job (whose create carries no `Tags`), an event action id this
+    // emulator never minted and a data grant (taggable per the model, but minted by an
+    // operation that is still a scaffold, so this emulator stores none), and resource
+    // paths that name no id at all or go deeper than any resource this service holds.
     let rows = vec![
         (
             "an unknown data set",
@@ -679,7 +679,7 @@ async fn an_arn_addressing_nothing_stored_is_a_404() {
             format!("arn:aws:dataexchange:{REGION}:{ACCOUNT}:jobs/{ABSENT_ID}"),
         ),
         (
-            "an event action, a taggable kind nothing is stored of",
+            "an event action id this emulator never minted",
             format!("arn:aws:dataexchange:{REGION}:{ACCOUNT}:event-actions/{ABSENT_ID}"),
         ),
         (

@@ -29,6 +29,7 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
     ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
@@ -332,6 +333,17 @@ pub const DELEGATION_SET_ALREADY_REUSABLE_MESSAGE: &str =
 pub const HOSTED_ZONE_NOT_EMPTY_MESSAGE: &str =
     "The specified hosted zone contains resource record sets other than the default SOA and NS \
      records and so cannot be deleted. Delete all non-default records and try again.";
+
+/// The refusal text `DisassociateVPCFromHostedZone` answers a request that would
+/// take the LAST VPC out of a private hosted zone's association set with
+/// (`LastVPCAssociation`, HTTP 400).
+///
+/// A CONSTANT, like [`HOSTED_ZONE_NOT_EMPTY_MESSAGE`] beside it: it names
+/// neither the VPC the request asked to remove nor the zone it asked about, so a
+/// caller telling this boundary apart from the other 4xx refusals of the same
+/// operation matches one fixed sentence rather than a per-request one.
+pub const LAST_VPC_ASSOCIATION_MESSAGE: &str =
+    "Cannot remove last VPC association for private zone";
 
 /// The version number a traffic policy's first version carries.
 ///
@@ -1884,13 +1896,38 @@ pub fn resource_location(
 ///
 /// The ONE place this service words that refusal, so every zone-addressed
 /// operation answers a missing zone identically. The message is
-/// REQUEST-DERIVED — it names the id the request asked about, as the request
-/// wrote it — which is what lets a caller tell which of a batch of ids was the
-/// missing one: `No hosted zone found with ID: <the requested id>`.
+/// REQUEST-DERIVED — it names the zone id the request asked about — which is
+/// what lets a caller tell which of a batch of ids was the missing one:
+/// `No hosted zone found with ID: <the requested id>`. The id is reported BARE,
+/// as [`normalize_zone_id`] resolves it, because the bare id and the
+/// `/hostedzone/`-prefixed form a response hands back name the same zone and the
+/// refusal reports the zone that was looked for, not the spelling it arrived in.
 pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
     NoSuchHostedZone {
-        message: Some(format!("No hosted zone found with ID: {requested_id}")),
+        message: Some(missing_hosted_zone_message(requested_id)),
     }
+}
+
+/// The modelled `HostedZoneNotFound` (HTTP 400) for a zone id that names no
+/// zone in this store.
+///
+/// A DIFFERENT shape from [`no_such_hosted_zone`] — the one
+/// `CreateReusableDelegationSet` declares for the zone its `HostedZoneId` names
+/// — reporting the same thing, so it is worded by the same rule and through the
+/// same sentence: request-derived, naming the bare zone id that was looked for.
+pub fn hosted_zone_not_found(requested_id: &str) -> HostedZoneNotFound {
+    HostedZoneNotFound {
+        message: Some(missing_hosted_zone_message(requested_id)),
+    }
+}
+
+/// The one sentence this service reports a zone id that names no zone with,
+/// whichever modelled shape carries it.
+fn missing_hosted_zone_message(requested_id: &str) -> String {
+    format!(
+        "No hosted zone found with ID: {}",
+        normalize_zone_id(requested_id)
+    )
 }
 
 /// The modelled `NoSuchDelegationSet` for an id that names no reusable

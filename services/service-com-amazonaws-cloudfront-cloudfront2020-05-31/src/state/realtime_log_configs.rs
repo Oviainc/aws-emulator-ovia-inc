@@ -350,6 +350,26 @@ pub fn invalid_realtime_log_config(reason: &str) -> InvalidArgument {
     }
 }
 
+/// The modelled `InvalidArgument` (HTTP 400) for a listing `Marker` that is no resume point
+/// this service ever handed out.
+///
+/// `ListRealtimeLogConfigsRequest$Marker` is "the value of `NextMarker` from the current
+/// page's response", which names a configuration on that page; a configuration is
+/// identified by a name that is never empty ([`REALTIME_LOG_CONFIG_NAME_REQUIRED`]), so an
+/// empty value is no resume point rather than a name the store holds nothing under. What the
+/// refusal states is the CONSTRAINT on the parameter, so nothing from the request belongs in
+/// the text and every refusal of this condition reads the same.
+pub fn invalid_realtime_log_config_marker() -> InvalidArgument {
+    InvalidArgument {
+        message: Some(REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE.to_string()),
+    }
+}
+
+/// The message a listing whose `Marker` is no resume point is refused with.
+pub const REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE: &str =
+    "Marker must be the name of a real-time log configuration, as returned in NextMarker by \
+     ListRealtimeLogConfigs.";
+
 /// The modelled `RealtimeLogConfigAlreadyExists` (HTTP 409) for a configuration name that
 /// is already taken.
 ///

@@ -24,19 +24,21 @@
 //! another resource of this service, and the same id at another regional endpoint.
 //!
 //! One thing here does NOT go through the wire: the sub-check results a run produced are
-//! PLACED in the store. A configuration check of this emulator evaluates no rule (see
-//! `state::CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`), so no API of this service writes
-//! a sub-check result and the paging rows above could not exist otherwise. What the
-//! readers do for a run as this emulator actually performs it is pinned over the wire
-//! alone, in [`a_run_that_produced_nothing_lists_nothing`].
+//! PLACED in the store. A run of this emulator produces exactly the results of the rules
+//! its check's catalogue entry names (`state::CONFIGURATION_CHECK_CATALOGUE`), which is a
+//! fixed handful per check, so the paging rows above — a full page of children, one past
+//! it — could not exist otherwise. What the readers report for a run as this emulator
+//! actually performs it is pinned over the wire alone, in
+//! [`a_run_reports_the_results_its_rules_produced`], and
+//! `tests/all/configuration_check_rules.rs` pins what those rules decide.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::{
     CONFIGURATION_CHECK_TYPE_VALUES, RULE_RESULT_STATUS_VALUES,
 };
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    no_configuration_check_operation_message, no_sub_check_result_message, StoredRuleResult,
-    StoredSubCheckResult, MAX_PAGE_SIZE,
+    configuration_check_entry, no_configuration_check_operation_message,
+    no_sub_check_result_message, StoredRuleResult, StoredSubCheckResult, MAX_PAGE_SIZE,
 };
 
 use crate::application_lifecycle::{Emulator, Reply, REGION};
@@ -147,11 +149,23 @@ pub(crate) fn sub_check_results(
 /// Put `results` on the configuration check run `operation_id` names, in the Region this
 /// suite drives. See this module's note on why these records are placed rather than
 /// produced.
-pub(crate) fn place_results(
+///
+/// The run is brought to its terminal status FIRST — the clock is waited out and the
+/// record read back over the wire — because that transition is what writes the results
+/// the run's own rules produced, and a row that placed its children before it would have
+/// them replaced mid-walk.
+pub(crate) async fn place_results(
     emulator: &Emulator,
     operation_id: &str,
     results: Vec<StoredSubCheckResult>,
 ) {
+    settle().await;
+    let ended = read_record(&emulator.get_check(operation_id).await);
+    assert_eq!(
+        string_field(&ended, "Status"),
+        "SUCCESS",
+        "the run a case places results on must have ended first, got {ended:?}"
+    );
     emulator.with_state(|state| {
         state
             .region_entry(REGION)
@@ -240,22 +254,28 @@ fn page_sizes() -> Vec<Option<i32>> {
 }
 
 /// RULE, over the wire alone: a configuration check run reports the sub-check results it
-/// produced — and a run of this emulator evaluates no rule
-/// (`state::CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE`), so it reports an EMPTY list
-/// rather than refusing or inventing one, in either phase of the run, without changing
-/// the record it reports on.
+/// produced — the ones its check's catalogue entry names rules for — in either phase of
+/// the run: none while it is still running, and one per sub-check of that entry once it
+/// has ended, each holding the results of that sub-check's rules, without the listing
+/// changing the record it reports on.
 #[tokio::test]
-async fn a_run_that_produced_nothing_lists_nothing() {
+async fn a_run_reports_the_results_its_rules_produced() {
     // One row per check the model defines: the rule is the reader's, not one check's.
     for check in CONFIGURATION_CHECK_TYPE_VALUES {
         let emulator = Emulator::new();
         let application_id = format!("HDB-RESULTS-{check}");
         emulator.with_application(&application_id).await;
         let operation_id = emulator.one_check(&application_id, check).await;
+        // What the run is expected to produce is the catalogue's entry for the check it
+        // runs, read off `state::CONFIGURATION_CHECK_CATALOGUE` rather than written out
+        // here, so a check whose rules change is still covered by this row.
+        let catalogued = configuration_check_entry(check)
+            .unwrap_or_else(|| panic!("case {check:?}: the service catalogues this check"));
 
         for phase in ["running", "ended"] {
             let case = format!("{check} ({phase})");
             let before = read_record(&emulator.get_check(&operation_id).await);
+            let running = string_field(&before, "Status") == "INPROGRESS";
             let reply = emulator
                 .list_sub_check_results(json!({"OperationId": operation_id}))
                 .await;
@@ -271,11 +291,65 @@ async fn a_run_that_produced_nothing_lists_nothing() {
                 .unwrap_or_else(|| {
                     panic!("case {case:?}: expected a SubCheckResults list, got {reply:?}")
                 });
-            assert!(
-                results.is_empty(),
-                "case {case:?}: a run that evaluated no rule produced no sub-check result, got \
-                 {results:?}"
-            );
+            if running {
+                // A run that has not finished has produced nothing yet, so there is
+                // nothing to report rather than something invented.
+                assert!(
+                    results.is_empty(),
+                    "case {case:?}: a run that has not ended has produced no sub-check \
+                     result, got {results:?}"
+                );
+            } else {
+                assert_eq!(
+                    results.len(),
+                    catalogued.sub_checks.len(),
+                    "case {case:?}: expected one sub-check result per sub-check of the \
+                     catalogued check, got {results:?}"
+                );
+                let names: Vec<String> = results
+                    .iter()
+                    .map(|result| {
+                        member(result, "Name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect();
+                for sub_check in catalogued.sub_checks {
+                    assert!(
+                        names.iter().any(|name| name == sub_check.name),
+                        "case {case:?}: expected a result for sub-check {:?}, got {names:?}",
+                        sub_check.name
+                    );
+                }
+                // Every rule of every sub-check produced exactly one rule result, which
+                // the other reader reports.
+                let mut rule_results = 0;
+                for result in &results {
+                    let sub_check_result_id = member(result, "Id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let rules = emulator
+                        .list_rule_results(json!({"SubCheckResultId": sub_check_result_id}))
+                        .await;
+                    assert_eq!(
+                        rules.status, 200,
+                        "case {case:?}: expected 200 from ListSubCheckRuleResults, got {rules:?}"
+                    );
+                    rule_results += rules
+                        .member("RuleResults")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or_default();
+                }
+                assert_eq!(
+                    rule_results,
+                    catalogued.rule_count(),
+                    "case {case:?}: expected one rule result per rule of the catalogued \
+                     check, got {rule_results}"
+                );
+            }
             assert!(
                 reply.member("NextToken").is_none(),
                 "case {case:?}: nothing remains, so nothing is handed out to resume from, got \
@@ -315,7 +389,7 @@ async fn sub_check_results_are_reported_in_id_order_and_paged() {
             .one_check(&application_id, CONFIGURATION_CHECK_TYPE_VALUES[0])
             .await;
         let stored = sub_check_results(0xBB, count, 2);
-        place_results(&emulator, &operation_id, stored.clone());
+        place_results(&emulator, &operation_id, stored.clone()).await;
 
         let mut expected_ids: Vec<String> = stored.iter().map(|result| result.id.clone()).collect();
         expected_ids.sort();
@@ -407,7 +481,7 @@ async fn rule_results_are_reported_in_id_order_and_paged() {
         let mut stored = sub_check_results(0xBB, 2, 0);
         stored[0].rule_results = rule_results(0xAA, count);
         stored[1].rule_results = rule_results(0xCC, 3);
-        place_results(&emulator, &operation_id, stored.clone());
+        place_results(&emulator, &operation_id, stored.clone()).await;
 
         // Each sub-check result of the run is asked for in turn, so the reader is shown
         // to report the rule results of the one asked for and no other's.
@@ -598,7 +672,7 @@ async fn a_sub_check_result_id_that_names_nothing_is_refused() {
         .await;
     let stored = sub_check_results(0xBB, 1, 2);
     let produced = stored[0].id.clone();
-    place_results(&emulator, &operation_id, stored);
+    place_results(&emulator, &operation_id, stored).await;
 
     for (label, sub_check_result_id) in [
         ("an id nothing was stored under", id(0, 0)),
@@ -668,7 +742,7 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
         .await;
     let stored = sub_check_results(0xBB, 3, 3);
     let sub_check_result_id = stored[0].id.clone();
-    place_results(&emulator, &operation_id, stored);
+    place_results(&emulator, &operation_id, stored).await;
 
     // Tokens the `NextToken` pattern (`^.{16,2048}$`) admits but this service never
     // handed out: plain text, hex that decodes to something else, and a resource id.
@@ -726,7 +800,7 @@ async fn deregistering_an_application_forgets_its_results() {
         // cannot resolve one through the other.
         let stored = sub_check_results(family, 1, 2);
         let sub_check_result_id = stored[0].id.clone();
-        place_results(&emulator, &operation_id, stored);
+        place_results(&emulator, &operation_id, stored).await;
         runs.push((application_id, operation_id, sub_check_result_id));
     }
 

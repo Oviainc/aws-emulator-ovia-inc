@@ -5,7 +5,9 @@
 //! Removes the named tag keys from the tags persisted with the one configuration
 //! manager `ResourceArn` names, so a later `GetConfigurationManager` reports what is
 //! left. `@idempotent`: a key the resource does not carry is removed by doing nothing,
-//! so repeating a request answers the same way.
+//! so repeating a request answers the same way. A key under the AWS-reserved prefix is
+//! the one exception: it names a tag the caller may not delete, so the request is
+//! refused rather than served.
 //!
 //! ## Shape of an operation
 //!
@@ -132,21 +134,28 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
 
 /// Why this request's `TagKeys` list cannot be served, or `None` when it can.
 ///
-/// The list carries no modelled length, so its only bound is the store's own
-/// (`crate::state::MAX_TAGS`, the most tags one configuration manager may carry): a
-/// longer list cannot name a key any resource holds, and is refused before the store
-/// lock is taken rather than walked under it. An EMPTY list needs no refusal — the
-/// route matches only a request carrying the `@required` `tagKeys` parameter, and
-/// removing no key would be the same no-op as removing a key the resource does not
-/// carry.
+/// Two rules, both applied before the store lock is taken:
+///
+/// * the list carries no modelled length, so its only bound is the store's own
+///   (`crate::state::MAX_TAGS`, the most tags one configuration manager may carry): a
+///   longer list cannot name a key any resource holds, and is refused rather than
+///   walked under the lock. An EMPTY list needs no refusal — the route matches only a
+///   request carrying the `@required` `tagKeys` parameter, and removing no key would be
+///   the same no-op as removing a key the resource does not carry;
+/// * a key under the AWS-reserved prefix names a tag that is not the caller's to
+///   delete, so it is refused rather than removed or silently reported as removed —
+///   `crate::state::reserved_tag_key_rejection` is the one place that rule lives,
+///   shared with every other member of this service that takes tag keys from the
+///   caller.
 fn tag_keys_rejection(tag_keys: &[String]) -> Option<String> {
-    (tag_keys.len() > crate::state::MAX_TAGS).then(|| {
-        format!(
+    if tag_keys.len() > crate::state::MAX_TAGS {
+        return Some(format!(
             "TagKeys carries {} entries, more than the {} this service accepts",
             tag_keys.len(),
             crate::state::MAX_TAGS
-        )
-    })
+        ));
+    }
+    crate::state::reserved_tag_key_rejection("TagKeys", tag_keys.iter().map(String::as_str))
 }
 
 /// The `UntagResource` operation.

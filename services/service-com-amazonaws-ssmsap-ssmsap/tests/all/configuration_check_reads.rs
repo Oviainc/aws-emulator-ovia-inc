@@ -23,9 +23,7 @@ use std::time::Instant;
 
 use serde_json::json;
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::CONFIGURATION_CHECK_TYPE_VALUES;
-use service_com_amazonaws_ssmsap_ssmsap::state::{
-    CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE, TRANSITION_SPAN,
-};
+use service_com_amazonaws_ssmsap_ssmsap::state::{configuration_check_entry, TRANSITION_SPAN};
 
 use crate::application_lifecycle::Emulator;
 use crate::configuration_checks::{field, read_record, settle, started, string_field};
@@ -60,9 +58,10 @@ async fn start_one(emulator: &Emulator, application_id: &str, check: &str) -> (S
 }
 
 /// What a record must carry for the status it reports, whichever phase a read caught it
-/// in: a running check has nothing to explain and no end, an ended one says why it ended
-/// and when.
-fn assert_consistent_with_its_status(case: &str, record: &serde_json::Value) {
+/// in: a running check has nothing to explain, no end and nothing to count yet, while an
+/// ended one reports when it ended and the tally of the rule results its rules produced.
+/// Either way it names the check it performs with the catalogue's own prose.
+fn assert_consistent_with_its_status(case: &str, check: &str, record: &serde_json::Value) {
     match string_field(record, "Status").as_str() {
         "INPROGRESS" => {
             assert!(
@@ -70,16 +69,24 @@ fn assert_consistent_with_its_status(case: &str, record: &serde_json::Value) {
                 "case {case:?}: a running check has no EndTime and nothing to explain, got \
                  {record:?}"
             );
+            assert!(
+                field(record, "RuleStatusCounts").is_none(),
+                "case {case:?}: a running check has produced no rule result to count, got \
+                 {record:?}"
+            );
         }
-        "ERROR" => {
+        "SUCCESS" => {
             assert!(
                 field(record, "EndTime").is_some(),
                 "case {case:?}: an ended check reports an EndTime, got {record:?}"
             );
-            assert_eq!(
-                string_field(record, "StatusMessage"),
-                CONFIGURATION_CHECK_NOT_EVALUATED_MESSAGE,
-                "case {case:?}: an ended check says why no rule result was produced, got \
+            assert!(
+                field(record, "StatusMessage").is_none(),
+                "case {case:?}: a check whose rules ran has nothing to explain, got {record:?}"
+            );
+            assert!(
+                field(record, "RuleStatusCounts").is_some(),
+                "case {case:?}: an ended check reports the tally of its rule results, got \
                  {record:?}"
             );
         }
@@ -87,9 +94,19 @@ fn assert_consistent_with_its_status(case: &str, record: &serde_json::Value) {
             "case {case:?}: a read reported the unmodelled status {other:?}, got {record:?}"
         ),
     }
-    assert!(
-        field(record, "RuleStatusCounts").is_none(),
-        "case {case:?}: no rule was evaluated, so no counts are reported, got {record:?}"
+    let catalogued = configuration_check_entry(check)
+        .unwrap_or_else(|| panic!("case {case:?}: the service catalogues {check:?}"));
+    assert_eq!(
+        (
+            string_field(record, "ConfigurationCheckName"),
+            string_field(record, "ConfigurationCheckDescription")
+        ),
+        (
+            catalogued.name.to_string(),
+            catalogued.description.to_string()
+        ),
+        "case {case:?}: a record names the check it performs with the catalogue's prose, got \
+         {record:?}"
     );
 }
 
@@ -111,7 +128,7 @@ async fn reading_a_running_check_reports_it_without_ending_it() {
                 "case {check:?} read {attempt}: expected 200, got {reply:?}"
             );
             let record = read_record(&reply);
-            assert_consistent_with_its_status(&format!("{check} read {attempt}"), &record);
+            assert_consistent_with_its_status(&format!("{check} read {attempt}"), check, &record);
             records.push(record);
         }
 
@@ -165,10 +182,10 @@ async fn an_ended_check_reports_the_same_terminal_record_on_every_read() {
         let first = read_record(&emulator.get_check(&id).await);
         assert_eq!(
             string_field(&first, "Status"),
-            "ERROR",
+            "SUCCESS",
             "case {check:?}: expected the terminal status once the clock owes it, got {first:?}"
         );
-        assert_consistent_with_its_status(check, &first);
+        assert_consistent_with_its_status(check, check, &first);
 
         for attempt in 1..READS_PER_PHASE {
             // Enough time passes between the reads that an `EndTime` stamped with the

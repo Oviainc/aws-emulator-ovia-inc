@@ -33,6 +33,8 @@ mod cluster_node_updates;
 mod cluster_provisioning;
 #[path = "all/cluster_updates.rs"]
 mod cluster_updates;
+#[path = "all/compatible_images.rs"]
+mod compatible_images;
 #[path = "all/export_job_parts.rs"]
 mod export_job_parts;
 #[path = "all/job_lifecycle.rs"]

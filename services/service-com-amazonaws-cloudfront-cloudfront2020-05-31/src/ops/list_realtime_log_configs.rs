@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRealtimeLogConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRealtimeLogConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRealtimeLogConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the real-time log configurations this account created, one page at a time.
+//! Every configuration a caller can see was stored by `CreateRealtimeLogConfig`, so the
+//! page is read from this service's records; a configuration is identified by its `Name`,
+//! which is the key the store orders them by and therefore the resume point `Marker` and
+//! `NextMarker` carry.
+//!
+//! A reporting operation: it reads the stored records and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +76,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +149,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRealtimeLogConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRealtimeLogConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRealtimeLogConfigs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "You can optionally specify the maximum number of items to receive in the
+        // response" — a page holds at least one item, so a non-positive size names no page
+        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // same one every listing of this service is bounded by, so one request cannot serve
+        // the whole store in a single response. A value the parameter cannot take is refused
+        // with the one sentence this service states the constraint in, whether it is out of
+        // range here or unreadable as an integer at the request boundary (see
+        // `crate::service::envelope`).
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListRealtimeLogConfigsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        // "To get the next page of the list, set this field's value to the value of
+        // NextMarker from the current page's response": the marker is a resume point this
+        // service handed out — the NAME of a configuration on the previous page — and a
+        // configuration is never named by the empty string
+        // (`crate::state::REALTIME_LOG_CONFIG_NAME_REQUIRED`), so an empty value was never
+        // one (`InvalidArgument`). A name that could be one but names no stored
+        // configuration is a configuration that does not exist, which is the resource this
+        // listing is about and the reason it models `NoSuchRealtimeLogConfig`.
+        if let Some(marker) = input.marker.as_deref() {
+            if marker.is_empty() {
+                return Err(ListRealtimeLogConfigsErrorModeled::InvalidArgument(
+                    crate::state::invalid_realtime_log_config_marker(),
+                )
+                .into());
+            }
+            if store.realtime_log_config(marker).is_none() {
+                return Err(ListRealtimeLogConfigsErrorModeled::NoSuchRealtimeLogConfig(
+                    crate::state::no_such_realtime_log_config(),
+                )
+                .into());
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it — "The
+        // response includes real-time log configurations in the list that occur after the
+        // marker" — and walking the pages enumerates every configuration exactly once. The
+        // store is ordered by name, so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<RealtimeLogConfig> = Vec::new();
+        let mut is_truncated = false;
+        for (_, stored) in store
+            .realtime_log_configs
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            // Read from the stored record, never from the request being served.
+            items.push(stored.to_realtime_log_config());
+        }
+
+        Ok(ListRealtimeLogConfigsOutput {
+            realtime_log_configs: Some(RealtimeLogConfigs {
+                // "This parameter indicates where this list of real-time log configurations
+                // begins": the resume point the request named, and nothing when it named
+                // none and the page therefore begins at the start of the collection.
+                marker: input.marker.unwrap_or_default(),
+                // "If there are more items in the list than are in this response, this
+                // element is present. It contains the value that you should use in the
+                // Marker field of a subsequent request to continue listing real-time log
+                // configurations where you left off": the name this page ended at, present
+                // exactly when configurations remain.
+                next_marker: if is_truncated {
+                    items.last().map(|config| config.name.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of real-time log configurations requested" — what the
+                // request asked for, or the default this service pages at when it asked for
+                // nothing.
+                max_items,
+                // "A flag that indicates whether there are more real-time log configurations
+                // than are contained in this list."
+                is_truncated,
+                // A page that lists nothing carries no `Items` element at all, rather than an
+                // empty one — as every other listing of this service answers.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

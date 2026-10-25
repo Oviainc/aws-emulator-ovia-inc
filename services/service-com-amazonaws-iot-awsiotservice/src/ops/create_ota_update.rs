@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOTAUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOTAUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOTAUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the OTA update under the `otaUpdateId` the request names, mints its
+//! `otaUpdateArn`, and DEPLOYS it through an AWS IoT job: the job the OTA Update
+//! Manager creates ([`crate::state::ota_update_job_id`], reported as `awsIotJobId` /
+//! `awsIotJobArn`) is recorded in the account's jobs and one `QUEUED` execution of it
+//! is created per targeted thing in the shared job-execution store the IoT Jobs data
+//! plane serves — so a device targeted by an OTA update sees its job on the very next
+//! `GetPendingJobExecutions` / `StartNextPendingJobExecution` poll.
+//!
+//! The update is answered in the NON-TERMINAL status
+//! [`crate::state::NEW_OTA_UPDATE_STATUS`], with the clock owing its move to
+//! [`crate::state::CREATED_OTA_UPDATE_STATUS`] at
+//! [`crate::state::OTA_UPDATE_CREATION_SPAN`]; `GetOTAUpdate` is what materialises that
+//! transition, so a caller reading straight back still observes the transient status.
+//!
+//! The `targets` are resolved exactly as `CreateJob` resolves a job's targets
+//! ([`crate::state::resolve_job_targets`]) — an OTA update's targets ARE its job's: a
+//! target ARN of another resource type (or a name outside the model's `ThingName`) is
+//! the modelled 400, a thing group the modelled 404 when the registry does not hold it
+//! and the modelled 400 when it does (a group's executions are its MEMBERS', and no
+//! membership is recorded while `AddThingToThingGroup` is a scaffold), and an
+//! `otaUpdateId` already in use — or one whose job id is — the modelled 409; nothing is
+//! written on any of them.
+//!
+//! `Targets` and `OTAUpdateFiles` are both modelled with a minimum and NO maximum, so
+//! the FAN-OUT of one request is bounded before any work proportional to it
+//! ([`crate::state::MAX_JOB_TARGETS`], [`crate::state::MAX_OTA_UPDATE_FILES`]) and
+//! refused past either with the modelled `LimitExceededException`.
+//!
+//! What this handler does not honour, and how it answers instead:
+//!
+//! * The deployed job carries NO `document`: an OTA job document names the stream and
+//!   the signed firmware image AWS's OTA Update Manager builds, and nothing here
+//!   streams or signs a file, so the job's executions report no `jobDocument` rather
+//!   than an invented one — the same answer a job created from `documentSource` gets.
+//! * `awsJobAbortConfig` / `awsJobTimeoutConfig` / `awsJobExecutionsRolloutConfig`
+//!   shape the RATE of a rollout, its abort criteria and its per-device timeout, not
+//!   whether an execution exists: every target is given its execution at once, which is
+//!   the end state of a completed rollout. The timeout IS carried onto the executions,
+//!   where a device reads it; the rollout config is retained because `GetOTAUpdate`
+//!   reports it, and the abort config is accepted and not retained (no reader of an OTA
+//!   update reports it).
+//! * `roleArn` names an IAM role this emulator neither assumes nor resolves, and no
+//!   reader of an OTA update reports it, so it is accepted and not retained.
 //!
 //! ## Shape of an operation
 //!
@@ -187,18 +222,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOTAUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOTAUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOTAUpdate"))
+        let unavailable = || -> CreateOTAUpdateError {
+            CreateOTAUpdateErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+            .into()
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        // The executions the deployed job creates are the device-facing records the
+        // IoT Jobs data plane serves, so they go in the SHARED store, not in this
+        // service's.
+        let Some(executions) = crate::state::job_execution_store(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        let invalid = |message: String| -> CreateOTAUpdateError {
+            CreateOTAUpdateErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+        let over_limit = |message: String| -> CreateOTAUpdateError {
+            CreateOTAUpdateErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // An OTA update is deployed by a job, and the job's id is derived from the
+        // update's: `OTAUpdateId` is longer than `JobId`, so an id whose job id would
+        // not fit the shape every `/jobs/{jobId}` request is addressed by could not be
+        // deployed at all.
+        if input.ota_update_id.len() > crate::state::MAX_OTA_UPDATE_ID_LEN {
+            return Err(invalid(format!(
+                "otaUpdateId must be at most {} characters long: an OTA update is \
+                 deployed by the job {}<otaUpdateId>, whose id may be at most 64 \
+                 characters",
+                crate::state::MAX_OTA_UPDATE_ID_LEN,
+                crate::state::OTA_UPDATE_JOB_ID_PREFIX
+            )));
+        }
+
+        // `files` is modelled `len 1..` — a minimum and no maximum — so what ONE
+        // request may store is bounded here, before the files are cloned into the
+        // record.
+        let file_count = input.files.len();
+        if file_count > crate::state::MAX_OTA_UPDATE_FILES {
+            return Err(over_limit(format!(
+                "an OTA update may carry at most {} files, got {file_count}",
+                crate::state::MAX_OTA_UPDATE_FILES
+            )));
+        }
+
+        // "The files to be streamed by the OTA update": a file is streamed FROM
+        // somewhere, and `FileLocation` is "The location of the updated firmware" with
+        // either a `stream` or an `s3Location`. A file naming neither could never be
+        // fetched by a device, so the request is refused rather than recorded.
+        for (index, file) in input.files.iter().enumerate() {
+            let located = file.file_location.as_ref().is_some_and(|location| {
+                location.stream.is_some() || location.s3_location.is_some()
+            });
+            if !located {
+                return Err(invalid(format!(
+                    "files[{index}].fileLocation must name either a stream or an s3Location"
+                )));
+            }
+        }
+
+        // How a refusal of the targets is answered: the same wording and status
+        // `CreateJob` answers with, because an OTA update's targets ARE its job's.
+        let refused = |refusal: crate::state::JobTargetsRefusal| -> CreateOTAUpdateError {
+            match refusal {
+                crate::state::JobTargetsRefusal::Invalid(message) => invalid(message),
+                crate::state::JobTargetsRefusal::NotFound(message) => {
+                    CreateOTAUpdateErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::JobTargetsRefusal::OverLimit(message) => over_limit(message),
+            }
+        };
+
+        // Which DEVICES this update runs on: a thing target names one, a thing-group
+        // target names its members. Resolved BEFORE any lock is taken, so a malformed
+        // request never reaches the stores at all, and bounded before the walk.
+        let fanout = crate::state::resolve_job_targets(&input.targets).map_err(refused)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let now_seconds = ::service_common::iot_job_executions::now_epoch_seconds();
+        let aws_iot_job_id = crate::state::ota_update_job_id(&input.ota_update_id);
+        let ota_update = crate::state::RegisteredOtaUpdate::new(
+            input.ota_update_id.clone(),
+            crate::state::ota_update_arn(&region, &input.ota_update_id),
+            aws_iot_job_id.clone(),
+            crate::state::job_arn(&region, &aws_iot_job_id),
+            input.description.clone(),
+            input.targets.clone(),
+            input.protocols.clone(),
+            input.target_selection.clone(),
+            input.aws_job_executions_rollout_config.clone(),
+            input.aws_job_presigned_url_config.clone(),
+            input.files.clone(),
+            input
+                .additional_parameters
+                .iter()
+                .flatten()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            now,
+        );
+        // The per-device timeout the request named is carried onto the job's
+        // executions, which is where a device reads it.
+        let in_progress_timeout_minutes = input
+            .aws_job_timeout_config
+            .as_ref()
+            .and_then(|config| config.in_progress_timeout_in_minutes);
+
+        // Nothing is written until every target resolves and both ids are free, so a
+        // request this operation refuses creates neither the update, nor its job, nor
+        // an execution for the targets that did resolve. The lock order is this
+        // service's state first and the shared execution store second, the order
+        // `CreateJob` takes.
+        let mut store = state.lock();
+
+        // "The ID of the OTA update to be created" identifies the update, so a second
+        // create under a live update's id is the conflict
+        // `ResourceAlreadyExistsException` (HTTP 409) names — and so is one whose
+        // derived job id is already taken by another job, since the update could not
+        // own the job that deploys it.
+        if let Some(existing) = store.ota_updates.get(&ota_update.ota_update_id) {
+            return Err(
+                CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "OTA update {} already exists",
+                            existing.ota_update_id
+                        )),
+                        resource_id: Some(existing.ota_update_id.clone()),
+                        resource_arn: Some(existing.ota_update_arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(existing) = store.jobs.get(&aws_iot_job_id) {
+            return Err(
+                CreateOTAUpdateErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!("Job {} already exists", existing.job_id)),
+                        resource_id: Some(existing.job_id.clone()),
+                        resource_arn: Some(existing.job_arn.clone()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.jobs.len() >= crate::state::MAX_JOBS {
+            return Err(over_limit(format!(
+                "the maximum of {} jobs is already reached",
+                crate::state::MAX_JOBS
+            )));
+        }
+        // A group's executions are its MEMBERS' executions, and no membership is
+        // recorded, so a group target is refused — never answered with a 200 that
+        // reports a group-targeted update as deployed while queueing nothing. The
+        // FIRST group target decides, as any one of them refuses the whole request.
+        if let Some(group_name) = fanout.groups.first() {
+            return Err(refused(store.thing_group_target_refusal(group_name)));
+        }
+
+        let job = crate::state::RegisteredJob {
+            job_id: aws_iot_job_id.clone(),
+            job_arn: ota_update.aws_iot_job_arn.clone(),
+            description: ota_update.description.clone(),
+            // An OTA job document names the stream and the signed image AWS builds;
+            // nothing here streams or signs a file, so the job carries none rather
+            // than an invented one.
+            document: None,
+            document_source: None,
+            targets: ota_update.targets.clone(),
+            target_selection: ota_update.target_selection.clone(),
+            in_progress_timeout_minutes,
+            created_at: now_seconds,
+        };
+
+        let mut pending = executions.lock();
+        if let Err(quota) = crate::state::queue_job_executions(
+            &mut pending,
+            &job.job_id,
+            job.document.as_deref(),
+            in_progress_timeout_minutes,
+            &fanout.things,
+            now_seconds,
+        ) {
+            return Err(over_limit(quota));
+        }
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what `GetOTAUpdate` reads are one value.
+        let output = CreateOTAUpdateOutput {
+            ota_update_id: Some(ota_update.ota_update_id.clone()),
+            ota_update_arn: Some(ota_update.ota_update_arn.clone()),
+            aws_iot_job_id: Some(ota_update.aws_iot_job_id.clone()),
+            aws_iot_job_arn: Some(ota_update.aws_iot_job_arn.clone()),
+            ota_update_status: Some(ota_update.status.clone()),
+        };
+        store.jobs.insert(job.job_id.clone(), job);
+        store
+            .ota_updates
+            .insert(ota_update.ota_update_id.clone(), ota_update);
+        Ok(output)
     }
 }
