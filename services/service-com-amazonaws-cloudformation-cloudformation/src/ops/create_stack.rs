@@ -340,6 +340,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The documented per-template quotas, which `DescribeAccountLimits` advertises as
+        // this account's limits: a body declaring more than one of them allows is refused
+        // HERE rather than created as a stack holding none of what it declares.
+        crate::state::validate_template_quotas(&template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "Creates a stack as specified in the template" — only a template CloudFormation
         // can deploy: a body declaring a resource type it does not recognise is refused
         // HERE, before the stack is created, so a template real AWS refuses outright is not
@@ -483,6 +488,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "Limit for stacks exceeded: no more than {} stacks can exist in \
                              this account",
                             crate::state::MAX_LIVE_STACKS
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The same quota, counted in RESOURCES rather than stacks: CloudFormation
+            // meters concurrent resources per account ("CloudFormation has the following
+            // limits per account: Number of concurrent resources"), and this create is
+            // what would bring the template's resources into the account. Checked on the
+            // same `LimitExceededException` channel and in the same place, so a create
+            // past either ceiling writes nothing — and so the ceiling
+            // `DescribeAccountLimits` reports as `ConcurrentResourcesLimit` is the one a
+            // caller is really held to.
+            if store.current_resource_count() + stack.current_resource_count()
+                > crate::state::MAX_CONCURRENT_RESOURCES
+            {
+                return Err(CreateStackErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Limit for concurrent resources exceeded: no more than {} \
+                             resources can exist across the stacks of this account",
+                            crate::state::MAX_CONCURRENT_RESOURCES
                         )),
                     },
                 )
