@@ -609,8 +609,8 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
     let arn = arn_of(&router, "policy-probe").await;
     let policy_uri = format!("/investigationGroups/{}/policy", label(&arn));
 
-    // The group's own name is the second identifier form the member documents, so the
-    // same call through it reports the POLICY absent — the group itself resolves.
+    // A bare label is not an address in this service, so the same call through the
+    // group's own name reports the GROUP absent even now that the group exists.
     let (status, code, by_name) = call(
         &router,
         "GET",
@@ -624,8 +624,8 @@ async fn an_absent_policy_on_a_group_that_exists_is_a_different_resource() {
         "case \"addressed by the bare name\": expected a 404, got {by_name:?}"
     );
     assert_eq!(
-        by_name, policy_absent,
-        "case \"addressed by the bare name\": expected {policy_absent:?}, got {by_name:?}"
+        by_name, group_absent,
+        "case \"addressed by the bare name\": expected {group_absent:?}, got {by_name:?}"
     );
 
     let (status, code, after_create) = call(&router, "GET", &policy_uri, None).await;
