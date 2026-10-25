@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateIpamByoasn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateIpamByoasn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateIpamByoasn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: associates an ASN the account has brought to IPAM with a BYOIP address
+//! range IPAM manages, writing the association onto the range and answering it in the
+//! non-terminal state it starts in. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +61,20 @@
 //! ## Output
 //!
 //! * `AsnAssociation` (AsnAssociation) — The ASN and BYOIP CIDR association.
+//!
+//! ## What this operation refuses
+//!
+//! * an `Asn` that is not a 2-byte or 4-byte ASN, or a `Cidr` that is not an address range:
+//!   `InvalidParameterValue` (an empty one: `MissingParameter`);
+//! * an address range IPAM does not manage, whether the account never brought it or never
+//!   moved it to IPAM: `InvalidCidr.NotFound`;
+//! * an ASN the account has not brought to IPAM: `InvalidByoasn.NotFound` — which is every
+//!   ASN until `ProvisionIpamByoasn` is written, exactly as the real service answers for an
+//!   ASN that was never provisioned;
+//! * an ASN whose own provision has not finished: `IncorrectState`;
+//! * a range-and-ASN pair that already holds an association: `Resource.AlreadyAssociated`;
+//! * an association that would take the range past this emulator's per-range association
+//!   ceiling or its storage budget: `ResourceLimitExceeded`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -138,18 +146,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateIpamByoasn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateIpamByoasnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateIpamByoasn"))
+        // `ctx` carries request metadata only; this operation reads none of it — the ASN and
+        // the range are each named in the request, and both are the account's rather than a
+        // Region's. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own form first, in the order the operation's members name the two
+        // resources, so a value that is not an ASN or not an address range is never reported
+        // as a resource that does not exist. Both members are modelled `@required` and
+        // `clientOptional`, so each reaches the handler as an empty string when the request
+        // carried it empty, which is a missing parameter rather than an unknown resource.
+        state::require_well_formed_byoasn("Asn", &input.asn)?;
+        let requested_cidr = input.cidr.as_str();
+        if requested_cidr.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter Cidr",
+            ));
+        }
+        // "The BYOIP CIDR you want to associate with an ASN" (`Cidr`): a value that is not
+        // an address range names no range, so there is nothing to look up. The range is
+        // canonicalised so one range cannot be named two ways.
+        let Ok(cidr) = state::canonical_byoip_cidr(requested_cidr) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{requested_cidr}' for Cidr. It must be an address range in \
+                 CIDR notation"
+            )));
+        };
+        let asn = input.asn.as_str();
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered once the request's own form has been checked and
+        // before anything is resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Moves owed earlier fell due whether or not anybody called, so whether this request
+        // is admissible is asked of the states things are ACTUALLY in: an ASN whose provision
+        // has completed can be associated, and an association started a moment ago is in
+        // force rather than still pending.
+        store.materialize_due_transitions();
+
+        // The range is resolved FIRST, and only as a range IPAM manages: "Associates your
+        // Autonomous System Number (ASN) with a BYOIP CIDR that you own in the same Amazon
+        // Web Services Region" is the IPAM BYOASN path ("Tutorial: Bring your ASN to IPAM"),
+        // so a range that is not in IPAM — one the account never brought, or one it brought
+        // but never moved there with `MoveByoipCidrToIpam` — is nothing this operation can
+        // act on, whatever the ASN turns out to be.
+        if store.byoip_cidr_in_ipam(&cidr).is_none() {
+            // The range as the REQUEST wrote it, which is what the caller has to correct.
+            return Err(state::cidr_not_found_in_ipam(requested_cidr));
+        }
+
+        // "Provisions your Autonomous System Number (ASN) for use in your Amazon Web
+        // Services account" (`ProvisionIpamByoasn`) is what brings an ASN to IPAM, and only
+        // an ASN the account has brought is its own to associate.
+        let Some(byoasn) = store.byoasns.get(asn) else {
+            return Err(state::byoasn_not_found(asn));
+        };
+        // "The provisioning state of the BYOASN" (`Byoasn$State`): an ASN part way through
+        // its provision, or one whose provision failed or has been given back, is not an ASN
+        // that can be made eligible for advertisement yet — the resource exists but is not in
+        // a state that admits the request, which is `IncorrectState`.
+        let asn_state = byoasn.state().to_string();
+        if asn_state != state::ASN_STATE_PROVISIONED {
+            return Err(state::incorrect_state(format!(
+                "The ASN '{asn}' is in state '{asn_state}'; only an ASN in state \
+                 '{provisioned}' can be associated with an address range",
+                provisioned = state::ASN_STATE_PROVISIONED,
+            )));
+        }
+
+        // One range-and-ASN pair holds at most one association, so a pair that already holds
+        // one is EC2's `Resource.AlreadyAssociated` and nothing is written. A pair whose
+        // association is not there — one whose disassociation has finished, or one that
+        // never took — holds none, so that pair can be associated again.
+        if let Some(held) = store
+            .asn_association(&cidr, asn)
+            .and_then(|association| association.state.clone())
+            .filter(|state| state::asn_association_is_held(state))
+        {
+            return Err(state::resource_already_associated(format!(
+                "The ASN '{asn}' is already associated with the address range '{cidr}' \
+                 (state '{held}')"
+            )));
+        }
+
+        // "AFTER the association succeeds, the ASN is eligible for advertisement": the
+        // association is answered in the non-terminal `pending-association` it starts in,
+        // with the clock owing it `associated`. The write is bounded — a range holds a finite
+        // number of associations and the store a finite number of pending moves — and a
+        // refusal there writes nothing.
+        let association = store.begin_asn_association(&cidr, asn)?;
+
+        Ok(AssociateIpamByoasnOutput {
+            asn_association: Some(association),
+        })
     }
 }
