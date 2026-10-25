@@ -183,10 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(stored) = application.revisions.get(&key) else {
                 return Err(GetApplicationRevisionErrorModeled::RevisionDoesNotExistException(
                     RevisionDoesNotExistException {
-                        message: Some(format!(
-                            "No revision found for application {name}: the revision is not \
-                             registered with it"
-                        )),
+                        message: Some(crate::state::REVISION_DOES_NOT_EXIST.to_string()),
                     },
                 ));
             };

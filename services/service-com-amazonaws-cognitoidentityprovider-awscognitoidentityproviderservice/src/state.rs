@@ -153,6 +153,17 @@ pub const DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE: &str =
 /// exactly as [`USER_NOT_FOUND_MESSAGE`] is reported for a username.
 pub const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
 
+/// The message a `TermsExistsException` carries for a `TermsName` the app client
+/// already holds terms documents under.
+///
+/// Terms document names "must be unique to the app client" (this service's
+/// model), so the refusal names the name that collided and the app client it
+/// collided within — the same sentence wherever that uniqueness is enforced, on
+/// a create of a second document of that name and on a rename onto it alike.
+pub fn terms_exists_message(terms_name: &str, client_id: &str) -> String {
+    format!("Terms with name {terms_name} already exists for Client {client_id}.")
+}
+
 // ---------------------------------------------------------------------------
 // Password policy rejection wording
 //

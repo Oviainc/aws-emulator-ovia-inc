@@ -297,6 +297,17 @@ pub fn instances_not_reported_for_platform(compute_platform: &str) -> String {
     )
 }
 
+/// `RevisionDoesNotExistException` (HTTP 400): the fixed sentence for an
+/// application revision no registry holds, interpolating NOTHING.
+///
+/// A revision is identified by a LOCATION (an S3 object, a GitHub commit, a
+/// string or AppSpec content), not by a scalar id, so there is no identifier of
+/// the revision to state; and this error is scoped to the revision, so the
+/// application the revision was looked up in — a request member the error is not
+/// about — stays out of it, the same way [`deployment_group_not_found`] does not
+/// name the application its group was looked up in.
+pub const REVISION_DOES_NOT_EXIST: &str = "No application revision found for revision.";
+
 /// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
 /// after the delimiter, in the same form as the other not-found sentences.
 pub fn deployment_config_not_found(deployment_config_name: &str) -> String {
@@ -423,6 +434,17 @@ pub fn host_not_registered(instance_name: &str) -> String {
     format!("Host {instance_name} is not registered")
 }
 
+/// `IamArnRequiredException` (HTTP 400): the fixed sentence for a registration
+/// that carried neither an IAM user ARN nor an IAM session ARN.
+///
+/// It is the sentence of the REFUSED ACTION — the registration could not be made,
+/// and what to put in the request to make it — rather than the error shape's
+/// documentation text, which describes the shape to a reader of the model and is
+/// never what a caller is answered with.
+pub const IAM_ARN_MISSING: &str = "The on-premises instance could not be registered because no \
+     IAM ARN was included in the request. Include either an IAM session ARN or IAM user ARN in \
+     the request, and then try again.";
+
 /// `InstanceNameAlreadyRegisteredException` (HTTP 400): the fixed sentence for a
 /// host name a registration already holds, interpolating nothing — the name is
 /// the one the request carried, so the refusal does not quote it back.
@@ -517,12 +539,15 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// `DescriptionTooLongException`, counted in Unicode characters.
 ///
 /// The model puts no `@length` on `Description`
-/// (`smithy_query(query="shape",shape="Description")` is a bare string) and AWS
-/// publishes no number for it, so this bound is CHOSEN — but the REFUSAL is not:
-/// `RegisterApplicationRevision` and `CreateDeployment` both model
-/// `DescriptionTooLongException`, which is what a description past the bound is
-/// answered with. Characters, not bytes, so a description of non-ASCII text is
-/// measured the way a caller counts it.
+/// (`smithy_query(query="shape",shape="Description")` is a bare string), so the
+/// bound is a RUNTIME rule of the service — and the refusal states it: the
+/// sentence a description past the bound is answered with
+/// ([`description_too_long_message`]) ends in this figure, which is why the
+/// number lives here once and is interpolated into the sentence rather than
+/// written into it. `RegisterApplicationRevision` and `CreateDeployment` both
+/// model `DescriptionTooLongException`, and both apply this bound. Characters,
+/// not bytes, so a description of non-ASCII text is measured the way a caller
+/// counts it.
 pub const MAX_DESCRIPTION_CHARS: usize = 512;
 
 /// Whether `description` is past [`MAX_DESCRIPTION_CHARS`].
@@ -530,14 +555,49 @@ pub fn description_too_long(description: &str) -> bool {
     description.chars().count() > MAX_DESCRIPTION_CHARS
 }
 
-/// The message a `DescriptionTooLongException` carries: how long the comment the
-/// request sent is and how long one may be, both built from the request so the
-/// caller can fix it.
-pub fn description_too_long_message(description: &str) -> String {
+/// What an operation's `description` is a comment ABOUT, which is what a
+/// [`description_too_long_message`] names.
+///
+/// One variant per operation that carries a `description` and models
+/// `DescriptionTooLongException`, each taken from that member's own
+/// documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Described {
+    /// `RegisterApplicationRevision$description` —
+    /// `smithy_query(query="doc",shape="RegisterApplicationRevisionInput",member="description")`:
+    /// "A comment about the revision."
+    Revision,
+    /// `CreateDeployment$description` —
+    /// `smithy_query(query="doc",shape="CreateDeploymentInput",member="description")`:
+    /// "A comment about the deployment."
+    Deployment,
+}
+
+impl Described {
+    /// How the refusal's sentence names it.
+    #[must_use]
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Revision => "Revision",
+            Self::Deployment => "Deployment",
+        }
+    }
+}
+
+/// The message a `DescriptionTooLongException` carries: the fixed sentence for
+/// the described resource, ending in the LIMIT
+/// ([`MAX_DESCRIPTION_CHARS`]) — the one machine-readable part of the refusal
+/// beyond the error code, so a caller that matches the sentence recovers the
+/// bound it has to fit in.
+///
+/// It quotes NOTHING back from the request: how long the description the caller
+/// sent is is something the caller already knows, and a length-of-input clause
+/// would report a generic constraint failure where this service models an error
+/// of its own.
+pub fn description_too_long_message(described: Described) -> String {
     format!(
-        "The description is too long: it is {} characters and at most {MAX_DESCRIPTION_CHARS} are \
-         allowed",
-        description.chars().count()
+        "{} description has a maximum length of {MAX_DESCRIPTION_CHARS}",
+        described.noun()
     )
 }
 
