@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResolverEndpointIpAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResolverEndpointIpAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResolverEndpointIpAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one IP address from a Resolver endpoint's persisted address set.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +147,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResolverEndpointIpAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResolverEndpointIpAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResolverEndpointIpAddress"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateResolverEndpointIpAddressErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let requested = &input.ip_address;
+
+        // The request has to say WHICH address to remove: an `IpAddressUpdate` that
+        // carries none of `IpId`, `Ip`, `Ipv6` or `SubnetId` names nothing. Refused
+        // before the store is locked, so nothing is written.
+        if requested.ip_id.is_none()
+            && requested.ip.is_none()
+            && requested.ipv6.is_none()
+            && requested.subnet_id.is_none()
+        {
+            return Err(
+                DisassociateResolverEndpointIpAddressErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: "IpAddress must identify the IP address to remove by IpId, \
+                                  Ip, Ipv6 or SubnetId"
+                            .to_string(),
+                        field_name: Some("IpAddress".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store
+            .resolver_endpoints
+            .get_mut(&input.resolver_endpoint_id)
+        else {
+            return Err(
+                DisassociateResolverEndpointIpAddressErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_endpoint_not_found(&input.resolver_endpoint_id),
+                )
+                .into(),
+            );
+        };
+
+        let Some(position) = record
+            .ip_addresses
+            .iter()
+            .position(|stored| stored.is_named_by(requested))
+        else {
+            return Err(
+                DisassociateResolverEndpointIpAddressErrorModeled::ResourceNotFoundException(
+                    crate::state::endpoint_ip_address_not_found(
+                        &input.resolver_endpoint_id,
+                        &crate::state::describe_requested_ip_address(requested),
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // An endpoint keeps at least the minimum number of addresses it could be
+        // created with, so the last removal that would take it below that is refused
+        // and the stored address set is left exactly as it was.
+        if record.ip_addresses.len() <= crate::state::MIN_ENDPOINT_IP_ADDRESSES {
+            return Err(
+                DisassociateResolverEndpointIpAddressErrorModeled::InvalidRequestException(
+                    crate::state::endpoint_ip_address_below_minimum(),
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::Instant::now();
+        let ready_at = now + crate::state::PROVISIONING_DELAY;
+        let timestamp = crate::state::now_rfc3339();
+
+        record.ip_addresses.remove(position);
+        // Detaching an address is a change to the endpoint, so it reports the
+        // transient status until the clock owes the move back to `OPERATIONAL`.
+        record.status = crate::state::ENDPOINT_STATUS_UPDATING.to_string();
+        record.ready_at = ready_at;
+        record.modification_time = timestamp;
+
+        Ok(DisassociateResolverEndpointIpAddressOutput {
+            resolver_endpoint: Some(record.to_endpoint(now)),
+        })
     }
 }
