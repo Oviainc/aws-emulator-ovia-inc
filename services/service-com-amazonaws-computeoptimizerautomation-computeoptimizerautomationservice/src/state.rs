@@ -1355,52 +1355,57 @@ pub fn previewed_actions<'store>(
         .filter(move |action| action_matches_criteria(action, criteria))
 }
 
-/// One group of recommended actions a summaries list reports as a row: the
-/// grouping key and what the actions under it accumulate.
+/// One group of summarised items a summaries list reports as a row — of
+/// recommended actions, or of automation events: the grouping key and what the
+/// items under it accumulate.
 ///
-/// An action Compute Optimizer has not estimated savings for carries no
-/// estimate, which adds nothing to the group's savings and is still one action
+/// An item Compute Optimizer has not estimated savings for carries no
+/// estimate, which adds nothing to the group's savings and is still one item
 /// of its count.
 #[derive(Debug, Default, Clone)]
 pub struct ActionGroup {
     /// The value of the grouping dimension this group holds, which is the row's
     /// `key`.
     pub key: String,
-    /// How many actions the group holds, estimate or not.
+    /// How many items the group holds, estimate or not.
     pub count: i32,
-    /// The estimates the group's actions carry, which [`total_savings`] reduces
+    /// The estimates the group's items carry, which [`total_savings`] reduces
     /// to the group's `estimatedMonthlySavings`.
     pub estimates: Vec<EstimatedMonthlySavings>,
 }
 
-/// The recommended actions of `actions`, grouped by `recommendedActionType`:
-/// one group per type the set holds, in the order the set first holds an action
-/// of that type.
+/// The items of `items`, grouped by the key `key` reads off each of them: one
+/// group per distinct key the set holds, in the order the set first holds an
+/// item carrying it, each group tallying how many items it holds and the
+/// estimates `estimate` reads off them.
 ///
-/// Every summaries list of this service reports its rows this way — a
-/// `key`-bearing summary row is one group of the dimension it is grouped by, so
-/// the rows are the distinct values the summarised actions carry for it, never a
-/// key for a dimension nothing was grouped by. The summarised actions are what
-/// gets grouped, so a type nothing matched is no group and an action the store
-/// records no type for belongs to no group.
+/// The ONE grouping every summaries list of this service reports its rows with,
+/// whatever it summarises: a `key`-bearing summary row is one group of the
+/// dimension it is grouped by, so the rows are the distinct values the
+/// summarised items carry for it, never a key for a dimension nothing was
+/// grouped by. The summarised items are what gets grouped, so a value nothing
+/// matched is no group and an item the store records no value for belongs to no
+/// group.
 ///
 /// The groups are kept as a SEQUENCE, so a group's key and its tally are one
 /// value: there is no second lookup that could miss and report a plausible zero
-/// total. The number of groups is bounded by the `RecommendedActionType` value
-/// set, so finding one by key is a walk over a handful of entries.
-pub fn group_by_recommended_action_type<'a>(
-    actions: impl Iterator<Item = &'a RecommendedAction>,
+/// total. The number of groups is bounded by the value set of the dimension
+/// grouped by, so finding one by key is a walk over a handful of entries.
+fn group_summary_rows<'a, T: 'a>(
+    items: impl Iterator<Item = &'a T>,
+    key: impl Fn(&'a T) -> Option<&'a str>,
+    estimate: impl Fn(&'a T) -> Option<&'a EstimatedMonthlySavings>,
 ) -> Vec<ActionGroup> {
     let mut grouped: Vec<ActionGroup> = Vec::new();
-    for action in actions {
-        let Some(action_type) = action.recommended_action_type.as_deref() else {
+    for item in items {
+        let Some(group_key) = key(item) else {
             continue;
         };
-        let index = match grouped.iter().position(|group| group.key == action_type) {
+        let index = match grouped.iter().position(|group| group.key == group_key) {
             Some(index) => index,
             None => {
                 grouped.push(ActionGroup {
-                    key: action_type.to_string(),
+                    key: group_key.to_string(),
                     ..ActionGroup::default()
                 });
                 grouped.len().saturating_sub(1)
@@ -1408,12 +1413,52 @@ pub fn group_by_recommended_action_type<'a>(
         };
         if let Some(group) = grouped.get_mut(index) {
             group.count = group.count.saturating_add(1);
-            if let Some(savings) = action.estimated_monthly_savings.as_ref() {
+            if let Some(savings) = estimate(item) {
                 group.estimates.push(savings.clone());
             }
         }
     }
     grouped
+}
+
+/// The automation events of `events`, grouped by `eventStatus`: one group per
+/// status the set holds, in the order the set first holds an event in it.
+///
+/// `EventStatus` is the one dimension an automation-event summary is grouped by,
+/// because it is the one value the model's `SummaryDimensionKey` declares
+/// (`smithy_query(query="shape",shape="SummaryDimensionKey")`, generated as
+/// `SUMMARY_DIMENSION_KEY_VALUES`). Every stored event carries a status, so no
+/// event is left out of the grouping; the rule itself is
+/// [`group_summary_rows`]'s.
+pub fn group_events_by_event_status<'a>(
+    events: impl Iterator<Item = &'a StoredEvent>,
+) -> Vec<ActionGroup> {
+    group_summary_rows(
+        events,
+        |event| Some(event.event_status.as_str()),
+        |event| event.estimated_monthly_savings.as_ref(),
+    )
+}
+
+/// The `SummaryDimensionKey` an automation-event summary names: the dimension
+/// its rows are grouped by, which is the single value that shape declares
+/// (generated as `SUMMARY_DIMENSION_KEY_VALUES`).
+pub const SUMMARY_DIMENSION_EVENT_STATUS: &str = "EventStatus";
+
+/// The recommended actions of `actions`, grouped by `recommendedActionType`:
+/// one group per type the set holds, in the order the set first holds an action
+/// of that type. An action the store records no type for belongs to no group.
+///
+/// The grouping rule is [`group_summary_rows`]'s, which every summaries list of
+/// this service reports its rows with.
+pub fn group_by_recommended_action_type<'a>(
+    actions: impl Iterator<Item = &'a RecommendedAction>,
+) -> Vec<ActionGroup> {
+    group_summary_rows(
+        actions,
+        |action| action.recommended_action_type.as_deref(),
+        |action| action.estimated_monthly_savings.as_ref(),
+    )
 }
 
 /// The `estimatedMonthlySavings` of a GROUP of recommended actions: the sums of
@@ -2597,6 +2642,86 @@ pub fn effective_window_start(
         _ => floor,
     }
 }
+
+/// How many characters a calendar date with no time of day has
+/// (`yyyy-MM-dd`).
+const DATE_ONLY_LEN: usize = "yyyy-MM-dd".len();
+
+/// The instant a STRING-typed date member of this service names, or `None` for
+/// text that names none.
+///
+/// `ListAutomationEventSummaries` takes its window as `startDateInclusive` and
+/// `endDateExclusive`, which the model targets at a plain `String` rather than
+/// at `timestamp`
+/// (`smithy_query(query="operation",operation="ListAutomationEventSummaries")`),
+/// so the framework never reads them as instants and the text is read here.
+///
+/// The model documents no format for either member, so every form a caller can
+/// name an instant in is read, and the READING is the library's in all of them:
+///
+/// * a calendar date, which names that day's FIRST instant, because a day is
+///   included from its start;
+/// * a date and time, with the UTC designator supplied when the text carries no
+///   zone at all — since every other instant this service reads or reports is
+///   UTC — and handed over exactly as written when it does carry one, so which
+///   instants are readable is the library's `Format::DateTime` answer and never
+///   a zone table of this service's own;
+/// * the seconds since the epoch this protocol renders every MODELLED timestamp
+///   of this service as, which is what `Format::EpochSeconds` reads.
+///
+/// The calendar conversion itself (month lengths, leap years, a fractional
+/// second) is the library's, so no timestamp is parsed here.
+///
+/// TOTAL over arbitrary text: the value comes straight off the wire, so text no
+/// form reads answers `None` for the caller to refuse as its modelled client
+/// error, rather than being answered for a window it does not name.
+pub fn parse_date_member(value: &str) -> Option<::aws_smithy_types::DateTime> {
+    let date_time = |text: &str| {
+        ::aws_smithy_types::DateTime::from_str(
+            text,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .ok()
+    };
+    if value.len() == DATE_ONLY_LEN {
+        if let Some(at) = date_time(&format!("{value}T00:00:00Z")) {
+            return Some(at);
+        }
+    }
+    let completed = if carries_zone(value) {
+        value.to_string()
+    } else {
+        format!("{value}Z")
+    };
+    if let Some(at) = date_time(&completed) {
+        return Some(at);
+    }
+    ::aws_smithy_types::DateTime::from_str(
+        value,
+        ::aws_smithy_types::date_time::Format::EpochSeconds,
+    )
+    .ok()
+}
+
+/// Does `value` already say which zone its time of day is in?
+///
+/// A UTC designator, or a sign inside the TIME part — the date's own separators
+/// are hyphens, so a `-` before the designator belongs to the date. Which
+/// instant the zone it names makes is the library's reading, not this
+/// function's: all this decides is whether the text needs the UTC designator
+/// supplied before it is read.
+fn carries_zone(value: &str) -> bool {
+    value.ends_with(['Z', 'z'])
+        || value
+            .rsplit_once(['T', 't'])
+            .is_some_and(|(_, time)| time.contains('+') || time.contains('-'))
+}
+
+/// What the service says when a string-typed date member names no instant: the
+/// requirement [`parse_date_member`] reads that member against, worded for
+/// [`constraint_report`] and echoing no value.
+pub const DATE_MEMBER_REQUIREMENT: &str =
+    "Member must be a date, a date and time, or seconds since the epoch";
 
 /// Does `event` satisfy every `ListAutomationEvents` filter?
 ///

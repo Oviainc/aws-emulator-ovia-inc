@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpotDatafeedSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpotDatafeedSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reports the account's Spot Instance data feed subscription out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State`], and refuses with EC2's
+//! `InvalidSpotDatafeed.NotFound` when the account has created none — a data feed is a
+//! singleton resource ("you can create one data feed per Amazon Web Services account"), not
+//! a setting with a default, so there is nothing to report until
+//! `CreateSpotDatafeedSubscription` has made one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpotDatafeedSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: the feed has no clock-owed move, so two calls in a row report the same
+//! thing and this handler writes nothing. A `DryRun` request is refused before the store is
+//! read, so it reports nothing at all.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +137,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpotDatafeedSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpotDatafeedSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpotDatafeedSubscription"))
+        use crate::state;
+
+        // "Describes the data feed for Spot Instances": the feed is one account-level
+        // resource, and this store is per account (`crate::state`'s module docs), so nothing
+        // of the request beyond `DryRun` is read and `ctx` carries nothing this operation
+        // needs.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // A `DryRun` request stops HERE, before the store is read, so a dry run reports
+        // nothing: "checks whether you have the required permissions for the action, without
+        // actually making the request … If you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`). The flag answers a question about
+        // PERMISSIONS, so like every other `DryRun` on this surface its answer does not
+        // depend on whether the resource the call would report exists.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // A REPORTING operation: the subscription is read out of the store and nothing is
+        // written back, so this call cannot change what a later caller sees. An account that
+        // has created no feed has none to report, and EC2 answers that with a code of its
+        // own rather than with an empty result.
+        let reported = store
+            .lock()
+            .spot_datafeed_subscription()
+            .ok_or_else(state::invalid_spot_datafeed_not_found)?;
+
+        Ok(DescribeSpotDatafeedSubscriptionOutput {
+            spot_datafeed_subscription: Some(reported),
+        })
     }
 }

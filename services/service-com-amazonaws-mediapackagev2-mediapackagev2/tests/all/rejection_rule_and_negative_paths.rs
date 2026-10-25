@@ -1141,7 +1141,11 @@ async fn a_stale_entity_tag_is_refused_and_a_fresh_one_commits() {
 
 /// A harvest job body whose schedule runs from `start` to `end` (epoch seconds) and whose
 /// harvested manifests are the named HLS manifests.
-fn harvest_body(start: f64, end: f64, manifests: &[&str]) -> Value {
+///
+/// `pub(crate)` with [`epoch_seconds_from_now`] below: they are the one `CreateHarvestJob`
+/// body this crate's suites share, so `harvest_job_tagging` creates its jobs through them
+/// rather than carrying a second copy.
+pub(crate) fn harvest_body(start: f64, end: f64, manifests: &[&str]) -> Value {
     json!({
         "HarvestedManifests": {
             "HlsManifests": manifests
@@ -1157,7 +1161,7 @@ fn harvest_body(start: f64, end: f64, manifests: &[&str]) -> Value {
 }
 
 /// Epoch seconds, far enough ahead that a scheduled window does not end mid-test.
-fn epoch_seconds_from_now(offset: f64) -> f64 {
+pub(crate) fn epoch_seconds_from_now(offset: f64) -> f64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after the epoch")

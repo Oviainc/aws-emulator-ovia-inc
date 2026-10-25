@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! IMPLEMENTED. Assigns tags to the channel group, channel or origin endpoint the
-//! `ResourceArn` names, after PARSING that ARN: a string that is not a syntactically
+//! IMPLEMENTED. Assigns tags to the resource the `ResourceArn` names — any level of the
+//! hierarchy this service tags, channel group through harvest job —
+//! after PARSING that ARN: a string that is not a syntactically
 //! valid ARN for one of this service's resources is refused `BadRequestException` (400)
 //! before any lookup, and a well-formed ARN naming a resource this emulator does not
 //! hold is refused `NotFoundException` (404). Neither code is in the model — the model
