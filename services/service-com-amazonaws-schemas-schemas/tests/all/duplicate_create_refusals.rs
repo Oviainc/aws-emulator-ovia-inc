@@ -2,15 +2,15 @@
 
 //! End-to-end HTTP tests for the ENVELOPE a duplicate create is refused with.
 //!
-//! RULE: a create whose name is already taken is refused with the error shape that
-//! operation's OWN modelled error set declares — a conflict shape (409) where the
-//! model binds one to the operation, and otherwise the client-refusal shape that set
-//! does carry (`BadRequestException`, 400) — always under the already-exists condition
-//! code and the service's sentence built from the name the request sent, leaving the
-//! stored resource exactly as it was.
+//! RULE: a create whose requested resource is already there is refused as a CONFLICT —
+//! this service's conflict shape, HTTP 409 — under the already-exists condition code
+//! and the service's already-exists sentence built from the identifier the request
+//! sent, leaving the stored resource exactly as it was. The class follows the
+//! CONDITION (the request is well-formed; what stops it is the stored resource), not
+//! which shapes one operation's modelled `errors` list happens to enumerate.
 //!
-//! The two creates this service implements sit on either side of that rule, which is
-//! why both are rows here rather than only the one an issue cited.
+//! Every create this service implements is a row, so the rule is asserted where it
+//! holds rather than only on the operation an issue cited.
 //!
 //! Every case drives the real wire path, through the crate's one harness in
 //! `registry_schema_lifecycle.rs`; nothing here touches the state struct directly.
@@ -20,50 +20,53 @@ use service_com_amazonaws_schemas_schemas::state::{
     CODE_MALFORMED_REQUEST, CODE_RESOURCE_ALREADY_EXIST,
 };
 
+use crate::discoverer_state::{discoverer_uri, source_arn, DISCOVERERS_URI};
 use crate::registry_schema_lifecycle::{registry_uri, schema_uri, Answer, Emulator};
 
 /// The registry the schema rows create their schemas in.
 const HOST_REGISTRY: &str = "duplicate-create-host";
 
-/// Which create a row is about.
+/// The status and shape every row expects.
+///
+/// Source: `smithy_query(query="shape", shape="ConflictException")` on this service's
+/// model — `errorKind` client, `httpError` 409 — the shape the service binds to a
+/// resource that already exists wherever it declares one.
+const CONFLICT_STATUS: u16 = 409;
+const CONFLICT_SHAPE: &str = "ConflictException";
+
+/// Which create a row is about: every create operation this service implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Create {
     Registry,
     Schema,
+    Discoverer,
 }
 
-/// One create operation and the refusal its own modelled error set gives a name that
-/// is already taken.
-///
-/// Source for `status`/`shape`: the operation's modelled `errors` list —
-/// `smithy_query(query="operation", operation="CreateRegistry")` declares
-/// `ConflictException` (httpError 409), while
-/// `smithy_query(query="operation", operation="CreateSchema")` declares
-/// `BadRequestException` (400), `ForbiddenException` (403),
-/// `InternalServerErrorException` (500) and `ServiceUnavailableException` (503) — and
-/// no conflict shape at all.
+/// One create operation and how its already-exists sentence names the resource the
+/// request asked for.
 #[derive(Debug)]
 struct Row {
     create: Create,
-    status: u16,
-    shape: &'static str,
-    /// The word the service's already-exists sentence names the resource kind with.
-    resource: &'static str,
+    /// The sentence the refusal must carry, built from the identifier the request sent
+    /// (`token`, below) exactly as the service builds it.
+    sentence: fn(&str) -> String,
 }
 
 fn rows() -> Vec<Row> {
     vec![
         Row {
             create: Create::Registry,
-            status: 409,
-            shape: "ConflictException",
-            resource: "Registry",
+            sentence: |token| format!("Registry with name {token} already exists."),
         },
         Row {
             create: Create::Schema,
-            status: 400,
-            shape: "BadRequestException",
-            resource: "Schema",
+            sentence: |token| format!("Schema with name {token} already exists."),
+        },
+        Row {
+            create: Create::Discoverer,
+            // A discoverer is identified by the source it discovers, so its sentence
+            // names that source rather than a name the caller chose.
+            sentence: |token| format!("Discoverer for source {} already exists.", source_arn(token)),
         },
     ]
 }
@@ -76,27 +79,30 @@ fn schema_body(marker: &str) -> Value {
     })
 }
 
-/// The URI the named create posts to.
-fn create_uri(create: Create, name: &str) -> String {
+/// The URI the named create posts to. A discoverer's identity travels in the BODY, so
+/// its route carries no identifier.
+fn create_uri(create: Create, token: &str) -> String {
     match create {
-        Create::Registry => registry_uri(name),
-        Create::Schema => schema_uri(HOST_REGISTRY, name),
+        Create::Registry => registry_uri(token),
+        Create::Schema => schema_uri(HOST_REGISTRY, token),
+        Create::Discoverer => DISCOVERERS_URI.to_string(),
     }
 }
 
 /// The body the FIRST (succeeding) create sends.
-fn first_body(create: Create) -> Value {
+fn first_body(create: Create, token: &str) -> Value {
     match create {
         Create::Registry => json!({"Description": "the original"}),
         Create::Schema => schema_body("original"),
+        Create::Discoverer => json!({"SourceArn": source_arn(token)}),
     }
 }
 
-/// Bodies a SECOND create under the same name sends: the rule is about the NAME, so
-/// it holds however the rest of the request differs from the stored resource — same
-/// body, a different description, different tags, different content, and (for a
-/// schema) a different `Type` with a document of that type.
-fn second_bodies(create: Create) -> Vec<(&'static str, Value)> {
+/// Bodies a SECOND create of the same resource sends: the rule is about the IDENTITY
+/// the request asks for, so it holds however the rest of the request differs from the
+/// stored resource — same body, a different description, different tags, different
+/// content, and (for a schema) a different `Type` with a document of that type.
+fn second_bodies(create: Create, token: &str) -> Vec<(&'static str, Value)> {
     match create {
         Create::Registry => vec![
             ("identical body", json!({"Description": "the original"})),
@@ -118,17 +124,41 @@ fn second_bodies(create: Create) -> Vec<(&'static str, Value)> {
                        "Description": "the impostor", "tags": {"owner": "someone"}}),
             ),
         ],
+        Create::Discoverer => vec![
+            ("identical body", json!({"SourceArn": source_arn(token)})),
+            (
+                "a different description",
+                json!({"SourceArn": source_arn(token), "Description": "the impostor"}),
+            ),
+            (
+                "CrossAccount flipped",
+                json!({"SourceArn": source_arn(token), "CrossAccount": false}),
+            ),
+            (
+                "tags the stored resource has not",
+                json!({"SourceArn": source_arn(token), "tags": {"owner": "someone"}}),
+            ),
+        ],
     }
 }
 
-/// What a read of the resource must still report after a refused duplicate: the
-/// member every row can read back through the implemented Describe, and its value.
-async fn describe(emulator: &Emulator, create: Create, name: &str) -> Answer {
-    let described = emulator.call("GET", &create_uri(create, name), None).await;
+/// The URI a read of the stored resource goes to, after the first create answered
+/// `created`. A discoverer's id is MINTED by the service, so it is read back from the
+/// create's answer rather than built from the request.
+fn read_uri(create: Create, token: &str, created: &Answer) -> String {
+    match create {
+        Create::Registry | Create::Schema => create_uri(create, token),
+        Create::Discoverer => discoverer_uri(&created.str_at("DiscovererId")),
+    }
+}
+
+/// What a read of the resource must still report after a refused duplicate: the whole
+/// body the implemented Describe answers with.
+async fn describe(emulator: &Emulator, case: &str, uri: &str) -> Answer {
+    let described = emulator.call("GET", uri, None).await;
     assert_eq!(
         described.status, 200,
-        "case {create:?}/{name:?}: the stored resource must survive a refused duplicate, \
-         got {} {:?}",
+        "case {case:?}: the stored resource must survive a refused duplicate, got {} {:?}",
         described.status, described.body
     );
     described
@@ -136,49 +166,46 @@ async fn describe(emulator: &Emulator, create: Create, name: &str) -> Answer {
 
 /// Assert one refusal's whole envelope: status, the shape in the header and in the
 /// restJson1 body, the condition code and the sentence.
-fn assert_refusal(case: &str, row: &Row, name: &str, answer: &Answer) {
+fn assert_refusal(case: &str, row: &Row, token: &str, answer: &Answer) {
     assert_eq!(
-        answer.status, row.status,
-        "case {case:?}: expected HTTP {}, got {} {:?}",
-        row.status, answer.status, answer.body
+        answer.status, CONFLICT_STATUS,
+        "case {case:?}: expected HTTP {CONFLICT_STATUS}, got {} {:?}",
+        answer.status, answer.body
     );
     assert_eq!(
         answer.error_type(),
-        row.shape,
-        "case {case:?}: expected x-amzn-errortype {}, got {:?}",
-        row.shape,
+        CONFLICT_SHAPE,
+        "case {case:?}: expected x-amzn-errortype {CONFLICT_SHAPE}, got {:?}",
         answer.header("x-amzn-errortype")
     );
     assert_eq!(
         answer.error_code(),
-        row.shape,
-        "case {case:?}: expected the restJson1 __type {}, got {:?}",
-        row.shape,
+        CONFLICT_SHAPE,
+        "case {case:?}: expected the restJson1 __type {CONFLICT_SHAPE}, got {:?}",
         answer.body
     );
     let code = answer.str_at("Code");
     assert_eq!(
         code, CODE_RESOURCE_ALREADY_EXIST,
-        "case {case:?}: a duplicate create carries one condition code whatever the \
-         shape, expected {CODE_RESOURCE_ALREADY_EXIST}, got {code:?}"
+        "case {case:?}: a duplicate create carries the already-exists condition code, \
+         expected {CODE_RESOURCE_ALREADY_EXIST}, got {code:?}"
     );
     let message = answer.str_at("Message");
     assert_eq!(
         message,
-        format!("{} with name {name} already exists.", row.resource),
+        (row.sentence)(token),
         "case {case:?}: wrong already-exists sentence"
     );
 }
 
-/// RULE (above): the class of a duplicate create's refusal is the one its own
-/// operation models — 409 for the create that declares a conflict shape, 400 for the
-/// create that does not — under one already-exists condition code, and the stored
-/// resource is untouched.
+/// RULE (above): every duplicate create this service serves is refused as a 409
+/// conflict under one already-exists condition code, and the stored resource is
+/// untouched.
 #[tokio::test]
-async fn a_duplicate_create_is_refused_in_the_class_its_own_operation_models() {
-    // Names differing in shape, length and alphabet: the rule generalises over the
-    // name the request sent, not over any one name.
-    let names: Vec<String> = vec![
+async fn a_duplicate_create_is_refused_as_a_conflict_whatever_the_resource() {
+    // Identifiers differing in shape, length and alphabet: the rule generalises over
+    // the identity the request sent, not over any one value.
+    let tokens: Vec<String> = vec![
         "dup".to_string(),
         "order.placed_v1".to_string(),
         "UPPER-and-lower-99".to_string(),
@@ -186,9 +213,9 @@ async fn a_duplicate_create_is_refused_in_the_class_its_own_operation_models() {
     ];
 
     for row in rows() {
-        for name in &names {
-            for (variant, body) in second_bodies(row.create) {
-                let case = format!("{:?} {name:?} recreated with {variant}", row.create);
+        for token in &tokens {
+            for (variant, body) in second_bodies(row.create, token) {
+                let case = format!("{:?} {token:?} recreated with {variant}", row.create);
                 let emulator = Emulator::new();
                 if row.create == Create::Schema {
                     let host = emulator
@@ -204,8 +231,8 @@ async fn a_duplicate_create_is_refused_in_the_class_its_own_operation_models() {
                 let created = emulator
                     .call(
                         "POST",
-                        &create_uri(row.create, name),
-                        Some(first_body(row.create)),
+                        &create_uri(row.create, token),
+                        Some(first_body(row.create, token)),
                     )
                     .await;
                 assert_eq!(
@@ -213,20 +240,21 @@ async fn a_duplicate_create_is_refused_in_the_class_its_own_operation_models() {
                     "case {case:?}: the first create must succeed, got {} {:?}",
                     created.status, created.body
                 );
-                let before = describe(&emulator, row.create, name).await;
+                let uri = read_uri(row.create, token, &created);
+                let before = describe(&emulator, &case, &uri).await;
 
                 // Repeating the duplicate must not drift: the same refusal every
                 // time, and never a different class on the second attempt.
                 for attempt in 1..=2 {
                     let refused = emulator
-                        .call("POST", &create_uri(row.create, name), Some(body.clone()))
+                        .call("POST", &create_uri(row.create, token), Some(body.clone()))
                         .await;
-                    assert_refusal(&format!("{case} (attempt {attempt})"), &row, name, &refused);
+                    assert_refusal(&format!("{case} (attempt {attempt})"), &row, token, &refused);
                 }
 
                 // Round trip: the read-back is byte-for-byte what it was before the
                 // refused creates, so nothing the duplicate carried reached the store.
-                let after = describe(&emulator, row.create, name).await;
+                let after = describe(&emulator, &case, &uri).await;
                 assert_eq!(
                     after.body, before.body,
                     "case {case:?}: a refused duplicate must change nothing, \
@@ -246,16 +274,18 @@ async fn a_duplicate_create_is_refused_in_the_class_its_own_operation_models() {
     }
 }
 
-/// RULE: `Code` carries the CONDITION, so the two conditions `CreateSchema` answers
-/// 400 for — a name already taken and a body that is not a schema document — are
-/// still told apart by it even though they share the shape and the status.
+/// RULE: the class follows the condition, so the two ways a `CreateSchema` can be
+/// refused on the SAME taken name are told apart by status, shape and code — the name
+/// already taken is the 409 conflict, while a body that is not a schema document is
+/// the 400 malformed request, judged from the request alone before the store's
+/// contents are read at all.
 #[tokio::test]
-async fn the_two_four_hundred_conditions_of_create_schema_differ_in_their_code() {
+async fn create_schema_separates_a_taken_name_from_a_malformed_body() {
     let emulator = Emulator::new();
     emulator
         .call("POST", &registry_uri(HOST_REGISTRY), Some(json!({})))
         .await;
-    let schema = "both-four-hundreds";
+    let schema = "both-refusals";
     let created = emulator
         .call(
             "POST",
@@ -269,25 +299,31 @@ async fn the_two_four_hundred_conditions_of_create_schema_differ_in_their_code()
         created.status, created.body
     );
 
-    // Rows: the condition, the body that provokes it, and the code it must carry.
-    // The malformed row is sent under the SAME (taken) name, which is what shows the
-    // request itself is judged before the store's contents are: `Content` and `Type`
-    // are required members of this operation, so a body that is not a schema document
-    // is refused as malformed whether or not the name is free.
-    for (case, body, code) in [
+    // Rows: the condition, the body that provokes it, and the envelope it must carry.
+    // Every row is sent under the SAME (taken) name, which is what shows the request
+    // itself is judged before the store's contents are: `Content` and `Type` are
+    // required members of this operation, so a body that is not a schema document is
+    // refused as malformed whether or not the name is free.
+    for (case, body, status, shape, code) in [
         (
             "a name the registry already holds",
             schema_body("impostor"),
+            CONFLICT_STATUS,
+            CONFLICT_SHAPE,
             CODE_RESOURCE_ALREADY_EXIST,
         ),
         (
             "content that is not a schema document",
             json!({"Content": "not json at all", "Type": "OpenApi3"}),
+            400,
+            "BadRequestException",
             CODE_MALFORMED_REQUEST,
         ),
         (
             "content that is JSON but not an object",
             json!({"Content": "[1,2,3]", "Type": "OpenApi3"}),
+            400,
+            "BadRequestException",
             CODE_MALFORMED_REQUEST,
         ),
     ] {
@@ -295,14 +331,14 @@ async fn the_two_four_hundred_conditions_of_create_schema_differ_in_their_code()
             .call("POST", &schema_uri(HOST_REGISTRY, schema), Some(body))
             .await;
         assert_eq!(
-            refused.status, 400,
-            "case {case:?}: expected 400, got {} {:?}",
+            refused.status, status,
+            "case {case:?}: expected {status}, got {} {:?}",
             refused.status, refused.body
         );
         assert_eq!(
             refused.error_type(),
-            "BadRequestException",
-            "case {case:?}: expected x-amzn-errortype BadRequestException, got {:?}",
+            shape,
+            "case {case:?}: expected x-amzn-errortype {shape}, got {:?}",
             refused.header("x-amzn-errortype")
         );
         assert_eq!(

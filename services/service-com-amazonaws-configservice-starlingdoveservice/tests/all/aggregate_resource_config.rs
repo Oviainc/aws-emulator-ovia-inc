@@ -244,6 +244,7 @@ fn seed(emulator: &Emulator, resources: &[Recorded]) {
                     .collect(),
                 first_recorded_at: resource.configuration.map(|_| captured_at()),
                 last_recorded_at: resource.configuration.map(|_| captured_at()),
+                ..DiscoveredResourceEntry::default()
             },
         );
     }

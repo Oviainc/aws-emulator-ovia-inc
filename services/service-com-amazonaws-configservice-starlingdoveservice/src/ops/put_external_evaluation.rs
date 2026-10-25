@@ -11,6 +11,11 @@
 //! decision following from one store standing for one account, not a modelled
 //! constraint on `ComplianceResourceId`.
 //!
+//! A delivery that CHANGES the rule's verdict for the account is a compliance change,
+//! which Config notifies by publishing an event onto the account's default EventBridge
+//! bus ([`crate::state::publish_service_event`]) — the only carrier of the verdict the
+//! resource changed FROM.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -139,8 +144,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; the evaluation is written to state.
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -224,48 +227,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let recorded_at = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // The rule has to be one this account holds AND a process check: every other
-        // rule is evaluated by Config itself, so there is no external verdict to
-        // record against it. Both read as the same refusal, which is what
-        // `NoSuchConfigRuleException` documents on this path ("Verify that the rule is
-        // an Config Process Check rule, that the rule name is correct").
-        let rule = store
-            .config_rules
-            .get_mut(&input.config_rule_name)
-            .filter(|rule| rule.is_process_check())
-            .ok_or_else(|| {
-                PutExternalEvaluationError::from(
-                    PutExternalEvaluationErrorModeled::NoSuchConfigRuleException(
-                        NoSuchConfigRuleException {
-                            message: Some(crate::state::no_such_config_rule_message(
-                                &input.config_rule_name,
-                            )),
-                        },
-                    ),
-                )
-            })?;
+        // ONE lock scope does the write: the rule is resolved and the result recorded
+        // against the rule the same guard resolved. The notification is published AFTER
+        // the guard is released, because publishing calls another service. Only the two
+        // fields the notification names are copied out of the store, so no request
+        // copies a rule's evaluation results.
+        let (rule_name, rule_arn, recorded, replaced) = {
+            let mut store = state.lock();
 
-        // One result per evaluated resource per evaluation mode: delivering again for
-        // the same resource REPLACES the verdict ("Add or updates the evaluations for
-        // process checks"). A process check is a detective evaluation — it reports on
-        // a process that has already run — and Config, not the caller, chose the mode.
-        let mut result = crate::state::EvaluationResultEntry::new(
-            &delivered.compliance_resource_type,
-            &delivered.compliance_resource_id,
-            crate::state::EVALUATION_MODE_DETECTIVE,
-            &delivered.compliance_type,
-            ordered_at,
-        );
-        result.annotation = delivered.annotation;
-        // The caller's `OrderingTimestamp` is "the time when the compliance was
-        // recorded", i.e. the instant the evaluation itself happened, which is also
-        // when the rule was invoked; Config recorded the result when this call
-        // arrived.
-        result.result_recorded_time = recorded_at;
-        rule.evaluation_results.insert(result.key(), result);
+            // The rule has to be one this account holds AND a process check: every other
+            // rule is evaluated by Config itself, so there is no external verdict to
+            // record against it. Both read as the same refusal, which is what
+            // `NoSuchConfigRuleException` documents on this path ("Verify that the rule is
+            // an Config Process Check rule, that the rule name is correct").
+            let rule = store
+                .config_rules
+                .get_mut(&input.config_rule_name)
+                .filter(|rule| rule.is_process_check())
+                .ok_or_else(|| {
+                    PutExternalEvaluationError::from(
+                        PutExternalEvaluationErrorModeled::NoSuchConfigRuleException(
+                            NoSuchConfigRuleException {
+                                message: Some(crate::state::no_such_config_rule_message(
+                                    &input.config_rule_name,
+                                )),
+                            },
+                        ),
+                    )
+                })?;
+
+            // One result per evaluated resource per evaluation mode: delivering again for
+            // the same resource REPLACES the verdict ("Add or updates the evaluations for
+            // process checks"). A process check is a detective evaluation — it reports on
+            // a process that has already run — and Config, not the caller, chose the mode.
+            let mut result = crate::state::EvaluationResultEntry::new(
+                &delivered.compliance_resource_type,
+                &delivered.compliance_resource_id,
+                crate::state::EVALUATION_MODE_DETECTIVE,
+                &delivered.compliance_type,
+                ordered_at,
+            );
+            result.annotation = delivered.annotation;
+            // The caller's `OrderingTimestamp` is "the time when the compliance was
+            // recorded", i.e. the instant the evaluation itself happened, which is also
+            // when the rule was invoked; Config recorded the result when this call
+            // arrived.
+            result.result_recorded_time = recorded_at;
+            // The rule's own writer records it, which is what keeps a rule's results
+            // bounded; the verdict it REPLACES is read first, because that is what the
+            // notification reports the resource changed FROM.
+            let replaced = rule.evaluation_results.get(&result.key()).cloned();
+            rule.record_evaluation_result(result.clone());
+            (rule.name.clone(), rule.arn.clone(), result, replaced)
+        };
+
+        // A verdict that did not change is not a compliance CHANGE, so it notifies
+        // nobody; a first verdict and a replaced one both are.
+        let changed = replaced
+            .as_ref()
+            .is_none_or(|previous| previous.compliance_type != recorded.compliance_type);
+        if changed {
+            let region = crate::state::request_region(ctx);
+            let detail = crate::state::compliance_change_detail(
+                &rule_name,
+                &rule_arn,
+                &region,
+                &recorded,
+                replaced.as_ref(),
+                recorded_at,
+            );
+            crate::state::publish_service_event(
+                ctx,
+                &region,
+                crate::state::COMPLIANCE_CHANGE_DETAIL_TYPE,
+                &detail,
+            )
+            .await;
+        }
 
         Ok(PutExternalEvaluationOutput {})
     }
 }
+

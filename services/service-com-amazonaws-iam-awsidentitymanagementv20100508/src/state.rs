@@ -354,6 +354,13 @@ pub const MARKER_SCOPE_GROUPS: &str = "groups";
 /// another's: see [`role_attached_policies_marker_scope`].
 pub const MARKER_SCOPE_ROLE_ATTACHED_POLICIES: &str = "role-attached-policies";
 
+/// The marker scope of ONE user's attached managed policies, which
+/// `ListAttachedUserPolicies` pages over. It is its OWN scope, with the user's key
+/// following it, so a marker issued while paging one user's attachments names no
+/// position in another user's — nor in any role's attachment order:
+/// see [`user_attached_policies_marker_scope`].
+pub const MARKER_SCOPE_USER_ATTACHED_POLICIES: &str = "user-attached-policies";
+
 /// The marker scope of ONE role's EMBEDDED inline policies, which
 /// `ListRolePolicies` pages over. The role's key follows it, exactly as it does
 /// for the attachment set, so a marker issued while paging one role's inline
@@ -1774,6 +1781,11 @@ const SERVICE_PROVISIONED_ROLE_ID_BASE: u64 = 1 << 63;
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the attachment set of the user keyed by `user_key`.
+pub fn user_attached_policies_marker_scope(user_key: &str) -> String {
+    format!("{MARKER_SCOPE_USER_ATTACHED_POLICIES}:{user_key}")
 }
 
 /// The marker scope of the inline-policy set of the role keyed by `role_key`.

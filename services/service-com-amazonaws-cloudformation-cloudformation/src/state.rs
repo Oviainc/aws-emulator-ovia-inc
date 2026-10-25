@@ -464,27 +464,33 @@ pub mod status {
     pub const REVIEW_IN_PROGRESS: &str = "REVIEW_IN_PROGRESS";
 }
 
-/// `ResourceStatus` values this service leaves a stack's resource in (all from the
-/// model's `ResourceStatus` enum).
+/// `ResourceStatus` values this service leaves a stack's resource in, and records a
+/// `StackEvent` for (all from the model's `ResourceStatus` enum).
 ///
-/// A stack operation of this service deploys a whole template at once, so the statuses a
-/// resource reaches here are the completions of the operation that created, updated or
-/// deleted it; a deployment that could not provision a resource is reported on the STACK
-/// (`StoredStack::fail_transition`), which does not install that template's resources at
-/// all.
+/// A stack operation walks the template's resources, so each one goes through the status
+/// that OPENS its transition and then the one that ends it: what the stack's own events say
+/// about the operation as a whole, these say about one resource of it
+/// ([`provisioning::ResourceTransition`]).
 pub mod resource_status {
-    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-    pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
-    pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
-    /// The status a resource the stack's create is still waiting on reports — the one a
-    /// signal it receives while that create is in flight is recorded under.
+    /// The status a resource the stack's create is still working on reports: the one that
+    /// OPENS its create — and the one a signal it receives while that create is in flight
+    /// is recorded under.
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
-    /// The status of a resource whose creation a FAILURE signal ended.
+    pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    /// The status of a resource whose creation the service that owns it refused, or a
+    /// FAILURE signal ended.
     pub const CREATE_FAILED: &str = "CREATE_FAILED";
     /// [`CREATE_IN_PROGRESS`]'s counterpart while the stack's UPDATE is in flight.
     pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
-    /// The status of a resource whose update a FAILURE signal ended.
+    pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+    /// The status of a resource whose update the service that owns it refused, or a FAILURE
+    /// signal ended.
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
+    /// [`CREATE_IN_PROGRESS`]'s counterpart while the resource is being DELETED.
+    pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+    pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
+    /// The status of a resource the service that owns it refused to delete.
+    pub const DELETE_FAILED: &str = "DELETE_FAILED";
 }
 
 /// `ResourceSignalStatus` values (the model's `ResourceSignalStatus` enum): "The status of
@@ -1219,6 +1225,39 @@ impl StoredStack {
             resource_status_reason,
             client_request_token,
         });
+    }
+
+    /// Append the event each RESOURCE transition of a stack operation owes, through
+    /// [`Self::record_resource_event`].
+    ///
+    /// "Returns all stack related events for a specified stack": an event is not only the
+    /// stack's own status changes but one record per transition of each resource the
+    /// operation acted on, naming that resource — which is what tells a client WHICH
+    /// resource a failed deployment failed on and, through
+    /// `StackEvent$ResourceStatusReason`, why the service that owns it refused.
+    ///
+    /// Every event of one stack operation carries that operation's id and the token the
+    /// call supplied ("All events triggered by a given stack operation are assigned the
+    /// same client request token"), which is what the stack is reporting as its last
+    /// operation while these are recorded.
+    pub fn record_resource_events(&mut self, transitions: &[provisioning::ResourceTransition]) {
+        let operation_id = self
+            .last_operation
+            .as_ref()
+            .map(|operation| operation.operation_id.clone());
+        let client_request_token = self.client_request_token.clone();
+        for transition in transitions {
+            self.record_resource_event(
+                transition.at,
+                &transition.logical_id,
+                transition.physical_resource_id.clone(),
+                &transition.resource_type,
+                &transition.status,
+                transition.reason.clone(),
+                operation_id.clone(),
+                client_request_token.clone(),
+            );
+        }
     }
 
     /// Record a signal `SignalResource` sent one of this stack's resources, and answer

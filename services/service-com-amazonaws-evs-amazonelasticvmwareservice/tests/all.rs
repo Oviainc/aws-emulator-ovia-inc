@@ -32,6 +32,8 @@ mod create_environment_network_membership;
 mod create_environment_validation;
 #[path = "all/created_environment_hosts.rs"]
 mod created_environment_hosts;
+#[path = "all/delete_entitlement.rs"]
+mod delete_entitlement;
 #[path = "all/depot_url.rs"]
 mod depot_url;
 #[path = "all/eip_allocation_existence.rs"]

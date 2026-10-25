@@ -186,12 +186,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|sub_check_result| (sub_check_result.id.clone(), sub_check_result.view()))
             .collect();
 
-        let page = crate::state::page(all, input.max_results, input.next_token.as_deref())
-            .map_err(|error| {
-                ListSubCheckResultsErrorModeled::ValidationException(
-                    crate::state::page_validation_exception(&error),
-                )
-            })?;
+        let page = crate::state::page(
+            all,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::SubCheckResults,
+        )
+        .map_err(|error| {
+            ListSubCheckResultsErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&error),
+            )
+        })?;
 
         Ok(ListSubCheckResultsOutput {
             sub_check_results: Some(page.items),

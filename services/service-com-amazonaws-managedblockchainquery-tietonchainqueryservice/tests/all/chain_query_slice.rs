@@ -132,6 +132,69 @@ pub(crate) fn unseeded_bitcoin_address() -> String {
     format!("1{}", "z".repeat(32))
 }
 
+/// Well-formed addresses OF `network`'s own chain that the fixture ledger holds nothing
+/// under: the rows every read has to answer with the modelled empty page or the modelled
+/// `ResourceNotFoundException`, because the only thing wrong with them is that the index
+/// holds nothing under them.
+///
+/// Which strings are addresses is fixed by the CHAIN, not by this service's
+/// `ChainAddress` pattern — Bitcoin spells an address in base58 (BIP-13: a version
+/// character, then the base58 alphabet) or bech32 (BIP-173: `bc`/`tb`, the `1`
+/// separator, then bech32's alphabet), an EVM chain in `0x` and the 40 hex digits of a
+/// 20-byte account — so the rows differ by network. An address of ANOTHER chain is a
+/// different case entirely, which `cross_chain_address.rs` owns.
+///
+/// `pub(crate)` because every suite that probes an identifier the ledger does not hold
+/// needs the same rows.
+pub(crate) fn unseeded_addresses(network: &str) -> Vec<String> {
+    if is_bitcoin(network) {
+        return vec![
+            // base58, the mainnet pay-to-public-key-hash version character.
+            unseeded_bitcoin_address(),
+            // base58, the pay-to-script-hash version character, at the shortest length
+            // the encoding admits.
+            format!("3{}", "y".repeat(25)),
+            // bech32 on the Bitcoin mainnet's human-readable part, and on the testnet's.
+            format!("bc1q{}", "z".repeat(38)),
+            format!("tb1q{}", "z".repeat(38)),
+        ];
+    }
+    vec![
+        // The zero account, the all-nines one, and one of alternating digits. All in
+        // lowercase, the spelling this API reports an address in: that the OTHER letter
+        // cases of one account name the same account is a rule of its own, which
+        // `response_fidelity.rs` owns.
+        format!("0x{}", "0".repeat(40)),
+        format!("0x{}", "9".repeat(40)),
+        format!("0x{}", "ab".repeat(20)),
+    ]
+}
+
+/// The first of [`unseeded_addresses`], for a row that needs one such address rather than
+/// a table of them.
+pub(crate) fn unseeded_address(network: &str) -> String {
+    unseeded_addresses(network)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case {network}: no unseeded address is known for it"))
+}
+
+/// A well-formed address of a chain OTHER than the one `network` runs: a base58 Bitcoin
+/// address for an EVM network, and an EVM address for a Bitcoin one.
+///
+/// `ChainAddress` admits both, which is why the service itself has to tell them apart:
+/// such a string is not an address of the chain the request named, so no index can hold
+/// anything under it.
+///
+/// `pub(crate)` because several suites need the same row.
+pub(crate) fn other_chain_address(network: &str) -> String {
+    if is_bitcoin(network) {
+        format!("0x{}", "d".repeat(40))
+    } else {
+        unseeded_bitcoin_address()
+    }
+}
+
 // Every operation of this service is implemented now: `ListFilteredTransactionEvents`,
 // `GetAssetContract` and `BatchGetTokenBalance` on mainline, and `ListAssetContracts` in
 // the change that answers the wire issue about this service's error responses. There is
@@ -564,21 +627,14 @@ async fn list_transactions_returns_exactly_the_stored_transactions_of_each_addre
 #[tokio::test]
 async fn list_transactions_returns_nothing_for_an_address_the_ledger_does_not_know() {
     let emulator = Emulator::new();
-    // Each row satisfies `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` and differs in form:
-    // an Ethereum-shaped address, a base58-shaped one, a hyphenated label, and the
-    // longest and shortest the pattern admits. The emulator holds no index of the
-    // public chains, so an identifier its fixture ledger does not hold answers with an
-    // empty page rather than with a history made up for it.
-    let strangers = [
-        "0x0000000000000000000000000000000000000000".to_string(),
-        "1NotASeededBitcoinAddressAtAll".to_string(),
-        "not-a-seeded-address".to_string(),
-        "a".repeat(13),
-        "Z".repeat(74),
-    ];
 
     for network in emulator.fixture() {
-        for stranger in &strangers {
+        // Each row is a well-formed address of the queried network's own chain
+        // ([`unseeded_addresses`]) that the fixture holds nothing under, and the rows
+        // differ in encoding, version character and length. The emulator holds no index
+        // of the public chains, so an address its fixture ledger does not hold answers
+        // with an empty page rather than with a history made up for it.
+        for stranger in unseeded_addresses(&network.network) {
             let reply = emulator
                 .ok(
                     "/list-transactions",
@@ -1259,14 +1315,11 @@ async fn get_token_balance_reports_the_instant_it_was_asked_for_and_the_last_upd
 #[tokio::test]
 async fn get_token_balance_refuses_a_token_it_cannot_identify_and_404s_an_unknown_owner() {
     let emulator = Emulator::new();
-    // Addresses that satisfy `ChainAddress`'s pattern and hold nothing in the fixture.
-    let strangers = [
-        "0x0000000000000000000000000000000000000000".to_string(),
-        "1NotASeededBitcoinAddressAtAll".to_string(),
-        "not-a-seeded-owner".to_string(),
-    ];
 
     for network in emulator.fixture() {
+        // Owners that are well-formed addresses of this network's own chain and hold
+        // nothing in the fixture.
+        let strangers = unseeded_addresses(&network.network);
         // A `TokenIdentifier` naming only a network identifies no token.
         emulator
             .fails(

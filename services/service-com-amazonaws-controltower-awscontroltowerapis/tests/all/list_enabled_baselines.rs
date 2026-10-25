@@ -14,8 +14,9 @@
 //!   has reached — and losing an enablement the clock has torn down;
 //! * the listing is narrowed by EVERY member of `filter`: a member the caller omits
 //!   narrows nothing, one they send keeps the enablements whose own value its set holds,
-//!   and a member no enablement has a value for (`parentIdentifiers`,
-//!   `inheritanceDriftStatuses`) selects nothing;
+//!   a member no enablement has a value for (`parentIdentifiers`) selects nothing, and
+//!   `inheritanceDriftStatuses` selects the enablements carrying that drift status, so it
+//!   selects nothing while no enablement has one yet;
 //! * a paginated walk returns every selected enablement exactly once, in pages of at most
 //!   `maxResults`, ending when the answer carries no `nextToken`; a token this operation
 //!   never handed out is refused.
@@ -31,6 +32,8 @@
 //! here either.
 
 use smithy_server_runtime::MultiServiceRouter;
+
+use service_com_amazonaws_controltower_awscontroltowerapis::state::assesses_inheritance_drift;
 
 use crate::baseline_operations::{disable, enable, enablements, Enablement};
 use crate::enabled_control_lifecycle::entries;
@@ -175,13 +178,14 @@ async fn the_listing_reports_every_enablement_the_store_holds() {
              the enablement is in flight, got {summary:?}",
             row.case
         );
-        // Neither member is invented: no parent enablement is recorded and no drift is
-        // assessed, which is what `GetEnabledBaseline` reports for the same resource.
+        // Neither member is invented: no parent enablement is recorded, and drift is only
+        // assessed once the configuration is deployed — which is what
+        // `GetEnabledBaseline` reports for the same resource while it is in flight.
         assert!(
             summary.get("parentIdentifier").is_none()
                 && summary.get("driftStatusSummary").is_none(),
-            "case {:?}: expected no parentIdentifier and no driftStatusSummary, got \
-             {summary:?}",
+            "case {:?}: expected no parentIdentifier and no driftStatusSummary while the \
+             enablement is in flight, got {summary:?}",
             row.case
         );
 
@@ -243,6 +247,27 @@ async fn the_listing_reports_every_enablement_the_store_holds() {
             ),
             "case {:?}: the persisted members must not change as the status does, got \
              {summary:?}",
+            row.case
+        );
+        // The deployed enablement carries the drift summary for the baselines AWS
+        // assesses inheritance drift on, and none for the others — the same summary
+        // `GetEnabledBaseline` reports for the same record.
+        let expected_drift = assesses_inheritance_drift(row.baseline_identifier).then(|| {
+            serde_json::json!({ "types": { "inheritance": { "status": "IN_SYNC" } } })
+        });
+        assert_eq!(
+            summary.get("driftStatusSummary").cloned(),
+            expected_drift,
+            "case {:?}: expected driftStatusSummary {expected_drift:?} once the \
+             enablement is due, got {summary:?}",
+            row.case
+        );
+        let detail = details(&router, arn).await;
+        assert_eq!(
+            summary.get("driftStatusSummary").cloned(),
+            detail.get("driftStatusSummary").cloned(),
+            "case {:?}: the two reporting operations must agree on the drift summary, got \
+             {summary:?} and {detail:?}",
             row.case
         );
     }
@@ -394,12 +419,13 @@ async fn the_listing_is_narrowed_by_every_filter_member() {
             none.clone(),
         ),
         (
-            "inheritanceDriftStatuses IN_SYNC, which no enablement has a value for",
+            "inheritanceDriftStatuses IN_SYNC, which no enablement carries while its \
+             deployment is still in flight",
             serde_json::json!({ "filter": { "inheritanceDriftStatuses": ["IN_SYNC"] } }),
             none.clone(),
         ),
         (
-            "inheritanceDriftStatuses DRIFTED, likewise",
+            "inheritanceDriftStatuses DRIFTED, which nothing here reaches",
             serde_json::json!({ "filter": { "inheritanceDriftStatuses": ["DRIFTED"] } }),
             none.clone(),
         ),
@@ -457,6 +483,33 @@ async fn the_listing_is_narrowed_by_every_filter_member() {
         let listed = list(
             &router,
             serde_json::json!({ "filter": { "statuses": [status] } }),
+        )
+        .await;
+        assert_eq!(
+            listed_arns(&listed),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            listed.body
+        );
+    }
+
+    // So does the drift filter: the enablements of a drift-assessed baseline carry
+    // IN_SYNC once deployed, and are the ones that filter then selects.
+    for (case, status, expected) in [
+        (
+            "inheritanceDriftStatuses IN_SYNC once every enablement is due",
+            "IN_SYNC",
+            selects(&|row| assesses_inheritance_drift(row.baseline_identifier)),
+        ),
+        (
+            "inheritanceDriftStatuses DRIFTED once every enablement is due",
+            "DRIFTED",
+            none.clone(),
+        ),
+    ] {
+        let listed = list(
+            &router,
+            serde_json::json!({ "filter": { "inheritanceDriftStatuses": [status] } }),
         )
         .await;
         assert_eq!(

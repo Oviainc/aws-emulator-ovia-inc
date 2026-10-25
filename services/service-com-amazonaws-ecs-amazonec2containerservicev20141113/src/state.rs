@@ -477,6 +477,17 @@ pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
 /// leads to it.
 pub const DAEMON_TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 
+/// `DaemonTaskDefinition$status` while the delete a `DeleteDaemonTaskDefinition` call
+/// asked for is still running — the status a revision stands in from the instant the
+/// delete was requested until it has been carried out, and the second of the
+/// `DaemonTaskDefinitionStatus` values.
+pub const DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
+/// `DaemonTaskDefinition$status` once a requested delete has been carried out — the
+/// terminal `DaemonTaskDefinitionStatus` value, reached [`TRANSITION_SPAN`] after the
+/// delete was requested and never left again.
+pub const DAEMON_TASK_DEFINITION_DELETED: &str = "DELETED";
+
 /// The `DaemonTaskDefinitionStatusFilter` value that narrows a daemon task-definition
 /// listing to nothing at all — `ListDaemonTaskDefinitions$status`: "If you set this
 /// parameter to `ALL`, all daemon task definitions are listed regardless of status." The
@@ -1037,6 +1048,39 @@ pub fn daemon_task_definition_reference_message(reference: &str) -> String {
         "daemonTaskDefinition",
         DAEMON_TASK_DEFINITION_RESOURCE_TYPE,
         reference,
+    )
+}
+
+/// `ClientException$message` for a `taskDefinition` that names a whole FAMILY where the
+/// call needs the ONE revision it acts on — the `DeregisterTaskDefinition` doc: "You must
+/// specify a revision."
+pub fn task_definition_revision_required_message(reference: &str) -> String {
+    revision_required_message("taskDefinition", TASK_DEFINITION_RESOURCE_TYPE, reference)
+}
+
+/// `ClientException$message` for a `daemonTaskDefinition` that names a whole FAMILY where
+/// the call needs the ONE revision it acts on — the `DeleteDaemonTaskDefinition$daemonTaskDefinition`
+/// doc: "The family and revision (family:revision) or full Amazon Resource Name (ARN) of
+/// the daemon task definition to delete", which unlike the reading operations' member
+/// does not offer the family on its own.
+pub fn daemon_task_definition_revision_required_message(reference: &str) -> String {
+    revision_required_message(
+        "daemonTaskDefinition",
+        DAEMON_TASK_DEFINITION_RESOURCE_TYPE,
+        reference,
+    )
+}
+
+/// The sentence a reference that names a FAMILY is refused with where the call needs one
+/// revision: the `member` it was given in, the forms that do name a revision and the
+/// value that names none.
+///
+/// Spelled once for both resources whose references take those forms, so a call that acts
+/// on one revision refuses a family the same way whichever resource it works on.
+fn revision_required_message(member: &str, resource_type: &str, reference: &str) -> String {
+    format!(
+        "{member} must name a revision (family:revision or a {resource_type} ARN); \
+         got {reference:?}"
     )
 }
 
@@ -1802,9 +1846,26 @@ pub struct DaemonTaskDefinitionRecord {
     /// "The Unix timestamp for the time when the daemon task definition delete was
     /// requested" — absent until a delete is asked for.
     pub delete_requested_at: Option<DateTime>,
+    /// When [`DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS`] ->
+    /// [`DAEMON_TASK_DEFINITION_DELETED`] falls due; `None` both for a revision no delete
+    /// was asked for and for one whose delete has already been materialised. Stored and
+    /// compared, never slept on
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]).
+    pub deleted_due_at: Option<SystemTime>,
 }
 
 impl DaemonTaskDefinitionRecord {
+    /// Record the delete a `DeleteDaemonTaskDefinition` call asked for at `now`: the
+    /// revision enters [`DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS`], keeps the instant
+    /// the delete was requested, and owes the clock its completion
+    /// [`TRANSITION_SPAN`] later — so a caller reading straight after the call still sees
+    /// the delete running.
+    pub fn request_delete(&mut self, now: SystemTime) {
+        self.status = DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS.to_string();
+        self.delete_requested_at = Some(DateTime::from(now));
+        self.deleted_due_at = Some(now + TRANSITION_SPAN);
+    }
+
     /// The `DaemonTaskDefinition` every daemon task-definition operation returns, built
     /// from what is stored — never from the request asking for it.
     pub fn view(&self) -> DaemonTaskDefinition {
@@ -2393,6 +2454,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         container.last_status = STATUS_STOPPED.to_string();
                     }
                     task.version += 1;
+                }
+            }
+        }
+        // The delete a `DeleteDaemonTaskDefinition` call asked for: once it is due the
+        // revision has been deleted, whether or not anybody called to look. Terminal, so
+        // the due instant is cleared with it and the status never moves again.
+        for record in self.daemon_task_definitions.values_mut() {
+            if let Some(due) = record.deleted_due_at {
+                if due <= now {
+                    record.deleted_due_at = None;
+                    record.status = DAEMON_TASK_DEFINITION_DELETED.to_string();
                 }
             }
         }

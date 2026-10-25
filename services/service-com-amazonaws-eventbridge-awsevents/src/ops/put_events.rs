@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEvents
-//! Publishes events onto an event bus and routes each one.
+//! Publishes events onto an event bus, routes each one, and delivers it to the
+//! targets of every rule it matched.
 //!
 //! Every accepted entry is matched against the stored rules of the bus it names:
 //! an enabled rule whose `EventPattern` matches the event envelope is recorded

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDataCatalogEncryptionSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDataCatalogEncryptionSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDataCatalogEncryptionSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the security configuration of ONE Data Catalog: the whole
+//! `DataCatalogEncryptionSettings` structure the request carries REPLACES the record the
+//! addressed catalog holds, which `GetDataCatalogEncryptionSettings` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +135,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDataCatalogEncryptionSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDataCatalogEncryptionSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDataCatalogEncryptionSettings"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutDataCatalogEncryptionSettingsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A `CatalogId` this emulator holds no Data Catalog under must not be conjured
+        // into existence by the write: on the real service it is another account's
+        // catalog, or one `CreateCatalog` has not made. This operation models no
+        // not-found error, so the refusal is the modelled client-input error.
+        if !crate::state::is_known_catalog(&catalog_id) {
+            return Err(
+                PutDataCatalogEncryptionSettingsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "CatalogId {catalog_id} is not a Data Catalog in this account"
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // The catalog container is materialised here if this store does not hold it yet,
+        // through the one place a catalog is brought into existence. `None` means the
+        // store already holds the maximum number of catalogs without holding this one,
+        // which the check above makes unreachable (only this account's id gets here), so
+        // it is answered as the server-side failure it would be rather than blamed on
+        // the request.
+        let Some(catalog) = store.catalog_mut_for_create(&catalog_id) else {
+            return Err(
+                PutDataCatalogEncryptionSettingsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(format!(
+                            "the Glue Data Catalog store cannot hold a catalog under \
+                             CatalogId {catalog_id}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The write carries the WHOLE settings structure, so it replaces the record
+        // rather than merging into it: a setting this request does not name reads back
+        // as that setting's default, not as what an earlier write left there.
+        catalog.encryption_settings = Some(input.data_catalog_encryption_settings);
+        ::tracing::info!(
+            operation = "PutDataCatalogEncryptionSettings",
+            catalog_id = %catalog_id,
+            "set a Data Catalog's security configuration"
+        );
+
+        Ok(PutDataCatalogEncryptionSettingsOutput {})
     }
 }

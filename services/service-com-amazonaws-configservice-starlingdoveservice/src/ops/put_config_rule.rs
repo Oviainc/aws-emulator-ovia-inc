@@ -358,7 +358,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             );
         }
-
         // Config hands the evaluation it just invoked a `ResultToken` where the rule is
         // one whose verdicts are DELIVERED back to Config rather than computed by it,
         // which is what `PutEvaluations` quotes to say which rule and which invocation
@@ -367,6 +366,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(rule) = store.config_rules.get_mut(name) {
             rule.mint_evaluation_result_token(now);
         }
+
+        // The store's guard is released before the pump is started, which is what makes
+        // the pass the rule was just invoked for run without any further call: it
+        // observes the resources in the rule's scope and records the verdict the rule
+        // places each one at, publishing a compliance change for every verdict that
+        // moved.
+        drop(store);
+        crate::state::drive_recorder_clock(ctx, &self.engine, &region);
 
         Ok(PutConfigRuleOutput)
     }

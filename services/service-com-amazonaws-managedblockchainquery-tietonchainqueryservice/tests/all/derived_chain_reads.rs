@@ -214,9 +214,9 @@ async fn a_published_mainnet_account_is_indexed_on_its_mainnet_only() {
 
     for network in networks() {
         // The rows: every catalogued account of every OTHER network. A mainnet account
-        // is not deployed on a testnet, nor on the other family's chain, so this
-        // network's index holds nothing under it — the same rule the well-known contract
-        // catalog follows.
+        // is not deployed on a testnet, so that network's index holds nothing under it;
+        // on the other chain FAMILY it is not even an address of the chain, which is a
+        // refusal rather than a missing resource.
         for other in networks() {
             if other == network {
                 continue;
@@ -226,6 +226,36 @@ async fn a_published_mainnet_account_is_indexed_on_its_mainnet_only() {
                     continue;
                 }
                 let case = format!("{network}/{address}");
+                // An account of the other CHAIN FAMILY is not an address of this
+                // network's chain at all — the chains spell an address differently — so
+                // the request names no resource to look for and is refused on the
+                // member that carried it (`cross_chain_address.rs`). Only a well-formed
+                // address of this chain gets as far as the index.
+                if is_bitcoin(&other) != is_bitcoin(&network) {
+                    emulator
+                        .fails(
+                            "/get-token-balance",
+                            &json!({
+                                "tokenIdentifier": {
+                                    "network": network,
+                                    "tokenId": native_token(&network),
+                                },
+                                "ownerIdentifier": {"address": address},
+                            }),
+                            400,
+                            "ValidationException",
+                        )
+                        .await;
+                    emulator
+                        .fails(
+                            "/list-transactions",
+                            &json!({"network": network, "address": address}),
+                            400,
+                            "ValidationException",
+                        )
+                        .await;
+                    continue;
+                }
                 emulator
                     .fails(
                         "/get-token-balance",

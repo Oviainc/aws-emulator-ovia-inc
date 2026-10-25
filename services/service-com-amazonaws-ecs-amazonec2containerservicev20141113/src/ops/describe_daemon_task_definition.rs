@@ -165,7 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // A requested delete finishes on the clock, so the status this read reports is the
+        // one the revision stands in AT THIS INSTANT — the transition was owed whether or
+        // not anybody called.
+        guard.advance_clock(::std::time::SystemTime::now());
         // "You can specify a family and revision to find information about a specific
         // daemon task definition, or you can simply specify the family to find the latest
         // ACTIVE revision in that family." A revision named explicitly is readable

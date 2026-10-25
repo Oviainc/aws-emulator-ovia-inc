@@ -16,11 +16,23 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): a rule's compliance change is published onto the
+# account's default event bus with `PutEvents`, the way an Amazon Web Services service
+# delivers its own events. Only the generated client is needed — the emulator supplies
+# the transport, so the SDK's own HTTPS stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: a running
+# configuration recorder OBSERVES the resources it records through the owning service's
+# own API (`state::recording`), so the buckets it records and their configuration come
+# from S3 itself rather than from another crate's state. Only the generated client is
+# needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false }
 # `sqlparser`: the SQL `SELECT` command `SelectResourceConfig` takes is PARSED with it,
 # so a malformed expression is refused because the parser cannot read it rather than
 # because this emulator searched its text.
@@ -38,6 +50,13 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `time` lets a test await the clock-owed recorder status transition.
 tokio = { workspace = true, features = ["time"] }
+# S3, EventBridge and SQS are mounted beside Config on one engine in the integration
+# tests: the recorder READS the resources it records from S3, and a rule's compliance
+# change is published onto the default EventBridge bus, whose rule delivers it to an SQS
+# queue — without them mounted there is nothing to record and nowhere to publish.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

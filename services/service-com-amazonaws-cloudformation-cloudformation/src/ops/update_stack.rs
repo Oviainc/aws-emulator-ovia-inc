@@ -570,6 +570,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
+            // The resources' own transitions come BEFORE the stack's terminal event: the
+            // event stream is what the update did, in the order it did it.
+            stack.record_resource_events(&materialised.transitions);
             stack.record_materialised_resources(materialised.resources);
             if let Some(failure) = materialised.failure {
                 // A resource an owning service refused: the update does not reach

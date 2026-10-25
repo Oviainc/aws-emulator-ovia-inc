@@ -262,24 +262,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The page size served. `maxResults` documents a minimum of 1 and a
-        // default of 25, so an explicit zero is refused and a request that names
-        // none is served the documented default — never the whole workspace.
-        // Whatever is asked for, the service serves at most
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member documents a
+        // minimum of 1 and the service's default of 25, so an explicit zero is
+        // refused and a request that names none is served that default — never
+        // the whole workspace. Whatever is asked for, the service serves at most
         // `crate::state::MAX_PAGE_SIZE`, so the page this call BUILDS is bounded
-        // by this code and not only by the boundary validator.
-        let page_size = match input.max_results {
-            None => crate::state::DEFAULT_PAGE_SIZE,
-            Some(requested) if requested < 1 => {
-                return Err(invalid(
-                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
-                )
-                .into())
-            }
-            Some(requested) => usize::try_from(requested)
-                .unwrap_or(crate::state::MAX_PAGE_SIZE)
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        // by that code and not only by the boundary validator.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // The clock, not this call, is what moves a component type on: the
         // transition was due at `settles_at`, so reporting the stored state

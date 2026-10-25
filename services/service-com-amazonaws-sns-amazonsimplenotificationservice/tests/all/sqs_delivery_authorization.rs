@@ -16,7 +16,11 @@
 //! The rows differ along what the rule generalises over: whether the queue carries a policy
 //! at all, which principal it grants to, which action, which resource, how the grant is
 //! scoped by condition (the publishing topic's ARN, the publishing account), and whether a
-//! `Deny` of the same send stands beside the grant.
+//! `Deny` of the same send stands beside the grant; then along the SHAPE each element is
+//! written in (one value or a list, the negated spelling, the letter case, an element left
+//! out, a condition operator that cannot be decided), and along how many publishes precede
+//! the read — the rule is per publish, so a queue that grants nothing stays at depth 0
+//! however many rounds it is fanned out to.
 
 use serde_json::{json, Value};
 
@@ -51,6 +55,19 @@ fn policy(statement: Value) -> String {
 /// How many messages the queue at `url` holds.
 async fn depth(emulator: &Emulator, url: &str) -> usize {
     drain(emulator, url).await.len()
+}
+
+/// The attributes the queue at `url` reports for `names`, as the `Attributes` map itself —
+/// `Null` for a name the queue carries no value for, which is how a queue with no policy of
+/// its own answers a read of `Policy`.
+async fn reported_attributes(emulator: &Emulator, url: &str, names: &[&str]) -> Value {
+    sqs(
+        emulator,
+        "GetQueueAttributes",
+        &json!({"QueueUrl": url, "AttributeNames": names}),
+    )
+    .await["Attributes"]
+        .clone()
 }
 
 #[tokio::test]
@@ -462,4 +479,321 @@ async fn a_batched_publish_is_withheld_from_a_queue_that_grants_nothing() {
         Some("0"),
         "the withheld queue must report depth 0, got {reported}"
     );
+}
+
+/// The rule holds per PUBLISH, not once per pipeline: a queue that grants nothing stays at
+/// depth 0 however many times the topic is published to, while the subscriber that does grant
+/// the send counts up by one per round. The rows differ in how many rounds precede the read,
+/// and both depth attributes are read without receiving, so a withheld delivery cannot hide
+/// as an in-flight one.
+#[tokio::test]
+async fn repeated_publishes_leave_a_queue_that_grants_nothing_at_depth_zero() {
+    // The two attributes a queue's whole depth is the sum of.
+    const DEPTH_ATTRIBUTES: [&str; 2] = [
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+    ];
+
+    for (case, rounds) in [
+        ("one round", 1_usize),
+        ("two rounds", 2),
+        ("three rounds", 3),
+        ("five rounds", 5),
+    ] {
+        let emulator = emulator();
+        let topic = element(
+            &sns(&emulator, "CreateTopic", &[("Name", "repeated-rounds")]).await,
+            "TopicArn",
+        );
+        let (granted_url, granted_arn) =
+            given_queue_without_policy(&emulator, "rounds-granted").await;
+        set_queue_policy(&emulator, &granted_url, &grant_to_sns(&granted_arn)).await;
+        let (withheld_url, withheld_arn) =
+            given_queue_without_policy(&emulator, "rounds-withheld").await;
+        for endpoint in [&granted_arn, &withheld_arn] {
+            sns(
+                &emulator,
+                "Subscribe",
+                &[
+                    ("TopicArn", &topic),
+                    ("Protocol", "sqs"),
+                    ("Endpoint", endpoint),
+                ],
+            )
+            .await;
+        }
+        for round in 0..rounds {
+            sns(
+                &emulator,
+                "Publish",
+                &[("TopicArn", &topic), ("Message", &format!("round-{round}"))],
+            )
+            .await;
+        }
+
+        // The subscriber that grants nothing grants it by carrying no policy AT ALL, which is
+        // how the queue itself reports it.
+        let policy_of_withheld = reported_attributes(&emulator, &withheld_url, &["Policy"]).await;
+        assert!(
+            policy_of_withheld["Policy"].is_null(),
+            "case {case:?}: the withheld subscriber must report no Policy of its own, got \
+             {policy_of_withheld}"
+        );
+
+        let counted = rounds.to_string();
+        let granted = reported_attributes(&emulator, &granted_url, &DEPTH_ATTRIBUTES).await;
+        assert_eq!(
+            granted[DEPTH_ATTRIBUTES[0]].as_str(),
+            Some(counted.as_str()),
+            "case {case:?}: the granted subscriber must hold one notification per round, got \
+             {granted}"
+        );
+        let withheld = reported_attributes(&emulator, &withheld_url, &DEPTH_ATTRIBUTES).await;
+        for name in DEPTH_ATTRIBUTES {
+            assert_eq!(
+                withheld[name].as_str(),
+                Some("0"),
+                "case {case:?}: the queue with no grant must report {name} of 0, got {withheld}"
+            );
+        }
+        let received = drain(&emulator, &withheld_url).await;
+        assert!(
+            received.is_empty(),
+            "case {case:?}: the queue with no grant must hand a consumer nothing, got \
+             {received:?}"
+        );
+    }
+}
+
+/// The SHAPE of the grant decides the delivery, by the same reading IAM gives a resource
+/// policy: the action element is matched case-insensitively and the resource element
+/// case-sensitively, each element may be one value or a list, the negated spellings match
+/// everything their values do not, a resource policy that names no resource covers the queue
+/// it is attached to, and a condition this evaluation cannot decide never grants.
+///
+/// These rows differ from the ones above along the element the grant is written in — the
+/// action, the principal, the resource, the condition key and its operator, the letter case
+/// of each — rather than along which of them is present.
+#[tokio::test]
+async fn the_shape_of_the_grant_decides_whether_the_notification_arrives() {
+    // (case, the queue's `Policy` built from (queue ARN, topic ARN), how many messages the
+    //  queue must hold after one publish)
+    type PolicyOf = fn(&str, &str) -> Option<String>;
+    let rows: &[(&str, PolicyOf, usize)] = &[
+        (
+            "the grant scoped by the account that owns the publishing topic",
+            |queue, topic| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                    "Condition": {"StringEquals": {"aws:SourceOwner": account_of(topic)}},
+                })))
+            },
+            1,
+        ),
+        (
+            "that same key naming another account",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                    "Condition": {"StringEquals": {"aws:SourceOwner": "999999999999"}},
+                })))
+            },
+            0,
+        ),
+        (
+            "the publishing topic compared as a string rather than as an ARN",
+            |queue, topic| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                    "Condition": {"StringEquals": {"aws:SourceArn": topic}},
+                })))
+            },
+            1,
+        ),
+        (
+            "a condition operator this evaluation cannot decide",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                    "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2020-01-01T00:00:00Z"}},
+                })))
+            },
+            0,
+        ),
+        (
+            "an action element listing the send among others",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": ["sqs:DeleteMessage", "sqs:SendMessage"],
+                    "Resource": queue,
+                })))
+            },
+            1,
+        ),
+        (
+            "an action element listing only other actions",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": ["sqs:DeleteMessage", "sqs:ReceiveMessage"],
+                    "Resource": queue,
+                })))
+            },
+            0,
+        ),
+        (
+            "an action named in another letter case",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "SQS:sendmessage",
+                    "Resource": queue,
+                })))
+            },
+            1,
+        ),
+        (
+            "a principal element listing SNS among other services",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": ["events.amazonaws.com", "sns.amazonaws.com"]},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                })))
+            },
+            1,
+        ),
+        (
+            "a grant to every principal EXCEPT SNS",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "NotPrincipal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                })))
+            },
+            0,
+        ),
+        (
+            "a grant to every principal EXCEPT another service",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "NotPrincipal": {"Service": "events.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                })))
+            },
+            1,
+        ),
+        (
+            "a grant naming no resource at all, which covers the queue it is attached to",
+            |_, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                })))
+            },
+            1,
+        ),
+        (
+            "a grant over every resource",
+            |_, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": "*",
+                })))
+            },
+            1,
+        ),
+        (
+            "a grant wildcarded over the queues of the account",
+            |queue, _| {
+                let any = format!(
+                    "arn:aws:sqs:{}:{}:*",
+                    region_of(queue),
+                    account_of(queue)
+                );
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": any,
+                })))
+            },
+            1,
+        ),
+        (
+            "a resource ARN differing only in letter case",
+            |queue, _| {
+                Some(policy(json!({
+                    "Effect": "Allow",
+                    "Principal": {"Service": "sns.amazonaws.com"},
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue.to_uppercase(),
+                })))
+            },
+            0,
+        ),
+        (
+            "a well-formed JSON document that states no policy",
+            |_, _| Some(json!({"queue": "open"}).to_string()),
+            0,
+        ),
+    ];
+
+    for (case, policy_of, expected) in rows {
+        let emulator = emulator();
+        let topic = element(
+            &sns(&emulator, "CreateTopic", &[("Name", "grant-shapes")]).await,
+            "TopicArn",
+        );
+        let (url, arn) = given_queue_without_policy(&emulator, "grant-shapes-queue").await;
+        if let Some(document) = policy_of(&arn, &topic) {
+            set_queue_policy(&emulator, &url, &document).await;
+        }
+        sns(
+            &emulator,
+            "Subscribe",
+            &[
+                ("TopicArn", &topic),
+                ("Protocol", "sqs"),
+                ("Endpoint", &arn),
+            ],
+        )
+        .await;
+        sns(
+            &emulator,
+            "Publish",
+            &[("TopicArn", &topic), ("Message", "an event")],
+        )
+        .await;
+
+        let held = depth(&emulator, &url).await;
+        assert_eq!(
+            held, *expected,
+            "case {case:?}: expected the queue to hold {expected} message(s), got {held}"
+        );
+    }
 }

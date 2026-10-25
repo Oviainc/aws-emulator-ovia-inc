@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStackEvents
-//! IMPLEMENTED: answers the stack-level events `CreateStack`/`UpdateStack`/`DeleteStack`
-//! recorded for the named stack, most recent first.
+//! IMPLEMENTED: answers the events recorded for the named stack, most recent first — the
+//! stack's own status events (`CreateStack`/`UpdateStack`/`DeleteStack` and the rollback of
+//! a failed create) interleaved with the per-resource events each of those operations
+//! recorded for the template resources it created, updated or deleted.
 //!
 //! ## Shape of an operation
 //!
@@ -69,8 +71,11 @@ use crate::state::StoredEvent;
 
 /// One recorded event as the modelled `StackEvent` shape.
 ///
-/// The hook members and `ResourceProperties` are absent because nothing in this emulator
-/// produces them: no hooks run, and no resource is created to have properties.
+/// The hook members are absent because nothing in this emulator produces them: no hooks
+/// run. `ResourceProperties` ("BLOB of the properties used to create the resource") is not
+/// reported: the properties document is caller-sized and the log holds up to
+/// [`crate::state::MAX_EVENTS_PER_STACK`] events per stack, so copying one into every
+/// event would let a single template grow the store by its own size over and over.
 fn stack_event_view(stored: &StoredEvent) -> StackEvent {
     StackEvent {
         stack_id: stored.stack_id.clone(),
@@ -184,10 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "Returns all stack related events for a specified stack in reverse chronological
-        // order": the store appends events in order, so reading it backwards is that
-        // order.
+        // order": the stack's own status events and the per-resource events of each
+        // operation are ONE stream, newest first. The store appends in order, so reading it
+        // backwards is that order — and the sort by `Timestamp` is what keeps it so when an
+        // operation whose resources took longer than its own status transition recorded its
+        // resource events after that transition had already fallen due. A stable sort, so
+        // events sharing an instant keep the reverse-append order.
+        let mut newest_first: Vec<&StoredEvent> = stack.events.iter().rev().collect();
+        newest_first.sort_by_key(|event| ::std::cmp::Reverse(event.timestamp));
         let newest_first: Vec<StackEvent> =
-            stack.events.iter().rev().map(stack_event_view).collect();
+            newest_first.into_iter().map(stack_event_view).collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken,
         // items: StackEvents)`: one response carries one bounded page.
         let (stack_events, next_token) = crate::state::paginate(

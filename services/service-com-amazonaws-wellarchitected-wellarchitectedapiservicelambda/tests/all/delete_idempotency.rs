@@ -34,11 +34,12 @@
 use serde_json::Value;
 
 use super::workload_harness::{
-    created_arn, created_id, encode_path_segment, minimal_create, minimal_template, Answer, Client,
+    created_arn, created_id, created_profile, encode_path_segment, minimal_create, minimal_template,
+    Answer, Client,
 };
 
 /// The deletes this service IMPLEMENTS that bind a `ClientRequestToken`, so the rule is
-/// asserted over the class rather than over one operation. `DeleteLens`, `DeleteProfile`,
+/// asserted over the class rather than over one operation. `DeleteLens`,
 /// `DeleteWorkloadShare`, `DeleteLensShare`, `DeleteProfileShare` and
 /// `DeleteTemplateShare` bind the member too and are still stubs, each with its own issue;
 /// `DeleteAgentGoal`, `DeleteAgentContext` and `DeleteAgentProfile` bind no token at all
@@ -48,10 +49,15 @@ use super::workload_harness::{
 enum Deletable {
     Workload,
     ReviewTemplate,
+    Profile,
 }
 
-/// Both rows, for the tables below to walk.
-const DELETABLES: [Deletable; 2] = [Deletable::Workload, Deletable::ReviewTemplate];
+/// Every row, for the tables below to walk.
+const DELETABLES: [Deletable; 3] = [
+    Deletable::Workload,
+    Deletable::ReviewTemplate,
+    Deletable::Profile,
+];
 
 impl Deletable {
     /// The operation a row exercises, for the assertion messages.
@@ -59,6 +65,7 @@ impl Deletable {
         match self {
             Self::Workload => "DeleteWorkload",
             Self::ReviewTemplate => "DeleteReviewTemplate",
+            Self::Profile => "DeleteProfile",
         }
     }
 
@@ -68,12 +75,13 @@ impl Deletable {
         match self {
             Self::Workload => "wl",
             Self::ReviewTemplate => "rt",
+            Self::Profile => "pf",
         }
     }
 }
 
 /// Create one resource of `kind` and answer the identifier its delete takes — the
-/// `WorkloadId` or the `TemplateArn`.
+/// `WorkloadId`, the `TemplateArn` or the `ProfileArn`.
 async fn create(client: &Client, kind: Deletable, name: &str) -> String {
     let token = format!("tok-create-{name}");
     match kind {
@@ -87,6 +95,7 @@ async fn create(client: &Client, kind: Deletable, name: &str) -> String {
                 .await;
             created_arn(&answer, &format!("{name}/create"))
         }
+        Deletable::Profile => created_profile(client, name).await.0,
     }
 }
 
@@ -117,6 +126,7 @@ async fn delete(client: &Client, kind: Deletable, id: &str, token: &str) -> Answ
                 )
                 .await
         }
+        Deletable::Profile => client.delete_profile(id, token).await,
     }
 }
 
@@ -126,11 +136,13 @@ async fn read(client: &Client, kind: Deletable, id: &str) -> Answer {
     match kind {
         Deletable::Workload => client.get(id).await,
         Deletable::ReviewTemplate => client.get_review_template(id).await,
+        Deletable::Profile => client.get_profile(id, None).await,
     }
 }
 
-/// Every assertion the result of a delete has to satisfy: the modelled empty 200 that both
-/// operations answer (`http {method: DELETE, code: 200}` over a `Unit` output).
+/// Every assertion the result of a delete has to satisfy: the modelled empty 200 every
+/// one of these operations answers (`http {method: DELETE, code: 200}` over a `Unit`
+/// output).
 fn assert_deleted(answer: &Answer, case: &str, operation: &str) {
     assert_eq!(
         answer.status, 200,
@@ -151,9 +163,9 @@ fn assert_deleted(answer: &Answer, case: &str, operation: &str) {
 /// it.
 ///
 /// `ClientRequestToken` is `@length(min: 1, max: 2048)` over `^[\x00-\x7F]*$`
-/// (`smithy_query(query="operation", operation="DeleteWorkload")`, whose
-/// `ClientRequestToken` member reports both), so the rows span that range: each published
-/// bound, a typical SDK-generated token, and an ASCII form the pattern allows but no SDK
+/// (`smithy_query(query="shape", shape="ClientRequestToken")`, the one shape every delete
+/// below binds), so the rows span that range: each published bound, a typical
+/// SDK-generated token, and an ASCII form the pattern allows but no SDK
 /// would mint. One character past each bound is refused at the boundary, which
 /// [`a_token_outside_the_modelled_length_is_refused`] pins. Every token is distinct,
 /// because a token names ONE request.

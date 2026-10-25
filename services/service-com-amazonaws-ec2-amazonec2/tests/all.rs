@@ -364,3 +364,7 @@ mod release_hosts;
 // Bin, and what that refuses.
 #[path = "all/image_recycle_bin.rs"]
 mod image_recycle_bin;
+// Declared LAST for the reason the header gives: copying one Amazon FPGA Image, what the
+// copy computes from the stored source, and what it refuses.
+#[path = "all/copy_fpga_image.rs"]
+mod copy_fpga_image;

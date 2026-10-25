@@ -176,3 +176,5 @@ mod api_key_gate;
 mod update_request_validator;
 #[path = "all/update_stage_variables.rs"]
 mod update_stage_variables;
+#[path = "all/update_vpc_link.rs"]
+mod update_vpc_link;

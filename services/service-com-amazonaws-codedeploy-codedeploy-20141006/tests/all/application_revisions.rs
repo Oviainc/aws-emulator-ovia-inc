@@ -10,11 +10,12 @@
 //! CHARACTERS, not bytes, so a non-ASCII comment is measured the way a caller
 //! counts it.
 //!
-//! The bound itself is CHOSEN by this emulator (the model puts no `@length` on
-//! `Description` and AWS publishes no number), so this suite imports the
-//! service's constant rather than restating a number AWS never stated: what it
-//! pins is the BEHAVIOUR on each side of that bound, and that both operations
-//! apply the same one.
+//! The limit itself is stated by the refusal this service answers past it (see
+//! `state::description_too_long_message`), and this suite imports the service's
+//! constant rather than restating the figure: what it pins is the BEHAVIOUR on
+//! each side of the bound, and that both operations apply the same one. The
+//! sentence the refusal carries is pinned by
+//! `tests/all/refusal_sentence_templates.rs`.
 //!
 //! The harness (`Emulator`, `error_code`, `s3_revision`, `seeded_group`) is the
 //! lifecycle suite's, so every case here goes through the same front door a

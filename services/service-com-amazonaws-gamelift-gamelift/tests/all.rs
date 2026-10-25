@@ -35,3 +35,5 @@ mod server_process_capacity;
 mod state_roundtrip;
 #[path = "all/unknown_resource_lookups.rs"]
 mod unknown_resource_lookups;
+#[path = "all/vpc_peering_authorizations.rs"]
+mod vpc_peering_authorizations;
