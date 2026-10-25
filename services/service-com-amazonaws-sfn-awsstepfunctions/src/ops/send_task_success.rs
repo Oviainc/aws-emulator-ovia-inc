@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendTaskSuccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendTaskSuccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendTaskSuccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does here
+//!
+//! A worker that polled `GetActivityTask` holds the `taskToken` of ONE outstanding
+//! activity task, and this is how it reports that task's result. The reply is that
+//! task's outcome, so the execution waiting at the state that scheduled it CONTINUES
+//! from there: the state's own result-side data flow (`ResultSelector`, `ResultPath`,
+//! `OutputPath`) is applied to the `output` the worker sent and the walk carries on to
+//! the state's `Next`, exactly as [`crate::state::plan_reply`] computes it. The task is
+//! then closed, so one token answers one task and no later reply resolves it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +155,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendTaskSuccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendTaskSuccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendTaskSuccess"))
+        // `taskToken` (1..2048) and `output` (0..262144) are modelled, so the
+        // centralized walk has already refused anything outside them. That the output
+        // is JSON, and that the token is one this service issued, are not modelled, so
+        // they are checked here. `ctx` carries no value this operation reads: a task
+        // token names its task, its execution and its region on its own.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "The JSON output of the task": a document that is not JSON is refused with
+        // the modelled `InvalidOutput` BEFORE anything is read or written, so a
+        // refused reply changes nothing — the task stays outstanding and the token
+        // still answers it.
+        let Ok(result) = serde_json::from_str::<serde_json::Value>(&input.output) else {
+            return Err(SendTaskSuccessErrorModeled::InvalidOutput(InvalidOutput {
+                message: Some(crate::state::invalid_output_message(&input.output)),
+            })
+            .into());
+        };
+
+        // The token is read BEFORE the store is consulted, exactly as every ARN here
+        // is: a value that is not a token this service mints is a defect in the
+        // REQUEST, which `InvalidToken` reports, and not a task that has been closed.
+        // The token NAMES the activity its task belongs to, which is what a refusal
+        // about a task the store no longer holds says.
+        let Some(token_activity) = crate::state::read_task_token(&input.task_token) else {
+            return Err(SendTaskSuccessErrorModeled::InvalidToken(InvalidToken {
+                message: Some(crate::state::invalid_token_message()),
+            })
+            .into());
+        };
+
+        let now = crate::state::now();
+
+        // Phase 1, under the lock: resolve the task, refuse what cannot be answered,
+        // and read what the continuation needs. The lock is released before the walk,
+        // so no other request waits on an interpretation.
+        let (
+            definition,
+            execution_input,
+            previous_event_id,
+            execution_arn,
+            start_date,
+            machine_arn,
+            machine_name,
+            context,
+            reply,
+        ) = {
+            let mut store = state.lock();
+            // Settle first: a task whose own bound the clock already made due is
+            // closed — and the execution waiting at it failed — before this call
+            // decides whether the token still answers anything.
+            store.settle(now);
+
+            let Some(task) = store.activity_tasks.get(&input.task_token) else {
+                return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into());
+            };
+            let activity_arn = task.activity_arn.clone();
+            let execution_arn = task.execution_arn.clone();
+            let state_name = task.state_name.clone();
+            // The state's RAW input, which its `ResultPath` combines the reply with:
+            // the task carries it, so the reply is placed against the document the
+            // state was really entered with.
+            let state_input = task.state_input.clone();
+            // The activity this task is queued under can be DELETED while the task is
+            // outstanding, which leaves the task with no activity to be answered for:
+            // the modelled `TaskDoesNotExist`, whose own documentation is "the
+            // activity does not exist".
+            if !store.activities.contains_key(&activity_arn) {
+                return Err(SendTaskSuccessErrorModeled::TaskDoesNotExist(
+                    TaskDoesNotExist {
+                        message: Some(crate::state::resource_error_message(
+                            crate::state::ACTIVITY_DOES_NOT_EXIST,
+                            &activity_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A task whose execution is no longer running is answered by nobody: it
+            // was stopped, or the clock closed an earlier bound of it, so the token
+            // names a task that has already been closed.
+            let Some(execution) = store
+                .executions
+                .get(&execution_arn)
+                .filter(|execution| !execution.is_terminal())
+            else {
+                return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into());
+            };
+            let Some(machine) = store.state_machines.get(&execution.state_machine_arn) else {
+                return Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into());
+            };
+            // The context object (`$$`) the continuation reads is the SAME execution's
+            // identity: a reply continues this execution rather than starting one, so
+            // `$$.Execution.Id` and `$$.Execution.Name` do not change.
+            let context = crate::state::asl::Context {
+                execution_arn: execution.arn.clone(),
+                execution_name: execution.name.clone(),
+                state_machine_arn: machine.arn.clone(),
+                state_machine_name: machine.name.clone(),
+                role_arn: machine.role_arn.clone(),
+            };
+            // The execution runs the definition it was STARTED on, which for one
+            // started through a version ARN — or through an alias that routed to a
+            // version — is that version's immutable snapshot and not what the state
+            // machine has been updated to since.
+            let definition = execution
+                .state_machine_version_arn
+                .as_deref()
+                .and_then(|version_arn| store.state_machine_versions.get(version_arn))
+                .map_or_else(
+                    || machine.definition.clone(),
+                    |version| version.definition.clone(),
+                );
+            (
+                definition,
+                execution.input.clone(),
+                execution.last_event_id(),
+                execution_arn,
+                execution.start_date,
+                machine.arn.clone(),
+                machine.name.clone(),
+                context,
+                crate::state::asl::ActivityReply {
+                    state_name,
+                    state_input,
+                    result,
+                },
+            )
+        };
+
+        // Phase 2, OUTSIDE the lock: the continuation is INTERPRETED here, from the
+        // state the task was scheduled at. The walk has no side effects and the states
+        // this emulator executes are deterministic, so it places the worker's reply
+        // against the raw input that state was entered with and runs on from its
+        // `Next`; the outcome it computes is owed to the clock, so the execution
+        // reports `RUNNING` until then.
+        let interpreted = {
+            let definition = definition.clone();
+            let execution_input = execution_input.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::plan_reply(
+                    &definition,
+                    &execution_input,
+                    start_date,
+                    now,
+                    &context,
+                    &reply,
+                    previous_event_id,
+                )
+            })
+            .await
+        };
+        let Ok(planned) = interpreted else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INTERPRETER_UNAVAILABLE,
+            ));
+        };
+        // The definition no longer declares the state the task was scheduled at, so
+        // there is nothing to continue the execution with: the reply is refused and
+        // the execution is left exactly as it was, rather than carried to an outcome
+        // no definition describes.
+        let Some(planned) = planned else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TASK_STATE_NOT_REACHED,
+            ));
+        };
+
+        // Phase 3, under the lock again: record it. Every check is re-made, because
+        // the task could have been answered or closed while the walk ran.
+        let mut store = state.lock();
+        store.settle(now);
+        let waiting = planned.waiting;
+        let task_bytes = waiting
+            .as_ref()
+            .map_or(0, crate::state::PlannedActivityTask::measure);
+        let map_runs = planned.map_runs;
+        let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
+        match store.answer_activity_task(
+            &input.task_token,
+            planned.opening,
+            planned.pending,
+            task_bytes + map_run_bytes,
+        ) {
+            Ok(()) => {
+                // The continuation reached ANOTHER activity task: it is queued for a
+                // worker to claim exactly as the first one was.
+                if let Some(waiting) = waiting {
+                    store.schedule_activity_task(&execution_arn, waiting);
+                }
+                // A Distributed Map state the continuation entered started a Map Run
+                // of its own, which `ListMapRuns` reports for this execution beside
+                // the ones its earlier states started.
+                store.append_map_runs(
+                    &execution_arn,
+                    &machine_arn,
+                    &machine_name,
+                    &crate::state::arn_region(&machine_arn),
+                    map_runs,
+                );
+                Ok(SendTaskSuccessOutput {})
+            }
+            Err(crate::state::TaskReplyRejection::Gone) => {
+                Err(SendTaskSuccessErrorModeled::TaskTimedOut(TaskTimedOut {
+                    message: Some(crate::state::task_timed_out_message(&token_activity)),
+                })
+                .into())
+            }
+            // The continuation's own events and outcome are what the execution would
+            // grow by, so a reply the store has no room for is refused rather than
+            // retained past its ceiling. This operation models no limit error, so the
+            // refusal is the standard 400 validation envelope.
+            Err(crate::state::TaskReplyRejection::NoRoom) => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "continuing execution {execution_arn} would take the store past the {} bytes \
+                     this emulator retains",
+                    crate::state::MAX_STORE_BYTES
+                )))
+            }
+        }
     }
 }

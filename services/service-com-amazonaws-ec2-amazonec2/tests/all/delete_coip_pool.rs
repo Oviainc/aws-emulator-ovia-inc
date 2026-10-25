@@ -25,7 +25,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::coip_pools::{REGION, describe_one, described_ids, seed};
-use super::ec2_query::{call, element, elements, error_code, unescaped};
+use super::ec2_query::{call, element, elements, error_code, error_message};
 
 /// The HTTP status EC2 answers `DryRunOperation` with: the request was refused because a
 /// precondition the CALLER set holds, not because anything was wrong with it.
@@ -80,11 +80,6 @@ fn reported_pool(xml: &str) -> ReportedPool {
         pool_cidrs: elements(&cidr_set, "item"),
         tags: keys.into_iter().zip(values).collect(),
     }
-}
-
-/// The `<Message>` of a failure body, with the XML entities resolved.
-fn error_message(xml: &str) -> String {
-    unescaped(&element(xml, "Message").unwrap_or_default())
 }
 
 /// How many pools the store holds.

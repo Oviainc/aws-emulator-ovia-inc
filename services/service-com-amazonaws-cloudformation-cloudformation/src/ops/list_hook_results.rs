@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHookResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHookResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHookResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Hook invocation results this account and Region persists
+//! ([`crate::state::hook_results`]), for the one parameter combination the request names.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +95,143 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::hook_results::{StoredHookResult, FILTERABLE_TARGET_TYPES};
+
+/// WHICH invocation results the request selects: "This operation supports the following
+/// parameter combinations: No parameters … `TypeArn` only … `TypeArn` and `Status` …
+/// `TargetId` and `TargetType`."
+///
+/// Any other combination is refused rather than served by ignoring a member, which is what
+/// makes this an enum: a request that cannot be read as exactly one of these three is not a
+/// request this operation supports.
+#[derive(Debug)]
+enum Selection {
+    /// "No parameters: Returns all Hook invocation summaries."
+    All,
+    /// "`TypeArn` only: Returns summaries for a specific Hook", and with `Status`
+    /// "filtered by status".
+    Hook {
+        type_arn: String,
+        status: Option<String>,
+    },
+    /// "`TargetId` and `TargetType`: Returns summaries for a specific Hook invocation
+    /// target."
+    Target {
+        target_type: String,
+        target_id: String,
+    },
+}
+
+impl Selection {
+    /// Read the request's filters, or the message that refuses a combination this operation
+    /// does not support. The message names the members at fault, because that is all the
+    /// caller has to fix the request from.
+    fn of(input: &ListHookResultsInput) -> Result<Self, String> {
+        let target_type = input.target_type.as_deref();
+        let target_id = input.target_id.as_deref();
+        let type_arn = input.type_arn.as_deref();
+        let status = input.status.as_deref();
+
+        if target_type.is_some() || target_id.is_some() {
+            // "Required when TargetType is specified and cannot be used otherwise" /
+            // "Required when TargetId is specified and cannot be used otherwise", and the
+            // target combination is not one `TypeArn` or `Status` may be added to.
+            if type_arn.is_some() || status.is_some() {
+                return Err("TargetId and TargetType cannot be used in combination with \
+                            TypeArn or Status"
+                    .to_string());
+            }
+            let (Some(target_type), Some(target_id)) = (target_type, target_id) else {
+                return Err(match target_type {
+                    Some(_) => "TargetId is required when TargetType is specified".to_string(),
+                    None => "TargetType is required when TargetId is specified".to_string(),
+                });
+            };
+            // "Currently, only CHANGE_SET and CLOUD_CONTROL are supported filter options."
+            // The other two values the enum admits are target types a RESULT can carry,
+            // not ones a request may filter on.
+            if !FILTERABLE_TARGET_TYPES.contains(&target_type) {
+                return Err(format!(
+                    "TargetType {target_type} is not a supported filter option; the \
+                     supported filter options are {}",
+                    FILTERABLE_TARGET_TYPES.join(" and ")
+                ));
+            }
+            return Ok(Self::Target {
+                target_type: target_type.to_string(),
+                target_id: target_id.to_string(),
+            });
+        }
+
+        match (type_arn, status) {
+            (Some(type_arn), status) => Ok(Self::Hook {
+                type_arn: type_arn.to_string(),
+                status: status.map(str::to_string),
+            }),
+            // `Status`: "Can only be used in combination with TypeArn."
+            (None, Some(_)) => {
+                Err("Status can only be used in combination with TypeArn".to_string())
+            }
+            (None, None) => Ok(Self::All),
+        }
+    }
+
+    /// Whether this selection covers `result`.
+    fn selects(&self, result: &StoredHookResult) -> bool {
+        match self {
+            Self::All => true,
+            Self::Hook { type_arn, status } => {
+                result.matches_type_arn(type_arn)
+                    && status.as_ref().is_none_or(|status| &result.status == status)
+            }
+            Self::Target {
+                target_type,
+                target_id,
+            } => result.matches_target(target_type, target_id),
+        }
+    }
+
+    /// Whether the request named an invocation TARGET, which is what decides both the two
+    /// members the response echoes and the two each summary withholds.
+    fn is_target_filtered(&self) -> bool {
+        matches!(self, Self::Target { .. })
+    }
+}
+
+/// One stored invocation result as the modelled `HookResultSummary`.
+///
+/// `InvokedAt` and `HookExecutionTarget` each carry this sentence in the model's own
+/// documentation trait, verbatim: "Only shown in responses when the request does not
+/// specify `TargetType` and `TargetId` filters." It is in
+/// `smithy-model/com-amazonaws-cloudformation-cloudformation.json` on both of those two
+/// members, with the member names wrapped in HTML `<code>` tags and a newline inside the
+/// sentence — so a search for it must be case-sensitive from `Only shown in responses when
+/// the request does not specify`, and reading it rendered is
+/// `smithy_query(query="doc", shape="HookResultSummary", member="InvokedAt")`. The clipped
+/// contract header above carries the operation's docs, not this shape's member docs, which
+/// is why it does not show it.
+///
+/// So `target_filtered` is what withholds them, and only them: a response to the target
+/// form reports neither, and every other member is reported from the record as always.
+fn hook_result_summary(stored: &StoredHookResult, target_filtered: bool) -> HookResultSummary {
+    HookResultSummary {
+        hook_result_id: Some(stored.hook_result_id.clone()),
+        invocation_point: Some(stored.invocation_point.clone()),
+        failure_mode: Some(stored.failure_mode.clone()),
+        type_name: Some(stored.type_name.clone()),
+        type_version_id: Some(stored.type_version_id.clone()),
+        type_configuration_version_id: stored.type_configuration_version_id.clone(),
+        status: Some(stored.status.clone()),
+        hook_status_reason: stored.hook_status_reason.clone(),
+        invoked_at: (!target_filtered).then(|| crate::state::timestamp(stored.invoked_at)),
+        target_type: Some(stored.target_type.clone()),
+        target_id: Some(stored.target_id.clone()),
+        type_arn: Some(stored.type_arn.clone()),
+        hook_execution_target: (!target_filtered)
+            .then(|| stored.hook_execution_target.clone())
+            .flatten(),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,18 +301,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHookResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHookResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Which combination of filters this is, refused up front for one the operation
+        // does not support: the modelled constraints are already satisfied by the time a
+        // request reaches here, but a COMBINATION of members is not something the model
+        // can express.
+        let selection =
+            Selection::of(&input).map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no invocation-result store to
+            // read, so this answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListHookResults",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due.
+        store.settle(::std::time::SystemTime::now());
+
+        // The account and Region's recorded invocations the selection covers, in invocation
+        // order — the order they entered the store — so a page is a stable window over them.
+        let target_filtered = selection.is_target_filtered();
+        let matching: Vec<HookResultSummary> = store
+            .hook_results
+            .iter()
+            .filter(|result| result.region == region && selection.selects(result))
+            .map(|result| hook_result_summary(result, target_filtered))
+            .collect();
+
+        // A filter that selects nothing is an EMPTY LIST, not a refusal: each supported
+        // parameter combination is a query over the recorded invocations, so the answer to
+        // "this Hook's" or "this target's" invocations is the ones that were recorded —
+        // none of them, for a Hook or a target that has not been invoked against. The
+        // modelled `HookResultNotFoundException` is the refusal of a request that names a
+        // target this service cannot address at all, which no combination above produces:
+        // a target id is matched against the recorded invocations, never resolved as a
+        // resource of its own.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHookResults"))
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: HookResults)`:
+        // one response carries one bounded page.
+        let (hook_results, next_token) = crate::state::paginate(
+            crate::state::PageOf::HookResults,
+            matching,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        // `TargetId` and `TargetType` report "the unique identifier of the Hook invocation
+        // target" and "the target type" — the target the response is about, which only the
+        // target form names.
+        let (target_type, target_id) = match selection {
+            Selection::Target {
+                target_type,
+                target_id,
+            } => (Some(target_type), Some(target_id)),
+            Selection::All | Selection::Hook { .. } => (None, None),
+        };
+
+        Ok(ListHookResultsOutput {
+            target_type,
+            target_id,
+            // Always present, as an empty element for a filter nothing matched: a client
+            // reading the list sees the same shape whether or not anything was recorded.
+            hook_results: Some(hook_results),
+            next_token,
+        })
     }
 }

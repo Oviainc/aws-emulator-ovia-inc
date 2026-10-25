@@ -27,6 +27,8 @@ mod connect_peer_delete;
 mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/core_network_change_events.rs"]
+mod core_network_change_events;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
 #[path = "all/core_network_policy_version_restore.rs"]
@@ -65,6 +67,8 @@ mod link_lifecycle;
 mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
+#[path = "all/network_resource_regions.rs"]
+mod network_resource_regions;
 #[path = "all/network_resources.rs"]
 mod network_resources;
 #[path = "all/network_telemetry.rs"]

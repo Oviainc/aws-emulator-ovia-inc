@@ -176,6 +176,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "If you see this error in response to DeleteRule or RemoveTargets, you
+        // can use the Force parameter in those calls to delete the rule or remove
+        // targets from the rule" (`ManagedRuleException`): a rule another service
+        // created on the account's behalf — the rule that serves an archive, say
+        // ([`crate::state::archive_rule`]) — is deleted only when the caller
+        // insists with `Force`.
+        if !input.force
+            && bus
+                .rules
+                .get(&input.name)
+                .is_some_and(|rule| rule.managed_by.is_some())
+        {
+            return Err(DeleteRuleErrorModeled::ManagedRuleException(
+                ManagedRuleException {
+                    message: Some(crate::state::managed_rule_refusal_force_overrides(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "Before you can delete the rule, you must remove all targets, using
         // RemoveTargets." The model declares no client-input error for this
         // operation, so the refusal travels on the 400 `ValidationException`
@@ -183,11 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `Force` does NOT lift this: it is for a managed rule ("If this is a
         // managed rule ... you must specify Force as True to delete the rule.
-        // This parameter is ignored for rules that are not managed rules"), and
-        // nothing in this emulator creates a managed rule, so every stored rule
-        // reports `ManagedBy` absent and `Force` has no effect. The issue plan
-        // asked for a Force bypass here; the model says otherwise, so the model
-        // is followed.
+        // This parameter is ignored for rules that are not managed rules"),
+        // which is the refusal above — the targets precondition stands whatever
+        // `Force` says.
         if let Some(rule) = bus.rules.get(&input.name) {
             if !rule.targets.is_empty() {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(

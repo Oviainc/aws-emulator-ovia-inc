@@ -341,10 +341,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(_), None) => {
                 return Err(PutFileErrorModeled::ParentCommitIdRequiredException(
                     ParentCommitIdRequiredException {
-                        message: Some(format!(
-                            "a parent commit id is required to write to the branch {}",
-                            input.branch_name
-                        )),
+                        message: Some(
+                            crate::state::PARENT_COMMIT_ID_REQUIRED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -364,10 +363,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return if repository.commits.contains_key(parent) {
                         Err(PutFileErrorModeled::ParentCommitIdOutdatedException(
                             ParentCommitIdOutdatedException {
-                                message: Some(format!(
-                                    "the parent commit id {parent} is not the tip of the branch {}",
-                                    input.branch_name
-                                )),
+                                message: Some(
+                                    crate::state::PARENT_COMMIT_ID_OUTDATED_MESSAGE.to_string(),
+                                ),
                             },
                         )
                         .into())
@@ -454,10 +452,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if blob_id_matches {
             return Err(PutFileErrorModeled::SameFileContentException(
                 SameFileContentException {
-                    message: Some(format!(
-                        "the file {file_path} already has this content in the branch {}",
-                        input.branch_name
-                    )),
+                    message: Some(crate::state::SAME_FILE_CONTENT_MESSAGE.to_string()),
                 },
             )
             .into());

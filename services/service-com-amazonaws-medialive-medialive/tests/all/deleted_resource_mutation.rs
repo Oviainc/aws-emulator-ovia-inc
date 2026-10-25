@@ -111,7 +111,7 @@ fn delete_tags(_id: &str, arn: &str) -> (&'static str, String, Option<Value>) {
 /// terminal state.
 #[tokio::test]
 async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
-    let table: [Row; 4] = [
+    let table: [Row; 5] = [
         Row {
             case: "input",
             create: (
@@ -257,6 +257,24 @@ async fn a_mutation_on_a_resource_whose_delete_was_accepted_is_not_found() {
                 CREATE_TAGS,
                 DELETE_TAGS,
             ],
+        },
+        Row {
+            case: "network",
+            create: (
+                "/prod/networks",
+                || json!({ "name": "doomed-network", "tags": { "team": "video" } }),
+                None,
+            ),
+            read: (|id| format!("/prod/networks/{id}"), None),
+            // The model's own 202: deleting a network is asynchronous.
+            delete: (|id| format!("/prod/networks/{id}"), 202),
+            settle_before_delete: false,
+            // `NetworkState` models a DELETING step, which the clock owes the
+            // terminal DELETED.
+            transient_delete: true,
+            // `UpdateNetwork` is a scaffold of its own, so the two tag writers
+            // are the mutations this row drives.
+            mutations: &[CREATE_TAGS, DELETE_TAGS],
         },
     ];
 

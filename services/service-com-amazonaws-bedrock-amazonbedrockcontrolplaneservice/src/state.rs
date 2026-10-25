@@ -58,9 +58,14 @@
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
 //!
+//! And it holds the application inference profiles `ops/create_inference_profile.rs`
+//! mints, `ops/get_inference_profile.rs` reads back and `ops/delete_inference_profile.rs`
+//! removes, each holding the foundation models that profile tracks metrics and costs for.
+//!
 //! And it holds the published foundation model catalog — the base models
-//! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
-//! written, because no operation of this service creates a foundation model.
+//! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
+//! row of — which is seeded with the store and never written, because no operation of this
+//! service creates a foundation model.
 //!
 //! And it holds the resource policies `ops/put_resource_policy.rs` attaches and
 //! `ops/get_resource_policy.rs` reports, keyed by the [`TaggedResource`] each one is
@@ -86,6 +91,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     CustomModelDataSource, CustomModelDeploymentSummary, CustomModelSummary, EndpointConfig,
     EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
+    FoundationModelDetails, FoundationModelLifecycle, FoundationModelSummary,
     GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
@@ -98,9 +104,9 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, ModelDataSource,
-    ModelEnforcement, PromptRouterTargetModel, ProvisionedModelSummary, RoutingCriteria,
-    SelectiveContentGuarding, Tag, VpcConfig,
+    GuardrailWordPolicyConfig, InferenceProfileModel, LoggingConfig, MarketplaceModelEndpoint,
+    ModelDataSource, ModelEnforcement, PromptRouterTargetModel, ProvisionedModelSummary,
+    RoutingCriteria, SelectiveContentGuarding, Tag, VpcConfig,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -558,6 +564,31 @@ pub const CUSTOM_MODEL_IMPORTED_BASE: &str = "imported";
 /// model names, or with fresh regions, which is why the bound is over the whole store
 /// rather than per region.
 pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
+
+/// `InferenceProfileStatus` — the only status an inference profile reports.
+///
+/// The enum is `[ACTIVE]` (`smithy_query(query="shape",shape="InferenceProfileStatus")`),
+/// documented as "`ACTIVE` means that the inference profile is ready to be used", so a
+/// created profile is READY and is owed no later transition.
+pub const INFERENCE_PROFILE_ACTIVE: &str = "ACTIVE";
+
+/// `InferenceProfileType` — the type of a profile a caller created.
+///
+/// The enum is `[SYSTEM_DEFINED, APPLICATION]`, and `APPLICATION` is documented as "the
+/// inference profile was created by a user"
+/// (`smithy_query(query="shape",shape="InferenceProfileSummary")`), which is every profile
+/// this store holds: `SYSTEM_DEFINED` profiles are the ones Amazon Bedrock itself defines,
+/// and no operation of this service creates one.
+pub const INFERENCE_PROFILE_TYPE_APPLICATION: &str = "APPLICATION";
+
+/// The most application inference profiles this account may hold at once, across every
+/// region it has created one in, past which a create is refused with
+/// `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota: without a server-side cap a
+/// caller could grow this part of the store with nothing but fresh profile names, or with
+/// fresh regions, which is why the bound is over the whole store rather than per region.
+pub const MAX_INFERENCE_PROFILES_PER_ACCOUNT: usize = 100;
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -1193,6 +1224,44 @@ impl CustomModelRecord {
     }
 }
 
+/// One stored application inference profile: the identity `CreateInferenceProfile`
+/// minted, the model source that request named, and what a read reports.
+///
+/// `status` and `profile_type` are `&'static str` for the same reason
+/// [`PromptRouter::status`] is: both are single values this emulator mints
+/// ([`INFERENCE_PROFILE_ACTIVE`], [`INFERENCE_PROFILE_TYPE_APPLICATION`]) rather than
+/// anything a request chooses.
+#[derive(Debug, Clone)]
+pub struct InferenceProfileRecord {
+    /// The `InferenceProfileArn` this profile is addressed by, minted by
+    /// [`application_inference_profile_arn`].
+    pub arn: String,
+    /// `inferenceProfileId` — the resource half of that ARN, so both spellings of an
+    /// `InferenceProfileIdentifier` name this one record.
+    pub id: String,
+    /// `inferenceProfileName`, as the create request spelled it.
+    pub name: String,
+    pub description: Option<String>,
+    /// The region the ARN carries, so a profile is only ever read in the region it was
+    /// created in.
+    pub region: String,
+    /// `models` — the foundation models this profile tracks metrics and costs for,
+    /// derived from the `modelSource` the create named.
+    pub models: Vec<InferenceProfileModel>,
+    pub tags: Vec<Tag>,
+    /// `InferenceProfileStatus`; [`INFERENCE_PROFILE_ACTIVE`] for every profile minted
+    /// here.
+    pub status: &'static str,
+    /// `InferenceProfileType`; [`INFERENCE_PROFILE_TYPE_APPLICATION`] for a profile a
+    /// caller created.
+    pub profile_type: &'static str,
+    pub created_at: SystemTime,
+    /// When the profile last changed. Equal to [`InferenceProfileRecord::created_at`]
+    /// until some operation changes it; the model carries no `UpdateInferenceProfile`, so
+    /// no request moves it today.
+    pub updated_at: SystemTime,
+}
+
 /// The account's enforced guardrail configuration: the guardrail revision every
 /// invocation in this account is guarded by, as `PutEnforcedGuardrailConfiguration` last
 /// installed it.
@@ -1297,6 +1366,13 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `CreateCustomModelDeployment` enforces, and
 ///   `custom_model_deployment_create_tokens` holds at most one entry per live deployment
 ///   for the same reason `create_tokens` does.
+///
+/// * `inference_profiles` holds one entry per live application inference profile, capped
+///   at [`MAX_INFERENCE_PROFILES_PER_ACCOUNT`] by the quota `CreateInferenceProfile`
+///   enforces (the entry is keyed by the profile ARN, which carries the minted id, so no
+///   two creates can address one entry), and `inference_profile_create_tokens` holds at
+///   most one entry per live profile for the same reason `create_tokens` does — including
+///   across a delete, which drops the entries naming the profile it removed.
 ///
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
@@ -1461,6 +1537,16 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many custom model ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_custom_models: u64,
+    /// Every stored application inference profile, keyed by its `InferenceProfileArn` —
+    /// one of the two spellings an `InferenceProfileIdentifier` carries.
+    pub inference_profiles: HashMap<String, InferenceProfileRecord>,
+    /// `CreateInferenceProfile` idempotency: `(region, clientRequestToken)` -> the
+    /// `inferenceProfileArn` that token minted. Scoped to that one operation, and to the
+    /// region the request addressed, the way the prompt router index is.
+    pub inference_profile_create_tokens: HashMap<(String, String), String>,
+    /// How many inference profile ids this store has minted; the uniqueness half of a
+    /// minted id.
+    pub minted_inference_profiles: u64,
     /// The foundation models this service offers, seeded from [`FOUNDATION_MODELS`] by
     /// [`FoundationModelCatalog::default`].
     ///
@@ -1535,6 +1621,60 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_prompt_router_id(&mut self, now: SystemTime) -> String {
         self.minted_prompt_routers += 1;
         minted_id(self.minted_prompt_routers, now)
+    }
+
+    /// Mint a fresh inference profile id: the resource half of an
+    /// `application-inference-profile/<id>` ARN, unique within this store.
+    ///
+    /// Built like a prompt router id, and for the same two reasons: the leading half is
+    /// this store's mint count so two ids can never collide, and the trailing half is
+    /// drawn from the creation instant so an id is not a guessable sequence number.
+    /// `[a-z0-9]+` is inside the `[a-zA-Z0-9-:.]+` that `InferenceProfileArn` admits
+    /// there, and inside the `^[a-zA-Z0-9-:.]+$` of `InferenceProfileId`.
+    pub fn mint_inference_profile_id(&mut self, now: SystemTime) -> String {
+        self.minted_inference_profiles += 1;
+        minted_id(self.minted_inference_profiles, now)
+    }
+
+    /// The `InferenceProfileArn` an `InferenceProfileIdentifier` names: the identifier
+    /// itself when it is the ARN of a stored profile, otherwise the ARN the profile of
+    /// that `inferenceProfileId` carries in `region`.
+    ///
+    /// The identifier's pattern admits that ARN or a bare profile id
+    /// (`smithy_query(query="operation",operation="GetInferenceProfile")`), so both
+    /// spellings address the same profile. Either spelling resolves only to a profile of
+    /// `region`: the ARN carries a region, so one of another region names another
+    /// account-region's profile.
+    #[must_use]
+    pub fn inference_profile_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if let Some(record) = self.inference_profiles.get(identifier) {
+            return (record.region == region).then(|| identifier.to_string());
+        }
+        let spelled = application_inference_profile_arn(region, identifier);
+        self.inference_profiles
+            .contains_key(&spelled)
+            .then_some(spelled)
+    }
+
+    /// The application inference profile an `InferenceProfileIdentifier` names.
+    #[must_use]
+    pub fn inference_profile(
+        &self,
+        identifier: &str,
+        region: &str,
+    ) -> Option<&InferenceProfileRecord> {
+        let arn = self.inference_profile_arn_of(identifier, region)?;
+        self.inference_profiles.get(&arn)
+    }
+
+    /// Forget the application inference profile `arn` names, together with the idempotency
+    /// tokens that minted it — so the token map stays bounded by the LIVE profiles rather
+    /// than by every create this store has ever admitted.
+    pub fn remove_inference_profile(&mut self, arn: &str) -> Option<InferenceProfileRecord> {
+        let record = self.inference_profiles.remove(arn)?;
+        self.inference_profile_create_tokens
+            .retain(|_, minted| minted != arn);
+        Some(record)
     }
 
     /// The marketplace model endpoint an `endpointArn` names, with any status transition
@@ -1826,6 +1966,12 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// reaches exactly the resources those reads report. A value naming nothing this store
     /// holds resolves to `None`, whichever family it names.
     ///
+    /// An application inference profile is addressable by the ARN it was minted with,
+    /// resolved through [`Self::inference_profile_arn_of`] — the index
+    /// `GetInferenceProfile` resolves an identifier through. (`TaggableResourcesArn`
+    /// spells its own bare-name alternative `@length(min: 20)`, which no minted profile id
+    /// reaches, so the ARN is the one spelling a tagging call can carry for it.)
+    ///
     /// Two families are addressable under two ARN spellings, and both spellings name the
     /// same resource: a prompt router is `default-prompt-router/<id>` to `PromptRouterArn`
     /// and `prompt-router/<id>` here, and an imported model is `imported-model/<id>` to
@@ -1833,9 +1979,9 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// read back to the first — the one the store is keyed by — in the region the ARN
     /// itself carries, so neither spelling reaches another region's resource.
     ///
-    /// The families this service holds no record of (a custom model, an inference profile,
-    /// an automated reasoning policy, a model invocation job, an async invoke) resolve to
-    /// `None`: nothing creates one yet, so this account holds no such resource to tag.
+    /// The families this service holds no record of (a custom model, an automated reasoning
+    /// policy, a model invocation job, an async invoke) resolve to `None`: nothing creates
+    /// one yet, so this account holds no such resource to tag.
     pub fn tagged_resource(
         &mut self,
         resource_arn: &str,
@@ -1889,6 +2035,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             let record = self.custom_model_deployment(resource_arn, region, now)?;
             return Some(TaggedResource::CustomModelDeployment(record.arn.clone()));
         }
+        if resource_arn.contains(":application-inference-profile/") {
+            let arn = self.inference_profile_arn_of(resource_arn, region)?;
+            return Some(TaggedResource::InferenceProfile(arn));
+        }
         if !resource_arn.starts_with("arn:") {
             // A bare resource NAME, which `TaggableResourcesArn` admits beside an ARN: it
             // names at most one resource of a family whose own identifier admits a name,
@@ -1939,6 +2089,9 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 .custom_model_deployments
                 .get(arn)
                 .map(|record| &record.tags),
+            TaggedResource::InferenceProfile(arn) => {
+                self.inference_profiles.get(arn).map(|record| &record.tags)
+            }
         }
         .map(Vec::as_slice)
     }
@@ -1971,6 +2124,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 .map(|record| &mut record.tags),
             TaggedResource::CustomModelDeployment(arn) => self
                 .custom_model_deployments
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::InferenceProfile(arn) => self
+                .inference_profiles
                 .get_mut(arn)
                 .map(|record| &mut record.tags),
         }
@@ -2086,6 +2243,8 @@ pub enum TaggedResource {
     ProvisionedModelThroughput(String),
     /// A custom model deployment, by its `CustomModelDeploymentArn`.
     CustomModelDeployment(String),
+    /// An application inference profile, by its `InferenceProfileArn`.
+    InferenceProfile(String),
 }
 
 /// The region field of an ARN (`arn:<partition>:<service>:<region>:<account>:<resource>`),
@@ -2295,6 +2454,23 @@ pub fn guardrail_arn(region: &str, id: &str) -> String {
 /// base-36 digits so it satisfies the other spelling's id form too.
 pub fn prompt_router_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("default-prompt-router/{id}"))
+}
+
+/// The ARN of an application inference profile in `region`:
+/// `arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>`.
+///
+/// `application-inference-profile` is the resource type `InferenceProfileArn` admits for a
+/// profile a caller created — its pattern is
+/// `^arn:aws(|-us-gov|-cn|-iso|-iso-b):bedrock:(|[0-9a-z-]{0,20}):(|[0-9]{12}):(inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+$`
+/// (`smithy_query(query="shape",shape="InferenceProfileSummary")`) — while
+/// `inference-profile` is the type the system-defined profiles Amazon Bedrock itself
+/// publishes carry, and no operation here mints one of those.
+pub fn application_inference_profile_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        "bedrock",
+        region,
+        &format!("application-inference-profile/{id}"),
+    )
 }
 
 /// The ARN of a Bedrock Marketplace model endpoint named `name` in `region`:
@@ -3038,8 +3214,11 @@ const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TR
 const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
 /// `FoundationModelLifecycleStatus` — the model is available.
 const LIFECYCLE_ACTIVE: &str = "ACTIVE";
-/// `FoundationModelLifecycleStatus` — the model is deprecated: its id still resolves, and
-/// callers are expected to move off it.
+/// `FoundationModelLifecycleStatus` — the model is deprecated: it is still offered and
+/// still invocable, and callers are expected to move off it before its end of life. The
+/// two values this enum carries are the two states an OFFERED model can be in; a model
+/// past its end of life is no longer offered, so it is absent from this catalog rather
+/// than carried in it under a status (see [`FOUNDATION_MODELS`]).
 const LIFECYCLE_LEGACY: &str = "LEGACY";
 
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
@@ -3049,11 +3228,19 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// `ListFoundationModels` reports and `GetFoundationModel` resolves one row of, not
 /// anything a request can add to or remove from.
 ///
+/// It is the set of models the service currently OFFERS, which is what makes it the set
+/// both of those operations answer out of: a model is here while it is available
+/// ([`LIFECYCLE_ACTIVE`]) and while it is deprecated ([`LIFECYCLE_LEGACY`]), and a model
+/// past its end of life is not offered at all, so it is in no row — it is listed by
+/// nothing and resolves for nobody. The inference plane keeps such an id in its own
+/// inventory to refuse it, which is where the end-of-life refusal belongs; the control
+/// plane simply no longer carries the model.
+///
 /// The ids are the base model ids AWS publishes in "Amazon Bedrock base model IDs
 /// (on-demand throughput)" and "Supported foundation models in Amazon Bedrock", and the
-/// rows past their end of life carry the ids "Model lifecycle" lists; this emulator's
-/// bedrock-runtime plane recognises the same ids, so the two planes agree about which
-/// models exist. Each row's provider, modalities, streaming support, customizations and
+/// rows AWS marks deprecated carry the status "Model lifecycle" lists them under; this
+/// emulator's bedrock-runtime plane serves the same ids, so the two planes agree about
+/// which models exist. Each row's provider, modalities, streaming support, customizations and
 /// inference types are as those pages publish them for that model; a per-model attribute
 /// no page publishes is left out of the row rather than invented (the lifecycle's
 /// `startOfLifeTime`, `endOfLifeTime`, `legacyTime` and `publicExtendedAccessTime` are
@@ -3063,17 +3250,6 @@ const LIFECYCLE_LEGACY: &str = "LEGACY";
 /// filter on, because the filter rule — not the catalog's size — is what this emulator
 /// has to get right.
 pub const FOUNDATION_MODELS: &[FoundationModel] = &[
-    FoundationModel {
-        model_id: "ai21.j2-ultra-v1",
-        model_name: "Jurassic-2 Ultra",
-        provider_name: "AI21 Labs",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: false,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
     FoundationModel {
         model_id: "ai21.jamba-1-5-mini-v1:0",
         model_name: "Jamba 1.5 Mini",
@@ -3163,17 +3339,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "amazon.titan-text-express-v1",
-        model_name: "Titan Text Express",
-        provider_name: "Amazon",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "amazon.titan-text-lite-v1",
         model_name: "Titan Text Lite",
         provider_name: "Amazon",
@@ -3182,7 +3347,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "amazon.titan-text-premier-v1:0",
@@ -3229,17 +3394,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         lifecycle_status: LIFECYCLE_ACTIVE,
     },
     FoundationModel {
-        model_id: "anthropic.claude-v2",
-        model_name: "Claude",
-        provider_name: "Anthropic",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
-    },
-    FoundationModel {
         model_id: "cohere.command-light-text-v14",
         model_name: "Command Light",
         provider_name: "Cohere",
@@ -3248,7 +3402,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.command-text-v14",
@@ -3259,7 +3413,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_ACTIVE,
+        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "cohere.embed-english-v3",
@@ -3271,17 +3425,6 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         lifecycle_status: LIFECYCLE_ACTIVE,
-    },
-    FoundationModel {
-        model_id: "meta.llama2-70b-chat-v1",
-        model_name: "Llama 2 Chat 70B",
-        provider_name: "Meta",
-        input_modalities: IN_TEXT,
-        output_modalities: OUT_TEXT,
-        response_streaming_supported: true,
-        customizations_supported: FINE_TUNING,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
-        lifecycle_status: LIFECYCLE_LEGACY,
     },
     FoundationModel {
         model_id: "meta.llama3-1-8b-instruct-v1:0",
@@ -3423,6 +3566,64 @@ pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
         .map_or(model.model_id, |(provider, _)| provider);
     by_provider.eq_ignore_ascii_case(model.provider_name)
         || by_provider.eq_ignore_ascii_case(id_provider)
+}
+
+/// One catalog row as the `FoundationModelSummary` a `ListFoundationModels` response for
+/// `region` carries.
+///
+/// Lives here rather than in `ops/list_foundation_models.rs` because every member it
+/// carries is also a member `GetFoundationModel` reports
+/// ([`foundation_model_details`], which is built out of it), and the two must agree about
+/// them: a listed summary is the same row the read of that one model finds.
+///
+/// `modelLifecycle` reports the row's `status` and none of the four lifecycle instants:
+/// nothing publishes a launch, legacy or end-of-life date per model, and a date is not
+/// something to invent.
+#[must_use]
+pub fn foundation_model_summary(model: &FoundationModel, region: &str) -> FoundationModelSummary {
+    let list = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+    FoundationModelSummary {
+        model_arn: foundation_model_arn(region, model.model_id),
+        model_id: model.model_id.to_string(),
+        model_name: Some(model.model_name.to_string()),
+        provider_name: Some(model.provider_name.to_string()),
+        input_modalities: Some(list(model.input_modalities)),
+        output_modalities: Some(list(model.output_modalities)),
+        response_streaming_supported: Some(model.response_streaming_supported),
+        customizations_supported: Some(list(model.customizations_supported)),
+        inference_types_supported: Some(list(model.inference_types_supported)),
+        model_lifecycle: Some(FoundationModelLifecycle {
+            status: model.lifecycle_status.to_string(),
+            start_of_life_time: None,
+            end_of_life_time: None,
+            legacy_time: None,
+            public_extended_access_time: None,
+        }),
+    }
+}
+
+/// The same catalog row as the `FoundationModelDetails` a `GetFoundationModel` response
+/// for `region` carries.
+///
+/// `FoundationModelDetails` and `FoundationModelSummary` declare the same ten members, and
+/// a read of a model must report what a listing reports for it, so this moves the ONE
+/// mapping [`foundation_model_summary`] computes into the shape this response declares
+/// rather than computing the members a second time.
+#[must_use]
+pub fn foundation_model_details(model: &FoundationModel, region: &str) -> FoundationModelDetails {
+    let summary = foundation_model_summary(model, region);
+    FoundationModelDetails {
+        model_arn: summary.model_arn,
+        model_id: summary.model_id,
+        model_name: summary.model_name,
+        provider_name: summary.provider_name,
+        input_modalities: summary.input_modalities,
+        output_modalities: summary.output_modalities,
+        response_streaming_supported: summary.response_streaming_supported,
+        customizations_supported: summary.customizations_supported,
+        inference_types_supported: summary.inference_types_supported,
+        model_lifecycle: summary.model_lifecycle,
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -1,10 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: codecommit.delete-file-on-tag-named-branch-blocked codecommit.git-push-non-fast-forward-refused-by-the-server codecommit.git-push-over-https-is-readable-through-the-api codecommit.executable-and-symlink-file-modes-change-the-tree-id codecommit.stale-parent-commit-id-rejected codecommit__codepipeline__glue__iam__lambda.refarch-glue-branch-via-put-file-and-create-commit-agree codecommit.blob-id-is-content-addressed-git-sha1 codecommit.branch-delete-then-get-not-found codecommit.delete-default-branch-rejected codecommit.create-commit-with-no-effective-change-rejected codecommit__codepipeline__glue__iam__lambda.refarch-glue-fresh-repository-has-no-branches-or-default
-Issue-Key: codecommit.delete-file-on-tag-named-branch-blocked|_run#24|RuntimeError|raise RuntimeError(
-Issue-Key: codecommit.git-push-non-fast-forward-refused-by-the-server|_retry_git#27|Timeout|time.sleep(interval_s)
-Issue-Key: codecommit.git-push-over-https-is-readable-through-the-api|_retry_git#28|Timeout|time.sleep(interval_s)
+Issue-Trace-Ids: codecommit.executable-and-symlink-file-modes-change-the-tree-id codecommit.stale-parent-commit-id-rejected codecommit__codepipeline__glue__iam__lambda.refarch-glue-branch-via-put-file-and-create-commit-agree codecommit.blob-id-is-content-addressed-git-sha1 codecommit.branch-delete-then-get-not-found codecommit.delete-default-branch-rejected codecommit.create-commit-with-no-effective-change-rejected codecommit__codepipeline__glue__iam__lambda.refarch-glue-fresh-repository-has-no-branches-or-default
 Issue-Key: codecommit.executable-and-symlink-file-modes-change-the-tree-id|run#29|KeyError|assert root["files"] == [], (
 Issue-Key: codecommit|PutFile|ParentCommitIdOutdatedException
 Issue-Key: codecommit__codepipeline__glue__iam__lambda.refarch-glue-branch-via-put-file-and-create-commit-agree|run#19|AssertionError|assert message == expected_message, (
@@ -15,7 +12,7 @@ Issue-Key: codecommit.create-commit-with-no-effective-change-rejected|run#16|Ass
 Issue-Key: codecommit__codepipeline__glue__iam__lambda.refarch-glue-fresh-repository-has-no-branches-or-default|run#13|AssertionError|assert (code, message) == ('CommitDoesNotExistException', expected_message), (
 Issue-Commit: 144a2fce0f9e3116760062dd946ebab581523079
 
-# CodeCommit: 8 net-new behavioral root causes — the announced git clone URL is unusable, GetFolder omits its empty lists, and six error-message templates diverge
+# CodeCommit: 7 net-new behavioral root causes — GetFolder omits its empty lists and six error-message templates diverge
 
 > _Note: this issue was identified against the code base at commit `144a2fce0f9e3116760062dd946ebab581523079`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
@@ -23,15 +20,15 @@ Issue-Commit: 144a2fce0f9e3116760062dd946ebab581523079
 PutFile
 
 ## Description
-Eight net-new root causes in the codecommit crate, each grounded in a failing behavioral check that the replay report left unmarked (not ALREADY FILED, not OWNED). Related open or resolved issues are named per cause. A fixer must close all eight before submitting.
+Eight net-new root causes in the codecommit crate, each grounded in a failing behavioral check that the replay report left unmarked (not ALREADY FILED, not OWNED). Related open or resolved issues are named per cause.
 
-Cause 1 of 8: the git clone URL the service announces cannot be used by a standard git client — the transport now answers, but with a TLS certificate no client trusts, so every clone/push fails.
-AWS: recorded behavior only. GetRepository.repositoryMetadata.cloneUrlHttp is an address the service answers git smart-HTTP on over TLS with a publicly trusted certificate: with IAM service-specific CodeCommit credentials, `git clone <cloneUrlHttp>` succeeds, `git push origin <tag>` creates a ref the control plane then sees, and a push that is not a fast-forward is refused inside receive-pack. CodeCommit has no API operation that creates a tag, so the tag-vs-branch and server-side push-refusal behaviors are reachable only over that transport.
-Emulator: `git push` against the announced URL fails before any git protocol exchange: rc=128, stderr "fatal: unable to access 'https://127.0.0.1:34793/v1/repos/<repo>/': server verification failed: certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none)". The host/port vary per run and are not the requirement; the requirement is that the announced cloneUrlHttp be reachable by an unmodified git client. The two other git checks exhaust their clone/push poll and the harness reports 'Check timed out after 60.0s'. Hypothesis: those polls retry the same TLS rejection until their budget is gone.
-Why: cloning cloneUrlHttp is the documented way to use a CodeCommit repository. A client that reads the metadata and clones it cannot reach the repository at all, and no server-side push refusal (non-fast-forward, branch-protection deny) or tag-created-by-git behavior is observable.
-Note: the RESOLVED issue '20261022T171422Z-codecommit-serves-no-git-smart-http-transport-and.md' reported that nothing answered at cloneUrlHttp; something answers now, so that fix is partially landed and this is the residual defect. Open issue '20261023T072048Z-codecommit-10-behavioral-root-causes-three-operations-answer.md' Cause 5 describes the same family and owns four other check ids; none of the three ids below is on its replay list.
-Fix: the git smart-HTTP transport's TLS termination for the codecommit crate, together with the cloneUrlHttp/cloneUrlSsh construction in its repository-metadata serializer — the announced URL must be an address and scheme the emulator serves with a certificate the test environment's client trust store accepts (or a scheme that needs none).
-Traces: codecommit.delete-file-on-tag-named-branch-blocked (hard rc=128 TLS refusal, the grounding evidence), codecommit.git-push-non-fast-forward-refused-by-the-server, codecommit.git-push-over-https-is-readable-through-the-api.
+> _Resolution note: causes 2 to 8 below are fixed (together with two further divergences the
+> replay revealed behind causes 6 and 7: the `DefaultBranchCannotBeDeletedException` and
+> `SameFileContentException` templates). Cause 1 of 8 — the announced `cloneUrlHttp` being
+> served with a certificate no git client trusts — is NOT fixed: it needs a core listener seam
+> no service crate can reach, so it, its three check ids and its three `Issue-Key` lines were
+> removed from this report and are owned by the open report
+> `issues/things-that-do-not-work/20261025T040000Z-codecommit-announced-clone-url-is-served-with-an-untrusted-certificate.md`._
 
 Cause 2 of 8: GetFolder omits its empty collection members instead of serializing them as empty lists.
 AWS: Smithy (com.amazonaws.codecommit#CodeCommit_20150413) GetFolderOutput has commitId (@required), folderPath (@required), treeId, and the four list members subFolders (FolderList), files (FileList), symbolicLinks (SymbolicLinkList) and subModules (SubModuleList). Recorded behavior: a folder that holds no files of a given kind still answers with the member present as an empty array — the check reads root["files"] and compares it to [] after asserting the subtree it did write.
@@ -86,7 +83,7 @@ Traces: codecommit__codepipeline__glue__iam__lambda.refarch-glue-fresh-repositor
 ## Evidence
 All quoted strings below are verbatim from the simparity-behavioral-aws-v1 replay report (154 checks, 37 passed). Generated repository names, commit ids, hosts and ports vary per run and are examples; the rule in each cause is the requirement.
 
-Cause 1 — codecommit.delete-file-on-tag-named-branch-blocked [error]: RuntimeError: command ['git', 'push', 'origin', 'main'] failed (rc=128): stderr="fatal: unable to access 'https://127.0.0.1:34793/v1/repos/sim2real-behav-repo-48407887cff0/': server verification failed: certificate signer not trusted. (CAfile: /etc/ssl/certs/ca-certificates.crt CRLfile: none)". codecommit.git-push-non-fast-forward-refused-by-the-server [mismatch] and codecommit.git-push-over-https-is-readable-through-the-api [mismatch]: 'Check timed out after 60.0s' with no git exchange completed.
+Cause 1 — moved to the open report named in the resolution note above, with its evidence.
 
 Cause 2 — codecommit.executable-and-symlink-file-modes-change-the-tree-id [error]: at `assert root["files"] == []` the client raises KeyError: 'files' — the GetFolder response has no 'files' member.
 
@@ -105,7 +102,7 @@ Cause 8 — codecommit__codepipeline__glue__iam__lambda.refarch-glue-fresh-repos
 ## Steps to Reproduce
 Boot the emulator and point botocore at it; cc = client('codecommit').
 
-1. Cause 1: meta = cc.create_repository(repositoryName=R)['repositoryMetadata']; take meta['cloneUrlHttp'] and run `git clone <cloneUrlHttp>` / `git push origin main` with an unmodified git client -> expect the clone and push to complete (and a non-fast-forward push to be refused by receive-pack); observe git exiting 128 with 'server verification failed: certificate signer not trusted', or the clone poll never succeeding.
+1. Cause 1: see the open report named in the resolution note above.
 2. Cause 2: cc.put_file(repositoryName=R, branchName='main', filePath='src/app.sh', fileContent=b'#!/bin/sh\n', fileMode='EXECUTABLE'); cc.get_folder(repositoryName=R, folderPath='/') -> expect the response to contain files=[] (and subFolders/symbolicLinks/subModules present) for a root holding only a subfolder; observe the 'files' key absent.
 3. Cause 3: c1 = cc.put_file(... branchName='main', filePath='a.txt', fileContent=b'a')['commitId']; cc.put_file(... parentCommitId=c1, filePath='b.txt', fileContent=b'b'); then cc.put_file(... parentCommitId=c1, filePath='c.txt', fileContent=b'c') -> expect 400 ParentCommitIdOutdatedException with exactly the fixed text quoted in Cause 3; observe 'the parent commit id <c1> is not the tip of the branch main'.
 4. Cause 4: with 'main' already carrying a tip, cc.put_file(repositoryName=R, branchName='main', filePath='d.txt', fileContent=b'd') with NO parentCommitId -> expect 400 ParentCommitIdRequiredException with 'A parent commit ID is required. Either use GetBranch to retrieve the latest commit ID for the branch, or use a Git command such as git pull or git log, and then try again.'; observe 'a parent commit id is required to write to the branch main'.

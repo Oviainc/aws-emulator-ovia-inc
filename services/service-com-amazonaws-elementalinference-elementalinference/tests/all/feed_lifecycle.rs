@@ -18,9 +18,9 @@
 //!   `maxResults` per page (10 when the request omits it), resuming from `nextToken`;
 //! * `UpdateFeed` overwrites the stored feed, so later reads report the new values,
 //!   and answers 200, so the response reports the feed's settled status;
-//! * `DeleteFeed` retires the feed, so once the deletion falls due `GetFeed` is a 404
-//!   and `ListFeeds` no longer lists it, while a retry of the delete itself reports the
-//!   completed deletion (`tests/all/completed_deletion.rs`);
+//! * `DeleteFeed` retires the feed, so once the deletion falls due `GetFeed` is a 404,
+//!   `ListFeeds` no longer lists it and a repeat of the delete is a 404 as well
+//!   (`tests/all/completed_deletion.rs`);
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on every feed
 //!   operation that takes one;
 //! * the feed store is BOUNDED: past the quota `CreateFeed` answers the modelled

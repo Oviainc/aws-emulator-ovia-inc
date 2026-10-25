@@ -55,6 +55,16 @@
 //! wrapper — and on the three framework-level renderers the operations never reach
 //! ([`RealTimeDefinition`]).
 //!
+//! The CORS and security headers of `crate::state::RESPONSE_HEADER_POLICY` travel the same
+//! way on a FAILURE, and only there. The model binds those members on four output shapes
+//! and on every error shape it declares, so a handler carries them on a success
+//! (`crate::state::ResponseHeaderPolicy`) and the protocol serializer writes them from the
+//! model's own `@httpHeader` traits; a failure is rendered as the one-member body
+//! `crate::scaffolded` describes, whose members the serializer never sees, so the headers
+//! are written onto the refusal here instead. The cross-origin GRANT is not among them: no
+//! response of this service names an allowed origin, which is the listener's own policy to
+//! decide.
+//!
 //! # How this service words a refusal
 //!
 //! IVS RealTime states a value outside a modelled constraint as `<Operation>.<member
@@ -314,6 +324,22 @@ fn with_response_envelope(mut resp: RtResponse) -> RtResponse {
     }
     if resp.headers().get(REQUEST_ID_HEADER).is_none() {
         let _ = resp.headers_mut().try_insert(REQUEST_ID_HEADER, request_id);
+    }
+    if resp.status().as_u16() >= FIRST_ERROR_STATUS {
+        // Every error shape this model declares binds the same CORS and security headers
+        // its four header-bearing output shapes do. A SUCCESS carries them as the modelled
+        // output members `crate::state::ResponseHeaderPolicy` fills in, so the serializer
+        // has already written them from the model's own `@httpHeader` traits and they are
+        // found present here; a FAILURE renders the one-member body `crate::scaffolded`
+        // describes rather than the modelled error shape, so its members never reach the
+        // serializer and the headers are written onto the response here, by the same
+        // `crate::state` policy the outputs report. The cross-origin grant is in neither
+        // place: see the note beside that policy.
+        for (name, value) in crate::state::RESPONSE_HEADER_POLICY {
+            if resp.headers().get(name).is_none() {
+                let _ = resp.headers_mut().try_insert(name, value);
+            }
+        }
     }
     resp
 }

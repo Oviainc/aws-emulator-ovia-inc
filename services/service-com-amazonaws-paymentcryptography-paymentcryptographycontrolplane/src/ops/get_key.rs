@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the key a `KeyIdentifier` names — a key ARN, an alias ARN or a bare
+//! `alias/<name>` — reading the whole `Key` structure out of [`crate::state`], so
+//! what it answers is what `CreateKey` stored and whatever later calls changed.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKey"))
+        // `KeyIdentifier`'s 7..322 length and its `KeyArnOrKeyAliasType` pattern are
+        // modelled, so the centralized walk has already refused anything that is
+        // neither a key ARN nor an alias before this body runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetKeyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let now = crate::state::now();
+        let store = state.lock();
+        // Reporting only: the `KeyState` a key scheduled for deletion reports once
+        // its `DeletePendingTimestamp` has passed is derived from the clock, so this
+        // read changes nothing a later caller sees.
+        let key = store.key(&input.key_identifier).ok_or_else(|| {
+            GetKeyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(input.key_identifier.clone()),
+            })
+        })?;
+
+        Ok(GetKeyOutput {
+            key: key.to_key(now),
+        })
     }
 }

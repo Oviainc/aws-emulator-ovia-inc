@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates a VPC link: renames the stored link the request addresses and reports the
+//! record it leaves behind. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVpcLink"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_vpc_link`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateVpcLink",
+            ));
+        };
+        // `Name` targets `StringWithLengthBetween1And128`, a bound the shape documents
+        // but declares no trait for, so it is this handler's to enforce — the same check
+        // `CreateVpcLink` makes of the name it stores. Checked BEFORE anything is
+        // written, so a refused patch leaves the link exactly as it was.
+        if let Some(message) = input
+            .name
+            .as_deref()
+            .and_then(|name| crate::state::validate_vpc_link_name(name).err())
+        {
+            return Err(UpdateVpcLinkErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The link is addressed by the `VpcLinkId` in the URI, so a request naming one no
+        // stored link carries has nothing to patch.
+        let Some(record) = store.vpc_links.get_mut(&input.vpc_link_id) else {
+            return Err(UpdateVpcLinkErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Invalid VPC link identifier specified {}:{}",
+                        ::engine::emulator_account_id(),
+                        input.vpc_link_id
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // A PATCH (`PATCH /v2/vpclinks/{VpcLinkId}`): `Name` is the only member this
+        // operation takes, so one the request carries replaces the stored name and one it
+        // omits leaves the stored name exactly as it was. Everything else about the link
+        // — its subnets, security groups, tags, creation time and the provisioning the
+        // clock owes it — is not an input here and is left untouched: renaming a link
+        // neither re-attaches its interfaces nor moves its status.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+
+        // Project the STORED record, so what this caller is told is what a later
+        // GetVpcLink reports.
+        let stored = record.to_wire();
+        Ok(UpdateVpcLinkOutput {
+            created_date: stored.created_date,
+            name: Some(stored.name),
+            security_group_ids: Some(stored.security_group_ids),
+            subnet_ids: Some(stored.subnet_ids),
+            tags: stored.tags,
+            vpc_link_id: Some(stored.vpc_link_id),
+            vpc_link_status: stored.vpc_link_status,
+            vpc_link_status_message: stored.vpc_link_status_message,
+            vpc_link_version: stored.vpc_link_version,
+        })
     }
 }

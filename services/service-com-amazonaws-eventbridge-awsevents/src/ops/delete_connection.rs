@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.connection_mut(&input.name) else {
             return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Connection '{}' does not exist.", input.name)),
+                    message: Some(crate::state::no_such_connection(&input.name)),
                 },
             )
             .into());

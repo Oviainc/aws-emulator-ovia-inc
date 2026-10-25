@@ -321,6 +321,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The configuration's reference is what the input INGESTS ON, so a reference it
+        // carries to a resource of THIS service — the router network interface a STANDARD,
+        // FAILOVER or MERGE input ingests on, the flow and flow output a MEDIACONNECT FLOW
+        // input takes its content from — is RESOLVED against the store before anything is
+        // stored: an input pointing at a resource the account does not hold ingests nothing,
+        // and the association could never be read back from the interface it claims. Resolved
+        // through the one function every operation that stores a router input configuration
+        // resolves it through
+        // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::router_input_configuration_rejection`).
+        if let Some(rejection) = store.router_input_configuration_rejection(&input.configuration) {
+            return Err(bad_request(rejection));
+        }
+
         // The router input store is bounded: nothing evicts a router input and
         // GetRouterInput must still answer what this operation created, so the create
         // refuses once the store is full rather than growing it without limit. See

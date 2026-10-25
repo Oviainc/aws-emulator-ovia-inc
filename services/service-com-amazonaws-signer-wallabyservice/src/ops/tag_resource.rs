@@ -9,9 +9,12 @@
 //!
 //! A label that is not a signing-profile ARN is refused 400 `BadRequestException`;
 //! a well-formed ARN naming no stored profile is refused 404 `NotFoundException`;
-//! and a CANCELED profile cannot be tagged — the shape documents that it "also
-//! occurs when you call a tagging API on a cancelled signing profile". A refused
-//! call writes nothing.
+//! a request carrying a key the modelled `TagKey` shape does not admit — one
+//! outside its length bounds, one inside AWS's reserved namespace or one carrying
+//! a character outside the alphabet its pattern states — is refused 400
+//! `BadRequestException`; and a CANCELED profile cannot be tagged — the shape
+//! documents that it "also occurs when you call a tagging API on a cancelled
+//! signing profile". A refused call writes nothing.
 //!
 //! Implemented alongside `ListTagsForResource` (issue
 //! `20261023T031331Z-signer-listtagsforresource-stub`): a list of tags can only be
@@ -196,13 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // AWS reserves the `aws:` prefix for its own tags, which `TagKey`'s
-        // pattern states as a negative lookahead the boundary validator cannot
-        // compile — so the request's keys are judged here, before anything is
-        // written.
-        if let Some(key) = crate::state::reserved_tag_key(input.tags.keys().map(String::as_str)) {
+        // Every key this request carries is held to the modelled `TagKey` shape —
+        // its length bounds, AWS's reserved `aws:` namespace and the alphabet its
+        // pattern admits — before anything is written, so one key the model does
+        // not admit refuses the whole write. The judgement lives in
+        // `crate::state` because the framework's boundary validator checks
+        // neither: a map KEY is not a constrained leaf there, and `TagKey`'s
+        // pattern is a negative lookahead its regex engine cannot compile.
+        if let Some((key, problem)) =
+            crate::state::invalid_tag_key(input.tags.keys().map(String::as_str))
+        {
             return Err(bad_request(
-                crate::state::reserved_tag_key_message(key),
+                crate::state::invalid_tag_key_message(key, problem),
                 crate::state::ERROR_CODE_BAD_REQUEST.to_string(),
             ));
         }

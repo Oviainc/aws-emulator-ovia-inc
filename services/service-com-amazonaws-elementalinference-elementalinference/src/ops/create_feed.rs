@@ -382,8 +382,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is in flight on a feed that has just been created, so there is no
             // status for the clock to settle it back into.
             settles_into: None,
-            // A feed that has just been created holds no completed deletion to report.
-            deleted_at: None,
         };
 
         // Built from the record that is about to be stored, so GetFeed answers with

@@ -11,14 +11,16 @@
 //!   neither shape is refused with the modelled `ClientException`
 //!   ([`crate::state::is_scheduling_policy_reference`]), and one of the right shape that
 //!   names no stored policy is refused with the ARN it resolved to
-//!   ([`crate::state::does_not_exist_message`]);
+//!   ([`crate::state::does_not_exist_sentence`]);
 //! * "Only one of fairsharePolicy or quotaSharePolicy can be set", and each is accepted
 //!   only inside the bounds its own members document
 //!   ([`crate::state::validate_policy_kinds`]);
 //! * "Once set during creation, a fairsharePolicy cannot be removed or changed to a
 //!   quotaSharePolicy" (and the mirror sentence on `quotaSharePolicy`), so an update that
-//!   carries the OTHER kind than the policy was created with is refused and the stored
-//!   policy is left exactly as it was;
+//!   carries the OTHER kind than the policy was created with is refused — naming the kind
+//!   the policy has and the kind the request asked for
+//!   ([`crate::state::policy_kind_change_message`]) — and the stored policy is left
+//!   exactly as it was;
 //! * a request that carries neither member changes nothing, and answers the same empty
 //!   200.
 //!
@@ -189,22 +191,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An identifier that resolves to nothing is refused with the ARN it resolved
             // to and nothing else: the policy is not stored, so that ARN comes from the
             // request.
-            return Err(refuse(batch::does_not_exist_message(&batch::resolved_arn(
+            return Err(refuse(batch::does_not_exist_sentence(&batch::resolved_arn(
                 &input.arn,
                 |name| batch::scheduling_policy_arn(&region, name),
             ))));
         };
         let Some(policy) = state.scheduling_policies.get_mut(&name) else {
-            return Err(refuse(batch::does_not_exist_message(&input.arn)));
+            return Err(refuse(batch::does_not_exist_sentence(&input.arn)));
         };
         // "Once set during creation, a fairsharePolicy cannot be removed or changed to a
         // quotaSharePolicy", and the mirror sentence on `quotaSharePolicy`: an update of
         // the other kind than the policy carries is refused.
+        // The refusal names the direction that was refused: the kind the STORED policy
+        // carries, then the kind the request asked for
+        // ([`batch::policy_kind_change_message`]).
         if input.fairshare_policy.is_some() && policy.quota_share_policy.is_some() {
-            return Err(refuse(batch::POLICY_KIND_IS_FIXED.to_string()));
+            return Err(refuse(batch::policy_kind_change_message(
+                batch::QUOTA_SHARE_POLICY_KIND,
+                batch::FAIRSHARE_POLICY_KIND,
+            )));
         }
         if input.quota_share_policy.is_some() && policy.fairshare_policy.is_some() {
-            return Err(refuse(batch::POLICY_KIND_IS_FIXED.to_string()));
+            return Err(refuse(batch::policy_kind_change_message(
+                batch::FAIRSHARE_POLICY_KIND,
+                batch::QUOTA_SHARE_POLICY_KIND,
+            )));
         }
         if let Some(fairshare) = input.fairshare_policy {
             policy.fairshare_policy = Some(fairshare);

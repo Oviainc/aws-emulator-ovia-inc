@@ -220,7 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every filter the request carries narrows the global network's inventory; an
         // absent one matches everything. Each is compared against the member the answer
         // itself reports, so a value no stored resource carries selects nothing rather
-        // than being silently ignored.
+        // than being silently ignored. `AwsRegion` is reported for every kind whose own
+        // reader names the single Region it sits at — the edge location of an attachment, a
+        // peering or a Connect peer — and is absent for a kind held under the global
+        // network itself or spanning a LIST of edges (a core network, a Direct Connect
+        // gateway attachment), which this filter therefore selects none of.
         let selects = |want: Option<&str>, reported: Option<&str>| {
             want.is_none_or(|value| reported == Some(value))
         };

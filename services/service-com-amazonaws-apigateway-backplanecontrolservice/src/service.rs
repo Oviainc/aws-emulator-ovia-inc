@@ -71,8 +71,9 @@
 //! id: it names no service, so the front door can resolve no target service from such a
 //! request and answers `404 UnknownService` for a URL this service told the caller to use.
 //! A client on the machine this emulator runs on resolves that host nowhere at all, so it
-//! points at the emulator's own endpoint and names the api by the STAGE segment of its
-//! path; [`invoke`] resolves both addressings.
+//! points at the emulator's own endpoint and names the api in its PATH — behind the
+//! reserved `/_aws/execute-api/{api-id}` prefix, as its first segment, or by the STAGE
+//! segment alone; [`invoke`] resolves every one of those addressings.
 //!
 //! Three seams carry it, and nothing else changes — the same shape
 //! `services/service-com-amazonaws-mediapackagev2-mediapackagev2` uses for its data plane:
