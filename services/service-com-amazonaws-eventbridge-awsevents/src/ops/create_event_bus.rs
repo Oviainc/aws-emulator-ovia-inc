@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut bus = crate::state::EventBus::new(&input.name, created);
+        let mut bus = crate::state::EventBus::new(&input.name, Some(created));
         bus.description = input.description;
         // An identifier that is not already an ARN names a key in this account
         // and region; the bus reports back the key it stored.

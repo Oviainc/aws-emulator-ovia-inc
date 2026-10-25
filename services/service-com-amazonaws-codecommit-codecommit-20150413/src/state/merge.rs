@@ -798,7 +798,11 @@ fn merged_file_mode(
 
 /// Are two sides of a path in the same state? Two absences are, since neither
 /// side holds the path at all.
-fn same_entry(left: Option<&FileEntry>, right: Option<&FileEntry>) -> bool {
+///
+/// `pub(crate)` because the handlers that REPORT on a path the evaluation named
+/// (`crate::ops::get_merge_conflicts`) ask the same question of the same two
+/// sides, and two readings of "the same thing here" must not drift.
+pub(crate) fn same_entry(left: Option<&FileEntry>, right: Option<&FileEntry>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => {

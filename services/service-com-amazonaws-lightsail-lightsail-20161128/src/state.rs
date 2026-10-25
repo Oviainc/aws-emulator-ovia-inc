@@ -871,6 +871,15 @@ pub const DISK_PAGE_SIZE: usize = 10;
 /// the same way.
 pub const DISK_SNAPSHOT_PAGE_SIZE: usize = 10;
 
+/// How many static IPs one `GetStaticIps` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more static IPs remain — "A next page
+/// token is not returned if there are no more results to display." Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const STATIC_IP_PAGE_SIZE: usize = 10;
+
 /// How many export snapshot records one `GetExportSnapshotRecords` page carries.
 ///
 /// CHOSEN: Lightsail publishes no page size for this operation either, only that

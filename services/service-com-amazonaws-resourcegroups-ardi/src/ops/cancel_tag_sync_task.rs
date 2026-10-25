@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelTagSyncTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelTagSyncTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelTagSyncTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancelling a tag-sync task STOPS it, so the task the request addressed is no longer one
+//! this service holds: it is removed from
+//! [`crate::state::ComAmazonawsResourcegroupsArdiState::tag_sync_tasks`] — the one map every
+//! reader of a task reads — and the slot it occupied is free for another task.
+//!
+//! A task is addressed by the ARN it was minted with (that map's own key) and belongs to the
+//! region of the group it syncs, so it is cancellable only through that region's endpoint.
+//! This operation models NO not-found error, where its siblings `GetTagSyncTask` and
+//! `StartTagSyncTask` both model `NotFoundException`, so cancelling a task this service does
+//! not hold is a success that changes nothing — which is also what makes a repeated
+//! cancellation idempotent.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +177,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelTagSyncTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelTagSyncTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelTagSyncTask"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read below for the region
+        // the request addressed and for the audit record.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelTagSyncTaskErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A tag-sync task belongs to the region of the group it syncs, so the
+        // request's own region is where it is resolved: another region's task is not
+        // cancellable from here, however it is addressed.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A task is addressed by the ARN it was minted with, which is this map's own
+        // key, so an ARN the store does not hold addresses no task.
+        let addressed = store
+            .tag_sync_tasks
+            .get(&input.task_arn)
+            .is_some_and(|task| task.region == region);
+        // Cancelling a task stops it, so its record goes: no later read reports a
+        // cancelled task, and the slot it held is free for another one.
+        let cancelled = if addressed {
+            store.tag_sync_tasks.remove(&input.task_arn)
+        } else {
+            None
+        };
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // A task this service does not hold is one there is nothing left to stop,
+        // which this operation models no error for; the outcome is recorded either
+        // way.
+        let outcome = if cancelled.is_some() {
+            "cancelled"
+        } else {
+            "no-stored-task"
+        };
+        let group = cancelled.map(|task| task.group_name);
+        // The access record for a state-changing operation: who, where, what, and the
+        // outcome. Metadata only — no tag values, no query body, no role — and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            group = ?group,
+            outcome,
+            "tag-sync task cancellation",
+        );
+        Ok(CancelTagSyncTaskOutput)
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an event notification subscription in this service's store and
+//! reports it back: the name it is identified by, the Amazon SNS topic it
+//! publishes to, the sources, event categories and severity it is scoped to —
+//! each resolved against the catalogs this service publishes and the sources
+//! this account holds — and the tags the request carried. A second create under
+//! the same name is refused with `SubscriptionAlreadyExistFault` and overwrites
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -142,7 +141,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateEventSubscriptionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateEventSubscription")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateEventSubscription",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateEventSubscriptionErrorModeled {
     EventSubscriptionQuotaExceededFault(EventSubscriptionQuotaExceededFault),
@@ -156,6 +161,7 @@ pub enum CreateEventSubscriptionErrorModeled {
     SubscriptionEventIdNotFoundFault(SubscriptionEventIdNotFoundFault),
     SubscriptionSeverityNotFoundFault(SubscriptionSeverityNotFoundFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -207,20 +213,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventSubscription"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateEventSubscriptionErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // The documented name syntax, checked under the same rule every other
+        // Redshift identifier is: the model bounds the member only at `len 0..`,
+        // so the constraint the service publishes for it is enforced here.
+        if let Err(message) = st::check_identifier(
+            st::EVENT_SUBSCRIPTION_NAME_RULE,
+            "SubscriptionName",
+            &input.subscription_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The topic is what the subscription publishes to, and it is named by an
+        // ARN Amazon SNS minted, so a value that is no SNS topic ARN names no
+        // topic and is refused before anything is stored. Whether that topic
+        // exists is Amazon SNS's own state, which this service does not hold.
+        if !st::is_sns_topic_arn(&input.sns_topic_arn) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Invalid value for SnsTopicArn: '{}'. The value must be the Amazon Resource Name (ARN) of an Amazon SNS topic.",
+                    input.sns_topic_arn
+                ),
+            ));
+        }
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work: a resource can carry only so many tags,
+        // so a request carrying more entries than one resource may hold is
+        // refused on its length alone.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateEventSubscriptionErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(tags.len())),
+                },
+            )
+            .into());
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateEventSubscriptionErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Identity before anything else: a request that would create nothing
+        // keeps the more specific fault. The NAME is what an account's
+        // subscriptions are unique on, so a second create under one name is
+        // refused and overwrites nothing.
+        if store.event_subscription(&input.subscription_name).is_some() {
+            return Err(
+                CreateEventSubscriptionErrorModeled::SubscriptionAlreadyExistFault(
+                    SubscriptionAlreadyExistFault {
+                        message: Some(format!(
+                            "Cannot create the event subscription because a subscription with the name {} already exists.",
+                            input.subscription_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.event_subscriptions.len() >= st::EVENT_SUBSCRIPTION_QUOTA {
+            return Err(
+                CreateEventSubscriptionErrorModeled::EventSubscriptionQuotaExceededFault(
+                    EventSubscriptionQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of event subscriptions ({}).",
+                            st::EVENT_SUBSCRIPTION_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the subscription publishes, resolved through the ONE rule this
+        // operation shares with `ModifyEventSubscription`: each refusal class the
+        // resolver reports is answered with the fault this operation's model
+        // declares for it.
+        let scope = store
+            .resolve_subscription_scope(
+                input.source_type.as_deref(),
+                input.source_ids.as_deref(),
+                input.event_categories.as_deref(),
+                input.severity.as_deref(),
+            )
+            .map_err(refuse)?;
+
+        // The record every later `DescribeEventSubscriptions` reports verbatim.
+        // `Status` is the one of a subscription whose topic has neither revoked
+        // Amazon Redshift's permission nor been deleted, and `Enabled` is what
+        // the request asked for — active unless it asked for the inactive form.
+        let subscription = EventSubscription {
+            customer_aws_id: Some(::engine::emulator_account_id().to_string()),
+            cust_subscription_id: Some(input.subscription_name.clone()),
+            sns_topic_arn: Some(input.sns_topic_arn.clone()),
+            status: Some(st::SUBSCRIPTION_STATUS_ACTIVE.to_string()),
+            subscription_creation_time: Some(created_at),
+            source_type: scope.source_type,
+            source_ids_list: scope.source_ids,
+            event_categories_list: scope.event_categories,
+            severity: scope.severity,
+            enabled: Some(
+                input
+                    .enabled
+                    .unwrap_or(st::EVENT_SUBSCRIPTION_ENABLED_BY_DEFAULT),
+            ),
+            tags: Some(tags),
+        };
+        store.event_subscriptions.push(subscription.clone());
+
+        Ok(CreateEventSubscriptionOutput {
+            event_subscription: Some(subscription),
+        })
+    }
+}
+
+/// The modelled fault this operation answers one class of subscription refusal
+/// with.
+fn refuse(refusal: crate::state::SubscriptionRefusal) -> CreateEventSubscriptionError {
+    use crate::state::SubscriptionRefusal as R;
+    match refusal {
+        R::InvalidParameterValue(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        R::SourceNotFound(message) => CreateEventSubscriptionErrorModeled::SourceNotFoundFault(
+            SourceNotFoundFault {
+                message: Some(message),
+            },
+        )
+        .into(),
+        R::CategoryNotFound(message) => {
+            CreateEventSubscriptionErrorModeled::SubscriptionCategoryNotFoundFault(
+                SubscriptionCategoryNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::SeverityNotFound(message) => {
+            CreateEventSubscriptionErrorModeled::SubscriptionSeverityNotFoundFault(
+                SubscriptionSeverityNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

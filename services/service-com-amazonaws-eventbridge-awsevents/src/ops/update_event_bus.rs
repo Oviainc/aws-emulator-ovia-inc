@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.log_config.is_some() {
             bus.log_config = input.log_config;
         }
-        bus.last_modified = modified;
+        bus.touch(modified);
 
         // Reported from the STORED record rather than from the request, so this
         // response and `DescribeEventBus`'s cannot disagree; the ARN is derived

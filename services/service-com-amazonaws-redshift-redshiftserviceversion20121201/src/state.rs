@@ -10,7 +10,9 @@
 //! copied snapshots in another region, the Query Editor (QEV2) IAM Identity
 //! Center applications the account registered, and the namespace registrations
 //! that expose a cluster's or a serverless namespace's data to a consumer
-//! account through the Glue Data Catalog. Every collection keeps
+//! account through the Glue Data Catalog, and the event notification
+//! subscriptions that say which Amazon Redshift events are published to an
+//! Amazon SNS topic. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -34,7 +36,8 @@ use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
     AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
+    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, EventSubscription,
+    HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
     ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet, SupportedOperation,
@@ -1538,6 +1541,234 @@ pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
 /// `DeleteSnapshotCopyGrant`.
 pub const SNAPSHOT_COPY_GRANT_QUOTA: usize = 10_000;
 
+/// How many event notification subscriptions the store holds before
+/// `CreateEventSubscription` refuses with the modelled
+/// `EventSubscriptionQuotaExceededFault`.
+///
+/// The same reasoning as [`SNAPSHOT_COPY_GRANT_QUOTA`]: the emulator's own bound
+/// on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::event_subscriptions`],
+/// not a claim about an account's published limit. A subscription's identity is
+/// the name its create gives it, and names are unlimited in number, so this
+/// bound is what stops the collection growing without end; it is set far above
+/// any workflow an emulator serves, and every record it holds is released by
+/// `DeleteEventSubscription`.
+pub const EVENT_SUBSCRIPTION_QUOTA: usize = 10_000;
+
+/// How many entries one request's `SourceIds` list may carry.
+///
+/// The emulator's own bound, and for the same reason as the collection quotas
+/// above: every entry costs a lookup in the account's own sources and a string
+/// on the stored subscription, so an unbounded list would let one request size
+/// both. Set at the number of sources of one type an account can hold
+/// ([`CLUSTER_QUOTA`], [`PARAMETER_GROUP_QUOTA`]) — and a subscription that
+/// wants every object of a type names NO ids at all
+/// (`smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="SourceIds")` — "If not specified, then events are returned for all
+/// objects within the source type specified"), so no workflow needs a longer
+/// one.
+pub const MAX_SUBSCRIPTION_SOURCE_IDS: usize = CLUSTER_QUOTA;
+
+/// How many entries one request's `EventCategories` list may carry: the
+/// published catalog's own size, since a longer list has to name one category
+/// twice.
+pub const MAX_SUBSCRIPTION_EVENT_CATEGORIES: usize = EVENT_CATEGORIES.len();
+
+/// The source types an event notification subscription can be scoped to, in the
+/// order the model lists them.
+///
+/// Source: `smithy_query(query="shape", shape="SourceType")` — the enum's values
+/// — which is also the list on `smithy_query(query="doc",
+/// shape="CreateEventSubscriptionMessage", member="SourceType")`: "Valid values:
+/// cluster, cluster-parameter-group, cluster-security-group, cluster-snapshot,
+/// and scheduled-action."
+pub const EVENT_SOURCE_TYPES: [&str; 5] = [
+    EVENT_SOURCE_TYPE_CLUSTER,
+    EVENT_SOURCE_TYPE_PARAMETER_GROUP,
+    EVENT_SOURCE_TYPE_SECURITY_GROUP,
+    EVENT_SOURCE_TYPE_SNAPSHOT,
+    EVENT_SOURCE_TYPE_SCHEDULED_ACTION,
+];
+
+/// The source type of events a provisioned cluster publishes.
+pub const EVENT_SOURCE_TYPE_CLUSTER: &str = "cluster";
+/// The source type of events a cluster parameter group publishes.
+pub const EVENT_SOURCE_TYPE_PARAMETER_GROUP: &str = "cluster-parameter-group";
+/// The source type of events a cluster security group publishes.
+pub const EVENT_SOURCE_TYPE_SECURITY_GROUP: &str = "cluster-security-group";
+/// The source type of events a cluster snapshot publishes.
+pub const EVENT_SOURCE_TYPE_SNAPSHOT: &str = "cluster-snapshot";
+/// The source type of events a scheduled action publishes.
+pub const EVENT_SOURCE_TYPE_SCHEDULED_ACTION: &str = "scheduled-action";
+
+/// The event categories a subscription can publish, in the order the model lists
+/// them.
+///
+/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="EventCategories")` — "Values: configuration, management, monitoring,
+/// security, pending".
+pub const EVENT_CATEGORIES: [&str; 5] = [
+    "configuration",
+    "management",
+    "monitoring",
+    "security",
+    "pending",
+];
+
+/// The event severities a subscription can publish, in the order the model lists
+/// them.
+///
+/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="Severity")` — "Values: ERROR, INFO".
+pub const EVENT_SEVERITIES: [&str; 2] = ["ERROR", "INFO"];
+
+/// The status of an event notification subscription whose topic is still the one
+/// it was created against.
+///
+/// Source: `smithy_query(query="doc", shape="EventSubscription",
+/// member="Status")` — "Can be one of the following: active | no-permission |
+/// topic-not-exist", where the other two are the states a topic that revoked
+/// Amazon Redshift's permission, or that was deleted after the subscription was
+/// created, leaves a subscription in. Neither has happened to a subscription
+/// this store holds, so every one of them reports this value.
+pub const SUBSCRIPTION_STATUS_ACTIVE: &str = "active";
+
+/// Whether a create that does not name `Enabled` yields an ACTIVE subscription.
+///
+/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="Enabled")` — "set to true to activate the subscription, and set to
+/// false to create the subscription but not activate it". The member's whole
+/// choice is between activating and deliberately NOT activating, so a request
+/// that does not ask for the inactive form gets the active one.
+pub const EVENT_SUBSCRIPTION_ENABLED_BY_DEFAULT: bool = true;
+
+/// The published spelling of the source type `requested` names, or `None` when
+/// this service publishes no such type.
+///
+/// Compared case-insensitively and answered in the published spelling, so one
+/// catalog value is stored and reported in exactly one form however a caller
+/// spelled it.
+pub fn published_source_type(requested: &str) -> Option<&'static str> {
+    published_catalog_value(&EVENT_SOURCE_TYPES, requested)
+}
+
+/// The published spelling of the event category `requested` names, or `None`
+/// when this service publishes no such category. Matched as
+/// [`published_source_type`] matches a source type.
+pub fn published_event_category(requested: &str) -> Option<&'static str> {
+    published_catalog_value(&EVENT_CATEGORIES, requested)
+}
+
+/// The published spelling of the event severity `requested` names, or `None`
+/// when this service publishes no such severity. Matched as
+/// [`published_source_type`] matches a source type.
+pub fn published_event_severity(requested: &str) -> Option<&'static str> {
+    published_catalog_value(&EVENT_SEVERITIES, requested)
+}
+
+/// The entry of a published catalog `requested` names, case-insensitively.
+fn published_catalog_value(catalog: &[&'static str], requested: &str) -> Option<&'static str> {
+    catalog
+        .iter()
+        .find(|published| published.eq_ignore_ascii_case(requested))
+        .copied()
+}
+
+/// The service an Amazon SNS topic ARN names.
+pub const SNS_ARN_SERVICE: &str = "sns";
+
+/// Whether a value is the ARN of an Amazon SNS TOPIC.
+///
+/// Source: the Amazon SNS documentation's ARN form for a topic,
+/// `arn:<partition>:sns:<region>:<account-id>:<topic-name>` — six
+/// colon-separated segments, the service `sns`, and a resource portion that is
+/// the topic name alone (a subscription ARN carries a further
+/// `<topic-name>:<subscription-id>` segment, and a topic ARN names no
+/// subresource). Checked on the FORM alone: whether that topic exists is Amazon
+/// SNS's own state, which this service does not hold.
+pub fn is_sns_topic_arn(value: &str) -> bool {
+    if !is_arn(value) {
+        return false;
+    }
+    let segments: Vec<&str> = value.split(':').collect();
+    segments.len() == 6
+        && segments[2] == SNS_ARN_SERVICE
+        && !segments[3].is_empty()
+        && !segments[4].is_empty()
+        && !segments[5].is_empty()
+}
+
+/// Why a request naming a value no published catalog holds is refused, naming
+/// the member, the value and every value the catalog publishes.
+pub fn unpublished_value_message(member: &str, value: &str, published: &[&str]) -> String {
+    format!(
+        "Invalid value for {member}: '{value}'. Valid Values: {}",
+        published.join(" | ")
+    )
+}
+
+/// What an event notification subscription publishes, resolved from one create
+/// or modify request: the sources it is scoped to, the event categories and the
+/// severity.
+///
+/// Each member is `None` when the request names none, which is what an
+/// unscoped subscription has: "If you do not specify either the SourceType nor
+/// the SourceIdentifier, you will be notified of events generated from all
+/// Amazon Redshift sources belonging to your Amazon Web Services account."
+#[derive(Debug, Default)]
+pub struct SubscriptionScope {
+    /// The published source type the subscription is scoped to.
+    pub source_type: Option<String>,
+    /// The identifiers of that type the subscription is scoped to.
+    pub source_ids: Option<Vec<String>>,
+    /// The published event categories the subscription publishes.
+    pub event_categories: Option<Vec<String>>,
+    /// The published severity the subscription publishes.
+    pub severity: Option<String>,
+}
+
+/// Why a request naming no event notification subscription is refused, naming
+/// the subscription it could not find.
+///
+/// The wording Amazon Redshift answers a missing subscription with, shared by
+/// every operation that looks one up so a client sees one message for one
+/// condition.
+pub fn subscription_not_found_message(subscription_name: &str) -> String {
+    format!("Event Subscription {subscription_name} not found")
+}
+
+/// Why a subscription configuration cannot be served, classified so each
+/// operation answers it with the fault its own model declares for that class.
+///
+/// One classification for the create and the modify path, so the two can never
+/// refuse the same configuration differently.
+#[derive(Debug)]
+pub enum SubscriptionRefusal {
+    /// A parameter value this service cannot honour at all — a source type it
+    /// does not publish, or source ids named without a type to read them
+    /// against. The model declares no client-input fault for either, so it is
+    /// answered with the `InvalidParameterValue` code Amazon Redshift itself
+    /// uses.
+    InvalidParameterValue(String),
+    /// A source identifier naming no event source this account holds —
+    /// `SourceNotFoundFault`.
+    SourceNotFound(String),
+    /// An event category this service does not publish —
+    /// `SubscriptionCategoryNotFoundFault`.
+    CategoryNotFound(String),
+    /// An event severity this service does not publish —
+    /// `SubscriptionSeverityNotFoundFault`.
+    SeverityNotFound(String),
+}
+
+/// Why source ids cannot be read without a source type to read them against.
+///
+/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="SourceType")` — "You must specify a source type in order to specify
+/// source IDs."
+pub const SOURCE_IDS_NEED_A_SOURCE_TYPE: &str =
+    "You must specify a source type in order to specify source IDs.";
+
 /// How many tags one resource may carry before a create that would exceed it
 /// refuses with the modelled `TagLimitExceededFault`.
 ///
@@ -2082,6 +2313,16 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// (namespace, consumer account) pair it is a registration of, in
     /// registration order.
     pub namespace_registrations: Vec<StoredNamespaceRegistration>,
+    /// Every event notification subscription, keyed by its name
+    /// (`CustSubscriptionId`), in creation order.
+    ///
+    /// The modelled `EventSubscription` shape IS the whole record — a
+    /// subscription's `Status` moves only when the Amazon SNS topic it names
+    /// loses its permission or is deleted, neither of which is a transition the
+    /// clock owes — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
+    /// this collection needs no `Stored*` wrapper.
+    pub event_subscriptions: Vec<EventSubscription>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -2124,6 +2365,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             account_attributes: published_account_attributes(),
             reserved_node_offerings: published_reserved_node_offerings(),
             namespace_registrations: Vec::new(),
+            event_subscriptions: Vec::new(),
         }
     }
 }
@@ -2449,6 +2691,153 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.snapshot_copy_grants
             .iter()
             .find(|grant| grant.snapshot_copy_grant_name.as_deref() == Some(name))
+    }
+
+    /// The event notification subscription with this name, if any.
+    ///
+    /// The name is compared exactly as the create that minted the subscription
+    /// spelled it: the documented syntax ([`EVENT_SUBSCRIPTION_NAME_RULE`])
+    /// states no case folding, so a caller naming it in another case names no
+    /// subscription.
+    pub fn event_subscription(&self, name: &str) -> Option<&EventSubscription> {
+        self.event_subscriptions
+            .iter()
+            .find(|subscription| subscription.cust_subscription_id.as_deref() == Some(name))
+    }
+
+    /// The position of the event notification subscription with this name, if
+    /// any.
+    ///
+    /// A position rather than a reference, because the callers of it — the
+    /// modify and the delete — need to write or remove the record they find; the
+    /// read path selects by reference while it walks the collection for a page.
+    pub fn event_subscription_position(&self, name: &str) -> Option<usize> {
+        self.event_subscriptions
+            .iter()
+            .position(|subscription| subscription.cust_subscription_id.as_deref() == Some(name))
+    }
+
+    /// Whether this account holds the event source of `source_type` that
+    /// `source_id` names.
+    ///
+    /// Each published source type names one collection of this store, so a
+    /// subscription can only be scoped to a source the account actually has.
+    /// Two of the published types name a resource nothing in this service mints:
+    /// a cluster security group governs the retired EC2-Classic platform (see
+    /// [`cluster_security_groups_available`]) and a scheduled action has no
+    /// implemented create, so an account holds none of either and no identifier
+    /// names one.
+    pub fn event_source_exists(&self, source_type: &str, source_id: &str) -> bool {
+        match source_type {
+            EVENT_SOURCE_TYPE_CLUSTER => self.cluster(source_id).is_some(),
+            EVENT_SOURCE_TYPE_PARAMETER_GROUP => self.parameter_group(source_id).is_some(),
+            EVENT_SOURCE_TYPE_SNAPSHOT => self.snapshot(source_id).is_some(),
+            _ => false,
+        }
+    }
+
+    /// Resolve what a create or a modify asks a subscription to publish, against
+    /// the published catalogs and the sources this account holds.
+    ///
+    /// The ONE rule `CreateEventSubscription` and `ModifyEventSubscription`
+    /// share, so the two cannot accept or refuse the same configuration
+    /// differently: a source type, an event category and a severity must each be
+    /// one this service publishes; source ids are read against the source type,
+    /// so naming them without one is refused; and every source id must name a
+    /// source of that type this account holds, since "All of the objects must be
+    /// of the same type as was specified in the source type parameter".
+    ///
+    /// A list the request carries EMPTY resolves to `None`: it scopes the
+    /// subscription to nothing, which is what naming no list does.
+    pub fn resolve_subscription_scope(
+        &self,
+        source_type: Option<&str>,
+        source_ids: Option<&[String]>,
+        event_categories: Option<&[String]>,
+        severity: Option<&str>,
+    ) -> Result<SubscriptionScope, SubscriptionRefusal> {
+        let source_type = match source_type {
+            None => None,
+            Some(requested) => match published_source_type(requested) {
+                Some(published) => Some(published),
+                None => {
+                    return Err(SubscriptionRefusal::InvalidParameterValue(
+                        unpublished_value_message("SourceType", requested, &EVENT_SOURCE_TYPES),
+                    ))
+                }
+            },
+        };
+        let source_ids = match source_ids.filter(|ids| !ids.is_empty()) {
+            None => None,
+            Some(ids) => {
+                // Bounded BEFORE the per-entry work: every entry costs a lookup
+                // in the account's sources and a string on the stored record, so
+                // no request can size either.
+                if ids.len() > MAX_SUBSCRIPTION_SOURCE_IDS {
+                    return Err(SubscriptionRefusal::InvalidParameterValue(format!(
+                        "Invalid value for SourceIds: the list names {} sources; at most {MAX_SUBSCRIPTION_SOURCE_IDS} may be named, and a subscription scoped to every object of a type names none.",
+                        ids.len()
+                    )));
+                }
+                let Some(published_type) = source_type else {
+                    return Err(SubscriptionRefusal::InvalidParameterValue(
+                        SOURCE_IDS_NEED_A_SOURCE_TYPE.to_string(),
+                    ));
+                };
+                for source_id in ids {
+                    if !self.event_source_exists(published_type, source_id) {
+                        return Err(SubscriptionRefusal::SourceNotFound(format!(
+                            "Event source not found: no {published_type} with the identifier '{source_id}' exists in this account."
+                        )));
+                    }
+                }
+                Some(ids.to_vec())
+            }
+        };
+        let event_categories = match event_categories.filter(|values| !values.is_empty()) {
+            None => None,
+            Some(values) => {
+                if values.len() > MAX_SUBSCRIPTION_EVENT_CATEGORIES {
+                    return Err(SubscriptionRefusal::InvalidParameterValue(format!(
+                        "Invalid value for EventCategories: the list names {} categories; this service publishes {MAX_SUBSCRIPTION_EVENT_CATEGORIES}.",
+                        values.len()
+                    )));
+                }
+                let mut published = Vec::with_capacity(values.len());
+                for value in values {
+                    match published_event_category(value) {
+                        Some(category) => published.push(category.to_string()),
+                        None => {
+                            return Err(SubscriptionRefusal::CategoryNotFound(
+                                unpublished_value_message(
+                                    "EventCategories",
+                                    value,
+                                    &EVENT_CATEGORIES,
+                                ),
+                            ))
+                        }
+                    }
+                }
+                Some(published)
+            }
+        };
+        let severity = match severity.filter(|value| !value.is_empty()) {
+            None => None,
+            Some(requested) => match published_event_severity(requested) {
+                Some(published) => Some(published.to_string()),
+                None => {
+                    return Err(SubscriptionRefusal::SeverityNotFound(
+                        unpublished_value_message("Severity", requested, &EVENT_SEVERITIES),
+                    ))
+                }
+            },
+        };
+        Ok(SubscriptionScope {
+            source_type: source_type.map(str::to_string),
+            source_ids,
+            event_categories,
+            severity,
+        })
     }
 
     /// The position of the snapshot copy grant with this
@@ -3236,6 +3625,19 @@ pub const SNAPSHOT_COPY_GRANT_NAME_RULE: IdentifierRule = IdentifierRule {
     member: "SnapshotCopyGrantName",
     max_len: 63,
     lowercase_only: true,
+};
+
+/// The rule for an event notification subscription name (`SubscriptionName`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="SubscriptionName")` — "Cannot be null, empty, or blank. Must contain
+/// from 1 to 255 alphanumeric characters or hyphens. First character must be a
+/// letter. Cannot end with a hyphen or contain two consecutive hyphens." (No
+/// lowercase restriction.)
+pub const EVENT_SUBSCRIPTION_NAME_RULE: IdentifierRule = IdentifierRule {
+    member: "SubscriptionName",
+    max_len: 255,
+    lowercase_only: false,
 };
 
 /// Check `value` against `rule`, naming the member and the constraint it broke.
