@@ -131,7 +131,10 @@ pub(crate) async fn wait_for_issued_certificate(emulator: &Emulator, name: &str)
 }
 
 /// The stored distribution `name`, as `GetDistributions` reports it.
-async fn distribution(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test target reads a distribution back
+/// through the same front door rather than carrying a second copy of the call.
+pub(crate) async fn distribution(emulator: &Emulator, name: &str) -> Value {
     let body = emulator
         .ok("GetDistributions", json!({"distributionName": name}))
         .await;
@@ -144,7 +147,13 @@ async fn distribution(emulator: &Emulator, name: &str) -> Value {
 
 /// Poll `GetDistributions` until the distribution `name` reports `want`,
 /// answering the whole record.
-async fn wait_for_distribution_status(emulator: &Emulator, name: &str, want: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`distribution`].
+pub(crate) async fn wait_for_distribution_status(
+    emulator: &Emulator,
+    name: &str,
+    want: &str,
+) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let reported = distribution(emulator, name).await;
