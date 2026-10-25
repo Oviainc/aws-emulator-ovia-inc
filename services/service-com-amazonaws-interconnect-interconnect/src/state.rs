@@ -49,6 +49,18 @@ pub const DEFAULT_PAGE_SIZE: usize = 100;
 /// materialised on the next call; nothing ever sleeps on it.
 pub const PROVISIONING_SPAN: Duration = Duration::from_millis(400);
 
+/// How long ONE leg of a new connection's provisioning progression takes: the move
+/// out of `requested`, and then the move out of `pending`.
+///
+/// AWS publishes no duration for either leg (the real move out of `requested` waits
+/// on a human at the partner portal), so this is an emulator-chosen span inside the
+/// core's 250–750 ms window, at its short end so a created connection reaches its
+/// ready state promptly while a caller reading straight back still observes the
+/// earlier state and the refusals that go with it. Each leg's due instant is stored
+/// and materialised on the next call; nothing ever sleeps on it.
+pub const ACTIVATION_SPAN: Duration = Duration::from_millis(250);
+
+
 /// How long a `deleted` connection stays readable before the store drops it.
 ///
 /// A deleted connection has to stay readable for a while — the terminal state is
@@ -93,6 +105,35 @@ pub struct PendingTransition {
     pub due: Instant,
     /// The `ConnectionState` the connection settles into.
     pub state: String,
+}
+
+/// The transition the clock owes a connection that has just entered `state` at
+/// `entered`, or `None` where `state` owes nothing.
+///
+/// This is the documented `ConnectionState` progression of a connection being
+/// brought up — "requested: the initial state of a connection. The state will
+/// remain here until the Connection is accepted on the Partner portal" ->
+/// "pending: the connection has been accepted and is being provisioned between AWS
+/// and the Partner" -> "available: the connection has been fully provisioned" — and
+/// it is owed by the CLOCK here because the emulator has no partner portal for
+/// anyone to accept at. Every other state is either terminal (`available`,
+/// `deleted`), impaired by a circuit fault the emulator cannot have (`down`,
+/// `failed`), or already owed a transition by the call that set it (`deleting`,
+/// `updating`), so none of them is advanced from here.
+///
+/// Derived from the state alone, so EVERY path that leaves a connection in a
+/// provisioning state hands it on along the same progression — the create that
+/// allocates it, and the clock leg or settled update that lands it there.
+pub fn owed_progression(state: &str, entered: Instant) -> Option<PendingTransition> {
+    let next = match state {
+        "requested" => "pending",
+        "pending" => "available",
+        _ => return None,
+    };
+    Some(PendingTransition {
+        due: entered + ACTIVATION_SPAN,
+        state: next.to_string(),
+    })
 }
 
 /// A persisted connection: the modelled resource plus the bookkeeping that is not
@@ -201,23 +242,36 @@ impl ComAmazonawsInterconnectInterconnectState {
     /// Apply every state change the clock has already made due.
     ///
     /// Called at the top of each connection operation, including the reporting
-    /// ones: a `deleting` connection becomes `deleted`, and an `updating` one
-    /// settles back, at the instant stored when the call that started the change
-    /// ran — whether or not anybody asked in between. It materialises only what was
-    /// already owed, so it never moves a state a call did not start.
+    /// ones: a newly created connection is accepted and then provisioned, a
+    /// `deleting` connection becomes `deleted`, and an `updating` one settles back,
+    /// at the instant stored when the call that started the change ran — whether or
+    /// not anybody asked in between. It materialises only what was already owed, so
+    /// it never moves a state a call did not start.
+    ///
+    /// A progression of several legs ([`owed_progression`]) is materialised leg by
+    /// leg in ONE pass, each leg due a span after the one before it rather than
+    /// after `now`: a caller that waits out the whole progression and then asks
+    /// sees the state the clock owed it, not just the next leg of it. The pass
+    /// terminates whatever the store holds — a leg's successor is due strictly
+    /// later than the leg itself, and [`owed_progression`] runs forward to a state
+    /// that owes nothing — so a single call does bounded work.
     pub fn materialise_due_transitions(&mut self, now: Instant) {
         let mut evicted: Vec<String> = Vec::new();
         for (id, stored) in &mut self.connections {
-            let due = stored
+            while stored
                 .pending_transition
                 .as_ref()
-                .is_some_and(|pending| pending.due <= now);
-            if due {
-                if let Some(pending) = stored.pending_transition.take() {
-                    stored.connection.state = pending.state;
-                    if stored.connection.state == DELETED_CONNECTION_STATE {
-                        stored.evict_due = Some(now + DELETED_RECORD_RETENTION);
-                    }
+                .is_some_and(|pending| pending.due <= now)
+            {
+                let Some(pending) = stored.pending_transition.take() else {
+                    break;
+                };
+                stored.connection.state = pending.state;
+                // Whatever the connection has just become may itself owe the next
+                // leg, timed from the instant this one was due.
+                stored.pending_transition = owed_progression(&stored.connection.state, pending.due);
+                if stored.connection.state == DELETED_CONNECTION_STATE {
+                    stored.evict_due = Some(pending.due + DELETED_RECORD_RETENTION);
                 }
             }
             if stored.evict_due.is_some_and(|evict_due| evict_due <= now) {

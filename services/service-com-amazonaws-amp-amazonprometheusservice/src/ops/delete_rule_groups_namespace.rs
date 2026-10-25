@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRuleGroupsNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRuleGroupsNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: marks the named rule groups namespace of the named workspace `DELETING`
+//! in the PERSISTED record and lets the clock release that record, and the rule groups
+//! definition it holds, at [`crate::state::TRANSITION_DELAY`]; `clientToken` makes the
+//! call idempotent while that deletion is in flight, a workspace or a name the store does
+//! not hold is refused `ResourceNotFoundException`, and a namespace or workspace that is
+//! not `ACTIVE` is refused `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRuleGroupsNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +173,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRuleGroupsNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRuleGroupsNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRuleGroupsNamespace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteRuleGroupsNamespaceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the workspace store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // The namespace lives "within a workspace", so without that workspace there is
+        // nothing to delete: `ResourceNotFoundException` (404).
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                DeleteRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let workspace_id = workspace.workspace_id.clone();
+        let workspace_status = workspace.status_code.clone();
+
+        // A name the workspace does not hold — never created, or already released by a
+        // deletion the clock has since made due — is a missing resource (404).
+        let Some(namespace) = workspace.rule_groups_namespaces.get_mut(&input.name) else {
+            return Err(
+                DeleteRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RULE_GROUPS_NAMESPACE_NOT_FOUND_MESSAGE
+                            .to_string(),
+                        resource_id: input.name.clone(),
+                        resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `clientToken` carries `@idempotencyToken` on an `@idempotent` operation:
+        // re-sending the very call that started the pending deletion is that same call,
+        // so it is accepted again instead of conflicting with the deletion it already
+        // started. The match is deliberately narrow — only while that deletion is in
+        // flight, which is the window the token identifies.
+        let replays_pending_delete = input.client_token.is_some()
+            && namespace.status_code == crate::state::NAMESPACE_STATUS_DELETING
+            && namespace.delete_token == input.client_token;
+
+        // Every entry of `RuleGroupsNamespaceStatusCode` documents the same rule:
+        // "Update/Deletion is disallowed until namespace is ACTIVE and workspace status is
+        // ACTIVE." A namespace still being created, still settling an update or already
+        // being deleted — or one inside a workspace that is not usable — is an
+        // inconsistent state rather than a missing resource, so `ConflictException` (409).
+        if !replays_pending_delete && workspace_status != crate::state::STATUS_ACTIVE {
+            return Err(DeleteRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The workspace is {workspace_status}; a deletion is disallowed \
+                         until workspace status is {}",
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace_id,
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+        if !replays_pending_delete
+            && namespace.status_code != crate::state::NAMESPACE_STATUS_ACTIVE
+        {
+            return Err(DeleteRuleGroupsNamespaceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The rule groups namespace is {}; a deletion is disallowed until \
+                         the namespace is {}",
+                        namespace.status_code,
+                        crate::state::NAMESPACE_STATUS_ACTIVE,
+                    ),
+                    resource_id: namespace.arn.clone(),
+                    resource_type: crate::state::RULE_GROUPS_NAMESPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        if !replays_pending_delete {
+            // Accepted (202) with the namespace DELETING, and the clock owes its removal
+            // — along with "its associated rule groups definition", the `data` blob the
+            // record holds — at `transition_due`. So a caller reading straight after this
+            // call still sees the namespace DELETING and the state refusals that go with
+            // it, and nothing but time releases the record
+            // (`crate::state::materialize_due`).
+            namespace.status_code = crate::state::NAMESPACE_STATUS_DELETING.to_string();
+            // "The date and time that the rule groups namespace was most recently
+            // changed" (`RuleGroupsNamespaceDescription$modifiedAt`): this call changed it.
+            namespace.modified_at = now;
+            // "The reason for the failure, if any": nothing has failed.
+            namespace.status_reason = None;
+            namespace.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            namespace.delete_token = input.client_token;
+            // No update is in flight any more: the record is on its way out.
+            namespace.update_token = None;
+        }
+        let namespace_arn = namespace.arn.clone();
+        drop(store);
+
+        // The call changed stored state (or replayed the call that did), so it leaves an
+        // access record naming the operation, the resource and the key id the request
+        // presented — see `crate::state::record_state_change`.
+        crate::state::record_state_change(Self::NAME, &namespace_arn, ctx.parts());
+
+        Ok(DeleteRuleGroupsNamespaceOutput)
     }
 }

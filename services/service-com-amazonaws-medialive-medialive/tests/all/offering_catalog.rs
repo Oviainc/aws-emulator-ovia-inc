@@ -92,10 +92,13 @@ fn listed(case: &str, body: &Value) -> Vec<Value> {
 /// Walk every page of the listing under `filters` (a query string without its
 /// leading separator, or empty) and answer the offerings reported, in order.
 ///
+/// Shared with the `DescribeOffering` suite, which reads the same catalog back
+/// one offering at a time.
+///
 /// The token discipline is asserted on the way: a page never carries more than
 /// the effective page size, and a token is handed out only beside a non-empty
 /// page.
-async fn every_page(
+pub(crate) async fn every_page(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,

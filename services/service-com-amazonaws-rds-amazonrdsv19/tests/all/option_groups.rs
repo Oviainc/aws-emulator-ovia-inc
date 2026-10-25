@@ -526,19 +526,20 @@ async fn the_input_members_are_refused_outside_what_they_document() {
             "ValidationException",
         ),
         (
-            // "MaxRecords ... Constraints: Minimum 20, maximum 100."
+            // "MaxRecords ... Constraints: Minimum 20, maximum 100." A value outside the
+            // documented window is one the parameter does not accept.
             "MaxRecords one below the documented minimum",
             "DescribeOptionGroups",
             vec![("MaxRecords", "19".to_string())],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             "MaxRecords one above the documented maximum",
             "DescribeOptionGroups",
             vec![("MaxRecords", "101".to_string())],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
         (
             // The EngineName value list, on a describe and on a create.

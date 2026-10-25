@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::request_region(ctx).map_err(DescribeDBEngineVersionsError::validation)?;
 
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeDBEngineVersionsError::validation)?;
+            .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;
         let filters = input.filters.clone().unwrap_or_default();
         check_filter_names(&filters).map_err(DescribeDBEngineVersionsError::validation)?;
         crate::state::check_filter_terms(&filters)

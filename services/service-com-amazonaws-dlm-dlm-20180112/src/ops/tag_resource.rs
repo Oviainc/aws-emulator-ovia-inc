@@ -134,7 +134,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -154,16 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // `ResourceArn` is a `PolicyArn`, so the resource it names is the policy
-        // whose STORED `PolicyArn` it equals — not one derived from the request.
-        let Some(policy_id) = store.policy_id_for_arn(&input.resource_arn) else {
+        // whose STORED `PolicyArn` it equals — not one derived from the request —
+        // among the policies of the region this request was signed for.
+        let Some(policy_id) = store.policy_id_for_arn(&region, &input.resource_arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found_by_arn(&input.resource_arn),
             )
             .into());
         };
-        let Some(policy) = store.policies.get_mut(&policy_id) else {
+        let Some(policy) = store.policy_mut(&region, &policy_id) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found_by_arn(&input.resource_arn),
             )

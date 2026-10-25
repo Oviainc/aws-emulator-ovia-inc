@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCapacityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCapacityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCapacityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes ONE capacity provider — the single record in [`crate::state`] the request's
+//! `CapacityProviderName` addresses, in either of its documented forms. "You cannot
+//! delete a capacity provider that is currently being used by Lambda functions", so a
+//! provider some function version is configured to run on is refused
+//! `ResourceConflictException`; otherwise the provider moves into the model's `Deleting`
+//! state and the call answers that record (HTTP 202 Accepted). Tearing the compute
+//! resources down is owed by the CLOCK, so the record disappears once its removal is due
+//! ([`crate::state::CapacityProviderRecord::begin_delete`]) and a later
+//! `GetCapacityProvider` then reports that no such provider exists. The operation is
+//! `@idempotent`, so a repeat delete of a provider already being deleted answers the same
+//! record rather than refusing.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCapacityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCapacityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCapacityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteCapacityProviderErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "You cannot delete a capacity provider that is currently being used by Lambda
+        // functions": a function version configured to run on it is such a use, and the
+        // provider's ARN is how a function names it. The users are collected before the
+        // provider is borrowed mutably below.
+        let users = match crate::state::parse_capacity_provider_name(
+            &input.capacity_provider_name,
+        ) {
+            Some(name) => store
+                .capacity_provider_users(&crate::state::capacity_provider_arn(&region, &name)),
+            None => Vec::new(),
+        };
+
+        // The provider is addressed the way every capacity-provider operation addresses
+        // it: by its name, or by the ARN that names the same record.
+        let record = crate::state::resolve_capacity_provider(
+            &mut store,
+            &input.capacity_provider_name,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                DeleteCapacityProviderErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                DeleteCapacityProviderErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        if let Some(user) = users.first() {
+            return Err(
+                DeleteCapacityProviderErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The capacity provider {} cannot be deleted while it is in use \
+                             by {} function version(s), including {user}",
+                            record.arn,
+                            users.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model marks this operation `@idempotent`, so a delete of a provider whose
+        // removal the clock already owes answers the record that first delete wrote
+        // rather than restarting the span or refusing.
+        if !record.is_deleting() {
+            record.begin_delete(now);
+        }
+        Ok(DeleteCapacityProviderOutput {
+            capacity_provider: record.reported(),
+        })
     }
 }

@@ -68,6 +68,9 @@ mod cluster_alerts;
 #[path = "all/cluster_creation.rs"]
 mod cluster_creation;
 
+#[path = "all/cluster_description.rs"]
+mod cluster_description;
+
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
@@ -178,6 +181,9 @@ mod node_lifecycle;
 
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
+
+#[path = "all/offering_description.rs"]
+mod offering_description;
 
 #[path = "all/partner_input.rs"]
 mod partner_input;

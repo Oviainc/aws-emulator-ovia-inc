@@ -17,7 +17,15 @@ pub struct GetCustomModelDeploymentInput {
     pub custom_model_deployment_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetCustomModelDeploymentResponse")]
+/// `GetCustomModelDeploymentResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` both carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetCustomModelDeployment")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetCustomModelDeploymentOutput {
     pub custom_model_deployment_arn: String,
@@ -30,6 +38,58 @@ pub struct GetCustomModelDeploymentOutput {
     pub failure_message: Option<String>,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+bedrock_schema_and_codec!(
+    GetCustomModelDeploymentOutput,
+    GET_CUSTOM_MODEL_DEPLOYMENT_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetCustomModelDeploymentResponse",
+    "com.amazonaws.bedrock",
+    "GetCustomModelDeploymentResponse",
+    (
+        M_CUSTOM_MODEL_DEPLOYMENT_ARN,
+        custom_model_deployment_arn,
+        "customModelDeploymentArn",
+        0,
+        req,
+        string
+    ),
+    (
+        M_MODEL_DEPLOYMENT_NAME,
+        model_deployment_name,
+        "modelDeploymentName",
+        1,
+        req,
+        string
+    ),
+    (M_MODEL_ARN, model_arn, "modelArn", 2, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+    (M_STATUS, status, "status", 4, req, string),
+    (M_DESCRIPTION, description, "description", 5, opt, string),
+    (
+        M_UPDATE_DETAILS,
+        update_details,
+        "updateDetails",
+        6,
+        opt,
+        struct_of(CustomModelDeploymentUpdateDetails)
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        8,
+        opt,
+        date_time
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#CustomModelDeploymentUpdateDetails")]
 #[derive(Debug, Clone, Default)]

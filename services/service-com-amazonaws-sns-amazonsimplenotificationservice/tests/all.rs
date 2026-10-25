@@ -23,6 +23,9 @@ mod resource_tags;
 #[path = "all/set_subscription_attributes.rs"]
 mod set_subscription_attributes;
 
+#[path = "all/sqs_subscription_delivery.rs"]
+mod sqs_subscription_delivery;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

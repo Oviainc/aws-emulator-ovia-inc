@@ -2,7 +2,8 @@
 
 //! @op SignUp
 //! Registers a user with an app client: the `ClientId` resolves the stored app client
-//! and the pool that holds it, the proposed password is checked against THAT pool's
+//! and the pool that holds it, a client that holds a client secret is proved by the
+//! request's `SecretHash`, the proposed password is checked against THAT pool's
 //! password policy, the attributes against its schema, and the user is stored
 //! `UNCONFIRMED` with a freshly minted `sub` — which is the `UserSub` the response
 //! carries and what `AdminGetUser` reads back.
@@ -270,6 +271,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| client_not_found(&input.client_id))?;
         let user_pool_id = pool.id.clone();
 
+        // `SecretHash` is an HMAC "calculated using the secret key of a user pool client
+        // and username plus the client ID in the message" (`SignUp.SecretHash`), so it
+        // is what a request proves the app client's secret with. A client that holds a
+        // secret therefore registers nobody until the request carries the hash THAT
+        // secret, this username and this client id produce; a client with no secret has
+        // nothing to prove. Checked before the password and the attributes: a caller
+        // that cannot address the client learns nothing about the pool's policy or
+        // schema from the answer.
+        let client = pool
+            .clients
+            .get(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
+            return Err(unverified_secret_hash(&input.client_id));
+        }
+
         // "The password must comply with the password requirements of your user pool"
         // (`SignUp.Password`). The member is optional — "To create a user with no
         // password, omit this parameter or submit a blank value" — so only a password
@@ -382,6 +399,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn client_not_found(client_id: &str) -> SignUpError {
     SignUpErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException` for a request whose `SecretHash` is not the
+/// one the app client's stored secret expects — including a request that carries none.
+fn unverified_secret_hash(client_id: &str) -> SignUpError {
+    SignUpErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(format!("Unable to verify secret hash for client {client_id}.")),
     })
     .into()
 }

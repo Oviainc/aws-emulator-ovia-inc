@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(DescribeOrderableDBInstanceOptionsError::validation)?;
         let page_size = crate::state::check_max_records_in(input.max_records, &MAX_RECORDS_RANGE)
-            .map_err(DescribeOrderableDBInstanceOptionsError::validation)?;
+            .map_err(DescribeOrderableDBInstanceOptionsError::invalid_parameter_value)?;
         // `Filters`: "This parameter isn't currently supported." Honouring it is not an
         // option (there is no documented filter name to honour) and ignoring it would
         // report options the caller tried to exclude, so a request carrying one is

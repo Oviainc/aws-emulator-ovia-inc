@@ -21,7 +21,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::agreement_lifecycle::{agreement_over, call, emulator, is_next_token, term, Answer};
+use crate::agreement_lifecycle::{
+    agreement_over, call, emulator, invoiced_agreement, is_next_token, term, Answer,
+};
 
 /// The catalog every agreement of this service is created in, spelled out here
 /// rather than imported so a handler reporting another one fails this test.
@@ -195,20 +197,26 @@ struct Listing {
 #[tokio::test]
 async fn every_filter_selects_on_the_stored_request() {
     let router = emulator();
-    let first = agreement_over(&router, "ap-adjust1", vec![term("eula.v1")]).await;
-    let second = agreement_over(&router, "ap-adjust2", vec![term("eula.v1")]).await;
+    let (first, first_invoice) = invoiced_agreement(&router, "ap-adjust1").await;
+    let (second, second_invoice) = invoiced_agreement(&router, "ap-adjust2").await;
 
     let early = submit_all(
         &router,
         &first,
-        &[("inv-1", "10"), ("inv-2", "2.5")],
+        &[(first_invoice.as_str(), "10"), (first_invoice.as_str(), "2.5")],
         "tok-early",
     )
     .await;
     // Two batches, far enough apart that their `createdAt` differ by more than
     // the resolution the wire carries a timestamp at.
     sleep(Duration::from_millis(5));
-    let late = submit_all(&router, &second, &[("inv-3", "0.00000001")], "tok-late").await;
+    let late = submit_all(
+        &router,
+        &second,
+        &[(second_invoice.as_str(), "0.00000001")],
+        "tok-late",
+    )
+    .await;
 
     let every: Vec<String> = early.iter().chain(late.iter()).cloned().collect();
     let first_created = created_at(&router, &first, &early[0]).await;
@@ -333,7 +341,7 @@ async fn every_filter_selects_on_the_stored_request() {
     // which the listing call never names.
     let answer = list(&router, json!({"agreementId": first})).await;
     let summaries = items(&answer);
-    let expected = [("inv-1", "10"), ("inv-2", "2.5")];
+    let expected = [(first_invoice.as_str(), "10"), (first_invoice.as_str(), "2.5")];
     for (summary, (invoice, amount)) in summaries.iter().zip(expected) {
         assert_eq!(
             summary["originalInvoiceId"].as_str(),
@@ -376,9 +384,9 @@ async fn every_filter_selects_on_the_stored_request() {
 #[tokio::test]
 async fn a_page_token_resumes_the_same_listing() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-pages", vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-pages").await;
     let invoices: Vec<(String, String)> = (0..7)
-        .map(|index| (format!("inv-{index}"), format!("{}", index + 1)))
+        .map(|index| (invoice.clone(), format!("{}", index + 1)))
         .collect();
     let borrowed: Vec<(&str, &str)> = invoices
         .iter()
@@ -480,8 +488,8 @@ async fn a_page_token_resumes_the_same_listing() {
 #[tokio::test]
 async fn a_submitted_request_is_pending_until_the_clock_completes_it() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-clock", vec![term("eula.v1")]).await;
-    let created = submit_all(&router, &agreement, &[("inv-clock", "42")], "tok-clock").await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-clock").await;
+    let created = submit_all(&router, &agreement, &[(invoice.as_str(), "42")], "tok-clock").await;
     let id = created[0].clone();
 
     // A caller acting straight after the submit still sees the transient state.
@@ -563,33 +571,39 @@ async fn a_submitted_request_is_pending_until_the_clock_completes_it() {
 /// channel — "a list of errors for entries that failed validation" — and stores
 /// nothing.
 ///
-/// The rows differ along the kind of entry: one naming a resource that does not
-/// exist, and three whose amount satisfies `PositiveAmountUpto8Decimals`'s
-/// pattern without being positive.
+/// The rows differ along the kind of entry: two naming a resource that does not
+/// exist — the agreement, and an invoice that is not one of that agreement's —
+/// and three whose amount satisfies `PositiveAmountUpto8Decimals`'s pattern
+/// without being positive.
 #[tokio::test]
 async fn an_entry_that_cannot_be_accepted_is_reported_as_an_error() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-errors", vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-errors").await;
 
     let cases = vec![
         (
             "an agreement that does not exist",
-            entry("agmt-absent", "inv-x", "10", "tok-absent"),
+            entry("agmt-absent", &invoice, "10", "tok-absent"),
+            "RESOURCE_NOT_FOUND_EXCEPTION",
+        ),
+        (
+            "an invoice that is not one of the agreement's",
+            entry(&agreement, "inv-x", "10", "tok-no-invoice"),
             "RESOURCE_NOT_FOUND_EXCEPTION",
         ),
         (
             "a zero amount",
-            entry(&agreement, "inv-x", "0", "tok-zero"),
+            entry(&agreement, &invoice, "0", "tok-zero"),
             "VALIDATION_EXCEPTION",
         ),
         (
             "a zero amount with decimals",
-            entry(&agreement, "inv-x", "0.00", "tok-zero-decimals"),
+            entry(&agreement, &invoice, "0.00", "tok-zero-decimals"),
             "VALIDATION_EXCEPTION",
         ),
         (
             "an empty amount",
-            entry(&agreement, "inv-x", "", "tok-empty"),
+            entry(&agreement, &invoice, "", "tok-empty"),
             "VALIDATION_EXCEPTION",
         ),
     ];
@@ -720,9 +734,9 @@ async fn a_malformed_batch_is_refused_as_a_whole() {
 
     // The bound itself is accepted: a batch of exactly the limit.
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-limit", vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-limit").await;
     let invoices: Vec<(String, String)> = (0..BATCH_LIMIT)
-        .map(|index| (format!("inv-{index}"), format!("{}", index + 1)))
+        .map(|index| (invoice.clone(), format!("{}", index + 1)))
         .collect();
     let borrowed: Vec<(&str, &str)> = invoices
         .iter()
@@ -754,7 +768,7 @@ async fn a_malformed_batch_is_refused_as_a_whole() {
 #[tokio::test]
 async fn a_created_request_reads_back_through_get() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-roundtrip", vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-roundtrip").await;
 
     let cases = vec![
         (
@@ -778,7 +792,6 @@ async fn a_created_request_reads_back_through_get() {
     ];
 
     for (index, (case, reason, description, amount)) in cases.into_iter().enumerate() {
-        let invoice = format!("inv-rt-{index}");
         let token = format!("tok-rt-{index}");
         let mut submitted = entry(&agreement, &invoice, amount, &token);
         submitted["adjustmentReasonCode"] = json!(reason);
@@ -922,8 +935,14 @@ async fn a_created_request_reads_back_through_get() {
 #[tokio::test]
 async fn a_listing_agreement_id_must_name_a_stored_agreement() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-listagreement", vec![term("eula.v1")]).await;
-    let created = submit_all(&router, &agreement, &[("inv-1", "1")], "tok-listagreement").await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-listagreement").await;
+    let created = submit_all(
+        &router,
+        &agreement,
+        &[(invoice.as_str(), "1")],
+        "tok-listagreement",
+    )
+    .await;
 
     let absent: Vec<(&str, Value)> = vec![
         ("a short id", json!({"agreementId": "agmt-absent"})),
@@ -999,7 +1018,7 @@ const STORE_QUOTA: usize = 1_000;
 #[tokio::test]
 async fn the_store_holds_at_most_its_quota_however_many_calls_are_made() {
     let router = emulator();
-    let agreement = agreement_over(&router, "ap-quota", vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(&router, "ap-quota").await;
 
     // Fill the store to one slot short of the bound, in batches of the largest
     // size one call accepts.
@@ -1011,7 +1030,7 @@ async fn the_store_holds_at_most_its_quota_however_many_calls_are_made() {
             .map(|index| {
                 entry(
                     &agreement,
-                    &format!("inv-{stored}-{index}"),
+                    &invoice,
                     "1",
                     &format!("tok-fill-{stored}-{index}"),
                 )
@@ -1039,14 +1058,7 @@ async fn the_store_holds_at_most_its_quota_however_many_calls_are_made() {
     // A batch that crosses the bound: one slot is free, so one entry is stored
     // and the other two are refused, each under its own clientToken.
     let crossing: Vec<Value> = (0..3)
-        .map(|index| {
-            entry(
-                &agreement,
-                &format!("inv-cross-{index}"),
-                "1",
-                &format!("tok-cross-{index}"),
-            )
-        })
+        .map(|index| entry(&agreement, &invoice, "1", &format!("tok-cross-{index}")))
         .collect();
     let crossed = submit(&router, crossing).await;
     assert_eq!(
@@ -1080,7 +1092,7 @@ async fn the_store_holds_at_most_its_quota_however_many_calls_are_made() {
     // refused under its own clientToken, and the call creates nothing.
     let refused = submit(
         &router,
-        vec![entry(&agreement, "inv-full", "1", "tok-full")],
+        vec![entry(&agreement, &invoice, "1", "tok-full")],
     )
     .await;
     assert_eq!(

@@ -378,7 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // REVIEW_IN_PROGRESS state until you execute the change set" — so a second CREATE
         // change set for it is accepted and targets that same record.
         let existing = store
-            .resolve(&input.stack_name)
+            .resolve(&region, &input.stack_name)
             .filter(|stack| stack.is_live())
             .map(|stack| (stack.stack_id.clone(), stack.status.clone()));
         let in_review = existing
@@ -409,8 +409,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::validate_stack_name(&input.stack_name)
                     .map_err(crate::scaffolded::Scaffolded::validation_error)?;
                 // "The quota for the resource has already been reached": the store holds at
-                // most `MAX_STACKS` live stacks, and a CREATE change set creates one.
-                if store.live_stacks().count() >= crate::state::MAX_STACKS {
+                // most `MAX_STACKS` live stacks per Region and `MAX_LIVE_STACKS` across
+                // every Region (the Region being the caller's own credential scope), and a
+                // CREATE change set creates one.
+                if store.live_stacks(&region).count() >= crate::state::MAX_STACKS
+                    || store.live_stack_count() >= crate::state::MAX_LIVE_STACKS
+                {
                     return Err(CreateChangeSetErrorModeled::LimitExceededException(
                         LimitExceededException {
                             message: Some(format!(
@@ -455,25 +459,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The stack's current template, parameters and DEPLOYED resources, which the
         // change set is computed against, plus the identity its pseudo parameters resolve
-        // to. A stack that does not exist yet has none of them.
+        // to. A stack that does not exist yet has none of them — and so does a stack id
+        // that resolves to nothing, which is the same case: there is nothing to compare
+        // against, and the arm below is the one a new stack takes.
         let (previous_template, previous_parameters, deployed, stack_identity) =
-            match target_stack_id.as_deref() {
+            match target_stack_id
+                .as_deref()
+                .and_then(|stack_id| store.resolve(&region, stack_id))
+            {
                 None => (None, Vec::new(), Vec::new(), None),
-                Some(stack_id) => {
-                    let stack = store
-                        .resolve(stack_id)
-                        .expect("the stack resolved immediately above");
-                    (
-                        stack.template_body.clone(),
-                        stack.parameters.clone(),
-                        stack.resources.clone(),
-                        Some((
-                            stack.region.clone(),
-                            stack.stack_name.clone(),
-                            stack.stack_id.clone(),
-                        )),
-                    )
-                }
+                Some(stack) => (
+                    stack.template_body.clone(),
+                    stack.parameters.clone(),
+                    stack.resources.clone(),
+                    Some((
+                        stack.region.clone(),
+                        stack.stack_name.clone(),
+                        stack.stack_id.clone(),
+                    )),
+                ),
             };
         // "Whether to reuse the template that's associated with the stack to create the
         // change set."
@@ -713,7 +717,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Stack$ChangeSetId` is the change set that last acted on the stack. A CREATE
         // change set is the only thing that has acted on the stack it created.
         let operation_id = crate::state::new_operation_id();
-        if let Some(stack) = store.resolve_mut(&stack_id) {
+        if let Some(stack) = store.resolve_mut(&region, &stack_id) {
             if creates_the_stack {
                 stack.change_set_id = Some(change_set_id.clone());
                 // On the stack this change set brings into existence, creating the change
@@ -737,14 +741,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (change_set_status::CREATE_COMPLETE, execution_status::AVAILABLE)
         };
         let stack_name = store
-            .resolve(&stack_id)
+            .resolve(&region, &stack_id)
             .map(|stack| stack.stack_name.clone())
             .unwrap_or_else(|| input.stack_name.clone());
         // "The drift status of the stack when the change set was created": read off the
         // stack now, so a later detection on the stack does not rewrite what this change
         // set reports.
         let stack_drift_status = store
-            .resolve(&stack_id)
+            .resolve(&region, &stack_id)
             .map_or_else(
                 || crate::state::DRIFT_STATUS_NOT_CHECKED.to_string(),
                 |stack| stack.drift_status.clone(),

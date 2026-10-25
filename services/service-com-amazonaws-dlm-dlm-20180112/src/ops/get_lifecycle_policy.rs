@@ -130,7 +130,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLifecyclePolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -142,9 +141,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A pure read: the answer is the record the create or the last update
-        // stored, and nothing is written back.
+        // stored, and nothing is written back. A policy lives in the region its
+        // create was signed for, so this read reaches that region's store only:
+        // an id belonging to another region names no policy here.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let Some(policy) = store.policies.get(&input.policy_id) else {
+        let Some(policy) = store.policy(&region, &input.policy_id) else {
             return Err(GetLifecyclePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::policies_not_found(&[input.policy_id]),
             )

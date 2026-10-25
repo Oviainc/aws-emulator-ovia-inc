@@ -57,6 +57,9 @@ mod get_agent_goal;
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 
+#[path = "all/get_answer_reads.rs"]
+mod get_answer_reads;
+
 #[path = "all/get_lens.rs"]
 mod get_lens;
 
@@ -179,3 +182,10 @@ mod workload_share_permissions;
 
 #[path = "all/workload_shares.rs"]
 mod workload_shares;
+
+// Out of alphabetical order ON PURPOSE, for the reason the `agent_goal_create_limits`
+// declaration above gives: the sorted position for an agent-profile suite falls in the one
+// gap of this list that every new agent suite lands in, and an insertion there is what
+// repeatedly refused to merge. Declared last instead, where nothing else is inserting.
+#[path = "all/agent_profile_updates.rs"]
+mod agent_profile_updates;

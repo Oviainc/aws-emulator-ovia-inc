@@ -256,6 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let percentiles: Vec<(&str, f64)> = extended
             .iter()
             .map(|name| {
+                // The parse and the percentile itself are `crate::state`'s, shared with the
+                // metric-alarm evaluation that reads an alarm's `ExtendedStatistic` over the
+                // same stored datapoints, so the two cannot compute a different number for
+                // one span.
                 crate::state::parse_percentile(name)
                     .map(|percentile| (*name, percentile))
                     .ok_or_else(|| invalid_value(format!("{name} is not a supported statistic")))
