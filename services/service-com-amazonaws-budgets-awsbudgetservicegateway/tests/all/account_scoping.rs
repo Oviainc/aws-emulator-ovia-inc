@@ -204,6 +204,15 @@ fn every_operation(account_id: &str, action_id: &str) -> Vec<(&'static str, Valu
             }),
         ),
         (
+            "UpdateNotification",
+            json!({
+                "AccountId": account_id,
+                "BudgetName": BUDGET,
+                "OldNotification": notification(),
+                "NewNotification": other_notification()
+            }),
+        ),
+        (
             "DescribeNotificationsForBudget",
             json!({"AccountId": account_id, "BudgetName": BUDGET}),
         ),

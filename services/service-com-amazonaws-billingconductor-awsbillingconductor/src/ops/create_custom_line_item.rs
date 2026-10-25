@@ -302,15 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     format!("the resource {arn} is listed more than once"),
                 ));
             }
-            associated_resources.push(crate::state::ResourceAssociationRecord {
+            associated_resources.push(crate::state::ResourceAssociationRecord::new(
                 arn,
-                inclusive_start_billing_period: period_range
-                    .as_ref()
-                    .map(|range| range.inclusive_start_billing_period.clone()),
-                exclusive_end_billing_period: period_range
-                    .as_ref()
-                    .and_then(|range| range.exclusive_end_billing_period.clone()),
-            });
+                crate::state::BillingPeriodSpan::new(
+                    period_range
+                        .as_ref()
+                        .map(|range| range.inclusive_start_billing_period.clone()),
+                    period_range
+                        .as_ref()
+                        .and_then(|range| range.exclusive_end_billing_period.clone()),
+                ),
+            ));
         }
 
         // The store is bounded by an explicit maximum, and a create past it is

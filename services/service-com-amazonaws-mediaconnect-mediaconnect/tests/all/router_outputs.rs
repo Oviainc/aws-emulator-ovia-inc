@@ -27,23 +27,27 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::{Emulator, REGION};
+use crate::router_network_interfaces::{create_network_interface, public_configuration};
 
 /// A `RouterNetworkInterfaceArn` matching the modelled pattern
 /// (`smithy_query(query="shape",shape="RouterNetworkInterfaceArn")`:
-/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`)
+/// that no create minted.
+///
+/// A create REFUSES a configuration naming it (see
+/// `tests/all/router_output_configuration_targets.rs`), so the only thing here that uses it
+/// is [`seed_router_outputs`], which writes straight into the store rather than over the
+/// wire.
 const NETWORK_INTERFACE_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:a1b2c3d4e5f6";
-/// A `FlowArn` matching the modelled pattern (see `flow_lifecycle`).
+/// A `FlowArn` matching the modelled pattern (see `flow_lifecycle`) that no create minted —
+/// an ARN of this service that is not a router output ARN, which the batch read's modelled
+/// `Arns` pattern refuses.
 ///
-/// `pub(crate)` because `tests/all/router_output_lifecycle.rs` and
-/// `tests/all/update_router_output.rs` build their own cases from the same fixtures, so the
-/// suites cannot drift apart.
+/// `pub(crate)` because `tests/all/update_router_network_interface.rs` addresses the same
+/// ARN for the same reason.
 pub(crate) const FLOW_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:ro-target";
-/// A `FlowSourceArn` matching the modelled pattern
-/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:source:[a-zA-Z0-9-]+:[a-zA-Z0-9_-]+$`.
-pub(crate) const FLOW_SOURCE_ARN: &str =
-    "arn:aws:mediaconnect:us-east-1:000000000000:source:1-0000000a:ro-target-source";
 /// A `MediaLiveInputArn` matching the modelled pattern
 /// `^arn:(aws[a-zA-Z-]*):medialive:[a-z0-9-]+:[0-9]{12}:input:[a-zA-Z0-9]+$`. See
 /// [`FLOW_ARN`] for why it is `pub(crate)`.
@@ -73,6 +77,88 @@ pub(crate) async fn create_router_output(
     body: Value,
 ) -> (u16, Option<String>, Value) {
     emulator.send("POST", "/v1/routerOutput", Some(body)).await
+}
+
+/// Mint one router network interface over the wire and answer the ARN the service gave it.
+///
+/// A STANDARD router output egresses FROM a router network interface of this account, which
+/// the create resolves against the store, so every suite that creates such an output mints
+/// its interface first. The request goes through the POST helper and the configuration
+/// fixture `router_network_interfaces` owns — the suite that pins
+/// CreateRouterNetworkInterface's own rules — so there is one spelling of that create.
+pub(crate) async fn minted_network_interface(emulator: &Emulator, name: &str) -> String {
+    let body = json!({
+        "name": name,
+        "configuration": public_configuration(0),
+    });
+    let (status, code, created) = create_network_interface(emulator, body).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "CreateRouterNetworkInterface expected 201 for {name:?}, got {status} {code:?}: \
+         {created}"
+    );
+    created["routerNetworkInterface"]["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the minted interface carries its ARN: {created}"))
+        .to_string()
+}
+
+/// Mint one flow with one source over the wire and answer `(FlowArn, FlowSourceArn)`.
+///
+/// A MEDIACONNECT FLOW router output delivers INTO a flow source of this account, which the
+/// create resolves against the store, so every suite that creates such an output mints the
+/// flow first — through this one helper, for the same reason as
+/// [`minted_network_interface`].
+pub(crate) async fn minted_flow_source(emulator: &Emulator, name: &str) -> (String, String) {
+    let body = json!({
+        "name": name,
+        "source": { "name": format!("{name}-src"), "protocol": "rtp",
+            "whitelistCidr": "10.0.0.0/16" },
+    });
+    let (status, code, created) = emulator.create_flow(body).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "CreateFlow expected 201 for {name:?}, got {status} {code:?}: {created}"
+    );
+    let flow_arn = created["flow"]["flowArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the minted flow carries its ARN: {created}"))
+        .to_string();
+    let source_arn = created["flow"]["source"]["sourceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the minted flow's source carries its ARN: {created}"))
+        .to_string();
+    (flow_arn, source_arn)
+}
+
+/// Every resource of THIS service a router output configuration can name, minted over the
+/// wire on one emulator: the router network interface a STANDARD output egresses from, and
+/// the flow and flow source a MEDIACONNECT FLOW output delivers into.
+///
+/// `pub(crate)` because every suite that creates a router output needs them, and they are
+/// per-emulator (an interface one emulator minted is not in another's store).
+pub(crate) struct ConfigurationTargets {
+    pub(crate) interface_arn: String,
+    pub(crate) flow_arn: String,
+    pub(crate) flow_source_arn: String,
+}
+
+/// Mint the whole set [`ConfigurationTargets`] describes, naming each resource after
+/// `prefix` so a suite's records are its own.
+pub(crate) async fn minted_configuration_targets(
+    emulator: &Emulator,
+    prefix: &str,
+) -> ConfigurationTargets {
+    let interface_arn = minted_network_interface(emulator, &format!("rni-{prefix}")).await;
+    let (flow_arn, flow_source_arn) =
+        minted_flow_source(emulator, &format!("flow-{prefix}")).await;
+    ConfigurationTargets {
+        interface_arn,
+        flow_arn,
+        flow_source_arn,
+    }
 }
 
 /// BatchGetRouterOutput binds its `Arns` member to the `arns` query parameter, one
@@ -218,10 +304,10 @@ struct CreateCase {
 /// A union's members are keyed on the wire by their MODELLED member name (`Standard`,
 /// `Rtp`, …): the framework's union schemas carry no `@jsonName`, so that is the key this
 /// emulator reads and writes for every service.
-pub(crate) fn standard(protocol_configuration: Value) -> Value {
+pub(crate) fn standard(interface_arn: &str, protocol_configuration: Value) -> Value {
     json!({
         "Standard": {
-            "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+            "networkInterfaceArn": interface_arn,
             "protocolConfiguration": protocol_configuration,
         }
     })
@@ -230,10 +316,14 @@ pub(crate) fn standard(protocol_configuration: Value) -> Value {
 /// The same configuration as [`standard`], with the `Protocol` the service must report
 /// filled in — what the store must hold afterwards. `pub(crate)` for the same reason as
 /// [`FLOW_ARN`].
-pub(crate) fn standard_with_protocol(protocol_configuration: Value, protocol: &str) -> Value {
+pub(crate) fn standard_with_protocol(
+    interface_arn: &str,
+    protocol_configuration: Value,
+    protocol: &str,
+) -> Value {
     json!({
         "Standard": {
-            "networkInterfaceArn": NETWORK_INTERFACE_ARN,
+            "networkInterfaceArn": interface_arn,
             "protocolConfiguration": protocol_configuration,
             "protocol": protocol,
         }
@@ -245,7 +335,13 @@ pub(crate) fn standard_with_protocol(protocol_configuration: Value, protocol: &s
 /// (`smithy_query(query="shape",shape="RouterOutputProtocol")`: RTP | RIST | SRT_CALLER |
 /// SRT_LISTENER | RTMP_PUSH), a request that names nothing optional beside a request that
 /// names every optional member, and both maintenance configurations.
-fn create_cases() -> Vec<CreateCase> {
+///
+/// The targets are the ones the account HOLDS: `interface_arn` is a minted router network
+/// interface ([`minted_network_interface`]) and `flow_arn` / `flow_source_arn` a minted flow
+/// and its source ([`minted_flow_source`]), because a configuration naming a target this
+/// account does not hold is refused (see
+/// `tests/all/router_output_configuration_targets.rs`).
+fn create_cases(interface_arn: &str, flow_arn: &str, flow_source_arn: &str) -> Vec<CreateCase> {
     let rtp = json!({"Rtp": {"destinationAddress": "198.51.100.10", "destinationPort": 5004,
         "forwardErrorCorrection": "ENABLED"}});
     let rist = json!({"Rist": {"destinationAddress": "198.51.100.11", "destinationPort": 2030}});
@@ -262,13 +358,13 @@ fn create_cases() -> Vec<CreateCase> {
             case: "standard RTP, nothing optional named",
             body: json!({
                 "name": "ro-rtp",
-                "configuration": standard(rtp.clone()),
+                "configuration": standard(interface_arn, rtp.clone()),
                 "maximumBitrate": 20_000_000i64,
                 "routingScope": "REGIONAL",
                 "tier": "OUTPUT_20",
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_STANDARD,
-            configuration: standard_with_protocol(rtp, "RTP"),
+            configuration: standard_with_protocol(interface_arn, rtp, "RTP"),
             stream_details: json!({"Standard": {"destinationIpAddress": "198.51.100.10"}}),
             availability_zone: "us-east-1a",
             maintenance_type: mc::MAINTENANCE_TYPE_DEFAULT,
@@ -280,14 +376,14 @@ fn create_cases() -> Vec<CreateCase> {
             case: "standard RIST, Region named explicitly",
             body: json!({
                 "name": "ro-rist",
-                "configuration": standard(rist.clone()),
+                "configuration": standard(interface_arn, rist.clone()),
                 "maximumBitrate": 30_000_000i64,
                 "routingScope": "GLOBAL",
                 "tier": "OUTPUT_50",
                 "regionName": REGION,
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_STANDARD,
-            configuration: standard_with_protocol(rist, "RIST"),
+            configuration: standard_with_protocol(interface_arn, rist, "RIST"),
             stream_details: json!({"Standard": {"destinationIpAddress": "198.51.100.11"}}),
             availability_zone: "us-east-1a",
             maintenance_type: mc::MAINTENANCE_TYPE_DEFAULT,
@@ -299,7 +395,7 @@ fn create_cases() -> Vec<CreateCase> {
             case: "standard SRT caller, maintenance window and tags named",
             body: json!({
                 "name": "ro-srt-caller",
-                "configuration": standard(srt_caller.clone()),
+                "configuration": standard(interface_arn, srt_caller.clone()),
                 "maximumBitrate": 100_000_000i64,
                 "routingScope": "REGIONAL",
                 "tier": "OUTPUT_100",
@@ -310,7 +406,7 @@ fn create_cases() -> Vec<CreateCase> {
                 "fabricConfiguration": {"recoveryLatencyMode": "LOW_LATENCY"},
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_STANDARD,
-            configuration: standard_with_protocol(srt_caller, "SRT_CALLER"),
+            configuration: standard_with_protocol(interface_arn, srt_caller, "SRT_CALLER"),
             stream_details: json!({"Standard": {"destinationIpAddress": "198.51.100.12"}}),
             availability_zone: "us-east-1c",
             maintenance_type: mc::MAINTENANCE_TYPE_PREFERRED_DAY_TIME,
@@ -323,13 +419,13 @@ fn create_cases() -> Vec<CreateCase> {
             case: "standard SRT listener, which names no destination address",
             body: json!({
                 "name": "ro-srt-listener",
-                "configuration": standard(srt_listener.clone()),
+                "configuration": standard(interface_arn, srt_listener.clone()),
                 "maximumBitrate": 500_000_000i64,
                 "routingScope": "GLOBAL",
                 "tier": "OUTPUT_500",
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_STANDARD,
-            configuration: standard_with_protocol(srt_listener, "SRT_LISTENER"),
+            configuration: standard_with_protocol(interface_arn, srt_listener, "SRT_LISTENER"),
             // A listener waits for a caller instead of sending to an address, so the
             // stream details carry no destination address at all.
             stream_details: json!({"Standard": {}}),
@@ -343,13 +439,17 @@ fn create_cases() -> Vec<CreateCase> {
             case: "standard RTMP push, naming the protocol its configuration implies",
             body: json!({
                 "name": "ro-rtmp-push",
-                "configuration": standard_with_protocol(rtmp_push.clone(), "RTMP_PUSH"),
+                "configuration": standard_with_protocol(
+                    interface_arn,
+                    rtmp_push.clone(),
+                    "RTMP_PUSH",
+                ),
                 "maximumBitrate": 1_000_000i64,
                 "routingScope": "REGIONAL",
                 "tier": "OUTPUT_250",
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_STANDARD,
-            configuration: standard_with_protocol(rtmp_push, "RTMP_PUSH"),
+            configuration: standard_with_protocol(interface_arn, rtmp_push, "RTMP_PUSH"),
             stream_details: json!({"Standard": {"destinationIpAddress": "198.51.100.13"}}),
             availability_zone: "us-east-1a",
             maintenance_type: mc::MAINTENANCE_TYPE_DEFAULT,
@@ -362,8 +462,8 @@ fn create_cases() -> Vec<CreateCase> {
             body: json!({
                 "name": "ro-mediaconnect-flow",
                 "configuration": {"MediaConnectFlow": {
-                    "flowArn": FLOW_ARN,
-                    "flowSourceArn": FLOW_SOURCE_ARN,
+                    "flowArn": flow_arn,
+                    "flowSourceArn": flow_source_arn,
                     "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
                         "encryptionKeyConfiguration": {"Automatic": {}}},
                 }},
@@ -374,8 +474,8 @@ fn create_cases() -> Vec<CreateCase> {
             }),
             output_type: mc::ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW,
             configuration: json!({"MediaConnectFlow": {
-                "flowArn": FLOW_ARN,
-                "flowSourceArn": FLOW_SOURCE_ARN,
+                "flowArn": flow_arn,
+                "flowSourceArn": flow_source_arn,
                 "destinationTransitEncryption": {"encryptionKeyType": "AUTOMATIC",
                     "encryptionKeyConfiguration": {"Automatic": {}}},
             }}),
@@ -422,6 +522,10 @@ fn create_cases() -> Vec<CreateCase> {
 #[tokio::test]
 async fn create_router_output_persists_what_batch_get_reports() {
     let emulator = Emulator::new();
+    // The targets the configurations below name, minted first: a router output's
+    // configuration must name resources this account holds.
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-create").await;
+    let (flow_arn, flow_source_arn) = minted_flow_source(&emulator, "flow-ro-create").await;
 
     for CreateCase {
         case,
@@ -434,7 +538,7 @@ async fn create_router_output_persists_what_batch_get_reports() {
         maintenance_configuration,
         recovery_latency_mode,
         tags,
-    } in create_cases()
+    } in create_cases(&interface_arn, &flow_arn, &flow_source_arn)
     {
         let requested_name = body["name"].as_str().unwrap_or_default().to_string();
         let requested_bitrate = body["maximumBitrate"].as_i64().unwrap_or_default();
@@ -574,6 +678,7 @@ struct BatchCase {
 #[tokio::test]
 async fn batch_get_reports_each_requested_arn_once_and_errors_for_the_rest() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-batch").await;
 
     // Three stored outputs to address, created through the wire like any client's.
     let mut arns: Vec<String> = Vec::new();
@@ -582,7 +687,7 @@ async fn batch_get_reports_each_requested_arn_once_and_errors_for_the_rest() {
             &emulator,
             json!({
                 "name": format!("ro-batch-{index}"),
-                "configuration": standard(json!({"Rtp": {
+                "configuration": standard(&interface_arn, json!({"Rtp": {
                     "destinationAddress": format!("198.51.100.{}", 20 + index),
                     "destinationPort": 5004,
                 }})),
@@ -736,12 +841,13 @@ fn stored_count(emulator: &Emulator) -> usize {
 #[tokio::test]
 async fn the_clock_settles_a_new_router_output_into_standby() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-clock").await;
     let (status, _, created) = create_router_output(
         &emulator,
         json!({
             "name": "ro-lifecycle",
-            "configuration": standard(json!({"Rist": {"destinationAddress": "198.51.100.30",
-                "destinationPort": 2030}})),
+            "configuration": standard(&interface_arn, json!({"Rist": {
+                "destinationAddress": "198.51.100.30", "destinationPort": 2030}})),
             "maximumBitrate": 20_000_000i64,
             "routingScope": "REGIONAL",
             "tier": "OUTPUT_20",
@@ -782,11 +888,12 @@ async fn the_clock_settles_a_new_router_output_into_standby() {
 #[tokio::test]
 async fn a_replayed_client_token_mints_no_second_router_output() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-token").await;
     let body = |name: &str, token: &str| {
         json!({
             "name": name,
-            "configuration": standard(json!({"Rtp": {"destinationAddress": "198.51.100.40",
-                "destinationPort": 5004}})),
+            "configuration": standard(&interface_arn, json!({"Rtp": {
+                "destinationAddress": "198.51.100.40", "destinationPort": 5004}})),
             "maximumBitrate": 20_000_000i64,
             "routingScope": "REGIONAL",
             "tier": "OUTPUT_20",
@@ -847,6 +954,7 @@ async fn a_replayed_client_token_mints_no_second_router_output() {
 #[tokio::test]
 async fn the_tier_bounds_the_maximum_bitrate() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-tier").await;
 
     // The catalog is `CreateRouterOutput$Tier`'s own documentation
     // (`smithy_query(query="doc",shape="CreateRouterOutputRequest",member="Tier")`): the
@@ -871,7 +979,7 @@ async fn the_tier_bounds_the_maximum_bitrate() {
         let body = |bitrate: i64| {
             json!({
                 "name": format!("ro-{}", tier.to_ascii_lowercase()),
-                "configuration": standard(json!({"Rtp": {
+                "configuration": standard(&interface_arn, json!({"Rtp": {
                     "destinationAddress": "198.51.100.50", "destinationPort": 5004}})),
                 "maximumBitrate": bitrate,
                 "routingScope": "REGIONAL",
@@ -923,8 +1031,11 @@ struct RefusalCase {
 #[tokio::test]
 async fn refusals_name_the_modelled_error() {
     let emulator = Emulator::new();
-    let configuration = standard(json!({"Rtp": {"destinationAddress": "198.51.100.60",
-        "destinationPort": 5004}}));
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-refusals").await;
+    let configuration = standard(
+        &interface_arn,
+        json!({"Rtp": {"destinationAddress": "198.51.100.60", "destinationPort": 5004}}),
+    );
     let valid = json!({
         "name": "ro-refusals",
         "configuration": configuration.clone(),
@@ -988,6 +1099,7 @@ async fn refusals_name_the_modelled_error() {
             body: Some(json!({
                 "name": "ro-protocol-mismatch",
                 "configuration": standard_with_protocol(
+                    &interface_arn,
                     json!({"Rtp": {"destinationAddress": "198.51.100.61",
                         "destinationPort": 5004}}),
                     "RIST",
@@ -1077,11 +1189,12 @@ async fn refusals_name_the_modelled_error() {
 #[tokio::test]
 async fn create_refuses_past_the_store_ceiling() {
     let emulator = Emulator::new();
+    let interface_arn = minted_network_interface(&emulator, "rni-ro-ceiling").await;
     let body = |name: &str| {
         json!({
             "name": name,
-            "configuration": standard(json!({"Rtp": {"destinationAddress": "198.51.100.70",
-                "destinationPort": 5004}})),
+            "configuration": standard(&interface_arn, json!({"Rtp": {
+                "destinationAddress": "198.51.100.70", "destinationPort": 5004}})),
             "maximumBitrate": 20_000_000i64,
             "routingScope": "REGIONAL",
             "tier": "OUTPUT_20",

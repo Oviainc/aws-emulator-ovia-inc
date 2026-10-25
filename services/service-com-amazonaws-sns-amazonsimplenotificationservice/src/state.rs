@@ -1307,11 +1307,46 @@ impl PublishedMessage {
     }
 }
 
+// =============================================================================
+// The SMS sandbox
+// =============================================================================
+
+/// The verification status a destination phone number in the SMS sandbox carries
+/// until its one-time password has been verified.
+///
+/// One of the two values the modelled `SMSSandboxPhoneNumberVerificationStatus` enum
+/// accepts; the other is [`SANDBOX_NUMBER_VERIFIED`]. Both are spelled exactly as
+/// [`crate::ops::types::S_M_S_SANDBOX_PHONE_NUMBER_VERIFICATION_STATUS_VALUES`]
+/// lists them, because that is what the enum lets a listing report.
+pub const SANDBOX_NUMBER_PENDING: &str = "Pending";
+
+/// The verification status a destination phone number in the SMS sandbox carries
+/// once its one-time password has been verified — the other value of the enum named
+/// on [`SANDBOX_NUMBER_PENDING`].
+pub const SANDBOX_NUMBER_VERIFIED: &str = "Verified";
+
+/// The name a refusal gives a sandbox destination phone number record.
+pub const SANDBOX_NUMBER_RECORD: &str = "SMS sandbox destination phone numbers";
+
+/// One destination phone number in the calling account's SMS sandbox, as
+/// `CreateSMSSandboxPhoneNumber` added it.
+#[derive(Debug, Clone)]
+pub struct SandboxPhoneNumberRecord {
+    /// The destination phone number, as the request that added it spelled it. The
+    /// model marks this member `@sensitive`, so it belongs in the modelled listing
+    /// and in no error string.
+    pub phone_number: String,
+    /// [`SANDBOX_NUMBER_PENDING`] or [`SANDBOX_NUMBER_VERIFIED`].
+    pub status: String,
+    pub created_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
-/// Every store here is caller-driven and therefore BOUNDED: `topics` and
-/// `subscriptions` at [`MAX_RECORDS_PER_STORE`] records each (a request that would
-/// cross it is refused with the modelled limit error), and `delivered` at
+/// Every store here is caller-driven and therefore BOUNDED: `topics`,
+/// `subscriptions` and `sandbox_phone_numbers` at [`MAX_RECORDS_PER_STORE`] records
+/// each (a request that would cross it is refused with a modelled error), and
+/// `delivered` at
 /// [`MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION`] messages per subscription AND
 /// [`MAX_RETAINED_DELIVERY_BYTES`] of payload overall, evicting oldest-first. So the
 /// product a publish multiplies out — payload x subscriptions x publishes — is capped
@@ -1322,6 +1357,10 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     pub topics: HashMap<String, TopicRecord>,
     /// Subscriptions by subscription ARN. At most [`MAX_RECORDS_PER_STORE`].
     pub subscriptions: HashMap<String, SubscriptionRecord>,
+    /// The calling account's SMS sandbox destination phone numbers, keyed by the
+    /// phone number itself: the sandbox holds one record per destination number. At
+    /// most [`MAX_RECORDS_PER_STORE`].
+    pub sandbox_phone_numbers: HashMap<String, SandboxPhoneNumberRecord>,
     /// Delivered messages by subscription ARN, oldest first. Bounded: write through
     /// [`Self::record_delivery`], never by hand.
     pub delivered: HashMap<String, Vec<PublishedMessage>>,
@@ -1360,6 +1399,20 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.arn.cmp(&b.arn))
+        });
+        found
+    }
+
+    /// Every destination phone number in the SMS sandbox, oldest first (the number
+    /// itself breaking a tie), so a listing and its pagination token are stable
+    /// across calls — see [`Self::subscriptions_of`].
+    pub fn sandbox_phone_numbers_in_order(&self) -> Vec<&SandboxPhoneNumberRecord> {
+        let mut found: Vec<&SandboxPhoneNumberRecord> =
+            self.sandbox_phone_numbers.values().collect();
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.phone_number.cmp(&b.phone_number))
         });
         found
     }
@@ -1659,6 +1712,15 @@ pub const TOPIC_DOES_NOT_EXIST: &str = "Topic does not exist";
 /// The HTTP 404 and the `NotFound` code are the requirement; this is SNS's wording of
 /// the reason.
 pub const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
+
+/// The sentence SNS states for a resource an SMS sandbox call names and the account
+/// does not hold — the sandbox counterpart of [`TOPIC_DOES_NOT_EXIST`], worded the
+/// same way: the resource that is missing, with none of the caller's identifier
+/// echoed back (the sandbox's identifier is a phone number, which the model marks
+/// `@sensitive`, so echoing it would also reproduce a sensitive value in an error
+/// string). The HTTP 404 and the `ResourceNotFound` code are the requirement; this is
+/// SNS's wording of the reason.
+pub const SANDBOX_RESOURCE_DOES_NOT_EXIST: &str = "Resource does not exist";
 
 /// The sentence SNS refuses an unacceptable topic name with.
 ///

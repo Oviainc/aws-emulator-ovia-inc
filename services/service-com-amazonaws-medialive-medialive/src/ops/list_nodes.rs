@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieve the list of Nodes of ONE MediaLive Anywhere cluster: the nodes the
+//! node store holds for the `ClusterId` the path names, in the order their ids
+//! were minted, cut into pages of at most `MaxResults` and resumed by the
+//! `NextToken` the previous page handed out. Every reported node is the
+//! `DescribeNodeSummary` projection `DescribeNode` answers from, so a listed node
+//! and a described one cannot disagree. This is a READ: it stores nothing beyond
+//! the transitions the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNodes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of nodes in one response. The page size is judged
+        // before the cluster is resolved, so a request the real service refuses is
+        // refused whatever cluster it names.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — a node's `DEREGISTERING` -> `DEREGISTERED` step among
+        // them — which were owed whether or not this listing ran, so a listed node
+        // reports the same `State` a describe of it does.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // A node lives inside ONE cluster, so a `ClusterId` this store holds no
+        // cluster for names no collection to page through. This operation models
+        // no 404, so the request itself is what cannot be read: the modelled 400.
+        if !state.clusters.contains_key(&input.cluster_id) {
+            return Err(bad_request(&crate::state::not_found_message(
+                "Cluster",
+                &input.cluster_id,
+            )));
+        }
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id,
+        // keeping only the nodes of the cluster the path names. A token naming a
+        // node gone since the previous page simply resumes at the next surviving
+        // id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .nodes
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .filter(|(_, node)| node.cluster_id == input.cluster_id);
+
+        // Every node is reported through the ONE projection `DescribeNode` answers
+        // from, so a listed summary cannot drift from the described node. A node
+        // whose delete has been accepted is still REPORTED, in the state the
+        // deregistration left it: the record stays in the account rather than
+        // vanishing. The projection is resolved BEFORE the page budget is spent,
+        // so the page carries `page_size` nodes whenever that many are left.
+        let nodes: Vec<DescribeNodeSummary> = remaining
+            .by_ref()
+            .filter_map(|(id, _)| state.node_description(&input.cluster_id, id))
+            .take(page_size)
+            .collect();
+        // Absent on the last page: a token is handed out only when a node of this
+        // cluster is left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListNodesOutput {
+            next_token,
+            nodes: Some(nodes),
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> ListNodesError {
+    ListNodesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the cluster's nodes from. A modelled server
+/// error, never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListNodesError {
+    ListNodesErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

@@ -187,6 +187,94 @@ pub fn billing_period_range_covers(
     after_start && before_end
 }
 
+/// Does the half-open bound `start` come strictly before `end`? An absent `start` is
+/// the unbounded past and an absent `end` the unbounded future, so either one absent
+/// orders. Both bounds are the month counts [`billing_period_key`] returns.
+pub fn billing_period_precedes(start: Option<i64>, end: Option<i64>) -> bool {
+    match (start, end) {
+        (Some(start), Some(end)) => start < end,
+        _ => true,
+    }
+}
+
+/// One half-open span of billing periods, `[InclusiveStartBillingPeriod,
+/// ExclusiveEndBillingPeriod)`, as a `CustomLineItemBillingPeriodRange` names one and
+/// as [`billing_period_range_covers`] reads it: an ABSENT bound is open, so a span with
+/// neither bound is every billing period.
+///
+/// The bounds are kept as the STRINGS a request carried, because a billing period has
+/// two spellings of one month (`2026-7` and `2026-07`) and a read reports the period
+/// back as the call that set it named it; ordering goes through
+/// [`billing_period_key`], so the two spellings still compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BillingPeriodSpan {
+    pub inclusive_start: Option<String>,
+    pub exclusive_end: Option<String>,
+}
+
+impl BillingPeriodSpan {
+    /// A span of the two bounds a `BillingPeriodRange` carries.
+    pub fn new(inclusive_start: Option<String>, exclusive_end: Option<String>) -> Self {
+        Self {
+            inclusive_start,
+            exclusive_end,
+        }
+    }
+
+    /// Is `billing_period` inside this span? See [`billing_period_range_covers`].
+    pub fn covers(&self, billing_period: &str) -> bool {
+        billing_period_range_covers(
+            self.inclusive_start.as_deref(),
+            self.exclusive_end.as_deref(),
+            billing_period,
+        )
+    }
+
+    /// This span's inclusive start as a comparable month count; `None` when it is open.
+    fn start_key(&self) -> Option<i64> {
+        self.inclusive_start.as_deref().and_then(billing_period_key)
+    }
+
+    /// This span's exclusive end as a comparable month count; `None` when it is open.
+    fn end_key(&self) -> Option<i64> {
+        self.exclusive_end.as_deref().and_then(billing_period_key)
+    }
+
+    /// The billing periods of this span that are NOT in `removed`, as spans in
+    /// ascending order.
+    ///
+    /// Subtracting one half-open span from another leaves the part BEFORE the removal
+    /// starts and the part FROM the removal's end on — so a removal that is bounded on
+    /// both sides and falls strictly inside this span leaves two, a removal that
+    /// overlaps one end leaves one, and a removal that covers this span leaves none.
+    /// A removal that shares no billing period with this span leaves it as it is.
+    pub fn minus(&self, removed: &Self) -> Vec<Self> {
+        let (start, end) = (self.start_key(), self.end_key());
+        let (removed_start, removed_end) = (removed.start_key(), removed.end_key());
+        // Two half-open spans share a billing period only when each one starts before
+        // the other ends.
+        if !billing_period_precedes(start, removed_end)
+            || !billing_period_precedes(removed_start, end)
+        {
+            return vec![self.clone()];
+        }
+        let mut left = Vec::new();
+        if removed_start.is_some() && billing_period_precedes(start, removed_start) {
+            left.push(Self::new(
+                self.inclusive_start.clone(),
+                removed.inclusive_start.clone(),
+            ));
+        }
+        if removed_end.is_some() && billing_period_precedes(removed_end, end) {
+            left.push(Self::new(
+                removed.exclusive_end.clone(),
+                self.exclusive_end.clone(),
+            ));
+        }
+        left
+    }
+}
+
 /// The `CurrencyCode` a custom line item's charge value is denominated in, DERIVED
 /// from the PARTITION of its ARN.
 ///
@@ -553,15 +641,51 @@ impl BillingGroupRecord {
 /// charge details the item was created with) persisted it. The billing period range
 /// is the one the associating call named, so `EndBillingPeriod` is reported from the
 /// association rather than guessed.
+///
+/// The periods the association is in effect in are held as a LIST of half-open spans,
+/// because a call that changes the association in a bounded billing period range
+/// changes it only there: removing a range from the middle of the association leaves
+/// the periods on either side of it, which one span cannot hold. The spans are
+/// disjoint and in ascending order, so a resource is ONE record however many spans it
+/// is in effect over and `AssociationSize` counts it once.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceAssociationRecord {
     /// The FULL ARN of the associated billing group or custom line item.
     pub arn: String,
-    pub inclusive_start_billing_period: Option<String>,
-    pub exclusive_end_billing_period: Option<String>,
+    /// The billing periods this association is in effect in — see
+    /// [`BillingPeriodSpan`]. An association made with no range at all is the one
+    /// fully open span. The spans are disjoint and ascending, and there are at most
+    /// [`MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION`] of them: a caller decides how many
+    /// bounded calls to make, and each one can carve one more stretch, so the list is
+    /// capped like every other store here.
+    pub spans: Vec<BillingPeriodSpan>,
+}
+
+/// What taking a range of billing periods out of a resource association did — see
+/// [`ResourceAssociationRecord::remove_periods`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodsRemoval {
+    /// The billing periods the association is in effect in changed.
+    Changed,
+    /// The range shares no billing period with the association, so nothing changed —
+    /// which is also how a retry of a call that already applied answers.
+    Unchanged,
+    /// REFUSED: the removal would leave the association in more separate stretches of
+    /// billing periods than [`MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION`], so nothing
+    /// was written.
+    AtSpanLimit,
 }
 
 impl ResourceAssociationRecord {
+    /// An association of `arn` in effect over `span` — the billing period range the
+    /// associating call named, which is fully open when it named none.
+    pub fn new(arn: String, span: BillingPeriodSpan) -> Self {
+        Self {
+            arn,
+            spans: vec![span],
+        }
+    }
+
     /// `Relationship`, DERIVED from the resource the ARN names — see
     /// [`association_relationship`].
     pub fn relationship(&self) -> &'static str {
@@ -573,11 +697,63 @@ impl ResourceAssociationRecord {
     /// (`InclusiveStartBillingPeriod` / `ExclusiveEndBillingPeriod`); an absent
     /// bound is open, so an association made without a range covers every period.
     pub fn covers(&self, billing_period: &str) -> bool {
-        billing_period_range_covers(
-            self.inclusive_start_billing_period.as_deref(),
-            self.exclusive_end_billing_period.as_deref(),
-            billing_period,
-        )
+        self.spans.iter().any(|span| span.covers(billing_period))
+    }
+
+    /// `EndBillingPeriod`: the billing period this association stops applying at,
+    /// EXCLUSIVE, absent when it does not stop.
+    ///
+    /// A read that names a billing period is asking about the association as it stands
+    /// IN that period, so the span covering it is the one that ends; a read that names
+    /// none is asking about the association as a whole, which ends where its LAST span
+    /// does.
+    pub fn end_billing_period(&self, billing_period: Option<&str>) -> Option<String> {
+        match billing_period {
+            Some(period) => self
+                .spans
+                .iter()
+                .find(|span| span.covers(period))
+                .and_then(|span| span.exclusive_end.clone()),
+            None => self
+                .spans
+                .last()
+                .and_then(|span| span.exclusive_end.clone()),
+        }
+    }
+
+    /// Take the billing periods `removed` names out of this association, and report
+    /// what that did to the periods it is in effect in.
+    ///
+    /// Each span keeps whatever of itself lies outside the removal
+    /// ([`BillingPeriodSpan::minus`]), so a removal bounded on both sides takes only
+    /// the periods between its bounds and the association resumes at its exclusive
+    /// end. An association left in effect in no period at all is empty
+    /// ([`Self::is_empty`]) and its record goes.
+    ///
+    /// A removal that would carve the association into more than
+    /// [`MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION`] separate stretches is REFUSED and
+    /// writes nothing, because a caller decides how many such calls to make and each
+    /// one can add a stretch.
+    pub fn remove_periods(&mut self, removed: &BillingPeriodSpan) -> PeriodsRemoval {
+        let left: Vec<BillingPeriodSpan> = self
+            .spans
+            .iter()
+            .flat_map(|span| span.minus(removed))
+            .collect();
+        if left == self.spans {
+            return PeriodsRemoval::Unchanged;
+        }
+        if left.len() > MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION {
+            return PeriodsRemoval::AtSpanLimit;
+        }
+        self.spans = left;
+        PeriodsRemoval::Changed
+    }
+
+    /// Is this association in effect in no billing period at all, so that nothing of
+    /// it is left to report?
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
     }
 }
 
@@ -827,7 +1003,11 @@ pub fn responsibility_transfer_owner_account(arn: &str) -> Option<&str> {
 ///   model itself can represent. A create past the cap is REFUSED with
 ///   `ServiceLimitExceededException`, and an association past it fails THAT resource
 ///   with the modelled `SERVICE_LIMIT_EXCEEDED` reason; a deleted billing group takes
-///   its items, and their associations, with it. An item also carries the generations
+///   its items, and their associations, with it. One association is in effect over at
+///   most [`MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION`] separate stretches of billing
+///   periods, since a disassociation bounded to a range inside one of them splits it:
+///   the one that would carve a stretch too many fails THAT resource with the same
+///   reason and writes nothing. An item also carries the generations
 ///   of it that later writes superseded, at most [`MAX_CUSTOM_LINE_ITEM_VERSIONS`],
 ///   oldest dropped first.
 /// * `billing_transfer_preferences` holds one entry per billing transfer whose
@@ -1617,6 +1797,20 @@ pub const MAX_CUSTOM_LINE_ITEMS: usize = 1000;
 /// association past the bound fails THAT resource with the modelled
 /// `SERVICE_LIMIT_EXCEEDED` reason rather than displacing a stored association.
 pub const MAX_RESOURCES_PER_CUSTOM_LINE_ITEM: usize = 5;
+
+/// How many SEPARATE stretches of billing periods one resource association may be in
+/// effect over ([`ResourceAssociationRecord::spans`]).
+///
+/// A CHOSEN bound, not an AWS limit: a caller decides how many bounded
+/// `BatchDisassociateResourcesFromCustomLineItem` calls to make, and one whose range
+/// falls inside a stretch the association already has splits it in two, so the list
+/// has to be capped like the kept history is ([`MAX_CUSTOM_LINE_ITEM_VERSIONS`], the
+/// same order of magnitude, for the same reason). A disassociation that would carve
+/// one more stretch past the cap fails THAT resource with the modelled
+/// `SERVICE_LIMIT_EXCEEDED` reason and writes nothing — never by coarsening the
+/// periods a stored association is in effect over, which a later read must still
+/// report faithfully.
+pub const MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION: usize = 100;
 
 /// How many SUPERSEDED generations of one custom line item this emulator keeps for
 /// `ListCustomLineItemVersions` to report.
