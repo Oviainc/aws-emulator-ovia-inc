@@ -29,7 +29,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::export_jobs::{settled_search_job, Settled};
 use crate::search_jobs::{
-    call, emulator_with_engine, recovery_point, seed_recovery_points, PAST_THE_DUE_INSTANT,
+    call, emulator_with_engine, recovery_point, seed_recovery_points, PAST_THE_CREATING_INSTANT,
+    PAST_THE_DUE_INSTANT,
 };
 
 /// One nanosecond, the finest step a `Duration` takes and the step the bisection below
@@ -400,6 +401,9 @@ async fn a_stopped_search_job_owes_its_end_at_the_transition_span_after_the_stop
         let identifier = started.string("SearchJobIdentifier");
         let job_uri = format!("/search-jobs/{identifier}");
 
+        // A stop acts from the running scan, so wait for the set-up phase to pass: the
+        // span asserted below is then measured from the stop call itself.
+        tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
         let before = SystemTime::now();
         let stopped = call(
             &emulator,

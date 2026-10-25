@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCostEstimate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCostEstimate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Forecasts what the resource the request names will cost over the window it asks
+//! about, computed from the plan and the size THIS store holds for that resource.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCostEstimate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What an estimate is made of
+//!
+//! Lightsail prices a resource in one of three ways, and which one applies is read
+//! off the stored record rather than carried per case:
+//!
+//! * a resource on a monthly PLAN (an instance, a bucket, a managed database, a
+//!   container service, a CDN distribution) is charged that plan's monthly price,
+//!   prorated over the hours of the window ([`HOURS_PER_BILLING_MONTH`]);
+//! * a resource priced by the storage it holds (a disk, a snapshot) is charged for
+//!   its size in GB over those same hours;
+//! * a resource with a flat hourly price (a load balancer, an idle static IP) is
+//!   charged per hour.
+//!
+//! Each of those is one [`Charge`], and a charge over a window of hours is the
+//! count of `pricingUnit` it consumes (`unit`) times the price of one unit
+//! (`usageCost`). A resource Lightsail prices by neither a plan nor a metered
+//! dimension this store holds — a DNS zone, an alarm, an export record — reports no
+//! usage type at all rather than an invented one.
+//!
+//! ## Which records a name resolves against
+//!
+//! The name is resolved in the Region the request is signed for for every record
+//! this store keys by Region — a bucket, a container service and a load balancer.
+//! The remaining records (an instance, a disk, a snapshot, a managed database, a
+//! distribution, a static IP, a DNS zone, an alarm, an export record) are keyed by
+//! name ALONE in `crate::state`, so one name addresses one such resource of the
+//! account whichever Region the request is made from, exactly as the operations
+//! that report those resources resolve them. Region-scoping them is a change to
+//! the store's keys, and so belongs to the store rather than to this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +189,573 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCostEstimate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCostEstimateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCostEstimate"))
+        // A bucket, a container service and a load balancer are REGIONAL records,
+        // so the region the request is signed for is part of what a name resolves
+        // against — exactly as it is for the operations that report them.
+        let region = crate::state::request_region(ctx.parts());
+
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        // The modelled `TimePeriod` is "start date is inclusive, but the end date
+        // is exclusive", so a window whose end is not after its start holds no
+        // instant at all and there is nothing to estimate over it.
+        if end_ms <= start_ms {
+            return Err(invalid(
+                "endTime must name an instant after startTime: a cost estimate window \
+                 includes startTime and excludes endTime"
+                    .to_string(),
+            ));
+        }
+
+        let billed = crate::state::with_state(&*self.engine, |store| {
+            billed_resources(store, &region, &input.resource_name)
+        })
+        .ok_or_else(unavailable)??;
+
+        // "A cost estimate will not generate for a resource that has been deleted":
+        // a name this account holds no resource under is the service's
+        // `DoesNotExist` rejection, never a zeroed 200.
+        if billed.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
+                "The resource does not exist: {}",
+                input.resource_name
+            )));
+        }
+
+        Ok(GetCostEstimateOutput {
+            resources_budget_estimate: Some(
+                billed
+                    .into_iter()
+                    .map(|resource| resource.estimate(start_ms, end_ms))
+                    .collect(),
+            ),
+        })
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the service charges for
+// ---------------------------------------------------------------------------
+
+/// The hours AWS prices one billing month at.
+///
+/// A monthly plan is billed by the hour at `price / 730`, which is what makes a
+/// window shorter than a month cost a fraction of the plan and a window of two
+/// months cost twice it.
+pub const HOURS_PER_BILLING_MONTH: f64 = 730.0;
+
+/// Milliseconds in one hour: the store keeps instants in epoch milliseconds and a
+/// charge is metered in hours.
+const MILLIS_PER_HOUR: f64 = 3_600_000.0;
+
+/// The price of one GB-month of block storage, in USD.
+///
+/// SOURCE: the block storage line of the Lightsail price list ($0.10 per GB per
+/// month). Lightsail charges a disk for the size it is PROVISIONED at rather than
+/// for what is written to it, so the stored size is the whole basis.
+pub const DISK_PRICE_USD_PER_GB_MONTH: f64 = 0.10;
+
+/// The price of one GB-month of snapshot storage, in USD.
+///
+/// SOURCE: the snapshot line of the same price list ($0.05 per GB per month),
+/// which covers a disk, an instance and a database snapshot alike.
+pub const SNAPSHOT_PRICE_USD_PER_GB_MONTH: f64 = 0.05;
+
+/// The monthly price of one load balancer, in USD.
+///
+/// SOURCE: the load balancer line of the Lightsail price list ($18 a month). A
+/// load balancer is on no plan of its own — `CreateLoadBalancer` takes no bundle —
+/// so this flat price is its only basis.
+pub const LOAD_BALANCER_PRICE_USD_PER_MONTH: f64 = 18.0;
+
+/// The price of one hour of an UNATTACHED static IP, in USD.
+///
+/// SOURCE: the static IP line of the Lightsail price list — an address attached to
+/// an instance is free and an idle one is charged by the hour ($0.005). Which of
+/// the two applies is read off the stored attachment.
+pub const UNATTACHED_STATIC_IP_PRICE_USD_PER_HOUR: f64 = 0.005;
+
+/// The modelled `PricingUnit` value of a charge for a monthly plan.
+pub const PRICING_UNIT_BUNDLES: &str = "Bundles";
+
+/// The modelled `PricingUnit` value of a charge for stored data.
+pub const PRICING_UNIT_GB_MONTH: &str = "GB-Mo";
+
+/// The modelled `PricingUnit` value of a charge metered by the hour.
+pub const PRICING_UNIT_HOURS: &str = "Hrs";
+
+/// The modelled `Currency` enum's only value, so every figure is in US dollars.
+pub const CURRENCY_USD: &str = "USD";
+
+/// The usage type of a charge for the plan a resource runs on, before the plan id.
+///
+/// The model constrains `CostEstimate$usageType` to a non-empty string only, and
+/// AWS's own usage types are Region-prefixed billing-catalog strings this emulator
+/// has no catalog for. So the usage types below are an emulator CONVENTION: each
+/// names what the charge is for and, where a plan decides the price, the stored
+/// plan it was read from. A recorded Lightsail response would replace them.
+pub const USAGE_TYPE_BUNDLE_PREFIX: &str = "BundleUsage";
+
+/// The usage type of a charge for the power a container service runs on, before
+/// the power id. A container service is priced by its power and its scale rather
+/// than by a bundle, so its charge names the power.
+pub const USAGE_TYPE_POWER_PREFIX: &str = "PowerUsage";
+
+/// The usage type of a charge for a provisioned block storage disk.
+pub const USAGE_TYPE_DISK_STORAGE: &str = "DiskUsage";
+
+/// The usage type of a charge for stored snapshot data.
+pub const USAGE_TYPE_SNAPSHOT_STORAGE: &str = "SnapshotUsage";
+
+/// The usage type of a charge for a load balancer.
+pub const USAGE_TYPE_LOAD_BALANCER: &str = "LoadBalancerUsage";
+
+/// The usage type of a charge for a reserved static IP.
+pub const USAGE_TYPE_STATIC_IP: &str = "StaticIpUsage";
+
+/// The usage type of a charge for the plan `bundle_id` names.
+pub fn bundle_usage_type(bundle_id: &str) -> String {
+    format!("{USAGE_TYPE_BUNDLE_PREFIX}:{bundle_id}")
+}
+
+/// The usage type of a charge for the container service power `power_id` names.
+pub fn power_usage_type(power_id: &str) -> String {
+    format!("{USAGE_TYPE_POWER_PREFIX}:{power_id}")
+}
+
+/// One metered dimension of what a resource costs: what the charge is called,
+/// what it is measured in, how many of that unit an hour of the resource
+/// consumes, and what one unit costs.
+///
+/// Keeping the per-hour consumption and the unit price apart is what lets one
+/// window length serve every pricing basis: the units of a window are
+/// `units_per_hour * hours` whether a unit is a bundle-month, a GB-month or an
+/// hour.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Charge {
+    /// The `CostEstimate$usageType` this charge is reported under.
+    pub usage_type: String,
+    /// The modelled `PricingUnit` the charge is metered in.
+    pub pricing_unit: &'static str,
+    /// How many pricing units one billed hour consumes.
+    pub units_per_hour: f64,
+    /// What one pricing unit costs, in USD.
+    pub rate_usd_per_unit: f64,
+}
+
+impl Charge {
+    /// `quantity` of a resource on a monthly plan costing `price_usd_per_month`.
+    ///
+    /// The plan is the pricing unit, so a window of exactly one billing month
+    /// consumes `quantity` of them and costs `quantity` times the plan.
+    pub fn plan(usage_type: String, quantity: f64, price_usd_per_month: f64) -> Self {
+        Self {
+            usage_type,
+            pricing_unit: PRICING_UNIT_BUNDLES,
+            units_per_hour: quantity / HOURS_PER_BILLING_MONTH,
+            rate_usd_per_unit: price_usd_per_month,
+        }
+    }
+
+    /// `size_in_gb` of stored data at `price_usd_per_gb_month` a GB-month.
+    pub fn stored_gigabytes(
+        usage_type: String,
+        size_in_gb: i32,
+        price_usd_per_gb_month: f64,
+    ) -> Self {
+        Self {
+            usage_type,
+            pricing_unit: PRICING_UNIT_GB_MONTH,
+            units_per_hour: f64::from(size_in_gb) / HOURS_PER_BILLING_MONTH,
+            rate_usd_per_unit: price_usd_per_gb_month,
+        }
+    }
+
+    /// A resource charged `price_usd_per_hour` for each hour it is held.
+    pub fn hourly(usage_type: String, price_usd_per_hour: f64) -> Self {
+        Self {
+            usage_type,
+            pricing_unit: PRICING_UNIT_HOURS,
+            units_per_hour: 1.0,
+            rate_usd_per_unit: price_usd_per_hour,
+        }
+    }
+
+    /// How many pricing units this charge consumes over `hours`, and what they
+    /// cost in USD.
+    pub fn over(&self, hours: f64) -> Metered {
+        let unit = self.units_per_hour * hours;
+        Metered {
+            unit: rounded(unit),
+            usage_cost_usd: rounded(unit * self.rate_usd_per_unit),
+        }
+    }
+
+    /// This charge over a window of `hours` covering `period`, as the modelled
+    /// `CostEstimate`.
+    fn estimate(&self, hours: f64, period: &TimePeriod) -> CostEstimate {
+        let metered = self.over(hours);
+        CostEstimate {
+            usage_type: Some(self.usage_type.clone()),
+            results_by_time: Some(vec![EstimateByTime {
+                usage_cost: Some(metered.usage_cost_usd),
+                pricing_unit: Some(self.pricing_unit.to_string()),
+                unit: Some(metered.unit),
+                currency: Some(CURRENCY_USD.to_string()),
+                time_period: Some(period.clone()),
+            }]),
+        }
+    }
+}
+
+/// What one charge comes to over a window: the pricing units consumed and their
+/// cost. Named rather than a pair, so the two figures cannot be swapped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Metered {
+    /// `EstimateByTime$unit` — the count of the charge's `pricingUnit`.
+    pub unit: f64,
+    /// `EstimateByTime$usageCost`, in USD.
+    pub usage_cost_usd: f64,
+}
+
+/// A stored resource an estimate can be made for: which resource it is, when the
+/// store created it, and every charge it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BilledResource {
+    /// The resource's name, as the store holds it.
+    pub name: String,
+    /// The resource's modelled `ResourceType`.
+    pub resource_type: &'static str,
+    /// When the store created it, in epoch milliseconds: nothing is charged for
+    /// an hour before the resource existed.
+    pub created_at_ms: i64,
+    /// What this resource is charged for — empty when Lightsail prices it by
+    /// neither a plan nor a metered dimension this store holds.
+    pub charges: Vec<Charge>,
+}
+
+impl BilledResource {
+    /// This resource's estimate over the window `[start_ms, end_ms)`.
+    ///
+    /// The BILLED span is that window intersected with the time the resource has
+    /// existed for, because an hour before it was created is an hour it cost
+    /// nothing: a window entirely before the resource existed estimates zero
+    /// rather than a month of its plan, and its billed span is the empty one at
+    /// the window's own end rather than an instant outside the window. The window
+    /// the caller asked about is reported as the estimate's own
+    /// `startTime`/`endTime`, and the billed span as each result's `timePeriod`.
+    pub fn estimate(self, start_ms: i64, end_ms: i64) -> ResourceBudgetEstimate {
+        // Both instants come from the request, so the span is computed in a width
+        // that holds the difference of any two of them: a window from one end of
+        // the epoch-millisecond range to the other must still answer its own
+        // length rather than a wrapped, negative one.
+        let billed_start_ms = start_ms.max(self.created_at_ms).min(end_ms);
+        let billed_end_ms = end_ms;
+        let hours = (i128::from(billed_end_ms) - i128::from(billed_start_ms)) as f64
+            / MILLIS_PER_HOUR;
+        let period = TimePeriod {
+            start: Some(crate::state::timestamp(billed_start_ms)),
+            end: Some(crate::state::timestamp(billed_end_ms)),
+        };
+        ResourceBudgetEstimate {
+            resource_name: Some(self.name),
+            resource_type: Some(self.resource_type.to_string()),
+            cost_estimates: Some(
+                self.charges
+                    .iter()
+                    .map(|charge| charge.estimate(hours, &period))
+                    .collect(),
+            ),
+            start_time: Some(crate::state::timestamp(start_ms)),
+            end_time: Some(crate::state::timestamp(end_ms)),
+        }
+    }
+}
+
+/// Every resource this account holds under `name` in `region`, with what each of
+/// them is charged for.
+///
+/// A Lightsail name identifies one resource of one type, so this answers at most
+/// one entry per resource type and in practice exactly one — which is why the
+/// operation's output is a LIST. The walk is over the store's own records, so a
+/// resource type this store holds nothing of contributes nothing rather than a
+/// zero.
+///
+/// A stored record on a plan none of this service's published catalogs holds is a
+/// modelled server fault ([`unpriced`]) rather than a resource that costs nothing:
+/// an empty charge list means "priced by no dimension this store holds", and the
+/// two must not be confused.
+pub fn billed_resources(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    region: &str,
+    name: &str,
+) -> Result<Vec<BilledResource>, GetCostEstimateError> {
+    let mut billed = Vec::new();
+
+    if let Some(instance) = store.instance(name) {
+        // The same plan size costs more on Windows Server, which carries that
+        // platform's licence, so which of the plan's two prices applies follows
+        // the instance's own blueprint.
+        let platform = if crate::state::blueprint_is_windows(&instance.blueprint_id) {
+            crate::state::PLATFORM_WINDOWS
+        } else {
+            crate::state::PLATFORM_LINUX_UNIX
+        };
+        billed.push(BilledResource {
+            name: instance.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_INSTANCE,
+            created_at_ms: instance.created_at_ms,
+            charges: vec![Charge::plan(
+                bundle_usage_type(&instance.bundle_id),
+                1.0,
+                f64::from(instance.bundle.price(platform)),
+            )],
+        });
+    }
+
+    if let Some(disk) = store.disk(name) {
+        billed.push(BilledResource {
+            name: disk.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_DISK,
+            created_at_ms: disk.created_at_ms,
+            charges: vec![Charge::stored_gigabytes(
+                USAGE_TYPE_DISK_STORAGE.to_string(),
+                disk.size_in_gb,
+                DISK_PRICE_USD_PER_GB_MONTH,
+            )],
+        });
+    }
+
+    if let Some(snapshot) = store.disk_snapshot(name) {
+        billed.push(BilledResource {
+            name: snapshot.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+            created_at_ms: snapshot.created_at_ms,
+            charges: vec![snapshot_charge(snapshot.size_in_gb)],
+        });
+    }
+
+    if let Some(snapshot) = store.instance_snapshot(name) {
+        billed.push(BilledResource {
+            name: snapshot.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT,
+            created_at_ms: snapshot.created_at_ms,
+            charges: vec![snapshot_charge(snapshot.size_in_gb)],
+        });
+    }
+
+    if let Some(database) = store.relational_database(name) {
+        billed.push(BilledResource {
+            name: database.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+            created_at_ms: database.created_at_ms,
+            charges: vec![Charge::plan(
+                bundle_usage_type(database.bundle.bundle_id),
+                1.0,
+                f64::from(database.bundle.price_usd_per_month),
+            )],
+        });
+    }
+
+    if let Some(snapshot) = store.relational_database_snapshot(name) {
+        billed.push(BilledResource {
+            name: snapshot.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE_SNAPSHOT,
+            created_at_ms: snapshot.created_at_ms,
+            charges: vec![snapshot_charge(snapshot.size_in_gb)],
+        });
+    }
+
+    if let Some(bucket) = store.bucket(region, name) {
+        // The call that stored this bucket resolved its bundle id against THIS
+        // published catalog, so a miss is a fault of this emulator; answering it
+        // with no charge would be a $0 estimate indistinguishable from a resource
+        // that is priced by nothing.
+        let bundle = crate::state::bucket_bundle_spec(&bucket.bundle_id).ok_or_else(|| {
+            unpriced(crate::state::RESOURCE_TYPE_BUCKET, &bucket.bundle_id)
+        })?;
+        billed.push(BilledResource {
+            name: bucket.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_BUCKET,
+            created_at_ms: bucket.created_at_ms,
+            charges: vec![Charge::plan(
+                bundle_usage_type(&bucket.bundle_id),
+                1.0,
+                f64::from(bundle.price_usd_per_month),
+            )],
+        });
+    }
+
+    if let Some(service) = store.container_service(region, name) {
+        // Same: the create resolved the power against this catalog.
+        let power = crate::state::container_service_power(&service.power).ok_or_else(|| {
+            unpriced(crate::state::RESOURCE_TYPE_CONTAINER_SERVICE, &service.power)
+        })?;
+        billed.push(BilledResource {
+            name: service.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+            created_at_ms: service.created_at_ms,
+            // The scale is the count of compute nodes the service runs, each of
+            // them on the chosen power, so the scale is how many of that power
+            // the service is charged for.
+            charges: vec![Charge::plan(
+                power_usage_type(power.power_id),
+                f64::from(service.scale),
+                f64::from(power.price),
+            )],
+        });
+    }
+
+    if let Some(distribution) = store.distribution(name) {
+        // Same: the create resolved the bundle id against this catalog.
+        let bundle = crate::state::distribution_bundle_spec(&distribution.bundle_id)
+            .ok_or_else(|| {
+                unpriced(
+                    crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                    &distribution.bundle_id,
+                )
+            })?;
+        billed.push(BilledResource {
+            name: distribution.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_DISTRIBUTION,
+            created_at_ms: distribution.created_at_ms,
+            charges: vec![Charge::plan(
+                bundle_usage_type(&distribution.bundle_id),
+                1.0,
+                f64::from(bundle.price_usd_per_month),
+            )],
+        });
+    }
+
+    if let Some(balancer) = store.load_balancer(region, name) {
+        billed.push(BilledResource {
+            name: balancer.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+            created_at_ms: balancer.created_at_ms,
+            charges: vec![Charge::hourly(
+                USAGE_TYPE_LOAD_BALANCER.to_string(),
+                LOAD_BALANCER_PRICE_USD_PER_MONTH / HOURS_PER_BILLING_MONTH,
+            )],
+        });
+    }
+
+    if let Some(static_ip) = store.static_ip(name) {
+        // An address attached to an instance costs nothing and an idle one is
+        // charged by the hour. The stored attachment is what decides, so
+        // attaching or releasing the address changes the next estimate.
+        let price_usd_per_hour = if static_ip.attached_to.is_some() {
+            0.0
+        } else {
+            UNATTACHED_STATIC_IP_PRICE_USD_PER_HOUR
+        };
+        billed.push(BilledResource {
+            name: static_ip.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_STATIC_IP,
+            created_at_ms: static_ip.created_at_ms,
+            charges: vec![Charge::hourly(
+                USAGE_TYPE_STATIC_IP.to_string(),
+                price_usd_per_hour,
+            )],
+        });
+    }
+
+    // A DNS zone, an alarm and an export snapshot record are resources of the
+    // account that this service prices by neither a plan nor a metered dimension
+    // this store holds, so each is reported WITH no usage type: the resource
+    // exists, so the call is not a not-found, and no charge is invented for it.
+    if let Some(domain) = store.domain(name) {
+        billed.push(BilledResource {
+            name: domain.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_DOMAIN,
+            created_at_ms: domain.created_at_ms,
+            charges: Vec::new(),
+        });
+    }
+
+    if let Some(alarm) = store.alarm(name) {
+        billed.push(BilledResource {
+            name: alarm.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_ALARM,
+            created_at_ms: alarm.created_at_ms,
+            charges: Vec::new(),
+        });
+    }
+
+    if let Some(record) = store.export_snapshot_record(name) {
+        billed.push(BilledResource {
+            name: record.name.clone(),
+            resource_type: crate::state::RESOURCE_TYPE_EXPORT_SNAPSHOT_RECORD,
+            created_at_ms: record.created_at_ms,
+            charges: Vec::new(),
+        });
+    }
+
+    Ok(billed)
+}
+
+/// A stored record is on a plan none of this service's published catalogs holds,
+/// so its price cannot be read: a modelled server fault.
+///
+/// Unreachable through the API — every create resolves the plan it is given
+/// against the same catalogs before storing it — and it is a fault rather than an
+/// empty charge list precisely so a bug here can never be read as a resource that
+/// costs nothing.
+fn unpriced(resource_type: &str, plan: &str) -> GetCostEstimateError {
+    GetCostEstimateErrorModeled::ServiceException(ServiceException {
+        message: Some(format!(
+            "the stored {resource_type} is on {plan}, which this service publishes no price for"
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The charge for `size_in_gb` of snapshot storage.
+fn snapshot_charge(size_in_gb: i32) -> Charge {
+    Charge::stored_gigabytes(
+        USAGE_TYPE_SNAPSHOT_STORAGE.to_string(),
+        size_in_gb,
+        SNAPSHOT_PRICE_USD_PER_GB_MONTH,
+    )
+}
+
+/// `value` to the millionth, so a figure computed in binary floating point is not
+/// reported with its representation noise (a nano plan over a billing month costs
+/// $3.5, not $3.5000000000000004).
+fn rounded(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// `at` in epoch milliseconds, or this operation's refusal when it names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetCostEstimateError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> GetCostEstimateError {
+    GetCostEstimateErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetCostEstimateError {
+    GetCostEstimateErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

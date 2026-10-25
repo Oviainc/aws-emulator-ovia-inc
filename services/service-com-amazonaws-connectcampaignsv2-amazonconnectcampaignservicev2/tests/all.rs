@@ -19,6 +19,8 @@ mod campaign_communication_limits_deletion;
 mod campaign_communication_time_deletion;
 #[path = "all/campaign_communication_time_update.rs"]
 mod campaign_communication_time_update;
+#[path = "all/campaign_entry_limits.rs"]
+mod campaign_entry_limits;
 #[path = "all/campaign_flow_association.rs"]
 mod campaign_flow_association;
 #[path = "all/campaign_lifecycle.rs"]

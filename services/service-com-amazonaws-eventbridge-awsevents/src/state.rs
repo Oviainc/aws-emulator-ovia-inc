@@ -138,13 +138,18 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// The `version` every EventBridge event envelope carries.
 pub const EVENT_VERSION: &str = "0";
 
-/// Largest size one `PutEvents` entry may have, in bytes.
+/// Largest TOTAL entry size one `PutEvents` request may carry, in bytes —
+/// INCLUSIVE: a request measuring exactly this is within the limit.
 ///
 /// "You can batch multiple event entries into one request for efficiency.
-/// However, the total entry size must be less than 1MB" (`PutEvents`). The size
-/// is the one AWS documents under "Calculating PutEvents event entry size" (see
-/// [`put_events_entry_size`]); an entry past it is refused rather than stored,
-/// which also bounds the text the event-pattern matcher evaluates.
+/// However, the total entry size must be less than 1MB" (`PutEvents`), where
+/// the megabyte the limit is published in is 2^20 bytes: entries totalling
+/// exactly 1,048,576 bytes are the most AWS accepts, and only MORE than that is
+/// refused. The charge is the one AWS documents under "Calculating PutEvents
+/// event entry size" (see [`put_events_entry_size`]), summed over the request's
+/// entries — which for a single-entry request is that entry's own size. A
+/// request past it is refused as a WHOLE (see [`REQUEST_SIZE_EXCEEDED`]),
+/// which is also what bounds the text the event-pattern matcher walks.
 pub const MAX_ENTRY_SIZE_BYTES: usize = 1_048_576;
 
 /// How many routed events the routing log keeps.
@@ -219,6 +224,16 @@ pub fn put_events_entry_size(
     }
     size + resources.iter().map(String::len).sum::<usize>()
 }
+
+/// What a refusal states for a request whose entries total more than
+/// [`MAX_ENTRY_SIZE_BYTES`].
+///
+/// The bound is on the REQUEST ("the total entry size"), so the refusal is of
+/// the whole call. It is a CONSTANT of the condition — the verdict is on the
+/// total of the request's entries, not on anything in any one of them — so it
+/// carries none of the request's values.
+pub const REQUEST_SIZE_EXCEEDED: &str =
+    "Total size of the entries in the request is over the limit.";
 
 /// One target of a rule, as `PutTargets` stored it.
 ///
@@ -2153,6 +2168,150 @@ pub fn entry_limit_violation(detail_type: Option<&str>) -> Option<String> {
     })
 }
 
+/// How deeply one published event entry's `Detail` may nest JSON containers.
+///
+/// "PutEvents will only process nested JSON up to 1000 levels deep" (this
+/// service's `PutEvents` documentation): the published bound is on the DOCUMENT
+/// the entry carries, not on the parser that happens to read it, so it is
+/// stated here and checked by [`validate_detail`] — the `serde_json` parse-depth
+/// default is an order of magnitude below it and refusing at that default would
+/// reject documents AWS publishes.
+pub const MAX_DETAIL_DEPTH: usize = 1000;
+
+/// Why one entry's `Detail` cannot be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailRefusal {
+    /// Not a JSON object: `Detail` is "a valid JSON object"
+    /// (`PutEventsRequestEntry$Detail`), and a pattern reaches into it, so
+    /// anything else names no event document.
+    NotAnObject,
+    /// Nests deeper than [`MAX_DETAIL_DEPTH`] containers; carries the depth
+    /// that was measured, so the refusal states what it found.
+    TooDeep(usize),
+}
+
+impl DetailRefusal {
+    /// What a refused entry's `ErrorMessage` states. The condition is a
+    /// property of the document the entry carried, so the wording names the
+    /// bound it passed rather than echoing the document back.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotAnObject => "Detail is malformed.".to_string(),
+            Self::TooDeep(depth) => format!(
+                "Detail nests JSON {depth} levels deep, which exceeds the maximum nesting depth \
+                 of {MAX_DETAIL_DEPTH} levels."
+            ),
+        }
+    }
+}
+
+/// How many levels of JSON containers `text` nests at its deepest point.
+///
+/// Measured by walking the bytes, not by recursing, so it answers for a
+/// document far deeper than anything that may be parsed — which is what lets
+/// [`MAX_DETAIL_DEPTH`] be enforced BEFORE a parser descends into it. Only the
+/// container delimiters matter, and a delimiter inside a JSON string is text
+/// rather than structure, so strings (and their escapes) are skipped. A closing
+/// delimiter with nothing open is ignored: such text is not JSON at all and the
+/// read reports that.
+pub fn json_nesting_depth(text: &str) -> usize {
+    let mut open = 0usize;
+    let mut deepest = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                open += 1;
+                deepest = deepest.max(open);
+            }
+            b'}' | b']' => open = open.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// Whether one entry's `Detail` is a publishable event document.
+///
+/// Both of its checks are made WITHOUT descending into the document: the depth
+/// comes from [`json_nesting_depth`]'s byte walk, and the form comes from
+/// reading the text as one JSON object whose member values are left as raw text,
+/// which `serde_json` does with an explicit stack rather than by recursion. So
+/// an entry is judged on whatever stack it arrives on, however deeply it nests,
+/// and a document past the published [`MAX_DETAIL_DEPTH`] is refused here
+/// without ever being read — only building the parse tree ([`parse_detail`])
+/// costs depth, and nothing reaches that until this has passed.
+///
+/// The depth charge comes FIRST, so text that is both unbalanced and deep in
+/// delimiters is reported as past the bound rather than as malformed — the
+/// delimiter walk is what decides whether the text may be read at all, and both
+/// answers are the same per-entry refusal to a caller.
+pub fn validate_detail(detail: &str) -> Result<(), DetailRefusal> {
+    let depth = json_nesting_depth(detail);
+    if depth > MAX_DETAIL_DEPTH {
+        return Err(DetailRefusal::TooDeep(depth));
+    }
+    let mut reader = ::serde_json::Deserializer::from_str(detail);
+    // The document's own depth bound is the one checked above, so the parser's
+    // default must not refuse first.
+    reader.disable_recursion_limit();
+    // Read as a stream of documents, which is how the parser is asked for ONE
+    // value and then for the end of the input: text carrying a second document,
+    // or trailing bytes that are not whitespace, is not one JSON document. The
+    // member values stay raw, so nothing below the top level is descended into.
+    type RawMembers = ::std::collections::BTreeMap<String, Box<::serde_json::value::RawValue>>;
+    let mut documents = reader.into_iter::<RawMembers>();
+    if !matches!(documents.next(), Some(Ok(_))) {
+        return Err(DetailRefusal::NotAnObject);
+    }
+    if documents.next().is_some() {
+        return Err(DetailRefusal::NotAnObject);
+    }
+    Ok(())
+}
+
+/// One entry's `Detail` as the parse tree a rule's `EventPattern` is matched
+/// against, or `None` when it is not a publishable document at all.
+///
+/// Building the tree is the one read of a `Detail` that DESCENDS into it, one
+/// frame per level, so it is as deep as the document nests. The published
+/// [`MAX_DETAIL_DEPTH`] is therefore charged HERE too, with the same byte walk
+/// [`validate_detail`] uses and before the parser is handed anything: the bound
+/// on the recursion is a property of this function rather than of the order its
+/// callers happen to check things in, so no caller can reach the parser with a
+/// document past it. A document AT that bound costs on the order of two
+/// megabytes of stack, which is well inside the stack the emulator gives the
+/// threads it serves requests on.
+pub fn parse_detail(detail: &str) -> Option<::serde_json::Value> {
+    if json_nesting_depth(detail) > MAX_DETAIL_DEPTH {
+        return None;
+    }
+    let mut reader = ::serde_json::Deserializer::from_str(detail);
+    // Past the charge above, the parser's own default would refuse a document
+    // this operation publishes, so the published bound replaces it.
+    reader.disable_recursion_limit();
+    let mut documents = reader.into_iter::<::serde_json::Value>();
+    let Some(Ok(value)) = documents.next() else {
+        return None;
+    };
+    if documents.next().is_some() || !value.is_object() {
+        return None;
+    }
+    Some(value)
+}
+
 /// One clause of a `ValidationException` message: the value that was rejected,
 /// the member path it sat at, and the requirement it failed.
 ///
@@ -2283,6 +2442,10 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// can evaluate a pattern. `detail` is the entry's `Detail` parsed as JSON,
 /// because a pattern reaches INTO it. Only the fields the real envelope carries
 /// are present, so a pattern that matches here matches in AWS too.
+///
+/// Building it DESCENDS into `detail` ([`parse_detail`]), which charges the
+/// published nesting bound itself, so an unpublishable document leaves `detail`
+/// an empty object rather than reaching the parser.
 pub fn event_envelope(
     event_id: &str,
     region: &str,
@@ -2302,7 +2465,7 @@ pub fn event_envelope(
         "region": region,
         "resources": resources,
         "detail": detail
-            .and_then(|raw| ::serde_json::from_str::<::serde_json::Value>(raw).ok())
+            .and_then(parse_detail)
             .unwrap_or_else(|| ::serde_json::json!({})),
     })
 }

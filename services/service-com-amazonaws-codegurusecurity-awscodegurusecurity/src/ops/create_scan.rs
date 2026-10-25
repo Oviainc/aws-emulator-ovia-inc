@@ -9,7 +9,11 @@
 //! The `tags` this call carries land in the same tag store the tagging operations write,
 //! so the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is closed
 //! here too: a request naming such a key is refused with the modelled
-//! `ValidationException` (HTTP 400) and starts no scan.
+//! `ValidationException` (HTTP 400) and starts no scan. They are applied the way any
+//! tagging input is applied — additively, through [`crate::state::merge_tags`] — so a
+//! re-run of a scan already carrying tags keeps the keys this request does not name, and
+//! the accumulated map honours [`crate::state::TAGS_PER_SCAN_QUOTA`] as `TagResource`
+//! does.
 //!
 //! ## Shape of an operation
 //!
@@ -359,6 +363,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => {}
         }
 
+        // This call's `tags` are applied to the scan's tag store the way a tagging input
+        // is applied — additively — so a re-run of a tagged scan can only grow the map,
+        // which the same bound every writer of that store honours has to cover. Judged
+        // before anything is written, so a refused request starts no revision.
+        if let (Some(tags), Some(scan)) = (input.tags.as_ref(), store.scans.get(&input.scan_name)) {
+            let would = crate::state::tag_count_after_merge(&scan.tags, tags);
+            if would > crate::state::TAGS_PER_SCAN_QUOTA {
+                return Err(CreateScanErrorModeled::ValidationException(
+                    crate::state::tag_quota_refusal(
+                        "tags",
+                        &scan.scan_name_arn,
+                        scan.tags.len(),
+                        would,
+                    ),
+                )
+                .into());
+            }
+        }
+
         let run = crate::state::ScanRun {
             run_id: crate::state::mint_uuid(),
             code_artifact_id,
@@ -382,8 +405,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(scan) => {
                     // A re-run of the same scan name: one more revision of the resource.
                     scan.updated_at_millis = Some(now);
+                    // The scan's tags are a resource attribute, and a tagging input is
+                    // additive: the keys this request names take its values and every
+                    // other key the scan carries stays. Starting a revision is not a
+                    // request to untag the scan.
                     if let Some(tags) = &input.tags {
-                        scan.tags = tags.clone().into_iter().collect();
+                        crate::state::merge_tags(&mut scan.tags, tags);
                     }
                     scan.runs.push(run);
                     let index = scan.runs.len() - 1;
