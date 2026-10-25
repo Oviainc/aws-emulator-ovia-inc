@@ -176,16 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // "You can create one scaling plan per application source."
-        let covered_by = state.scaling_plans.values().find(|plan| {
-            crate::state::application_source_key(&plan.application_source)
-                .is_some_and(|key| key == source_key)
-        });
-        if let Some(existing) = covered_by {
-            return Err(validation(format!(
-                "The application source is already covered by the scaling plan '{}'",
-                existing.name
-            )));
+        // "You can create one scaling plan per application source." No plan exists yet
+        // under this name, so every stored plan is a competing claimant.
+        if let Some(existing) = state.plan_covering_source(&source_key, None) {
+            return Err(validation(
+                crate::state::application_source_covered_message(&existing.name),
+            ));
         }
 
         // The store this call grows is bounded: past the per-account quota a create

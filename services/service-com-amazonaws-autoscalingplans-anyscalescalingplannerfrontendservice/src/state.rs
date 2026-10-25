@@ -218,6 +218,29 @@ impl ComAmazonawsAutoscalingplansAnyscalescalingplannerfrontendserviceState {
             .get_mut(name)
             .filter(|plan| plan.version == version)
     }
+
+    /// The stored plan — other than `excluding` — that already claims the application
+    /// source whose identity is `source_key`.
+    ///
+    /// `ApplicationSource` is documented as "You can create one scaling plan per
+    /// application source", so EVERY path that sets a plan's application source refuses
+    /// a source this answers `Some` for. `excluding` names the plan the call itself
+    /// writes, which of course may keep claiming the source it already claims.
+    ///
+    /// A plan whose removal is only OWED still counts: it is still stored, and both
+    /// Describe operations still report it, so its source is claimable again only once
+    /// the clock has actually removed it (callers run [`Self::settle_due`] first).
+    pub fn plan_covering_source(
+        &self,
+        source_key: &str,
+        excluding: Option<&str>,
+    ) -> Option<&ScalingPlanRecord> {
+        self.scaling_plans.values().find(|plan| {
+            excluding != Some(plan.name.as_str())
+                && application_source_key(&plan.application_source)
+                    .is_some_and(|key| key == source_key)
+        })
+    }
 }
 
 /// A modelled `TimestampType` from a stored wall-clock instant.
@@ -885,6 +908,16 @@ pub fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String>
 /// on every path.
 pub fn plan_not_found_message(name: &str, version: i64) -> String {
     format!("No scaling plan found for scaling plan name: {name}, version: {version}")
+}
+
+/// The refusal wording for an application source another plan already claims, built
+/// from the name of the plan that claims it.
+///
+/// Both write paths (`CreateScalingPlan` and `UpdateScalingPlan`) refuse with this one
+/// text, so the single-plan-per-application-source rule reads the same however the
+/// source was about to be claimed.
+pub fn application_source_covered_message(covered_by: &str) -> String {
+    format!("The application source is already covered by the scaling plan '{covered_by}'")
 }
 
 /// Encode a pagination cursor as an opaque token.
