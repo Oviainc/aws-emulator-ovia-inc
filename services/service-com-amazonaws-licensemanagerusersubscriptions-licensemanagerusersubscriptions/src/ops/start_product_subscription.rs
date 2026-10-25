@@ -7,6 +7,13 @@
 //! the `ProductUserSummary` built from the record it stored, so
 //! `ListProductSubscriptions` reports exactly this subscription.
 //!
+//! The summary's license expiry is the one member not read straight off the record: a
+//! subscription through a registration backed by a license server endpoint carries the
+//! expiry of the license it holds, counted from the instant the subscription started,
+//! and one through a registration with no such endpoint carries none. Both come from
+//! `crate::state`'s one summary reader, so every operation that reports this product
+//! user answers the same thing.
+//!
 //! An identity provider that is not registered for the requested product makes this call
 //! fail CLOSED: `UnauthorizedException` with the fixed sentence, which says nothing about
 //! whether the provider exists. Subscribing a user is a user-plane call, and a caller told
@@ -200,6 +207,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The in-memory store is bounded, and AWS bounds this resource per account too:
+        // the modelled quota error is what a caller at the limit is told, exactly as
+        // `AssociateUser` and `RegisterIdentityProvider` answer it, so a caller cannot buy
+        // unbounded state — nor the work a later list spends on it — one subscribe at a
+        // time.
+        let subscribed = state.product_users.len();
+        if crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::at_resource_limit(
+            subscribed,
+        ) {
+            return Err(
+                StartProductSubscriptionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the account already has {subscribed} product subscriptions, the \
+                             most this service holds"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let id = state.mint_id("pu");
         let arn = crate::state::resource_arn(&signing_name, &region, "user", &id);
         let record = crate::state::ProductUserRecord {
@@ -210,22 +239,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::STATUS_SUBSCRIBED.to_string(),
             status_message: None,
             domain: input.domain.clone(),
-            subscription_start_date: Some(crate::state::iso8601(now)),
-            subscription_end_date: None,
-            // Only a product served by a license server endpoint carries an expiry; this
-            // slice creates none, so the member stays absent rather than invented.
-            license_expiration_date: None,
+            subscribed_at: now,
+            unsubscribed_at: None,
         };
 
         if let Some(tags) = input.tags.as_ref() {
             state.merge_tags(&arn, tags).map_err(into_error)?;
         }
-        state.product_users.insert(arn.clone(), record.clone());
-        state.product_user_order.push(arn);
-        state.product_user_index.insert(index_key, record.arn.clone());
+        // The one product-user writer, so the record, the list order and the index that
+        // reaches it cannot disagree.
+        state.insert_product_user(record.clone());
 
         Ok(StartProductSubscriptionOutput {
-            product_user_summary: crate::state::product_user_summary(&record, &provider_union),
+            product_user_summary: state.product_user_summary(&record, &provider_union),
         })
     }
 }

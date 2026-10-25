@@ -39,6 +39,8 @@ mod import_task_lifecycle;
 mod import_task_minting;
 #[path = "all/private_graph_endpoint_lifecycle.rs"]
 mod private_graph_endpoint_lifecycle;
+#[path = "all/private_graph_endpoint_listing.rs"]
+mod private_graph_endpoint_listing;
 #[path = "all/private_graph_endpoint_read.rs"]
 mod private_graph_endpoint_read;
 #[path = "all/query_cancellation.rs"]

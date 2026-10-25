@@ -194,10 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )))
         })?;
         ended.status = crate::state::STATUS_UNSUBSCRIBED.to_string();
-        ended.subscription_end_date = Some(crate::state::iso8601(now));
+        ended.unsubscribed_at = Some(now);
 
         Ok(StopProductSubscriptionOutput {
-            product_user_summary: crate::state::product_user_summary(&ended, &provider_union),
+            product_user_summary: state.product_user_summary(&ended, &provider_union),
         })
     }
 }

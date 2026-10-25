@@ -15,6 +15,8 @@
 mod account_device_gate;
 #[path = "all/device_ec2_instances.rs"]
 mod device_ec2_instances;
+#[path = "all/device_resources.rs"]
+mod device_resources;
 #[path = "all/device_task_lifecycle.rs"]
 mod device_task_lifecycle;
 #[path = "all/empty_inventory_refusals.rs"]
