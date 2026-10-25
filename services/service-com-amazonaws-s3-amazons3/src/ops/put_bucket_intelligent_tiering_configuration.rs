@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketIntelligentTieringConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketIntelligentTieringConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records one S3 Intelligent-Tiering configuration on an existing bucket,
+//! under the `Id` the request names — a bucket carries up to
+//! [`crate::state::MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET`] of them, so a put
+//! under an id the bucket already carries replaces THAT configuration and leaves the rest
+//! in place, and a put that would add one past the ceiling answers
+//! `TooManyConfigurations`. Refused before anything is written when the payload is not a
+//! configuration S3 can apply: an `Id` that is not the one the request identifies, a
+//! `Status` or a tiering `AccessTier` outside its enum, or a tiering `Days` outside the
+//! range that tier's documentation publishes (`InvalidArgument`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketIntelligentTieringConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read side is `ListBucketIntelligentTieringConfigurations`, implemented in the same
+//! change so a put can be read back; `GetBucketIntelligentTieringConfiguration` and
+//! `DeleteBucketIntelligentTieringConfiguration` are still the scaffold's 501 and are
+//! their own stub issues.
 //!
 //! ## Shape of an operation
 //!
@@ -128,9 +133,21 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketIntelligentTier
 // here — hence the `PutBucketIntelligentTieringConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketIntelligentTieringConfiguration")]
+// Widened by `NoSuchBucket` the way `PutBucketReplication` widens it: the model's error
+// list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketIntelligentTieringConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket
+// does not exist", `httpError 404`). `extra_errors` widens the set with that shape, which
+// the SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketIntelligentTieringConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketIntelligentTieringConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -184,18 +201,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketIntelligentTieringConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketIntelligentTieringConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketIntelligentTieringConfiguration"))
+        // Everything this write needs is in its deserialized input: the expected owner,
+        // the id and the configuration travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketIntelligentTieringConfigurationRequest$ExpectedBucketOwner`), judged
+        // as every other bucket-scoped operation in this crate judges it: this emulator
+        // serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no bucket store to write to, and
+            // this operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketIntelligentTieringConfiguration",
+            ));
+        };
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put
+        // leaves the bucket's configurations exactly as they were; and the bucket is looked
+        // up FIRST, so a request naming a bucket this emulator does not hold answers that
+        // rather than reporting whatever is wrong with a configuration the bucket could
+        // never have carried (the order `PutBucketReplication` keeps).
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(
+                PutBucketIntelligentTieringConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        }
+
+        let configuration = &input.intelligent_tiering_configuration;
+
+        // The request identifies the configuration by "the ID used to identify the S3
+        // Intelligent-Tiering configuration" (`Id`), and the payload carries that same id
+        // as `IntelligentTieringConfiguration$Id`: a payload naming a different one does
+        // not describe the configuration the request addresses, which is what
+        // `InvalidArgument` reports.
+        if configuration.id != input.id {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "IntelligentTieringConfiguration.Id must be the id the request \
+                     identifies ({:?}), got {:?}",
+                    input.id, configuration.id
+                ),
+            ));
+        }
+
+        // `IntelligentTieringStatus` is an enum of exactly two values
+        // (`smithy_query(query="shape",shape="IntelligentTieringStatus")`). The boundary
+        // validator refuses a value outside it before this handler runs, so this is what
+        // keeps the handler TOTAL rather than a second statement of that bound — the
+        // reading `PutBucketAcl` gives its own canned-ACL check.
+        if !INTELLIGENT_TIERING_STATUS_VALUES.contains(&configuration.status.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!(
+                    "IntelligentTieringConfiguration.Status must name one of \
+                     {INTELLIGENT_TIERING_STATUS_VALUES:?}, got {:?}",
+                    configuration.status
+                ),
+            ));
+        }
+
+        for tiering in &configuration.tierings {
+            // `IntelligentTieringAccessTier` is an enum of exactly two values — refused at
+            // the boundary as the status above is — and the day range a tiering may name
+            // depends on which of them it is, which is this handler's own rule.
+            let Some(floor) = archive_tier_minimum_days(&tiering.access_tier) else {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Tiering.AccessTier must name one of \
+                         {INTELLIGENT_TIERING_ACCESS_TIER_VALUES:?}, got {:?}",
+                        tiering.access_tier
+                    ),
+                ));
+            };
+            if tiering.days < floor || tiering.days > MAX_TIERING_DAYS {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Tiering.Days for access tier {:?} must be between {floor} and \
+                         {MAX_TIERING_DAYS}, got {}",
+                        tiering.access_tier, tiering.days
+                    ),
+                ));
+            }
+        }
+
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(
+                PutBucketIntelligentTieringConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        };
+        // The payload is the complete container, so what the request names becomes the
+        // bucket's configuration under this id in full; the store refuses a put that would
+        // add one past the published per-bucket ceiling and writes nothing for it.
+        match bucket.put_intelligent_tiering_configuration(
+            input.id.clone(),
+            input.intelligent_tiering_configuration,
+        ) {
+            crate::state::IntelligentTieringWrite::Stored => {}
+            crate::state::IntelligentTieringWrite::ConfigurationCountReached => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::TOO_MANY_CONFIGURATIONS_CODE,
+                    crate::state::TOO_MANY_CONFIGURATIONS_STATUS,
+                    format!(
+                        "The bucket already carries the {} S3 Intelligent-Tiering \
+                         configurations a bucket may have",
+                        crate::state::MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET
+                    ),
+                ));
+            }
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketIntelligentTieringConfigurationOutput)
     }
 }
+
+/// The fewest consecutive days of no access a tiering may name for `access_tier`, or
+/// `None` when `access_tier` is not one of `IntelligentTieringAccessTier`'s values.
+///
+/// From `Tiering$Days`'s own documentation: "The minimum number of days specified for
+/// Archive Access tier must be at least 90 days and Deep Archive Access tier must be at
+/// least 180 days." The tier names are the enum's values, read from the crate's own
+/// generated catalog ([`INTELLIGENT_TIERING_ACCESS_TIER_VALUES`]) so the set this accepts
+/// cannot drift from the model.
+fn archive_tier_minimum_days(access_tier: &str) -> Option<i32> {
+    if !INTELLIGENT_TIERING_ACCESS_TIER_VALUES.contains(&access_tier) {
+        return None;
+    }
+    match access_tier {
+        DEEP_ARCHIVE_ACCESS_TIER => Some(DEEP_ARCHIVE_ACCESS_MINIMUM_DAYS),
+        _ => Some(ARCHIVE_ACCESS_MINIMUM_DAYS),
+    }
+}
+
+/// The deeper of the two archiving tiers, as `IntelligentTieringAccessTier` spells it: the
+/// one whose floor is the longer of the two the `Days` documentation publishes.
+const DEEP_ARCHIVE_ACCESS_TIER: &str = "DEEP_ARCHIVE_ACCESS";
+
+/// "The minimum number of days specified for Archive Access tier must be at least 90 days"
+/// (`Tiering$Days`).
+const ARCHIVE_ACCESS_MINIMUM_DAYS: i32 = 90;
+
+/// "… and Deep Archive Access tier must be at least 180 days" (the same sentence).
+const DEEP_ARCHIVE_ACCESS_MINIMUM_DAYS: i32 = 180;
+
+/// "The maximum can be up to 2 years (730 days)" (the same documentation) — the far end of
+/// the range, which holds for either access tier.
+const MAX_TIERING_DAYS: i32 = 730;
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

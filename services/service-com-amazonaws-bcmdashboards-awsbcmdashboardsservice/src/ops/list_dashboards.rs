@@ -159,69 +159,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it walks the stored dashboards and writes nothing.
         let state = state.lock();
 
-        // Where this page starts. An absent token starts at the first dashboard; a
-        // token this service minted names the ARN to resume at.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_page_token(
-                token,
-                crate::state::DASHBOARD_ARN_SEGMENT,
-            ) {
-                Some(arn) => Some(arn),
-                None => {
-                    return Err(ListDashboardsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: "Member must be a nextToken returned by a previous \
-                                      ListDashboards call: nextToken"
-                                .to_string(),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
-        // `max_results` carries the model's declared default (20) when the client
-        // omitted it, and its @range (1..100) is already enforced at the boundary. A
-        // non-positive page size is refused rather than clamped: a zero-item page that
-        // still carried a cursor would be a client loop that never terminates.
-        let page_size = match usize::try_from(input.max_results) {
-            Ok(size) if size >= 1 => size,
-            _ => {
-                return Err(ListDashboardsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "Member must have value greater than or equal to 1: maxResults {}",
-                            input.max_results
-                        ),
-                    },
-                )
-                .into())
-            }
-        };
-        // The page starts at the cursor's ARN when there is one, else at the first
-        // stored dashboard. Borrowed bounds, so resuming copies no ARN.
-        let start = match resume_from.as_deref() {
-            Some(arn) => ::std::ops::Bound::Included(arn),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        let mut remaining = state
-            .dashboards
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded));
-
-        let mut dashboards = Vec::new();
-        for (_, dashboard) in remaining.by_ref().take(page_size) {
-            dashboards.push(dashboard.reference());
-        }
-        // The cursor is the first dashboard AFTER this page, so `nextToken` is present
-        // exactly when one remains.
-        let next_token = remaining
-            .next()
-            .map(|(arn, _)| crate::state::encode_page_token(arn));
+        // The cursor and page-size rule every listing of this service follows lives in
+        // `crate::state::listing_page`: an absent token starts at the first dashboard, a
+        // token this service minted for a dashboard listing names the ARN to resume at,
+        // and the page holds at most `max_results` dashboards (the model's declared
+        // default, 20, when the client omitted it; its @range 1..100 is already enforced
+        // at the boundary). Each stored record is projected onto a `DashboardReference`.
+        let page = crate::state::listing_page(
+            &state.dashboards,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::DASHBOARD_ARN_SEGMENT,
+            crate::state::Dashboard::reference,
+        )
+        .map_err(|refusal| {
+            ListDashboardsErrorModeled::ValidationException(ValidationException {
+                message: refusal.message(<Self as smithy_server_runtime::Operation>::NAME),
+            })
+        })?;
 
         Ok(ListDashboardsOutput {
-            dashboards,
-            next_token,
+            dashboards: page.items,
+            next_token: page.next_token,
         })
     }
 }

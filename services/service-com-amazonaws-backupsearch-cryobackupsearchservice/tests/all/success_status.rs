@@ -32,7 +32,7 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
     call, emulator, emulator_with_engine, percent_encode, query_value, recovery_point,
-    seed_recovery_points, PAST_THE_DUE_INSTANT,
+    seed_recovery_points, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
 };
 
 /// The region every call in this suite is signed for. The status does not vary by region
@@ -259,9 +259,9 @@ async fn every_operations_success_status_is_the_one_its_response_shape_implies()
 
     // `StopSearchJob` is the empty-output operation whose success code the model STATES,
     // so it is the row that pins the other side of the rule. It is addressed at a job
-    // started right before it, which is therefore still inside its transition span and
-    // can still be cancelled.
+    // whose scan is running, which is the status the operation acts from.
     let (to_stop, _) = started_job(&emulator, "success-status-stopped", json!({})).await;
+    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
     let stop = vec![Row {
         // output {} just like the two tag writes, but http {code: 200} stated EXPLICITLY
         // (no codeDefaulted), so the model's own code is the contract.

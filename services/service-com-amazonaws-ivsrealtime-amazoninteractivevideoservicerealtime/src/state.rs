@@ -1182,25 +1182,49 @@ impl CompositionRecord {
     /// `ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`'s
     /// to act on.
     pub fn materialize_due(&mut self, now: SystemTime) {
-        if self.state == COMPOSITION_STATE_STARTING && now >= self.active_at {
-            self.state = COMPOSITION_STATE_ACTIVE.to_string();
+        let due = self.state_at(now);
+        if due == self.state {
+            return;
+        }
+        let due = due.to_string();
+        if due == COMPOSITION_STATE_ACTIVE {
             for destination in &mut self.destinations {
                 if destination.state == DESTINATION_STATE_STARTING {
                     destination.state = DESTINATION_STATE_ACTIVE.to_string();
                 }
             }
-            return;
-        }
-        let stopped_at = self.ended_at.map(|ended_at| ended_at + COMPOSITION_STOP_SPAN);
-        if self.state == COMPOSITION_STATE_STOPPING
-            && stopped_at.is_some_and(|stopped_at| now >= stopped_at)
-        {
-            self.state = COMPOSITION_STATE_STOPPED.to_string();
+        } else if due == COMPOSITION_STATE_STOPPED {
             for destination in &mut self.destinations {
                 if destination.state == DESTINATION_STATE_STOPPING {
                     destination.state = DESTINATION_STATE_STOPPED.to_string();
                 }
             }
+        }
+        self.state = due;
+    }
+
+    /// The `CompositionState` this composition is in at `now`, whether or not anybody has
+    /// called since the clock made it due.
+    ///
+    /// A composition's position in its lifecycle is a function of the instants the start
+    /// and the stop recorded — [`Self::active_at`] for `STARTING` -> `ACTIVE`, one
+    /// [`COMPOSITION_STOP_SPAN`] after [`Self::ended_at`] for `STOPPING` -> `STOPPED` —
+    /// so this is what every reader asks, and the stored `state` is only where
+    /// [`Self::materialize_due`] writes the answer down. A reader holding the store
+    /// immutably therefore reaches the same answer as one that can write, instead of
+    /// seeing a transition that is due but not yet recorded. A state the clock owes
+    /// nothing from is reported as stored.
+    pub fn state_at(&self, now: SystemTime) -> &str {
+        match self.state.as_str() {
+            COMPOSITION_STATE_STARTING if now >= self.active_at => COMPOSITION_STATE_ACTIVE,
+            COMPOSITION_STATE_STOPPING
+                if self
+                    .ended_at
+                    .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN) =>
+            {
+                COMPOSITION_STATE_STOPPED
+            }
+            state => state,
         }
     }
 
@@ -1273,6 +1297,11 @@ impl CompositionRecord {
     /// The two states a composition reaches on its way up ([`COMPOSITION_STATE_STARTING`]
     /// and [`COMPOSITION_STATE_ACTIVE`]); from any other one the broadcast is already
     /// ending or has ended, which is what makes a second stop the modelled conflict.
+    ///
+    /// Asked of the stored state, because the only transitions the clock owes are between
+    /// two states this answers the same for ([`Self::state_at`] moves `STARTING` to
+    /// `ACTIVE` and `STOPPING` to `STOPPED`): whether the due transition has been written
+    /// down yet cannot change the answer.
     pub fn is_running(&self) -> bool {
         self.state == COMPOSITION_STATE_STARTING || self.state == COMPOSITION_STATE_ACTIVE
     }
@@ -1296,11 +1325,11 @@ impl CompositionRecord {
     /// nothing may report it any more.
     ///
     /// Due one [`COMPOSITION_STOP_SPAN`] after the stop finished, which is two spans after
-    /// the stop began — computed from the recorded end time rather than stored, so a
-    /// reader that holds the record immutably reaches the same answer as one that can
-    /// write ([`Self::materialize_due`] is what removes it).
+    /// the stop began — computed from the recorded end time and [`Self::state_at`] rather
+    /// than from the stored state, so a reader that holds the record immutably reaches the
+    /// same answer as one that can write ([`Self::materialize_due`] is what removes it).
     pub fn is_reclaimed(&self, now: SystemTime) -> bool {
-        self.state == COMPOSITION_STATE_STOPPED
+        self.state_at(now) == COMPOSITION_STATE_STOPPED
             && self
                 .ended_at
                 .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN * 2)
@@ -3368,9 +3397,10 @@ pub fn resource_tags(
             .compositions
             .get(arn)
             // This reader holds the store immutably, so a composition the clock has
-            // already reclaimed is skipped rather than dropped: a tag listing answers for
-            // exactly the compositions `GetComposition` answers for, and the next call
-            // that can write clears the record.
+            // already reclaimed is skipped rather than dropped: the reclaim deadline is
+            // computed from the instant the stop recorded, so a tag listing answers for
+            // exactly the compositions `GetComposition` answers for at the same instant,
+            // and the next call that can write clears the record.
             .filter(|composition| !composition.is_reclaimed(SystemTime::now()))
             .map(|composition| composition.tags.clone()),
         "ingest-configuration" => state

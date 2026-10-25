@@ -160,69 +160,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it walks the stored scheduled reports and writes nothing.
         let state = state.lock();
 
-        // Where this page starts. An absent token starts at the first report; a token
-        // this service minted for a scheduled-report listing names the ARN to resume at.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_page_token(
-                token,
-                crate::state::SCHEDULED_REPORT_ARN_SEGMENT,
-            ) {
-                Some(arn) => Some(arn),
-                None => {
-                    return Err(ListScheduledReportsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: "Member must be a nextToken returned by a previous \
-                                      ListScheduledReports call: nextToken"
-                                .to_string(),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
-        // `max_results` carries the model's declared default (50) when the client
-        // omitted it, and its @range (1..100) is already enforced at the boundary. A
-        // non-positive page size is refused rather than clamped: a zero-item page that
-        // still carried a cursor would be a client loop that never terminates.
-        let page_size = match usize::try_from(input.max_results) {
-            Ok(size) if size >= 1 => size,
-            _ => {
-                return Err(ListScheduledReportsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "Member must have value greater than or equal to 1: maxResults {}",
-                            input.max_results
-                        ),
-                    },
-                )
-                .into())
-            }
-        };
-        // The page starts at the cursor's ARN when there is one, else at the first
-        // stored report. Borrowed bounds, so resuming copies no ARN.
-        let start = match resume_from.as_deref() {
-            Some(arn) => ::std::ops::Bound::Included(arn),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        let mut remaining = state
-            .scheduled_reports
-            .range::<str, _>((start, ::std::ops::Bound::Unbounded));
-
-        let mut scheduled_reports = Vec::new();
-        for (_, report) in remaining.by_ref().take(page_size) {
-            scheduled_reports.push(report.summary());
-        }
-        // The cursor is the first report AFTER this page, so `nextToken` is present
-        // exactly when one remains.
-        let next_token = remaining
-            .next()
-            .map(|(arn, _)| crate::state::encode_page_token(arn));
+        // The same cursor and page-size rule the dashboard listing follows, from the one
+        // place it is defined (`crate::state::listing_page`): an absent token starts at
+        // the first report, a token this service minted for a scheduled-report listing
+        // names the ARN to resume at, and the page holds at most `max_results` reports
+        // (the model's declared default, 50, when the client omitted it; its @range
+        // 1..100 is already enforced at the boundary). Each stored record is projected
+        // onto a `ScheduledReportSummary`.
+        let page = crate::state::listing_page(
+            &state.scheduled_reports,
+            input.next_token.as_deref(),
+            input.max_results,
+            crate::state::SCHEDULED_REPORT_ARN_SEGMENT,
+            crate::state::ScheduledReportRecord::summary,
+        )
+        .map_err(|refusal| {
+            ListScheduledReportsErrorModeled::ValidationException(ValidationException {
+                message: refusal.message(<Self as smithy_server_runtime::Operation>::NAME),
+            })
+        })?;
 
         Ok(ListScheduledReportsOutput {
-            scheduled_reports,
-            next_token,
+            scheduled_reports: page.items,
+            next_token: page.next_token,
         })
     }
 }

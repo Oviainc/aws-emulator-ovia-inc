@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/entry_level_semantics.rs"]
+mod entry_level_semantics;
 #[path = "all/event_bus_configuration.rs"]
 mod event_bus_configuration;
 #[path = "all/event_bus_deletion.rs"]

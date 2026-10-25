@@ -5,9 +5,11 @@
 //! — with the id this call answered for it and the names of the bus's enabled rules
 //! whose event pattern the event matched — so what the call reports is what the store
 //! holds. `FailedEntryCount` counts the entries that were refused: an entry whose
-//! `Detail` is not a JSON object, an entry over the documented 256 KB entry size, and
-//! an entry addressed to a bus the account does not own. The bus's log is bounded, so
-//! recording the newest event evicts the oldest once the retention window is full.
+//! `Detail` is not a JSON object, and an entry over the documented 256 KB entry size.
+//! An entry addressed to a bus the account does not own is NOT one of them: the
+//! destination is not a property of the entry, so the entry is ingested, given an id,
+//! and the event is simply routed nowhere. The bus's log is bounded, so recording the
+//! newest event evicts the oldest once the retention window is full.
 //!
 //! ## Shape of an operation
 //!
@@ -256,17 +258,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 };
                 let bus_name = recorded.bus_name.clone();
-                if store.bus_for_write(&bus_name, &region).is_none() {
-                    *outcome = Outcome::Refused(PutEventsResultEntry {
-                        event_id: None,
-                        error_code: Some("ResourceNotFoundException".to_string()),
-                        error_message: Some(format!("Event bus {bus_name} does not exist.")),
-                    });
-                    continue;
+                // An entry naming a bus the account does not hold is still
+                // INGESTED: the destination is not a property of the entry, and
+                // this operation models no error for a missing one, so nothing
+                // reports it to the publisher. There is simply nothing to match
+                // such an event against, and nothing to record it on.
+                if store.bus_exists(&bus_name) {
+                    candidates
+                        .entry(bus_name.clone())
+                        .or_insert_with(|| store.match_candidates(&bus_name));
                 }
-                candidates
-                    .entry(bus_name.clone())
-                    .or_insert_with(|| store.match_candidates(&bus_name));
                 recorded.event_id = store.mint_event_id();
             }
         }
@@ -318,38 +319,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         entries.push(entry);
                     }
                     Outcome::Accepted(recorded) => {
-                        // Phase 2 resolved this bus and nothing can remove one
-                        // (`DeleteEventBus` is still a stub), so the bus is
-                        // there; a request that somehow found it gone is
-                        // refused rather than answered with an id for an event
-                        // nothing holds.
                         let event_id = recorded.event_id.clone();
                         let bus_name = recorded.bus_name.clone();
-                        let recorded_now = store
-                            .bus_for_write(&bus_name, &region)
-                            .map(|bus| {
-                                // The log is bounded: recording the newest event
-                                // evicts the oldest once the bus is at its
-                                // retention window.
-                                bus.record(recorded);
-                            })
-                            .is_some();
-                        if recorded_now {
-                            entries.push(PutEventsResultEntry {
-                                event_id: Some(event_id),
-                                error_code: None,
-                                error_message: None,
-                            });
-                        } else {
-                            failed_entry_count += 1;
-                            entries.push(PutEventsResultEntry {
-                                event_id: None,
-                                error_code: Some("ResourceNotFoundException".to_string()),
-                                error_message: Some(format!(
-                                    "Event bus {bus_name} does not exist."
-                                )),
-                            });
+                        // Recorded where there is a bus to record it on. The log
+                        // is bounded: recording the newest event evicts the
+                        // oldest once the bus is at its retention window. An
+                        // event published to a bus the account does not hold is
+                        // routed nowhere, so nothing holds it — and the id this
+                        // call already answered with stands either way, because
+                        // the entry WAS ingested.
+                        if let Some(bus) = store.bus_for_write(&bus_name, &region) {
+                            bus.record(recorded);
                         }
+                        entries.push(PutEventsResultEntry {
+                            event_id: Some(event_id),
+                            error_code: None,
+                            error_message: None,
+                        });
                     }
                 }
             }

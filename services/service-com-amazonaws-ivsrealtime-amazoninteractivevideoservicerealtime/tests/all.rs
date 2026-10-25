@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/composition_stop.rs"]
 mod composition_stop;
+#[path = "all/composition_tag_lifetime.rs"]
+mod composition_tag_lifetime;
 #[path = "all/compositions.rs"]
 mod compositions;
 #[path = "all/create_ingest_configuration_inputs.rs"]
