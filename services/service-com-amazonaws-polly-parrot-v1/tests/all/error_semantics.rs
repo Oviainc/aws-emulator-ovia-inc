@@ -258,16 +258,20 @@ async fn get_speech_synthesis_task_reports_the_stored_task() {
             Some(i64::from(task.request_characters)),
             "case {case:?}: wrong RequestCharacters, got {reported:?}"
         );
-        assert_eq!(
-            reported["LexiconNames"],
-            serde_json::json!(task.lexicon_names),
-            "case {case:?}: wrong LexiconNames, got {reported:?}"
-        );
-        assert_eq!(
-            reported["SpeechMarkTypes"],
-            serde_json::json!(task.speech_mark_types),
-            "case {case:?}: wrong SpeechMarkTypes, got {reported:?}"
-        );
+        // An optional list member is reported only when the task has values for it,
+        // so a task that applied no lexicon and asked for no speech marks carries
+        // neither key — not an empty array.
+        for (member, stored) in [
+            ("LexiconNames", &task.lexicon_names),
+            ("SpeechMarkTypes", &task.speech_mark_types),
+        ] {
+            let expected = (!stored.is_empty()).then(|| serde_json::json!(stored));
+            assert_eq!(
+                reported.get(member).cloned(),
+                expected,
+                "case {case:?}: wrong {member}, got {reported:?}"
+            );
+        }
         let reported_creation = reported["CreationTime"]
             .as_f64()
             .unwrap_or_else(|| panic!("case {case:?}: CreationTime is a timestamp, got {reported:?}"));

@@ -32,10 +32,12 @@ use crate::ops::types::{
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
-    CognitoOptions, CognitoOptionsStatus, ConnectionProperties, DataSourceDetails, DataSourceType,
+    CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
+    DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
-    DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainStatus, EBSOptions,
+    DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
+    DomainStatus, EBSOptions,
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
@@ -44,11 +46,13 @@ use crate::ops::types::{
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
-    PackageConfiguration, PackageDetails, PackageEncryptionOptions, PackageSource,
+    PackageAssociationConfiguration, PackageConfiguration, PackageDetails,
+    PackageEncryptionOptions, PackageSource,
     PackageVendingOptions,
     RecurringCharge, ReservedInstance,
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
-    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
+    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ScheduledAction, ServiceSoftwareOptions,
+    SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
@@ -954,6 +958,79 @@ impl ServiceSoftware {
     }
 }
 
+/// One configuration change scheduled on a domain, as this emulator persists it.
+///
+/// A scheduled action is a record with an identity of its own — an action id, a type,
+/// a severity and the instant it is to happen — rather than a projection of some
+/// other record: `ListScheduledActions` reports it and `UpdateScheduledAction`
+/// reschedules it, so this is the ONE copy both reach. The operations that SCHEDULE
+/// one (`StartServiceSoftwareUpdate` for a service software update, and the Auto-Tune
+/// side of `UpdateDomainConfig` for a blue/green enhancement) are still scaffold
+/// stubs, so today the only writer is whatever puts a record here directly.
+///
+/// Its members are kept as the values the model's own enums admit (`ActionType`,
+/// `ActionSeverity`, `ScheduledBy`, `ActionStatus`) so the report is the stored
+/// record rather than a second derivation of it.
+#[derive(Debug, Clone)]
+pub struct ScheduledChange {
+    /// `ScheduledAction$Id`: "the unique identifier of the scheduled action". Unique
+    /// per domain, so it is the key the domain holds the record under and the place a
+    /// pagination token names.
+    pub id: String,
+    /// `ScheduledAction$Type`, one of `ActionType`'s values: which change is
+    /// scheduled.
+    pub action_type: String,
+    /// `ScheduledAction$Severity`, one of `ActionSeverity`'s values.
+    pub severity: String,
+    /// The instant the change is scheduled to happen, reported as
+    /// `ScheduledAction$ScheduledTime`.
+    pub scheduled_at: SystemTime,
+    /// `ScheduledAction$Description`: "a description of the action to be taken",
+    /// absent where the type and severity say it all.
+    pub description: Option<String>,
+    /// `ScheduledAction$ScheduledBy`, one of `ScheduledBy`'s values: whether a caller
+    /// scheduled this change or the service did.
+    pub scheduled_by: String,
+    /// `ScheduledAction$Status`, one of `ActionStatus`'s values: where the change is
+    /// in its own lifecycle.
+    pub status: String,
+    /// `ScheduledAction$Mandatory`: "whether the action is required or optional".
+    pub mandatory: bool,
+    /// `ScheduledAction$Cancellable`: "whether or not the scheduled action is
+    /// cancellable".
+    pub cancellable: bool,
+}
+
+impl ScheduledChange {
+    /// This record as `ScheduledAction` — the ONE projection of it, so every operation
+    /// that reports a scheduled action reports the same values.
+    pub fn to_action(&self) -> ScheduledAction {
+        ScheduledAction {
+            id: self.id.clone(),
+            r#type: self.action_type.clone(),
+            severity: self.severity.clone(),
+            scheduled_time: epoch_millis(self.scheduled_at),
+            description: self.description.clone(),
+            scheduled_by: Some(self.scheduled_by.clone()),
+            status: Some(self.status.clone()),
+            mandatory: Some(self.mandatory),
+            cancellable: Some(self.cancellable),
+        }
+    }
+}
+
+/// `at` as the epoch-millisecond count a `Long` timestamp of this service carries —
+/// the unit the model states for its epoch timestamps (`InsightTimeRange`'s members
+/// are "epoch millisecond timestamps"), negative for an instant before the epoch.
+pub fn epoch_millis(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .map(|millis| -millis)
+            .unwrap_or(i64::MIN),
+    }
+}
+
 /// One OpenSearch Service domain, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -1022,11 +1099,26 @@ pub struct Domain {
     /// domain, so the name IS the key. Iterating a `BTreeMap` is order-stable, which
     /// is what lets `ListDataSources` report the same order twice.
     pub data_sources: BTreeMap<String, DataSource>,
+    /// The packages of this account that are associated with this domain, keyed by
+    /// their `PackageID` — a domain holds at most ONE association per package, so
+    /// the package's id IS the key. `AssociatePackages` makes one and
+    /// `ListPackagesForDomain` reports it, from THIS one record, and deleting the
+    /// domain releases every association with it. Iterating a `BTreeMap` is
+    /// order-stable, which is what lets two reads report the same associations in
+    /// the same order.
+    ///
+    /// The set needs no quota of its own: a domain holds at most one association per
+    /// package and every association names a package the store holds, so
+    /// [`PACKAGE_QUOTA`] bounds it, and [`DOMAIN_QUOTA`] bounds it across domains.
+    pub package_associations: BTreeMap<String, PackageAssociation>,
     /// This domain's configuration changes, oldest first, bounded by
     /// [`CHANGE_HISTORY`]: a FIFO, because the cap drops the oldest change and the
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
     /// names no `ChangeId`.
     pub changes: VecDeque<ConfigChange>,
+    /// The configuration changes scheduled on this domain, keyed by their action id
+    /// — unique per domain, so the id IS the key. See [`ScheduledChange`].
+    pub scheduled_actions: BTreeMap<String, ScheduledChange>,
 }
 
 impl Domain {
@@ -1110,6 +1202,11 @@ impl Domain {
         // A service software deployment is owed its completion by the same clock, and
         // on its own span: it is not one of the domain's configuration changes.
         self.service_software.settle(now);
+        // An association of a package with this domain is owed its outcome by that
+        // same clock, and likewise on its own span.
+        for association in self.package_associations.values_mut() {
+            association.settle(now);
+        }
         let Some(due) = self.processing_until else {
             return;
         };
@@ -2216,6 +2313,216 @@ pub fn new_package_id() -> String {
 pub fn package_name_exists(package_name: &str) -> ResourceAlreadyExistsException {
     ResourceAlreadyExistsException {
         message: Some(format!("Package already exists: {package_name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Package associations
+//
+// An association is the LINK between one domain and one package of this
+// account: `AssociatePackages` makes one and `ListPackagesForDomain` reports
+// it. It is held on the [`Domain`] it links, under the `PackageID` of the
+// package it links to, so no map beside the domain can disagree about which
+// packages that domain has, and releasing the domain releases its associations.
+//
+// The association carries only what belongs to the LINK — its lifecycle status,
+// the package version it put on the domain, its prerequisites and its
+// configuration. The package's own name and type are read from the one stored
+// [`Package`] record through [`PackageAssociation::to_details`], so a package
+// operation and an association one cannot report the same package differently.
+// ---------------------------------------------------------------------------
+
+/// `DomainPackageStatus`'s `ASSOCIATING`: the association has been asked for and
+/// the package is being put in place on the domain.
+pub const DOMAIN_PACKAGE_STATUS_ASSOCIATING: &str = "ASSOCIATING";
+
+/// `DomainPackageStatus`'s `ACTIVE`: the package is in place on the domain, at the
+/// version the association carries.
+pub const DOMAIN_PACKAGE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `DomainPackageStatus`'s `DISSOCIATING`: the package is being removed from the
+/// domain.
+pub const DOMAIN_PACKAGE_STATUS_DISSOCIATING: &str = "DISSOCIATING";
+
+/// `PackageType`'s `TXT-DICTIONARY` value: the dictionary content a domain's index
+/// settings reference BY PATH, which is what gives an association of it a
+/// `ReferencePath`.
+pub const PACKAGE_TYPE_TXT_DICTIONARY: &str = "TXT-DICTIONARY";
+
+/// The directory a domain's index settings reference an associated dictionary
+/// package under, from the form the service documents for that reference
+/// (`analyzers/<PackageID>`).
+const ANALYZERS_DIRECTORY: &str = "analyzers";
+
+/// One link between a domain and a package of this account, as this emulator
+/// persists it.
+#[derive(Debug, Clone)]
+pub struct PackageAssociation {
+    /// The `PackageID` of the package this association links to, which is also the
+    /// key the domain holds it under.
+    pub package_id: String,
+    /// Where the association is in its lifecycle: one of `DomainPackageStatus`'s
+    /// values.
+    pub status: String,
+    /// The status move the clock owes this association, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// `DomainPackageDetails$PackageVersion`: the version of the package's content
+    /// this association put on the domain, which is the version the package had
+    /// available when the association was asked for. A package whose content is
+    /// updated does not change what a domain already has: a later association is
+    /// what moves the domain onto the newer version.
+    pub package_version: String,
+    /// `DomainPackageDetails$PrerequisitePackageIDList`: the packages this one
+    /// needed on the domain, as the call that made the association named them.
+    pub prerequisite_package_ids: Vec<String>,
+    /// `DomainPackageDetails$AssociationConfiguration`, absent where the call that
+    /// made the association carried none.
+    pub association_configuration: Option<PackageAssociationConfiguration>,
+    /// `DomainPackageDetails$LastUpdated`: "timestamp of the most recent update to
+    /// the package association status".
+    pub last_updated: SystemTime,
+}
+
+impl PackageAssociation {
+    /// Materialise the status move the clock owes this association, if `now` is past
+    /// its due instant: a package that was being put in place on the domain becomes
+    /// one that is in place there.
+    ///
+    /// This is the only write a reporting operation makes, and it writes only what
+    /// was already owed at the same instant had nobody called — which is why the
+    /// record is stamped with the instant the move fell DUE rather than the instant
+    /// of the call that happened to observe it.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
+            return;
+        };
+        self.status = owed.status;
+        self.last_updated = owed.due;
+    }
+
+    /// Whether this association still has a status move outstanding, meaning the
+    /// change asked for by the call that last touched it has not landed yet.
+    ///
+    /// Read AFTER [`Self::settle`], so a move that has merely fallen due does not
+    /// read as one still in flight.
+    pub fn in_flight(&self) -> bool {
+        self.owed.is_some()
+    }
+
+    /// This record as `DomainPackageDetails` — the shape every operation that
+    /// reports an association answers with, so an association's own answer and a
+    /// later read of it cannot disagree.
+    ///
+    /// `package` is the stored record of the package this association links to: its
+    /// name and type belong to the PACKAGE, so they are read from there rather than
+    /// copied onto the association.
+    pub fn to_details(&self, domain_name: &str, package: &Package) -> DomainPackageDetails {
+        DomainPackageDetails {
+            package_id: Some(self.package_id.clone()),
+            package_name: Some(package.package_name.clone()),
+            package_type: Some(package.package_type.clone()),
+            last_updated: Some(datetime(self.last_updated)),
+            domain_name: Some(domain_name.to_string()),
+            domain_package_status: Some(self.status.clone()),
+            package_version: Some(self.package_version.clone()),
+            // "A list of package IDs that must be associated with the domain before
+            // or with the package can be associated": reported only where the
+            // association has any.
+            prerequisite_package_id_list: (!self.prerequisite_package_ids.is_empty())
+                .then(|| self.prerequisite_package_ids.clone()),
+            reference_path: package_reference_path(package),
+            // "Additional information if the package is in an error state. Null
+            // otherwise." This association is not in one.
+            error_details: None,
+            association_configuration: self.association_configuration.clone(),
+        }
+    }
+}
+
+/// `DomainPackageDetails$ReferencePath`: "the relative path of the package on the
+/// OpenSearch Service cluster nodes. This is `synonym_path` when the package is for
+/// synonym files."
+///
+/// Dictionary content is the kind a domain's index settings name by path, and the
+/// documented form of that reference is the analyzers directory followed by the
+/// package's id — so the path is DERIVED from the stored package rather than
+/// invented per call. Content of any other type is loaded onto the nodes rather
+/// than referenced by an index setting, so it has no such path.
+pub fn package_reference_path(package: &Package) -> Option<String> {
+    (package.package_type == PACKAGE_TYPE_TXT_DICTIONARY)
+        .then(|| format!("{ANALYZERS_DIRECTORY}/{}", package.package_id))
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no package of this
+/// account — the package mirror of [`domain_not_found`].
+pub fn package_not_found(package_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Package not found: {package_id}")),
+    }
+}
+
+/// The `ConflictException` payload for associating a package whose content is not in
+/// place: a package can be put on a domain only once its copy has left it
+/// [`PACKAGE_STATUS_AVAILABLE`], so a call made before that conflicts with the
+/// status the package is in, and names it.
+pub fn package_not_available(package_id: &str, status: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Package {package_id} is {status}, not {PACKAGE_STATUS_AVAILABLE}."
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a call that would change an association which
+/// already has a change in flight: the association is in use by that change until it
+/// lands, and the refusal names the status it is in.
+pub fn association_in_flight(
+    package_id: &str,
+    domain_name: &str,
+    status: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "The association of package {package_id} with domain {domain_name} is {status}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a prerequisite that the domain does not
+/// have and the call does not associate either.
+///
+/// A prerequisite "must be linked to the domain before or simultaneously with the
+/// package association", so the refusal names both packages and the domain the link
+/// is missing on.
+pub fn prerequisite_not_associated(
+    package_id: &str,
+    prerequisite: &str,
+    domain_name: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "PrerequisitePackageIDList of package {package_id} names {prerequisite}, which is \
+             not associated with domain {domain_name} and not associated by this request."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a package the same call names twice: a
+/// domain holds ONE association per package, so a request that names it twice asks
+/// for two states of one association and cannot be served as asked.
+pub fn package_named_twice(member: &str, package_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!("{member} names package {package_id} twice.")),
+    }
+}
+
+/// The `ValidationException` payload for a package that names ITSELF among the
+/// packages that must be associated before it: no association can precede its own.
+pub fn prerequisite_is_self(package_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "PrerequisitePackageIDList of package {package_id} names that same package."
+        )),
     }
 }
 

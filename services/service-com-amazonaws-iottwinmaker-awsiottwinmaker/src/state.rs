@@ -1368,13 +1368,15 @@ pub struct ComponentType {
     /// no component of, which exists to be extended.
     ///
     /// STORED rather than derived at each reader, so the value
-    /// `GetComponentType` reports and the set a `ListComponentTypes`
-    /// `isAbstract` filter selects cannot drift apart. `isAbstract` is not a
-    /// member of `CreateComponentTypeRequest` and not derivable from one that
-    /// is — the API offers no way to declare a component type abstract — so
-    /// every component type a caller creates is concrete, and the abstract ones
-    /// are the service's own built-ins, which the workspace is provisioned with
-    /// rather than asked for ([`built_in_component_types`]).
+    /// `GetComponentType` reports, the set a `ListComponentTypes` `isAbstract`
+    /// filter selects and the component types `CreateEntity` refuses to
+    /// instantiate cannot drift apart. `isAbstract` is not a member of
+    /// `CreateComponentTypeRequest` — a caller does not declare it — so a
+    /// writer DECIDES it from what the request declares
+    /// ([`component_type_is_abstract`]) and stores the answer beside the
+    /// record; the service's own built-ins carry the abstractness the service
+    /// publishes for them, which the workspace is provisioned with rather than
+    /// asked for ([`built_in_component_types`]).
     pub is_abstract: bool,
     /// The parent component types this one extends, in the order the create
     /// gave them.
@@ -1533,6 +1535,81 @@ pub fn property_definition_needs_data_type(
     extends_from.is_empty() && definition.data_type.is_none()
 }
 
+/// The names under which a component type's `functions` map carries a DATA
+/// CONNECTOR — the function that fetches, or writes, the values of a property
+/// whose values live outside the service.
+///
+/// The map's keys are free-form in the model (`functions` is a
+/// `map<String, FunctionRequest>`), so these are the names the AWS IoT
+/// TwinMaker user guide publishes for a component type's data connectors:
+/// a reader at entity scope, a reader at component-type scope, the plain
+/// reader, and the writer. The schema initializer
+/// ([`SCHEMA_INITIALIZER_FUNCTION`]) is NOT one of them: it initializes the
+/// component type's schema and serves no property's values.
+pub const DATA_CONNECTOR_FUNCTION_NAMES: &[&str] = &[
+    "dataReader",
+    "dataReaderByEntity",
+    "dataReaderByComponentType",
+    "dataWriter",
+];
+
+/// Whether `definition` declares a property whose values live OUTSIDE this
+/// service — `isStoredExternally`, "a Boolean value that specifies whether the
+/// property is stored externally" (the member's own documentation), resolved so
+/// an absent member reads as `false`.
+pub fn property_is_stored_externally(
+    definition: &crate::ops::types::PropertyDefinitionRequest,
+) -> bool {
+    definition.is_stored_externally.unwrap_or(false)
+}
+
+/// Whether a component type is ABSTRACT — whether it is a base type that exists
+/// to be extended rather than instantiated, which is what `isAbstract`, "a
+/// Boolean value that specifies whether the component type is abstract",
+/// reports.
+///
+/// A component type is abstract exactly when it has no way to serve the values
+/// of some property it declares: it carries an externally stored property
+/// ([`property_is_stored_externally`]) and no data connector
+/// ([`DATA_CONNECTOR_FUNCTION_NAMES`]) that could read or write one. Such a
+/// type is incomplete on its own — a type extending it supplies the connector —
+/// so no component instantiates it.
+///
+/// Both halves are resolved over the record AND the inheritance it declares
+/// (`extendsFrom`, walked by [`Workspace::component_type_chain`]): a property
+/// inherited from a parent is as much the type's as one it restates, and a
+/// connector inherited from a parent serves it just as well. `record` is passed
+/// in rather than looked up, so the rule holds for a component type a create
+/// has not stored yet and for one an update has patched on a copy.
+pub fn component_type_is_abstract(workspace: &Workspace, record: &ComponentType) -> bool {
+    let inherited = record
+        .extends_from
+        .iter()
+        .flat_map(|parent| workspace.component_type_chain(parent));
+    let mut stores_externally = false;
+    let mut has_connector = false;
+    for component_type in std::iter::once(record).chain(inherited) {
+        stores_externally |= component_type
+            .property_definitions
+            .values()
+            .any(property_is_stored_externally);
+        has_connector |= component_type
+            .functions
+            .keys()
+            .any(|function_name| DATA_CONNECTOR_FUNCTION_NAMES.contains(&function_name.as_str()));
+    }
+    stores_externally && !has_connector
+}
+
+/// Why a component of the component type `component_type_id` cannot be created,
+/// as the message a `ValidationException` carries: the component type is
+/// ABSTRACT ([`component_type_is_abstract`]), so it is extended rather than
+/// instantiated. Built from the request — it names the component type the call
+/// asked for — so a caller is told which one to change.
+pub fn abstract_component_type_message(component_type_id: &str) -> String {
+    format!("Abstract ComponentType {component_type_id} can not be used for creating a component")
+}
+
 /// The id prefix the service's own BUILT-IN component types carry.
 ///
 /// IoT TwinMaker publishes the component types it ships under the reserved
@@ -1566,7 +1643,12 @@ struct BuiltInComponentType {
     /// Its published `componentTypeId`, inside
     /// [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`].
     component_type_id: &'static str,
-    /// Whether it is abstract — see [`ComponentType::is_abstract`].
+    /// Whether it is abstract — see [`ComponentType::is_abstract`]. The
+    /// abstractness the SERVICE publishes for the built-in, carried as declared
+    /// rather than decided by [`component_type_is_abstract`]: a built-in is
+    /// provisioned with the workspace, and no caller can create or update one
+    /// in the reserved namespace, so no writer of a component type's
+    /// definitions or functions ever reaches a built-in's record.
     is_abstract: bool,
     /// The property definitions it declares itself, which a component type
     /// extending it inherits.
@@ -2411,6 +2493,27 @@ pub fn sync_job_not_found_message(workspace_id: &str, sync_source: &str) -> Stri
 /// [`entity_not_found_message`], one level up the resource tree.
 pub fn workspace_not_found_message(workspace_id: &str) -> String {
     format!("Workspace {workspace_id} not found.")
+}
+
+/// The message for a create whose id is already TAKEN, as the message a
+/// `ConflictException` carries.
+///
+/// Built entirely from the request, in the service's own construction: the kind
+/// of resource and the id the create asked for first, then the workspace that
+/// holds it where the resource lives inside one, then what is wrong with it —
+/// the same order the not-found family above reads in
+/// ([`entity_not_found_message`]), with "already exists" in place of "not
+/// found". `kind` is the resource's name as the service writes it in this
+/// sentence; `workspace_id` is `None` for a resource that nests under no
+/// workspace. Shared by every create of this service, so one conflict reads one
+/// way wherever it is refused.
+pub fn already_exists_message(kind: &str, resource_id: &str, workspace_id: Option<&str>) -> String {
+    match workspace_id {
+        Some(workspace_id) => {
+            format!("{kind} {resource_id} in workspace {workspace_id} already exists.")
+        }
+        None => format!("{kind} {resource_id} already exists."),
+    }
 }
 
 /// The region to build an ARN in for this request: the region of its SigV4

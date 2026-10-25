@@ -19,8 +19,12 @@ mod administrator_disassociation;
 mod client_rejections;
 #[path = "all/client_token_store.rs"]
 mod client_token_store;
+#[path = "all/coverage_listing.rs"]
+mod coverage_listing;
 #[path = "all/custom_detection_rule_association_listing.rs"]
 mod custom_detection_rule_association_listing;
+#[path = "all/custom_detection_rule_org_configuration_delete.rs"]
+mod custom_detection_rule_org_configuration_delete;
 #[path = "all/custom_detection_rule_org_configuration_listing.rs"]
 mod custom_detection_rule_org_configuration_listing;
 #[path = "all/custom_detection_rule_org_configuration_update.rs"]

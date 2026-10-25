@@ -74,10 +74,11 @@ use crate::ops::types::{
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
     ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
     ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
-    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, ResolveTo,
-    Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration, TimeInNanos,
-    TrimSettings, Variant, WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo,
-    WorkspaceStatus, ENCRYPTION_TYPE_VALUES, VIDEO_DATA_TYPE_VALUES,
+    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
+    ResolveTo, Resource, ResourceStatus, SearchFilters, TargetResource, TaskConfiguration,
+    TimeInNanos, TrimSettings, Variant, WorkspaceEncryptionConfiguration,
+    WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
+    VIDEO_DATA_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -392,6 +393,27 @@ pub const DEFAULT_GATEWAY_VERSION: &str = "2";
 /// creating a V3 gateway (gatewayVersion=3), you must also specify the
 /// coreDeviceOperatingSystem".
 pub const GATEWAY_VERSION_V3: &str = "3";
+
+/// The `CapabilitySyncStatus` a capability reports once the gateway has processed
+/// the configuration the last write to it supplied, as the member documents it:
+/// "IN_SYNC - The gateway is running with the latest configuration".
+pub const CAPABILITY_SYNC_IN_SYNC: &str = "IN_SYNC";
+
+/// The `CapabilitySyncStatus` a capability reports until then, as
+/// `UpdateGatewayCapabilityConfiguration` documents it: "After updating a
+/// capability configuration, the sync status becomes OUT_OF_SYNC until the
+/// gateway processes the configuration".
+pub const CAPABILITY_SYNC_OUT_OF_SYNC: &str = "OUT_OF_SYNC";
+
+/// How many capability namespaces one gateway holds configurations for.
+///
+/// The same kind of bound, and for the same reason, as [`MAX_GATEWAYS`]: a write
+/// naming a fresh namespace is the only thing that adds one and nothing evicts
+/// one, so the list needs a maximum entry count. The emulator's own bound, not a
+/// published AWS default, and high enough that no ordinary workflow meets it;
+/// `UpdateGatewayCapabilityConfiguration` refuses past it with the modelled
+/// `LimitExceededException` (HTTP 410).
+pub const MAX_CAPABILITIES_PER_GATEWAY: usize = 100;
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the workspace map.
 /// `CreateWorkspace` is the only thing that adds a workspace and it declares the
@@ -1168,8 +1190,12 @@ fn state_at(settling: &str, active_at: SystemTime, now: SystemTime) -> &str {
 /// A stored gateway: everything `DescribeGateway` reports, plus the `tags` the
 /// tagging operations read.
 ///
-/// `capability_summaries` starts EMPTY: a freshly created gateway has no
-/// capability configured, and only `UpdateGatewayCapabilityConfiguration` adds one.
+/// `capabilities` starts EMPTY: a freshly created gateway has no capability
+/// configured, and only `UpdateGatewayCapabilityConfiguration` adds one. The
+/// summaries `DescribeGateway` and `ListGateways` report are DERIVED from that
+/// list ([`Self::capability_summaries`]), so a summary and the configuration
+/// `DescribeGatewayCapabilityConfiguration` answers with can never disagree about
+/// a namespace or its sync status.
 #[derive(Debug, Clone)]
 pub struct GatewayRecord {
     pub id: String,
@@ -1177,10 +1203,99 @@ pub struct GatewayRecord {
     pub name: String,
     pub platform: GatewayPlatform,
     pub version: String,
-    pub capability_summaries: Vec<GatewayCapabilitySummary>,
+    pub capabilities: Vec<GatewayCapabilityRecord>,
     pub creation_date: SystemTime,
     pub last_update_date: SystemTime,
     pub tags: HashMap<String, String>,
+}
+
+impl GatewayRecord {
+    /// The capability configured under `namespace`, or `None` when no write to
+    /// this gateway has named that namespace.
+    ///
+    /// A gateway holds one configuration per namespace and may hold several
+    /// namespaces at once, so the namespace alone selects one.
+    pub fn capability(&self, namespace: &str) -> Option<&GatewayCapabilityRecord> {
+        self.capabilities
+            .iter()
+            .find(|capability| capability.namespace == namespace)
+    }
+
+    /// Every configured capability as the summary a gateway reader reports, in the
+    /// order the namespaces were first configured in.
+    pub fn capability_summaries(&self, now: SystemTime) -> Vec<GatewayCapabilitySummary> {
+        self.capabilities
+            .iter()
+            .map(|capability| GatewayCapabilitySummary {
+                capability_namespace: capability.namespace.clone(),
+                capability_sync_status: capability.sync_status(now).to_string(),
+            })
+            .collect()
+    }
+
+    /// Configure `namespace` on this gateway with `configuration`, replacing
+    /// whatever a previous write put there, and report the sync status the write
+    /// answers with.
+    ///
+    /// A write is the last word on the namespace it names and says nothing about
+    /// any other, so an existing entry is replaced IN PLACE — keeping the order a
+    /// reader reports — and a namespace nothing has configured is appended. The
+    /// gateway's `lastUpdateDate` moves with it, because the capability summaries
+    /// a gateway reader reports are part of what this write changed.
+    pub fn set_capability(
+        &mut self,
+        namespace: &str,
+        configuration: String,
+        now: SystemTime,
+    ) -> &'static str {
+        let record = GatewayCapabilityRecord {
+            namespace: namespace.to_string(),
+            configuration,
+            in_sync_at: now + ACTIVATION_DELAY,
+        };
+        match self
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.namespace == namespace)
+        {
+            Some(existing) => *existing = record,
+            None => self.capabilities.push(record),
+        }
+        self.last_update_date = now;
+        CAPABILITY_SYNC_OUT_OF_SYNC
+    }
+}
+
+/// One capability configured on a gateway: the namespace that selects it, the
+/// JSON document the last write to it supplied, and the instant the gateway has
+/// processed that document.
+///
+/// The sync status is DERIVED from that instant rather than stored, so a read
+/// never has to write for the status to move on.
+#[derive(Debug, Clone)]
+pub struct GatewayCapabilityRecord {
+    pub namespace: String,
+    pub configuration: String,
+    /// When the capability stops being out of sync — see [`Self::sync_status`].
+    pub in_sync_at: SystemTime,
+}
+
+impl GatewayCapabilityRecord {
+    /// This capability's `CapabilitySyncStatus` at `now`.
+    ///
+    /// `UpdateGatewayCapabilityConfiguration` documents the rule: after a write
+    /// "the sync status becomes OUT_OF_SYNC until the gateway processes the
+    /// configuration", which is the owed transition this emulator settles at
+    /// [`ACTIVATION_DELAY`] — so the status is `OUT_OF_SYNC` until then and
+    /// `IN_SYNC` ("The gateway is running with the latest configuration")
+    /// afterwards.
+    pub fn sync_status(&self, now: SystemTime) -> &'static str {
+        if now < self.in_sync_at {
+            CAPABILITY_SYNC_OUT_OF_SYNC
+        } else {
+            CAPABILITY_SYNC_IN_SYNC
+        }
+    }
 }
 
 /// A stored dataset: everything `DescribeDataset` reports, plus the `tags` the
@@ -2881,6 +2996,19 @@ impl QueryRecord {
             _ => None,
         }
     }
+
+    /// This query as the summary a listing reports for it, at `now`.
+    ///
+    /// Derived here rather than in the handler so a listing and a read of one
+    /// stored query cannot report different statuses or instants for it.
+    pub fn summary(&self, now: SystemTime) -> QuerySummary {
+        QuerySummary {
+            query_id: self.query_id.clone(),
+            status: self.status(now).to_string(),
+            submitted_at: to_date_time(self.submitted_at),
+            completed_at: self.completed_at(now).map(to_date_time),
+        }
+    }
 }
 
 /// The key [`ComAmazonawsIotsitewiseAwsiotsitewiseState::queries`] holds a query
@@ -3053,8 +3181,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub dataset_export_jobs: HashMap<(String, String), DatasetExportJobRecord>,
     /// The asynchronous queries of every workspace, by [`query_key`] — the
     /// workspace they were started in and their own id — because every operation
-    /// on a query addresses it within a workspace. Written by `StartQuery` and
-    /// read by `DescribeQuery`; bounded by [`MAX_QUERIES`] and
+    /// on a query addresses it within a workspace. Written by `StartQuery`,
+    /// read by `DescribeQuery` and enumerated, one workspace at a time, by
+    /// `ListQueries`; bounded by [`MAX_QUERIES`] and
     /// [`MAX_QUERIES_PER_WORKSPACE`].
     pub queries: HashMap<(String, String), QueryRecord>,
     /// Workspaces by `workspaceName`, which is what identifies one in an
@@ -4306,6 +4435,14 @@ pub const RESOURCE_ASSET_COMPOSITE_MODEL: &str = "Asset Composite Model";
 /// kind and the three below, the label is the service's resource name under that
 /// same one form, so every handler addressing one states the absence identically.
 pub const RESOURCE_GATEWAY: &str = "Gateway";
+
+/// The resource kind those errors name for one CAPABILITY of a gateway — the
+/// configuration a gateway holds under one namespace.
+///
+/// A capability is not a top-level resource, so it is named as what it is rather
+/// than as a "Gateway", and it lives here beside its siblings so the operations
+/// that address one cannot each invent a kind of their own.
+pub const RESOURCE_GATEWAY_CAPABILITY: &str = "Gateway Capability";
 
 /// The resource kind those errors name for a data stream, which every operation
 /// that addresses one addresses by its `alias`.

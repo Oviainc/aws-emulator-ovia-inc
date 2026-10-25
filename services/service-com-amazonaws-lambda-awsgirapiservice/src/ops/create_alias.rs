@@ -185,10 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `Alias` pattern's negative lookahead (`^(?!^[0-9]+$)([a-zA-Z0-9-_]+)$`) is
         // what keeps an alias name out of the version-number namespace, so a name that
         // does not satisfy it names no alias a function could ever address.
+        //
+        // The check belongs to the request's SHAPE, not to what the value means, so it
+        // is answered the way the framework's own constraint walk answers one — 400
+        // `ValidationException` with the clause naming the member and the expression —
+        // rather than with the modelled semantic refusal below. The walk itself cannot
+        // state it: its regex engine does not compile the lookahead, so an unparseable
+        // pattern is treated as satisfied and the value arrives here.
         if !crate::state::is_alias_name(&input.name) {
-            return Err(invalid_parameter(crate::state::alias_name_message(
-                &input.name,
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::alias_name_message(&input.name),
+            ));
         }
 
         // `VersionWithLatestPublished` also admits `$LATEST.PUBLISHED`, a destination

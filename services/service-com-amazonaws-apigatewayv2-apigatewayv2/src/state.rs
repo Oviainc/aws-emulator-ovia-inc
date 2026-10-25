@@ -2566,6 +2566,31 @@ pub fn validate_ec2_resource_ids(
     Ok(())
 }
 
+/// The longest `Name` a VPC link accepts.
+///
+/// `CreateVpcLink$Name` and `UpdateVpcLink$Name` both target
+/// `StringWithLengthBetween1And128`, whose own documentation is "A string with a length
+/// between [1-128]" (`smithy_query(query="shape",
+/// shape="StringWithLengthBetween1And128")`). The shape carries no `@length` trait, so
+/// the bound is a handler's to enforce rather than the boundary validator's.
+pub const MAX_VPC_LINK_NAME_LEN: usize = 128;
+
+/// Refuse a VPC link `Name` outside the documented bound of the shape it targets: at
+/// least one character and at most [`MAX_VPC_LINK_NAME_LEN`].
+///
+/// `Ok(())` or the message for the operation's `BadRequestException`: it names the member
+/// and the bound it broke.
+pub fn validate_vpc_link_name(name: &str) -> Result<(), String> {
+    let length = name.chars().count();
+    if length == 0 || length > MAX_VPC_LINK_NAME_LEN {
+        return Err(format!(
+            "Invalid value for Name: must have length between 1 and \
+             {MAX_VPC_LINK_NAME_LEN}, got {length}."
+        ));
+    }
+    Ok(())
+}
+
 /// The ARN of a portal: API Gateway's ARNs name the resource by its own REST path
 /// (`/apis/{apiId}` for an api, `/domainnames/{name}` for a domain name), so a portal's
 /// is `/portals/{portalId}`. Built through `engine::emulator_arn`, so the account

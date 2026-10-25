@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::check_enum;
+        use crate::state::check_recurrence;
 
         // This operation addresses its rotation by ARN and mints nothing, so it reads
         // nothing off the request envelope.
@@ -183,33 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request is checked whole before any of it is applied, so a refused update
         // leaves the stored rotation exactly as it was.
         //
-        // `DayOfWeek` is an enum SHAPE, so it arrives as a plain string — the same two
-        // places `CreateRotation` checks it in a `RecurrenceSettings`.
-        for setting in input.recurrence.weekly_settings.iter().flatten() {
-            check_enum(
-                "recurrence.weeklySettings.dayOfWeek",
-                &setting.day_of_week,
-                DAY_OF_WEEK_VALUES,
-            )
-            .map_err(validation)?;
-        }
-        for day in input.recurrence.shift_coverages.iter().flatten().map(|(day, _)| day) {
-            check_enum("recurrence.shiftCoverages", day, DAY_OF_WEEK_VALUES)
-                .map_err(validation)?;
-        }
-
-        // A recurrence with no daily, weekly or monthly settings describes no shift at all,
-        // and `Recurrence` is required here: an update cannot leave a rotation describing a
-        // schedule `CreateRotation` would have refused.
-        let describes_a_schedule = carries_a_setting(&input.recurrence.daily_settings)
-            || carries_a_setting(&input.recurrence.weekly_settings)
-            || carries_a_setting(&input.recurrence.monthly_settings);
-        if !describes_a_schedule {
-            return Err(validation(
-                "Value at 'recurrence' failed to satisfy constraint: Member must carry one of \
-                 dailySettings, weeklySettings or monthlySettings",
-            ));
-        }
+        // Which recurrences describe a schedule is the SAME rule `CreateRotation` admits its
+        // own `Recurrence` by — each `DayOfWeek` a modelled value, and one of the daily,
+        // weekly and monthly settings lists carrying an entry — so it is read from
+        // `crate::state` rather than written out again here: an update cannot leave a
+        // rotation describing a schedule the create would have refused.
+        check_recurrence(&input.recurrence).map_err(validation)?;
 
         if !state.rotations.contains_key(&input.rotation_id) {
             return Err(not_found(
@@ -267,14 +246,6 @@ const ROTATION_RESOURCE_TYPE: &str = "rotation";
 /// The `resourceType` a not-found error names for a contact, spelled as the contact handlers
 /// spell it.
 const CONTACT_RESOURCE_TYPE: &str = "contact";
-
-/// Whether one of `RecurrenceSettings`' settings lists is present AND carries an entry.
-///
-/// An absent list and an empty one say the same thing: this recurrence has no shift of that
-/// period.
-fn carries_a_setting<T>(settings: &Option<Vec<T>>) -> bool {
-    settings.as_ref().is_some_and(|settings| !settings.is_empty())
-}
 
 /// This operation's modelled 404, carrying the ARN the request named.
 fn not_found(message: String, resource_id: &str, resource_type: &str) -> UpdateRotationError {

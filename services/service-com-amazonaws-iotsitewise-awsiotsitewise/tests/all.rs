@@ -228,3 +228,15 @@ mod update_asset_model;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
 
+// Declared after the sorted list for the reason the note above gives: both
+// stretches above are where every concurrent iotsitewise change inserts a
+// declaration of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/list_queries.rs"]
+mod list_queries;
+
+// Declared after the suite above, for the same reason it is: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/gateway_capability_configuration.rs"]
+mod gateway_capability_configuration;
+

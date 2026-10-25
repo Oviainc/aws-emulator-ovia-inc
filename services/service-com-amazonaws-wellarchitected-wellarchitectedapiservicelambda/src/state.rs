@@ -22,7 +22,7 @@
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
 //! lenses beside the AWS-official lens this emulator ships. The Well-Architected
-//! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
+//! Tool profiles (`CreateProfile`, `GetProfile`, `ListProfiles`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
 //! OF, pinned at the profile version the workload is reviewed against — the version
@@ -37,7 +37,14 @@
 //! `GetAgentRecommendationGeneration`) are held the same way; a generation is a JOB, so
 //! its status, progress and transition timestamps are DERIVED from the instants the
 //! clock owes its transitions at ([`AgentGenerationRecord`]) rather than stored, and no
-//! read has to write. The record types and
+//! read has to write. The recommendations a COMPLETED generation produced
+//! (`ListAgentRecommendations`, `UpdateAgentRecommendationStatus`) are held under the
+//! profile they belong to and keyed by the ARN that names each one, materialised from the
+//! generation whose analysis the clock has finished
+//! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::materialise_due_agent_recommendations`])
+//! and carrying the finding's content by reference into the catalog in
+//! [`recommendation_catalog`], so a recommendation's text is the same in every reading of
+//! it and only its status is a caller's to move. The record types and
 //! their projections live here rather than in a handler because several operations reach
 //! them.
 //!
@@ -63,6 +70,11 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 pub mod official_lenses;
+pub mod recommendation_catalog;
+
+pub use recommendation_catalog::{
+    recommendation_content, RecommendationContent, RECOMMENDATION_CATALOG,
+};
 
 pub use official_lenses::{
     framework_lens_published_at, lens_metadata, lens_pillars, lens_question, lens_question_count,
@@ -71,12 +83,13 @@ pub use official_lenses::{
 };
 
 use crate::ops::types::{
-    AgentProfileSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
+    AgentProfileSummary, AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer,
+    ConflictException,
     ContextContent,
     ContextSummary,
     GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary, Milestone,
     MilestoneSummary, PillarReviewSummary,
-    Profile, ProfileQuestion, Progress,
+    Profile, ProfileQuestion, ProfileSummary, Progress,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateAnswer, ReviewTemplateLensReview,
     ReviewTemplatePillarReviewSummary,
@@ -990,6 +1003,19 @@ pub const ARN_NAMESPACE: &str = "wellarchitected";
 /// The region an unsigned request is attributed to, when no SigV4 credential scope
 /// names one.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The Region an ARN names, or [`DEFAULT_REGION`] when the text carries no Region field.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, so the Region is
+/// its fourth field. Used where a resource is minted FROM another resource's ARN rather
+/// than from a request: the new ARN then names the same Region as the resource it belongs
+/// to.
+fn arn_region(arn: &str) -> &str {
+    match arn.split(':').nth(3) {
+        Some(region) if !region.is_empty() => region,
+        _ => DEFAULT_REGION,
+    }
+}
 
 /// The most workloads this emulator holds for its one account and Region.
 ///
@@ -3702,6 +3728,14 @@ pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
 /// (`CreateProfileInput$ProfileQuestions` / `UpdateProfileInput$ProfileQuestions`).
 pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
 
+/// `ProfileOwnerType$SELF`: a profile the CALLING account owns
+/// (`smithy_query(query="shape", shape="ProfileOwnerType")`, which publishes `SELF` and
+/// `SHARED`).
+pub const PROFILE_OWNER_TYPE_SELF: &str = "SELF";
+
+/// `ProfileOwnerType$SHARED`: a profile another account owns and shared with the caller.
+pub const PROFILE_OWNER_TYPE_SHARED: &str = "SHARED";
+
 /// One stored Well-Architected Tool profile: the resource `CreateProfile` mints and
 /// `GetProfile` reports.
 ///
@@ -3754,6 +3788,36 @@ impl ProfileRecord {
             // what a projection of the stored profile reports.
             tags: Some(self.tags.clone().into_iter().collect()),
         }
+    }
+
+    /// The `ProfileSummary` projection the profile LIST reports
+    /// (`ListProfilesOutput$ProfileSummaries`), so one place decides how a stored profile
+    /// is summarised.
+    ///
+    /// `ProfileSummary` is its own structure (`smithy_query(query="shape",
+    /// shape="ProfileSummary")`) carrying the members it declares and no other: the
+    /// questions, the tags and the share invitation `Profile` also carries are NOT among
+    /// them. Every member it does declare is read off the same record [`Self::to_profile`]
+    /// reads, so a listed profile cannot disagree with a read of it.
+    pub fn to_summary(&self) -> ProfileSummary {
+        ProfileSummary {
+            profile_arn: Some(self.profile_arn.clone()),
+            profile_version: Some(self.profile_version.clone()),
+            profile_name: Some(self.profile_name.clone()),
+            profile_description: Some(self.profile_description.clone()),
+            owner: Some(self.owner.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+
+    /// Whether this profile is owned by `account`, which is what a `ProfileOwnerType` of
+    /// [`PROFILE_OWNER_TYPE_SELF`] selects — the complement,
+    /// [`PROFILE_OWNER_TYPE_SHARED`], being a profile another account owns and shared
+    /// with the caller. `Profile$Owner` is the account that created it, so ownership is
+    /// decided by that member rather than by where the record is held.
+    pub fn owned_by(&self, account: &str) -> bool {
+        self.owner == account
     }
 
     /// The stored questions as the modelled `Profile$ProfileQuestions` carries them.
@@ -4353,6 +4417,130 @@ impl AgentGenerationRecord {
     }
 }
 
+/// `ResourceNotFoundException$ResourceType` for an optimization recommendation — the
+/// resource a completed generation produces, `ListAgentRecommendations` reports and
+/// `UpdateAgentRecommendationStatus` moves the status of. `ExceptionResourceType` is a
+/// free-form string, so it names the kind of resource that was missing: a recommendation.
+pub const AGENT_RECOMMENDATION_RESOURCE_TYPE: &str = "RECOMMENDATION";
+
+/// `RecommendationStatus$ACTIVE`: the status a recommendation a generation has just
+/// produced carries — nobody has acted on it yet (`smithy_query(query="shape",
+/// shape="RecommendationStatus")`).
+pub const RECOMMENDATION_ACTIVE: &str = "ACTIVE";
+
+/// `RecommendationStatus$COMPLETED`: the caller has implemented the recommendation.
+pub const RECOMMENDATION_COMPLETED: &str = "COMPLETED";
+
+/// `RecommendationStatus$SUPPRESSED`: the caller has decided not to act on the
+/// recommendation.
+pub const RECOMMENDATION_SUPPRESSED: &str = "SUPPRESSED";
+
+/// `RecommendationState$OPEN`: a recommendation that is still outstanding work.
+pub const RECOMMENDATION_STATE_OPEN: &str = "OPEN";
+
+/// `RecommendationState$CLOSED`: a recommendation that is no longer outstanding work.
+pub const RECOMMENDATION_STATE_CLOSED: &str = "CLOSED";
+
+/// One optimization recommendation: the resource a COMPLETED recommendation generation
+/// produced, `ListAgentRecommendations` reports and `UpdateAgentRecommendationStatus`
+/// moves "through the implementation lifecycle".
+///
+/// The record holds what the SERVICE owns — the ARN it minted, the generation the
+/// recommendation came out of, the finding's content and the identity and instant it is
+/// attributed to — plus the status a caller has since moved it to. `state` is DERIVED from
+/// that status ([`Self::state`]) rather than stored beside it, so the two cannot disagree,
+/// and the finding's text is a reference INTO
+/// [`recommendation_catalog::RECOMMENDATION_CATALOG`] rather than a copy of it, so every
+/// reading of one recommendation reports the same words.
+#[derive(Debug, Clone)]
+pub struct AgentRecommendationRecord {
+    /// The minted `RecommendationArn` this recommendation is named by, everywhere.
+    pub arn: String,
+    /// The agent profile the recommendation belongs to: the profile whose generation
+    /// produced it, and the only profile that lists it.
+    pub profile_arn: String,
+    /// `generationId` — "the identifier of the generation process that produced this
+    /// recommendation".
+    pub generation_id: String,
+    /// The finding this recommendation reports, by reference into the catalog. Its
+    /// `pillar` is the pillar of the generation's scope this recommendation came from.
+    pub content: &'static RecommendationContent,
+    /// `type` — the `RecommendationType` the generation was started for
+    /// (`StartAgentRecommendationGenerationRequest$types`, modelled `@length(1, 1)`), which
+    /// is what kind of recommendation it asked for.
+    pub recommendation_type: String,
+    /// `status` — a `RecommendationStatus`: [`RECOMMENDATION_ACTIVE`] as produced, then
+    /// whatever `UpdateAgentRecommendationStatus` last moved it to.
+    pub status: String,
+    /// `updateReason` — "the free-text reason associated with the recommendation's most
+    /// recent status update", so it is whatever the last update carried and absent when
+    /// that update carried none.
+    pub update_reason: Option<String>,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub last_modified_by: Option<String>,
+    pub last_modified_at: Option<SystemTime>,
+}
+
+impl AgentRecommendationRecord {
+    /// `state` — the `RecommendationState` this recommendation is in, DERIVED from its
+    /// status.
+    ///
+    /// The status tracks the recommendation "through the implementation lifecycle"
+    /// (`UpdateAgentRecommendationStatus` doc) and the state is the OPEN/CLOSED reading of
+    /// that lifecycle a listing filters on ("return only recommendations with the specified
+    /// state (OPEN or CLOSED)" — `ListAgentRecommendationsRequest$state`): a recommendation
+    /// still `ACTIVE` is outstanding work, and one the caller has implemented
+    /// (`COMPLETED`) or decided against (`SUPPRESSED`) is not. Derived rather than stored,
+    /// so no update can leave the two disagreeing.
+    pub fn state(&self) -> &'static str {
+        match self.status.as_str() {
+            RECOMMENDATION_COMPLETED | RECOMMENDATION_SUPPRESSED => RECOMMENDATION_STATE_CLOSED,
+            // [`RECOMMENDATION_ACTIVE`], and — defensively — any status only a later
+            // revision of the enum could publish: a recommendation that has neither been
+            // implemented nor set aside is outstanding work.
+            _ => RECOMMENDATION_STATE_OPEN,
+        }
+    }
+
+    /// The `AgentRecommendationSummary` projection a listing reports this recommendation as
+    /// (`ListAgentRecommendationsResponse$items`), so one place decides how a stored
+    /// recommendation is summarised.
+    ///
+    /// `numberOfResources`, `businessUnits` and `applications` are left absent: they
+    /// describe the customer's own resources, business units and applications, and this
+    /// emulator analyses none — all three are modelled optional, so reporting nothing is
+    /// what it has to say about them.
+    pub fn to_summary(&self) -> AgentRecommendationSummary {
+        AgentRecommendationSummary {
+            recommendation_arn: self.arn.clone(),
+            profile_arn: self.profile_arn.clone(),
+            generation_id: Some(self.generation_id.clone()),
+            title: self.content.title.to_string(),
+            description: self.content.description.to_string(),
+            r#type: self.recommendation_type.clone(),
+            pillar: self.content.pillar.to_string(),
+            priority: self.content.priority.to_string(),
+            effort: self.content.effort.to_string(),
+            status: self.status.clone(),
+            state: self.state().to_string(),
+            update_reason: self.update_reason.clone(),
+            impact: self.content.impact.to_string(),
+            roi: self.content.roi(),
+            number_of_resources: None,
+            aws_services: Some(self.content.aws_service_list()),
+            business_units: None,
+            applications: None,
+            created_by: self.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_by: self.last_modified_by.clone(),
+            last_modified_at: self
+                .last_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
 /// What a `CreateAgentProfile` idempotency token resolves to: the profile the original
 /// request created, plus that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -4522,6 +4710,17 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// because generation-id order is the stable order a listing pages over, exactly as
     /// the goals and contexts above are held.
     pub agent_generations: HashMap<String, BTreeMap<String, AgentGenerationRecord>>,
+    /// Every optimization recommendation a COMPLETED generation has produced, keyed by the
+    /// agent profile's ARN then by the recommendation's own `RecommendationArn`. A
+    /// `BTreeMap` because ARN order is the stable order `ListAgentRecommendations` pages
+    /// over, exactly as the goals, contexts and generations above are held.
+    ///
+    /// Bounded by what it is produced FROM: a generation produces one recommendation per
+    /// pillar its scope names (at most the `Pillar` enum's whole set), and a profile holds
+    /// at most [`MAX_GENERATIONS_PER_AGENT_PROFILE`] generations, so no caller can grow
+    /// this past that product — and [`Self::remove_agent_profile`] drops a deleted
+    /// profile's recommendations with its generations, which is what keeps that bound real.
+    pub agent_recommendations: HashMap<String, BTreeMap<String, AgentRecommendationRecord>>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -4814,6 +5013,164 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.agent_generations.get(profile_arn)?.values().find(|record| {
             record.fingerprint == fingerprint && !record.is_terminal(now)
         })
+    }
+
+    /// A fresh `RecommendationArn`: `agent-recommendation/<UUID>` in `region`, the form the
+    /// modelled `AgentRecommendationArn` / `RecommendationArn` pattern requires
+    /// (`…:agent-recommendation/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`),
+    /// and unused by any recommendation this store holds.
+    ///
+    /// Uniqueness is checked across EVERY profile's recommendations: the ARN names the
+    /// recommendation on its own — `UpdateAgentRecommendationStatus` and
+    /// `GetAgentRecommendation` resolve one by ARN alone, with no profile in the path — so
+    /// two profiles handing out the same one would make it ambiguous.
+    pub fn mint_agent_recommendation_arn(&mut self, region: &str) -> String {
+        loop {
+            let id = self.next_uuid();
+            let arn = ::engine::emulator_arn(
+                ARN_NAMESPACE,
+                region,
+                &format!("agent-recommendation/{id}"),
+            );
+            if !self
+                .agent_recommendations
+                .values()
+                .any(|recommendations| recommendations.contains_key(&arn))
+            {
+                return arn;
+            }
+        }
+    }
+
+    /// The recommendation `arn` names, if this store holds one, for a caller that is about
+    /// to write to it — `UpdateAgentRecommendationStatus` is the one operation that does.
+    ///
+    /// A `RecommendationArn` identifies the recommendation on its own, so the lookup spans
+    /// every profile's recommendations: one map lookup per profile, bounded by
+    /// [`MAX_AGENT_PROFILES`], and exact — the inner maps are keyed by the ARN itself, so
+    /// no ARN suffix can be mistaken for another. A listing reaches a profile's
+    /// recommendations through [`Self::agent_recommendations`] directly, because it is
+    /// enumerating them rather than resolving one.
+    pub fn agent_recommendation_mut(
+        &mut self,
+        arn: &str,
+    ) -> Option<&mut AgentRecommendationRecord> {
+        self.agent_recommendations
+            .values_mut()
+            .find_map(|recommendations| recommendations.get_mut(arn))
+    }
+
+    /// Record the recommendations of every generation whose analysis the clock has
+    /// finished and whose results are not recorded yet, as of `now`.
+    ///
+    /// A generation "analyzes your Amazon Web Services resources and generates optimization
+    /// recommendations based on the configured pillars and scope", and its results are
+    /// ready when it reaches `COMPLETED` ("poll this operation until status reaches a
+    /// terminal value of COMPLETED (results are ready)" —
+    /// `GetAgentRecommendationGeneration` doc). The completion is owed by the CLOCK
+    /// ([`AgentGenerationRecord::ends_at`]), and nothing in this emulator runs between
+    /// requests, so the recommendations it produced are materialised by the first operation
+    /// that goes looking for them — the write a reporting operation is allowed to make,
+    /// because it was due at that instant whether or not anybody called.
+    ///
+    /// One recommendation per pillar the generation's scope named, which is the same
+    /// reading of a scope as its progress ([`AgentGenerationRecord::progress`]): one scoped
+    /// pillar is one step of the analysis, and the finding that step produced is the
+    /// catalog's content for that pillar. A pillar the catalog publishes no finding for
+    /// yields no recommendation, so the table is the only place that decides what a
+    /// generation can produce.
+    ///
+    /// IDEMPOTENT: a generation whose recommendations are already recorded is skipped, so
+    /// however many times this runs, one generation's analysis produces its results once.
+    pub fn materialise_due_agent_recommendations(&mut self, now: SystemTime) {
+        // What each due generation produces, resolved while the generations are only read,
+        // so the minting below can take the store mutably.
+        let due: Vec<(
+            String,
+            String,
+            String,
+            Vec<&'static RecommendationContent>,
+            SystemTime,
+        )> = self
+            .agent_generations
+            .iter()
+            .flat_map(|(profile_arn, generations)| {
+                generations
+                    .values()
+                    .map(move |generation| (profile_arn, generation))
+            })
+            .filter(|(profile_arn, generation)| {
+                generation.is_terminal(now)
+                    && !self.generation_has_recommendations(profile_arn, &generation.id)
+            })
+            .filter_map(|(profile_arn, generation)| {
+                Some((
+                    profile_arn.clone(),
+                    generation.id.clone(),
+                    generation.types.first()?.clone(),
+                    generation
+                        .scope
+                        .pillars
+                        .iter()
+                        .filter_map(|pillar| recommendation_content(pillar))
+                        .collect(),
+                    generation.ends_at,
+                ))
+            })
+            .collect();
+
+        for (profile_arn, generation_id, recommendation_type, findings, completed_at) in due {
+            // A recommendation of a profile is a resource of the same account and Region as
+            // that profile, so its ARN is minted in the Region the profile's own ARN names
+            // rather than in the Region of whichever request happened to materialise it.
+            let region = arn_region(&profile_arn).to_string();
+            for content in findings {
+                let arn = self.mint_agent_recommendation_arn(&region);
+                let record = AgentRecommendationRecord {
+                    arn: arn.clone(),
+                    profile_arn: profile_arn.clone(),
+                    generation_id: generation_id.clone(),
+                    content,
+                    recommendation_type: recommendation_type.clone(),
+                    // "The current status of the recommendation": a recommendation nobody
+                    // has acted on yet is the active one of the lifecycle
+                    // `UpdateAgentRecommendationStatus` moves it through.
+                    status: RECOMMENDATION_ACTIVE.to_string(),
+                    update_reason: None,
+                    // "The identifier of the user or system that created this
+                    // recommendation": the analysis is the SERVICE's work, so it is
+                    // attributed to this emulator's one account, exactly as the generation
+                    // that produced it is.
+                    created_by: ::engine::emulator_account_id().to_string(),
+                    // The instant the analysis finished — when the recommendation came
+                    // into being — rather than the instant some later read noticed.
+                    created_at: completed_at,
+                    last_modified_by: None,
+                    last_modified_at: None,
+                };
+                self.agent_recommendations
+                    .entry(profile_arn.clone())
+                    .or_default()
+                    .insert(arn, record);
+            }
+        }
+    }
+
+    /// Whether the generation `generation_id` of `profile_arn` has already had its
+    /// recommendations recorded.
+    ///
+    /// Read off the recommendations themselves rather than off a flag beside them, so there
+    /// is ONE record of what a generation produced: every generation this emulator accepts
+    /// scopes at least one pillar (`Scope$pillars` is modelled `@length(1, 5)`), so a
+    /// generation whose results are recorded always has at least one recommendation to find.
+    fn generation_has_recommendations(&self, profile_arn: &str, generation_id: &str) -> bool {
+        self.agent_recommendations
+            .get(profile_arn)
+            .is_some_and(|recommendations| {
+                recommendations
+                    .values()
+                    .any(|record| record.generation_id == generation_id)
+            })
     }
 
     /// The tags recorded on the resource an ARN names, or `None` when it names no
@@ -5118,6 +5475,11 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.create_agent_context_tokens
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_generations.remove(profile_arn);
+        // The recommendations those generations produced go with them: a recommendation is
+        // a result OF a generation of this profile, so none can outlive the profile, and
+        // dropping them is what keeps the bound on
+        // [`Self::agent_recommendations`] real.
+        self.agent_recommendations.remove(profile_arn);
         Some(record)
     }
 
@@ -5202,6 +5564,20 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `TemplateName` is a member `UpdateReviewTemplate` can move.
     pub fn review_template_order(&self) -> Vec<String> {
         let mut keys: Vec<String> = self.review_templates.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// The stable list order `ListProfiles` pages over: `ProfileArn`, which is also what
+    /// [`Self::profiles`] is keyed by.
+    ///
+    /// The model publishes no order for `ProfileSummaries`, so this is the emulator's own,
+    /// chosen for the reason [`Self::review_template_order`] gives: the `NextToken` carries
+    /// the key of the last profile a page served, so that key has to be unique and fixed
+    /// for the profile's whole life. The ARN is both, where `ProfileName` is a member
+    /// `UpdateProfile` can move.
+    pub fn profile_order(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.profiles.keys().cloned().collect();
         keys.sort();
         keys
     }
@@ -5708,6 +6084,21 @@ pub fn decode_review_template_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("t")?.as_str()?.to_string())
 }
 
+/// Encode a `ListProfiles` cursor: the `ProfileArn` last served, in the same opaque
+/// scheme as [`encode_next_token`]. Profiles are enumerated in `ProfileArn` order
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profile_order`]),
+/// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_profile_next_token(profile_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "o": profile_arn }))
+}
+
+/// The `ProfileArn` a `ListProfiles` `NextToken` points just past, or `None` when the
+/// token is not one this service issued.
+pub fn decode_profile_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("o")?.as_str()?.to_string())
+}
+
 /// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same
 /// opaque scheme as [`encode_next_token`]. Contexts are enumerated in id order, so that
 /// id is the whole cursor. Its own key, so a cursor issued by another paginated
@@ -5749,6 +6140,22 @@ pub fn encode_agent_profile_next_token(profile_arn: &str) -> String {
 /// when the token is not one this service issued.
 pub fn decode_agent_profile_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("p")?.as_str()?.to_string())
+}
+
+/// Encode a `ListAgentRecommendations` cursor: the `RecommendationArn` last served, in
+/// the same opaque scheme as [`encode_next_token`]. Recommendations are enumerated in ARN
+/// order and an ARN is never reused
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::mint_agent_recommendation_arn`]),
+/// so that ARN is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_agent_recommendation_next_token(recommendation_arn: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "a": recommendation_arn }))
+}
+
+/// The `RecommendationArn` a `ListAgentRecommendations` `NextToken` points just past, or
+/// `None` when the token is not one this service issued.
+pub fn decode_agent_recommendation_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("a")?.as_str()?.to_string())
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this
@@ -6518,6 +6925,21 @@ pub fn agent_generation_not_found(profile_arn: &str, id: &str) -> ResourceNotFou
 /// `ResourceId`: see [`profile_scoped_resource_id`].
 pub fn agent_generation_resource_id(profile_arn: &str, id: &str) -> String {
     profile_scoped_resource_id(profile_arn, id)
+}
+
+/// [`resource_not_found`] for a `RecommendationArn` that names no recommendation this
+/// store holds.
+///
+/// A recommendation is named by its ARN ALONE — `UpdateAgentRecommendationStatus` and
+/// `GetAgentRecommendation` carry no profile in the path — so the `ResourceId` is that ARN
+/// as sent and the message names the recommendation rather than a profile it was looked
+/// for in. Shared by every operation that resolves one, so they cannot word it differently.
+pub fn agent_recommendation_not_found(recommendation_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        AGENT_RECOMMENDATION_RESOURCE_TYPE,
+        recommendation_arn.to_string(),
+        &format!("recommendation with ARN {recommendation_arn}"),
+    )
 }
 
 /// [`resource_not_found`] for a milestone number that names no recorded milestone of

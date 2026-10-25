@@ -395,8 +395,9 @@ const MAX_STATEMENT_TOKENS: usize = 1_000;
 const MAX_EXPRESSION_DEPTH: usize = 32;
 
 /// The prefix every `ValidationException` for an unusable statement carries, so the
-/// refusals that are about the statement read alike.
-const INVALID_STATEMENT: &str = "the queryStatement is not a valid query";
+/// refusals that are about the statement read alike: the service names the member it
+/// could not use, which is the `queryStatement` the request carried.
+const INVALID_STATEMENT: &str = "Invalid QueryStatement";
 
 /// The one source this language's `FROM` clause can name.
 const ENTITY_GRAPH: &str = "EntityGraph";
@@ -485,7 +486,10 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::NotEqual);
                     at += 2;
                 } else {
-                    return Err(unexpected_character(character, at));
+                    // The token the lexer was matching is the `!` AND the
+                    // character that failed to complete it, which is as much of
+                    // the statement as it had consumed when the match failed.
+                    return Err(invalid_token(&characters, at, 2));
                 }
             }
             '<' => {
@@ -566,7 +570,7 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, String> {
                 }
                 tokens.push(Token::Word(characters[start..at].iter().collect()));
             }
-            other => return Err(unexpected_character(other, at)),
+            _ => return Err(invalid_token(&characters, at, 1)),
         }
     }
     if tokens.is_empty() {
@@ -575,8 +579,40 @@ fn tokenize(statement: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-fn unexpected_character(character: char, at: usize) -> String {
-    format!("unexpected character {character:?} at position {at}")
+/// Why a run of characters the lexer cannot recognise as a token refuses the
+/// statement, as the reason the `ValidationException`'s message carries after
+/// [`INVALID_STATEMENT`].
+///
+/// Built from the request: it names WHERE in the statement the lexer stopped —
+/// as a 1-based line and column, which is how a statement's own text is
+/// addressed, so an editor or a console can point at the character — and quotes
+/// the text it had consumed for the token it could not finish (`at` is the index
+/// of that token's first character and `width` how many characters the attempt
+/// spanned, clamped to the end of the statement).
+fn invalid_token(characters: &[char], at: usize, width: usize) -> String {
+    let (line, column) = line_and_column(characters, at);
+    let end = at.saturating_add(width).min(characters.len());
+    let token: String = characters[at.min(end)..end].iter().collect();
+    format!(
+        "at line {line}, column {column}: invalid token, token recognition error at: '{token}'"
+    )
+}
+
+/// Where the character at index `at` sits in the statement: its 1-BASED line and
+/// column, counting a line per `\n`. A statement is one line unless the caller
+/// wrote it across several, and the first character of a line is column 1.
+fn line_and_column(characters: &[char], at: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for character in &characters[..at.min(characters.len())] {
+        if *character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    (line, column)
 }
 
 // ---------------------------------------------------------------------------

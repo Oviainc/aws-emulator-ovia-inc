@@ -7,13 +7,19 @@
 //! reads it back. A `clientToken` makes the submit idempotent. A queue that resolves to
 //! nothing, a queue that is not of type `SAGEMAKER_TRAINING`, a `jobName`,
 //! `schedulingPriority` or `retryStrategy.attempts` outside what the member documents, a
-//! `clientToken` reused for a different request and a full store are each the modelled
-//! `ClientException` (HTTP 400).
+//! `clientToken` reused for a different request, a `serviceRequestPayload` past the bytes
+//! this service stores for one job ([`crate::state::limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES`])
+//! and a full store are each the modelled `ClientException` (HTTP 400).
 //!
-//! The work itself is NOT run: nothing here runs SageMaker AI, so the clock walks the
-//! job `SUBMITTED` -> `RUNNABLE` and then ends it in the modelled failure state with
-//! [`crate::state::NO_SERVICE_JOB_RUNTIME_REASON`], inventing no `scheduledAt`,
-//! `startedAt`, attempt or capacity usage.
+//! The work itself is NOT run: nothing here runs SageMaker AI, so a job the scheduler can
+//! place is walked by the clock `SUBMITTED` -> `RUNNABLE` and then ended in the modelled
+//! failure state with [`crate::state::NO_SERVICE_JOB_RUNTIME_REASON`], inventing no
+//! `scheduledAt`, `startedAt`, attempt or capacity usage. A job whose request asks for more
+//! capacity than the service environments of its queue publish is never placed, so it rests
+//! in `RUNNABLE` instead of reaching any terminal status
+//! ([`crate::state::capacity_admits`]). What capacity the request asks for is derived HERE,
+//! once, and kept on the record ([`crate::state::requested_capacity`]), so no later call
+//! re-reads the payload.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -244,6 +250,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The payload is stored on the record and read once to derive what capacity the
+        // job asks for, so its size is bounded rather than letting one submit decide how
+        // much this service stores and parses
+        // (`state::limits::MAX_SERVICE_REQUEST_PAYLOAD_BYTES`).
+        batch::validate_service_request_payload(&input.service_request_payload).map_err(
+            |detail| {
+                SubmitServiceJobError::from(SubmitServiceJobErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            },
+        )?;
+
         // "You can specify either the name or the ARN of the queue."
         //
         // A reference that answers to no queue is the service's own lookup missing, so it
@@ -298,6 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let job_id = state.new_uuid();
         let arn = batch::service_job_arn(&region, &job_id);
+        let requested = batch::requested_capacity(&input.service_request_payload);
         let job = batch::ServiceJob {
             job_id: job_id.clone(),
             job_arn: arn.clone(),
@@ -320,6 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quota_share_name: input.quota_share_name,
             scheduling_priority: input.scheduling_priority,
             service_request_payload: Some(input.service_request_payload),
+            // What capacity the job asks for is derived HERE, once, so the scheduler never
+            // re-reads the payload (`state::requested_capacity`).
+            requested_capacity: requested,
             retry_strategy: input.retry_strategy,
             timeout_config: input.timeout_config,
             preemption_configuration: input.preemption_configuration,

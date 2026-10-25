@@ -359,11 +359,12 @@ impl CapCase {
 }
 
 /// RULE: a `TagResource` call is accepted exactly while the tag set it would
-/// leave on the resource is within the modelled maximum of 50 tags
-/// ([`MAX_TAGS_PER_RESOURCE`], from `TagMap`'s `@length(min: 0, max: 50)`);
-/// otherwise it is refused with HTTP 400 `TooManyTagsException` and stores
-/// nothing. Rewriting the value of a key the resource already carries never
-/// grows the set, so it is accepted even at the maximum.
+/// leave on the resource is within the maximum of 50 tags per resource
+/// ([`MAX_TAGS_PER_RESOURCE`]); otherwise it is refused as the QUOTA refusal
+/// exceeding a per-resource quota earns — HTTP 402
+/// `ServiceQuotaExceededException` — and stores nothing. Rewriting the value of
+/// a key the resource already carries never grows the set, so it is accepted
+/// even at the maximum.
 ///
 /// The rows differ along how full the resource is and how many of the request's
 /// keys are new — including both sides of the boundary and one past it.
@@ -460,8 +461,8 @@ async fn tagging_past_the_maximum_is_refused_and_stores_nothing() {
         } else {
             assert_eq!(
                 (resp.status, resp.error_type.as_deref()),
-                (400, Some("TooManyTagsException")),
-                "case {case:?}: expected a 400 TooManyTagsException, got {resp:?}"
+                (402, Some("ServiceQuotaExceededException")),
+                "case {case:?}: expected a 402 ServiceQuotaExceededException, got {resp:?}"
             );
         }
         assert!(

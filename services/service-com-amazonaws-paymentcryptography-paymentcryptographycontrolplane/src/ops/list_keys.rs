@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the stored keys as `KeySummary` entries, optionally narrowed to
+//! one `KeyState`, in `KeyArn` order with an opaque `NextToken` naming the key the
+//! next page starts at.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +174,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListKeys"))
+        // `MaxResults`' 1..100 range, `NextToken`'s 1..8192 length and the `KeyState`
+        // enum are modelled, so the centralized walk refuses values outside them
+        // before this body runs. The page size is clamped again below, so the page
+        // this handler allocates is sized by the server either way.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListKeysErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(token, &crate::state::key_arn_prefix())
+                    .ok_or_else(|| {
+                        // This operation declares its own `ValidationException`, so the
+                        // refusal carries the service's error shape rather than the
+                        // framework's synthetic one.
+                        ListKeysError::from(ListKeysErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    "NextToken is not a pagination token issued by ListKeys"
+                                        .to_string(),
+                                ),
+                            },
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+
+        let now = crate::state::now();
+        let store = state.lock();
+        let remaining = match &start {
+            Some(arn) => store.keys.range(arn.clone()..),
+            None => store.keys.range::<String, _>(..),
+        };
+
+        // Reserve no more than the store can actually yield.
+        let mut keys = Vec::with_capacity(page_size.min(store.keys.len()));
+        let mut next_token = None;
+        for (arn, key) in remaining {
+            // The filter is applied to the state the key reports NOW, so a key whose
+            // deletion window has elapsed is listed under `DELETE_COMPLETE`.
+            if input
+                .key_state
+                .as_deref()
+                .is_some_and(|wanted| key.effective_state(now) != wanted)
+            {
+                continue;
+            }
+            // The first matching key that does not fit becomes the next page's
+            // start, and only then is a `NextToken` emitted — the last page carries
+            // none.
+            if keys.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(arn));
+                break;
+            }
+            keys.push(key.to_summary(now));
+        }
+
+        Ok(ListKeysOutput { keys, next_token })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Binds an alias name to a key: stores the name together with the `KeyArn` the
+//! request names in [`crate::state`] and answers the stored binding, so a later
+//! `GetAlias` or a `KeyIdentifier` naming the alias resolves to the same key. An
+//! alias is never stored unbound here — this operation's own documentation says an
+//! alias cannot be created without a key, so a request carrying no `KeyArn` is
+//! refused.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +187,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAlias"))
+        // `AliasName`'s `^alias/[a-zA-Z0-9/_-]+$` pattern and 7..256 length, and
+        // `KeyArn`'s own pattern and 70..150 length, are modelled, so the centralized
+        // walk has already refused a malformed name or ARN before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAliasErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment cryptography key store is unavailable".to_string()),
+            })
+        })?;
+
+        // The model leaves `KeyArn` optional on the input shape, but this operation's
+        // own documentation states the rule the service applies: "You can't create an
+        // alias without a key." A request that names none is therefore refused here,
+        // which the model cannot express.
+        let Some(key_arn) = input.key_arn.clone() else {
+            return Err(CreateAliasErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "KeyArn is required: an alias cannot be created without a key".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        // An alias name identifies one key within the account, so a name already in
+        // use cannot be taken by a different key. This operation carries
+        // `@idempotent` though — `smithy_query(query="operation",operation="CreateAlias")`
+        // reports `"idempotent": true`, and this crate's OPERATIONS.md lists it under
+        // "## CreateAlias / Traits: @idempotent" — so a repeat of the SAME create, the
+        // normal consequence of an SDK retry, answers the binding that is already
+        // stored instead of failing; only a rebind to another key is the inconsistent
+        // state `ConflictException` describes. This is a deliberate deviation from
+        // the bootstrap issue's text, which asked for 409 on any second create of the
+        // name.
+        if let Some(existing) = store.aliases.get(&input.alias_name) {
+            if existing.as_deref() != Some(key_arn.as_str()) {
+                return Err(CreateAliasErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "the alias {} already exists and is bound to another key",
+                        input.alias_name
+                    )),
+                })
+                .into());
+            }
+            return Ok(CreateAliasOutput {
+                alias: crate::state::alias(&input.alias_name, Some(&key_arn)),
+            });
+        }
+        // An alias may only be bound to a key that exists. Checked before the store's
+        // own capacity, so the error a request earns does not depend on how full the
+        // store happens to be.
+        if !store.keys.contains_key(&key_arn) {
+            return Err(
+                CreateAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    resource_id: Some(key_arn),
+                })
+                .into(),
+            );
+        }
+        if store.aliases.len() >= crate::state::MAX_ALIASES {
+            return Err(
+                CreateAliasErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} aliases",
+                            crate::state::MAX_ALIASES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store
+            .aliases
+            .insert(input.alias_name.clone(), Some(key_arn));
+
+        // Answered from the binding that was just stored, not from the request.
+        let stored = store.aliases.get(&input.alias_name).cloned().flatten();
+        crate::state::record_mutation(ctx.parts(), Self::NAME, &input.alias_name);
+        Ok(CreateAliasOutput {
+            alias: crate::state::alias(&input.alias_name, stored.as_ref()),
+        })
     }
 }

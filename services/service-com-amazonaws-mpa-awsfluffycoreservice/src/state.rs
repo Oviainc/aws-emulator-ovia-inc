@@ -138,6 +138,11 @@
 //!   carry an Amazon Resource Name and does not is refused with, raised by a handler for
 //!   a member the model gives no ARN `@pattern` and by `crate::service`'s refusal seam
 //!   ([`is_malformed_arn_violation`]) for the members it does.
+//! * [`reserved_tag_key`] — the one message every path that WRITES tags refuses a key in
+//!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]).
+//! * [`unattachable_policy`] — the one message a policy reference the catalog cannot
+//!   resolve is refused with
+//!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -327,6 +332,63 @@ where
         .filter(|key| !existing.contains_key(*key))
         .collect();
     existing.len() + added.len()
+}
+
+/// Prefix a tag KEY carries when it belongs to Amazon Web Services rather than to the
+/// caller.
+///
+/// AWS's tagging rules reserve this key namespace for AWS itself: a caller can neither
+/// create nor change a tag whose key starts with it, so no request this service serves
+/// may write one — see [`names_reserved_tag_key`]. The comparison ignores case, so the
+/// namespace cannot be entered by spelling the prefix differently.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the reserved namespace [`RESERVED_TAG_KEY_PREFIX`] names.
+#[must_use]
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    key.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+/// Whether any of `keys` lies in the reserved namespace, which is what every path that
+/// WRITES tags refuses a request for ([`reserved_tag_key`]).
+#[must_use]
+pub fn names_reserved_tag_key<'a, I>(keys: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().any(is_reserved_tag_key)
+}
+
+/// The refusal a request that would write a tag key in the reserved namespace earns.
+///
+/// The message names the member and the constraint it breaks and no value the request
+/// carried: a `TagKey` is `@sensitive`, so the key itself is not quoted back.
+#[must_use]
+pub fn reserved_tag_key() -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Tags names a key in the '{RESERVED_TAG_KEY_PREFIX}' namespace, which is \
+             reserved for Amazon Web Services. Choose a key outside it, and try again."
+        ),
+    }
+}
+
+/// The refusal a `Policies` reference that names no policy version this service holds
+/// earns.
+///
+/// The reference is a `QualifiedPolicyArn`, which carries no `@sensitive` trait, so the
+/// refusal names the ARN that resolved to nothing.
+#[must_use]
+pub fn unattachable_policy(policy_arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Policies names a policy version that does not exist: {policy_arn}. Attach a \
+             policy version ListPolicies and ListPolicyVersions report."
+        ),
+    }
 }
 
 /// The pending deletion window `days` names, or `None` when `days` is not a day count
@@ -2197,6 +2259,25 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     #[must_use]
     pub fn policy(&self, arn: &str) -> Option<&CatalogPolicy> {
         self.policies.get(arn)
+    }
+
+    /// The first of `references` that names no policy version this store holds, or
+    /// `None` when every one of them resolves.
+    ///
+    /// A policy is AWS-owned — no operation of this model mints, updates or deletes one —
+    /// so a reference is only attachable when the catalog already holds the policy AND
+    /// the version it names. References are resolved through [`Self::policy_version`],
+    /// the one resolver a `QualifiedPolicyArn` is read by, so an attachment that is
+    /// accepted when a resource is written is one every later read of that resource can
+    /// resolve.
+    #[must_use]
+    pub fn unattachable_policy_reference<'a, I>(&self, references: I) -> Option<&'a str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        references
+            .into_iter()
+            .find(|reference| self.policy_version(reference).is_none())
     }
 
     /// The catalog policy and the one of its versions that a `QualifiedPolicyArn` names,

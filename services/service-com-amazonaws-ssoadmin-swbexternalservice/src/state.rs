@@ -27,7 +27,7 @@ use crate::ops::types::{
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
     PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
-    ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
+    ResourceServerScopeDetails, ScopeDetails, Tag, TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -468,9 +468,19 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const ASSIGNMENT_OPERATION_SPAN: Duration = Duration::from_millis(500);
 
 /// The page size a paginated read uses when the caller sends no `MaxResults`, and the
-/// ceiling it clamps a caller's value to: the model bounds every `MaxResults` member of
-/// this service at `range(min: 1, max: 100)`.
+/// ceiling it clamps a caller's value to: the model's `MaxResults` shape is
+/// `range(min: 1, max: 100)`.
 pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The largest page `ListApplicationAccessScopes` can answer: the maximum its own
+/// `MaxResults` MEMBER declares, which narrows the `MaxResults` shape's `range(min: 1,
+/// max: 100)` and is the same bound its response's `Scopes` list carries
+/// (`length(min: 0, max: 10)`), so no larger page is expressible.
+///
+/// The validating walk enforces the constraints the SCHEMA carries, which are the target
+/// shape's, so the handler of an operation whose member narrows them states the narrower
+/// bound itself — see [`crate::service::refusal::value_above_maximum`].
+pub const MAX_ACCESS_SCOPES_PER_PAGE: i32 = 10;
 
 /// The maximum number of records this emulator keeps in ANY ONE of its caller-driven
 /// stores ([`ComAmazonawsSsoadminSwbexternalserviceState::permission_sets`],
@@ -1346,6 +1356,24 @@ pub fn customer_managed_policy_ceiling_message(permission_set_arn: &str) -> Stri
     )
 }
 
+/// The refusal an ATTACH of a reference the permission set ALREADY holds earns, as the
+/// message of the modelled `ConflictException` (HTTP 409) — "a conflict with a previous
+/// successful write".
+///
+/// Built from the request: it names the pair that is already attached and the permission
+/// set it is attached to, because a client has to tell which of the request's resources
+/// the conflict is about.
+pub fn customer_managed_policy_already_attached_message(
+    permission_set_arn: &str,
+    name: &str,
+    path: &str,
+) -> String {
+    format!(
+        "A customer managed policy reference with name {name} and path {path} is already \
+         attached to permission set {permission_set_arn}."
+    )
+}
+
 /// The refusal a detach of a reference the permission set does not hold earns, as the
 /// message of the modelled `ResourceNotFoundException` (HTTP 404).
 ///
@@ -1391,6 +1419,23 @@ pub fn managed_policy_ceiling_message(permission_set_arn: &str) -> String {
         "Cannot attach another managed policy: this emulator holds at most \
          {MAX_MANAGED_POLICIES_PER_PERMISSION_SET} managed policies per permission set, \
          and {permission_set_arn} already holds that many"
+    )
+}
+
+/// The refusal an ATTACH of an AWS managed policy the permission set ALREADY carries
+/// earns, as the message of the modelled `ConflictException` (HTTP 409) — "a conflict
+/// with a previous successful write".
+///
+/// Built from the request, like
+/// [`customer_managed_policy_already_attached_message`]: it names the ARN that is already
+/// attached and the permission set it is attached to.
+pub fn managed_policy_already_attached_message(
+    permission_set_arn: &str,
+    managed_policy_arn: &str,
+) -> String {
+    format!(
+        "Managed policy with arn {managed_policy_arn} is already attached to permission \
+         set {permission_set_arn}."
     )
 }
 
@@ -1520,9 +1565,9 @@ pub struct PermissionSetRecord {
     /// The AWS MANAGED POLICY ARNs attached to this permission set.
     ///
     /// An attachment's IDENTITY is its `ManagedPolicyArn` — a permission set holds a given
-    /// AWS managed policy at most once, so attaching the same ARN twice attaches it once
-    /// and a detach removes the one entry its ARN names. They live ON the permission-set
-    /// record rather than in a second map, for the same reason as
+    /// AWS managed policy at most once, so an attach of an ARN the set already carries is
+    /// refused and a detach removes the one entry its ARN names. They live ON the
+    /// permission-set record rather than in a second map, for the same reason as
     /// [`Self::customer_managed_policies`]: a permission set that no longer exists holds
     /// none of them, and the attach, detach and list operations all resolve the same
     /// permission set every other read resolves. Holds at most
@@ -1536,7 +1581,8 @@ pub struct PermissionSetRecord {
     /// permission set that no longer exists holds none of them and the attach, detach and
     /// list operations all resolve the same permission set every other read resolves. A
     /// `BTreeMap` so an enumeration walks one stable order and can page by that identity,
-    /// and so an attach of a reference already attached stores it ONCE. Holds at most
+    /// and so one identity names at most one stored reference — an attach of a reference
+    /// already attached is refused before the insert. Holds at most
     /// [`MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET`] references; an attach that
     /// would add one beyond that ceiling is refused rather than grown into.
     pub customer_managed_policies: BTreeMap<String, CustomerManagedPolicyReferenceRecord>,
@@ -1822,6 +1868,34 @@ pub struct ApplicationRecord {
     /// holds at most four entries per application. A `BTreeMap` so an enumeration walks
     /// one stable order and can page by grant type.
     pub grants: BTreeMap<String, Grant>,
+}
+
+impl ApplicationRecord {
+    /// The access scopes this application carries, in `Scope` order, as the
+    /// `(page key, item)` pairs [`page`] enumerates.
+    ///
+    /// The scope NAME is both the page key and the identity of a scope — an application
+    /// carries a given scope at most once, since [`Self::access_scopes`] is keyed by it —
+    /// so the enumeration order is stable across calls however the scopes were put, and a
+    /// pagination cursor resumes after a KEY rather than after a position a later put
+    /// would shift.
+    pub fn access_scope_details(&self) -> Vec<(String, ScopeDetails)> {
+        self.access_scopes
+            .iter()
+            .map(|(scope, authorized_targets)| {
+                (
+                    scope.clone(),
+                    ScopeDetails {
+                        scope: scope.clone(),
+                        // Reported from the STORED scope: absent for a scope put with no
+                        // `AuthorizedTargets`, since `ScopeTargets` is `length 1..10` and
+                        // cannot express an empty list.
+                        authorized_targets: authorized_targets.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// A direct assignment of one principal to one application.
@@ -3181,6 +3255,13 @@ pub fn cursor_permission_sets(instance_arn: &str) -> String {
 /// instance that permission set belongs to (the same pair the read resolves against).
 pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
     format!("managedPolicies|{instance_arn}|{permission_set_arn}")
+}
+
+/// Cursor scope of a `ListApplicationAccessScopes` enumeration: the operation and the
+/// application whose access scopes it walks (the same application every scope read
+/// resolves against).
+pub fn cursor_access_scopes(application_arn: &str) -> String {
+    format!("accessScopes|{application_arn}")
 }
 
 /// Cursor scope of a `ListApplicationGrants` enumeration: the operation and the

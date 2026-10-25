@@ -110,7 +110,11 @@ struct TargetCase {
 /// The segments are the ones the modelled `RouterNetworkInterfaceArn` pattern fixes
 /// (`smithy_query(query="shape",shape="RouterNetworkInterfaceArn")`:
 /// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
-fn unheld_interface_arns() -> Vec<(&'static str, String)> {
+///
+/// `pub(crate)` because the router INPUT side refuses the same ARNs for the same reason, and
+/// there is one catalog of them rather than one per suite (see
+/// `tests/all/router_input_configuration_targets.rs`).
+pub(crate) fn unheld_interface_arns() -> Vec<(&'static str, String)> {
     vec![
         (
             "an interface id no create minted",

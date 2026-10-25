@@ -511,7 +511,14 @@ enum Shape {
 }
 
 /// A `Detail` nesting `depth` levels of `shape`, with `"a"` as every object key
-/// so one pattern reaches into any of them.
+/// so one pattern reaches into any of them, and a LEAF beside the nesting at the
+/// outermost level.
+///
+/// The leaf is what the depth table's rule matches on: a pattern term compares a
+/// LEAF value ("exists only works on leaf nodes. It does not work on intermediate
+/// nodes"), so a document the handler did not really parse — reported as an empty
+/// object — matches nothing, whatever the nesting below the leaf looks like. It
+/// adds no depth: it sits in the outermost object, which is level 0 either way.
 fn nested_detail(shape: Shape, depth: usize) -> String {
     assert!(depth >= 1, "a Detail object nests at least one level");
     let mut document = "1".to_string();
@@ -523,13 +530,22 @@ fn nested_detail(shape: Shape, depth: usize) -> String {
             Shape::Mixed => level % 2 == 0,
         };
         document = if as_object {
-            format!(r#"{{"a":{document}}}"#)
+            if level == 0 {
+                format!(r#"{{"a":{document},"{PARSE_PROBE_KEY}":{PARSE_PROBE_VALUE}}}"#)
+            } else {
+                format!(r#"{{"a":{document}}}"#)
+            }
         } else {
             format!("[{document}]")
         };
     }
     document
 }
+
+/// The leaf member of a nested `Detail` the depth table's rule matches on, and
+/// its value ([`nested_detail`]).
+const PARSE_PROBE_KEY: &str = "parsed";
+const PARSE_PROBE_VALUE: i32 = 7;
 
 /// The stack the depth table drives the handler on: the size the emulator's own
 /// router gives each tokio WORKER thread (`core/router/src/main.rs`'s
@@ -576,11 +592,20 @@ fn a_detail_nests_to_the_documented_depth_whatever_it_nests() {
 async fn nesting_depth_rows() {
     let emulator = emulator();
     // The pattern reaches one level INTO the detail, so it matches only if the
-    // document was really parsed rather than taken as an empty object.
+    // document was really parsed rather than taken as an empty object. It
+    // compares the document's LEAF member, because a pattern term matches a leaf
+    // value: "exists only works on leaf nodes. It does not work on intermediate
+    // nodes", so a clause on the nesting itself would say nothing about the parse.
     let (status, body) = call(
         &emulator,
         "PutRule",
-        &json!({ "Name": "reaches-into-detail", "EventPattern": r#"{"detail":{"a":[{"exists":true}]}}"# }),
+        &json!({
+            "Name": "reaches-into-detail",
+            "EventPattern": json!({
+                "detail": { PARSE_PROBE_KEY: [PARSE_PROBE_VALUE] },
+            })
+            .to_string(),
+        }),
     )
     .await;
     assert_eq!(status, 200, "PutRule answered {status} {body}");

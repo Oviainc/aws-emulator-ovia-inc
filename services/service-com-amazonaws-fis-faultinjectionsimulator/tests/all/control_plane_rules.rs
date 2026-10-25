@@ -1627,7 +1627,12 @@ async fn an_unknown_id_is_reported_by_the_rule_for_its_resource() {
 async fn updating_a_target_account_configuration_changes_only_what_the_request_names() {
     let router = emulator();
 
-    let created = create_template(&router, wait_template("target-accounts", "PT5M")).await;
+    // A target account configuration belongs to a template that targets MULTIPLE accounts:
+    // `accountTargeting` and the configurations a template holds state the same thing
+    // between them.
+    let mut body = wait_template("target-accounts", "PT5M");
+    body["experimentOptions"] = json!({ "accountTargeting": "multi-account" });
+    let created = create_template(&router, body).await;
     let template = created_template_id("target-accounts", &created);
 
     // No configuration for that account yet: the update is refused and creates none.

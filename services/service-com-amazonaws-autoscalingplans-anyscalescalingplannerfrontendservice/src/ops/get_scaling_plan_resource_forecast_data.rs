@@ -7,9 +7,10 @@
 //! The forecast for ONE scalable resource over ONE time window, in two steps:
 //!
 //! 1. the request's own members are refused first — the forecast window (its two
-//!    endpoints in order, the documented seven-day maximum width measured on the
-//!    instants themselves, and the documented 56-day limit on how far before the current
-//!    date and time the start may sit), the scaling plan version (the model documents a
+//!    endpoints in order, the documented seven-day maximum width and the documented
+//!    56-day limit on how far before the current date and time the start may sit, both
+//!    measured in whole hourly forecast periods, the granularity forecast data exists
+//!    at), the scaling plan version (the model documents a
 //!    single valid value), the resource coordinates (forecasts are issued for an Auto
 //!    Scaling group's desired capacity and nothing else) and the `ForecastDataType` enum —
 //!    so a bad request is refused whether or not the named plan exists;
@@ -20,13 +21,11 @@
 //! takes the scaling instruction that names the requested resource: that instruction's
 //! capacity band, its target tracking configurations and its predictive-scaling settings
 //! decide every value, and each `ForecastDataType` reports the quantity the model defines
-//! for it (see [`ResourceForecast`]). The plan name and version are required and name ONE
-//! plan, so a lookup that finds none is refused with the service's not-found sentence
-//! ([`crate::state::plan_not_found_message`]) in the modelled `ValidationException`
-//! (HTTP 400), this operation's generic client error. A plan that IS held but holds no
-//! instruction for the requested resource, and an instruction that configures no
-//! predictive scaling, have no forecast: that is the empty `Datapoints` list, a resource
-//! with nothing to forecast rather than a plan that does not exist.
+//! for it (see [`ResourceForecast`]). This operation binds no not-found error at all, so
+//! a lookup that finds no plan of that (name, version) is not a client error — like a
+//! plan that IS held but holds no instruction for the requested resource, and like an
+//! instruction that configures no predictive scaling, it has no forecast, which is the
+//! empty `Datapoints` list. Only step 1, the request's own members, can refuse this call.
 //!
 //! AWS predicts each hour's load from the CloudWatch history of the instruction's load
 //! metric. This emulator ingests no metric data, so it has no history to predict FROM and
@@ -219,29 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due (a plan whose creation or deletion came due) rather than a stale one.
         state.settle_due(now);
 
-        // A lookup by (name, version) that finds no plan is refused, like every other
-        // operation here that looks a plan up by those two members: there is no resource
-        // to forecast for under a plan the service does not hold. The shape is this
-        // operation's generic `ValidationException`
-        // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
-        // binds only `InternalServiceException` and `ValidationException`), carrying the
-        // service's one not-found sentence.
-        let plan = state
-            .plan(&input.scaling_plan_name, input.scaling_plan_version)
-            .ok_or_else(|| {
-                validation(crate::state::plan_not_found_message(
-                    &input.scaling_plan_name,
-                    input.scaling_plan_version,
-                ))
-            })?;
-
         // The forecast is computed from the stored plan: the scaling instruction that
         // names the requested resource is what a forecast for it is issued from.
         //
-        // Where the held plan instructs no such resource there is no forecast, and the
-        // empty `Datapoints` list reports it — a scalable resource this plan does not
-        // cover, not a missing plan.
-        let datapoints = instruction_for(plan, &input)
+        // Where this service holds no plan of that (name, version), or the held plan
+        // instructs no such resource, there is nothing to forecast — and that is the
+        // empty `Datapoints` list, not a refusal: this operation binds no not-found shape
+        // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
+        // binds only `InternalServiceException` and `ValidationException`), so only the
+        // request's own members, refused above, can make this call a refusal.
+        let datapoints = state
+            .plan(&input.scaling_plan_name, input.scaling_plan_version)
+            .and_then(|plan| instruction_for(plan, &input))
             .map(|instruction| {
                 forecast(
                     instruction,
@@ -319,11 +307,17 @@ fn days_in_nanos(days: i64) -> i128 {
 /// 1. `StartTime` is "the inclusive start time" and `EndTime` "the exclusive end time" of
 ///    a time range, so an end at or before the start spans no time at all;
 /// 2. the documented maximum width — "The maximum time duration between the start and end
-///    time is seven days" — is a duration between the two instants the request carries, so
-///    it is measured on those instants and nothing coarser: a window even one second past
-///    seven days is refused;
+///    time is seven days";
 /// 3. `StartTime` "can be at most [`MAX_FORECAST_HISTORY_DAYS`] days before the current
 ///    date and time", so a start further back than that span before `now` is refused.
+///
+/// Both DAY bounds are spans of forecast data, and forecast data exists at one data point
+/// per [`FORECAST_INTERVAL_SECONDS`] — so each is measured in whole forecast periods
+/// ([`period_nanos`]), the granularity the quantity they bound is reported at, and not at
+/// the nanosecond the wire can carry: a window reaching less than one period past a bound
+/// asks for no forecast period beyond it and is served, while one reaching a whole period
+/// past it is refused. Measuring either bound finer than the data it bounds refuses
+/// windows the service has every period of.
 ///
 /// Nothing bounds how far into the FUTURE the window may reach: `EndTime` "can accept a
 /// date and time that is more than two days in the future", and a window AWS issues no
@@ -340,18 +334,34 @@ fn validate_forecast_window(
     if end <= start {
         return Err("Start time must be before end time".to_string());
     }
-    if end - start > days_in_nanos(MAX_FORECAST_WINDOW_DAYS) {
+    if whole_periods(end - start) > days_in_periods(MAX_FORECAST_WINDOW_DAYS) {
         return Err(format!(
             "The maximum allowed time range is {MAX_FORECAST_WINDOW_DAYS} days"
         ));
     }
-    if start < clock_nanos(now) - days_in_nanos(MAX_FORECAST_HISTORY_DAYS) {
+    if whole_periods(clock_nanos(now) - start) > days_in_periods(MAX_FORECAST_HISTORY_DAYS) {
         return Err(format!(
             "Start time must be at most {MAX_FORECAST_HISTORY_DAYS} days before the \
              current date and time"
         ));
     }
     Ok(())
+}
+
+/// One forecast period as a span in nanoseconds: the granularity forecast data exists at.
+fn period_nanos() -> i128 {
+    i128::from(FORECAST_INTERVAL_SECONDS) * 1_000_000_000
+}
+
+/// `span` as a count of whole forecast periods, rounded towards zero, so a remainder
+/// shorter than one period adds no period to it.
+fn whole_periods(span: i128) -> i128 {
+    span / period_nanos()
+}
+
+/// `days` as a count of whole forecast periods.
+fn days_in_periods(days: i64) -> i128 {
+    days_in_nanos(days) / period_nanos()
 }
 
 /// The scaling plan version a caller asked a forecast for.

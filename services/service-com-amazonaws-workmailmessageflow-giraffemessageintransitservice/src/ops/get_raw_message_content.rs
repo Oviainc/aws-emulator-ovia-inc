@@ -3,7 +3,8 @@
 //! @op GetRawMessageContent
 //!
 //! Reports the MIME bytes currently stored for an in-transit message. A pure read:
-//! it returns `messages[messageId].content` verbatim as the HTTP payload and writes
+//! it returns the content stored for the `messageId` in the message flow of the
+//! region the request was made in, verbatim as the HTTP payload, and writes
 //! nothing, so a later caller sees exactly what this one saw. A message that is
 //! frozen (no longer eligible for update) is still readable — only
 //! `PutRawMessageContent` refuses it.
@@ -133,19 +134,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // This service is a regional data plane, so the region the request was made
+        // in is half of the address: a message in transit in another region's
+        // message flow is not reachable through this endpoint at all.
+        let request_region = crate::state::request_region(ctx.parts());
         let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let state = state.lock();
 
         // The bytes come out of the store and nowhere else: no canned MIME blob, and
-        // nothing derived from the request beyond the id used to look the message up.
-        let message = state.messages.get(&input.message_id).ok_or_else(|| {
+        // nothing derived from the request beyond the region and id used to look the
+        // message up.
+        let message = state
+            .message(&request_region, &input.message_id)
+            .ok_or_else(|| {
             ::tracing::info!(
                 operation = "GetRawMessageContent",
                 akid = %akid,
                 message_id = %input.message_id,
+                region = %request_region,
                 outcome = "ResourceNotFoundException",
-                "no in-transit message is stored under this id"
+                "no in-transit message is stored under this id in this region"
             );
             // The text is the service's own rule — the fixed prefix plus the
             // rejected id — and both operations render it from the one place that
@@ -161,6 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = "GetRawMessageContent",
             akid = %akid,
             message_id = %input.message_id,
+            region = %request_region,
             content_octets = message.content.len(),
             outcome = "success",
             "reported the raw content of an in-transit message"

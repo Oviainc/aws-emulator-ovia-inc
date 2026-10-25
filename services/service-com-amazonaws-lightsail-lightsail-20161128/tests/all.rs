@@ -51,6 +51,8 @@ mod disk_block_storage;
 mod disk_delete;
 #[path = "all/disk_detach.rs"]
 mod disk_detach;
+#[path = "all/disk_listing.rs"]
+mod disk_listing;
 #[path = "all/disk_restore_from_snapshot.rs"]
 mod disk_restore_from_snapshot;
 #[path = "all/disk_restore_snapshot_completeness.rs"]
@@ -63,6 +65,8 @@ mod disk_snapshot_delete;
 mod disk_snapshot_listing;
 #[path = "all/distribution_cdn.rs"]
 mod distribution_cdn;
+#[path = "all/distribution_certificate_attachment.rs"]
+mod distribution_certificate_attachment;
 #[path = "all/distribution_metric_data.rs"]
 mod distribution_metric_data;
 #[path = "all/domain_delete.rs"]

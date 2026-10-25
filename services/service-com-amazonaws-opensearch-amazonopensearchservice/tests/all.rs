@@ -33,12 +33,16 @@ mod domain_lifecycle;
 mod domain_nodes;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
+#[path = "all/package_associations.rs"]
+mod package_associations;
 #[path = "all/package_registry.rs"]
 mod package_registry;
 #[path = "all/reserved_instance_offerings.rs"]
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
 mod reserved_instances;
+#[path = "all/scheduled_actions.rs"]
+mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]
 mod service_software_rollback;
 #[path = "all/shared_es_signing_name_claim.rs"]

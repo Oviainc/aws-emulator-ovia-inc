@@ -221,11 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+            // The refusal is about the built-in user the id RESOLVES to, not
+            // about the characters the request wrote it with, so it is worded
+            // from `crate::state::DEFAULT_USER_ID` alone: every spelling of
+            // that one id is answered the same way.
             return Err(DeleteUserErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(format!(
-                        "Invalid value {} for UserId: the {} user cannot be deleted.",
-                        input.user_id,
+                        "{} user can't be deleted.",
                         crate::state::DEFAULT_USER_ID
                     )),
                 },

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal, LFTag,
+    ColumnWildcard, Condition, DataCellsFilter, DataLakePrincipal, DatabaseResource, LFTag,
     PrincipalResourcePermissions, Resource, TableWithColumnsResource,
 };
 
@@ -453,22 +453,17 @@ pub const DEFAULT_IAM_ACCESS_CONTROL_PERMISSION: &str = "ALL";
 /// `RevokePermissions` is the only call that can take the default away, and what it leaves
 /// behind is recorded in `revoked_default_grants`, which answers every later call.
 ///
-/// Two consequences of this rendering, both deliberate:
+/// One consequence of this rendering, deliberate: every database NAME carries the default
+/// on the REVOKE path, including one the Data Catalog does not hold, so a revoke against a
+/// database that does not exist answers 200 where the real service refuses the request.
+/// [`missing_grant_entity`] is what can tell the two apart — `GrantPermissions` refuses on
+/// it — but `RevokePermissions` does NOT apply it: a revoke is refused by what the grantee
+/// HOLDS, and the recorded trace shows that refusal naming the permissions it does not
+/// have. Refusing a revoke on the entity instead would need a recorded unit to pin which
+/// of the two the real service answers first.
 ///
-/// * Every database NAME carries the default, including one the Data Catalog does not
-///   hold, so a revoke against a database that does not exist answers 200 where the real
-///   service refuses the request. [`missing_grant_entity`] is what can now tell the two
-///   apart — `GrantPermissions` refuses on it — but `RevokePermissions` does NOT apply it:
-///   a revoke is refused by what the grantee HOLDS, and the recorded trace shows that
-///   refusal naming the permissions it does not have. Refusing a revoke on the entity
-///   instead would need a recorded unit to pin which of the two the real service answers
-///   first.
-/// * `ListPermissions` does not report default grants, which is what its own documentation
-///   says it does: "This operation returns only those permissions that have been explicitly
-///   granted" (`smithy_query(query="doc",shape="ListPermissions")`). A default grant is
-///   held but was never granted by a call, so a reader that enumerates records is right to
-///   omit it — and with no set of databases to enumerate, a request that NAMES one is the
-///   only thing that can render its default.
+/// What a LISTING reports is [`default_database_grants`], which renders the same grant for
+/// the databases the Data Catalog actually holds.
 pub fn default_database_grant(
     resource: &Resource,
     principal: &str,
@@ -480,6 +475,174 @@ pub fn default_database_grant(
         return None;
     }
     Some(vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()])
+}
+
+/// The default grants a listing in `catalog_id` must report, keyed by [`grant_key`] so
+/// each one merges with the explicit grant on the same resource.
+///
+/// A Data Catalog database is created carrying the account's
+/// `DataLakeSettings$CreateDatabaseDefaultPermissions` as a DATABASE-level grant — by
+/// default `ALL` to [`IAM_ALLOWED_PRINCIPALS`] — and holds it until a revoke takes it
+/// away, so a reader of that database's permissions sees it. The permissions a database
+/// hands to the TABLES created in it are a different setting
+/// (`Database$CreateTableDefaultPermissions`, held in the Data Catalog), so they change
+/// nothing here.
+///
+/// Which databases: the one a `Database` resource filter names, or every database the
+/// catalog holds when the listing filters on no resource at all. A filter naming any other
+/// resource selects no database-level grant.
+///
+/// Only a database the Data Catalog HOLDS carries one, so a name it does not hold, and a
+/// catalog this emulator holds nothing for, report nothing: what a listing says has to be
+/// grounded in what a store says, and a catalog that cannot be enumerated cannot be
+/// answered for one name either. (`RevokePermissions` is looser — see
+/// [`default_database_grant`] — because a revoke is refused by what the grantee holds.)
+///
+/// The databases belong to GLUE, so they are read from Glue's own store in the shared
+/// engine, the same seam [`missing_grant_entity`] uses. Call this BEFORE locking this
+/// service's store: it takes Glue's lock itself, and never holds the two at the same time.
+///
+/// `resource_filter`, when present, must already be [`normalize_resource`]d, so the name
+/// is the one the catalog stores and the catalog id is filled in — that is what makes the
+/// key here the one `RevokePermissions` records a revoked default under.
+pub fn default_database_grants<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    catalog_id: &str,
+    resource_filter: Option<&Resource>,
+) -> Vec<(String, PermissionGrant)> {
+    let (database_catalog, named) = match resource_filter {
+        Some(resource) => {
+            let Some(database) = &resource.database else {
+                return Vec::new();
+            };
+            (
+                match database.catalog_id.as_deref() {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => catalog_id.to_string(),
+                },
+                Some(database.name.clone()),
+            )
+        }
+        None => (catalog_id.to_string(), None),
+    };
+
+    // The databases the Data Catalog holds under the addressed catalog id: the one named,
+    // if it is there, else every one of them.
+    let Some(catalog) = glue_state::service_state(engine) else {
+        return Vec::new();
+    };
+    let names: Vec<String> = {
+        let catalog = catalog.lock();
+        let Some(held) = catalog.catalogs.get(&database_catalog) else {
+            return Vec::new();
+        };
+        match named {
+            Some(name) => {
+                let stored = glue_state::fold_name(&name);
+                if !held.databases.contains_key(&stored) {
+                    return Vec::new();
+                }
+                vec![stored]
+            }
+            None => held.databases.keys().cloned().collect(),
+        }
+    };
+
+    names
+        .into_iter()
+        .map(|name| {
+            let resource = Resource {
+                database: Some(DatabaseResource {
+                    catalog_id: Some(database_catalog.clone()),
+                    name,
+                }),
+                ..Resource::default()
+            };
+            let grant = PermissionGrant {
+                catalog_id: catalog_id.to_string(),
+                principal: IAM_ALLOWED_PRINCIPALS.to_string(),
+                resource,
+                permissions: vec![DEFAULT_IAM_ACCESS_CONTROL_PERMISSION.to_string()],
+                // The default carries no grant option and no condition.
+                permissions_with_grant_option: Vec::new(),
+                condition_expression: None,
+            };
+            let key = grant_key(catalog_id, &grant.principal, &grant.resource, None);
+            (key, grant)
+        })
+        .collect()
+}
+
+/// The `arn:<partition>:iam::<account>:<type>/…` resource types that name an IAM
+/// principal: an IAM user or an IAM role. Nothing else under the `iam` service is a
+/// principal IAM can allow a request from (an identity provider, a policy, an instance
+/// profile), and a decorated principal of another identity system carries its own type
+/// here.
+pub const IAM_PRINCIPAL_RESOURCE_TYPES: [&str; 2] = ["role", "user"];
+
+/// Whether `identifier` names an IAM principal, i.e. an IAM user or role ARN.
+///
+/// The six-field `arn:partition:service:region:account-id:resource` layout, with the
+/// service `iam` and one of [`IAM_PRINCIPAL_RESOURCE_TYPES`] as the resource's type.
+pub fn is_iam_principal(identifier: &str) -> bool {
+    let fields: Vec<&str> = identifier.splitn(6, ':').collect();
+    if fields.len() < 6 || fields[0] != "arn" || fields[2] != "iam" {
+        return false;
+    }
+    fields[5]
+        .split_once('/')
+        .is_some_and(|(resource_type, rest)| {
+            IAM_PRINCIPAL_RESOURCE_TYPES.contains(&resource_type) && !rest.is_empty()
+        })
+}
+
+/// Whether a grant held by `grant_principal` is part of what `queried` EFFECTIVELY holds.
+///
+/// Its own grants, plus the grants of every group it belongs to. The one group this
+/// service models is [`IAM_ALLOWED_PRINCIPALS`], which stands for every principal IAM
+/// itself allows — so an IAM user or role ([`is_iam_principal`]) holds what that group
+/// holds, while a principal of another identity system, and the group itself, match only
+/// by name.
+pub fn effective_principal_holds(queried: &str, grant_principal: &str) -> bool {
+    grant_principal == queried
+        || (grant_principal == IAM_ALLOWED_PRINCIPALS && is_iam_principal(queried))
+}
+
+/// Adds `grant` to the listing being built in `reported`, under the principal it is
+/// REPORTED to be held by: `reported_as` when the listing resolves a group grant onto the
+/// principal it asked about, else the grantee the record names.
+///
+/// Two grants reported under one identity — a principal's own record and a group grant
+/// resolved onto it — are ONE entry carrying the union of both, because a listing reports
+/// one entry per (principal, resource, condition) triple and re-attributing a group grant
+/// must not open a second entry for a triple that already has one.
+pub fn merge_reported_grant(
+    reported: &mut BTreeMap<String, PermissionGrant>,
+    grant: &PermissionGrant,
+    reported_as: Option<&str>,
+) {
+    let mut grant = grant.clone();
+    if let Some(principal) = reported_as {
+        grant.principal = principal.to_string();
+    }
+    let key = grant_key(
+        &grant.catalog_id,
+        &grant.principal,
+        &grant.resource,
+        grant.condition_expression.as_deref(),
+    );
+    match reported.get_mut(&key) {
+        Some(held) => {
+            merge_permissions(&mut held.permissions, &grant.permissions);
+            merge_permissions(
+                &mut held.permissions_with_grant_option,
+                &grant.permissions_with_grant_option,
+            );
+        }
+        None => {
+            reported.insert(key, grant);
+        }
+    }
 }
 
 /// The most revoked-default records this store will hold, beside the explicit grants

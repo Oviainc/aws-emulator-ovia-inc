@@ -7,7 +7,9 @@
 //! [`ClusterInfo`] with [`Cluster::to_cluster_info`], `DescribeClusterV2` /
 //! `ListClustersV2` build the v2 `Cluster` with [`Cluster::to_cluster_v2`], and
 //! `GetBootstrapBrokers` builds its endpoint strings with
-//! [`Cluster::broker_endpoints`] plus the access predicates beside it. Keeping them
+//! [`Cluster::broker_endpoints`] plus the access predicates beside it, and
+//! `ListNodes` renders one stored broker node with [`Cluster::to_node_info`].
+//! Keeping them
 //! next to the record is what makes the readers agree: they render the same stored
 //! cluster the same way.
 //!
@@ -76,14 +78,14 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo,
-    ClientAuthentication, ClusterInfo, ClusterOperationInfo, Configuration, ConfigurationInfo,
-    ConfigurationRevision, ConnectivityInfo, CreateChannelInput, CreateClusterInput,
-    CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
+    BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo, BrokerSoftwareInfo,
+    ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, Configuration,
+    ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, CreateChannelInput,
+    CreateClusterInput, CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
     DescribeChannelOutput, EBSStorageInfo, EncryptionAtRest, EncryptionConfiguration,
     EncryptionInTransit, EncryptionInfo, IcebergDestinationConfiguration, JmxExporter,
     JmxExporterInfo, KafkaCluster, KafkaClusterDescription, KafkaClusterSummary, LogDelivery,
-    LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
+    LoggingInfo, MutableClusterInfo, NodeExporter, NodeExporterInfo, NodeInfo, OpenMonitoring,
     OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, ProvisionedRequest,
     ProvisionedThroughput, Rebalancing, ReplicationInfo, ReplicationInfoDescription,
     ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, Serverless,
@@ -620,6 +622,10 @@ pub const CLUSTER_TYPE_SERVERLESS: &str = "SERVERLESS";
 pub const PROVISIONED_ONLY_MESSAGE: &str =
     "The cluster is a serverless cluster; this operation applies to provisioned clusters only.";
 
+/// The one `NodeType` the model names: `ListNodes` reports a cluster's broker
+/// nodes, so every node it lists is of this type.
+pub const NODE_TYPE_BROKER: &str = "BROKER";
+
 /// The largest page a listing may report, from the `range` on the `MaxResults`
 /// shape (1..100) that `ListClusters`, `ListClustersV2` and `ListKafkaVersions`
 /// all bind. Also the page size used when a request names none.
@@ -629,8 +635,10 @@ pub const MAX_RESULTS_LIMIT: i32 = 100;
 /// some other list cannot be mistaken for one of these.
 const CLUSTER_PAGE_TOKEN_PREFIX: &str = "kafka:clusters:";
 
-/// One broker node of a provisioned cluster, and the DNS name clients reach it on.
-/// `GetBootstrapBrokers` renders every bootstrap string from these hosts.
+/// One broker node of a provisioned cluster: the DNS name clients reach it on,
+/// and the placement the service gave it when it joined the cluster.
+/// `GetBootstrapBrokers` renders every bootstrap string from these hosts, and
+/// `ListNodes` reports each node through [`Cluster::to_node_info`].
 #[derive(Debug, Clone)]
 pub struct BrokerNode {
     /// 1-based broker id, as it appears in the `b-<id>` DNS label.
@@ -638,6 +646,59 @@ pub struct BrokerNode {
     /// `b-<id>.<cluster>.<suffix>.kafka.<region>.amazonaws.com` — the port is
     /// appended per access path.
     pub endpoint_host: String,
+    /// The one subnet of `BrokerNodeGroupInfo$ClientSubnets` this broker's
+    /// network interface sits in. Stored rather than recomputed per read, so the
+    /// placement a node was given does not move when the cluster's
+    /// configuration is read again.
+    pub client_subnet: String,
+    /// The id of the elastic network interface the service created for this
+    /// broker in [`Self::client_subnet`] — `ClientSubnets`' documentation is
+    /// what says one is created per node.
+    pub attached_eni_id: String,
+    /// The private IPv4 address that interface answers on inside the client VPC.
+    pub client_vpc_ip_address: String,
+    /// When the node joined the cluster: the creation instant for a broker the
+    /// create laid out, so a node added later carries its own.
+    pub added_to_cluster_time: SystemTime,
+}
+
+impl BrokerNode {
+    /// Lay out broker `id` of a cluster whose endpoints sit under `dns_suffix`:
+    /// its endpoint host, the client subnet it is placed in, the network
+    /// interface created for it there, and the instant it joined.
+    ///
+    /// `client_subnets` is the cluster's own `BrokerNodeGroupInfo$ClientSubnets`
+    /// and the brokers are spread over it in order, which is what makes an
+    /// `MSK` cluster's nodes sit across the Availability Zones those subnets
+    /// name. The ids are pure functions of the node's endpoint host — unique per
+    /// cluster and per broker — so a node keeps them for as long as the record
+    /// holds it.
+    fn placed(
+        region: &str,
+        name: &str,
+        dns_suffix: &str,
+        id: i32,
+        client_subnets: &[String],
+        now: SystemTime,
+    ) -> Self {
+        let endpoint_host = format!("b-{id}.{name}.{dns_suffix}.kafka.{region}.amazonaws.com");
+        // The brokers are placed round-robin over the submitted subnets, so
+        // broker 1 lands in the first. A cluster whose stored group names none
+        // (which the model's `required` `ClientSubnets` does not allow a create
+        // to submit) places the node nowhere rather than inventing a subnet.
+        let client_subnet = client_subnets
+            .get(usize::try_from(id - 1).unwrap_or(0) % client_subnets.len().max(1))
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            attached_eni_id: ec2_long_id("eni", &format!("{endpoint_host}#eni")),
+            client_vpc_ip_address: private_ipv4(&format!("{endpoint_host}#ip")),
+            client_subnet,
+            endpoint_host,
+            id,
+            added_to_cluster_time: now,
+        }
+    }
 }
 
 /// A provisioned MSK cluster, holding the whole submitted configuration so every
@@ -2989,10 +3050,14 @@ impl Cluster {
             .clamp(1, MAX_BROKER_NODES_PER_CLUSTER);
         let mut brokers = Vec::with_capacity(usize::try_from(broker_count).unwrap_or(0));
         for id in 1..=broker_count {
-            brokers.push(BrokerNode {
+            brokers.push(BrokerNode::placed(
+                region,
+                name,
+                &dns_suffix,
                 id,
-                endpoint_host: format!("b-{id}.{name}.{dns_suffix}.kafka.{region}.amazonaws.com"),
-            });
+                &input.broker_node_group_info.client_subnets,
+                now,
+            ));
         }
         let zookeeper_hosts: Vec<String> = (1..=ZOOKEEPER_NODE_COUNT)
             .map(|id| format!("z-{id}.{name}.{dns_suffix}.kafka.{region}.amazonaws.com"))
@@ -3483,6 +3548,50 @@ impl Cluster {
         )
     }
 
+    /// One stored broker node as the `NodeInfo` `ListNodes` reports.
+    ///
+    /// Every member is derived from the record: the node's own placement and
+    /// endpoint from [`BrokerNode`], and the attributes that belong to the whole
+    /// broker group — the instance type and the deployed software — from the
+    /// cluster, so an applied `UpdateBrokerType` or configuration change moves
+    /// what every node reports at once. `ZookeeperNodeInfo` and
+    /// `ControllerNodeInfo` are absent: a broker node is neither, and the
+    /// model's `NodeType` names `BROKER` alone.
+    pub fn to_node_info(&self, broker: &BrokerNode) -> NodeInfo {
+        NodeInfo {
+            added_to_cluster_time: rendered_instant(broker.added_to_cluster_time),
+            broker_node_info: Some(BrokerNodeInfo {
+                attached_eni_id: Some(broker.attached_eni_id.clone()),
+                // `BrokerNodeInfo$BrokerId` is a `__double` in the model, so the
+                // 1-based id travels as the number it is.
+                broker_id: Some(f64::from(broker.id)),
+                client_subnet: Some(broker.client_subnet.clone()),
+                client_vpc_ip_address: Some(broker.client_vpc_ip_address.clone()),
+                current_broker_software_info: Some(self.broker_software_info()),
+                // One endpoint per node: the host every access path's bootstrap
+                // string carries for this broker, which is what the cluster's
+                // endpoint list is built from too.
+                endpoints: Some(vec![broker.endpoint_host.clone()]),
+            }),
+            controller_node_info: None,
+            instance_type: Some(self.broker_node_group_info.instance_type.clone()),
+            node_arn: Some(self.node_arn(broker.id)),
+            node_type: Some(NODE_TYPE_BROKER.to_string()),
+            zookeeper_node_info: None,
+        }
+    }
+
+    /// The ARN of broker node `broker_id` on this cluster.
+    ///
+    /// A node is a sub-resource of the cluster it belongs to, so it is named by
+    /// the cluster's own ARN followed by the broker id — derived from the stored
+    /// cluster ARN, which keeps a node's ARN in the same partition, region and
+    /// account as the cluster that holds it, the same way [`Self::topic_arn`]
+    /// derives a topic's.
+    pub fn node_arn(&self, broker_id: i32) -> String {
+        format!("{}/{broker_id}", self.arn)
+    }
+
     /// The ARN of the topic `topic_name` on this cluster.
     ///
     /// Amazon MSK names a topic as
@@ -3801,6 +3910,48 @@ fn open_monitoring_effective(info: &OpenMonitoringInfo) -> OpenMonitoringInfo {
             }),
         },
     }
+}
+
+/// An instant as the string a `__string` timestamp member carries: ISO-8601
+/// (RFC 3339), the form every modelled timestamp of this service travels in.
+/// `None` only for an instant no date-time can represent, which no stored record
+/// holds.
+fn rendered_instant(at: SystemTime) -> Option<String> {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+}
+
+/// An EC2 long resource id for `kind` (`"eni"`): the prefix, a hyphen and 17
+/// lowercase hexadecimal digits — the longer of the two published EC2
+/// resource-id forms, which is what [`is_ec2_resource_id`] accepts. A pure
+/// function of `seed`, so the resource it names keeps one id.
+fn ec2_long_id(kind: &str, seed: &str) -> String {
+    use std::fmt::Write;
+
+    let digest = stable_digest(seed);
+    let mut id = format!("{kind}-");
+    // Nine bytes render 18 digits; the id takes the first 17 of them.
+    for byte in digest.iter().take(9) {
+        // Infallible: `{:02x}` raises no formatting error, and a `String` is the
+        // one `fmt::Write` that cannot fail for any other reason.
+        let _ = write!(id, "{byte:02x}");
+    }
+    id.truncate(kind.len() + 1 + 17);
+    id
+}
+
+/// The private IPv4 address a network interface this service creates answers on,
+/// as a pure function of `seed` so the interface keeps one address.
+///
+/// CHOSEN, not documented: the real service allocates from the client subnet's
+/// CIDR, and this emulator holds no VPC inventory to read a CIDR from. The
+/// address is drawn from 10.0.0.0/8 — a private range (RFC 1918) — with a host
+/// octet in 1..=254, so it is never a network or broadcast address.
+fn private_ipv4(seed: &str) -> String {
+    let digest = stable_digest(seed);
+    let host = 1 + u32::from(digest[2]) % 254;
+    format!("10.{}.{}.{host}", digest[0], digest[1])
 }
 
 /// 32 digest bytes for `seed`, from the hasher the standard library ships

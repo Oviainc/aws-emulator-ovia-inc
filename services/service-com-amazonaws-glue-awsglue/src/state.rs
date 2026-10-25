@@ -19,6 +19,12 @@
 //! every operation that addresses a crawler does so by name alone, so a crawler's
 //! `CatalogId` says where its output goes, not where the crawler itself lives.
 //!
+//! CUSTOM ENTITY TYPES — the custom sensitive-data patterns `CreateCustomEntityType`
+//! registers — sit in the same kind of per-account namespace, keyed by pattern name:
+//! "This name must be unique per Amazon Web Services account"
+//! (`CustomEntityType$Name`), and every operation that addresses one names it by name
+//! alone, with no `CatalogId` member.
+//!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
 //! lowercase when it is stored") and `TableInput$Name` — and every lookup folds the
@@ -32,11 +38,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionsList, Crawler,
-    CrawlerTargets, CreateCrawlerInput, CreateJobInput, DataLakePrincipal, Database,
-    DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty, FederatedDatabase,
-    FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration, LineageConfiguration,
-    NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy, Schedule,
-    SchemaChangePolicy, SourceControlDetails, StartJobRunInput, StorageDescriptor, Table,
+    CrawlerTargets, CreateCrawlerInput, CreateCustomEntityTypeInput, CreateJobInput,
+    DataLakePrincipal, Database, DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty,
+    FederatedDatabase, FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration,
+    LineageConfiguration, NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy,
+    Schedule, SchemaChangePolicy, SourceControlDetails, StartJobRunInput, StorageDescriptor, Table,
     TableIdentifier, TableInput,
 };
 
@@ -60,6 +66,29 @@ pub const MAX_STORED_TABLES: usize = 10_000;
 /// Ceiling on the connection definitions one catalog may hold, for the same reason as
 /// [`MAX_JOBS`].
 pub const MAX_CONNECTIONS_PER_CATALOG: usize = 1_000;
+
+/// Ceiling on the CATALOGS the whole store may hold.
+///
+/// The ceilings above bound what one container holds; this one bounds how many
+/// containers there are, which is what makes the store as a whole bounded. The map is
+/// keyed by `CatalogId`, a member a request may name, so without this a create that
+/// reached a catalog the store does not hold yet could add containers without end — each
+/// able to hold its own [`MAX_DATABASES_PER_CATALOG`] and
+/// [`MAX_CONNECTIONS_PER_CATALOG`] records. It is also what keeps the store-wide walks
+/// below ([`ComAmazonawsGlueAwsglueState::stored_tables`] and its siblings) a bounded
+/// cost per create. A create that would add one past the ceiling is refused with the
+/// operation's modelled `ResourceNumberLimitExceededException`.
+pub const MAX_CATALOGS: usize = 16;
+
+/// Ceiling on the databases the whole store may hold, across every catalog, for the same
+/// reason as [`MAX_STORED_TABLES`]: the per-catalog ceiling alone, multiplied by
+/// [`MAX_CATALOGS`], would still let a caller grow the store past what one process
+/// should hold.
+pub const MAX_STORED_DATABASES: usize = 10_000;
+
+/// Ceiling on the connection definitions the whole store may hold, across every catalog,
+/// for the same reason as [`MAX_STORED_DATABASES`].
+pub const MAX_STORED_CONNECTIONS: usize = 10_000;
 
 /// The `ConnectionProperties` key holding a connection's password: "`PASSWORD` - A
 /// password, if one is used, for the user name." (`Connection$ConnectionProperties`.) It is
@@ -97,6 +126,11 @@ pub const MAX_CRAWLERS: usize = 1_000;
 /// [`MAX_CRAWLERS`]. A create past it is refused with `CreateJob`'s own modelled
 /// `ResourceNumberLimitExceededException`.
 pub const MAX_JOBS: usize = 1_000;
+
+/// Ceiling on the custom entity types this emulator will hold, for the same reason as
+/// [`MAX_CRAWLERS`]. A create past it is refused with `CreateCustomEntityType`'s own
+/// modelled `ResourceNumberLimitExceededException`.
+pub const MAX_CUSTOM_ENTITY_TYPES: usize = 1_000;
 
 /// The `CrawlerState` of a crawler with no run in progress — the state a crawler is in
 /// the moment `CreateCrawler` returns, and the only one this emulator stores until
@@ -256,6 +290,15 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// unique in your account"). The key is the name exactly as sent — the model
     /// documents no case fold for `Job$Name`.
     pub jobs: HashMap<String, JobEntry>,
+    /// Every custom entity type (custom sensitive-data pattern) this emulator holds,
+    /// keyed by its name.
+    ///
+    /// Per account, like crawlers and job definitions: `GetCustomEntityType`,
+    /// `DeleteCustomEntityType` and `BatchGetCustomEntityTypes` address a pattern by name
+    /// alone, and `CustomEntityType$Name` is documented as unique per account. Ordered,
+    /// so `ListCustomEntityTypes` has one deterministic order to page over. The key is
+    /// the name exactly as sent — the model documents no case fold for it.
+    pub custom_entity_types: BTreeMap<String, CustomEntityTypeEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -281,25 +324,71 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|catalog| catalog.connections.get(name))
     }
 
+    /// How many records the whole store holds of one catalog-scoped kind: `count` says
+    /// how many ONE catalog holds, and this sums it over every catalog.
+    ///
+    /// The one walk the three store-wide counts below share, so a count and the ceiling
+    /// checked against it can never disagree about which records they cover. Bounded by
+    /// [`MAX_CATALOGS`] catalogs, so the walk itself is a bounded cost.
+    fn stored_in_catalogs(&self, count: impl Fn(&Catalog) -> usize) -> usize {
+        self.catalogs.values().map(count).sum()
+    }
+
     /// How many tables the whole store holds. Bounded by the ceilings above, so this
-    /// walk is over at most [`MAX_DATABASES_PER_CATALOG`] entries per catalog.
+    /// walk is over at most [`MAX_CATALOGS`] catalogs of
+    /// [`MAX_DATABASES_PER_CATALOG`] entries each.
     pub fn stored_tables(&self) -> usize {
-        self.catalogs
-            .values()
-            .map(|catalog| {
-                catalog
-                    .databases
-                    .values()
-                    .map(|database| database.tables.len())
-                    .sum::<usize>()
-            })
-            .sum()
+        self.stored_in_catalogs(|catalog| {
+            catalog
+                .databases
+                .values()
+                .map(|database| database.tables.len())
+                .sum()
+        })
     }
 
     /// Whether the store as a whole can hold another table, i.e. is below
     /// [`MAX_STORED_TABLES`].
     pub fn can_store_table(&self) -> bool {
         self.stored_tables() < MAX_STORED_TABLES
+    }
+
+    /// How many databases the whole store holds, across every catalog. Bounded by
+    /// [`MAX_CATALOGS`] times [`MAX_DATABASES_PER_CATALOG`], so this walk is bounded.
+    pub fn stored_databases(&self) -> usize {
+        self.stored_in_catalogs(|catalog| catalog.databases.len())
+    }
+
+    /// Whether the store as a whole can hold another database, i.e. is below
+    /// [`MAX_STORED_DATABASES`].
+    pub fn can_store_database(&self) -> bool {
+        self.stored_databases() < MAX_STORED_DATABASES
+    }
+
+    /// How many connection definitions the whole store holds, across every catalog.
+    pub fn stored_connections(&self) -> usize {
+        self.stored_in_catalogs(|catalog| catalog.connections.len())
+    }
+
+    /// Whether the store as a whole can hold another connection definition, i.e. is
+    /// below [`MAX_STORED_CONNECTIONS`].
+    pub fn can_store_connection(&self) -> bool {
+        self.stored_connections() < MAX_STORED_CONNECTIONS
+    }
+
+    /// The catalog `catalog_id`, for a create that is about to write a record into it:
+    /// the one this store already holds, or a fresh empty one when there is room for
+    /// another container ([`MAX_CATALOGS`]). `None` means the store holds no such catalog
+    /// and cannot take one, so the create must be refused rather than served.
+    ///
+    /// The ONE place a catalog is brought into existence, so no create can grow the
+    /// container map past the ceiling, and a create that is refused earlier leaves no
+    /// empty catalog behind: a handler calls this only once every other check has passed.
+    pub fn catalog_mut_for_create(&mut self, catalog_id: &str) -> Option<&mut Catalog> {
+        if !self.catalogs.contains_key(catalog_id) && self.catalogs.len() >= MAX_CATALOGS {
+            return None;
+        }
+        Some(self.catalogs.entry(catalog_id.to_string()).or_default())
     }
 
     /// Whether the store can hold another crawler, i.e. is below [`MAX_CRAWLERS`].
@@ -310,6 +399,12 @@ impl ComAmazonawsGlueAwsglueState {
     /// Whether the store can hold another job definition, i.e. is below [`MAX_JOBS`].
     pub fn can_store_job(&self) -> bool {
         self.jobs.len() < MAX_JOBS
+    }
+
+    /// Whether the store can hold another custom entity type, i.e. is below
+    /// [`MAX_CUSTOM_ENTITY_TYPES`].
+    pub fn can_store_custom_entity_type(&self) -> bool {
+        self.custom_entity_types.len() < MAX_CUSTOM_ENTITY_TYPES
     }
 
     /// The tag set of the resource `resource` names, or `None` when this store holds no
@@ -869,6 +964,50 @@ impl CrawlerEntry {
             crawler_security_configuration: self.crawler_security_configuration.clone(),
             lake_formation_configuration: self.lake_formation_configuration.clone(),
             catalog_id: Some(self.catalog_id.clone()),
+        }
+    }
+}
+
+/// A stored custom entity type: the custom pattern `CreateCustomEntityType` registers
+/// for detecting sensitive data.
+///
+/// Every member of the modelled `CustomEntityType` shape is held here, plus the create's
+/// `Tags`, which that shape does not carry — so a later read reports the pattern the
+/// create stored and nothing the server invented. There is no server-set member: the
+/// model gives a custom entity type no id, status or timestamp.
+#[derive(Debug, Clone)]
+pub struct CustomEntityTypeEntry {
+    /// The pattern's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::custom_entity_types`].
+    pub name: String,
+    /// "A regular expression string that is used for detecting sensitive data in a custom
+    /// pattern", stored exactly as sent.
+    pub regex_string: String,
+    /// The context words the create supplied, if any. "If no context words are passed only
+    /// a regular expression is checked", so a create that named none is stored with NO
+    /// list rather than with an empty one: the two are different patterns, and the
+    /// modelled list is 1..20 long, so an empty list is not even a value a create can send.
+    pub context_words: Option<Vec<String>>,
+    /// The create's `Tags`, which are not part of the `CustomEntityType` shape.
+    ///
+    /// Kept so the create does not discard what the client sent, but NOT yet reachable
+    /// through the tagging operations: [`TaggedResourceKind`] carries no custom entity
+    /// type variant, because the model states no ARN resource-type segment for this kind
+    /// (nothing in it spells one), and the segment is what every tag lookup resolves an
+    /// ARN against. So a tagging call naming a custom entity type still resolves to
+    /// nothing, and these tags are stored rather than served.
+    pub tags: HashMap<String, String>,
+}
+
+impl CustomEntityTypeEntry {
+    /// Build a stored custom entity type from a `CreateCustomEntityType` request. Every
+    /// member comes from the request: the client supplies the whole definition.
+    pub fn from_create_input(input: &CreateCustomEntityTypeInput) -> Self {
+        Self {
+            name: input.name.clone(),
+            regex_string: input.regex_string.clone(),
+            context_words: input.context_words.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
         }
     }
 }

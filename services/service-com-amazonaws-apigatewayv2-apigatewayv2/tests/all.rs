@@ -35,6 +35,8 @@ mod deployment_stage_release;
 mod domain_name_endpoint_required;
 #[path = "all/domain_name_lifecycle.rs"]
 mod domain_name_lifecycle;
+#[path = "all/http_api_jwt_data_plane.rs"]
+mod http_api_jwt_data_plane;
 #[path = "all/http_api_servable_stage.rs"]
 mod http_api_servable_stage;
 #[path = "all/integration_deletion.rs"]
@@ -83,6 +85,8 @@ mod stage_lifecycle;
 mod state_roundtrip;
 #[path = "all/vpc_link_lifecycle.rs"]
 mod vpc_link_lifecycle;
+#[path = "all/vpc_link_update.rs"]
+mod vpc_link_update;
 #[path = "all/websocket_connect_authorization.rs"]
 mod websocket_connect_authorization;
 #[path = "all/websocket_handshake_data_plane.rs"]

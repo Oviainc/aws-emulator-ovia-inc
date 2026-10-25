@@ -97,6 +97,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::ResponseHeaderPolicy;
 
 /// The resource a participant-replica quota refusal names, as
 /// `crate::state::quota_exceeded_message` states it.
@@ -370,9 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .push(record);
 
         // Every member of `StartParticipantReplicationResponse` is an `@httpHeader`
-        // binding for a CORS or security response header, and none is a fact about the
-        // replication: this emulator sets no CORS policy, so each stays absent and the
-        // operation's whole answer is its modelled 200 plus the state above.
-        Ok(StartParticipantReplicationOutput::default())
+        // binding for a CORS or security response header, so the whole modelled output of
+        // this operation is the endpoint's answer policy
+        // (`crate::state::ResponseHeaderPolicy`), reported here as it is on every other
+        // response of this service; the replication itself is the state written above.
+        Ok(StartParticipantReplicationOutput::default().with_response_header_policy())
     }
 }

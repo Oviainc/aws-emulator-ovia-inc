@@ -250,12 +250,9 @@ fn refusal_message(reply: &Reply) -> String {
         .to_string()
 }
 
-/// The ARN of the base model `model_id` in `region`: a foundation model is published by
-/// AWS rather than owned by the account, so `FoundationModelArn` carries an EMPTY account
-/// field.
-fn model_arn(region: &str, model_id: &str) -> String {
-    format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
-}
+// The ARN of the base model `model_id` in `region`, as `crate::support` spells it: one
+// spelling across the suites that compare a response's ARN against it.
+use crate::support::foundation_model_arn as model_arn;
 
 /// Whether `arn` is a `ProvisionedModelArn`:
 /// `^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:provisioned-model/[a-z0-9]{12}$`.

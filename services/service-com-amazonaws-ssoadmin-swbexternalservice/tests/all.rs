@@ -71,6 +71,8 @@ mod instance_region_status;
 mod instance_regions;
 #[path = "all/instance_update.rs"]
 mod instance_update;
+#[path = "all/list_application_access_scopes.rs"]
+mod list_application_access_scopes;
 #[path = "all/list_instances_pagination.rs"]
 mod list_instances_pagination;
 #[path = "all/managed_policies.rs"]
@@ -83,6 +85,8 @@ mod permission_set_update;
 mod permissions_boundary;
 #[path = "all/permissions_boundary_delete.rs"]
 mod permissions_boundary_delete;
+#[path = "all/policy_attach_conflict.rs"]
+mod policy_attach_conflict;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/ssoadmin_permission_sets.rs"]

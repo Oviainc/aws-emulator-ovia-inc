@@ -21,6 +21,8 @@ mod catalog_mutations;
 mod catalog_projections;
 #[path = "all/crawlers.rs"]
 mod crawlers;
+#[path = "all/custom_entity_types.rs"]
+mod custom_entity_types;
 #[path = "all/data_catalog.rs"]
 mod data_catalog;
 #[path = "all/error_messages.rs"]
@@ -39,5 +41,7 @@ mod job_runs;
 mod jobs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_capacity.rs"]
+mod store_capacity;
 #[path = "all/wire.rs"]
 mod wire;
