@@ -14,9 +14,10 @@
 //!   scan run is started on is the archive that was uploaded, whatever its size or media
 //!   type and whatever scan name the target was minted for;
 //! * a target holds one resource, so a repeated upload replaces it;
-//! * everything else on that path space is refused: a method the URL does not describe, a
-//!   path naming no target of this account, and an archive past what this emulator
-//!   retains.
+//! * the archive's SIZE is never a refusal — see `crate::upload_size`, which asserts that
+//!   rule over a table of sizes;
+//! * everything else on that path space is refused: a method the URL does not describe
+//!   and a path naming no target of this account.
 //!
 //! Every request goes through the real router (`MultiServiceRouter::dispatch`), the same
 //! path a client takes.
@@ -30,8 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
     self as cgs_state, UploadArtifact, UploadedResource, DEFAULT_REGION,
     SCAN_RESOURCE_NOT_UPLOADED_MESSAGE, SCAN_STATE_FAILED, SCAN_STATE_SUCCESSFUL,
-    STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_ARTIFACT_TTL_MILLIS, UPLOAD_CONTENT_MAX_BYTES,
-    UPLOAD_CONTENT_TOTAL_MAX_BYTES,
+    STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_ARTIFACT_TTL_MILLIS, UPLOAD_RETAINED_PREFIX_MAX_BYTES,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -46,10 +46,10 @@ const ARCHIVE_CONTENT_TYPE: &str = "application/zip";
 
 /// What a scan run that has settled reports, read off `GetScan`.
 #[derive(Debug)]
-struct SettledRun {
-    status: u16,
-    scan_state: String,
-    error_message: String,
+pub(crate) struct SettledRun {
+    pub(crate) status: u16,
+    pub(crate) scan_state: String,
+    pub(crate) error_message: String,
 }
 
 /// What a request to a published upload target answered.
@@ -170,7 +170,7 @@ async fn create_upload_url_signed_for(
 }
 
 /// The resource held against `artifact` in the shared store.
-fn stored_upload(
+pub(crate) fn stored_upload(
     engine: &Arc<engine::InMemoryEngine>,
     artifact: &str,
 ) -> Option<UploadedResource> {
@@ -181,8 +181,38 @@ fn stored_upload(
         .and_then(|held| held.upload.clone())
 }
 
+/// Lowercase hex SHA-256 of `bytes`, computed here so a case checks the digest the store
+/// recorded against an independently taken one.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Whether `held` is this store's record of the archive `bytes`: the length of the whole
+/// archive, a digest over every one of its bytes, and the leading content retained of it
+/// (all of it for an archive no longer than what one target retains).
+pub(crate) fn is_record_of(held: &UploadedResource, bytes: &[u8]) -> bool {
+    let retained = bytes.len().min(UPLOAD_RETAINED_PREFIX_MAX_BYTES);
+    held.byte_count == u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        && held.content_sha256 == sha256_hex(bytes)
+        && held.retained_prefix == bytes[..retained]
+}
+
+/// How `held` reads in an assertion message.
+pub(crate) fn describe(held: &UploadedResource) -> String {
+    format!(
+        "{} bytes, sha256 {}, {} retained",
+        held.byte_count,
+        held.content_sha256,
+        held.retained_prefix.len()
+    )
+}
+
 /// `GetScan` for the latest run of `scan_name`.
-async fn settled_run(router: &MultiServiceRouter, scan_name: &str) -> SettledRun {
+pub(crate) async fn settled_run(router: &MultiServiceRouter, scan_name: &str) -> SettledRun {
     let answer = call(router, "GET", &format!("/scans/{scan_name}"), None).await;
     SettledRun {
         status: answer.status,
@@ -202,7 +232,7 @@ async fn settled_run(router: &MultiServiceRouter, scan_name: &str) -> SettledRun
 /// Wait past a Standard run's clock-owed transition out of `InProgress`, so the next read
 /// observes the settled run. The handlers store the due instant rather than sleeping, so
 /// only the test waits.
-async fn wait_for_settle() {
+pub(crate) async fn wait_for_settle() {
     let span = u64::try_from(STANDARD_SCAN_SETTLE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span + 150)).await;
 }
@@ -232,7 +262,7 @@ pub(crate) fn archive_of(len: usize, seed: u8) -> Vec<u8> {
 async fn the_published_target_receives_every_shape_of_resource_and_holds_it_for_the_scan() {
     let (engine, router) = harness();
     // Rows span what the rule generalises over: the SIZE of the uploaded archive (empty,
-    // one byte, a few KiB, and exactly the maximum one target retains) and the scan name
+    // one byte, a few KiB, and either side of what one target retains) and the scan name
     // the target was minted for (each character class `ScanName`'s pattern
     // `^[a-zA-Z0-9-_$:.]*$` allows, and its modelled maximum length of 140).
     let long_name = "n".repeat(140);
@@ -251,9 +281,14 @@ async fn the_published_target_receives_every_shape_of_resource_and_holds_it_for_
             archive_of(128, 71),
         ),
         (
-            "exactly the retained maximum",
-            "at-the-byte-ceiling",
-            archive_of(UPLOAD_CONTENT_MAX_BYTES, 83),
+            "exactly what one target retains",
+            "at-the-retained-prefix",
+            archive_of(UPLOAD_RETAINED_PREFIX_MAX_BYTES, 83),
+        ),
+        (
+            "past what one target retains",
+            "over-the-retained-prefix",
+            archive_of(UPLOAD_RETAINED_PREFIX_MAX_BYTES + 1, 89),
         ),
     ];
 
@@ -292,19 +327,20 @@ async fn the_published_target_receives_every_shape_of_resource_and_holds_it_for_
             String::from_utf8_lossy(&answer.body)
         );
 
-        // It is held, byte for byte, against the artifact the URL names.
+        // It is held, byte for byte accounted for, against the artifact the URL names.
         let held = stored_upload(&engine, &artifact)
             .unwrap_or_else(|| panic!("case {case:?}: the target holds no resource"));
         assert_eq!(
-            held.bytes.len(),
+            held.byte_count,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "case {case:?}: expected {} bytes received, got {}",
             bytes.len(),
-            "case {case:?}: expected {} bytes held, got {}",
-            bytes.len(),
-            held.bytes.len()
+            describe(&held)
         );
         assert!(
-            held.bytes == *bytes,
-            "case {case:?}: the held resource is not the uploaded archive"
+            is_record_of(&held, bytes),
+            "case {case:?}: the held resource is not the uploaded archive, got {}",
+            describe(&held)
         );
         assert_eq!(
             held.content_type.as_deref(),
@@ -438,10 +474,10 @@ async fn a_repeated_upload_replaces_the_one_resource_a_target_holds() {
         let held = stored_upload(&engine, &artifact)
             .unwrap_or_else(|| panic!("upload {index}: the target holds no resource"));
         assert!(
-            held.bytes == *bytes,
+            is_record_of(&held, bytes),
             "upload {index}: the target must hold exactly the last archive uploaded, got {} \
-             bytes for {} uploaded",
-            held.bytes.len(),
+             for {} bytes uploaded",
+            describe(&held),
             bytes.len()
         );
     }
@@ -466,10 +502,10 @@ async fn a_repeated_upload_replaces_the_one_resource_a_target_holds() {
     let second =
         stored_upload(&engine, &other_artifact).expect("the second target holds a resource");
     assert!(
-        first.bytes.is_empty() && second.bytes == other_bytes,
-        "each target holds its own resource, got {} and {} bytes",
-        first.bytes.len(),
-        second.bytes.len()
+        is_record_of(&first, &[]) && is_record_of(&second, &other_bytes),
+        "each target holds its own resource, got {} and {}",
+        describe(&first),
+        describe(&second)
     );
 }
 
@@ -503,9 +539,9 @@ async fn the_published_target_is_written_only_by_the_documented_method() {
         );
         let still = stored_upload(&engine, &artifact).expect("the target still holds its resource");
         assert!(
-            still.bytes == held,
-            "case {method:?}: a refused request must change nothing, got {} bytes",
-            still.bytes.len()
+            is_record_of(&still, &held),
+            "case {method:?}: a refused request must change nothing, got {}",
+            describe(&still)
         );
     }
 }
@@ -577,7 +613,8 @@ async fn a_path_that_names_no_target_of_this_account_is_refused() {
     }
     // Only the control row's target holds anything.
     assert!(
-        stored_upload(&engine, &artifact).is_some_and(|held| held.bytes == archive_of(48, 29)),
+        stored_upload(&engine, &artifact)
+            .is_some_and(|held| is_record_of(&held, &archive_of(48, 29))),
         "the one named target holds the archive"
     );
     assert!(
@@ -611,64 +648,8 @@ async fn a_path_that_names_no_target_of_this_account_is_refused() {
     }
 }
 
-#[tokio::test]
-async fn an_upload_past_what_this_emulator_retains_is_refused_and_stores_nothing() {
-    let (engine, router) = harness();
-    let minted = create_upload_url(&router, "over-the-bound").await;
-    let artifact = minted.str_of("codeArtifactId");
-    let url = minted.str_of("s3Url");
-    let headers = required_headers(&minted);
-
-    // One archive past the per-target ceiling.
-    let answer = upload(
-        &router,
-        &url,
-        &headers,
-        archive_of(UPLOAD_CONTENT_MAX_BYTES + 1, 41),
-    )
-    .await;
-    assert_eq!(
-        (answer.status, answer.error_code.as_str()),
-        (400, "EntityTooLarge"),
-        "an archive past the per-target ceiling must be refused, got {} {:?}",
-        answer.status,
-        answer.error_code
-    );
-    assert!(
-        stored_upload(&engine, &artifact).is_none(),
-        "a refused upload must not be stored, not even truncated"
-    );
-
-    // An archive that would push the RETAINED TOTAL past its ceiling. The already-held
-    // total is seeded rather than uploaded, so the case does not have to transfer the
-    // whole ceiling to reach it.
-    store_of(&engine).lock().upload_bytes_held = UPLOAD_CONTENT_TOTAL_MAX_BYTES - 4;
-    let answer = upload(&router, &url, &headers, archive_of(5, 43)).await;
-    assert_eq!(
-        (answer.status, answer.error_code.as_str()),
-        (507, "InsufficientStorage"),
-        "an upload past the retained total must be refused, got {} {:?}",
-        answer.status,
-        answer.error_code
-    );
-    assert!(
-        stored_upload(&engine, &artifact).is_none(),
-        "the target still holds nothing"
-    );
-
-    // Right at the ceiling it is accepted, and the retained total is what is held.
-    store_of(&engine).lock().upload_bytes_held = UPLOAD_CONTENT_TOTAL_MAX_BYTES - 5;
-    let answer = upload(&router, &url, &headers, archive_of(5, 43)).await;
-    assert_eq!(
-        answer.status, 200,
-        "an upload that exactly reaches the retained total is accepted, got {} {:?}",
-        answer.status, answer.error_code
-    );
-    assert!(
-        stored_upload(&engine, &artifact).is_some_and(|held| held.bytes.len() == 5),
-        "the accepted archive is held"
-    );
-}
+// The size of the archive is NOT one of this plane's refusals; `crate::upload_size`
+// asserts what the target does with an archive of any size.
 
 // ---------------------------------------------------------------------------------
 // The published URL is followable as a pre-signed URL is
@@ -715,7 +696,7 @@ async fn the_published_target_is_served_without_a_credential_on_an_authenticatin
         String::from_utf8_lossy(&answer.body)
     );
     assert!(
-        stored_upload(&engine, &artifact).is_some_and(|held| held.bytes == bytes),
+        stored_upload(&engine, &artifact).is_some_and(|held| is_record_of(&held, &bytes)),
         "the unsigned upload is held against the artifact"
     );
 }
@@ -758,7 +739,7 @@ async fn a_credential_scope_that_names_no_region_still_publishes_a_served_target
             String::from_utf8_lossy(&answer.body)
         );
         assert!(
-            stored_upload(&engine, &artifact).is_some_and(|held| held.bytes == bytes),
+            stored_upload(&engine, &artifact).is_some_and(|held| is_record_of(&held, &bytes)),
             "case {scope:?}: the upload is held against the artifact"
         );
     }
