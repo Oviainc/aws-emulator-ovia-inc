@@ -462,18 +462,14 @@ impl PendingChange {
         }
     }
 
-    /// The change `kind`, due once a progression of `steps` steps has run: one
-    /// [`TRANSITION_SPAN`] per step, counted from now.
+    /// The change `kind`, due at the instant `due`.
     ///
-    /// For a change the clock owes at the instant the work a call started
-    /// FINISHES rather than one span later — a connector leaving the state it
-    /// is updating in, say, which is owed exactly when its update's last step
-    /// is done.
-    pub fn in_steps(kind: PendingKind, steps: u32) -> Self {
-        Self {
-            kind,
-            due: Instant::now() + TRANSITION_SPAN * steps.max(1),
-        }
+    /// For a change the clock owes at the instant some OTHER work it is tied to
+    /// finishes rather than a span after this call — a connector leaving the
+    /// state a call against it put it in, say, which is owed exactly when the
+    /// connector operation reporting that call's work ends.
+    pub fn at(kind: PendingKind, due: Instant) -> Self {
+        Self { kind, due }
     }
 
     /// Whether this change is owed at `now`.
@@ -1029,6 +1025,37 @@ impl ConnectorOperationRecord {
     /// that has not finished has no end.
     pub fn end_time(&self) -> Option<::aws_smithy_types::DateTime> {
         self.has_ended().then(|| date_time(self.ends_at))
+    }
+
+    /// The instant the clock has this operation reach its terminal state — the
+    /// instant the asynchronous work it reports finishes.
+    ///
+    /// Its progression is walked one state per [`TRANSITION_SPAN`] from the
+    /// instant the next one is owed, so the last state still ahead of it is owed
+    /// one span per state after that one. An operation that has already ended
+    /// owes nothing further, so its work finished at or before now.
+    fn ends_due(&self) -> Instant {
+        match self.pending {
+            Some(next) => {
+                let left = u32::try_from(self.remaining_states.len()).unwrap_or(1);
+                next.due + TRANSITION_SPAN * left.saturating_sub(1)
+            }
+            None => Instant::now(),
+        }
+    }
+
+    /// The change the clock owes the connector this operation runs against: its
+    /// return to [`CONNECTOR_RUNNING`], due at the instant this operation ends.
+    ///
+    /// The connector's state and this operation's state are two reports of ONE
+    /// piece of asynchronous work, so they are held on ONE clock: the connector
+    /// leaves the transient state the call put it in at exactly the instant the
+    /// operation reporting that call's work reaches its terminal state, and not
+    /// before. So while that operation is still running the connector reads as
+    /// not running — and a further call against it, which only a running
+    /// connector takes, is refused.
+    pub fn connector_settle(&self) -> PendingChange {
+        PendingChange::at(PendingKind::Settle, self.ends_due())
     }
 
     /// Apply every step of this operation's progression the clock already owes

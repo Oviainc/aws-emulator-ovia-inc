@@ -28,6 +28,11 @@
 //! have the same provenance again, and live in
 //! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalous_log_groups`],
 //! which `ListAnomalousLogGroups` reports for the insight they belong to.
+//!
+//! The RECOMMENDATIONS that analysis derived to remediate an insight's behaviour have
+//! the same provenance too, and live in
+//! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::recommendations`], which
+//! `ListRecommendations` reports for the insight they remediate.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -40,7 +45,8 @@ use crate::ops::types::{
     MonitoredResourceIdentifier, PerformanceInsightsMetricsDetail, PredictionTimeRange,
     ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
-    ReactiveOrganizationInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
+    ReactiveOrganizationInsightSummary, Recommendation, RecommendationRelatedAnomaly,
+    RecommendationRelatedEvent, ResourceCollection, ServiceCollection, ServiceHealth,
     ServiceInsightHealth, StartTimeRange, TagCollection, TagHealth, ValidationException,
     ValidationExceptionField, INSIGHT_SEVERITY_VALUES, INSIGHT_STATUS_VALUES, INSIGHT_TYPE_VALUES,
     SERVICE_NAME_VALUES,
@@ -113,6 +119,20 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// levels because the read pages over the inner one: the key order is stable,
     /// which is what a page cursor needs.
     pub anomalous_log_groups: BTreeMap<String, BTreeMap<String, AnomalousLogGroupRecord>>,
+    /// The recommendations DevOps Guru's analysis produced to remediate the behaviour
+    /// one insight reports, keyed by that `InsightId` and then by the recommendation's
+    /// `Name`.
+    ///
+    /// The same provenance as [`Self::insights`], [`Self::anomalies`] and
+    /// [`Self::anomalous_log_groups`]: a recommendation is derived by DevOps Guru from
+    /// the anomalies that generated the insight, so no modelled operation mints one and
+    /// this map is what that analysis writes and `ListRecommendations` reports. It stays
+    /// empty on an emulator over which no analysis ran, so the read over it reports
+    /// nothing rather than inventing advice, and one recommendation is reported at most
+    /// once per insight because the inner map is keyed by its name. `BTreeMap` at both
+    /// levels because the read pages over the inner one: the key order is stable, which
+    /// is what a page cursor needs.
+    pub recommendations: BTreeMap<String, BTreeMap<String, RecommendationRecord>>,
     /// The account that administers DevOps Guru for the organization this store
     /// records, if any.
     ///
@@ -272,15 +292,16 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
         i32::try_from(analysed.len()).unwrap_or(i32::MAX)
     }
 
-    /// Remove the insight `insight_id` names together with the anomalies that belong
-    /// to it, answering the record removed, or `None` when the store held no insight
-    /// under that id and nothing was removed.
+    /// Remove the insight `insight_id` names together with the anomalies and the
+    /// recommendations that belong to it, answering the record removed, or `None` when
+    /// the store held no insight under that id and nothing was removed.
     ///
     /// The cascade `DeleteInsight` documents — "Deletes the insight along with the
     /// associated anomalies, events and recommendations" — so an anomaly whose
     /// [`AnomalyRecord::associated_insight_id`] names the deleted insight goes with
     /// it and `DescribeAnomaly` then refuses it as not found. Anomalies associated
-    /// with no insight, and those associated with another one, are untouched.
+    /// with no insight, and those associated with another one, are untouched, and so
+    /// is another insight's advice.
     pub fn remove_insight(&mut self, insight_id: &str) -> Option<InsightRecord> {
         let removed = self.insights.remove(insight_id)?;
         self.anomalies.retain(|_, anomaly| {
@@ -290,6 +311,9 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
         // cascade: they are anomalies of the insight, keyed by it, so the log groups
         // they were found in are no longer reported for it.
         self.anomalous_log_groups.remove(insight_id);
+        // The recommendations are named by that same cascade, and are keyed by the
+        // insight they remediate, so they go with it too.
+        self.recommendations.remove(insight_id);
         Some(removed)
     }
 }
@@ -937,6 +961,88 @@ impl AnomalousLogGroupRecord {
         }
     }
 }
+
+/// One recommendation DevOps Guru derived to remediate the behaviour an insight
+/// reports, as `ListRecommendations` reports it.
+///
+/// Holds every member the modelled `Recommendation` carries. The related events and
+/// anomalies are kept as the modelled shapes, the way [`AnomalyRecord`] keeps its
+/// source details and [`AnomalousLogGroupRecord`] its showcases: relating a
+/// recommendation to the evidence behind it is the analysis's own output, so the store
+/// keeps what it produced rather than a second encoding of it.
+///
+/// The PROSE is held per language in [`Self::text`], because the read serves it in the
+/// language the request asks for; everything else identifies the recommendation and is
+/// the same whichever language it is read in.
+#[derive(Debug, Clone, Default)]
+pub struct RecommendationRecord {
+    /// `InsightId` — the outer map key, repeated here so a record is self-contained.
+    pub insight_id: String,
+    /// `Name` — the inner map key, repeated for the same reason.
+    pub name: String,
+    /// `Link`: where to read more about addressing the problem. Absent when the
+    /// analysis published no such page.
+    pub link: Option<String>,
+    /// `Category`: the kind of recommendation this is. `RecommendationCategory` is an
+    /// unconstrained string, so the store keeps whatever the analysis categorised it
+    /// as; absent when it categorised it as nothing.
+    pub category: Option<String>,
+    /// The `Description` and `Reason`, keyed by the `Locale` the analysis rendered
+    /// them in — see `LOCALE_VALUES` in `ops/types/shared_types.rs`.
+    pub text: BTreeMap<String, RecommendationText>,
+    /// `RelatedEvents`: the events that are related to the problem. Empty when the
+    /// analysis related none.
+    pub related_events: Vec<RecommendationRelatedEvent>,
+    /// `RelatedAnomalies`: the anomalies that are related to the problem. Empty when
+    /// the analysis related none.
+    pub related_anomalies: Vec<RecommendationRelatedAnomaly>,
+}
+
+/// One language's rendering of a recommendation's prose.
+#[derive(Debug, Clone, Default)]
+pub struct RecommendationText {
+    /// `Description`: a description of the problem, in this language.
+    pub description: Option<String>,
+    /// `Reason`: why the anomalous behaviour was flagged as a problem, in this
+    /// language.
+    pub reason: Option<String>,
+}
+
+impl RecommendationRecord {
+    /// This record as the modelled `Recommendation` the read reports, with its prose in
+    /// `locale`.
+    ///
+    /// A recommendation the analysis rendered in no such language is reported in
+    /// [`DEFAULT_LOCALE`], the language every rendering starts from, rather than with no
+    /// prose at all; one rendered in neither reports neither member, both being optional.
+    pub fn to_recommendation(&self, locale: &str) -> Recommendation {
+        let text = self
+            .text
+            .get(locale)
+            .or_else(|| self.text.get(DEFAULT_LOCALE));
+        Recommendation {
+            name: Some(self.name.clone()),
+            description: text.and_then(|text| text.description.clone()),
+            reason: text.and_then(|text| text.reason.clone()),
+            link: self.link.clone(),
+            category: self.category.clone(),
+            related_events: (!self.related_events.is_empty())
+                .then(|| self.related_events.clone()),
+            related_anomalies: (!self.related_anomalies.is_empty())
+                .then(|| self.related_anomalies.clone()),
+        }
+    }
+}
+
+/// The language a recommendation read reports its prose in when the request names
+/// none: `Locale`'s English (United States) value — see `LOCALE_VALUES` in
+/// `ops/types/shared_types.rs`.
+pub const DEFAULT_LOCALE: &str = "EN_US";
+
+/// The most recommendations one response carries, from the modelled length of
+/// `Recommendations` (0..10): a longer page could not be serialized against the model,
+/// so the walk pages at this size.
+pub const RECOMMENDATIONS_PAGE_SIZE: usize = 10;
 
 // ---------------------------------------------------------------------------
 // What an insight listing selects
@@ -2156,8 +2262,9 @@ pub const PAGE_SIZE: usize = 100;
 // `insights` carries no cap because no request can grow it: insights come from DevOps
 // Guru's analysis, which this emulator does not run, so nothing a caller sends adds an
 // entry. `anomalies` is the same: an anomaly is detected by that analysis too, and no
-// modelled operation mints one. An operation that ever mints either brings its own
-// bound.
+// modelled operation mints one. `anomalous_log_groups` and `recommendations` are the
+// same again, and are reclaimed with the insight they are keyed by. An operation that
+// ever mints any of them brings its own bound.
 // ---------------------------------------------------------------------------
 
 /// DevOps Guru's own documented ceiling, from `UpdateResourceCollection`'s and

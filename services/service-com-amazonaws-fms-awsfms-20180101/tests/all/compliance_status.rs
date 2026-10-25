@@ -200,7 +200,11 @@ fn pin_updated_at(engine: &Arc<engine::InMemoryEngine>, policy_id: &str, when: S
 
 /// Record `count` violations of `policy_id` against resources of `account`, as a
 /// Firewall Manager policy evaluation records them.
-fn seed_violations(
+///
+/// `pub(crate)` so a sibling suite in this test target seeds the violation
+/// inventory through this one helper rather than writing the record a second
+/// way.
+pub(crate) fn seed_violations(
     engine: &Arc<engine::InMemoryEngine>,
     policy_id: &str,
     account: &str,

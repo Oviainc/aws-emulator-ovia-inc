@@ -12,7 +12,7 @@
 //! `MaxResults` is the page size and `NextToken` resumes where the previous page
 //! stopped; the last page carries no `NextToken`. A caller that names no
 //! `MaxResults` gets the WHOLE catalog in one page and no `NextToken`
-//! ([`crate::state::SERVICE_CATALOG_UNASKED_PAGE_SIZE`]): `MaxResults`' 1..100 range
+//! ([`crate::state::UNASKED_PAGE_SIZE`]): `MaxResults`' 1..100 range
 //! bounds what a caller may ask for, not what this listing returns unasked, and the
 //! recorded answer to an empty `ListServices` body carries the inventory whole. A
 //! token this service did not issue is refused with
@@ -116,15 +116,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let services = state.lock().services();
-        // The unasked page is the WHOLE inventory, not `state::UNASKED_PAGE_SIZE`:
-        // `MaxResults` bounds only what a caller asks for.
-        let page = crate::state::paginate_bounded(
+        // The unasked page is the WHOLE inventory: `MaxResults` bounds only what a
+        // caller asks for.
+        let page = crate::state::paginate(
             Self::NAME,
             services,
             input.max_results,
             input.next_token.as_deref(),
-            crate::state::MAX_PAGE_SIZE,
-            crate::state::SERVICE_CATALOG_UNASKED_PAGE_SIZE,
         )
         .map_err(|_| {
             ListServicesErrorModeled::InvalidPaginationTokenException(
