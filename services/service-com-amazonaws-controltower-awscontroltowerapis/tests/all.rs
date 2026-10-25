@@ -29,6 +29,8 @@ mod enable_control_persistence;
 mod enabled_baseline_update;
 #[path = "all/enabled_control_lifecycle.rs"]
 mod enabled_control_lifecycle;
+#[path = "all/enabled_control_update.rs"]
+mod enabled_control_update;
 #[path = "all/front_door_validation.rs"]
 mod front_door_validation;
 #[path = "all/landing_zone_lifecycle.rs"]
