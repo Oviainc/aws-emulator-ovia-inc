@@ -230,6 +230,12 @@ impl From<PlsRejection> for PutLexiconError {
             // document Amazon Polly's PLS reader cannot use: the document is invalid
             // as a whole, so the error is `InvalidLexiconException` and not the more
             // specific `UnsupportedPlsAlphabetException` the model also declares.
+            // That is the code Amazon Polly's OWN responses carry for such a document
+            // (recorded trace `polly.put-lexicon-unsupported-alphabet-error`, for a
+            // document declaring `alphabet="klingon"`) — a code the model declares is
+            // not thereby a code the service answers, and this one it does not (see
+            // `crate::service::errors`). The suite
+            // `tests/all/pls_alphabet_support.rs` pins it over the whole class.
             PlsRejection::NotALexicon(_) | PlsRejection::UnsupportedAlphabet(_) => {
                 PutLexiconErrorModeled::InvalidLexiconException(
                     crate::service::errors::invalid_lexicon(),

@@ -815,6 +815,32 @@
 //! deliver, one that was cancelled, one whose payment is pending or failed — are stored, as
 //! [`CapacityBlockRecord::pinned_state`].
 //!
+//! ## IPAM
+//!
+//! [`ComAmazonawsEc2Amazonec2State::ipams`] holds the account's IP Address Manager
+//! instances as the modelled [`Ipam`] shape itself, keyed by `IpamId` in a [`BTreeMap`],
+//! for the same reason the VPC store holds [`Vpc`]s: `CreateIpam` and `DescribeIpams`
+//! cannot report one IPAM differently, and the map's order is the one order the describe
+//! reports and pages over. Creating an IPAM creates FOUR resources, not one — "an IPAM
+//! contains two default scopes" (`IpamScope`) and "the default resource discovery is the
+//! resource discovery automatically created when you create an IPAM"
+//! ([`IpamResourceDiscovery`]`$IsDefault`), which is then associated with the IPAM
+//! ([`IpamResourceDiscoveryAssociation`]`$IsDefault`) — so
+//! [`ComAmazonawsEc2Amazonec2State::ipam_scopes`],
+//! [`ComAmazonawsEc2Amazonec2State::ipam_resource_discoveries`] and
+//! [`ComAmazonawsEc2Amazonec2State::ipam_resource_discovery_associations`] hold those
+//! beside it, each as its own modelled shape keyed by its own id, and
+//! [`ComAmazonawsEc2Amazonec2State::insert_ipam`] writes all four at once so the ids the
+//! `Ipam` reports always name records this store really holds.
+//!
+//! Each of the four is answered in a non-terminal state (`create-in-progress`,
+//! `associate-in-progress`), so the clock owes all four their completed state one
+//! [`TRANSITION_DELAY`] later; the due instant is recorded in
+//! [`ComAmazonawsEc2Amazonec2State::ipam_create_complete_at`], on the same monotonic clock
+//! as an instance's [`PendingTransition`] and a `pending` VPC's
+//! [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
+//!
 //! ## Capacity Reservations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservations`] holds the account's Capacity
@@ -1030,8 +1056,9 @@ use crate::ops::types::{
     EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
     ImageCriterion, ImportSnapshotTask, Instance, InstanceApplicationStatus, InstanceStorageInfo,
     InstanceTypeInfo,
-    IpamInternetRegistryAssociation, IpamPolicy, IpamPool, IpamRoutingPolicyRegistration,
-    IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
+    Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
+    IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
+    IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange,
     LOCATION_TYPE_VALUES,
@@ -2405,6 +2432,31 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// Every IPAM the account holds, by `IpamId`, as the modelled [`Ipam`] shape itself —
+    /// see the module docs. Ordered by id, which is the order `DescribeIpams` reports and
+    /// pages over.
+    pub ipams: BTreeMap<String, Ipam>,
+    /// When each IPAM's `create-in-progress` -> `create-complete` transition falls due, for
+    /// the IPAMs that have one.
+    ///
+    /// The IPAM counterpart of [`Self::vpc_available_at`], for the same reason and on the
+    /// same clock: `CreateIpam` answers an IPAM in the non-terminal `create-in-progress`
+    /// state, so the clock owes it `create-complete` [`TRANSITION_DELAY`] later whether or
+    /// not anybody calls again. The one entry covers the IPAM's default scopes, its default
+    /// resource discovery and that discovery's association too, since all four were created
+    /// by the same call and are owed their completed state at the same instant.
+    pub ipam_create_complete_at: BTreeMap<String, Instant>,
+    /// Every IPAM resource discovery the account holds, by `IpamResourceDiscoveryId`, as the
+    /// modelled [`IpamResourceDiscovery`] shape itself. Starts with the default resource
+    /// discovery of each IPAM ([`Self::insert_ipam`]).
+    pub ipam_resource_discoveries: BTreeMap<String, IpamResourceDiscovery>,
+    /// Every IPAM resource discovery association, by `IpamResourceDiscoveryAssociationId`,
+    /// as the modelled [`IpamResourceDiscoveryAssociation`] shape itself. Starts with the
+    /// association of each IPAM's own default resource discovery ([`Self::insert_ipam`]).
+    pub ipam_resource_discovery_associations: BTreeMap<String, IpamResourceDiscoveryAssociation>,
+    /// A `CreateIpam` `ClientToken` and the IPAM it minted, so a repeat of the same request
+    /// answers with that IPAM instead of creating a second one.
+    pub ipam_client_tokens: HashMap<String, String>,
     /// The tag keys registered to appear in scheduled event notifications, by Region.
     ///
     /// `DescribeInstanceEventNotificationAttributes` reports "the tag keys that are
@@ -2552,10 +2604,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `CreateIpamPool` resolves its `IpamScopeId` against and takes the pool's IPAM, Region
     /// and scope type from.
     ///
-    /// A fresh account holds none: a scope belongs to an IPAM, and `CreateIpam` and
-    /// `CreateIpamScope` are both still scaffolds, so until one of them is written every
-    /// scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] — exactly as the
-    /// real service does for a scope that does not exist.
+    /// A fresh account holds none: a scope belongs to an IPAM, so the two default scopes of
+    /// an IPAM are written by [`Self::insert_ipam`] when `CreateIpam` creates it, and
+    /// `CreateIpamScope` (still a scaffold) is what would add a further one. Until an IPAM
+    /// exists, every scope id a request names answers [`INVALID_IPAM_SCOPE_ID_NOT_FOUND`] —
+    /// exactly as the real service does for a scope that does not exist.
     pub ipam_scopes: BTreeMap<String, IpamScope>,
     /// When a `create-in-progress` IPAM pool's move to `create-complete` falls due, by
     /// `IpamPoolId` — the fact the modelled [`IpamPool`] shape carries no member for, stored
@@ -2795,6 +2848,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            ipams: BTreeMap::new(),
+            ipam_create_complete_at: BTreeMap::new(),
+            ipam_resource_discoveries: BTreeMap::new(),
+            ipam_resource_discovery_associations: BTreeMap::new(),
+            ipam_client_tokens: HashMap::new(),
             instance_event_tag_registrations: BTreeMap::new(),
             route_server_endpoints: BTreeMap::new(),
             route_server_endpoint_available_at: BTreeMap::new(),
@@ -4744,7 +4802,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// `pending-withdrawal` BYOIP range reaching the end of its withdrawal, and a
     /// `pending-deprovision` BYOIP range reaching the end of its release — leaving the
     /// account, or landing in `failed-deprovision` when addresses are still allocated from
-    /// it.
+    /// it — and an IPAM (with its default scopes, resource discovery and that discovery's
+    /// association) reaching `create-complete`.
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
@@ -5081,6 +5140,20 @@ impl ComAmazonawsEc2Amazonec2State {
             // stays absent for the same reason: no network interface was analyzed.
             record.view.findings_found = Some(FINDINGS_FOUND_UNKNOWN.to_string());
             record.pending = None;
+        }
+        // Each IPAM whose `create-complete` has fallen due, with the scopes, resource
+        // discovery and association the same `CreateIpam` call created. The due ids are
+        // collected first because completing one borrows the other IPAM stores.
+        let due_ipams: Vec<String> = self
+            .ipam_create_complete_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(ipam_id, _)| ipam_id.clone())
+            .collect();
+        for ipam_id in due_ipams {
+            // The transition is applied once; nothing is owed on this IPAM any more.
+            self.ipam_create_complete_at.remove(&ipam_id);
+            self.complete_ipam_creation(&ipam_id);
         }
         // The resources whose own record carries the move the clock owes it
         // ([`PendingStateMove`]): a transit gateway attachment an acceptance or a rejection
@@ -21050,6 +21123,411 @@ impl ComAmazonawsEc2Amazonec2State {
             .count();
         if let Some(scope) = self.ipam_scopes.get_mut(scope_id) {
             scope.pool_count = i32::try_from(pools).ok();
+        }
+    }
+}
+
+// =============================================================================
+// IPAM
+// =============================================================================
+
+/// The id prefix a stored IPAM is minted with.
+///
+/// The model publishes no pattern for `IpamId` (`smithy_query(query="shape",shape="Ipam")`
+/// gives a plain `String` target), so the id takes EC2's own `<prefix>-<hex>` form through
+/// [`ComAmazonawsEc2Amazonec2State::next_id`], with the prefix AWS gives the resource.
+pub const IPAM_ID_PREFIX: &str = "ipam";
+
+/// The id prefix a stored IPAM resource discovery is minted with — see [`IPAM_ID_PREFIX`].
+pub const IPAM_RESOURCE_DISCOVERY_ID_PREFIX: &str = "ipam-res-disco";
+
+/// The id prefix a stored IPAM resource discovery association is minted with — see
+/// [`IPAM_ID_PREFIX`].
+pub const IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX: &str = "ipam-res-disco-assoc";
+
+/// The ARN resource type of an IPAM, which is also the `ResourceType` a `TagSpecification`
+/// names to tag one.
+pub const RESOURCE_TYPE_IPAM: &str = "ipam";
+
+/// The ARN resource type of an IPAM resource discovery.
+pub const RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY: &str = "ipam-resource-discovery";
+
+/// The ARN resource type of an IPAM resource discovery association.
+pub const RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION: &str =
+    "ipam-resource-discovery-association";
+
+/// The ARN of one IPAM resource: `arn:aws:ec2::<account>:<resource_type>/<id>`.
+///
+/// The Region segment is EMPTY, unlike every other EC2 ARN this crate builds: the Service
+/// Authorization Reference spells the EC2 `ipam` resource
+/// `arn:${Partition}:ec2::${Account}:ipam/${IpamId}`, and its `ipam-scope`,
+/// `ipam-resource-discovery` and `ipam-resource-discovery-association` resources the same
+/// way, an IPAM being a multi-Region resource whose home Region is reported in
+/// `Ipam$IpamRegion` instead. [`::engine::emulator_arn`] takes an empty `region` for exactly
+/// this ("Global-service ARNs simply pass an empty `region`").
+pub fn ipam_resource_arn(resource_type: &str, id: &str) -> String {
+    ::engine::emulator_arn("ec2", "", &format!("{resource_type}/{id}"))
+}
+
+/// An IPAM, scope or resource discovery AWS is still creating: the `create-in-progress`
+/// member shared by `IpamState`, `IpamScopeState` and `IpamResourceDiscoveryState`.
+pub const IPAM_STATE_CREATE_IN_PROGRESS: &str = "create-in-progress";
+
+/// The state those three enums reach once the creation is done: `create-complete`.
+pub const IPAM_STATE_CREATE_COMPLETE: &str = "create-complete";
+
+/// A resource discovery association AWS is still making: the
+/// `IpamResourceDiscoveryAssociationState` enum's `associate-in-progress` member.
+pub const IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS: &str = "associate-in-progress";
+
+/// The state an association reaches once it is made: `associate-complete`.
+pub const IPAM_ASSOCIATION_STATE_ASSOCIATE_COMPLETE: &str = "associate-complete";
+
+/// "`active` - Connection or permissions required to read the results of the resource
+/// discovery are intact" (`IpamResourceDiscoveryAssociation$ResourceDiscoveryStatus`): the
+/// status of a discovery the IPAM owns itself, which nothing can stop sharing.
+pub const IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE: &str = "active";
+
+/// The tier an IPAM that names none gets: "IPAM is offered in a Free Tier and an Advanced
+/// Tier" (`IpamTier`, one of `free` | `advanced` — a value outside it is refused by the
+/// boundary validator, so only the DEFAULT is a decision this crate makes), and the Free
+/// Tier is the one an account has without asking.
+pub const DEFAULT_IPAM_TIER: &str = "free";
+
+/// The metered account an IPAM that names none gets: "`ipam-owner` (default): The Amazon
+/// Web Services account which owns the IPAM is charged for all active IP addresses managed
+/// in IPAM" (`CreateIpamRequest$MeteredAccount`). The other member of `IpamMeteredAccount`
+/// is `resource-owner`, and a value outside the enum is refused by the boundary validator.
+pub const DEFAULT_IPAM_METERED_ACCOUNT: &str = "ipam-owner";
+
+/// How many scopes a freshly created IPAM has: "An IPAM contains two default scopes"
+/// (`IpamScope`), the public one and the private one, and nothing else has created a scope
+/// in it yet.
+pub const DEFAULT_IPAM_SCOPE_COUNT: i32 = 2;
+
+/// How many resource discoveries a freshly created IPAM has associated: "When you create an
+/// IPAM, a default resource discovery is created for your IPAM and it's associated with your
+/// IPAM" (`IpamResourceDiscoveryAssociation$IsDefault`) — exactly that one.
+pub const DEFAULT_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_COUNT: i32 = 1;
+
+/// How many IPAMs this emulator stores.
+///
+/// A ceiling of this store, not a published AWS quota: like [`MAX_VPCS`] it exists so
+/// repeated creates cannot grow memory without bound, and a create asks
+/// [`ComAmazonawsEc2Amazonec2State::has_ipam_capacity`] before inserting.
+pub const MAX_IPAMS: usize = 1_000;
+
+/// `IpamLimitExceeded`: the create would take the account past the IPAMs it may hold.
+pub const IPAM_LIMIT_EXCEEDED: &str = "IpamLimitExceeded";
+
+/// `InvalidIpamId.NotFound`: the request named an IPAM id this account holds no IPAM for.
+pub const INVALID_IPAM_ID_NOT_FOUND: &str = "InvalidIpamId.NotFound";
+
+/// Refuse a create that would take the store past [`MAX_IPAMS`]: HTTP 400
+/// `IpamLimitExceeded`.
+pub fn ipam_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        IPAM_LIMIT_EXCEEDED,
+        400,
+        format!("This emulator holds {MAX_IPAMS} IPAMs, which is as many as it stores"),
+    )
+}
+
+/// Refuse a request that named an IPAM the account holds none of: HTTP 400
+/// `InvalidIpamId.NotFound`.
+pub fn invalid_ipam_id_not_found<E>(ipam_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_ID_NOT_FOUND,
+        400,
+        format!("The IPAM ID '{ipam_id}' does not exist"),
+    )
+}
+
+/// What one stored IPAM is created with, beside everything the store derives itself (every
+/// id, every ARN, the states, the scope and association counts).
+///
+/// The spec of the resource, in the same shape [`VpcEndpointConnectionSpec`] has for a
+/// connection: `CreateIpam` fills this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam`] turns it into the modelled [`Ipam`] the
+/// describe reports — plus the two default scopes, the default resource discovery and that
+/// discovery's association — so no two paths can create an IPAM two ways.
+#[derive(Debug, Clone)]
+pub struct IpamSpec {
+    /// The IPAM's home Region: the Region the creating request was signed for
+    /// (`Ipam$IpamRegion`).
+    pub region: String,
+    /// "A description for the IPAM" (`CreateIpamRequest$Description`), or `None`.
+    pub description: Option<String>,
+    /// The Region names of `Ipam$OperatingRegions`, already validated and deduplicated by
+    /// the caller, including the home Region.
+    pub operating_regions: Vec<String>,
+    /// The `IpamTier` the IPAM is in.
+    pub tier: String,
+    /// The `IpamMeteredAccount` the IPAM meters to.
+    pub metered_account: String,
+    /// "Enable this option to use your own GUA ranges as private IPv6 addresses"
+    /// (`Ipam$EnablePrivateGua`).
+    pub enable_private_gua: bool,
+    /// The tags of an `ipam` tag specification.
+    pub tags: Vec<Tag>,
+    /// The request's `ClientToken`, which [`ComAmazonawsEc2Amazonec2State::insert_ipam`]
+    /// records against the IPAM it mints so a replay of the same request answers with that
+    /// IPAM, or `None` when the request carried none.
+    pub client_token: Option<String>,
+}
+
+/// The bytes one `CreateIpam` adds to the store THROUGH
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam`] itself: the caller-chosen ones — its
+/// description, the Region names it operates in, its tags and the client token the token map
+/// keeps — plus the fixed [`STORED_RECORD_OVERHEAD_BYTES`] each of the three records that
+/// writer inserts costs. Every other member is an id, an ARN, a state or a count this module
+/// derives, so it is fixed-size.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and a removal path must give back the same
+/// number. The two default scopes a create also writes are charged by
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam_scope`], the one writer of that store, and so
+/// are deliberately NOT counted here — counting them in both places would make a later
+/// delete refund less than was charged. The resource discovery keeps its own copy of the
+/// description and the Region names, which is why those are counted twice.
+pub fn ipam_payload_bytes(spec: &IpamSpec) -> usize {
+    let regions: usize = spec.operating_regions.iter().map(String::len).sum();
+    let description = spec.description.as_deref().unwrap_or_default().len();
+    // The IPAM keeps the description and the Regions; the resource discovery keeps a copy
+    // of both. A request that carries no client token is charged nothing for one. Beside
+    // those, the THREE records this writer inserts (the IPAM, its resource discovery and
+    // that discovery's association) each cost the fixed [`STORED_RECORD_OVERHEAD_BYTES`],
+    // so a create with no description, Regions or tags is not free against
+    // [`MAX_STORED_BYTES`].
+    tag_list_bytes(&spec.tags)
+        .saturating_add(2 * (regions + description))
+        .saturating_add(spec.client_token.as_deref().unwrap_or_default().len())
+        .saturating_add(3 * STORED_RECORD_OVERHEAD_BYTES)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another IPAM fits inside the store's ceiling ([`MAX_IPAMS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses with
+    /// [`ipam_limit_exceeded`] when it answers `false`.
+    pub fn has_ipam_capacity(&self) -> bool {
+        self.ipams.len() < MAX_IPAMS
+    }
+
+    /// Store an IPAM with the two default scopes, the default resource discovery and that
+    /// discovery's association AWS creates with it, and answer the `IpamId` it was given —
+    /// or `None` when this store cannot hold the IPAM and both of its default scopes, which
+    /// a handler answers with [`ipam_limit_exceeded`].
+    ///
+    /// Every id and every ARN is minted HERE rather than taken from `spec`, so the ids the
+    /// `Ipam` reports (`PublicDefaultScopeId`, `PrivateDefaultScopeId`,
+    /// `DefaultResourceDiscoveryId`, `DefaultResourceDiscoveryAssociationId`) always name
+    /// records this store holds — the two scopes through [`Self::insert_ipam_scope`], the
+    /// ONE writer of [`Self::ipam_scopes`], so a scope this path creates and a scope
+    /// `CreateIpamScope` creates cannot be built two ways. All four records start in their
+    /// non-terminal state and the due instant of their completion is recorded in
+    /// [`Self::ipam_create_complete_at`], so a caller that reads straight back still sees
+    /// `create-in-progress`. The caller-chosen bytes are charged against the store's byte
+    /// budget here, so no path can store them uncharged; a create still asks
+    /// [`Self::has_ipam_capacity`] and [`Self::would_exceed_stored_bytes`] first so it can
+    /// refuse instead of overshooting.
+    pub fn insert_ipam(&mut self, spec: IpamSpec) -> Option<String> {
+        // Room for the IPAM itself AND for the two default scopes that come up with it,
+        // asked before anything is written: a create stores all of it or none of it, so no
+        // IPAM can end up naming a default scope this store refused to hold.
+        let default_scopes = usize::try_from(DEFAULT_IPAM_SCOPE_COUNT).unwrap_or_default();
+        if !self.has_ipam_capacity()
+            || self.ipam_scopes.len() + default_scopes > MAX_STORED_RECORDS_PER_STORE
+        {
+            return None;
+        }
+        let payload_bytes = ipam_payload_bytes(&spec);
+        let ipam_id = self.next_id(IPAM_ID_PREFIX);
+        let ipam_arn = ipam_resource_arn(RESOURCE_TYPE_IPAM, &ipam_id);
+        let owner_id = ::engine::emulator_account_id().to_string();
+        let operating_regions: Vec<IpamOperatingRegion> = spec
+            .operating_regions
+            .iter()
+            .map(|region_name| IpamOperatingRegion {
+                region_name: Some(region_name.clone()),
+            })
+            .collect();
+
+        // The two default scopes. "The public scope is intended for all public IP address
+        // space" and the private one for private space (`IpamScope`); both are default
+        // scopes of this IPAM, in its home Region, holding no pool yet. The room for both
+        // was taken above, so neither write can be refused here.
+        let public_scope_id =
+            self.insert_default_ipam_scope(IPAM_SCOPE_TYPE_PUBLIC, &ipam_arn, &spec.region)?;
+        let private_scope_id =
+            self.insert_default_ipam_scope(IPAM_SCOPE_TYPE_PRIVATE, &ipam_arn, &spec.region)?;
+
+        // The default resource discovery, and its association with this IPAM: "a default
+        // resource discovery is created for your IPAM and it's associated with your IPAM"
+        // (`IpamResourceDiscoveryAssociation$IsDefault`). It discovers in the IPAM's own
+        // operating Regions, and it excludes no organizational unit.
+        let resource_discovery_id = self.next_id(IPAM_RESOURCE_DISCOVERY_ID_PREFIX);
+        self.ipam_resource_discoveries.insert(
+            resource_discovery_id.clone(),
+            IpamResourceDiscovery {
+                owner_id: Some(owner_id.clone()),
+                ipam_resource_discovery_id: Some(resource_discovery_id.clone()),
+                ipam_resource_discovery_arn: Some(ipam_resource_arn(
+                    RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY,
+                    &resource_discovery_id,
+                )),
+                ipam_resource_discovery_region: Some(spec.region.clone()),
+                description: spec.description.clone(),
+                operating_regions: Some(operating_regions.clone()),
+                is_default: Some(true),
+                state: Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string()),
+                // The tags of the request are the IPAM's; nothing tagged the discovery.
+                tags: Some(Vec::new()),
+                organizational_unit_exclusions: Some(Vec::new()),
+            },
+        );
+        let association_id = self.next_id(IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX);
+        self.ipam_resource_discovery_associations.insert(
+            association_id.clone(),
+            IpamResourceDiscoveryAssociation {
+                owner_id: Some(owner_id.clone()),
+                ipam_resource_discovery_association_id: Some(association_id.clone()),
+                ipam_resource_discovery_association_arn: Some(ipam_resource_arn(
+                    RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION,
+                    &association_id,
+                )),
+                ipam_resource_discovery_id: Some(resource_discovery_id.clone()),
+                ipam_id: Some(ipam_id.clone()),
+                ipam_arn: Some(ipam_arn.clone()),
+                ipam_region: Some(spec.region.clone()),
+                is_default: Some(true),
+                resource_discovery_status: Some(
+                    IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE.to_string(),
+                ),
+                state: Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS.to_string()),
+                tags: Some(Vec::new()),
+            },
+        );
+
+        let ipam = Ipam {
+            owner_id: Some(owner_id),
+            ipam_id: Some(ipam_id.clone()),
+            ipam_arn: Some(ipam_arn),
+            ipam_region: Some(spec.region),
+            public_default_scope_id: Some(public_scope_id),
+            private_default_scope_id: Some(private_scope_id),
+            scope_count: Some(DEFAULT_IPAM_SCOPE_COUNT),
+            description: spec.description,
+            operating_regions: Some(operating_regions),
+            state: Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string()),
+            tags: Some(spec.tags),
+            default_resource_discovery_id: Some(resource_discovery_id),
+            default_resource_discovery_association_id: Some(association_id),
+            resource_discovery_association_count: Some(
+                DEFAULT_IPAM_RESOURCE_DISCOVERY_ASSOCIATION_COUNT,
+            ),
+            // "The state message" (`Ipam$StateMessage`): nothing has gone wrong, so there
+            // is none.
+            state_message: None,
+            tier: Some(spec.tier),
+            enable_private_gua: Some(spec.enable_private_gua),
+            metered_account: Some(spec.metered_account),
+        };
+        self.add_stored_bytes(payload_bytes);
+        self.ipams.insert(ipam_id.clone(), ipam);
+        // The token that minted this IPAM, so a replay of the same request answers with it
+        // rather than creating a second one. Recorded HERE, with the record itself, so no
+        // path can store one without the other.
+        if let Some(token) = spec.client_token {
+            self.ipam_client_tokens.insert(token, ipam_id.clone());
+        }
+        // What the clock now owes all four records: their completed state, one
+        // TRANSITION_DELAY from now — the same span, off the same monotonic clock, as a
+        // pending VPC's move to `available`.
+        self.ipam_create_complete_at
+            .insert(ipam_id.clone(), Instant::now() + TRANSITION_DELAY);
+        Some(ipam_id)
+    }
+
+    /// One default scope of an IPAM, stored, and the `IpamScopeId` it was given — or `None`
+    /// when the scope store is at its ceiling.
+    ///
+    /// Written through [`Self::insert_ipam_scope`], the one writer of that store, which
+    /// derives the id, the ARN it reports, the owning account and its pool count; what a
+    /// DEFAULT scope adds is only what the IPAM it belongs to decides.
+    fn insert_default_ipam_scope(
+        &mut self,
+        scope_type: &str,
+        ipam_arn: &str,
+        region: &str,
+    ) -> Option<String> {
+        self.insert_ipam_scope(IpamScope {
+            ipam_arn: Some(ipam_arn.to_string()),
+            ipam_region: Some(region.to_string()),
+            ipam_scope_type: Some(scope_type.to_string()),
+            // "Defines if the scope is the default scope or not" (`IpamScope$IsDefault`):
+            // this is one of the two an IPAM is created with.
+            is_default: Some(true),
+            // A default scope carries no description: nothing has set one, and the
+            // request's description is the IPAM's.
+            description: None,
+            state: Some(IPAM_STATE_CREATE_IN_PROGRESS.to_string()),
+            tags: Some(Vec::new()),
+            // "The external authority configuration for this IPAM scope, IF CONFIGURED"
+            // (`IpamScope$ExternalAuthorityConfiguration`): a scope IPAM created itself is
+            // linked to no external authority.
+            external_authority_configuration: None,
+            // Derived by `insert_ipam_scope`, which is why they are left unset here.
+            ipam_scope_id: None,
+            ipam_scope_arn: None,
+            owner_id: None,
+            pool_count: None,
+        })
+    }
+
+    /// Move one IPAM and everything created with it to its completed state.
+    ///
+    /// Called only by [`Self::materialize_due_transitions`], once the instant recorded in
+    /// [`Self::ipam_create_complete_at`] has passed. Each record is moved only out of the
+    /// state the create left it in, so a record something else has since moved is left
+    /// alone.
+    fn complete_ipam_creation(&mut self, ipam_id: &str) {
+        let Some(ipam) = self.ipams.get_mut(ipam_id) else {
+            return;
+        };
+        if ipam.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+            ipam.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+        }
+        let scope_ids = [
+            ipam.public_default_scope_id.clone(),
+            ipam.private_default_scope_id.clone(),
+        ];
+        let resource_discovery_id = ipam.default_resource_discovery_id.clone();
+        let association_id = ipam.default_resource_discovery_association_id.clone();
+
+        for scope_id in scope_ids.into_iter().flatten() {
+            if let Some(scope) = self.ipam_scopes.get_mut(&scope_id) {
+                if scope.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                    scope.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+                }
+            }
+        }
+        if let Some(discovery) = resource_discovery_id
+            .and_then(|discovery_id| self.ipam_resource_discoveries.get_mut(&discovery_id))
+        {
+            if discovery.state.as_deref() == Some(IPAM_STATE_CREATE_IN_PROGRESS) {
+                discovery.state = Some(IPAM_STATE_CREATE_COMPLETE.to_string());
+            }
+        }
+        if let Some(association) = association_id.and_then(|association_id| {
+            self.ipam_resource_discovery_associations
+                .get_mut(&association_id)
+        }) {
+            if association.state.as_deref() == Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS)
+            {
+                association.state =
+                    Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_COMPLETE.to_string());
+            }
         }
     }
 }

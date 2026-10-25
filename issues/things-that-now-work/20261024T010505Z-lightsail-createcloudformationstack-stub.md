@@ -23,3 +23,24 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the lightsail emulator
 2. Call CreateCloudFormationStack and observe HTTP 501 with no state persisted
+
+## Resolution
+
+Implemented in `src/ops/create_cloud_formation_stack.rs` over the store's own
+`cloud_formation_stack_records`, together with its only reader,
+`GetCloudFormationStackRecords` (its own stub issue). The call creates the AWS
+CloudFormation stack for the export snapshot record the single instance entry
+names and appends the one record that tracks it — `Started`, settled to
+`Succeeded` by the clock — reporting the stack's ARN as `destinationInfo`.
+
+EMULATOR-CHOSEN behaviour, recorded here so the deviation is discoverable: a
+second `CreateCloudFormationStack` naming an export snapshot record whose
+earlier stack is still `Started` is refused with the modelled
+`InvalidInputException`. AWS states this only as guidance to the caller ("Wait
+until after your new Amazon EC2 instance is created before running the create
+cloud formation stack operation again with the same export snapshot record"),
+not as a documented service-enforced rejection, so a request real Lightsail may
+accept is refused here. Everything else the handler refuses comes from a
+documented rule (one instance entry per call, an export snapshot record of this
+account whose export has succeeded, a zone of that export's Region, an Amazon
+EC2 instance type name, Amazon EC2's 16 KB user-data cap).

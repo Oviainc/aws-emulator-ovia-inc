@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnlinkIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnlinkIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnlinkIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! FORGETS the links between a stored identity and the named login providers: every login
+//! this pool had indexed for one of those providers against the identity is dropped, so a
+//! later `GetId` presenting it resolves nothing and mints a NEW identity — "unlinked
+//! logins will be considered new identities next time they are seen". The identity record
+//! itself survives with the remaining providers; removing its last one leaves it reachable
+//! through no login at all, which is what makes it inaccessible.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +171,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnlinkIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnlinkIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnlinkIdentity"))
+        // This operation reads and writes the identity store only; `ctx` carries nothing it
+        // needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UnlinkIdentityErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The identity named is what this call unlinks logins FROM, so it has to be one
+        // this service holds.
+        let Some(identity) = store.identities.get(&input.identity_id) else {
+            return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                },
+            )
+            .into());
+        };
+        let identity_pool_id = identity.identity_pool_id.clone();
+
+        // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
+        // wherever else this service is handed one: an entry naming an Amazon Cognito user
+        // pool carries its issuer in the provider name, so a token minted by a user pool
+        // that is none of this pool's `CognitoIdentityProviders` authorizes nobody here.
+        let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+            return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+        if input
+            .logins
+            .keys()
+            .any(|provider| !pool.accepts_login_provider(provider))
+        {
+            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A presented login this pool has linked to a DIFFERENT identity belongs to that
+        // other account, so the call is not one this identity may make — which is exactly
+        // what the modelled `ResourceConflictException` states ("a login which is already
+        // linked to another account").
+        let presents_another_account = input.logins.iter().any(|(provider, login)| {
+            store
+                .linked_identity(&identity_pool_id, provider, login)
+                .is_some_and(|linked| *linked != input.identity_id)
+        });
+        if presents_another_account {
+            return Err(UnlinkIdentityErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    message: Some(format!(
+                        "A login presented for identity '{}' is already linked to another \
+                         identity.",
+                        input.identity_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `LoginsToRemove` carries PROVIDER NAMES, and unlinking a provider from an identity
+        // means no login of that provider reaches the identity any more — so every login
+        // value this pool indexed for it against this identity goes, not just a value the
+        // request happened to present. The index is swept ONCE, whatever the length of the
+        // list (`LoginsList` states no bound of its own), so the work is the size of the
+        // store rather than the product of the two.
+        let unlinked: ::std::collections::HashSet<&str> =
+            input.logins_to_remove.iter().map(String::as_str).collect();
+        let indexed_before = store.login_index.len();
+        store.login_index.retain(|(pool_id, provider, _), linked| {
+            !(*pool_id == identity_pool_id
+                && *linked == input.identity_id
+                && unlinked.contains(provider.as_str()))
+        });
+        let mut unlinked_anything = store.login_index.len() != indexed_before;
+
+        // The identity keeps the providers the call did not name. It is NOT deleted when the
+        // last one goes: "removing the last linked login will make this identity
+        // inaccessible", which is what an identity no login resolves to already is.
+        if let Some(identity) = store.identities.get_mut(&input.identity_id) {
+            let linked_before = identity.logins.len();
+            identity
+                .logins
+                .retain(|provider| !unlinked.contains(provider.as_str()));
+            unlinked_anything |= identity.logins.len() != linked_before;
+            // A link the call actually removed is a change to the identity, recorded with
+            // the instant it happened; a call that removed none leaves the record alone.
+            if unlinked_anything {
+                identity.last_modified_date = now;
+            }
+        }
+
+        Ok(UnlinkIdentityOutput)
     }
 }

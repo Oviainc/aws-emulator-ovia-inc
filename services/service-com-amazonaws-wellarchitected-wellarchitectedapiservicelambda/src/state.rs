@@ -1698,6 +1698,27 @@ const TAGGABLE_RESOURCE_KINDS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Where the tags of the resource a tag ARN names LIVE in this store: which map holds the
+/// record the tags sit on, plus — for a workload, which is keyed by its `WorkloadId`
+/// rather than by its ARN — the key it is held under.
+///
+/// Resolved in ONE place
+/// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::tagged_resource`]),
+/// so reading a resource's tags and writing them cannot disagree about what an ARN names.
+enum TaggedResource {
+    /// The workload held under this `WorkloadId`.
+    Workload(String),
+    /// The review template held under the ARN as sent.
+    ReviewTemplate,
+    /// The Well-Architected Tool profile held under the ARN as sent.
+    Profile,
+    /// The agent profile held under the ARN as sent.
+    AgentProfile,
+    /// The custom lens the ARN resolves to
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_by_alias`]).
+    Lens,
+}
+
 /// What a caller has WRITTEN to ONE lens review of a workload: the review's own notes,
 /// the notes of each pillar of the lens under review, and the Jira question selection
 /// recorded against it.
@@ -5191,27 +5212,78 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// lens, and it is consulted only for a string that IS an ARN: a bare lens id is not
     /// an ARN, so it names no resource here.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
-        if let Some(record) = self
+        match self.tagged_resource(resource_arn)? {
+            TaggedResource::Workload(workload_id) => {
+                self.workloads.get(&workload_id).map(|record| &record.tags)
+            }
+            TaggedResource::ReviewTemplate => self
+                .review_templates
+                .get(resource_arn)
+                .map(|record| &record.tags),
+            TaggedResource::Profile => self.profiles.get(resource_arn).map(|record| &record.tags),
+            TaggedResource::AgentProfile => self
+                .agent_profiles
+                .get(resource_arn)
+                .map(|record| &record.tags),
+            TaggedResource::Lens => self.lens_by_alias(resource_arn).map(|record| &record.tags),
+        }
+    }
+
+    /// [`Self::resource_tags`] for a caller that is about to CHANGE the resource's tags —
+    /// the same resolution, so a tag write lands on exactly the resource a tag read
+    /// reports, and an ARN naming no resource this store holds writes nothing.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match self.tagged_resource(resource_arn)? {
+            TaggedResource::Workload(workload_id) => self
+                .workloads
+                .get_mut(&workload_id)
+                .map(|record| &mut record.tags),
+            TaggedResource::ReviewTemplate => self
+                .review_templates
+                .get_mut(resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::Profile => self
+                .profiles
+                .get_mut(resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::AgentProfile => self
+                .agent_profiles
+                .get_mut(resource_arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::Lens => self
+                .lens_by_alias_mut(resource_arn)
+                .map(|record| &mut record.tags),
+        }
+    }
+
+    /// Which resource of this store, if any, the ARN a tag operation named holds its tags
+    /// on — the resolution [`Self::resource_tags`] and [`Self::resource_tags_mut`] share.
+    fn tagged_resource(&self, resource_arn: &str) -> Option<TaggedResource> {
+        if let Some((workload_id, _)) = self
             .workloads
-            .values()
-            .find(|record| record.workload_arn == resource_arn)
+            .iter()
+            .find(|(_, record)| record.workload_arn == resource_arn)
         {
-            return Some(&record.tags);
+            return Some(TaggedResource::Workload(workload_id.clone()));
         }
-        if let Some(record) = self.review_templates.get(resource_arn) {
-            return Some(&record.tags);
+        if self.review_templates.contains_key(resource_arn) {
+            return Some(TaggedResource::ReviewTemplate);
         }
-        if let Some(record) = self.profiles.get(resource_arn) {
-            return Some(&record.tags);
+        if self.profiles.contains_key(resource_arn) {
+            return Some(TaggedResource::Profile);
         }
-        if let Some(record) = self.agent_profiles.get(resource_arn) {
-            return Some(&record.tags);
+        if self.agent_profiles.contains_key(resource_arn) {
+            return Some(TaggedResource::AgentProfile);
         }
         if !resource_arn.starts_with("arn:") {
             return None;
         }
         self.lens_by_alias(resource_arn)
-            .map(|record| &record.tags)
+            .is_some()
+            .then_some(TaggedResource::Lens)
     }
 
     /// The next 32-lowercase-hex candidate id: a per-store counter and the wall clock,

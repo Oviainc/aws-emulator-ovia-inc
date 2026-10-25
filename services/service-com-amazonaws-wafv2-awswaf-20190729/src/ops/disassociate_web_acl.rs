@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes the web ACL away from a protected resource, leaving it unprotected.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It removes the binding `AssociateWebACL` wrote from
+//! [`crate::state::ComAmazonawsWafv2Awswaf20190729State::web_acl_associations`],
+//! so `GetWebACLForResource` reports no web ACL for the resource afterwards and
+//! `ListResourcesForWebACL` no longer lists it.
+//!
+//! A resource that carries no binding is a SUCCESS, not a refusal: the operation
+//! "disassociates the specified resource from its web ACL association, IF IT HAS
+//! ONE" (its own doc), so the call is idempotent and what it reports is the state
+//! it leaves behind. `ResourceArn` is still judged against
+//! [`crate::state::PROTECTED_RESOURCE_FORMS`]: an ARN no web ACL could ever have
+//! been put in front of is `WAFInvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +165,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateWebACL"))
+        // A mutation: it removes the binding the association reads report. `ctx`
+        // carries only request metadata, which this operation does not need.
+        let _ = ctx;
+
+        // The same judgement `AssociateWebACL` makes on this parameter: an ARN that
+        // is malformed, or that names a resource kind a web ACL is never put in
+        // front of, is refused rather than looked up.
+        if crate::state::protected_resource_type(&input.resource_arn).is_none() {
+            return Err(DisassociateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Which web ACL was in front of the resource is read before the binding
+        // goes, so the audit record names it.
+        let removed = state
+            .web_acl_for_resource(&input.resource_arn)
+            .map(|entry| {
+                (
+                    entry.scope.clone(),
+                    entry.web_acl.name.clone(),
+                    entry.web_acl.id.clone(),
+                )
+            });
+        state.disassociate_web_acl(&input.resource_arn);
+        let (scope, name, id) = removed.clone().unwrap_or_default();
+        crate::state::audit(
+            "DisassociateWebACL",
+            &scope,
+            &name,
+            &id,
+            if removed.is_some() {
+                "disassociated"
+            } else {
+                "the resource carried no web ACL association"
+            },
+        );
+
+        // `DisassociateWebACLResponse` models no members: the success is the empty
+        // body, whether or not there was a binding to take away.
+        Ok(DisassociateWebACLOutput {})
     }
 }

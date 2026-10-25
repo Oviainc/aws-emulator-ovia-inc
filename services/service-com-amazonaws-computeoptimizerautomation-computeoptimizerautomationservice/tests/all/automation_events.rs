@@ -144,14 +144,18 @@ fn is_next_token(value: &str) -> bool {
 
 /// Now, truncated to whole seconds, so a case can name an event's exact
 /// `createdTimestamp` on the wire.
-fn now_secs() -> i64 {
+///
+/// `pub(crate)` with the two seeding helpers below, because the sibling suites
+/// that summarise the same events seed them the same way rather than each
+/// growing a copy.
+pub(crate) fn now_secs() -> i64 {
     DateTime::from(std::time::SystemTime::now()).secs()
 }
 
 /// One stored event. `eventId` is 16 characters of `[0-9A-Za-z]` (the model's
 /// `EventId` pattern) and `resourceType` has the single value the model's
 /// `ResourceType` enum declares (`EbsVolume`).
-fn stored_event(
+pub(crate) fn stored_event(
     index: usize,
     account_id: &str,
     event_type: &str,
@@ -184,7 +188,7 @@ fn stored_event(
 }
 
 /// Put `events` in the shared store, in the order given.
-fn seed(engine: &Arc<engine::InMemoryEngine>, events: &[StoredEvent]) {
+pub(crate) fn seed(engine: &Arc<engine::InMemoryEngine>, events: &[StoredEvent]) {
     let state = engine.state::<AutomationState>();
     let mut store = state.lock();
     for event in events {

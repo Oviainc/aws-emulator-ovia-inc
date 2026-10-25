@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationEventSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationEventSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationEventSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Summarises the automation events the store holds — the same
+//! [`crate::state::EventStore`] `ListAutomationEvents` reports — GROUPED by
+//! `eventStatus` (see [`crate::state::group_events_by_event_status`]), narrowed
+//! by `filters` exactly as that operation narrows its list and by the
+//! `[startDateInclusive, endDateExclusive)` window, and paged by `maxResults`
+//! with an opaque `nextToken` that resumes where the previous page stopped.
+//! `@paginated(inputToken: nextToken, outputToken: nextToken,
+//! items: automationEventSummaries)`.
+//!
+//! One summary per group the matched events hold: its `key` is the group's
+//! `eventStatus`, its `dimensions` names that dimension and the group's value
+//! for it, its `timePeriod` is the window the summary was computed over, and
+//! its `total` holds how many of the matched events are in that status and the
+//! sum of their `estimatedMonthlySavings`. A status nothing matched is no
+//! summary, so a request nothing matched is summarised as no summaries at all.
+//!
+//! `eventStatus` is the one dimension the rows are grouped by because it is the
+//! one value the model's `SummaryDimensionKey` declares. Only events created
+//! inside the retrieval window are summarised ("Only events created within the
+//! past year will be included in the summary"), and this handler only READS
+//! what the store holds apart from materialising the status transitions the
+//! clock has already made due, which `ListAutomationEvents` and
+//! `GetAutomationEvent` materialise too.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +179,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationEventSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationEventSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationEventSummaries"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAutomationEventSummariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the service is not mounted on a state-bearing engine".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let filters = input.filters.unwrap_or_default();
+        // `AutomationEventFilter$name` is typed as the `AutomationEventFilterName`
+        // value set, but a name outside it is refused here too so a filter is
+        // never silently ignored — the same refusal `ListAutomationEvents` gives
+        // for the same filter list, since both operations narrow the same events
+        // with it.
+        if crate::state::unknown_event_filter_name(&filters).is_some() {
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "filters.member.name",
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    AUTOMATION_EVENT_FILTER_NAME_VALUES.join(", ")
+                ),
+            )));
+        }
+
+        // The window bounds are modelled as plain STRINGS, so the framework
+        // hands them over unparsed: each is read into the instant it names, and
+        // text that names none is refused rather than ignored, which would
+        // summarise a window the caller did not ask for.
+        let start_date = match input.start_date_inclusive.as_deref() {
+            None => None,
+            Some(value) => match crate::state::parse_date_member(value) {
+                Some(at) => Some(at),
+                None => {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "startDateInclusive",
+                        crate::state::DATE_MEMBER_REQUIREMENT,
+                    )))
+                }
+            },
+        };
+        let end_date = match input.end_date_exclusive.as_deref() {
+            None => None,
+            Some(value) => match crate::state::parse_date_member(value) {
+                Some(at) => Some(at),
+                None => {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "endDateExclusive",
+                        crate::state::DATE_MEMBER_REQUIREMENT,
+                    )))
+                }
+            },
+        };
+
+        // `endDateExclusive` is exclusive, so a range whose end does not come
+        // after its start can hold no event at all: refuse it rather than
+        // summarise an empty window the caller cannot have meant. The wording is
+        // the service's own constant message for this rule.
+        if !crate::state::time_range_is_valid(start_date, end_date) {
+            return Err(invalid_parameter(
+                crate::state::INVALID_TIME_RANGE_MESSAGE.to_string(),
+            ));
+        }
+
+        // The page token carries this operation's name and the whole query — the
+        // filters AND the window — because both define the sequence of groups a
+        // page is a window onto, so resuming with a different query, or with a
+        // token another operation issued, is refused instead of answered with a
+        // page of a different result set.
+        let query_fingerprint = crate::state::fingerprint(&(
+            Self::NAME,
+            &filters,
+            start_date.map(crate::state::instant_key),
+            end_date.map(crate::state::instant_key),
+        ));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned by a previous \
+                         ListAutomationEventSummaries call",
+                    )));
+                };
+                if cursor.filter_fingerprint != query_fingerprint {
+                    return Err(invalid_parameter(crate::state::constraint_report(
+                        "nextToken",
+                        "Member must be a token returned for the same filters and dates",
+                    )));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` carries a member `@range` of min 1 / max 100
+        // (`smithy_query(query="shape",shape="ListAutomationEventSummariesRequest")`),
+        // enforced by the generated request walk BEFORE this handler runs — so
+        // the page size is only defaulted here, never bounded above, exactly as
+        // `ListAutomationEvents` defaults the page over the same events. The
+        // floor is against a zero page, which would return nothing while
+        // carrying a token whose offset never advances.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let now = ::std::time::SystemTime::now();
+        // Only events created inside the retrieval window are reachable, so the
+        // window this call summarises over starts at the later of the caller's
+        // `startDateInclusive` and that floor.
+        let window_start = crate::state::effective_window_start(start_date, now);
+
+        let mut guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of filter evaluation: an
+        // account that is not opted in is refused the whole call rather than
+        // handed an (empty) summary that reads as a healthy, idle account. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(
+                ListAutomationEventSummariesErrorModeled::OptInRequiredException(refusal).into(),
+            );
+        }
+        // Before summarising, materialise the status transitions the clock has
+        // already made due, so this reader and `GetAutomationEvent` agree on
+        // every event's status — which is the dimension the rows are grouped by.
+        guard.events.settle_due(now);
+
+        // The matching events, grouped by `eventStatus`: the matched events are
+        // what gets grouped, so a status nothing matched is no group, and the
+        // groups come back in the order the store first holds an event in each
+        // status — the same order `ListAutomationEvents` walks.
+        let grouped = crate::state::group_events_by_event_status(
+            guard
+                .events
+                .iter_in_order()
+                .filter(|event| {
+                    crate::state::within_window(
+                        event.created_timestamp,
+                        Some(window_start),
+                        end_date,
+                    )
+                })
+                .filter(|event| crate::state::event_matches_filters(event, &filters)),
+        );
+
+        // Every row covers the same window: the one this call summarised over,
+        // which starts at `window_start` and ends at the caller's exclusive
+        // bound — or, where the caller named none, at the instant this summary
+        // was computed, the open end of the window.
+        let time_period = TimePeriod {
+            start_time_inclusive: Some(window_start),
+            end_time_exclusive: Some(end_date.unwrap_or_else(|| {
+                ::aws_smithy_types::DateTime::from(now)
+            })),
+        };
+
+        // The page walk is the same one every paginated list of this service
+        // performs — one group beyond the page is what says another page exists,
+        // and the token resumes exactly where this page stopped.
+        let taken: Vec<crate::state::ActionGroup> = grouped
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = taken.len() > page_size;
+        let page: Vec<AutomationEventSummary> = taken
+            .into_iter()
+            .take(page_size)
+            .map(|group| AutomationEventSummary {
+                dimensions: Some(vec![SummaryDimension {
+                    key: crate::state::SUMMARY_DIMENSION_EVENT_STATUS.to_string(),
+                    value: group.key.clone(),
+                }]),
+                key: Some(group.key),
+                time_period: Some(time_period.clone()),
+                total: Some(SummaryTotals {
+                    automation_event_count: Some(group.count),
+                    // `SummaryTotals$estimatedMonthlySavings` is OPTIONAL, so a
+                    // group whose events carry no estimate at all reports no
+                    // savings figure rather than a zero in no currency.
+                    estimated_monthly_savings: (!group.estimates.is_empty())
+                        .then(|| crate::state::total_savings(group.estimates.iter())),
+                }),
+            })
+            .collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + page.len(),
+                filter_fingerprint: query_fingerprint,
+            })
+        });
+
+        Ok(ListAutomationEventSummariesOutput {
+            automation_event_summaries: Some(page),
+            next_token,
+        })
     }
+}
+
+fn invalid_parameter(message: String) -> ListAutomationEventSummariesError {
+    ListAutomationEventSummariesErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

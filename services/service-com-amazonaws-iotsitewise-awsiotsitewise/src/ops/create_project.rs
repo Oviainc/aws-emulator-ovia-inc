@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a project in the portal the request names and persists it, so
+//! `DescribeProject` reads back exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +166,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProjectError::Modeled(CreateProjectErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TagMap`'s KEYS target `TagKey` (@length 1..128), which the framework's
+        // constraint walk does not reach — it validates a map's values only — so the
+        // bound is enforced here, in the same wording every other create in this
+        // service uses, and as the client-input error this operation MODELS: its
+        // error list declares no `ValidationException`, so a malformed request can
+        // only be `InvalidRequestException` (400).
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // project rather than replaying the first answer. Deliberately left to the
+        // idempotency issue rather than half-done here, exactly as `CreatePortal`
+        // leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        // A project is created IN a portal, so a `portalId` that resolves to no
+        // stored portal names no container for the project to live in.
+        if !store.portals.contains_key(&input.portal_id) {
+            return Err(CreateProjectError::Modeled(
+                CreateProjectErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_PORTAL,
+                        &input.portal_id,
+                    ),
+                }),
+            ));
+        }
+
+        // The store is bounded: a create is the only thing that adds a project and
+        // nothing evicts one, so past the cap this is a quota refusal.
+        if store.projects.len() >= crate::state::MAX_PROJECTS {
+            return Err(CreateProjectError::Modeled(
+                CreateProjectErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} projects.",
+                        crate::state::MAX_PROJECTS
+                    ),
+                }),
+            ));
+        }
+
+        let project_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.projects.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::ProjectRecord {
+            id: project_id.clone(),
+            arn: crate::state::project_arn(&region, &project_id),
+            portal_id: input.portal_id.clone(),
+            name: input.project_name.clone(),
+            description: input.project_description.clone(),
+            creation_date: now,
+            last_update_date: now,
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateProjectOutput {
+            project_id: record.id.clone(),
+            project_arn: record.arn.clone(),
+        };
+
+        store.projects.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares, the way every sibling handler reports a malformed
+/// request.
+fn invalid_request(message: String) -> CreateProjectError {
+    CreateProjectError::Modeled(CreateProjectErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

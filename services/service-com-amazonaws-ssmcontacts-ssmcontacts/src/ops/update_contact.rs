@@ -22,10 +22,18 @@
 //! exactly as it was. `Alias` and `Type` are not in the input at all, so no update can
 //! change a contact's identity or kind.
 //!
-//! Like `CreateContact`, the `Plan` is persisted as given: the model constrains the stage
-//! durations and the target ARNs (already enforced at the boundary) but documents no rule
-//! tying a plan's shape to the contact's `Type`, so inventing one here would refuse
-//! requests AWS admits.
+//! Like `CreateContact`, the `Plan` is persisted as given — but only once it RESOLVES. A
+//! plan is a graph of references (a target's `ContactChannelId`, a target's `ContactId`, a
+//! plan's `RotationIds`), and an ARN is only a reference: each one must name a resource
+//! this account holds, or the write is refused with the modelled `ValidationException`
+//! (HTTP 400) and the stored plan is left exactly as it was
+//! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::resolve_plan`]). Nothing ties
+//! a plan's shape to the contact's `Type`, though: the model documents no such rule, so
+//! inventing one here would refuse requests AWS admits.
+//!
+//! An update must also NAME something to change: `DisplayName` and `Plan` are the only
+//! members this operation can write, so a request carrying neither describes no update and
+//! is refused with the same `ValidationException` rather than answered as a silent no-op.
 //!
 //! ## Shape of an operation
 //!
@@ -196,12 +204,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .require_active_replication_set()
             .map_err(account_precondition_failed)?;
 
-        let Some(contact) = state.contacts.get_mut(&input.contact_id) else {
+        if !state.contacts.contains_key(&input.contact_id) {
             return Err(UpdateContactErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: format!("Contact {} not found", input.contact_id),
                     resource_id: input.contact_id.clone(),
                     resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The request is checked WHOLE before any of it is applied, so a refused update
+        // leaves the stored contact exactly as it was.
+        //
+        // `DisplayName` and `Plan` are the only members this operation writes, so a request
+        // naming neither describes no update at all.
+        if input.display_name.is_none() && input.plan.is_none() {
+            return Err(validation(NOTHING_TO_UPDATE_MESSAGE));
+        }
+
+        // A plan is stored only once every resource it NAMES resolves against this store.
+        if let Some(plan) = &input.plan {
+            state
+                .resolve_plan(&input.contact_id, plan)
+                .map_err(validation)?;
+        }
+
+        let Some(contact) = state.contacts.get_mut(&input.contact_id) else {
+            // Unreachable: the key was found above, under this same lock.
+            return Err(UpdateContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the contact resolved for this update is no longer stored"
+                        .to_string(),
+                    retry_after_seconds: 0,
                 },
             )
             .into());
@@ -236,6 +272,21 @@ fn account_precondition_failed(message: String) -> UpdateContactError {
         message,
         reason: Some("OTHER".to_string()),
         fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// The message an update that names none of the members it could write is refused with.
+const NOTHING_TO_UPDATE_MESSAGE: &str =
+    "Invalid value provided - Either displayName or plan must be provided";
+
+/// A member-level refusal: this operation's modelled `ValidationException`, which the model
+/// classifies `client` with `httpError` 400, carrying `message`.
+fn validation(message: impl Into<String>) -> UpdateContactError {
+    UpdateContactErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
     })
     .into()
 }

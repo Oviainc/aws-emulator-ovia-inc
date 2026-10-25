@@ -251,16 +251,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A disassociated account stays in the consolidated billing family while
         // belonging to no billing group, which is what `ListAccountAssociations`
         // reports as `UNMONITORED` — the same release `DeleteBillingGroup` performs
-        // for every member of the group it removes.
+        // for every member of the group it removes. The membership it had of THIS
+        // group ends at the current billing period rather than being forgotten, so a
+        // read scoped to a period it was a member in still reports it.
         for account_id in &input.account_ids {
-            if state
-                .account_associations
-                .get(account_id)
-                .is_some_and(|owner| owner == &group_arn)
-            {
-                state.account_associations.remove(account_id);
-            }
-            state.note_unassociated_account(account_id);
+            state.release_account(account_id, &group_arn);
         }
 
         Ok(DisassociateAccountsOutput {

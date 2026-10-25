@@ -17,6 +17,11 @@
 //!    cannot carry — never change. Each row's expectation is COMPUTED as "what was created,
 //!    overlaid with what the request named", so the assertion states that rule rather than
 //!    a transcript.
+//!
+//! Every plan written here NAMES resources this suite created first — a channel of the
+//! contact being updated, another contact, a rotation — because a plan's references are
+//! resolved against the store before it is stored; `tests/all/contact_plan_references.rs`
+//! is the suite about THAT rule, including what a plan naming something absent answers.
 
 use serde_json::{json, Value};
 
@@ -68,6 +73,10 @@ pub(crate) fn onboard(emulator: &Emulator) {
 /// `src/ops/types/shared_types.rs`) and both shapes the modelled `Plan` admits — a `Stages`
 /// list and a `RotationIds` list — plus one contact created with no `DisplayName` at all,
 /// so "omitted member left as it was" is also asserted over an absent starting value.
+///
+/// A plan's references are resolved when it is written, so a row's `plan` carries the
+/// placeholders [`CONTACT_PLACEHOLDER`] and [`ROTATION_PLACEHOLDER`], which
+/// [`PlanReferences::fill`] replaces with the resources the fixture created.
 struct BaseContact {
     case: &'static str,
     alias: &'static str,
@@ -98,7 +107,9 @@ const BASE_CONTACTS: &[BaseContact] = &[
         contact_type: "ESCALATION",
         plan: r#"{"Stages": [
             {"DurationInMinutes": 10, "Targets": []},
-            {"DurationInMinutes": 20, "Targets": [{"ContactTargetInfo": {"IsEssential": true}}]}
+            {"DurationInMinutes": 20, "Targets": [
+                {"ContactTargetInfo": {"ContactId": "<contact>", "IsEssential": true}}
+            ]}
         ]}"#,
     },
     BaseContact {
@@ -106,16 +117,92 @@ const BASE_CONTACTS: &[BaseContact] = &[
         alias: "weekend-rotation",
         display_name: Some("Weekend Rotation"),
         contact_type: "ONCALL_SCHEDULE",
-        plan: r#"{"RotationIds": ["arn:aws:ssm-contacts:us-east-1:000000000000:rotation/weekend"]}"#,
+        plan: r#"{"RotationIds": ["<rotation>"]}"#,
     },
 ];
 
+/// The placeholder a table row puts where a stored CONTACT's ARN belongs.
+pub(crate) const CONTACT_PLACEHOLDER: &str = "<contact>";
+
+/// The placeholder a table row puts where a stored ROTATION's ARN belongs.
+pub(crate) const ROTATION_PLACEHOLDER: &str = "<rotation>";
+
+/// The placeholder a table row puts where a stored CONTACT CHANNEL's ARN belongs.
+pub(crate) const CHANNEL_PLACEHOLDER: &str = "<channel>";
+
+/// The resources a table row's plan NAMES, created before the plan that names them.
+///
+/// A plan is a graph of references and every one of them is resolved against the store when
+/// the plan is written, so a suite that writes plans has to create what they name: a second
+/// contact for a `ContactTargetInfo`, a rotation for a `RotationIds` entry, and — once the
+/// contact under test exists — one of its own channels for a `ChannelTargetInfo`.
+pub(crate) struct PlanReferences {
+    pub(crate) contact: String,
+    pub(crate) rotation: String,
+    pub(crate) channel: String,
+}
+
+impl PlanReferences {
+    /// Create the contact and the rotation a plan may name. Called BEFORE the contact under
+    /// test, so its own create can already name them.
+    pub(crate) async fn create(emulator: &Emulator) -> Self {
+        let contact = emulator
+            .create_contact(
+                json!({
+                    "Alias": "plan-target",
+                    "Type": "PERSONAL",
+                    "Plan": {"Stages": []},
+                }),
+                "the contact a plan target names",
+            )
+            .await;
+        let rotation = emulator
+            .create_rotation(&contact, "weekend", "the rotation a plan names")
+            .await;
+        Self {
+            contact,
+            rotation,
+            // Filled in by `with_channel_of` once the contact under test exists: a channel
+            // is created UNDER a stored contact.
+            channel: String::new(),
+        }
+    }
+
+    /// Create a contact channel under `contact_arn` and remember it as the channel a plan
+    /// target may name.
+    pub(crate) async fn with_channel_of(mut self, emulator: &Emulator, contact_arn: &str) -> Self {
+        self.channel = emulator
+            .create_channel(
+                json!({
+                    "ContactId": contact_arn,
+                    "Name": "email",
+                    "Type": "EMAIL",
+                    "DeliveryAddress": {"SimpleAddress": "ops@example.com"},
+                }),
+                "the channel a plan target names",
+            )
+            .await;
+        self
+    }
+
+    /// `text` with every placeholder replaced by the ARN of the resource it stands for,
+    /// parsed as JSON.
+    pub(crate) fn fill(&self, text: &str) -> Value {
+        parse(
+            &text
+                .replace(CONTACT_PLACEHOLDER, &self.contact)
+                .replace(ROTATION_PLACEHOLDER, &self.rotation)
+                .replace(CHANNEL_PLACEHOLDER, &self.channel),
+        )
+    }
+}
+
 /// The `CreateContact` body a base row is created with.
-fn create_request(row: &BaseContact) -> Value {
+fn create_request(row: &BaseContact, references: &PlanReferences) -> Value {
     let mut request = json!({
         "Alias": row.alias,
         "Type": row.contact_type,
-        "Plan": parse(row.plan),
+        "Plan": references.fill(row.plan),
     });
     if let Some(display_name) = row.display_name {
         request["DisplayName"] = json!(display_name);
@@ -131,16 +218,16 @@ fn create_request(row: &BaseContact) -> Value {
 /// modelled pattern `^[\p{L}\p{Z}\p{N}_.\-]*$` admits) and the shape a named `Plan` carries
 /// (no stages, one stage at `StageDurationInMins`' published minimum 0, one at its published
 /// maximum 30, a channel target, a contact target, a `RotationIds` list instead of stages).
+///
+/// A row that names a resource carries the placeholder [`PlanReferences::fill`] replaces, so
+/// every plan written here resolves. An update naming NEITHER member is not a row: it writes
+/// nothing to patch, and `tests/all/contact_plan_references.rs` asserts what it answers.
 struct UpdateRow {
     case: &'static str,
     patch: &'static str,
 }
 
 const UPDATE_ROWS: &[UpdateRow] = &[
-    UpdateRow {
-        case: "neither member named: a no-op update",
-        patch: "{}",
-    },
     UpdateRow {
         case: "DisplayName only",
         patch: r#"{"DisplayName": "Renamed Primary"}"#,
@@ -161,26 +248,21 @@ const UPDATE_ROWS: &[UpdateRow] = &[
         case: "Plan only, one stage at the published minimum duration with a channel target",
         patch: r#"{"Plan": {"Stages": [{"DurationInMinutes": 0, "Targets": [
             {"ChannelTargetInfo": {
-                "ContactChannelId": "arn:aws:ssm-contacts:us-east-1:000000000000:contact-channel/oncall-primary/c1",
+                "ContactChannelId": "<channel>",
                 "RetryIntervalInMinutes": 2
             }}
         ]}]}}"#,
     },
     UpdateRow {
         case: "Plan only, replaced by rotation ids instead of stages",
-        patch: r#"{"Plan": {"RotationIds": [
-            "arn:aws:ssm-contacts:us-east-1:000000000000:rotation/weeknights"
-        ]}}"#,
+        patch: r#"{"Plan": {"RotationIds": ["<rotation>"]}}"#,
     },
     UpdateRow {
         case: "both members named, the plan at the published maximum duration",
         patch: r#"{
             "DisplayName": "Escalation Tier 1.a",
             "Plan": {"Stages": [{"DurationInMinutes": 30, "Targets": [
-                {"ContactTargetInfo": {
-                    "ContactId": "arn:aws:ssm-contacts:us-east-1:000000000000:contact/pager_backup_2",
-                    "IsEssential": false
-                }}
+                {"ContactTargetInfo": {"ContactId": "<contact>", "IsEssential": false}}
             ]}]}
         }"#,
     },
@@ -188,7 +270,11 @@ const UPDATE_ROWS: &[UpdateRow] = &[
 
 /// What `GetContact` must report for `base` after `patch` was applied: the created contact
 /// overlaid with the members the request named. This IS the rule under test.
-fn expected_after(base: &BaseContact, patch: &Value) -> (Option<String>, Value) {
+fn expected_after(
+    base: &BaseContact,
+    patch: &Value,
+    references: &PlanReferences,
+) -> (Option<String>, Value) {
     let display_name = match patch.get("DisplayName").and_then(Value::as_str) {
         Some(named) => Some(named.to_string()),
         None => base.display_name.map(str::to_string),
@@ -196,7 +282,7 @@ fn expected_after(base: &BaseContact, patch: &Value) -> (Option<String>, Value) 
     let plan = patch
         .get("Plan")
         .cloned()
-        .unwrap_or_else(|| parse(base.plan));
+        .unwrap_or_else(|| references.fill(base.plan));
     (display_name, plan)
 }
 
@@ -228,9 +314,14 @@ async fn an_update_replaces_the_members_it_names_and_leaves_the_rest() {
             let case = format!("{} updated by {}", base.case, update.case);
             let emulator = Emulator::new();
             onboard(&emulator);
-            let arn = emulator.create_contact(create_request(base), &case).await;
+            // What the plans name, created BEFORE the plans that name them.
+            let references = PlanReferences::create(&emulator).await;
+            let arn = emulator
+                .create_contact(create_request(base, &references), &case)
+                .await;
+            let references = references.with_channel_of(&emulator, &arn).await;
 
-            let patch = parse(update.patch);
+            let patch = references.fill(update.patch);
             let mut request = patch.clone();
             request["ContactId"] = json!(arn);
             let (status, body) = emulator.call("UpdateContact", request).await;
@@ -243,7 +334,7 @@ async fn an_update_replaces_the_members_it_names_and_leaves_the_rest() {
                 "case {case:?}: UpdateContact models an empty output, got {body:?}"
             );
 
-            let (expected_display_name, expected_plan) = expected_after(base, &patch);
+            let (expected_display_name, expected_plan) = expected_after(base, &patch, &references);
             let stored = get_contact(&emulator, &arn, &case).await;
             assert_eq!(
                 stored["DisplayName"].as_str().map(str::to_string),
@@ -282,15 +373,19 @@ async fn updates_accumulate_and_the_last_write_wins() {
     let case = "every update row applied in sequence to one contact";
     let emulator = Emulator::new();
     onboard(&emulator);
-    let arn = emulator.create_contact(create_request(base), case).await;
+    let references = PlanReferences::create(&emulator).await;
+    let arn = emulator
+        .create_contact(create_request(base, &references), case)
+        .await;
+    let references = references.with_channel_of(&emulator, &arn).await;
 
     // The contact as created; each patch overlays the state the previous one left.
     let mut display_name = base.display_name.map(str::to_string);
-    let mut plan = parse(base.plan);
+    let mut plan = references.fill(base.plan);
 
     for update in UPDATE_ROWS {
         let case = format!("{case}, at {}", update.case);
-        let patch = parse(update.patch);
+        let patch = references.fill(update.patch);
         if let Some(named) = patch.get("DisplayName").and_then(Value::as_str) {
             display_name = Some(named.to_string());
         }
@@ -351,9 +446,11 @@ async fn an_update_is_refused_when_the_account_has_no_active_replication_set() {
             // update differs in is the precondition.
             onboard(&emulator);
             let base = &BASE_CONTACTS[0];
+            let references = PlanReferences::create(&emulator).await;
             let live = emulator
-                .create_contact(create_request(base), account_case)
+                .create_contact(create_request(base, &references), account_case)
                 .await;
+            let references = references.with_channel_of(&emulator, &live).await;
             let absent = absent_contact_arn("never-created-contact");
 
             for (target_case, target) in [("a stored contact", &live), ("an absent contact", &absent)]
@@ -362,7 +459,7 @@ async fn an_update_is_refused_when_the_account_has_no_active_replication_set() {
                 let case =
                     format!("{account_case}, {target_case}, updated by {}", update.case);
 
-                let mut request = parse(update.patch);
+                let mut request = references.fill(update.patch);
                 request["ContactId"] = json!(target);
                 let (status, body) = emulator.call("UpdateContact", request).await;
                 assert_eq!(
@@ -387,7 +484,7 @@ async fn an_update_is_refused_when_the_account_has_no_active_replication_set() {
                 );
                 assert_eq!(
                     stored["Plan"],
-                    parse(base.plan),
+                    references.fill(base.plan),
                     "case {case:?}: a refused update must write nothing, got {stored:?}"
                 );
             }
@@ -406,15 +503,17 @@ async fn an_onboarded_account_updating_an_unstored_contact_answers_404() {
     // One live contact, so "absent" cannot be confused with "the store is empty", plus one
     // channel ARN and one deleted contact's ARN: every well-formed ARN that names no STORED
     // CONTACT answers the same way.
+    let references = PlanReferences::create(&emulator).await;
     let live = emulator
-        .create_contact(create_request(&BASE_CONTACTS[0]), "a live contact")
+        .create_contact(create_request(&BASE_CONTACTS[0], &references), "a live contact")
         .await;
+    let references = references.with_channel_of(&emulator, &live).await;
     let (status, body) = emulator
         .call(
             "CreateContactChannel",
             json!({
                 "ContactId": live,
-                "Name": "email",
+                "Name": "pager",
                 "Type": "EMAIL",
                 "DeliveryAddress": {"SimpleAddress": "ops@example.com"},
             }),
@@ -430,7 +529,10 @@ async fn an_onboarded_account_updating_an_unstored_contact_answers_404() {
         .to_string();
 
     let doomed = emulator
-        .create_contact(create_request(&BASE_CONTACTS[1]), "a contact to delete")
+        .create_contact(
+            create_request(&BASE_CONTACTS[1], &references),
+            "a contact to delete",
+        )
         .await;
     let (status, body) = emulator
         .call("DeleteContact", json!({"ContactId": doomed}))
@@ -452,7 +554,7 @@ async fn an_onboarded_account_updating_an_unstored_contact_answers_404() {
     for (case, target) in absent {
         for update in UPDATE_ROWS {
             let case = format!("{case}, updated by {}", update.case);
-            let mut request = parse(update.patch);
+            let mut request = references.fill(update.patch);
             request["ContactId"] = json!(target);
             let (status, body) = emulator.call("UpdateContact", request).await;
             assert_eq!(
@@ -477,8 +579,12 @@ async fn an_onboarded_account_updating_an_unstored_contact_answers_404() {
 async fn members_outside_their_modelled_constraint_are_refused() {
     let emulator = Emulator::new();
     onboard(&emulator);
+    let references = PlanReferences::create(&emulator).await;
     let arn = emulator
-        .create_contact(create_request(&BASE_CONTACTS[0]), "a live contact")
+        .create_contact(
+            create_request(&BASE_CONTACTS[0], &references),
+            "a live contact",
+        )
         .await;
 
     let refused: &[(&str, Value)] = &[
@@ -539,7 +645,7 @@ async fn members_outside_their_modelled_constraint_are_refused() {
     );
     assert_eq!(
         stored["Plan"],
-        parse(BASE_CONTACTS[0].plan),
+        references.fill(BASE_CONTACTS[0].plan),
         "a refused request must write nothing, got {stored:?}"
     );
 }

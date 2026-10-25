@@ -39,6 +39,8 @@ mod front_door;
 mod front_door_errors;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/pagination_page_walk.rs"]
+mod pagination_page_walk;
 #[path = "all/pagination_token_opacity.rs"]
 mod pagination_token_opacity;
 #[path = "all/report_projection.rs"]

@@ -38,6 +38,11 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
+/// See [`STATUS_CREATING`]. The transient status a resource whose UPDATE has been
+/// accepted reports until the clock settles it back to [`STATUS_ACTIVE`]: an entry of
+/// `com.amazonaws.amp#ScraperStatusCode` documented "Scraper is being updated. Deletion
+/// is disallowed until status is ACTIVE."
+pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// `WorkspaceConfigurationStatusCode` values a workspace CONFIGURATION moves through
 /// here. Each is an entry of the modelled
@@ -691,7 +696,12 @@ pub struct QueryLoggingConfiguration {
 /// which is its own stub issue — so an account that has never created one lists the empty
 /// page AWS lists for it; when `CreateScraper` lands it inserts here and the listing needs
 /// no change. `DeleteScraper` moves the record it names to `DELETING` and lets the clock
-/// drop it ([`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]).
+/// drop it ([`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`]);
+/// `UpdateScraper` replaces the members it carries and moves the record to `UPDATING`
+/// until that same clock settles it.
+///
+/// Every member of `ScraperDescription` lives here too ([`scraper_description`]), so a
+/// describe reports the record rather than a second copy of it.
 #[derive(Debug, Clone)]
 pub struct Scraper {
     pub scraper_id: String,
@@ -715,6 +725,10 @@ pub struct Scraper {
     pub role_configuration: Option<crate::ops::types::RoleConfiguration>,
     /// `ScraperSummary$exporters` is modelled `len ..1`; empty when none is configured.
     pub exporters: Vec<crate::ops::types::ExporterConfiguration>,
+    /// "The configuration in use by the scraper."
+    /// (`ScraperDescription$scrapeConfiguration`, @required) — the base-64 encoded YAML
+    /// the caller last supplied, stored exactly as given.
+    pub scrape_configuration: crate::ops::types::ScrapeConfiguration,
     /// When the clock owes this scraper's next lifecycle transition, if one is pending:
     /// `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
     pub transition_due: Option<SystemTime>,
@@ -722,6 +736,12 @@ pub struct Scraper {
     /// replaying that exact call stays idempotent rather than conflicting with the
     /// deletion it already started.
     pub delete_token: Option<String>,
+    /// The `clientToken` of the `UpdateScraper` call that started a pending update, for
+    /// the same reason [`Scraper::delete_token`] records a deletion's: replaying that
+    /// exact call is the SAME request, so it answers from the record that call wrote
+    /// instead of applying the change twice. Cleared once the update settles, since the
+    /// token then stands for no pending change.
+    pub update_token: Option<String>,
 }
 
 /// One stored anomaly detector: every member `AnomalyDetectorDescription` /
@@ -898,6 +918,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
                     false
                 } else {
                     scraper.status_code = STATUS_ACTIVE.to_string();
+                    // The token identified the change that just settled, so it stops
+                    // standing for one: a later call carrying it is a new request.
+                    scraper.update_token = None;
                     true
                 }
             }
@@ -2108,6 +2131,31 @@ pub fn scraper_summary(scraper: &Scraper) -> crate::ops::types::ScraperSummary {
         created_at: ::aws_smithy_types::DateTime::from(scraper.created_at),
         last_modified_at: ::aws_smithy_types::DateTime::from(scraper.last_modified_at),
         tags: tag_map(&scraper.tags),
+        source: scraper.source.clone(),
+        destination: scraper.destination.clone(),
+        role_configuration: scraper.role_configuration.clone(),
+        exporters: Some(scraper.exporters.clone()),
+    }
+}
+
+/// The stored scraper as the `ScraperDescription` `DescribeScraper` reports — the same
+/// persisted record [`scraper_summary`] reports, plus the three members the description
+/// carries and the summary does not (`scrapeConfiguration`, and `source` and
+/// `destination` in their described form).
+pub fn scraper_description(scraper: &Scraper) -> crate::ops::types::ScraperDescription {
+    crate::ops::types::ScraperDescription {
+        scraper_id: scraper.scraper_id.clone(),
+        arn: scraper.arn.clone(),
+        alias: scraper.alias.clone(),
+        role_arn: scraper.role_arn.clone(),
+        status: crate::ops::types::ScraperStatus {
+            status_code: scraper.status_code.clone(),
+        },
+        status_reason: scraper.status_reason.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(scraper.created_at),
+        last_modified_at: ::aws_smithy_types::DateTime::from(scraper.last_modified_at),
+        tags: tag_map(&scraper.tags),
+        scrape_configuration: scraper.scrape_configuration.clone(),
         source: scraper.source.clone(),
         destination: scraper.destination.clone(),
         role_configuration: scraper.role_configuration.clone(),
