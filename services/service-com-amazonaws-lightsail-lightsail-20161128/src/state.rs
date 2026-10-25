@@ -1612,6 +1612,10 @@ pub fn release_bucket_object_store<Eng: Send + Sync + 'static>(
 /// keys with a current object plus the keys only noncurrent versions are left of,
 /// since a stored version is an object the bucket still holds.
 ///
+/// KEYS, not versions: a key several versions are stored of counts once here. What
+/// the bucket's storage metrics are over is the versions themselves and their
+/// bytes — see [`bucket_object_storage`].
+///
 /// A pure READ of the object store, for the one thing this service's control
 /// plane has to know about a bucket's contents: whether the bucket is empty, which
 /// is what decides a `DeleteBucket` without `forceDelete`. A name the object store
@@ -1628,6 +1632,59 @@ pub fn bucket_object_count<Eng: Send + Sync + 'static>(engine: &Eng, name: &str)
             .bucket(name)
             .map_or(0, |bucket| bucket.version_keys().len()),
     )
+}
+
+/// What a bucket's object store holds, measured over every object version it
+/// keeps: the two quantities a bucket's storage metrics are computed from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketStorage {
+    /// How many objects the bucket holds, every stored version counted —
+    /// a noncurrent version is an object the bucket still holds.
+    ///
+    /// Delete markers are NOT among them: a marker holds no object and no bytes,
+    /// which is why the object store keeps it as a version of its own
+    /// (`::service_com_amazonaws_s3_amazons3::state::StoredVersion`).
+    pub objects: u64,
+    /// How many bytes those objects' payloads are, summed over the same set.
+    pub bytes: u64,
+}
+
+/// Measure what the bucket named `name` holds in its object store right now:
+/// the object versions it keeps and the bytes they are.
+///
+/// The one place this service measures a bucket's contents, for the storage
+/// metrics `GetBucketMetricData` reports — the same object store
+/// [`bucket_object_count`] reads whether the bucket is empty from, because that
+/// store is the only place that knows what a bucket holds.
+///
+/// A bucket this emulator holds no in-progress multipart upload PARTS for
+/// contributes none: the object store records an upload's settled members but no
+/// part of one, so there is nothing of a part to count or to size.
+///
+/// A name the object store holds no bucket for holds nothing, and measures zero.
+/// A pure READ: `None` only when that store cannot be reached at all. The same
+/// LOCK ORDER as [`claim_bucket_object_store`].
+pub fn bucket_object_storage<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+) -> Option<BucketStorage> {
+    let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let store = state.lock();
+    let Some(bucket) = store.bucket(name) else {
+        return Some(BucketStorage::default());
+    };
+    let mut measured = BucketStorage::default();
+    for key in bucket.version_keys() {
+        for version in bucket.object_versions(key) {
+            if let Some(object) = version.as_object() {
+                measured.objects = measured.objects.saturating_add(1);
+                measured.bytes = measured
+                    .bytes
+                    .saturating_add(u64::try_from(object.body.len()).unwrap_or(u64::MAX));
+            }
+        }
+    }
+    Some(measured)
 }
 
 /// The ARN of the bucket `id` in `region`. A bucket is regional, so its ARN
@@ -7985,10 +8042,10 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 /// documentation: "When this action creates an alarm, the alarm state is
 /// immediately set to INSUFFICIENT_DATA."
 ///
-/// It is also where an alarm of this store STAYS until something moves it: the
-/// store holds no metric datapoints at all (this emulator runs no instance,
-/// container, load balancer or database workload and receives no measurement of
-/// one, which is why `GetInstanceMetricData` and
+/// It is also where an alarm of this store STAYS until something moves it: no
+/// metric an alarm can watch has a datapoint at all (this emulator runs no
+/// instance, container, load balancer or database workload and receives no
+/// measurement of one, which is why `GetInstanceMetricData` and
 /// `GetContainerServiceMetricData` both answer an empty `metricData`; the
 /// remaining `Get*MetricData` operations are still scaffolds with their own
 /// issues), and
@@ -7997,6 +8054,12 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 /// available, or not enough data is available for the metric to determine the
 /// alarm state". Nothing here invents an evaluation that no metric data could
 /// support.
+///
+/// A bucket's STORAGE metrics are the one series this store does measure — they
+/// are a count and a size of what the bucket itself holds, not a measurement of a
+/// running workload, so `GetBucketMetricData` computes them — and no alarm is
+/// affected: [`ALARM_METRICS`] carries no bucket row, because the modelled
+/// `PutAlarmRequest$metricName` documentation lists no bucket metric.
 pub const ALARM_STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 
 /// The one `AlarmState` a notification trigger list must name, from the modelled
