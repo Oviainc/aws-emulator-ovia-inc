@@ -35,6 +35,8 @@ mod regional_scoping;
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_removal.rs"]
+mod tag_removal;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
 #[path = "all/volume_attachment.rs"]

@@ -197,9 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still starting, already stopping, idle, deleting) is a conflict.
         if channel.state != crate::state::channel_state::RUNNING {
             return Err(StopChannelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Channel {} is in state {} and can only be stopped from RUNNING",
-                    channel.id, channel.state
+                message: Some(crate::state::channel_not_running_message(
+                    &channel.id,
+                    &channel.state,
                 )),
             })
             .into());
