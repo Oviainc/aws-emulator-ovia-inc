@@ -49,6 +49,8 @@ mod distributions_by_connection_mode;
 mod error_envelope;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/function_update.rs"]
+mod function_update;
 #[path = "all/invalidation_list.rs"]
 mod invalidation_list;
 #[path = "all/key_value_store_lifecycle.rs"]

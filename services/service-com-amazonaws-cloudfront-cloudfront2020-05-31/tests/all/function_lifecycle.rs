@@ -56,7 +56,7 @@ use crate::response_headers_policy_lifecycle::escape;
 /// `aws_smithy_types::base64::encode` is the runtime's own encoder — the one the sibling
 /// suites of this workspace send blob members through — and this crate already depends on
 /// `aws-smithy-types`, so nothing is added to the manifest or the lockfile for it.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(bytes)
 }
 
@@ -65,7 +65,7 @@ fn base64(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/function` with the request document `body`.
-async fn create_function(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_function(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -78,7 +78,7 @@ async fn create_function(router: &MultiServiceRouter, body: &str) -> Answer {
 
 /// `GET /2020-05-31/function/{Name}/describe`, naming `stage` when it is `Some` and
 /// leaving the optional query parameter out entirely when it is `None`.
-async fn describe_function(
+pub(crate) async fn describe_function(
     router: &MultiServiceRouter,
     name: &str,
     stage: Option<&str>,
@@ -96,7 +96,7 @@ fn describe_uri(name: &str, stage: Option<&str>) -> String {
 
 /// `POST /2020-05-31/key-value-store`, so a function configuration can name a store this
 /// service actually holds. Answers the ARN the create minted.
-async fn create_key_value_store(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn create_key_value_store(router: &MultiServiceRouter, name: &str) -> String {
     let body = format!(
         "<CreateKeyValueStoreRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -163,15 +163,15 @@ async fn tag_resource(
 /// `GetFunction`'s payload is the `FunctionBlob` itself rather than a document, so it is
 /// read as bytes: code that is not valid UTF-8 (a blob may be anything) must come back
 /// unchanged, which a string would not show.
-struct CodeAnswer {
-    status: u16,
-    etag: String,
+pub(crate) struct CodeAnswer {
+    pub(crate) status: u16,
+    pub(crate) etag: String,
     content_type: String,
-    body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
 }
 
 /// `GET /2020-05-31/function/{Name}`, read as raw bytes.
-async fn get_function(
+pub(crate) async fn get_function(
     router: &MultiServiceRouter,
     name: &str,
     stage: Option<&str>,
@@ -214,24 +214,24 @@ async fn get_function(
 
 /// One `CreateFunction` request a client submits.
 #[derive(Debug, Clone)]
-struct Create {
-    case: &'static str,
-    name: String,
+pub(crate) struct Create {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
     /// `FunctionConfig.Comment`, which is required on the wire.
-    comment: String,
+    pub(crate) comment: String,
     /// `FunctionConfig.Runtime`.
-    runtime: &'static str,
+    pub(crate) runtime: &'static str,
     /// `FunctionCode`, as the bytes a client submits.
-    code: Vec<u8>,
+    pub(crate) code: Vec<u8>,
     /// The `KeyValueStoreARN` of each association the configuration names.
-    associations: Vec<String>,
+    pub(crate) associations: Vec<String>,
     /// `Tags.Items`, as `(Key, Value)` pairs.
-    tags: Vec<(&'static str, &'static str)>,
+    pub(crate) tags: Vec<(&'static str, &'static str)>,
 }
 
 impl Create {
     /// The `CreateFunctionRequest` XML a client sends for this create.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<CreateFunctionRequest xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
         );
@@ -257,7 +257,7 @@ impl Create {
     }
 
     /// The `FunctionConfig` element this create carries.
-    fn config_xml(&self) -> String {
+    pub(crate) fn config_xml(&self) -> String {
         let mut out = format!(
             "<FunctionConfig><Comment>{}</Comment><Runtime>{}</Runtime>",
             escape(&self.comment),
@@ -285,7 +285,7 @@ impl Create {
 /// A CloudFront function that rewrites the request URI and a header — the shape of code a
 /// viewer-request function carries, including the characters XML predefines, so the
 /// round trip is tested on code a client really sends.
-const VIEWER_REQUEST_CODE: &str = "function handler(event) {\n\
+pub(crate) const VIEWER_REQUEST_CODE: &str = "function handler(event) {\n\
      \x20   var request = event.request;\n\
      \x20   if (request.uri === '/old' && request.method === 'GET') {\n\
      \x20       request.uri = '/new';\n\
@@ -370,7 +370,7 @@ fn member(summary: &Node, path: &str, case: &str, raw: &str) -> String {
 
 /// Assert the `FunctionSummary` document `answer` carries is the function `create` asked
 /// for, in `stage`, and answer the ARN it reports.
-fn assert_summary(answer: &Answer, create: &Create, stage: &str, context: &str) -> String {
+pub(crate) fn assert_summary(answer: &Answer, create: &Create, stage: &str, context: &str) -> String {
     let case = create.case;
     let summary = answer.root();
     let raw = answer.raw.as_str();
