@@ -15,6 +15,10 @@
 //! * a `resourceArn` that is not a signing-profile ARN is refused 400
 //!   `BadRequestException`, and a well-formed one naming no stored profile 404
 //!   `NotFoundException`, for every one of the three operations;
+//! * a tag key is one the modelled `TagKey` shape admits — inside its length
+//!   bounds, outside AWS's reserved namespace, and made only of the characters
+//!   its pattern's alphabet states — and every operation that takes tag keys
+//!   refuses the whole request for any other key, writing and removing nothing;
 //! * a CANCELED profile's tags cannot be CHANGED (the modelled bad request "also
 //!   occurs when you call a tagging API on a cancelled signing profile") while it
 //!   stays readable, because Signer documents a canceled profile as still
@@ -32,7 +36,7 @@ use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_signer_wallabyservice::state::{
     ERROR_CODE_BAD_REQUEST, ERROR_CODE_PROFILE_NOT_FOUND, ERROR_CODE_VALIDATION,
-    MAX_TAGS_PER_PROFILE, RESERVED_TAG_KEY_PREFIX,
+    MAX_TAGS_PER_PROFILE, RESERVED_TAG_KEY_PREFIX, TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH,
 };
 use service_com_amazonaws_signer_wallabyservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1156,5 +1160,376 @@ async fn a_key_outside_the_reserved_namespace_round_trips_through_every_tag_oper
             Some(ERROR_CODE_PROFILE_NOT_FOUND),
             "case {operation:?}: the reserved key is refused before the profile lookup"
         );
+    }
+}
+
+/// A `tags` JSON object carrying ONE tag. The key is an expression rather than a
+/// literal, which is what `json!`'s object syntax cannot spell.
+fn tags_json(key: &str, value: &str) -> Value {
+    Value::Object(
+        [(key.to_string(), Value::String(value.to_string()))]
+            .into_iter()
+            .collect::<Map<String, Value>>(),
+    )
+}
+
+/// One tag key the modelled alphabet does not admit. The rows differ along what
+/// the rule generalises over: WHICH character outside the alphabet the key
+/// carries and where in the key it sits.
+///
+/// The alphabet is the character class of `TagKey`'s `@pattern`,
+/// `^(?!aws:)[a-zA-Z+-=._:/]+$` (`smithy_query(query="shape", shape="TagKey")`):
+/// the ASCII letters, the inclusive range from `+` to `=` — which covers the
+/// digits and `+ , - . / : ; < =` — and `_`. Every character below sits outside
+/// it, so no key below is one AWS Signer could hold.
+struct RejectedKeyCase {
+    case: &'static str,
+    key: &'static str,
+}
+
+fn keys_outside_the_modelled_alphabet() -> Vec<RejectedKeyCase> {
+    vec![
+        RejectedKeyCase {
+            case: "a space inside the key",
+            key: "my key",
+        },
+        RejectedKeyCase {
+            case: "a space in front of an otherwise admitted key",
+            key: " env",
+        },
+        RejectedKeyCase {
+            case: "an at sign",
+            key: "owner@team",
+        },
+        RejectedKeyCase {
+            case: "a hash",
+            key: "cost#center",
+        },
+        RejectedKeyCase {
+            case: "braces",
+            key: "a{b}",
+        },
+        RejectedKeyCase {
+            case: "square brackets",
+            key: "tag[0]",
+        },
+        RejectedKeyCase {
+            case: "an exclamation mark, at the end of the key",
+            key: "env!",
+        },
+        RejectedKeyCase {
+            case: "a percent sign",
+            key: "100%",
+        },
+        RejectedKeyCase {
+            case: "an ampersand",
+            key: "a&b",
+        },
+        RejectedKeyCase {
+            case: "a star — the character immediately below the alphabet's + to = range",
+            key: "a*b",
+        },
+        RejectedKeyCase {
+            case: "a caret",
+            key: "a^b",
+        },
+        RejectedKeyCase {
+            case: "a question mark",
+            key: "why?",
+        },
+        RejectedKeyCase {
+            case: "a backslash",
+            key: "a\\b",
+        },
+        RejectedKeyCase {
+            case: "a pipe",
+            key: "a|b",
+        },
+        RejectedKeyCase {
+            case: "a tilde",
+            key: "a~b",
+        },
+        RejectedKeyCase {
+            case: "a tab",
+            key: "a\tb",
+        },
+        RejectedKeyCase {
+            case: "a character outside ASCII",
+            key: "naïve",
+        },
+    ]
+}
+
+/// Keys the modelled alphabet DOES admit, beside the ones the suite's other
+/// tables already carry: the three characters the pattern's `+` to `=` range
+/// covers without the class spelling them out (`,`, `;`, `<`), and one key
+/// carrying every punctuation character of that alphabet at once.
+const KEYS_INSIDE_THE_MODELLED_ALPHABET: &[&str] =
+    &["a,b", "a;b", "a<b", "k+,-./0:;<=Z_", "Env9"];
+
+/// A tag key the modelled `TagKey` alphabet does not admit is refused 400 by
+/// every operation that takes tag keys, and the profile's tag map is left exactly
+/// as it was — while a key made only of characters that alphabet admits round
+/// trips through all three.
+#[tokio::test]
+async fn a_tag_key_outside_the_modelled_alphabet_is_refused_by_every_tag_operation() {
+    let router = emulator();
+    let seeded = tags(&[("env", "prod"), ("team", "iot")]);
+    let arn = seed_profile(&router, "Alphabet_Keys").await;
+    assert_eq!(
+        tag_resource(&router, &arn, &seeded).await.status,
+        200,
+        "seeding the profile's tags must succeed"
+    );
+
+    for (index, row) in keys_outside_the_modelled_alphabet()
+        .into_iter()
+        .enumerate()
+    {
+        let case = row.case;
+        let key = row.key;
+
+        // The write half: refused, and nothing added.
+        let write = tag_resource(&router, &arn, &tags(&[(key, "written")])).await;
+        assert_eq!(
+            write.status, 400,
+            "case {case:?}: expected TagResource to refuse key {key:?} with 400, got {} {:?}",
+            write.status, write.body
+        );
+        assert_eq!(
+            write.code(),
+            Some(ERROR_CODE_BAD_REQUEST),
+            "case {case:?}: expected the modelled code for key {key:?}, got {:?}",
+            write.body
+        );
+        assert_eq!(
+            write.error_type.as_deref(),
+            Some("BadRequestException"),
+            "case {case:?}: expected the modelled error shape for key {key:?}, got {:?}",
+            write.error_type
+        );
+        assert_eq!(
+            list_tags(&router, &arn).await.tags().as_ref(),
+            Some(&seeded),
+            "case {case:?}: a refused write must store nothing, got {:?}",
+            list_tags(&router, &arn).await.tags()
+        );
+
+        // The removal half, over the same key: refused, and every seeded key is
+        // still there.
+        let removal = untag_resource(&router, &arn, &[key]).await;
+        assert_eq!(
+            removal.status, 400,
+            "case {case:?}: expected UntagResource to refuse key {key:?} with 400, got {} {:?}",
+            removal.status, removal.body
+        );
+        assert_eq!(
+            removal.code(),
+            Some(ERROR_CODE_BAD_REQUEST),
+            "case {case:?}: expected the modelled code for key {key:?}, got {:?}",
+            removal.body
+        );
+        assert_eq!(
+            list_tags(&router, &arn).await.tags().as_ref(),
+            Some(&seeded),
+            "case {case:?}: a refused removal must remove nothing, got {:?}",
+            list_tags(&router, &arn).await.tags()
+        );
+
+        // The create half: the same key on `PutSigningProfile`, whose modelled
+        // 400 is `ValidationException` — and no profile is stored for it.
+        let created = format!("Alphabet_Create_{index}");
+        let create = put_profile(
+            &router,
+            &created,
+            json!({
+                "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+                "tags": tags_json(key, "created"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            create.status, 400,
+            "case {case:?}: expected PutSigningProfile to refuse key {key:?} with 400, got {} {:?}",
+            create.status, create.body
+        );
+        assert_eq!(
+            create.code(),
+            Some(ERROR_CODE_VALIDATION),
+            "case {case:?}: expected the modelled code for key {key:?}, got {:?}",
+            create.body
+        );
+        let read_back = get_profile(&router, &created).await;
+        assert_eq!(
+            read_back.status, 404,
+            "case {case:?}: a refused create must store no profile, got {} {:?}",
+            read_back.status, read_back.body
+        );
+    }
+
+    // The other direction: a key the alphabet admits is written, reported and
+    // removed by the same three operations.
+    for key in KEYS_INSIDE_THE_MODELLED_ALPHABET {
+        let write = tag_resource(&router, &arn, &tags(&[(key, "written")])).await;
+        assert_eq!(
+            write.status, 200,
+            "case {key:?}: expected TagResource 200, got {} {:?}",
+            write.status, write.body
+        );
+        assert_eq!(
+            list_tags(&router, &arn)
+                .await
+                .tags()
+                .and_then(|map| map.get(*key).cloned()),
+            Some("written".to_string()),
+            "case {key:?}: expected the written value to be reported"
+        );
+        let removal = untag_resource(&router, &arn, &[key]).await;
+        assert_eq!(
+            removal.status, 200,
+            "case {key:?}: expected UntagResource 200, got {} {:?}",
+            removal.status, removal.body
+        );
+        assert!(
+            list_tags(&router, &arn)
+                .await
+                .tags()
+                .is_some_and(|map| !map.contains_key(*key)),
+            "case {key:?}: expected the removed key to be gone"
+        );
+    }
+}
+
+/// One tag key judged by `TagKey`'s own `@length(min: 1, max: 128)`
+/// (`smithy_query(query="shape", shape="TagKey")`): each published bound, and one
+/// character past each of them.
+struct KeyLengthCase {
+    case: &'static str,
+    key: String,
+    admitted: bool,
+}
+
+fn key_length_cases() -> Vec<KeyLengthCase> {
+    vec![
+        KeyLengthCase {
+            case: "the empty key, one character below the modelled minimum",
+            key: String::new(),
+            admitted: false,
+        },
+        KeyLengthCase {
+            case: "a key at the modelled minimum length",
+            key: "k".repeat(TAG_KEY_MIN_LENGTH),
+            admitted: true,
+        },
+        KeyLengthCase {
+            case: "a key at the modelled maximum length",
+            key: "k".repeat(TAG_KEY_MAX_LENGTH),
+            admitted: true,
+        },
+        KeyLengthCase {
+            case: "a key one character past the modelled maximum",
+            key: "k".repeat(TAG_KEY_MAX_LENGTH + 1),
+            admitted: false,
+        },
+    ]
+}
+
+/// A tag key is admitted at both of `TagKey`'s published length bounds and
+/// refused one character outside either of them, by both operations that write a
+/// tag MAP — the map's key is the one value the framework's boundary leaves
+/// entirely to the handler, while `UntagResource`'s `tagKeys` are list members the
+/// boundary already judges against the same bounds.
+#[tokio::test]
+async fn a_tag_key_is_judged_against_the_modelled_length_bounds() {
+    let router = emulator();
+    let arn = seed_profile(&router, "Key_Lengths").await;
+
+    for (index, row) in key_length_cases().into_iter().enumerate() {
+        let case = row.case;
+        let key = row.key.as_str();
+        let written = tags(&[(key, "written")]);
+
+        let write = tag_resource(&router, &arn, &written).await;
+        let expected_status = if row.admitted { 200 } else { 400 };
+        assert_eq!(
+            write.status, expected_status,
+            "case {case:?}: expected TagResource {expected_status} for a {}-character key, got {} \
+             {:?}",
+            row.key.len(),
+            write.status,
+            write.body
+        );
+
+        let created = format!("Key_Length_Create_{index}");
+        let create = put_profile(
+            &router,
+            &created,
+            json!({
+                "platformId": "AWSLambda-SHA384-ECDSA",
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+                "tags": tags_json(key, "created"),
+            }),
+        )
+        .await;
+
+        if row.admitted {
+            assert_eq!(
+                list_tags(&router, &arn)
+                    .await
+                    .tags()
+                    .and_then(|map| map.get(key).cloned()),
+                Some("written".to_string()),
+                "case {case:?}: expected the written value to be reported"
+            );
+            assert_eq!(
+                untag_resource(&router, &arn, &[key]).await.status,
+                200,
+                "case {case:?}: expected UntagResource to remove the admitted key"
+            );
+            assert_eq!(
+                create.status, 200,
+                "case {case:?}: expected PutSigningProfile 200, got {} {:?}",
+                create.status, create.body
+            );
+            assert_eq!(
+                get_profile(&router, &created)
+                    .await
+                    .tags()
+                    .and_then(|map| map.get(key).cloned()),
+                Some("created".to_string()),
+                "case {case:?}: expected the created tag to be reported by GetSigningProfile"
+            );
+        } else {
+            assert_eq!(
+                write.code(),
+                Some(ERROR_CODE_BAD_REQUEST),
+                "case {case:?}: expected the modelled code, got {:?}",
+                write.body
+            );
+            assert!(
+                list_tags(&router, &arn)
+                    .await
+                    .tags()
+                    .is_some_and(|map| !map.contains_key(key)),
+                "case {case:?}: a refused write must store nothing"
+            );
+            assert_eq!(
+                create.status, 400,
+                "case {case:?}: expected PutSigningProfile to refuse the key with 400, got {} {:?}",
+                create.status, create.body
+            );
+            assert_eq!(
+                create.code(),
+                Some(ERROR_CODE_VALIDATION),
+                "case {case:?}: expected the modelled code, got {:?}",
+                create.body
+            );
+            assert_eq!(
+                get_profile(&router, &created).await.status,
+                404,
+                "case {case:?}: a refused create must store no profile"
+            );
+        }
     }
 }
