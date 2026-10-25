@@ -27,7 +27,8 @@ use crate::ops::types::{
     Statement, Tag, WAFAssociatedItemException, WAFDuplicateItemException,
     WAFExpiredManagedRuleGroupVersionException, WAFFeatureNotIncludedInPricingPlanException,
     WAFInvalidOperationException, WAFInvalidParameterException, WAFInvalidPermissionPolicyException,
-    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
+    WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException,
+    WAFUnsupportedAggregateKeyTypeException, WebACL,
 };
 
 /// The `Scope` values the model declares
@@ -181,6 +182,25 @@ pub const INVALID_OPERATION_MESSAGE: &str = "The operation isn't valid.";
 pub fn invalid_operation_exception() -> WAFInvalidOperationException {
     WAFInvalidOperationException {
         message: Some(INVALID_OPERATION_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence `WAFUnsupportedAggregateKeyTypeException` carries: the shape's own
+/// documented sentence
+/// (`smithy_query(query="shape",shape="WAFUnsupportedAggregateKeyTypeException")`),
+/// its wrapping whitespace flattened. See [`DUPLICATE_ITEM_MESSAGE`] for why the
+/// wording is a property of the exception type rather than of the call: the body
+/// names neither the rule that was asked about nor the aggregation it uses.
+pub const UNSUPPORTED_AGGREGATE_KEY_TYPE_MESSAGE: &str = "The rule that you've named \
+     doesn't aggregate solely on the IP address or solely on the forwarded IP \
+     address. This call is only available for rate-based rules with an \
+     AggregateKeyType setting of IP or FORWARDED_IP.";
+
+/// `WAFUnsupportedAggregateKeyTypeException` as WAF returns it: nothing but
+/// [`UNSUPPORTED_AGGREGATE_KEY_TYPE_MESSAGE`].
+pub fn unsupported_aggregate_key_type_exception() -> WAFUnsupportedAggregateKeyTypeException {
+    WAFUnsupportedAggregateKeyTypeException {
+        message: Some(UNSUPPORTED_AGGREGATE_KEY_TYPE_MESSAGE.to_string()),
     }
 }
 
