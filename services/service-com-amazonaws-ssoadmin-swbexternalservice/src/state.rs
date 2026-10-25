@@ -1346,6 +1346,24 @@ pub fn customer_managed_policy_ceiling_message(permission_set_arn: &str) -> Stri
     )
 }
 
+/// The refusal an ATTACH of a reference the permission set ALREADY holds earns, as the
+/// message of the modelled `ConflictException` (HTTP 409) — "a conflict with a previous
+/// successful write".
+///
+/// Built from the request: it names the pair that is already attached and the permission
+/// set it is attached to, because a client has to tell which of the request's resources
+/// the conflict is about.
+pub fn customer_managed_policy_already_attached_message(
+    permission_set_arn: &str,
+    name: &str,
+    path: &str,
+) -> String {
+    format!(
+        "A customer managed policy reference with name {name} and path {path} is already \
+         attached to permission set {permission_set_arn}."
+    )
+}
+
 /// The refusal a detach of a reference the permission set does not hold earns, as the
 /// message of the modelled `ResourceNotFoundException` (HTTP 404).
 ///
@@ -1391,6 +1409,23 @@ pub fn managed_policy_ceiling_message(permission_set_arn: &str) -> String {
         "Cannot attach another managed policy: this emulator holds at most \
          {MAX_MANAGED_POLICIES_PER_PERMISSION_SET} managed policies per permission set, \
          and {permission_set_arn} already holds that many"
+    )
+}
+
+/// The refusal an ATTACH of an AWS managed policy the permission set ALREADY carries
+/// earns, as the message of the modelled `ConflictException` (HTTP 409) — "a conflict
+/// with a previous successful write".
+///
+/// Built from the request, like
+/// [`customer_managed_policy_already_attached_message`]: it names the ARN that is already
+/// attached and the permission set it is attached to.
+pub fn managed_policy_already_attached_message(
+    permission_set_arn: &str,
+    managed_policy_arn: &str,
+) -> String {
+    format!(
+        "Managed policy with arn {managed_policy_arn} is already attached to permission \
+         set {permission_set_arn}."
     )
 }
 
@@ -1520,9 +1555,9 @@ pub struct PermissionSetRecord {
     /// The AWS MANAGED POLICY ARNs attached to this permission set.
     ///
     /// An attachment's IDENTITY is its `ManagedPolicyArn` — a permission set holds a given
-    /// AWS managed policy at most once, so attaching the same ARN twice attaches it once
-    /// and a detach removes the one entry its ARN names. They live ON the permission-set
-    /// record rather than in a second map, for the same reason as
+    /// AWS managed policy at most once, so an attach of an ARN the set already carries is
+    /// refused and a detach removes the one entry its ARN names. They live ON the
+    /// permission-set record rather than in a second map, for the same reason as
     /// [`Self::customer_managed_policies`]: a permission set that no longer exists holds
     /// none of them, and the attach, detach and list operations all resolve the same
     /// permission set every other read resolves. Holds at most
@@ -1536,7 +1571,8 @@ pub struct PermissionSetRecord {
     /// permission set that no longer exists holds none of them and the attach, detach and
     /// list operations all resolve the same permission set every other read resolves. A
     /// `BTreeMap` so an enumeration walks one stable order and can page by that identity,
-    /// and so an attach of a reference already attached stores it ONCE. Holds at most
+    /// and so one identity names at most one stored reference — an attach of a reference
+    /// already attached is refused before the insert. Holds at most
     /// [`MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET`] references; an attach that
     /// would add one beyond that ceiling is refused rather than grown into.
     pub customer_managed_policies: BTreeMap<String, CustomerManagedPolicyReferenceRecord>,

@@ -173,6 +173,9 @@ mod multiplex_stop;
 #[path = "all/multiplex_update.rs"]
 mod multiplex_update;
 
+#[path = "all/network_deletion.rs"]
+mod network_deletion;
+
 #[path = "all/networks.rs"]
 mod networks;
 

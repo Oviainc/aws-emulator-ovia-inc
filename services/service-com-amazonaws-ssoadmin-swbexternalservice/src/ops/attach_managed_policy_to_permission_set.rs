@@ -3,8 +3,10 @@
 //! @op AttachManagedPolicyToPermissionSet
 //!
 //! Adds ONE AWS managed policy ARN to the set a stored permission set carries. The ARN is
-//! what identifies an AWS managed policy, so attaching the same ARN twice attaches it once,
-//! and a later `ListManagedPoliciesInPermissionSet` reports the set that is attached.
+//! what identifies an AWS managed policy, so a permission set holds a given one at most
+//! once and an attach of an ARN the set already carries is a conflict with the write that
+//! attached it — refused, with the stored set left as it was. A later
+//! `ListManagedPoliciesInPermissionSet` reports the set that is attached.
 //!
 //! ## Shape of an operation
 //!
@@ -228,14 +230,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // The emulator's own per-permission-set ceiling, asked only of an ARN that would
-        // ADD an entry: re-attaching one the set already holds grows nothing, so it cannot
-        // cross a ceiling the set is already at.
+        // An ATTACH, not a PUT: the model marks this operation NOT `@idempotent` and
+        // declares `ConflictException` for "a conflict with a previous successful write".
+        // The ARN is the attachment's identity, so a request naming one the set already
+        // carries is that conflict — refused, and the stored set is left as it was rather
+        // than reporting success for a write that would add nothing.
         if record.managed_policies.contains(&input.managed_policy_arn) {
-            // Already attached: the ARN is the attachment's identity, so attaching it
-            // again attaches it once and the stored set is left exactly as it was.
-            return Ok(AttachManagedPolicyToPermissionSetOutput {});
+            return Err(
+                AttachManagedPolicyToPermissionSetErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::managed_policy_already_attached_message(
+                            &permission_set_arn,
+                            &input.managed_policy_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
+        // The emulator's own per-permission-set ceiling, asked of every ARN that reaches
+        // it: a duplicate was already refused above, so each one here would ADD an entry.
         if record.managed_policies.len() >= crate::state::MAX_MANAGED_POLICIES_PER_PERMISSION_SET {
             return Err(
                 AttachManagedPolicyToPermissionSetErrorModeled::ServiceQuotaExceededException(

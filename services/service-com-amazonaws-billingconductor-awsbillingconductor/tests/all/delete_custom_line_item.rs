@@ -13,17 +13,25 @@
 //! untouched when the span shares no period with it, and removing the record only once
 //! nothing of it is left. It answers the deleted item's full ARN, refuses an `Arn` that
 //! names no stored item with 400 `ValidationException`
-//! (`MISSING_CUSTOMLINEITEM`), and refuses a range that covers no billing period with
-//! 400 `ValidationException` (`ILLEGAL_BILLING_PERIOD_RANGE`) while leaving the stored
-//! item readable.
+//! (`MISSING_CUSTOMLINEITEM`), refuses a range that covers no billing period with
+//! 400 `ValidationException` (`ILLEGAL_BILLING_PERIOD_RANGE`), and — because the
+//! operation acts "in the current, or previous billing period" — refuses a range
+//! STARTING in any other period with 400 `ValidationException`
+//! (`INVALID_BILLING_PERIOD_FOR_OPERATION`), all three while leaving the stored item
+//! exactly as it was.
+//!
+//! Every billing period here is therefore expressed as an offset from the CURRENT
+//! billing period ([`period`]), which is the only window the request may start in.
 //!
 //! The rows span what the rule generalises over rather than one recorded call: the form
 //! the `Arn` takes (full ARN / bare resource id), the charge kind of the item (flat /
 //! percentage, with and without associated resources), the span the stored item was
-//! created with (none / open-ended / bounded), where the request's span falls relative to
-//! it (disjoint before, abutting, overlapping the head, overlapping the tail, strictly
-//! inside, equal, covering), how the request's span is bounded (open end / bounded) and
-//! how a billing period is spelled (`2026-7` / `2026-07`).
+//! created with (none / open-ended / bounded, before / around / after the window), where
+//! the request's span falls relative to it (disjoint before, disjoint after, abutting,
+//! overlapping the head, overlapping the tail, equal, covering), how the request's span
+//! is bounded (open end / bounded), how far outside the window a refused range starts
+//! (one month, a year, a decade, the epoch month, a far-future month) and how a billing
+//! period is spelled (`2026-7` / `2026-07`).
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -231,6 +239,36 @@ fn range(inclusive_start: &str, exclusive_end: Option<&str>) -> Value {
     value
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// The periods a delete may START in are the current one and the one before it, which
+/// the wall clock decides, so every period in this suite is named relative to the
+/// service's own current billing period rather than by a fixed month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// Assert a refusal: the status, the modelled error shape, the `Reason` the model
 /// enumerates and the member at fault.
 fn assert_refused(
@@ -371,17 +409,16 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
 /// One row of the billing-period-range table: the case, the span the item is created
 /// with (none when it applies to every period), the span the delete names, the periods a
 /// later read still reports the item for, and the periods it does not.
-type SpanRow = (
-    &'static str,
-    Option<Value>,
-    Value,
-    &'static [&'static str],
-    &'static [&'static str],
-);
+type SpanRow = (&'static str, Option<Value>, Value, Vec<String>, Vec<String>);
 
 /// THE RULE for a request that names a billing period range: the item is deleted only
 /// from the half-open span that range covers, so a later read reports it exactly for the
 /// periods the delete did not cover.
+///
+/// Every span the DELETE names starts in the window the operation may act in (the
+/// current billing period or the one before it — [`period`] counts from the current
+/// one); the span the item was CREATED with is free, so the rows still put the
+/// request's span before, after, over and across the item's.
 #[tokio::test]
 async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those_periods() {
     // (case, the span the item is created with, the span the delete names, the periods
@@ -390,79 +427,82 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
         (
             "an open-ended delete of an item with no span",
             None,
-            range("2026-06", None),
-            &["2025-01", "2026-05"],
-            &["2026-06", "2026-07", "2027-06"],
+            range(&period(0), None),
+            vec![period(-3), period(-1)],
+            vec![period(0), period(1), period(12)],
         ),
         (
             "a bounded delete of an item with no span ends it where the delete begins",
             None,
-            range("2026-06", Some("2026-08")),
-            &["2025-01", "2026-05"],
-            &["2026-06", "2026-07", "2026-09"],
+            range(&period(-1), Some(&period(1))),
+            vec![period(-3), period(-2)],
+            vec![period(-1), period(0), period(1)],
         ),
         (
             "a delete overlapping the head of a bounded span",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-01", Some("2026-05")),
-            &["2026-05", "2026-08"],
-            &["2026-03", "2026-04", "2026-09"],
+            Some(range(&period(-1), Some(&period(3)))),
+            range(&period(-1), Some(&period(1))),
+            vec![period(1), period(2)],
+            vec![period(-1), period(0), period(3)],
         ),
         (
             "a delete overlapping the tail of a bounded span",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-06", None),
-            &["2026-03", "2026-05"],
-            &["2026-06", "2026-08", "2026-09"],
+            Some(range(&period(-3), Some(&period(3)))),
+            range(&period(0), None),
+            vec![period(-3), period(-1)],
+            vec![period(0), period(2), period(3)],
         ),
         (
             "a delete covering a bounded span exactly",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-03", Some("2026-09")),
-            &[],
-            &["2026-02", "2026-03", "2026-05", "2026-09"],
+            Some(range(&period(-1), Some(&period(0)))),
+            range(&period(-1), Some(&period(0))),
+            vec![],
+            vec![period(-2), period(-1), period(0)],
         ),
         (
             "a delete covering more than the whole span",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-01", None),
-            &[],
-            &["2026-01", "2026-03", "2026-08", "2027-06"],
+            Some(range(&period(0), Some(&period(2)))),
+            range(&period(-1), None),
+            vec![],
+            vec![period(-1), period(0), period(1), period(2)],
         ),
         (
             "a delete of the periods after an open-ended span starts",
-            Some(range("2026-03", None)),
-            range("2026-03", None),
-            &[],
-            &["2026-03", "2026-07", "2027-06"],
+            Some(range(&period(0), None)),
+            range(&period(0), None),
+            vec![],
+            vec![period(0), period(1), period(12)],
         ),
         (
             "a delete whose span abuts the start of the item's",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-01", Some("2026-03")),
-            &["2026-03", "2026-08"],
-            &["2026-02", "2026-09"],
+            Some(range(&period(0), Some(&period(3)))),
+            range(&period(-1), Some(&period(0))),
+            vec![period(0), period(2)],
+            vec![period(-1), period(3)],
         ),
         (
             "a delete whose span lies entirely before the item's",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2025-01", Some("2025-06")),
-            &["2026-03", "2026-08"],
-            &["2026-02", "2026-09"],
+            Some(range(&period(3), Some(&period(6)))),
+            range(&period(-1), Some(&period(0))),
+            vec![period(3), period(5)],
+            vec![period(-1), period(0), period(6)],
         ),
         (
             "a delete whose span lies entirely after the item's",
-            Some(range("2026-03", Some("2026-09"))),
-            range("2026-12", None),
-            &["2026-03", "2026-08"],
-            &["2026-02", "2026-09"],
+            Some(range(&period(-6), Some(&period(-3)))),
+            range(&period(0), None),
+            vec![period(-6), period(-4)],
+            vec![period(-3), period(0), period(1)],
         ),
         (
             "a one-digit month names the same period as its zero-padded spelling",
-            Some(range("2026-3", Some("2026-9"))),
-            range("2026-6", None),
-            &["2026-03", "2026-05"],
-            &["2026-06", "2026-08", "2026-09"],
+            Some(range(
+                &one_digit_month(&period(-1)),
+                Some(&one_digit_month(&period(3))),
+            )),
+            range(&one_digit_month(&period(0)), None),
+            vec![period(-1)],
+            vec![period(0), period(2)],
         ),
     ];
 
@@ -482,16 +522,16 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
             "case {case:?}: expected the item's full ARN, got {answered}"
         );
 
-        for period in reported {
+        for probe in &reported {
             assert!(
-                emulator.reports(case, &item, Some(period)).await,
-                "case {case:?}: expected the read for {period:?} to still report the item"
+                emulator.reports(case, &item, Some(probe)).await,
+                "case {case:?}: expected the read for {probe:?} to still report the item"
             );
         }
-        for period in unreported {
+        for probe in &unreported {
             assert!(
-                !emulator.reports(case, &item, Some(period)).await,
-                "case {case:?}: expected the read for {period:?} not to report the item"
+                !emulator.reports(case, &item, Some(probe)).await,
+                "case {case:?}: expected the read for {probe:?} not to report the item"
             );
         }
     }
@@ -503,46 +543,50 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
 /// was created either way.
 #[tokio::test]
 async fn narrowing_an_item_advances_last_modified_time_and_changing_nothing_leaves_it() {
-    // (case, the span the delete names, whether it narrows the item, a billing period
-    // the item is still reported for afterwards)
-    let rows: Vec<(&str, Value, bool, &str)> = vec![
+    // (case, the span the item is created with, the span the delete names, whether it
+    // narrows the item, a billing period the item is still reported for afterwards)
+    let rows: Vec<(&str, Value, Value, bool, String)> = vec![
         (
             "an open-ended delete of the item's tail",
-            range("2026-06", None),
+            range(&period(-1), Some(&period(3))),
+            range(&period(0), None),
             true,
-            "2026-03",
+            period(-1),
         ),
         (
             "a bounded delete of the item's head",
-            range("2026-01", Some("2026-05")),
+            range(&period(-1), Some(&period(3))),
+            range(&period(-1), Some(&period(0))),
             true,
-            "2026-05",
+            period(1),
         ),
         (
             "a delete whose span lies entirely after the item's",
-            range("2026-12", None),
+            range(&period(-6), Some(&period(-3))),
+            range(&period(0), None),
             false,
-            "2026-03",
+            period(-5),
         ),
         (
             "a delete whose span lies entirely before the item's",
-            range("2025-01", Some("2025-06")),
+            range(&period(3), Some(&period(6))),
+            range(&period(-1), Some(&period(0))),
             false,
-            "2026-03",
+            period(4),
         ),
     ];
 
-    for (case, deleted_with, narrows, readable_at) in rows {
+    for (case, created_with, deleted_with, narrows, readable_at) in rows {
         let emulator = Emulator::new();
         let group = emulator.billing_group("payer").await;
         let item = emulator
             .custom_line_item(
                 &group,
                 "narrowed",
-                json!({ "BillingPeriodRange": range("2026-03", Some("2026-09")) }),
+                json!({ "BillingPeriodRange": created_with }),
             )
             .await;
-        let before = emulator.stored_at(case, &item, readable_at).await;
+        let before = emulator.stored_at(case, &item, &readable_at).await;
         // The instants this service records are wall-clock milliseconds, so the delete is
         // made in a LATER millisecond than the create — otherwise "advances" could not be
         // told from "unchanged" whatever the handler did.
@@ -550,7 +594,7 @@ async fn narrowing_an_item_advances_last_modified_time_and_changing_nothing_leav
 
         emulator.delete_ok(case, &item, &deleted_with).await;
 
-        let after = emulator.stored_at(case, &item, readable_at).await;
+        let after = emulator.stored_at(case, &item, &readable_at).await;
         let modified_before = before.get("LastModifiedTime").and_then(Value::as_i64);
         let modified_after = after.get("LastModifiedTime").and_then(Value::as_i64);
         if narrows {
@@ -650,23 +694,221 @@ async fn a_billing_period_range_that_covers_no_period_is_refused_and_changes_not
     let before = emulator.stored("the untouched item", &item).await;
 
     // (case, the start, the end) — equal bounds, one month reversed, far reversed, and
-    // equal bounds spelled differently.
-    let rows: Vec<(&str, &str, &str)> = vec![
-        ("an end equal to the start", "2026-05", "2026-05"),
-        ("an end one month before the start", "2026-05", "2026-04"),
-        ("an end years before the start", "2026-05", "2019-12"),
-        ("equal bounds spelled both ways", "2026-5", "2026-05"),
-        ("an end in the same month, one-digit", "2026-5", "2026-5"),
+    // equal bounds spelled differently. A span that covers no period names nothing to
+    // delete whatever period it names, so the rows span both a start inside the window
+    // the operation may act in and starts outside it.
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "an end equal to the start, in the window",
+            period(0),
+            period(0),
+        ),
+        (
+            "an end one month before the start, in the window",
+            period(0),
+            period(-1),
+        ),
+        (
+            "an end equal to the start",
+            "2026-05".to_string(),
+            "2026-05".to_string(),
+        ),
+        (
+            "an end one month before the start",
+            "2026-05".to_string(),
+            "2026-04".to_string(),
+        ),
+        (
+            "an end years before the start",
+            "2026-05".to_string(),
+            "2019-12".to_string(),
+        ),
+        (
+            "equal bounds spelled both ways",
+            "2026-5".to_string(),
+            "2026-05".to_string(),
+        ),
+        (
+            "an end in the same month, one-digit",
+            "2026-5".to_string(),
+            "2026-5".to_string(),
+        ),
     ];
 
     for (case, start, end) in rows {
-        let (status, body) = emulator.delete(&item, &range(start, Some(end))).await;
+        let (status, body) = emulator.delete(&item, &range(&start, Some(&end))).await;
         assert_refused(
             case,
             status,
             &body,
             "ILLEGAL_BILLING_PERIOD_RANGE",
             "BillingPeriodRange.ExclusiveEndBillingPeriod",
+        );
+        assert_eq!(
+            emulator.stored(case, &item).await,
+            before,
+            "case {case:?}: a refused delete must leave the stored item untouched"
+        );
+    }
+}
+
+/// THE RULE on the billing period a delete may act in: `DeleteCustomLineItem` deletes
+/// the item "in the current, or previous billing period", so the period its
+/// `BillingPeriodRange` STARTS in — the period from which the deletion takes effect —
+/// has to be one of those two. A range starting in any other period (a month whose bill
+/// is closed, or one that has not begun) is refused with the modelled 400
+/// `ValidationException` and the reason the model enumerates for a period this
+/// operation may not act in, and the stored item keeps every period it applied in.
+///
+/// The rows differ along how far outside the window the start lies and in which
+/// direction (one month, a year, a decade, the epoch month, each end of the modelled
+/// `BillingPeriod` pattern `^\d{4}-(0?[1-9]|1[012])$`), how the range is bounded (open
+/// end / bounded), and how the month is spelled — plus the two periods the window does
+/// admit and the month on each side of them.
+#[tokio::test]
+async fn a_delete_whose_range_starts_outside_the_current_or_previous_period_is_refused() {
+    // (case, the range the delete names, whether the operation may act there)
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "a range starting in the current billing period, open ended",
+            range(&period(0), None),
+            true,
+        ),
+        (
+            "a range starting in the current billing period, bounded",
+            range(&period(0), Some(&period(1))),
+            true,
+        ),
+        (
+            "a range from the previous billing period to the current one",
+            range(&period(-1), Some(&period(0))),
+            true,
+        ),
+        (
+            "a range starting in the previous billing period, one-digit month",
+            range(&one_digit_month(&period(-1)), None),
+            true,
+        ),
+        (
+            "one month before the previous billing period",
+            range(&period(-2), Some(&period(-1))),
+            false,
+        ),
+        (
+            "a year before the current billing period",
+            range(&period(-12), None),
+            false,
+        ),
+        (
+            "a decade before the current billing period",
+            range(&period(-120), Some(&period(-119))),
+            false,
+        ),
+        (
+            // The month the `Instant` members this service records count from.
+            "the epoch month",
+            range("1970-01", None),
+            false,
+        ),
+        (
+            // The earliest month the modelled `BillingPeriod` pattern admits.
+            "the first month of year zero",
+            range("0000-01", Some("0001-01")),
+            false,
+        ),
+        (
+            "the month after the current billing period",
+            range(&period(1), None),
+            false,
+        ),
+        (
+            "a year after the current billing period",
+            range(&period(12), Some(&period(13))),
+            false,
+        ),
+        (
+            "a future month spelled with a one-digit month",
+            range(&one_digit_month(&period(2)), None),
+            false,
+        ),
+        (
+            // The latest month the modelled `BillingPeriod` pattern admits.
+            "the last month of year 9999",
+            range("9999-12", None),
+            false,
+        ),
+    ];
+
+    for (case, deleted_with, inside_the_window) in rows {
+        let emulator = Emulator::new();
+        let group = emulator.billing_group("payer").await;
+        // An item with no span of its own applies to EVERY billing period, so a range
+        // the operation may act in always has something of it to delete and one it may
+        // not act in is refused for the period it names, not for naming nothing.
+        let item = emulator.custom_line_item(&group, "guarded", json!({})).await;
+        let before = emulator.stored(case, &item).await;
+
+        let (status, body) = emulator.delete(&item, &deleted_with).await;
+        if inside_the_window {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {body}"
+            );
+            continue;
+        }
+        assert_refused(
+            case,
+            status,
+            &body,
+            "INVALID_BILLING_PERIOD_FOR_OPERATION",
+            "BillingPeriodRange.InclusiveStartBillingPeriod",
+        );
+        // Nothing of the item moved: it is still reported, unchanged, for the periods
+        // it applied in — including the ones the refused range named.
+        assert_eq!(
+            emulator.stored(case, &item).await,
+            before,
+            "case {case:?}: a refused delete must leave the stored item untouched"
+        );
+        for probe in [period(-120), period(-1), period(0), period(120)] {
+            assert!(
+                emulator.reports(case, &item, Some(&probe)).await,
+                "case {case:?}: expected the read for {probe:?} to still report the item"
+            );
+        }
+    }
+}
+
+/// THE RULE on a start that is no billing period at all: it names none of the periods
+/// the operation may act in, so the request is refused with the modelled 400
+/// `ValidationException` rather than deleting anything.
+#[tokio::test]
+async fn a_delete_whose_range_starts_at_a_value_that_is_no_billing_period_is_refused() {
+    let emulator = Emulator::new();
+    let group = emulator.billing_group("payer").await;
+    let item = emulator.custom_line_item(&group, "guarded", json!({})).await;
+    let before = emulator.stored("the untouched item", &item).await;
+
+    // (case, the value the range starts at) — the modelled `BillingPeriod` pattern
+    // `^\d{4}-(0?[1-9]|1[012])$` admits none of them.
+    let rows: Vec<(&str, &str)> = vec![
+        ("a month of zero", "2026-00"),
+        ("a thirteenth month", "2026-13"),
+        ("a two-digit year", "26-01"),
+        ("a year on its own", "2026"),
+        ("empty", ""),
+    ];
+
+    for (case, start) in rows {
+        let (status, body) = emulator.delete(&item, &range(start, None)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            body.get("__type").and_then(Value::as_str),
+            Some("ValidationException"),
+            "case {case:?}: expected the modelled ValidationException, got {body}"
         );
         assert_eq!(
             emulator.stored(case, &item).await,

@@ -111,6 +111,11 @@ mod describe_subnets;
 mod describe_vpc_attribute;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
+// What `DetachVolume` refuses and what it writes beyond the detach path in
+// `fpga_image_tasks_and_volume_io`: the `IncorrectState` wording, the owed `detached`
+// instant, and an attachment to an Amazon Web Services-managed resource.
+#[path = "all/detach_volume.rs"]
+mod detach_volume;
 // The DHCP option set a VPC inherits: the Region's one default set, and what
 // `DescribeDhcpOptions` reports for it.
 #[path = "all/dhcp_options.rs"]

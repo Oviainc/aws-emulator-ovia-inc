@@ -5,7 +5,8 @@
 //! later read no longer reports it for them. A request that names no
 //! `BillingPeriodRange` deletes the item outright; one that names a range deletes it
 //! only from the periods that range covers, which narrows the span the stored item
-//! applies in and removes the record only once nothing is left of it.
+//! applies in and removes the record only once nothing is left of it. A range that
+//! starts outside the current or previous billing period is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +195,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          start billing period"
                             .to_string(),
                     ));
+                }
+                // "Deletes the custom line item … in the current, or previous billing
+                // period": the periods this operation may take effect in are bounded
+                // to that window, so a range starting outside it — an already closed
+                // month or one that has not begun — is refused and the stored item is
+                // left exactly as it was.
+                if let Err((reason, field, message)) =
+                    crate::state::check_billing_period_range_is_modifiable(range)
+                {
+                    return Err(validation(reason, field, message));
                 }
                 remaining_span(&stored, range)
             }

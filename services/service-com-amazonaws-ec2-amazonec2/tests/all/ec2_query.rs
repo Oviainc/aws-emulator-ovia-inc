@@ -272,3 +272,10 @@ pub fn unescaped(xml_text: &str) -> String {
         .replace("&gt;", ">")
         .replace("&amp;", "&")
 }
+
+/// The `<Message>` of a failure body, with the XML entities resolved — part of the same
+/// envelope as [`error_code`], so every suite that asserts a refusal's wording reads it
+/// the one way.
+pub fn error_message(xml: &str) -> String {
+    unescaped(&element(xml, "Message").unwrap_or_default())
+}

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +151,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteNetwork";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_NETWORK_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_NETWORK_OUTPUT_SCHEMA;
+    // The model's own `@http` code, kept: deleting a network is genuinely
+    // asynchronous (the body reports the network in `DELETING`), so `202
+    // Accepted` is exactly what this answer is — the caller polls
+    // `DescribeNetwork` for the terminal `DELETED`. The SYNCHRONOUS deletes in
+    // this service are the ones that answer 200 (`DeleteSdiSource`,
+    // `DeleteInput`).
     const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(
@@ -167,18 +164,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetwork"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // `settle` materialises the transitions the clock had already made due —
+        // a network's `CREATING` -> `ACTIVE` step and an earlier delete's
+        // `DELETING` -> `DELETED` one among them — which were owed whether or
+        // not this delete ran, so the checks below see the store a reader would.
+        state.settle(now);
+
+        if !state.networks.contains_key(&input.network_id) {
+            return Err(DeleteNetworkErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "Network",
+                    &input.network_id,
+                )),
+            })
+            .into());
+        }
+
+        // "The Network must have no resources associated with it": the resources
+        // this store associates with a network are the clusters mapped onto it —
+        // the same derivation its `AssociatedClusterIds` reports — so a network
+        // something is still attached to is the modelled conflict rather than a
+        // deletion. The refusal is taken before anything is written, so the
+        // network it names is left exactly as it was.
+        let associated = state.clusters_using_network(&input.network_id);
+        if !associated.is_empty() {
+            return Err(DeleteNetworkErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Network {} still has {} associated resource(s) ({}); a network must have \
+                     no resources associated with it to be deleted",
+                    input.network_id,
+                    associated.len(),
+                    associated.join(", ")
+                )),
+            })
+            .into());
+        }
+
+        // A repeated delete is answered 202 rather than with `ConflictException`:
+        // the state the caller is asking for is the one the network is already
+        // heading for or in, so nothing about the request conflicts with the
+        // stored network — and the acceptance keeps the instant the first call
+        // set, so a repeat can neither restart the clock nor revive a deleted
+        // network. This is the answer `DeleteInput` and `DeleteNode` give too.
+        let network = state
+            .networks
+            .get_mut(&input.network_id)
+            .ok_or_else(unavailable)?;
+        crate::state::begin_delete_network(network, now);
+
+        // Read back out of the store, so the response reports the network as it
+        // now stands — `DELETING`, with the clock owing it the terminal
+        // `DELETED` it then keeps — rather than one this handler assembled.
+        let network = state
+            .network_description(&input.network_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(crate::state::network_description_output!(
+            DeleteNetworkOutput,
+            network
+        ))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the network from. A modelled server error,
+/// never a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteNetworkError {
+    DeleteNetworkErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

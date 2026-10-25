@@ -115,7 +115,7 @@ async fn provisioned_model_arn(emu: &Emulator, name: &str) -> String {
             "/provisioned-model-throughput",
             Some(json!({
                 "provisionedModelName": name,
-                "modelId": "amazon.titan-text-express-v1",
+                "modelId": "amazon.titan-text-lite-v1",
                 "modelUnits": 1,
                 "commitmentDuration": "OneMonth",
             })),

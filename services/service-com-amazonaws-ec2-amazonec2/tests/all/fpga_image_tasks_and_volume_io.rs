@@ -110,7 +110,8 @@ async fn create_fpga_image(router: &MultiServiceRouter) -> (String, String) {
 }
 
 /// Create one 8 GiB volume in the Region's first Availability Zone, and answer its id.
-async fn create_volume(router: &MultiServiceRouter) -> String {
+/// Shared with the `DetachVolume` suite ([`super::detach_volume`]).
+pub(super) async fn create_volume(router: &MultiServiceRouter) -> String {
     let (status, body) = op(
         router,
         "CreateVolume",
@@ -1395,8 +1396,9 @@ async fn enable_volume_io_is_refused_unless_the_volumes_io_is_disabled() {
 }
 
 /// Give the volume `volume_id` an attachment to `instance_id` at `device`, the way
-/// `AttachVolume` will.
-fn attach_in_store(
+/// `AttachVolume` will. Shared with the `DetachVolume` suite
+/// ([`super::detach_volume`]), which seeds attachments of other shapes beside it.
+pub(super) fn attach_in_store(
     engine: &engine::InMemoryEngine,
     volume_id: &str,
     instance_id: &str,
@@ -1649,12 +1651,14 @@ async fn detaching_a_volume_frees_it_on_the_clock() {
 // Instance export tasks
 // ---------------------------------------------------------------------------
 
-/// Store one instance export task in `state`, and answer its `ExportTaskId`.
+/// Store one instance export task in `state`, and answer its `ExportTaskId`. Shared with
+/// the `DetachVolume` suite ([`super::detach_volume`]), which asserts the `IncorrectState`
+/// wording across resource kinds.
 ///
 /// Minted under the same prefix the handler accepts
 /// (`ec2::ops::cancel_export_task::INSTANCE_EXPORT_TASK_ID_PREFIX`), so the seeded form and
 /// the accepted form cannot drift apart.
-fn seed_export_task(engine: &engine::InMemoryEngine, state: &str) -> String {
+pub(super) fn seed_export_task(engine: &engine::InMemoryEngine, state: &str) -> String {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     let export_task_id = guard.next_id(INSTANCE_EXPORT_TASK_ID_PREFIX);

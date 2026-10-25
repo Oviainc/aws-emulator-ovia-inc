@@ -6,8 +6,9 @@
 //! THE RULE under test: a permission set carries a SET of customer managed policy
 //! references, each identified by its (`Name`, `Path`) pair with `Path` materialised to the
 //! value the member documents as its default (`/`) when a request names none;
-//! `AttachCustomerManagedPolicyReferenceToPermissionSet` adds one entry to that set (so
-//! attaching the same pair twice attaches it once),
+//! `AttachCustomerManagedPolicyReferenceToPermissionSet` adds one entry to that set and
+//! refuses a pair the set already holds with `ConflictException` (the duplicate-attach
+//! rule itself is `policy_attach_conflict.rs`),
 //! `DetachCustomerManagedPolicyReferenceFromPermissionSet` removes exactly the entry whose
 //! identity the request names and answers `ResourceNotFoundException` for a pair the
 //! permission set does not carry, and
@@ -293,17 +294,32 @@ async fn an_attach_stores_the_reference_and_the_list_answers_from_it() {
 }
 
 #[tokio::test]
-async fn attaching_the_same_reference_twice_attaches_it_once() {
+async fn a_second_attach_of_a_reference_the_set_already_holds_is_refused() {
     let (router, instance_arn) = organization_router();
     for (index, case) in reference_cases().into_iter().enumerate() {
         let permission_set_arn =
             create_permission_set(&router, &instance_arn, &format!("Twice{index}")).await;
-        for attempt in 1..=3 {
+        let (status, body) = attach(&router, &instance_arn, &permission_set_arn, &case.sent).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the first attach expected 200, got {status} {body}",
+            case.label
+        );
+        // Every later attach of the same pair is a conflict with the write that attached
+        // it, whichever form the pair takes.
+        for attempt in 2..=3 {
             let (status, body) =
                 attach(&router, &instance_arn, &permission_set_arn, &case.sent).await;
             assert_eq!(
-                status, 200,
-                "case {:?}: attach #{attempt} expected 200, got {status} {body}",
+                status, 400,
+                "case {:?}: attach #{attempt} of an attached pair expected 400, got {status} \
+                 {body}",
+                case.label
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {:?}: attach #{attempt} expected ConflictException, got {body}",
                 case.label
             );
         }
@@ -311,7 +327,7 @@ async fn attaching_the_same_reference_twice_attaches_it_once() {
         assert_eq!(
             found,
             vec![(case.name.clone(), case.path.clone())],
-            "case {:?}: three attaches of one pair attach it once, got {found:?}",
+            "case {:?}: the refused attaches leave the one entry stored, got {found:?}",
             case.label
         );
     }
@@ -818,13 +834,18 @@ async fn an_attach_beyond_the_emulator_ceiling_is_refused_and_stores_nothing() {
         "case \"one past the ceiling\": a refused attach stores nothing, got {after:?}"
     );
 
-    // Re-attaching a reference the set ALREADY holds adds no entry, so it is not refused
-    // even at the ceiling.
+    // Re-attaching a reference the set ALREADY holds is the DUPLICATE refusal, not the
+    // ceiling one: the request would add no entry, so it never reaches the ceiling.
     let held = json!({"Name": "Policy000", "Path": "/"});
     let (status, body) = attach(&router, &instance_arn, &permission_set_arn, &held).await;
     assert_eq!(
-        status, 200,
-        "case \"re-attach at the ceiling\": expected 200, got {status} {body}"
+        status, 400,
+        "case \"re-attach at the ceiling\": expected 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ConflictException",
+        "case \"re-attach at the ceiling\": expected ConflictException, got {body}"
     );
     let after = attached_set(&router, &instance_arn, &permission_set_arn).await;
     assert_eq!(

@@ -33,6 +33,8 @@ mod domain_lifecycle;
 mod domain_nodes;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
+#[path = "all/package_associations.rs"]
+mod package_associations;
 #[path = "all/package_registry.rs"]
 mod package_registry;
 #[path = "all/reserved_instance_offerings.rs"]
