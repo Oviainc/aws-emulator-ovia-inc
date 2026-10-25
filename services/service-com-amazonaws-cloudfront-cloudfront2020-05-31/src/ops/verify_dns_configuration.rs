@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyDnsConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyDnsConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyDnsConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! "This API operation checks whether your domain name points to the correct routing
+//! endpoint of the connection group, such as `d111111abcdef8.cloudfront.net`." So for each
+//! domain in scope — the one `Domain` names, or every domain the distribution tenant holds
+//! — the answer compares the endpoint that DNS name resolves to against the routing
+//! endpoint of the connection group the tenant is routed through:
+//!
+//! * `valid-configuration` when the name resolves to exactly that routing endpoint;
+//! * `invalid-configuration` when it resolves to a DIFFERENT CloudFront endpoint — "the
+//!   DNS record exists but it's using an incorrect routing endpoint";
+//! * `unknown-configuration` when no DNS record this service can read resolves the name,
+//!   so no comparison was made at all — CloudFront "can't verify the DNS record". Recorded
+//!   behaviour: a domain with no DNS record is answered with this rather than with
+//!   `invalid-configuration`. It is also the answer when there is no routing endpoint to
+//!   compare against.
+//!
+//! The names this service can resolve are the ones it is authoritative for and MINTED
+//! ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::resolved_cloudfront_endpoint`]):
+//! a name in a customer's own zone is published by DNS this emulator neither runs nor
+//! reaches, so it holds no record for one. This operation REPORTS: beyond the transitions
+//! the clock already owes, it writes nothing, so a verification cannot change what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -105,6 +122,67 @@ pub type VerifyDnsConfigurationError = crate::scaffolded::Scaffolded<VerifyDnsCo
 impl From<VerifyDnsConfigurationErrorModeled> for VerifyDnsConfigurationError {
     fn from(modeled: VerifyDnsConfigurationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// This operation's modelled refusal for a request whose arguments name no domain this
+/// service can verify — "An argument is invalid." — carrying the reason the argument was
+/// unusable.
+fn invalid_argument(reason: String) -> VerifyDnsConfigurationError {
+    VerifyDnsConfigurationErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(format!("An argument is invalid: {reason}")),
+    })
+    .into()
+}
+
+/// The `DnsConfiguration` reported for `domain`, given the `routing_endpoint` of the
+/// connection group the distribution tenant is routed through and the endpoint `domain`
+/// resolves to.
+///
+/// The one place the three statuses are decided, so the `Domain`-scoped call and the
+/// whole-tenant call cannot disagree about one domain.
+fn dns_configuration(
+    domain: &str,
+    routing_endpoint: Option<&str>,
+    resolved: Option<&str>,
+) -> DnsConfiguration {
+    let (status, reason) = match (routing_endpoint, resolved) {
+        // Nothing to compare against: the verification was not made, rather than made
+        // and failed.
+        (None, _) => (
+            crate::state::DNS_CONFIGURATION_UNKNOWN,
+            format!(
+                "The connection group of this distribution tenant has no routing endpoint, so \
+                 the DNS configuration of {domain} could not be verified."
+            ),
+        ),
+        (Some(endpoint), Some(resolved)) if crate::state::same_domain(resolved, endpoint) => (
+            crate::state::DNS_CONFIGURATION_VALID,
+            format!(
+                "{domain} points to {endpoint}, the routing endpoint of the connection group of \
+                 this distribution tenant."
+            ),
+        ),
+        (Some(endpoint), Some(resolved)) => (
+            crate::state::DNS_CONFIGURATION_INVALID,
+            format!(
+                "{domain} points to {resolved} instead of {endpoint}. Update the DNS record to \
+                 point to {endpoint}, the routing endpoint of the connection group of this \
+                 distribution tenant."
+            ),
+        ),
+        (Some(endpoint), None) => (
+            crate::state::DNS_CONFIGURATION_UNKNOWN,
+            format!(
+                "No DNS record for {domain} could be verified against {endpoint}, the routing \
+                 endpoint of the connection group of this distribution tenant."
+            ),
+        ),
+    };
+    DnsConfiguration {
+        domain: domain.to_string(),
+        status: status.to_string(),
+        reason: Some(reason),
     }
 }
 
@@ -144,18 +222,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyDnsConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyDnsConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyDnsConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "The domain name that you're verifying": a name that is no domain name at all
+        // names nothing to verify. Decided BEFORE the store lock is taken — it is a
+        // property of the request alone — under the service's ONE rule for the shape of a
+        // domain name, the same one the calls that associate a domain apply.
+        if let Some(domain) = &input.domain {
+            if let Some(reason) = crate::state::domain_name_refusal(domain) {
+                return Err(invalid_argument(reason));
+            }
+        }
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so the records this read
+        // compares are the ones they are at this instant.
+        store.settle(SystemTime::now());
+
+        // "The identifier of the distribution tenant. You can specify the ARN, ID, or name
+        // of the distribution tenant" — an identifier no tenant carries names no entity.
+        let Some(tenant) = store.distribution_tenant(&input.identifier) else {
+            return Err(VerifyDnsConfigurationErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+        // The scope: the one domain the request names, or every domain the STORED record
+        // holds, in the order it holds them. Either way the list is bounded by the store
+        // ([`crate::state::MAX_DOMAINS_PER_TENANT`]) rather than by a length the caller
+        // chose, so no request can make this walk — one store lookup per domain — grow.
+        let domains: Vec<String> = match &input.domain {
+            Some(domain) => vec![domain.clone()],
+            None => tenant.domains.clone(),
+        };
+        // The endpoint every domain in scope is compared against: the routing endpoint of
+        // the connection group this tenant is routed through, read from that group's
+        // record rather than from the request.
+        let routing_endpoint = store
+            .connection_group(&tenant.connection_group_id)
+            .map(|group| group.routing_endpoint.clone());
+
+        let dns_configuration_list: Vec<DnsConfiguration> = domains
+            .iter()
+            .map(|domain| {
+                let resolved = store.resolved_cloudfront_endpoint(domain);
+                dns_configuration(domain, routing_endpoint.as_deref(), resolved.as_deref())
+            })
+            .collect();
+
+        Ok(VerifyDnsConfigurationOutput {
+            // "The list of domain names, their statuses, and a description of each status."
+            dns_configuration_list: Some(dns_configuration_list),
+        })
     }
 }

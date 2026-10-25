@@ -116,6 +116,22 @@ fn clause(violation: &Violation) -> String {
     )
 }
 
+/// The clause this service states for a value past the maximum of a `@range`, for a
+/// handler to refuse with.
+///
+/// The validating walk checks the constraints the SCHEMA carries — the ones the member's
+/// TARGET shape declares — so an operation whose member narrows that range is the one
+/// place the narrower bound can be checked. Worded through [`clause`] rather than spelled
+/// out, so such a refusal is indistinguishable from the one the walk states for the same
+/// member and the same constraint class.
+pub fn value_above_maximum(member_path: &str, maximum: i32) -> String {
+    clause(&Violation {
+        path: member_path.to_string(),
+        kind: ViolationKind::MaxValue(maximum.to_string()),
+        value: None,
+    })
+}
+
 /// The member path as the clause names it: the framework's own path, with the three
 /// sequences the message format itself uses taken out of it.
 ///

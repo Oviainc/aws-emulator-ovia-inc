@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tenant) = store.distribution_tenant(&input.id) else {
             return Err(
                 CreateInvalidationForDistributionTenantErrorModeled::EntityNotFound(
-                    crate::state::distribution_tenant_not_found(&input.id),
+                    crate::state::distribution_tenant_not_found(),
                 )
                 .into(),
             );
@@ -278,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(owner) = store.distribution_tenants.get_mut(&tenant_id) else {
             return Err(
                 CreateInvalidationForDistributionTenantErrorModeled::EntityNotFound(
-                    crate::state::distribution_tenant_not_found(&input.id),
+                    crate::state::distribution_tenant_not_found(),
                 )
                 .into(),
             );

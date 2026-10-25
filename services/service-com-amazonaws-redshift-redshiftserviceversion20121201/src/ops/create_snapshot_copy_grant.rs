@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshotCopyGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshotCopyGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSnapshotCopyGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new snapshot copy grant into this service's store and reports it
+//! back: the name as given, the Key Management Service key it permits Amazon
+//! Redshift to use — the account's default key when the request names none —
+//! and the tags the request carried. A second create under the same name is
+//! refused with `SnapshotCopyGrantAlreadyExistsFault` and overwrites nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -103,7 +100,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateSnapshotCopyGrantError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateSnapshotCopyGrant")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateSnapshotCopyGrant",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateSnapshotCopyGrantErrorModeled {
     DependentServiceRequestThrottlingFault(DependentServiceRequestThrottlingFault),
@@ -112,6 +112,7 @@ pub enum CreateSnapshotCopyGrantErrorModeled {
     SnapshotCopyGrantAlreadyExistsFault(SnapshotCopyGrantAlreadyExistsFault),
     SnapshotCopyGrantQuotaExceededFault(SnapshotCopyGrantQuotaExceededFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,20 +164,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshotCopyGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotCopyGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshotCopyGrant"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateSnapshotCopyGrantErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The documented name syntax, checked under the same rule every other
+        // Redshift identifier is: the model bounds the member only at `len 0..`,
+        // so the constraint the service publishes for it is enforced here.
+        if let Err(message) = st::check_identifier(
+            st::SNAPSHOT_COPY_GRANT_NAME_RULE,
+            "SnapshotCopyGrantName",
+            &input.snapshot_copy_grant_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work: a resource can carry only so many tags,
+        // so a request carrying more entries than one resource may hold is
+        // refused on its length alone.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateSnapshotCopyGrantErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(tags.len())),
+                },
+            )
+            .into());
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateSnapshotCopyGrantErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound. The NAME
+        // is what an account's grants are unique on, so a second create under
+        // one name is refused and overwrites nothing.
+        if store
+            .snapshot_copy_grant(&input.snapshot_copy_grant_name)
+            .is_some()
+        {
+            return Err(
+                CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantAlreadyExistsFault(
+                    SnapshotCopyGrantAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cannot create the snapshot copy grant because a grant with the name {} already exists.",
+                            input.snapshot_copy_grant_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.snapshot_copy_grants.len() >= st::SNAPSHOT_COPY_GRANT_QUOTA {
+            return Err(
+                CreateSnapshotCopyGrantErrorModeled::SnapshotCopyGrantQuotaExceededFault(
+                    SnapshotCopyGrantQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of snapshot copy grants ({}).",
+                            st::SNAPSHOT_COPY_GRANT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record every later `DescribeSnapshotCopyGrants` reports verbatim:
+        // the name the request carried, the key it named — the account's default
+        // key when it named none — and the tags it carried (an empty list when
+        // it carried none, which is what the grant then has).
+        let grant = SnapshotCopyGrant {
+            snapshot_copy_grant_name: Some(input.snapshot_copy_grant_name.clone()),
+            kms_key_id: Some(
+                input
+                    .kms_key_id
+                    .clone()
+                    .unwrap_or_else(|| st::DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY.to_string()),
+            ),
+            tags: Some(tags),
+        };
+        store.snapshot_copy_grants.push(grant.clone());
+
+        Ok(CreateSnapshotCopyGrantOutput {
+            snapshot_copy_grant: Some(grant),
+        })
     }
 }

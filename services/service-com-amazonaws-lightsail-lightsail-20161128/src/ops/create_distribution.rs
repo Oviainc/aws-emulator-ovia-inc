@@ -384,9 +384,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `DetachCertificateFromDistribution` are what change it later.
                 certificate_name: input.certificate_name.clone(),
                 // The alternate domain names of a distribution are the domains
-                // of its attached certificate, and this slice holds no
-                // certificate records to read them from, so a created
-                // distribution reports none of its own.
+                // of its attached certificate, and
+                // `AttachCertificateToDistribution` is what attaches one and
+                // publishes them — so a distribution this call created reports
+                // none of its own.
                 alternative_domain_names: Vec::new(),
                 origin: Origin {
                     name: Some(origin_name.clone()),

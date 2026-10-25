@@ -201,11 +201,14 @@ async fn deploy_api(
 }
 
 /// The answer to one request: its status, its `x-amzn-errortype`, the `sec-websocket-accept`
-/// header it carries (or `None`), and its parsed body.
+/// and `location` headers it carries (or `None`), and its parsed body.
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) error_type: Option<String>,
     pub(crate) accept: Option<String>,
+    /// Where a redirect sends the caller — the header the HTTP data plane answers an
+    /// `HTTP_PROXY` upstream with (`http_api_jwt_data_plane`).
+    pub(crate) location: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -249,6 +252,7 @@ pub(crate) async fn send(
     };
     let error_type = header("x-amzn-errortype");
     let accept = header("sec-websocket-accept");
+    let location = header("location");
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -259,6 +263,7 @@ pub(crate) async fn send(
         status,
         error_type,
         accept,
+        location,
         body,
     }
 }
@@ -573,17 +578,6 @@ async fn what_the_socket_front_door_does_not_claim() {
             .await,
         ),
         (
-            "a handshake on an HTTP-protocol api's stage, whose data plane is its routes",
-            handshake(
-                &emulator,
-                &plain.endpoint_host,
-                "/live",
-                "Upgrade",
-                "websocket",
-            )
-            .await,
-        ),
-        (
             "a handshake on the @connections path space, which ApiGatewayManagementApi \
              models",
             handshake(
@@ -621,6 +615,31 @@ async fn what_the_socket_front_door_does_not_claim() {
             answer.summary()
         );
     }
+
+    // An upgrade request to an HTTP api's stage is an ordinary HTTP request to that api's
+    // routes, so it belongs to the HTTP data plane (`src/service/invoke.rs`) and not to
+    // this one: the api serves the host, nothing of it matches `GET /`, and the answer is
+    // that data plane's `404` rather than this module's capability refusal. What is pinned
+    // here is only that the WEBSOCKET plane did not answer it.
+    let on_an_http_api = handshake(
+        &emulator,
+        &plain.endpoint_host,
+        "/live",
+        "Upgrade",
+        "websocket",
+    )
+    .await;
+    assert_ne!(
+        on_an_http_api.status, NOT_IMPLEMENTED,
+        "a handshake on an HTTP api's stage must not be answered by the WebSocket data \
+         plane, got {}",
+        on_an_http_api.summary()
+    );
+    assert_eq!(
+        on_an_http_api.accept, None,
+        "no upgrade happened, so no Sec-WebSocket-Accept is sent, got {}",
+        on_an_http_api.summary()
+    );
     let _ = (&socket.api_id, &plain.api_id, &plain.stage);
 }
 

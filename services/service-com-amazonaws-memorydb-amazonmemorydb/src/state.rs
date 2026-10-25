@@ -382,6 +382,36 @@ pub const ENGINE_VALKEY: &str = "valkey";
 /// and its major version (`memorydb_redis7`, `memorydb_valkey7`).
 const PARAMETER_GROUP_FAMILY_PREFIX: &str = "memorydb_";
 
+/// The VARIANT parameter group families MemoryDB publishes of an engine line, as a
+/// suffix on the line's family name, per engine and major version.
+///
+/// A parameter group family is not always just an engine at a major version: the
+/// vector-search PREVIEW line is a family of its own
+/// (`memorydb_redis7.search.preview`), with its own `default.<family>` group and its own
+/// name a `CreateParameterGroup` can name. The engine versions themselves publish only
+/// the line's base family, so a variant is listed here rather than derived from
+/// [`ENGINE_VERSIONS`] alone.
+///
+/// Source: the `default.<family>` parameter groups the recorded MemoryDB endpoint
+/// reports for an account that created none (see [`default_parameter_groups`]).
+const FAMILY_VARIANTS: &[(&str, u32, &[&str])] = &[(ENGINE_REDIS, 7, &[".search.preview"])];
+
+/// The engine lines MemoryDB provides a SEARCH-enabled default parameter group for,
+/// as `(engine, major version)`.
+///
+/// The vector-search engine is a setting of the line's own family rather than a family
+/// of its own, so the group this names — the line's `default.` group with
+/// [`SEARCH_DEFAULT_GROUP_SUFFIX`] on it — is a SECOND baseline of that same family: it
+/// reports the family the line publishes, like every other group of it.
+///
+/// Source: the `default.<family>` parameter groups the recorded MemoryDB endpoint
+/// reports for an account that created none (see [`default_parameter_groups`]).
+const SEARCH_DEFAULT_GROUP_LINES: &[(&str, u32)] = &[(ENGINE_REDIS, 7), (ENGINE_VALKEY, 7)];
+
+/// What the search-enabled default parameter group of a line is named after the line's
+/// own default group.
+const SEARCH_DEFAULT_GROUP_SUFFIX: &str = ".search";
+
 impl EngineVersion {
     /// `EngineVersionInfo$EngineVersion` — "The engine version": `<major>.<minor>`.
     pub fn version(&self) -> String {
@@ -601,16 +631,45 @@ const GENERATION_REDIS7: u32 = 1;
 /// carry.
 const GENERATION_VALKEY: u32 = 2;
 
+/// The engine line `family` belongs to: a VARIANT family carries the engine defaults of
+/// the family it varies (`memorydb_valkey7.search` → `memorydb_valkey7`), and a family
+/// that is no published variant is its own base.
+///
+/// Every answer about a family's engine defaults — its generation, its parameters, the
+/// earliest release one of them applies to — is resolved through here, so a variant
+/// family cannot end up reporting nothing just because no engine version names it. It is
+/// on the hot path of a parameter listing (once per reported parameter), so the family
+/// name is compared in place rather than rebuilt.
+pub fn base_parameter_group_family(family: &str) -> &str {
+    for (engine, major, variants) in FAMILY_VARIANTS {
+        for variant in *variants {
+            let Some(base) = family.strip_suffix(*variant) else {
+                continue;
+            };
+            let names_this_line = base
+                .strip_prefix(PARAMETER_GROUP_FAMILY_PREFIX)
+                .and_then(|line| line.strip_prefix(*engine))
+                .is_some_and(|version| version.parse::<u32>().is_ok_and(|read| read == *major));
+            if names_this_line {
+                return base;
+            }
+        }
+    }
+    family
+}
+
 /// The generation of engine defaults the parameter group family `family` carries, or
-/// `None` when no published engine version belongs to that family.
+/// `None` when no published engine version belongs to that family's engine line.
 ///
 /// This is how a family's parameters FOLLOW the engine catalog: a family name is
 /// resolved against [`ENGINE_VERSIONS`] rather than against a second list of families,
-/// so a family carries engine defaults exactly when an engine version publishes it.
+/// so a family carries engine defaults exactly when an engine version publishes its
+/// line ([`base_parameter_group_family`] maps a variant onto that line).
 pub fn family_generation(family: &str) -> Option<u32> {
+    let base = base_parameter_group_family(family);
     ENGINE_VERSIONS
         .iter()
-        .find(|version| version.parameter_group_family() == family)
+        .find(|version| version.parameter_group_family() == base)
         .map(version_generation)
 }
 
@@ -632,30 +691,99 @@ pub fn family_parameters(family: &str) -> Vec<&'static EngineParameter> {
 }
 
 /// Every parameter group family this service publishes, in catalog order and each one
-/// once.
+/// once: each engine line the catalog publishes, followed by that line's variants.
 ///
-/// DERIVED from [`ENGINE_VERSIONS`], exactly as [`family_generation`] resolves a family
-/// against the catalog: a family exists precisely when a published engine version names
-/// it, so the families this list reports and the families `DescribeEngineVersions`
-/// reports cannot disagree. Several versions of one engine's major version share a
-/// family ([`EngineVersion::parameter_group_family`]), so the duplicates are dropped.
+/// DERIVED from [`ENGINE_VERSIONS`] and the variants of each line
+/// ([`FAMILY_VARIANTS`]), exactly as [`family_generation`] resolves a family: a family
+/// exists precisely when a published engine version names its line, so the families
+/// this list reports and the engine lines `DescribeEngineVersions` reports cannot
+/// disagree. Several versions of one engine's major version share a family
+/// ([`EngineVersion::parameter_group_family`]), so the duplicates are dropped.
 pub fn parameter_group_families() -> Vec<String> {
     let mut families: Vec<String> = Vec::new();
     for version in ENGINE_VERSIONS {
         let family = version.parameter_group_family();
-        if !families.contains(&family) {
-            families.push(family);
+        if families.contains(&family) {
+            continue;
+        }
+        let variants = FAMILY_VARIANTS
+            .iter()
+            .filter(|(engine, major, _)| *engine == version.engine && *major == version.major)
+            .flat_map(|(_, _, variants)| variants.iter());
+        families.push(family.clone());
+        for variant in variants {
+            families.push(format!("{family}{variant}"));
         }
     }
     families
 }
 
-/// The name of the parameter group MemoryDB itself provides for `family`: the
-/// [`DEFAULT_PARAMETER_GROUP_PREFIX`] followed by the family name with its underscores
-/// written as hyphens (`memorydb_valkey7` → `default.memorydb-valkey7`).
+/// One parameter group MemoryDB itself provides in every account: the baseline a caller
+/// reads without creating anything.
 ///
-/// The family is the only input, so the group's name, its family and the parameters it
-/// reports all follow the one engine catalog.
+/// The three members are held together because they do NOT all follow from one another:
+/// the search baseline of an engine line reports the LINE's family under a name of its
+/// own, so a default group's family is not recoverable from its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultParameterGroup {
+    /// `ParameterGroup$Name`.
+    pub name: String,
+    /// `ParameterGroup$Family`: the family whose engine defaults the group reports.
+    pub family: String,
+    /// `ParameterGroup$Description`: the service's own wording for the baseline the
+    /// group is of ([`default_parameter_group_description`]), which the recorded
+    /// per-family and search-preview groups confirm. The two search baselines are
+    /// described by the same template, since no documented rule produces another
+    /// wording for them from the family, the name or the request.
+    pub description: String,
+}
+
+/// The parameter groups MemoryDB itself provides in every account, each once.
+///
+/// One per family it publishes ([`parameter_group_families`], named by
+/// [`default_parameter_group_name`]), plus the SEARCH-enabled baseline of every line
+/// that has one ([`SEARCH_DEFAULT_GROUP_LINES`]): the vector-search engine is a setting
+/// of its line's family, so that group reports the line's own family while its name and
+/// its description name the search baseline it is.
+///
+/// Source: the groups the recorded MemoryDB endpoint reports for an account that
+/// created none — `default.memorydb-redis6`, `default.memorydb-redis7`,
+/// `default.memorydb-redis7.search`, `default.memorydb-redis7.search.preview`,
+/// `default.memorydb-valkey7` and `default.memorydb-valkey7.search`.
+pub fn default_parameter_groups() -> Vec<DefaultParameterGroup> {
+    let mut groups: Vec<DefaultParameterGroup> = Vec::new();
+    for family in parameter_group_families() {
+        groups.push(DefaultParameterGroup {
+            name: default_parameter_group_name(&family),
+            family: family.clone(),
+            description: default_parameter_group_description(&family),
+        });
+        let line_has_search_baseline = SEARCH_DEFAULT_GROUP_LINES
+            .iter()
+            .any(|(engine, major)| family == line_family(engine, *major));
+        if line_has_search_baseline {
+            // The baseline this group is of is the line's family WITH the search
+            // suffix, which is what its name and its description are built from; the
+            // family it reports is the line's own.
+            let baseline = format!("{family}{SEARCH_DEFAULT_GROUP_SUFFIX}");
+            groups.push(DefaultParameterGroup {
+                name: default_parameter_group_name(&baseline),
+                family,
+                description: default_parameter_group_description(&baseline),
+            });
+        }
+    }
+    groups
+}
+
+/// The parameter group family of the engine line `engine` at major version `major`.
+fn line_family(engine: &str, major: u32) -> String {
+    format!("{PARAMETER_GROUP_FAMILY_PREFIX}{engine}{major}")
+}
+
+/// The name of the parameter group MemoryDB itself provides for the baseline `family`:
+/// the [`DEFAULT_PARAMETER_GROUP_PREFIX`] followed by the family name with its
+/// underscores written as hyphens (`memorydb_valkey7` → `default.memorydb-valkey7`).
 pub fn default_parameter_group_name(family: &str) -> String {
     format!(
         "{DEFAULT_PARAMETER_GROUP_PREFIX}{}",
@@ -664,8 +792,8 @@ pub fn default_parameter_group_name(family: &str) -> String {
 }
 
 /// `ParameterGroup$Description` of a group MemoryDB itself provides: the service's own
-/// wording for the family baseline, so a default group reports a description like every
-/// other stored group rather than an absent member.
+/// wording for the baseline it is of, so a default group reports a description like
+/// every other stored group rather than an absent member.
 pub fn default_parameter_group_description(family: &str) -> String {
     format!("Default parameter group for {family}")
 }
@@ -673,11 +801,12 @@ pub fn default_parameter_group_description(family: &str) -> String {
 /// Why `family` is not a parameter group family this service publishes, or `None` when it
 /// is one.
 ///
-/// A family EXISTS precisely when a published engine version names it
-/// ([`parameter_group_families`] is derived from [`ENGINE_VERSIONS`], as
-/// [`family_generation`] resolves one), so a group created in any other family would
-/// carry no engine defaults at all: nothing to describe, and nothing an update could
-/// name. The message is built from the request — the member and the value it sent for it.
+/// A family EXISTS precisely when a published engine version names its engine line
+/// ([`parameter_group_families`] is derived from [`ENGINE_VERSIONS`] and the variants of
+/// each line, as [`family_generation`] resolves one), so a group created in any other
+/// family would carry no engine defaults at all: nothing to describe, and nothing an
+/// update could name. The message is built from the request — the member and the value
+/// it sent for it.
 pub fn parameter_group_family_rejection(family: &str) -> Option<String> {
     family_generation(family)
         .is_none()
@@ -761,14 +890,16 @@ impl EngineParameter {
     /// Family-relative, because a parameter is only ever reported as one family's
     /// listing: the earliest release a Valkey family's setting can apply to is the
     /// earliest Valkey release, whatever a Redis OSS family publishes for a setting of
-    /// the same name. DERIVED from [`ENGINE_VERSIONS`], so it can never name a release
-    /// this service does not offer; `None` when no published release of the family
-    /// carries the parameter at all.
+    /// the same name. A variant family reports its own engine line's releases
+    /// ([`base_parameter_group_family`]). DERIVED from [`ENGINE_VERSIONS`], so it can
+    /// never name a release this service does not offer; `None` when no published
+    /// release of the family carries the parameter at all.
     pub fn minimum_engine_version(&self, family: &str) -> Option<String> {
+        let base = base_parameter_group_family(family);
         ENGINE_VERSIONS
             .iter()
             .filter(|version| {
-                version.parameter_group_family() == family
+                version.parameter_group_family() == base
                     && self.covers_generation(version_generation(version))
             })
             .min_by_key(|version| (version.major, version.minor, version.patch))
@@ -1607,22 +1738,20 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 arn: acl_arn(region, OPEN_ACCESS_ACL_NAME),
             },
         );
-        // One default parameter group per parameter group family: MemoryDB provides the
-        // family baseline in every account, so a caller can read a family's engine
-        // defaults (and compare a custom group against them) without creating anything.
-        // The families come from the engine catalog
-        // ([`parameter_group_families`]), so the groups that exist here are exactly the
-        // families `DescribeEngineVersions` reports.
-        for family in parameter_group_families() {
-            let name = default_parameter_group_name(&family);
-            let description = default_parameter_group_description(&family);
-            let arn = parameter_group_arn(region, &name);
+        // The default parameter groups MemoryDB provides in every account, so a caller
+        // can read a family's engine defaults (and compare a custom group against them)
+        // without creating anything. Both the groups and the family each one reports
+        // come from the engine catalog ([`default_parameter_groups`]), so the groups
+        // that exist here cannot disagree with the engine lines
+        // `DescribeEngineVersions` reports.
+        for group in default_parameter_groups() {
+            let arn = parameter_group_arn(region, &group.name);
             self.parameter_groups.insert(
-                name.clone(),
+                group.name.clone(),
                 StoredParameterGroup {
-                    name,
-                    family,
-                    description,
+                    name: group.name,
+                    family: group.family,
+                    description: group.description,
                     arn,
                     // The family baseline overrides nothing: every parameter a default
                     // group reports is its family's engine default, and the group is

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_memorydb_amazonmemorydb::state::{
-    default_parameter_group_name, parameter_group_families, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
+    default_parameter_groups, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
 };
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -213,14 +213,15 @@ fn group_names(body: &Value, case: &str) -> Vec<String> {
 }
 
 /// Every name a full listing must report, in name order: the groups a row created plus
-/// the `default.<family>` groups MemoryDB itself provides in every account (one per
-/// family of the engine catalog), which exist without being created.
+/// the `default.*` groups MemoryDB itself provides in every account (one per family of
+/// the engine catalog, plus the search baseline of every line that has one), which
+/// exist without being created.
 fn expected_listing(created: &[&str]) -> Vec<String> {
     let mut names: Vec<String> = created.iter().map(|name| name.to_string()).collect();
     names.extend(
-        parameter_group_families()
-            .iter()
-            .map(|family| default_parameter_group_name(family)),
+        default_parameter_groups()
+            .into_iter()
+            .map(|group| group.name),
     );
     names.sort();
     names
@@ -478,8 +479,8 @@ async fn deleting_a_parameter_group_removes_it_from_state() {
 
     // Every group MemoryDB itself owns is refused, whichever family it belongs to, and
     // is still there afterwards.
-    for family in parameter_group_families() {
-        let name = default_parameter_group_name(&family);
+    for group in default_parameter_groups() {
+        let name = group.name;
         let request = json!({ "ParameterGroupName": name });
         let (status, refused) = call(&router, "DeleteParameterGroup", &request).await;
         assert_eq!(

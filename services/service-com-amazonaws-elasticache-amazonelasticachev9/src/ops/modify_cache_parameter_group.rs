@@ -262,10 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             let Some(parameter) = store.family_parameter(&family, &parameter_name) else {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value {parameter_name} for ParameterName: cache parameter group \
-                     family {family} publishes no such parameter."
-                )));
+                return Err(invalid_parameter_value(
+                    crate::state::unknown_parameter_message(&parameter_name),
+                ));
             };
             if let Err(message) = crate::state::check_parameter_value(parameter, &value) {
                 return Err(invalid_parameter_value(message));

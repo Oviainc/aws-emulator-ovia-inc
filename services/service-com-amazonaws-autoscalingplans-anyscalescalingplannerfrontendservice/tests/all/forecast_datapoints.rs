@@ -30,8 +30,6 @@
 //! The harness (router, dispatch, instruction builder) is reused from
 //! [`crate::scaling_plan_lifecycle`]; nothing here builds a second one.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::get_scaling_plan_resource_forecast_data::{
@@ -40,13 +38,12 @@ use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice
 };
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 
-use crate::scaling_plan_lifecycle::{error_code, error_message, instruction, stack_source, Emulator};
+use crate::scaling_plan_lifecycle::{
+    instruction, now_secs, stack_source, Emulator, DAY_SECONDS as DAY,
+};
 
 /// The operation under test.
 const OPERATION: &str = "GetScalingPlanResourceForecastData";
-
-/// Seconds in a day, for placing windows.
-const DAY: i64 = 86_400;
 
 /// The Auto Scaling group every plan here scales. `ResourceId` "consists of a prefix
 /// (autoScalingGroup) followed by the name of a specified Auto Scaling group (my-asg)".
@@ -74,14 +71,6 @@ const MODE_FORECAST_ONLY: &str = "ForecastOnly";
 /// magnitude: the two sides of every relation below are computed from the same double in
 /// a different order, so only floating-point slack separates them.
 const TOLERANCE: f64 = 1e-9;
-
-/// Now, as the epoch seconds an `awsJson1_1` timestamp is carried as.
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("a host clock at or after the epoch")
-        .as_secs() as i64
-}
 
 /// The start of the forecast interval containing now.
 fn current_interval_start() -> i64 {
@@ -642,27 +631,16 @@ async fn a_forecast_is_reported_only_for_a_resource_a_stored_plan_instructs() {
              resource, so its forecast is not empty"
         );
 
-        // A plan this service does not hold is refused instead: a resource a held plan
-        // does not instruct has no forecast, but a plan that is not held has no resources
-        // at all. Both resource ids are tried, so the refusal follows the plan lookup and
+        // A plan this service does not hold reads like a resource no held plan instructs:
+        // nothing to forecast, so the empty list — this operation models no not-found
+        // error. Both resource ids are tried, so the answer follows the plan lookup and
         // not the resource.
         for resource in [RESOURCE, OTHER_RESOURCE] {
-            let (status, body) = emulator
-                .call(
-                    OPERATION,
-                    &forecast_request(ABSENT_PLAN, resource, data_type, window),
-                )
-                .await;
-            let expected = format!(
-                "No scaling plan found for scaling plan name: {ABSENT_PLAN}, \
-                 version: {ONLY_VERSION}"
-            );
-            let message = error_message(&body);
-            assert_eq!(
-                (status, error_code(&body), message),
-                (400, "ValidationException", expected.as_str()),
-                "case an absent plan / {resource} / {data_type}: expected a 400 \
-                 ValidationException saying {expected:?}, got {status} with {body}"
+            let got = points(&emulator, ABSENT_PLAN, resource, data_type, window).await;
+            assert!(
+                got.is_empty(),
+                "case an absent plan / {resource} / {data_type}: nothing is held for this \
+                 plan, so there is no forecast, got {got:?}"
             );
         }
     }
