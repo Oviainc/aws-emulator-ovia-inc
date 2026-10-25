@@ -79,7 +79,10 @@ async fn call_as(
 
 /// A `CreateReportGroup` request body: every member the operation models as required,
 /// plus `tags` when the case supplies them.
-fn create_report_group_body(
+///
+/// `pub(crate)` because `tests/all/delete_report_group.rs` seeds its groups the same
+/// way rather than growing a second copy of this builder.
+pub(crate) fn create_report_group_body(
     name: &str,
     report_type: &str,
     export_config: Value,

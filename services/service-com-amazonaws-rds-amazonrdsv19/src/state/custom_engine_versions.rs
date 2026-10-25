@@ -16,8 +16,10 @@
 //! parameter group family and the capability members of its engine — is computed from the
 //! engine-version catalogue rather than stored twice.
 
-use super::ARN_NAMESPACE;
-use crate::ops::types::Tag;
+use std::time::Instant;
+
+use super::{PendingChange, PendingStatus, ARN_NAMESPACE};
+use crate::ops::types::{Tag, CUSTOM_ENGINE_VERSION_STATUS_VALUES};
 
 /// How many custom engine versions one region holds. The cap is this emulator's, for the
 /// reason every other per-region quota in `src/state.rs` exists: it bounds the store and
@@ -25,13 +27,35 @@ use crate::ops::types::Tag;
 /// `CustomDBEngineVersionQuotaExceededFault` reports.
 pub const CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION: usize = 20;
 
-/// The `Status` a created CEV reports: the first value
+/// The `Status` a CEV reports once this service has finished creating it: the first value
 /// `ModifyCustomDBEngineVersion$Status` publishes ("`available` — You can use this CEV to
 /// create a new RDS Custom DB instance"), and the status `DescribeDBEngineVersions` lists
-/// an engine version under by default. A create answers with a CEV already in it, so this
-/// service owes a new CEV no status transition; `ModifyCustomDBEngineVersion` is what moves
-/// a CEV to another status afterwards ("you can change any status to any status").
+/// an engine version under by default. `ModifyCustomDBEngineVersion` is what moves a CEV
+/// between this status and the other availability statuses afterwards ("you can change any
+/// status to any status").
 pub const CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE: &str = "available";
+
+/// The `Status` a CEV reports while this service is still creating it.
+///
+/// A CEV is built from media the account supplies, which RDS imports AFTER the create is
+/// accepted — `ModifyCustomDBEngineVersion`'s own documentation names "the MediaImport
+/// service that imports files from Amazon S3 to create CEVs" — so a create answers with a
+/// CEV that is not usable yet, and this service owes it the move to
+/// [`CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE`] a moment later (`super::STATUS_TRANSITION_DELAY`).
+/// It is not one of the availability statuses, so a CEV in it is neither reported by
+/// default nor modifiable ([`custom_engine_version_is_modifiable`]).
+pub const CUSTOM_ENGINE_VERSION_STATUS_CREATING: &str = "creating";
+
+/// Whether a CEV in `status` is one `ModifyCustomDBEngineVersion` can change.
+///
+/// The availability statuses that operation's `Status` member publishes are exactly the
+/// ones a CEV can be moved between — "you can change any status to any status" ranges over
+/// those — so a CEV in any OTHER status is one whose creation has not settled yet, and
+/// changing it is refused with the modelled `InvalidCustomDBEngineVersionStateFault` rather
+/// than applied.
+pub fn custom_engine_version_is_modifiable(status: &str) -> bool {
+    CUSTOM_ENGINE_VERSION_STATUS_VALUES.contains(&status)
+}
 
 /// The engines a custom engine version can be created for, as
 /// `CreateCustomDBEngineVersion$Engine` publishes them: the four RDS Custom for Oracle
@@ -132,6 +156,9 @@ pub struct CustomDbEngineVersionRecord {
     pub database_installation_files: Vec<String>,
     /// `Status`.
     pub status: String,
+    /// The status change the clock owes this record, if any: the move out of
+    /// [`CUSTOM_ENGINE_VERSION_STATUS_CREATING`] a create owes it.
+    pub pending_status: Option<PendingStatus>,
     /// `CreateTime`.
     pub create_time: ::aws_smithy_types::DateTime,
     /// `Tags`, reported as `TagList`.
@@ -139,6 +166,26 @@ pub struct CustomDbEngineVersionRecord {
 }
 
 impl CustomDbEngineVersionRecord {
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, so the caller drops it from the store.
+    pub(super) fn settle(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
+        }
+        false
+    }
+
     /// This record's store key within its region.
     pub fn key(&self) -> String {
         custom_db_engine_version_key(&self.engine, &self.engine_version)

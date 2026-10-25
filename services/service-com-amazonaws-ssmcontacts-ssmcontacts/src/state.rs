@@ -757,6 +757,94 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
         }
     }
 
+    /// Resolve every resource the `Plan` a request carries NAMES, against this store.
+    ///
+    /// A plan is a graph of references: each `Stage`'s `Target` names either a contact
+    /// channel (`ChannelTargetInfo$ContactChannelId`, `@required` inside the target) or a
+    /// contact (`ContactTargetInfo$ContactId`), and a plan's `RotationIds` name on-call
+    /// rotations. Every one of them is an `SsmContactsArn`, and an ARN is only a reference:
+    /// the resource it names is this store's to resolve. A plan naming something the account
+    /// does not hold would engage nothing, so the write that would persist it is refused
+    /// instead — which is why this is checked by every operation that STORES a plan, with
+    /// the message it refuses the caller with.
+    ///
+    /// `contact_arn` is the contact whose plan this is, which a `ContactTargetInfo` may name
+    /// as well: that reference is what an escalation plan is made of, including a plan that
+    /// names its own contact. A `ChannelTargetInfo` is resolved as a reference ONLY: nothing
+    /// in the model ties a channel to the contact whose plan targets it, and a page is
+    /// attributed to the contact the channel itself belongs to
+    /// ([`ContactChannelRecord::contact_arn`]), which is how a plan reaches a person by
+    /// naming their channel.
+    ///
+    /// This resolves the plan at WRITE time only. A reference that stops resolving later —
+    /// the channel or rotation it names is deleted — leaves the stored plan alone and is
+    /// skipped when the plan is engaged, which is what `DeleteContactChannel` documents.
+    ///
+    /// The walk itself is BOUNDED, by [`MAX_PLAN_STAGES`] and [`MAX_PLAN_TARGETS`]: the
+    /// modelled `StagesList`/`TargetsList` declare no length, so without a ceiling one
+    /// request would choose how much work is done under the store's lock and how large a
+    /// plan the store then holds. A plan past either ceiling is refused with the message,
+    /// before any of it is resolved.
+    pub fn resolve_plan(&self, contact_arn: &str, plan: &Plan) -> Result<(), String> {
+        let stages = plan.stages.as_ref().map_or(0, Vec::len);
+        if stages > MAX_PLAN_STAGES {
+            return Err(plan_too_large_message("plan.stages", stages, MAX_PLAN_STAGES));
+        }
+        let targets: usize = plan
+            .stages
+            .iter()
+            .flatten()
+            .map(|stage| stage.targets.len())
+            .sum();
+        if targets > MAX_PLAN_TARGETS {
+            return Err(plan_too_large_message(
+                "plan.stages.targets",
+                targets,
+                MAX_PLAN_TARGETS,
+            ));
+        }
+        let rotation_ids = plan.rotation_ids.as_ref().map_or(0, Vec::len);
+        if rotation_ids > MAX_PLAN_ROTATION_IDS {
+            return Err(plan_too_large_message(
+                "plan.rotationIds",
+                rotation_ids,
+                MAX_PLAN_ROTATION_IDS,
+            ));
+        }
+
+        for stage in plan.stages.iter().flatten() {
+            for target in &stage.targets {
+                if target.channel_target_info.is_none() && target.contact_target_info.is_none() {
+                    return Err(TARGET_WITHOUT_TARGET_INFO_MESSAGE.to_string());
+                }
+                if let Some(channel_target) = &target.channel_target_info {
+                    let channel_arn = &channel_target.contact_channel_id;
+                    if !self.contact_channels.contains_key(channel_arn) {
+                        return Err(invalid_resource_arn_message(channel_arn));
+                    }
+                }
+                if let Some(contact_target) = &target.contact_target_info {
+                    let Some(target_arn) = contact_target
+                        .contact_id
+                        .as_deref()
+                        .filter(|arn| !arn.is_empty())
+                    else {
+                        return Err(CONTACT_TARGET_WITHOUT_CONTACT_ID_MESSAGE.to_string());
+                    };
+                    if target_arn != contact_arn && !self.contacts.contains_key(target_arn) {
+                        return Err(invalid_resource_arn_message(target_arn));
+                    }
+                }
+            }
+        }
+        for rotation_arn in plan.rotation_ids.iter().flatten() {
+            if !self.rotations.contains_key(rotation_arn) {
+                return Err(invalid_resource_arn_message(rotation_arn));
+            }
+        }
+        Ok(())
+    }
+
     /// [`tags_of`](Self::tags_of), for the operations that write the list back.
     pub fn tags_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
         match self.contacts.get_mut(arn) {
@@ -772,6 +860,24 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
 // ---------------------------------------------------------------------------
 // Store bounds
 // ---------------------------------------------------------------------------
+
+/// How many stages ONE stored `Plan` may carry.
+///
+/// This is the EMULATOR's own ceiling, not a claim about an AWS account quota: the modelled
+/// `StagesList` declares no length, so without a bound one request chooses both how much
+/// resolving happens under the store's lock and how large a plan every later reader walks.
+/// It sits far above any realistic engagement or escalation plan, so nothing a client does
+/// legitimately reaches it.
+pub const MAX_PLAN_STAGES: usize = 100;
+
+/// The same bound for the targets of ONE plan, summed over its stages: the modelled
+/// `TargetsList` declares no length either. See [`MAX_PLAN_STAGES`].
+pub const MAX_PLAN_TARGETS: usize = 1_000;
+
+/// The same bound for a plan's `RotationIds`, which the model DOES constrain (`length`
+/// 0..25): the ceiling is that published maximum, so the resolver bounds the member even
+/// where it is reached other than through the request boundary.
+pub const MAX_PLAN_ROTATION_IDS: usize = 25;
 
 /// How many contacts this store holds before a NEW create is refused with the modelled
 /// `ServiceQuotaExceededException`.
@@ -1286,9 +1392,31 @@ pub fn invalid_resource_arn_message(arn: &str) -> String {
     format!("Invalid value provided - Invalid resource Arn {arn}")
 }
 
+/// The message a plan is refused with when one of its lists is longer than the resolver
+/// walks: it names the member, the length the request carried and the ceiling.
+pub fn plan_too_large_message(member: &str, carried: usize, ceiling: usize) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: Member must hold at most \
+         {ceiling} entries, got {carried}"
+    )
+}
+
+/// The message a plan is refused with when one of its targets carries neither
+/// `ChannelTargetInfo` nor `ContactTargetInfo`: the modelled `Target` makes both members
+/// optional, but a target that names no channel and no contact engages nothing.
+pub const TARGET_WITHOUT_TARGET_INFO_MESSAGE: &str =
+    "Value at 'plan.stages.targets' failed to satisfy constraint: Member must carry one of \
+     channelTargetInfo or contactTargetInfo";
+
+/// The message a plan is refused with when a `ContactTargetInfo` carries no `ContactId`:
+/// the member is modelled optional, but a contact target that names no contact engages
+/// nothing.
+pub const CONTACT_TARGET_WITHOUT_CONTACT_ID_MESSAGE: &str =
+    "Value at 'plan.stages.targets.contactTargetInfo' failed to satisfy constraint: Member \
+     must carry contactId";
+
 /// `Ok` with `key`'s value when `tag` carries a key, else the `ValidationException` message
-/// saying so.
-///
+/// saying so.///
 /// The modelled `Tag` makes both members optional, but a tag with no `Key` names nothing to
 /// store, read back or remove, so it is refused rather than persisted.
 pub fn require_tag_key(tag: &Tag) -> Result<&str, String> {

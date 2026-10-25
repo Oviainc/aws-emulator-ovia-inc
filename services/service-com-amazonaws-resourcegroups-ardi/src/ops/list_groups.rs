@@ -4,7 +4,8 @@
 //!
 //! Reports one `GroupIdentifier` per persisted group, in group-name order, computed from
 //! [`crate::state`]. A page carries at most `MaxResults` identifiers and, when more
-//! remain, a `NextToken` the next call resumes after.
+//! remain, a `NextToken` the next call resumes after. Every `Filters` entry narrows the
+//! listing to the groups whose named attribute carries one of its values.
 //!
 //! ## Shape of an operation
 //!
@@ -186,29 +187,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every name the modelled `GroupFilterName` declares is answered from the
+        // stored record below; any other name selects no attribute at all, so a
+        // request carrying one is refused rather than answered with a listing it
+        // did not ask for.
         let filters = input.filters.unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(bad_request(format!(
+                "Filters carries {} filters, which is more than the {MAX_FILTERS} this \
+                 emulator applies in one call",
+                filters.len(),
+            )));
+        }
         for filter in &filters {
-            match filter.name.as_str() {
-                "criticality" | "display-name" | "owner" => {}
-                // Both read data this slice does not hold: a group's service
-                // configuration (`GetGroupConfiguration` and
-                // `PutGroupConfiguration` are still scaffolded) and the resource
-                // types a group's query selects.
-                "configuration-type" | "resource-type" => {
-                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                        "ListGroups filtered by {}",
-                        filter.name,
-                    )));
-                }
-                other => {
-                    return Err(bad_request(format!(
-                        "Filters contains the filter name {}, which is not valid: expected one of {}",
-                        other,
-                        GROUP_FILTER_NAME_VALUES.join(", "),
-                    )));
-                }
+            if !GROUP_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
+                return Err(bad_request(format!(
+                    "Filters contains the filter name {}, which is not valid: expected one of {}",
+                    filter.name,
+                    GROUP_FILTER_NAME_VALUES.join(", "),
+                )));
             }
         }
+        // Whether the resource types a group's stored query is limited to are read
+        // at all for this call, so a request that asks for none pays for none.
+        let reads_query = filters
+            .iter()
+            .any(|filter| filter.name == RESOURCE_TYPE_FILTER);
 
         // The token is this service's own opaque encoding of the name the previous
         // page stopped at; anything else cannot name a resume point.
@@ -231,7 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let mut remaining: Vec<&crate::state::GroupRecord> = store
             .groups_in(&region)
-            .filter(|group| filters.iter().all(|filter| matches_filter(group, filter)))
+            .filter(|group| {
+                // Read ONCE per group however many filters the request carries, so
+                // the work one call asks for grows with the region's groups and not
+                // with their product with the filter list.
+                let query_resource_types = if reads_query {
+                    group.query_resource_types()
+                } else {
+                    Vec::new()
+                };
+                filters
+                    .iter()
+                    .all(|filter| matches_filter(group, filter, &query_resource_types))
+            })
             .collect();
         // The listing order is group-name order, which is what the resume key below
         // is compared against. One region's groups are stored in that order, and
@@ -267,6 +283,22 @@ const LISTING: &str = "groups";
 /// working the same way whether or not `MaxResults` was sent.
 const MAX_RESULTS: usize = 50;
 
+/// The most `Filters` entries this operation applies to one call.
+///
+/// NOT an AWS quota: the modelled `GroupFilterList` declares no length, and each
+/// entry's `Values` is modelled `1..5`. This is the emulator's own bound on the
+/// work ONE request can ask for, since every entry is evaluated against every
+/// group of the region: it caps that product beside the bound the store already
+/// puts on the groups themselves. The modelled `GroupFilterName` declares five
+/// names, so a caller can still send several value sets per name. Reaching it is
+/// a `BadRequestException`.
+const MAX_FILTERS: usize = 10;
+
+/// The modelled `GroupFilterName` value whose attribute is read out of a group's
+/// stored resource query — the one a listing reads per group rather than per
+/// filter.
+const RESOURCE_TYPE_FILTER: &str = "resource-type";
+
 /// How many identifiers one page carries, from the caller's `MaxResults`.
 ///
 /// The framework refuses a value outside the modelled range before this handler
@@ -286,17 +318,43 @@ fn page_size(max_results: Option<i32>) -> Result<usize, ListGroupsError> {
     }
 }
 
-/// Whether `group` satisfies one `GroupFilter`: the attribute the filter names
-/// equals one of its values. A group whose attribute is unset matches no value.
-/// The caller has already refused every filter name this slice cannot answer.
-fn matches_filter(group: &crate::state::GroupRecord, filter: &GroupFilter) -> bool {
-    let attribute = match filter.name.as_str() {
-        "criticality" => group.criticality.map(|rank| rank.to_string()),
-        "display-name" => group.display_name.clone(),
-        "owner" => group.owner.clone(),
-        _ => None,
-    };
-    attribute.is_some_and(|value| filter.values.contains(&value))
+/// Whether `group` satisfies one `GroupFilter`: the group attribute the filter
+/// names carries one of the filter's values.
+///
+/// Three of the modelled names (`criticality`, `display-name`, `owner`) name a
+/// single-valued attribute of the group, and a group whose attribute is unset
+/// carries no value and so matches none. The other two name a set-valued one:
+/// `configuration-type` the types the group's service configuration declares,
+/// `resource-type` the types the group's resource query is limited to (read from
+/// the record by the caller, as `query_resource_types`, so one listing reads a
+/// group's query once) — each matching when the set and the filter's values share
+/// a member, which is what "have the specified … type" asks for. A name the model
+/// does not declare is refused before this runs.
+fn matches_filter(
+    group: &crate::state::GroupRecord,
+    filter: &GroupFilter,
+    query_resource_types: &[String],
+) -> bool {
+    match filter.name.as_str() {
+        "criticality" => group
+            .criticality
+            .is_some_and(|rank| filter.values.contains(&rank.to_string())),
+        "display-name" => group
+            .display_name
+            .as_ref()
+            .is_some_and(|value| filter.values.contains(value)),
+        "owner" => group
+            .owner
+            .as_ref()
+            .is_some_and(|value| filter.values.contains(value)),
+        "configuration-type" => group
+            .configuration_types()
+            .any(|declared| filter.values.iter().any(|value| value == declared)),
+        RESOURCE_TYPE_FILTER => query_resource_types
+            .iter()
+            .any(|declared| filter.values.contains(declared)),
+        _ => false,
+    }
 }
 
 /// A `BadRequestException` (HTTP 400) — the modelled refusal for a request whose

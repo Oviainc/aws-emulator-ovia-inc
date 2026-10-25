@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `chime_family`: the request-claim rule for the six services that share the `chime`
+# SigV4 signing name, stated once rather than inlined in this service's `can_handle`.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

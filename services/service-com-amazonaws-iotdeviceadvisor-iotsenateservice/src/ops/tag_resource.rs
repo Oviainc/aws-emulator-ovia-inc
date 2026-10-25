@@ -154,12 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.into_iter().collect();
         let mut store = state.lock();
 
+        // An ARN the store holds no resource for is a lookup of the resource the request
+        // NAMED, so the refusal carries the service's single not-found template, built
+        // from the input member that identified it — the same wording every other lookup
+        // in this crate answers with.
         if !store.holds_tagged_resource(&input.resource_arn, &resource) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No IoT Device Advisor resource with resourceArn {}",
-                        input.resource_arn
+                    message: Some(crate::state::not_found_message(
+                        "resourceArn",
+                        &input.resource_arn,
                     )),
                 },
             )

@@ -46,13 +46,17 @@ const MAX_INVITATIONS: usize =
 
 /// One seeded invitation: the inviting account id, the invitation id and the instant it
 /// was sent in epoch milliseconds.
-type Seed = (String, String, i64);
+pub(crate) type Seed = (String, String, i64);
 
 /// Build `count` invitations that differ along every member the record carries: the
 /// inviting account id across the 12-digit `AccountId` space (`len 12..12` —
 /// `smithy_query(shape="AccountId")`), the shape of the invitation id (modelled as a
 /// plain `String`) and the instant the invitation was sent.
-fn seeds(count: usize) -> Vec<Seed> {
+///
+/// The inviting account ids ASCEND with the index, which is the order the inbox reads
+/// report them in — shared with the `invitation_delete` suite, so neither suite can
+/// drift from the other on what an inbox holds.
+pub(crate) fn seeds(count: usize) -> Vec<Seed> {
     (0..count)
         .map(|index| {
             (

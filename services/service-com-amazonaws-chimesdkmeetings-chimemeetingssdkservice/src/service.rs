@@ -45,34 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
-/// first segment (`"/"`, `""`).
-fn first_path_segment(path: &str) -> Option<&str> {
-    let segment = path.trim_start_matches('/').split('/').next()?;
-    (!segment.is_empty()).then_some(segment)
-}
-
-/// Whether `parts` addresses a path inside `path_segments` — the model-derived first URI
-/// path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
+/// This service's own `aws.api#service$endpointPrefix`, the name that identifies it
+/// among the six services that sign as `chime`.
 ///
-/// This mirrors the framework's own discriminator,
-/// `emulator_server::can_handle_based_on_route_key_and_path`. That helper takes a whole
-/// buffered `http::Request`, which the `Service::can_handle` seam below does not receive,
-/// so the rule is applied here over `Parts` instead of called. It is kept identical,
-/// including both edge cases: an EMPTY list means the model published no usable
-/// discriminator and is "no constraint", and the framework's own `ROOT_PATH_SEGMENT`
-/// sentinel is how a service that must answer `POST /` claims the root path without
-/// claiming every path. Matching is EXACT segment equality, deliberately never a prefix
-/// test.
-fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
-    if path_segments.is_empty() {
-        return true;
-    }
-    match first_path_segment(parts.uri.path()) {
-        Some(segment) => path_segments.contains(&segment),
-        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
-    }
-}
+/// Source: `smithy_query(query="service_info",
+/// model_path="services/service-com-amazonaws-chimesdkmeetings-chimemeetingssdkservice/\
+/// smithy-model/com-amazonaws-chimesdkmeetings-chimemeetingssdkservice.json")` —
+/// `awsService.endpointPrefix`.
+const OWN_ENDPOINT_PREFIX: &str = "meetings-chime";
 
 /// The `com-amazonaws-chimesdkmeetings-chimemeetingssdkservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -104,21 +84,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
         // This service signs as `chime` — a signing name it SHARES with every other
-        // Amazon Chime SDK service in this workspace (`service-com-amazonaws-chime-*`).
-        // The router's routing key comes from the SigV4 credential scope first, so all of
-        // them resolve to `chime` and matching on the signing name ALONE makes each one
-        // claim every `chime`-signed request.
+        // Amazon Chime SDK service in this workspace (`service-com-amazonaws-chime-*`),
+        // each of which serves its OWN endpoint (`chime`, `identity-chime`,
+        // `media-pipelines-chime`, `messaging-chime`, `voice-chime`). The router's
+        // routing key comes from the SigV4 credential scope first, so all of them resolve
+        // to `chime` and matching on the signing name ALONE makes each one claim every
+        // `chime`-signed request.
         //
-        // So the claim is narrowed the way the framework narrows its other signing-name
-        // collisions: the signing name must match AND the request must address this
-        // service's own modeled URI path space (`/meetings…`, `/tags`) — see
-        // `claims_modeled_path`.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
-                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
-            }
-            _ => false,
-        }
+        // So the claim is keyed on what identifies ONE service: the endpoint the request
+        // addresses, and failing that this model's own URI path space (`/meetings…`,
+        // `/tags`). That rule, and the readers for the path spaces the family shares,
+        // live once in `service-common` — this file used to carry its own copy of the
+        // path half, which could not tell this service's `/meetings` space from the
+        // legacy Amazon Chime endpoint's `/meetings/{MeetingId}/dial-outs`.
+        //
+        // This model owns the `/meetings` resource space; the legacy endpoint binds only
+        // the dial-out sub-space of it, so this service claims the COMPLEMENT of that one
+        // sub-space. (`/tags` is shared by five of the six and is resolved by endpoint
+        // prefix only — see `chime_family`.)
+        service_common::chime_family::claims_chime_family_request(
+            parts,
+            OWN_ENDPOINT_PREFIX,
+            crate::ROUTE_PATH_SEGMENTS,
+            |parts| {
+                let path = parts.uri.path();
+                service_common::chime_family::addresses_meeting_space(path)
+                    && !service_common::chime_family::addresses_meeting_dial_outs(path)
+            },
+        )
     }
 
     fn override_operation(

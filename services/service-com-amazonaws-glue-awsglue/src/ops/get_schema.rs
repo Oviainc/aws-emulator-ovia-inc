@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the schema set its `SchemaId` names, read from
+//! [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what `CreateSchema`
+//! persisted is what this reports, and a `SchemaId` naming nothing this endpoint holds is
+//! refused with `EntityNotFoundException`.
+//!
+//! A `SchemaId` carrying a `SchemaName` and no `RegistryName` addresses the default
+//! registry, which is the registry a `CreateSchema` that named none wrote into
+//! ([`crate::state::schema_reference`] is the one resolution both go through).
+//!
+//! This operation only REPORTS: it writes nothing, so a read never changes what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +175,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchema"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSchemaErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let reference = match crate::state::schema_reference(&input.schema_id, &region) {
+            Ok(reference) => reference,
+            Err(message) => {
+                return Err(GetSchemaErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+        // A schema ARN of another account or another Region names a schema of an estate
+        // this endpoint does not serve, so it names none here whatever this store holds
+        // under that name.
+        let (registry_name, schema_name) = match reference {
+            crate::state::Reference::Local(names) => names,
+            crate::state::Reference::Elsewhere((_, schema_name)) => {
+                return Err(GetSchemaErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::schema_not_found(&schema_name)),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+
+        let store = state.lock();
+        let Some(schema) = store.schema(&registry_name, &schema_name) else {
+            return Err(GetSchemaErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::schema_not_found(&schema_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSchemaOutput {
+            registry_name: Some(schema.registry_name.clone()),
+            registry_arn: Some(crate::state::registry_arn(&region, &schema.registry_name)),
+            schema_name: Some(schema.name.clone()),
+            schema_arn: Some(crate::state::schema_arn(
+                &region,
+                &schema.registry_name,
+                &schema.name,
+            )),
+            description: schema.description.clone(),
+            data_format: Some(schema.data_format.clone()),
+            compatibility: Some(schema.compatibility.clone()),
+            schema_checkpoint: Some(schema.checkpoint),
+            latest_schema_version: Some(schema.latest_schema_version()),
+            next_schema_version: Some(schema.next_schema_version()),
+            schema_status: Some(schema.status.clone()),
+            created_time: Some(crate::state::to_timestamp_string(schema.created_time)),
+            updated_time: Some(crate::state::to_timestamp_string(schema.updated_time)),
+        })
     }
 }

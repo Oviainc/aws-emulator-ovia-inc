@@ -55,20 +55,23 @@ use crate::ssoadmin_permission_sets::{
 };
 
 /// One assignment to grant and then delete.
+///
+/// `pub(crate)` so the deletion-status suite (`account_assignment_deletion_status.rs`)
+/// asserts its own rules over the SAME table of inputs rather than a second copy of it.
 #[derive(Debug, Clone, Copy)]
-struct Case {
-    label: &'static str,
+pub(crate) struct Case {
+    pub(crate) label: &'static str,
     /// `TargetId`: modelled `^\d{12}$`, length 12..12.
-    account_id: &'static str,
+    pub(crate) account_id: &'static str,
     /// `PrincipalType`: the model's enum is `USER | GROUP`.
-    principal_type: &'static str,
+    pub(crate) principal_type: &'static str,
     /// `PrincipalId`: modelled
     /// `^([0-9a-f]{10}-|)[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$`.
-    principal_id: &'static str,
+    pub(crate) principal_id: &'static str,
 }
 
 /// The table the rules are asserted over.
-const CASES: &[Case] = &[
+pub(crate) const CASES: &[Case] = &[
     Case {
         label: "a user, bare GUID",
         account_id: "123456789012",
@@ -105,7 +108,7 @@ const CASES: &[Case] = &[
 /// and the tracking view of the call that starts the operation does not. The names are
 /// the model's
 /// (`smithy_query(query="shape", shape="AccountAssignmentOperationStatus")`).
-const DETAIL_MEMBERS: [&str; 5] = [
+pub(crate) const DETAIL_MEMBERS: [&str; 5] = [
     "TargetId",
     "TargetType",
     "PermissionSetArn",
@@ -116,7 +119,7 @@ const DETAIL_MEMBERS: [&str; 5] = [
 /// Move the stored completion instant of every assignment DELETION to `due_at`, so the
 /// status the clock owes can be observed on both sides of it without the test sleeping.
 /// The status itself is still derived by the service, exactly as in production.
-fn hold_completion(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
+pub(crate) fn hold_completion(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
     with_store(engine, |store| {
         for record in store.assignment_deletions.iter_mut() {
             record.succeeded_due = due_at;
@@ -135,7 +138,11 @@ fn unknown_permission_set_arn(instance_arn: &str) -> String {
 }
 
 /// Create a permission set on `instance_arn` and return its minted ARN.
-async fn permission_set(router: &MultiServiceRouter, instance_arn: &str, name: &str) -> String {
+pub(crate) async fn permission_set(
+    router: &MultiServiceRouter,
+    instance_arn: &str,
+    name: &str,
+) -> String {
     let (status, body) = call(
         router,
         "CreatePermissionSet",
@@ -154,7 +161,11 @@ async fn permission_set(router: &MultiServiceRouter, instance_arn: &str, name: &
 
 /// The request body both `CreateAccountAssignment` and `DeleteAccountAssignment` take for
 /// one row.
-fn assignment_body(instance_arn: &str, permission_set_arn: &str, case: &Case) -> Value {
+pub(crate) fn assignment_body(
+    instance_arn: &str,
+    permission_set_arn: &str,
+    case: &Case,
+) -> Value {
     json!({
         "InstanceArn": instance_arn,
         "TargetId": case.account_id,
@@ -166,7 +177,7 @@ fn assignment_body(instance_arn: &str, permission_set_arn: &str, case: &Case) ->
 }
 
 /// Grant one row's assignment and return the `RequestId` of the create.
-async fn grant(
+pub(crate) async fn grant(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
@@ -192,7 +203,7 @@ async fn grant(
 }
 
 /// `DescribeAccountAssignmentDeletionStatus` for one request id.
-async fn describe(
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     instance_arn: &str,
     request_id: &str,
@@ -210,7 +221,7 @@ async fn describe(
 
 /// The (principal type, principal id) pairs `ListAccountAssignments` reports under one
 /// (account, permission set) filter, sorted so two readings compare.
-async fn assigned(
+pub(crate) async fn assigned(
     router: &MultiServiceRouter,
     instance_arn: &str,
     account_id: &str,

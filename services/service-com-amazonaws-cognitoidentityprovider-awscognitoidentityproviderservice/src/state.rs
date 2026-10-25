@@ -95,6 +95,11 @@ pub const USER_PASSWORD_AUTH_FLOWS: [&str; 2] =
 /// is also one of the three a client that sets no `ExplicitAuthFlows` gets.
 pub const REFRESH_TOKEN_AUTH_FLOWS: [&str; 1] = ["ALLOW_REFRESH_TOKEN_AUTH"];
 
+/// The `ExplicitAuthFlows` value that enables `AuthFlow=USER_AUTH`:
+/// "`ALLOW_USER_AUTH`: Enable selection-based sign-in with `USER_AUTH`"
+/// (`CreateUserPoolClient.ExplicitAuthFlows` in this service's model).
+pub const USER_AUTH_FLOWS: [&str; 1] = ["ALLOW_USER_AUTH"];
+
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
 
@@ -376,12 +381,15 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let expired = self
             .auth_sessions
             .get(token)
-            .is_some_and(|stored| stored.expires_at <= now);
+            .filter(|stored| stored.expires_at <= now)
+            .cloned();
         self.auth_sessions.retain(|_, stored| stored.expires_at > now);
         match self.auth_sessions.get(token) {
             Some(stored) => SessionLookup::Found(stored.clone()),
-            None if expired => SessionLookup::Expired,
-            None => SessionLookup::Unknown,
+            None => match expired {
+                Some(stored) => SessionLookup::Expired(stored),
+                None => SessionLookup::Unknown,
+            },
         }
     }
 
@@ -1007,6 +1015,92 @@ impl UserPool {
             .any(|attribute| attribute == name)
     }
 
+    /// The attribute a sign-up confirmation message for `user` is addressed to,
+    /// and the stored value it goes to, or `None` when this pool has no such
+    /// destination for that user.
+    ///
+    /// "Amazon Cognito sends confirmation codes to the user attribute in the
+    /// `AutoVerifiedAttributes` property of your user pool"
+    /// (`ResendConfirmationCode` in this service's model), so the pool's own
+    /// auto-verified attributes decide where the code goes, in the order the
+    /// pool declares them; the user has to hold a value for one of them for a
+    /// message to have an address at all.
+    pub fn confirmation_destination(&self, user: &User) -> Option<(String, String)> {
+        self.auto_verified_attributes
+            .iter()
+            .filter(|attribute| delivery_medium(attribute).is_some())
+            .find_map(|attribute| {
+                user.destination_of(attribute)
+                    .map(|destination| (attribute.clone(), destination))
+            })
+    }
+
+    /// Where a password-reset message for `user` goes, as this pool's
+    /// `AccountRecoverySetting` decides.
+    ///
+    /// "If `verified_email` has a priority of 1 and `verified_phone_number` has
+    /// a priority of 2, your user pool sends account-recovery messages to a
+    /// verified email address but falls back to an SMS message if the user has a
+    /// verified phone number. The `admin_only` option prevents self-service
+    /// account recovery" (`RecoveryOptionType` in this service's model) \u2014 so the
+    /// mechanisms are tried in ascending priority and only a VERIFIED value is a
+    /// destination.
+    pub fn recovery_destination(&self, user: &User) -> RecoveryDestination {
+        let mut mechanisms: Vec<(i32, String)> = self
+            .account_recovery_setting
+            .as_ref()
+            .and_then(|setting| setting.recovery_mechanisms.clone())
+            .map(|mechanisms| {
+                mechanisms
+                    .into_iter()
+                    .map(|mechanism| (mechanism.priority, mechanism.name))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                DEFAULT_RECOVERY_MECHANISMS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            i32::try_from(index).unwrap_or_default() + 1,
+                            (*name).to_string(),
+                        )
+                    })
+                    .collect()
+            });
+        if mechanisms
+            .iter()
+            .any(|(_, name)| name == RECOVERY_ADMIN_ONLY)
+        {
+            return RecoveryDestination::AdminOnly;
+        }
+        mechanisms.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        mechanisms
+            .iter()
+            .filter_map(|(_, name)| recovered_attribute(name))
+            .find_map(|attribute| {
+                user.verified_destination_of(attribute)
+                    .map(|destination| RecoveryDestination::Delivered {
+                        attribute: attribute.to_string(),
+                        destination,
+                    })
+            })
+            .unwrap_or(RecoveryDestination::None)
+    }
+
+    /// Whether `factor` is a first authentication factor this pool admits:
+    /// `SignInPolicyType.AllowedFirstAuthFactors` is "the sign-in methods that a
+    /// user pool supports as the first factor" (this service's model), and a pool
+    /// that configures none admits `PASSWORD` alone
+    /// ([`effective_policies`]).
+    pub fn allows_first_auth_factor(&self, factor: &str) -> bool {
+        self.policies
+            .sign_in_policy
+            .as_ref()
+            .and_then(|policy| policy.allowed_first_auth_factors.as_ref())
+            .is_some_and(|factors| factors.iter().any(|allowed| allowed == factor))
+    }
+
     /// Whether this pool holds a new value of `name` PENDING until the user
     /// confirms it:
     /// `UserAttributeUpdateSettings.AttributesRequireVerificationBeforeUpdate`
@@ -1303,6 +1397,11 @@ impl UserPoolClient {
         self.allows_any_of(&REFRESH_TOKEN_AUTH_FLOWS)
     }
 
+    /// Whether `AuthFlow=USER_AUTH` is enabled for this client.
+    pub fn allows_user_auth(&self) -> bool {
+        self.allows_any_of(&USER_AUTH_FLOWS)
+    }
+
     /// Whether this client's stored `ExplicitAuthFlows` carry any of `flows`.
     fn allows_any_of(&self, flows: &[&str]) -> bool {
         self.explicit_auth_flows
@@ -1502,13 +1601,14 @@ pub struct User {
     /// a listing of several is stable. `DeviceKeyType` carries no
     /// case-insensitivity trait, so a key is matched exactly as it was stored.
     pub devices: BTreeMap<String, Device>,
-    /// The attribute verification codes outstanding for this user, keyed by the
-    /// attribute name each was issued for and ordered so a read is stable.
+    /// The verification codes outstanding for this user, keyed by what each was
+    /// issued for and ordered so a read is stable.
     ///
-    /// A fresh code for an attribute REPLACES the one issued before it, so one
-    /// user holds at most one per attribute and this map is bounded by the
-    /// attributes a message is sent for at all ([`delivery_medium`]).
-    pub pending_attribute_verifications: BTreeMap<String, AttributeVerification>,
+    /// A fresh code for one purpose REPLACES the one issued for it before, so a
+    /// user holds at most one code per purpose and this map is bounded by
+    /// [`CodePurpose`]'s variants and the attributes a message is sent for at all
+    /// ([`delivery_medium`]).
+    pub outstanding_codes: BTreeMap<CodePurpose, VerificationCode>,
 }
 
 impl User {
@@ -1632,27 +1732,171 @@ impl User {
             .map(|(key, _)| key.clone())
             .collect()
     }
+
+    /// The stored value of `attribute` a message can be addressed to, or `None`
+    /// when this user holds no value for it: a code is a message, so it needs an
+    /// address to be sent to.
+    pub fn destination_of(&self, attribute: &str) -> Option<String> {
+        self.attributes
+            .get(attribute)
+            .filter(|value| !value.is_empty())
+            .cloned()
+    }
+
+    /// The stored value of `attribute` whose verified flag says this user
+    /// confirmed it ([`verified_flag`]) \u2014 the only kind of destination a
+    /// password-reset message is sent to.
+    pub fn verified_destination_of(&self, attribute: &str) -> Option<String> {
+        self.destination_of(attribute)
+            .filter(|_| self.alias_is_active(attribute))
+    }
+
+    /// Record `code` as the code outstanding for `purpose`, REPLACING whatever
+    /// was outstanding for it before \u2014 which is what makes a re-sent code
+    /// supersede the one before it \u2014 and return what was stored.
+    pub fn issue_code(&mut self, purpose: CodePurpose, code: VerificationCode) -> VerificationCode {
+        self.outstanding_codes.insert(purpose, code.clone());
+        code
+    }
+
+    /// The code outstanding for `purpose`, or `None` when nothing is.
+    pub fn outstanding_code(&self, purpose: &CodePurpose) -> Option<&VerificationCode> {
+        self.outstanding_codes.get(purpose)
+    }
+
+    /// Check `presented` against the code outstanding for `purpose` as of `now`.
+    ///
+    /// A PURE read: accepting a code is what spends it ([`User::consume_code`]),
+    /// so a refused attempt leaves the outstanding code exactly as it was and a
+    /// caller can present the right one afterwards. Nothing outstanding, a value
+    /// that is not the outstanding code, and a code a later one superseded are
+    /// all the same answer: this is not the code the service is expecting.
+    pub fn check_code(
+        &self,
+        purpose: &CodePurpose,
+        presented: &str,
+        now: SystemTime,
+    ) -> Result<&VerificationCode, CodeRejection> {
+        let outstanding = self
+            .outstanding_code(purpose)
+            .ok_or(CodeRejection::Mismatch)?;
+        if outstanding.code != presented {
+            return Err(CodeRejection::Mismatch);
+        }
+        if outstanding.expired(now) {
+            return Err(CodeRejection::Expired);
+        }
+        Ok(outstanding)
+    }
+
+    /// Spend the code outstanding for `purpose`: a delivered code is accepted
+    /// ONCE, so presenting it again finds nothing outstanding.
+    pub fn consume_code(&mut self, purpose: &CodePurpose) -> Option<VerificationCode> {
+        self.outstanding_codes.remove(purpose)
+    }
 }
 
-/// One verification code issued for one attribute of a user: what the
-/// operation that sent the code recorded, and the delivery it reported.
+/// What one stored verification code was issued for.
+///
+/// Amazon Cognito sends a code for several distinct purposes, and each is
+/// answered by its own operation: the sign-up confirmation code by
+/// `ConfirmSignUp`, the password-reset code by `ConfirmForgotPassword` and an
+/// attribute's code by `VerifyUserAttribute`. Keying the outstanding codes by
+/// purpose is what keeps them independent — a resent sign-up code does not
+/// disturb an outstanding reset code — while a second code for the SAME purpose
+/// supersedes the first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CodePurpose {
+    /// The code that confirms a new user's sign-up, sent by `SignUp` and
+    /// re-sent by `ResendConfirmationCode`.
+    SignUpConfirmation,
+    /// The code that authorises a password reset, sent by `ForgotPassword`.
+    PasswordReset,
+    /// The code that confirms the value of ONE attribute, sent by
+    /// `GetUserAttributeVerificationCode` and by an update of an attribute the
+    /// pool verifies, and carried for the attribute it names.
+    AttributeVerification(String),
+}
+
+/// One verification code issued to a user: what the operation that sent the
+/// code recorded, and the delivery it reported.
 #[derive(Debug, Clone)]
-pub struct AttributeVerification {
+pub struct VerificationCode {
     /// The code itself ([`new_verification_code`]). The real service delivers
-    /// it out of band — by mail or text message — so no response carries it.
-    /// Stored because it is what a verification of this attribute would check;
-    /// no operation implemented here reads it yet.
+    /// it out of band — by mail or text message — so no response carries it;
+    /// it is stored because it is what the operation that consumes this code
+    /// checks the presented one against.
     pub code: String,
-    /// The stored attribute value the code was issued for: the address or
-    /// number the message was addressed to, which is what
-    /// `CodeDeliveryDetailsType.Destination` reports.
+    /// The user attribute the message was addressed to (`VerifiedAttributeType`),
+    /// which is what `CodeDeliveryDetailsType.AttributeName` reports and what
+    /// decides the medium it travelled over ([`delivery_medium`]).
+    pub attribute: String,
+    /// The attribute value the code was sent to: the address or number the
+    /// message was addressed to, which is what
+    /// `CodeDeliveryDetailsType.Destination` reports, masked.
     pub destination: String,
-    /// The `DeliveryMediumType` that destination is reached over
-    /// ([`verification_delivery_medium`]).
-    pub delivery_medium: String,
-    /// When this code was issued.
+    /// When this code was issued, which is what its validity window is counted
+    /// from.
     pub issued_at: SystemTime,
 }
+
+impl VerificationCode {
+    /// A fresh verification code for `attribute`, addressed to its stored
+    /// `destination`.
+    pub fn issued(attribute: &str, destination: &str, now: SystemTime) -> Self {
+        Self::minted(new_verification_code(), attribute, destination, now)
+    }
+
+    /// A fresh email one-time password for `attribute`, addressed to its stored
+    /// `destination`.
+    pub fn issued_email_otp(attribute: &str, destination: &str, now: SystemTime) -> Self {
+        Self::minted(new_email_otp_code(), attribute, destination, now)
+    }
+
+    /// `code`, recorded as issued for `attribute` at `now`.
+    fn minted(code: String, attribute: &str, destination: &str, now: SystemTime) -> Self {
+        Self {
+            code,
+            attribute: attribute.to_string(),
+            destination: destination.to_string(),
+            issued_at: now,
+        }
+    }
+
+    /// The delivery this code's message reported, rendered from what is stored.
+    pub fn delivery_details(&self) -> Option<CodeDeliveryDetailsType> {
+        code_delivery_details(&self.attribute, &self.destination)
+    }
+
+    /// Whether this code's validity window has closed by `now`.
+    pub fn expired(&self, now: SystemTime) -> bool {
+        now >= self.issued_at + VERIFICATION_CODE_VALIDITY
+    }
+}
+
+/// Why a presented code was not accepted, which decides the modelled error the
+/// operation that was given it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeRejection {
+    /// The presented code is not the outstanding one — including the case where
+    /// nothing is outstanding at all, and the case where a later code for the
+    /// same purpose superseded the presented one.
+    Mismatch,
+    /// The presented code IS the outstanding one, but its validity window has
+    /// closed.
+    Expired,
+}
+
+/// How long an issued code stays acceptable: Amazon Cognito's verification and
+/// confirmation codes expire 24 hours after they are sent (Amazon Cognito
+/// Developer Guide, "Signing up and confirming user accounts").
+pub const VERIFICATION_CODE_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The message a code that is not the outstanding one is refused with.
+pub const CODE_MISMATCH_MESSAGE: &str = "Invalid verification code provided, please try again.";
+
+/// The message a code past its validity window is refused with.
+pub const EXPIRED_CODE_MESSAGE: &str = "Invalid code provided, please request a code again.";
 
 /// One device of a user: the device a sign-in minted a `DeviceKey` for, as the
 /// device operations stored it, and what every later device read of this user
@@ -1856,6 +2100,15 @@ pub struct AuthSession {
     pub username: String,
     pub challenge_name: String,
     pub expires_at: SystemTime,
+    /// The one-time code this challenge is answered with, for a challenge whose
+    /// start DELIVERED one (the email one-time password), and `None` for a
+    /// challenge that is answered with something else.
+    ///
+    /// The code lives on the session because that is what bounds it: the
+    /// challenge is answerable only while its session lasts
+    /// (`CreateUserPoolClient.AuthSessionValidity` is "the duration, in minutes,
+    /// of that session token"), so the code's window is the session's window.
+    pub code: Option<VerificationCode>,
 }
 
 /// What resolving a `Session` token found
@@ -1866,8 +2119,9 @@ pub struct AuthSession {
 pub enum SessionLookup {
     /// The stored session, still inside its validity window.
     Found(AuthSession),
-    /// A stored session whose validity window had already closed.
-    Expired,
+    /// A stored session whose validity window had already closed, as it was
+    /// stored: which challenge it was waiting on decides the refusal it owes.
+    Expired(AuthSession),
     /// No session of that token: this emulator never handed it out.
     Unknown,
 }
@@ -2065,20 +2319,34 @@ pub fn is_standard_attribute(name: &str) -> bool {
 /// verification messages carry a six-digit code.
 const VERIFICATION_CODE_LENGTH: usize = 6;
 
-/// A fresh verification code: [`VERIFICATION_CODE_LENGTH`] decimal digits,
-/// which satisfies `ConfirmationCodeType`'s modelled length 1..2048 and
-/// pattern `^[\S]+$` — the shape the member that carries it back accepts.
+/// How many digits a minted email one-time password carries: Amazon Cognito's
+/// `EMAIL_OTP` sign-in challenge delivers an eight-digit one-time password.
+const EMAIL_OTP_CODE_LENGTH: usize = 8;
+
+/// A fresh verification code: [`VERIFICATION_CODE_LENGTH`] decimal digits.
+pub fn new_verification_code() -> String {
+    new_numeric_code(VERIFICATION_CODE_LENGTH)
+}
+
+/// A fresh email one-time password: [`EMAIL_OTP_CODE_LENGTH`] decimal digits.
+pub fn new_email_otp_code() -> String {
+    new_numeric_code(EMAIL_OTP_CODE_LENGTH)
+}
+
+/// A fresh code of `digits` decimal digits, which satisfies
+/// `ConfirmationCodeType`'s modelled length 1..2048 and pattern `^[\S]+$` — the
+/// shape the member that carries it back accepts.
 ///
 /// The randomness is the same v4-UUID source every other minted value in this
 /// file draws on ([`new_uuid`]), so nothing here is a hand-rolled generator: a
 /// v4 UUID renders as 32 hex characters, each reduced to one decimal digit, so
 /// one draw always yields the whole code and this makes no loop.
-pub fn new_verification_code() -> String {
+fn new_numeric_code(digits: usize) -> String {
     new_uuid()
         .chars()
         .filter_map(|character| character.to_digit(16))
         .filter_map(|value| char::from_digit(value % 10, 10))
-        .take(VERIFICATION_CODE_LENGTH)
+        .take(digits)
         .collect()
 }
 
@@ -2112,6 +2380,44 @@ pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
     match attribute {
         "email" => Some("EMAIL"),
         "phone_number" => Some("SMS"),
+        _ => None,
+    }
+}
+
+/// Where a password-reset message for one user goes
+/// ([`UserPool::recovery_destination`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryDestination {
+    /// The attribute the message is addressed to, and the stored value it goes
+    /// to.
+    Delivered {
+        attribute: String,
+        destination: String,
+    },
+    /// This pool reserves password resets to administrators (`admin_only`), so
+    /// no self-service message is sent at all.
+    AdminOnly,
+    /// The user holds no verified address or number for any mechanism this pool
+    /// allows, so there is nowhere to send a reset code.
+    None,
+}
+
+/// The `RecoveryOptionNameType` value that "prevents self-service account
+/// recovery" (`RecoveryOptionType` in this service's model).
+pub const RECOVERY_ADMIN_ONLY: &str = "admin_only";
+
+/// The recovery mechanisms a pool that configures none gets, in priority order:
+/// Amazon Cognito's default account recovery is the verified email address,
+/// falling back to the verified phone number (the two attribute-bearing
+/// `RecoveryOptionNameType` values).
+const DEFAULT_RECOVERY_MECHANISMS: [&str; 2] = ["verified_email", "verified_phone_number"];
+
+/// The user attribute a `RecoveryOptionNameType` recovers through, or `None` for
+/// a mechanism that names no attribute (`admin_only`).
+fn recovered_attribute(mechanism: &str) -> Option<&'static str> {
+    match mechanism {
+        "verified_email" => Some("email"),
+        "verified_phone_number" => Some("phone_number"),
         _ => None,
     }
 }

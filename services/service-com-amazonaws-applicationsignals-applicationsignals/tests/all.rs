@@ -65,5 +65,7 @@ mod slo_indicator_required;
 mod slo_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_attachment.rs"]
+mod tag_attachment;
 #[path = "all/time_ranged_reads.rs"]
 mod time_ranged_reads;

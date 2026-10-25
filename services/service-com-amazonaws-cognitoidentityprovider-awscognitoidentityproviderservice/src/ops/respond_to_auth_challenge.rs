@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RespondToAuthChallenge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RespondToAuthChallenge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the challenge an `InitiateAuth` left outstanding, for the challenge this
+//! emulator delivers a code for: the email one-time password.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RespondToAuthChallenge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `Session` names the stored challenge and the user it was started for, and the
+//! response is checked against the code that challenge DELIVERED: a wrong code is
+//! refused `CodeMismatchException`, a session whose window has closed
+//! `ExpiredCodeException`, and a code accepted once completes the sign-in — the
+//! session is spent, so the same code cannot sign in twice.
 //!
 //! ## Shape of an operation
 //!
@@ -306,18 +305,251 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RespondToAuthChallenge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RespondToAuthChallengeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RespondToAuthChallenge"))
+        // Request metadata only: the app client in the body names the pool, and
+        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // A session's window is read against the clock, so an expired challenge is
+        // refused whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+        // `Session` is "the session identifier that maintains the state of
+        // authentication requests and challenge responses": without it there is no
+        // outstanding challenge to answer.
+        let session_token = input
+            .session
+            .clone()
+            .ok_or_else(|| missing_parameter("Session"))?;
+        let responses = input.challenge_responses.clone().unwrap_or_default();
+
+        let mut guard = state.lock();
+        // This operation models no `UserPoolId`: the app client the request names is
+        // what resolves the pool, and it has to exist before the session it carries can
+        // mean anything.
+        let user_pool_id = guard
+            .pool_of_client(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?
+            .id
+            .clone();
+
+        // The STORED session says which challenge is outstanding and for whom. A token
+        // this emulator never handed out, or one started for another app client,
+        // authorizes nothing.
+        let session = match guard.session(&session_token, now) {
+            crate::state::SessionLookup::Found(session) => session,
+            // A challenge that delivered a code is answerable exactly while its session
+            // lasts, so a closed window is that CODE's expiry: "this exception is
+            // thrown if a code has expired" (`ExpiredCodeException`). A challenge that
+            // delivered none has no code to expire, so its session expiry is reported
+            // as the session's.
+            crate::state::SessionLookup::Expired(expired) => {
+                return Err(if expired.code.is_some() {
+                    expired_code()
+                } else {
+                    expired_session()
+                });
+            }
+            crate::state::SessionLookup::Unknown => return Err(invalid_session()),
+        };
+        if session.user_pool_id != user_pool_id || session.client_id != input.client_id {
+            return Err(invalid_session());
+        }
+        // `ChallengeName` is "the name of the challenge that you are responding to", so
+        // it has to name the challenge this session is waiting on.
+        if input.challenge_name != session.challenge_name {
+            return Err(invalid_parameter(format!(
+                "Invalid challenge name provided, this session is waiting for a response to {}",
+                session.challenge_name
+            )));
+        }
+        if session.challenge_name != EMAIL_OTP {
+            // No other challenge this emulator starts carries state a response to it
+            // could be checked against.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "RespondToAuthChallenge with ChallengeName={}",
+                session.challenge_name
+            )));
+        }
+
+        // `EMAIL_OTP`: `"ChallengeResponses": {"EMAIL_OTP_CODE": "[code]", "USERNAME":
+        // "[username]"}` (`ChallengeResponses` in this service's model).
+        let presented = responses
+            .get(EMAIL_OTP_CODE)
+            .ok_or_else(|| missing_challenge_response(EMAIL_OTP_CODE, &session.challenge_name))?;
+        // A response that names a user is answered only for the user its own session
+        // was started for.
+        if let Some(named) = responses.get(USERNAME) {
+            let pool = guard
+                .pool(&user_pool_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            if pool.user_storage_key(named) != pool.user_storage_key(&session.username) {
+                return Err(invalid_session());
+            }
+        }
+        // The code is checked against the one the challenge DELIVERED. A wrong code
+        // leaves the session standing — answering it is what spends it — so the caller
+        // can present the right one while the session lasts.
+        let code = session.code.as_ref().ok_or_else(invalid_session)?;
+        if code.code != *presented {
+            return Err(code_mismatch());
+        }
+
+        // The user the session names may have been disabled, reset or deleted since the
+        // challenge was started, so the sign-in is refused on the stored user's own
+        // state just as the one that started it was.
+        let user = guard
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user(&session.username))
+            .ok_or_else(user_not_found)?;
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        match user.status {
+            crate::state::UserStatus::ResetRequired => return Err(password_reset_required()),
+            crate::state::UserStatus::Unconfirmed => return Err(user_not_confirmed()),
+            _ => {}
+        }
+        let username = user.username.clone();
+
+        // The challenge is answered, so the session is spent: the same code cannot
+        // complete a second sign-in.
+        guard.end_session(&session_token);
+        let authentication_result = guard
+            .issue_tokens(&user_pool_id, &input.client_id, &username, now)
+            .ok_or_else(internal_error)?;
+        Ok(RespondToAuthChallengeOutput {
+            // Authentication is complete, so there is no next challenge and no session
+            // to carry into one.
+            challenge_name: None,
+            session: None,
+            challenge_parameters: None,
+            authentication_result: Some(authentication_result),
+            available_challenges: None,
+        })
     }
+}
+
+/// The email one-time-password challenge (`ChallengeNameType` in this service's
+/// model), the one challenge this emulator delivers a code for.
+const EMAIL_OTP: &str = "EMAIL_OTP";
+
+/// The `ChallengeResponses` entry an `EMAIL_OTP` response carries the delivered code
+/// in.
+const EMAIL_OTP_CODE: &str = "EMAIL_OTP_CODE";
+
+/// The `ChallengeResponses` entry naming the user a response is for.
+const USERNAME: &str = "USERNAME";
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for a user that is gone. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `CodeMismatchException`: "this exception is thrown if the
+/// provided code doesn't match what the server was expecting" (this service's model).
+fn code_mismatch() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::CodeMismatchException(CodeMismatchException {
+        message: Some(crate::state::CODE_MISMATCH_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `ExpiredCodeException`: "this exception is thrown if a code has
+/// expired" (this service's model).
+fn expired_code() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::ExpiredCodeException(ExpiredCodeException {
+        message: Some(crate::state::EXPIRED_CODE_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a `Session` no stored challenge answers.
+fn invalid_session() -> RespondToAuthChallengeError {
+    not_authorized("Invalid session for the user.")
+}
+
+/// The refusal for a `Session` whose validity window has closed with no code
+/// outstanding on it.
+fn expired_session() -> RespondToAuthChallengeError {
+    not_authorized("Invalid session for the user, session is expired.")
+}
+
+/// This operation's `PasswordResetRequiredException` for a user Amazon Cognito is
+/// waiting on a new password from.
+fn password_reset_required() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::PasswordResetRequiredException(
+        PasswordResetRequiredException {
+            message: Some("Password reset required for the user.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `UserNotConfirmedException` for a user whose sign-up nothing
+/// confirmed.
+fn user_not_confirmed() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::UserNotConfirmedException(UserNotConfirmedException {
+        message: Some("User is not confirmed.".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an input member this challenge response requires and the request
+/// did not carry.
+fn missing_parameter(parameter: &str) -> RespondToAuthChallengeError {
+    invalid_parameter(format!("Missing required parameter {parameter}"))
+}
+
+/// The refusal for a `ChallengeResponses` entry the challenge requires and the
+/// request did not carry.
+fn missing_challenge_response(
+    parameter: &str,
+    challenge_name: &str,
+) -> RespondToAuthChallengeError {
+    invalid_parameter(format!(
+        "Missing required parameter {parameter} in ChallengeResponses for ChallengeName \
+         {challenge_name}"
+    ))
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> RespondToAuthChallengeError {
+    RespondToAuthChallengeErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
