@@ -19,7 +19,8 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, expect_error, ok, parse_time, string_member, without_status, ACCOUNT, REGION,
+    call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
+    ACCOUNT, REGION,
 };
 
 /// The `OutpostResolver` of a create/get/update/delete response.
@@ -819,6 +820,148 @@ async fn an_instance_count_below_the_documented_minimum_is_refused() {
             "case {case:?}: a refused update must leave InstanceCount alone, got {fetched}"
         );
     }
+}
+
+/// The service error code of the "this instance count is below the minimum"
+/// fault, as recorded on AWS for the Resolver-on-Outpost write operations. It is
+/// the per-fault discriminator: the HTTP status (400) and the exception shape
+/// name are shared by the other `ValidationException` faults of those
+/// operations.
+const RSLVR_CODE_INSTANCE_COUNT: &str = "RSLVR-03002";
+
+/// The bracketed service error code at the head of a Resolver exception
+/// message, asserted to be of the service's `RSLVR-nnnnn` form.
+fn rslvr_code(case: &str, message: &str) -> String {
+    let tail = message.strip_prefix('[').unwrap_or_else(|| {
+        panic!("case {case:?}: expected a bracketed service error code, got {message:?}")
+    });
+    let (code, sentence) = tail.split_once("] ").unwrap_or_else(|| {
+        panic!("case {case:?}: expected \"[<code>] <sentence>\", got {message:?}")
+    });
+    let digits = code.strip_prefix("RSLVR-").unwrap_or_else(|| {
+        panic!("case {case:?}: expected an RSLVR-nnnnn code, got {message:?}")
+    });
+    assert!(
+        digits.len() == 5 && digits.chars().all(|c| c.is_ascii_digit()),
+        "case {case:?}: expected five digits after RSLVR-, got {message:?}"
+    );
+    assert!(
+        !sentence.is_empty() && sentence.ends_with('.'),
+        "case {case:?}: expected a sentence ending in a period after the code, got {message:?}"
+    );
+    code.to_string()
+}
+
+/// Every Resolver-on-Outpost write refused for an `InstanceCount` below the
+/// documented minimum states the fault with Route 53 Resolver's own service
+/// error code inside the message, because the status and the exception shape
+/// name alone do not say which fault occurred.
+///
+/// The table spans what the rule generalises over: the operation that enforces
+/// the minimum (create and update), and the rejected count along its magnitude —
+/// one below the minimum, one, zero, negative and the smallest `Integer` the
+/// wire carries. The counts the minimum admits are checked too, so the refusal
+/// is keyed on the bound and not on "an InstanceCount was sent".
+#[tokio::test]
+async fn an_instance_count_below_the_minimum_is_refused_with_its_rslvr_error_code() {
+    let minimum = OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT;
+    // The sentence states the documented minimum (`InstanceCount`: "The default
+    // and minimal value is 4."), never the rejected count, so it is the same for
+    // every row below.
+    let expected_message = format!(
+        r#"[{RSLVR_CODE_INSTANCE_COUNT}] The instance count must be equal to or greater than "{minimum}"."#
+    );
+
+    let router = emulator();
+    // One settled Resolver, so an update case is refused for its count and not
+    // for a missing record or an unsettled status.
+    let created = ok(
+        &router,
+        "CreateOutpostResolver",
+        create_body("req-rslvr-code", "coded"),
+    )
+    .await;
+    let id = string_member(resolver(&created), "Id");
+    settle().await;
+
+    for (case, count) in [
+        ("one below the minimum", minimum - 1),
+        ("a single instance", 1),
+        ("no instances", 0),
+        ("a negative count", -7),
+        ("the smallest Integer on the wire", i32::MIN),
+    ] {
+        let mut create = create_body(&format!("req-{count}"), "coded");
+        create["InstanceCount"] = json!(count);
+        let requests = [
+            ("CreateOutpostResolver", create),
+            (
+                "UpdateOutpostResolver",
+                json!({ "Id": id.clone(), "InstanceCount": count }),
+            ),
+        ];
+
+        for (operation, body) in requests {
+            let (status, parsed) = call(&router, operation, body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}/{operation}: expected HTTP 400, got {status}: {parsed}"
+            );
+            assert!(
+                error_type(&parsed).contains("ValidationException"),
+                "case {case:?}/{operation}: expected ValidationException, got {parsed}"
+            );
+
+            let message = string_member(&parsed, "Message");
+            let code = rslvr_code(&format!("{case}/{operation}"), &message);
+            assert_eq!(
+                code, RSLVR_CODE_INSTANCE_COUNT,
+                "case {case:?}/{operation}: expected the instance-count service error code, got {message:?}"
+            );
+            assert_eq!(
+                message, expected_message,
+                "case {case:?}/{operation}: expected Message {expected_message:?}, got {message:?}"
+            );
+        }
+    }
+
+    // The refusal is keyed on the documented bound: the minimum itself, a count
+    // above it and an absent count are all accepted, and the stored Resolver
+    // reports the count the last accepted write asked for (an absent count
+    // leaves the stored one alone).
+    let mut stored = i64_member(resolver(&created), "InstanceCount");
+    for (case, count) in [
+        ("exactly the minimum", Some(minimum)),
+        ("above the minimum", Some(minimum + 1)),
+        ("no InstanceCount at all", None),
+    ] {
+        let mut body = json!({ "Id": id.clone(), "Name": "coded" });
+        if let Some(count) = count {
+            body["InstanceCount"] = json!(count);
+            stored = i64::from(count);
+        }
+        let updated = ok(&router, "UpdateOutpostResolver", body).await;
+        assert_eq!(
+            i64_member(resolver(&updated), "InstanceCount"),
+            stored,
+            "case {case:?}: an accepted InstanceCount must be stored as asked, got {updated}"
+        );
+        settle().await;
+    }
+
+    // The code is a per-fault discriminator, so another fault of the same
+    // resource does not answer with this one.
+    let (_, parsed) = call(
+        &router,
+        "GetOutpostResolver",
+        json!({ "Id": "rslvr-op-0000000000000000" }),
+    )
+    .await;
+    let message = string_member(&parsed, "Message");
+    assert!(
+        !message.contains(RSLVR_CODE_INSTANCE_COUNT),
+        "a missing-Resolver refusal must not carry the instance-count code, got {message:?}"
+    );
 }
 
 /// A delete removes the record: it reports the Resolver as `DELETING`, and for

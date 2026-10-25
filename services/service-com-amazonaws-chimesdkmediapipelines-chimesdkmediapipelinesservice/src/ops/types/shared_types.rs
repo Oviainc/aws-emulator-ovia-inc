@@ -175,8 +175,14 @@ pub struct MediaCapturePipeline {
     pub sink_iam_role_arn: Option<String>,
 }
 
-/// One member schema of [`MediaCapturePipeline`], at `index` in the member list.
-const fn media_capture_pipeline_member(
+/// One member schema of a hand-written structure in this module, at `index` in that
+/// structure's member list.
+///
+/// Shared by every hand-written schema block here (see the note on
+/// [`MediaCapturePipeline`] for why they are hand-written): each member of this service's
+/// shapes lives in the one namespace, so only the member's own shape id, wire name, kind
+/// and position differ.
+const fn member_schema(
     shape_id: &'static str,
     name: &'static str,
     shape_type: ::aws_smithy_schema::ShapeType,
@@ -198,43 +204,43 @@ impl MediaCapturePipeline {
     // Associated member-schema consts. `tests/all/media_capture_pipeline_lifecycle.rs`
     // pins their names, order and `member_index` values against the model, so this
     // hand-written block cannot drift from it silently.
-    const M_MEDIA_PIPELINE_ID: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_MEDIA_PIPELINE_ID: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$MediaPipelineId",
         "MediaPipelineId",
         ::aws_smithy_schema::ShapeType::String,
         0,
     );
-    const M_MEDIA_PIPELINE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_MEDIA_PIPELINE_ARN: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$MediaPipelineArn",
         "MediaPipelineArn",
         ::aws_smithy_schema::ShapeType::String,
         1,
     );
-    const M_SOURCE_TYPE: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_SOURCE_TYPE: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SourceType",
         "SourceType",
         ::aws_smithy_schema::ShapeType::String,
         2,
     );
-    const M_SOURCE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_SOURCE_ARN: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SourceArn",
         "SourceArn",
         ::aws_smithy_schema::ShapeType::String,
         3,
     );
-    const M_STATUS: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$Status",
         "Status",
         ::aws_smithy_schema::ShapeType::String,
         4,
     );
-    const M_SINK_TYPE: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_SINK_TYPE: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkType",
         "SinkType",
         ::aws_smithy_schema::ShapeType::String,
         5,
     );
-    const M_SINK_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_SINK_ARN: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkArn",
         "SinkArn",
         ::aws_smithy_schema::ShapeType::String,
@@ -242,7 +248,7 @@ impl MediaCapturePipeline {
     );
     /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this
     /// member targets. THE reason this schema is hand-written.
-    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$CreatedTimestamp",
         "CreatedTimestamp",
         ::aws_smithy_schema::ShapeType::Timestamp,
@@ -250,28 +256,26 @@ impl MediaCapturePipeline {
     )
     .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
     /// `@timestampFormat("date-time")`, as `CreatedTimestamp` above.
-    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$UpdatedTimestamp",
         "UpdatedTimestamp",
         ::aws_smithy_schema::ShapeType::Timestamp,
         8,
     )
     .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
-    const M_CHIME_SDK_MEETING_CONFIGURATION: ::aws_smithy_schema::Schema =
-        media_capture_pipeline_member(
-            "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$ChimeSdkMeetingConfiguration",
-            "ChimeSdkMeetingConfiguration",
-            ::aws_smithy_schema::ShapeType::Structure,
-            9,
-        );
-    const M_SSE_AWS_KEY_MANAGEMENT_PARAMS: ::aws_smithy_schema::Schema =
-        media_capture_pipeline_member(
-            "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SseAwsKeyManagementParams",
-            "SseAwsKeyManagementParams",
-            ::aws_smithy_schema::ShapeType::Structure,
-            10,
-        );
-    const M_SINK_IAM_ROLE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+    const M_CHIME_SDK_MEETING_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$ChimeSdkMeetingConfiguration",
+        "ChimeSdkMeetingConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        9,
+    );
+    const M_SSE_AWS_KEY_MANAGEMENT_PARAMS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SseAwsKeyManagementParams",
+        "SseAwsKeyManagementParams",
+        ::aws_smithy_schema::ShapeType::Structure,
+        10,
+    );
+    const M_SINK_IAM_ROLE_ARN: ::aws_smithy_schema::Schema = member_schema(
         "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkIamRoleArn",
         "SinkIamRoleArn",
         ::aws_smithy_schema::ShapeType::String,
@@ -781,7 +785,21 @@ pub struct VoiceEnhancementSinkConfiguration {
     pub disabled: bool,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration")]
+// `MediaInsightsPipelineConfiguration`'s schema is written out by hand for the same
+// reason `MediaCapturePipeline`'s is, above: the model targets both timestamp members
+// at `Iso8601Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="MediaInsightsPipelineConfiguration")` reports
+// `"timestampFormat": "date-time"` on `CreatedTimestamp`/`UpdatedTimestamp`), the
+// derive does not carry that trait onto the member schema, and the restJson1 codec
+// then renders the protocol default of epoch seconds — a JSON number no SDK built
+// from this model can read into the modelled `date-time`. See the note on
+// `MediaCapturePipeline` for the full statement. Both blocks are WORKAROUNDS and go
+// away with the one core-library change that makes the derive carry the trait, filed
+// as `issues/things-that-do-not-work/20261021T223000Z-scaffold-codegen-drops-timestampformat-from-member-schemas.md`;
+// the derive itself lives under the read-only `vendor/` tree, so it cannot be fixed
+// from here, and a per-shape schema is the only way this service renders the modelled
+// format meanwhile. The two blocks already share `member_schema` below, so the next
+// shape that needs one adds members, not another copy of the rule.
 #[derive(Debug, Clone, Default)]
 pub struct MediaInsightsPipelineConfiguration {
     pub media_insights_pipeline_configuration_name: Option<String>,
@@ -792,6 +810,172 @@ pub struct MediaInsightsPipelineConfiguration {
     pub media_insights_pipeline_configuration_id: Option<String>,
     pub created_timestamp: Option<::aws_smithy_types::DateTime>,
     pub updated_timestamp: Option<::aws_smithy_types::DateTime>,
+}
+
+impl MediaInsightsPipelineConfiguration {
+    // Associated member-schema consts, in the model's member order.
+    // `tests/all/media_insights_pipeline_configuration_lifecycle.rs` pins the wire
+    // form this block exists for.
+    const M_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$MediaInsightsPipelineConfigurationName",
+        "MediaInsightsPipelineConfigurationName",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$MediaInsightsPipelineConfigurationArn",
+        "MediaInsightsPipelineConfigurationArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_RESOURCE_ACCESS_ROLE_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$ResourceAccessRoleArn",
+        "ResourceAccessRoleArn",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_REAL_TIME_ALERT_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$RealTimeAlertConfiguration",
+        "RealTimeAlertConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        3,
+    );
+    const M_ELEMENTS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$Elements",
+        "Elements",
+        ::aws_smithy_schema::ShapeType::List,
+        4,
+    );
+    const M_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$MediaInsightsPipelineConfigurationId",
+        "MediaInsightsPipelineConfigurationId",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this member
+    /// targets. THE reason this schema is hand-written.
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$CreatedTimestamp",
+        "CreatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        6,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `CreatedTimestamp` above.
+    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration$UpdatedTimestamp",
+        "UpdatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        7,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineConfiguration",
+            "com.amazonaws.chimesdkmediapipelines",
+            "MediaInsightsPipelineConfiguration",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_NAME,
+            &Self::M_ARN,
+            &Self::M_RESOURCE_ACCESS_ROLE_ARN,
+            &Self::M_REAL_TIME_ALERT_CONFIGURATION,
+            &Self::M_ELEMENTS,
+            &Self::M_ID,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_UPDATED_TIMESTAMP,
+        ],
+    );
+}
+
+pub static MEDIA_INSIGHTS_PIPELINE_CONFIGURATION_SCHEMA: &::aws_smithy_schema::Schema =
+    &MediaInsightsPipelineConfiguration::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MediaInsightsPipelineConfiguration {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.media_insights_pipeline_configuration_name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.media_insights_pipeline_configuration_arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.resource_access_role_arn.as_ref() {
+            s.write_string(&Self::M_RESOURCE_ACCESS_ROLE_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.real_time_alert_configuration.as_ref() {
+            s.write_struct(&Self::M_REAL_TIME_ALERT_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.elements.as_ref() {
+            s.write_list(&Self::M_ELEMENTS, &|elements| {
+                for element in v.iter() {
+                    // A list of structures writes each element against the ELEMENT
+                    // shape's own schema, as the generator does.
+                    elements.write_struct(
+                        &MediaInsightsPipelineConfigurationElement::SCHEMA,
+                        element,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.media_insights_pipeline_configuration_id.as_ref() {
+            s.write_string(&Self::M_ID, v.as_str())?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.updated_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIMESTAMP, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MediaInsightsPipelineConfiguration {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    out.media_insights_pipeline_configuration_name = Some(d.read_string(member)?)
+                }
+                Some(1) => {
+                    out.media_insights_pipeline_configuration_arn = Some(d.read_string(member)?)
+                }
+                Some(2) => out.resource_access_role_arn = Some(d.read_string(member)?),
+                Some(3) => {
+                    out.real_time_alert_configuration = Some(
+                        <RealTimeAlertConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(4) => {
+                    let mut elements: Vec<MediaInsightsPipelineConfigurationElement> = Vec::new();
+                    d.read_list(member, &mut |element| {
+                        elements.push(
+                            <MediaInsightsPipelineConfigurationElement as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(element)?,
+                        );
+                        Ok(())
+                    })?;
+                    out.elements = Some(elements);
+                }
+                Some(5) => {
+                    out.media_insights_pipeline_configuration_id = Some(d.read_string(member)?)
+                }
+                Some(6) => out.created_timestamp = Some(d.read_timestamp(member)?),
+                Some(7) => out.updated_timestamp = Some(d.read_timestamp(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#LiveConnectorSourceConfiguration")]

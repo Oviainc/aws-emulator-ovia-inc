@@ -1099,6 +1099,16 @@ async fn deleting_removes_exactly_what_it_names() {
 
 /// The operations this slice does not implement still answer HTTP 501, never an empty
 /// success: the stub census stays honest.
+///
+/// The three `/tags` operations are in the table too. All five Amazon Chime SDK
+/// namespaces bind the identical `/tags` routes, and what names the resource there travels
+/// in the request BODY on tag and untag — which the claim seam is not handed — so
+/// `service_common::chime_family` resolves that whole space by the endpoint the request
+/// addresses. This suite addresses THIS service's endpoint (`meetings-chime`), so the
+/// space is this service's here and the three operations answer their honest 501; which
+/// service answers a `/tags` request that names no family endpoint is a routing fact
+/// pinned by `core/router/tests/all/chime_family_signing_name_routing.rs`, not an
+/// implementation one.
 #[tokio::test]
 async fn the_operations_outside_this_slice_are_still_not_implemented() {
     let emulator = Emulator::new();
@@ -1109,6 +1119,9 @@ async fn the_operations_outside_this_slice_are_still_not_implemented() {
         .attendee_id_of_new_attendee(&meeting_id, "user-stubs")
         .await;
     let capabilities = json!({ "Audio": "Send", "Video": "None", "Content": "None" });
+    // A well-formed `AmazonResourceName` (len 1..1011, pattern `^arn:`), so every row below
+    // is refused for being unimplemented and not for a modelled constraint.
+    let resource_arn = format!("arn:aws:chime:us-east-1:000000000000:meeting/{meeting_id}");
 
     let cases: Vec<(&str, Reply)> = vec![
         (
@@ -1134,12 +1147,29 @@ async fn the_operations_outside_this_slice_are_still_not_implemented() {
         (
             "ListTagsForResource",
             emulator
+                .call("GET", &format!("/tags?arn={resource_arn}"), None)
+                .await,
+        ),
+        (
+            "TagResource",
+            emulator
                 .call(
-                    "GET",
-                    &format!(
-                        "/tags?arn=arn:aws:chime:us-east-1:{ACCOUNT_ID}:meeting/{meeting_id}"
-                    ),
-                    None,
+                    "POST",
+                    "/tags?operation=tag-resource",
+                    Some(&json!({
+                        "ResourceARN": resource_arn,
+                        "Tags": [{ "Key": "team", "Value": "collab" }],
+                    })),
+                )
+                .await,
+        ),
+        (
+            "UntagResource",
+            emulator
+                .call(
+                    "POST",
+                    "/tags?operation=untag-resource",
+                    Some(&json!({ "ResourceARN": resource_arn, "TagKeys": ["team"] })),
                 )
                 .await,
         ),

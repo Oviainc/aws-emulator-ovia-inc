@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeManagedRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeManagedRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeManagedRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the high-level information a VENDOR publishes about one of its managed
+//! rule groups: the group the `(VendorName, Name)` pair names, at the version the
+//! request names or at the vendor's default, with the capacity a web ACL spends to
+//! run it, the rules it runs and the labels those rules add.
+//!
+//! Every one of those is read from this service's managed-rule-group catalogue
+//! ([`crate::state::MANAGED_RULE_GROUP_CATALOGUE`]) — the same catalogue that
+//! prices a `ManagedRuleGroupStatement`, decides whether such a statement names a
+//! group that exists, and that `ListAvailableManagedRuleGroupVersions` lists the
+//! versions from — so one published figure answers every call that reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +203,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeManagedRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeManagedRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeManagedRuleGroup"))
+        // A read of PUBLISHED data: what a vendor offers is not state this account
+        // owns — nothing creates, updates or deletes a managed rule group — so the
+        // engine's store holds none of it and nothing here writes. `ctx` is read
+        // only for the signed region the notification topic's ARN carries.
+        let _ = &self.engine;
+
+        // `Scope` names the namespace the request is made in, and WAF recognises
+        // only the two values the enum declares. It narrows nothing below: a
+        // managed rule group is identified by its `(VendorName, Name)` pair alone
+        // ("you use this, along with the vendor name, to identify the rule group",
+        // `Name`'s own doc), so a vendor publishes the same group in either
+        // namespace — the scope only decides which region the group's notification
+        // topic ARN names.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(
+                DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(
+                    crate::state::invalid_parameter_exception(
+                        crate::state::FIELD_SCOPE_VALUE,
+                        &input.scope,
+                        "the scope names the namespace the request is made in, and is one of \
+                         CLOUDFRONT or REGIONAL",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A `(VendorName, Name)` pair the catalogue does not list names nothing
+        // that exists — the modelled `WAFNonexistentItemException`, exactly as a
+        // `ManagedRuleGroupStatement` naming an uncatalogued pair is refused.
+        let Some(group) = crate::state::managed_rule_group(&input.vendor_name, &input.name) else {
+            return Err(
+                DescribeManagedRuleGroupErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
+        };
+
+        // "The version of the rule group … If you don't provide this, WAF uses the
+        // vendor's default version" (`VersionName`'s own doc), and the versions a
+        // request may name are the ones its vendor offers — the same list
+        // `ListAvailableManagedRuleGroupVersions` answers. A version no vendor
+        // offers is not something WAF can describe, so it is refused with the
+        // modelled `WAFInvalidParameterException` naming the managed rule group and
+        // carrying the rejected version; a request naming none describes the
+        // vendor's default, and a group its vendor offers no version of reports no
+        // version rather than a refusal naming nothing.
+        let version_name = match input.version_name.as_deref() {
+            None => group.current_default_version(),
+            Some(requested) => {
+                let Some(offered) = group.offered_version(Some(requested)) else {
+                    return Err(
+                        DescribeManagedRuleGroupErrorModeled::WAFInvalidParameterException(
+                            crate::state::invalid_parameter_exception(
+                                crate::state::FIELD_MANAGED_RULE_SET,
+                                requested,
+                                "the version must be one the vendor offers for this managed \
+                                 rule group, as ListAvailableManagedRuleGroupVersions reports \
+                                 them",
+                            ),
+                        )
+                        .into(),
+                    );
+                };
+                Some(offered)
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        Ok(DescribeManagedRuleGroupOutput {
+            version_name: version_name.map(|version| version.to_string()),
+            sns_topic_arn: Some(group.sns_topic_arn(&input.scope, &region)),
+            // "The web ACL capacity units (WCUs) required for this rule group …
+            // Rule group capacity is fixed at creation": the one published figure
+            // this service also prices a `ManagedRuleGroupStatement` from, so what
+            // a web ACL's derived `Capacity` spends on running this group is what
+            // this call reports.
+            capacity: Some(group.capacity),
+            rules: Some(group.rule_summaries()),
+            label_namespace: Some(group.managed_label_namespace()),
+            available_labels: Some(group.available_labels()),
+            // "The labels that one or more rules in this rule group match against
+            // in label match statements": no rule of a published group matches on
+            // a label, so the list is empty — reported as a list, like the rule
+            // group projections this service derives from stored rules, rather than
+            // left unknown.
+            consumed_labels: Some(Vec::new()),
+        })
     }
 }
