@@ -245,6 +245,13 @@ impl ActionRun {
 pub struct StageRun {
     /// `StageDeclaration$name`.
     pub name: String,
+    /// WHICH declared stage of the pinned declaration this is the run of.
+    ///
+    /// A plan does not have to hold every declared stage, nor hold them from the
+    /// pipeline's first one: a stage rollback runs ONE stage, so what each action of a
+    /// plan IS is read from the declared stage this names rather than from the run's
+    /// position in the plan ([`declared_action`]).
+    pub declaration_index: usize,
     /// A `StageExecutionStatus` value, or `None` while the stage has not been entered.
     pub status: Option<String>,
     /// This stage's actions, in declaration order.
@@ -259,6 +266,34 @@ impl StageRun {
             Some("Succeeded" | "Failed" | "Stopped" | "Skipped" | "Cancelled")
         )
     }
+
+    /// True while this stage has been entered and has not reached an outcome.
+    pub fn is_in_progress(&self) -> bool {
+        self.status.is_some() && !self.is_terminal()
+    }
+}
+
+/// The declared stage `run` is the execution's run of, from the declaration the
+/// execution pinned.
+pub fn declared_stage<'a>(
+    declaration: &'a PipelineDeclaration,
+    run: &StageRun,
+) -> Option<&'a crate::ops::types::StageDeclaration> {
+    declaration.stages.get(run.declaration_index)
+}
+
+/// The declared action the `action`th action of `run` runs.
+///
+/// What an action IS — its type, its configuration, the artifacts it consumes and
+/// produces — is read HERE, from the stage of the pinned declaration the run names, so
+/// a plan that holds only some of the declaration's stages still reads the right
+/// action. `None` means the pinned declaration no longer declares it at all.
+pub fn declared_action<'a>(
+    declaration: &'a PipelineDeclaration,
+    run: &StageRun,
+    action: usize,
+) -> Option<&'a ActionDeclaration> {
+    declared_stage(declaration, run)?.actions.get(action)
 }
 
 /// A `StopPipelineExecution` request recorded against an execution.
@@ -277,19 +312,44 @@ pub struct StopRequest {
 /// instant the execution starts, so a later `UpdatePipeline` does not rewrite a running
 /// execution.
 pub fn plan_stages(declaration: &PipelineDeclaration, now: SystemTime) -> Vec<StageRun> {
-    declaration
+    (0..declaration.stages.len())
+        .filter_map(|index| plan_stage_at(declaration, index, now))
+        .collect()
+}
+
+/// The plan a rollback of ONE stage runs: that declared stage alone, nothing started.
+///
+/// `None` when the declaration declares no stage of that name, which is what a stage
+/// rollback refuses as an unknown stage.
+pub fn plan_stage(
+    declaration: &PipelineDeclaration,
+    stage_name: &str,
+    now: SystemTime,
+) -> Option<StageRun> {
+    let index = declaration
         .stages
         .iter()
-        .map(|stage| StageRun {
-            name: stage.name.clone(),
-            status: None,
-            actions: stage
-                .actions
-                .iter()
-                .map(|action| plan_action(action, now))
-                .collect(),
-        })
-        .collect()
+        .position(|stage| stage.name == stage_name)?;
+    plan_stage_at(declaration, index, now)
+}
+
+/// One declared stage, as the engine will run it.
+fn plan_stage_at(
+    declaration: &PipelineDeclaration,
+    index: usize,
+    now: SystemTime,
+) -> Option<StageRun> {
+    let stage = declaration.stages.get(index)?;
+    Some(StageRun {
+        name: stage.name.clone(),
+        declaration_index: index,
+        status: None,
+        actions: stage
+            .actions
+            .iter()
+            .map(|action| plan_action(action, now))
+            .collect(),
+    })
 }
 
 /// One declared action, as the engine will run it.
