@@ -119,17 +119,19 @@ pub const MAX_RESOURCE_NAME_LEN: usize = 40;
 /// The smallest page size a MemoryDB listing accepts for `MaxResults`.
 ///
 /// `MaxResults` is an `IntegerOptional` the model puts no `@range` on; the WINDOW comes
-/// from the service's own refusal, which names both of its bounds — the recorded
-/// `DescribeUsers(MaxResults=0)` answer is `InvalidParameterValueException` "Invalid
-/// value for max results. Must be between 1 and 50", and `MaxResults=51` is refused on
-/// the same path. So the bound lives here and every listing in this service reads it
-/// through [`max_results_rejection`], rather than each one inventing its own.
-pub const MIN_MAX_RESULTS: i32 = 1;
+/// from the service's own refusal, which names both of its bounds — a page size below
+/// this one, or above [`MAX_MAX_RESULTS`], is answered with
+/// `InvalidParameterValueException` naming the window, and a size at either bound is
+/// served. So the bound lives here and every paginated listing in this service reads it
+/// through [`max_results_rejection`], rather than each one inventing its own: a page
+/// size the service will not serve cannot be accepted by one listing and refused by the
+/// next.
+pub const MIN_MAX_RESULTS: i32 = 20;
 
 /// The largest page size a MemoryDB listing accepts for `MaxResults`, the upper bound
-/// of the same recorded refusal as [`MIN_MAX_RESULTS`] ("Must be between 1 and 50"),
-/// read through the same [`max_results_rejection`].
-pub const MAX_MAX_RESULTS: i32 = 50;
+/// of the same refusal as [`MIN_MAX_RESULTS`], read through the same
+/// [`max_results_rejection`].
+pub const MAX_MAX_RESULTS: i32 = 100;
 
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
@@ -687,11 +689,16 @@ pub fn parameter_group_family_rejection(family: &str) -> Option<String> {
 /// The `default.<family>` groups belong to MemoryDB, not to the caller
 /// ([`DEFAULT_PARAMETER_GROUP_PREFIX`] is the same rule the tag mutations refuse one
 /// with, see [`default_resource_rejection`]): they carry the family's engine defaults
-/// and are immutable, so every write path over a parameter group refuses one. The
-/// caller maps the refusal onto its own modelled `InvalidParameterValueException`.
-pub fn immutable_parameter_group_rejection(name: &str) -> Option<String> {
+/// and are immutable, so every write path over a parameter group refuses one — stating
+/// the ACTION it refused, the way [`builtin_resource_rejection`] does for the other
+/// built-in resources. The caller maps the refusal onto its own modelled
+/// `InvalidParameterValueException`.
+pub fn immutable_parameter_group_rejection(name: &str, mutation: Mutation) -> Option<String> {
     name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
-        .then(|| "Cannot modify a default parameter group.".to_string())
+        .then(|| match mutation {
+            Mutation::Modify => "Cannot modify a default parameter group.".to_string(),
+            Mutation::Delete => "Cannot delete a default parameter group.".to_string(),
+        })
 }
 
 /// The message a `ParameterGroupNotFoundFault` carries for the group `name` the request
@@ -1655,6 +1662,25 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             .collect()
     }
 
+    /// The names of the clusters currently referencing `parameter_group_name`, in name
+    /// order — the clusters a parameter group is "associated with", which is what
+    /// `DeleteParameterGroup` ("You cannot delete a parameter group if it is associated
+    /// with any clusters") refuses on. DERIVED from the clusters in state, exactly as
+    /// [`Self::clusters_using_acl`] is, so the refusal names the clusters a caller reads
+    /// in `Cluster$ParameterGroupName`.
+    pub fn clusters_using_parameter_group(&self, parameter_group_name: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| {
+                cluster
+                    .parameter_group_name
+                    .as_deref()
+                    .is_some_and(|name| name == parameter_group_name)
+            })
+            .map(|cluster| cluster.name.clone())
+            .collect()
+    }
+
     /// The same membership for EVERY ACL, in ONE pass over the clusters.
     ///
     /// A listing uses this rather than [`Self::clusters_using_acl`] per ACL, so the
@@ -2293,15 +2319,16 @@ pub fn fold_name(name: &str) -> String {
 /// The service enforces a TIGHTER rule than the model's `^[a-zA-Z][a-zA-Z0-9\-]*$`:
 /// at most [`MAX_RESOURCE_NAME_LEN`] characters, beginning with a letter, only ASCII
 /// letters, digits and hyphens, and neither a trailing hyphen nor two consecutive
-/// hyphens. Both refusals name the identifier the way the SERVICE names it
-/// ([`ResourceKind::name_label`]) rather than the wire member the request carried it
-/// in, which is how a caller learns which rule it broke; the caller maps the refusal
-/// onto its own modelled `InvalidParameterValueException`.
+/// hyphens. The length refusal names the identifier the way the SERVICE names it
+/// ([`ResourceKind::name_label`]); the spelling refusal is worded per kind by
+/// [`ResourceKind::identifier_rule_message`], because the parameter-group surface names
+/// the REQUEST MEMBER it rejected there. Either way the caller maps the refusal onto
+/// its own modelled `InvalidParameterValueException`.
 pub fn resource_name_rejection(kind: ResourceKind, name: &str) -> Option<String> {
-    let label = kind.name_label();
     if name.chars().count() > MAX_RESOURCE_NAME_LEN {
         return Some(format!(
-            "{label} length must be less than {MAX_RESOURCE_NAME_LEN}."
+            "{} length must be less than {MAX_RESOURCE_NAME_LEN}.",
+            kind.name_label()
         ));
     }
     let well_formed = name.starts_with(|first: char| first.is_ascii_alphabetic())
@@ -2310,14 +2337,17 @@ pub fn resource_name_rejection(kind: ResourceKind, name: &str) -> Option<String>
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
         && !name.ends_with('-')
         && !name.contains("--");
-    (!well_formed).then(|| {
-        format!(
-            "{label} must begin with a letter; must contain only ASCII letters, digits, \
-             and hyphens; and must not end with a hyphen or contain two consecutive \
-             hyphens."
-        )
-    })
+    (!well_formed).then(|| kind.identifier_rule_message())
 }
+
+/// The clauses of the identifier rule itself, which every spelling refusal ends with
+/// whichever form the kind of resource words it in (see
+/// [`ResourceKind::identifier_rule_message`]): the rule a well-formed MemoryDB
+/// identifier follows, stated as the service states it.
+const IDENTIFIER_RULE_CLAUSES: &str = "must begin with a letter; must contain only \
+                                       ASCII letters, digits, and hyphens; and must \
+                                       not end with a hyphen or contain two \
+                                       consecutive hyphens.";
 
 /// The message a create's already-exists refusal carries, built from the kind of
 /// resource and the FOLDED name the request named.
@@ -2406,18 +2436,49 @@ pub fn default_user_membership_rejection<'a>(
     .then(|| format!("{DEFAULT_USER_NAME} user can't be added to another ACL."))
 }
 
+/// How one listing's refusal names the page size it rejected.
+///
+/// The BOUND is one rule for every paginated listing in this service
+/// ([`MIN_MAX_RESULTS`]..=[`MAX_MAX_RESULTS`], read through
+/// [`max_results_rejection`]); the NOUN is per listing, because that is how this
+/// service's wire words it: most of its listings call the page size "max records" — the
+/// noun every `MaxResults` member's own documentation uses ("The maximum number of
+/// records to include in the response") — while the parameter-group surface calls it
+/// "max results". So each handler names the noun its own listing answers with and reads
+/// the rule itself from one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSizeNoun {
+    /// "max records": the noun the model's own `MaxResults` documentation uses, and the
+    /// one the cluster, ACL, event and engine-version listings answer with.
+    Records,
+    /// "max results": the noun the parameter-group surface (`DescribeParameterGroups`,
+    /// `DescribeParameters`) answers with.
+    Results,
+}
+
+impl PageSizeNoun {
+    /// The noun as the refusal spells it.
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::Records => "max records",
+            Self::Results => "max results",
+        }
+    }
+}
+
 /// Why a listing cannot serve this `MaxResults`, or `None` when it can.
 ///
 /// EVERY paginated listing in this service reads the page-size window through here, so
-/// one request's page size is refused with the same rule and the same message whichever
-/// listing it was sent to. The caller maps the refusal onto its own modelled
+/// one request's page size is refused by the same rule, with the same bounds, whichever
+/// listing it was sent to; `noun` is only how that listing names the page size (see
+/// [`PageSizeNoun`]). The caller maps the refusal onto its own modelled
 /// `InvalidParameterValueException`.
-pub fn max_results_rejection(max_results: Option<i32>) -> Option<String> {
+pub fn max_results_rejection(noun: PageSizeNoun, max_results: Option<i32>) -> Option<String> {
     let max = max_results?;
     (!(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&max)).then(|| {
         format!(
-            "Invalid value for max results. Must be between {MIN_MAX_RESULTS} and \
-             {MAX_MAX_RESULTS}"
+            "Invalid value for {}. Must be between {MIN_MAX_RESULTS} and {MAX_MAX_RESULTS}",
+            noun.phrase()
         )
     })
 }
@@ -2785,9 +2846,9 @@ pub fn build_shards(
 /// names a resource that existed when the page was served, so a token past the end is
 /// reported rather than quietly treated as the end of the listing.
 ///
-/// `limit` is an already-validated page size (the callers refuse a `MaxResults` below
-/// 1 with a modelled 400 before converting), and it only ever caps a `take` over an
-/// existing list, so it never sizes an allocation.
+/// `limit` is an already-validated page size (the callers refuse a `MaxResults` outside
+/// the service's page-size window with a modelled 400 before converting), and it only
+/// ever caps a `take` over an existing list, so it never sizes an allocation.
 pub fn paginate<T>(
     entries: Vec<(String, T)>,
     limit: Option<usize>,
@@ -2807,7 +2868,8 @@ pub fn paginate<T>(
 }
 
 /// The already-validated page size of a listing request: `None` for "every remaining
-/// item". Only reached once the caller has refused a `MaxResults` below 1.
+/// item". Only reached once the caller has refused a `MaxResults` outside
+/// [`MIN_MAX_RESULTS`]..=[`MAX_MAX_RESULTS`], so the value is bounded before it is used.
 pub fn page_limit(max_results: Option<i32>) -> Option<usize> {
     max_results.and_then(|max| usize::try_from(max).ok())
 }
@@ -2987,6 +3049,57 @@ impl ResourceKind {
             Self::SubnetGroup => "Subnet group name",
             Self::MultiRegionCluster => "Multi-Region cluster name",
             Self::MultiRegionParameterGroup => "Multi-Region parameter group name",
+        }
+    }
+
+    /// The MEMBER a request carries this kind of resource's name in, as the model
+    /// spells it (`smithy_query query="operation"` → the input members of the
+    /// operations that take each name: `CreateCluster$ClusterName`,
+    /// `CreateCluster$ACLName`, `CreateUser$UserName`,
+    /// `CreateParameterGroup$ParameterGroupName`, `CreateCluster$SnapshotName`,
+    /// `CreateCluster$SubnetGroupName`, `CreateCluster$MultiRegionClusterName`,
+    /// `DescribeMultiRegionParameterGroups$MultiRegionParameterGroupName`).
+    ///
+    /// Read by [`identifier_rule_message`] for the kinds whose refusal names the
+    /// request member rather than the service's own label for the identifier.
+    ///
+    /// [`identifier_rule_message`]: ResourceKind::identifier_rule_message
+    pub fn name_member(self) -> &'static str {
+        match self {
+            Self::Cluster => "ClusterName",
+            Self::Acl => "ACLName",
+            Self::User => "UserName",
+            Self::ParameterGroup => "ParameterGroupName",
+            Self::Snapshot => "SnapshotName",
+            Self::SubnetGroup => "SubnetGroupName",
+            Self::MultiRegionCluster => "MultiRegionClusterName",
+            Self::MultiRegionParameterGroup => "MultiRegionParameterGroupName",
+        }
+    }
+
+    /// How the service states the identifier rule for a name of this kind that is not a
+    /// well-formed identifier — the sentence a caller learns the broken rule from.
+    ///
+    /// Both forms end in the same clauses ([`IDENTIFIER_RULE_CLAUSES`]); they differ in
+    /// what they name as the thing refused:
+    ///
+    /// * a PARAMETER GROUP's refusal is built from the request: it names the member the
+    ///   name arrived in ([`name_member`]) and then states the rule for identifiers
+    ///   generally, so a caller — or tooling reading the message — can tell which
+    ///   request member was rejected;
+    /// * every other kind states the rule about the service's own label for that
+    ///   identifier ([`name_label`]), which is how this service words those refusals.
+    ///
+    /// [`name_member`]: ResourceKind::name_member
+    /// [`name_label`]: ResourceKind::name_label
+    pub fn identifier_rule_message(self) -> String {
+        match self {
+            Self::ParameterGroup | Self::MultiRegionParameterGroup => format!(
+                "The parameter {} is not a valid identifier. Identifiers {}",
+                self.name_member(),
+                IDENTIFIER_RULE_CLAUSES
+            ),
+            _ => format!("{} {}", self.name_label(), IDENTIFIER_RULE_CLAUSES),
         }
     }
 

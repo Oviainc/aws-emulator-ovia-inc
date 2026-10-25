@@ -12,10 +12,12 @@
 //! (`InvalidParameterValueException`) covers every one of these rules. The rules under
 //! test, each over a SET of inputs rather than one recorded request:
 //!
-//! * a name refusal states the service's ONE rule for that kind of resource, naming the
-//!   identifier the way the service names it (`User id`, `ACL name`, …) rather than the
-//!   wire member — and says the same whether the name was caught by the model's half of
-//!   the rule or by the service's tighter half;
+//! * a name refusal states the service's ONE rule for that kind of resource: the length
+//!   clause names the identifier the way the service names it (`User id`, `ACL name`, …),
+//!   and the spelling clause names the REQUEST MEMBER for a parameter group ("The
+//!   parameter ParameterGroupName is not a valid identifier. …") and the service's own
+//!   label for the other kinds — and says the same whether the name was caught by the
+//!   model's half of the rule or by the service's tighter half;
 //! * a password refusal states the documented length bound, a password-count refusal
 //!   states the service's maximum, and an `AuthenticationMode` whose type and
 //!   `Passwords` do not go together names the type it refused — for every operation
@@ -111,10 +113,11 @@ fn create_body(operation: &str, name: &str) -> Value {
 
 /// A name refusal states the service's ONE name rule for that kind of resource: the
 /// length clause names the published bound, the spelling clause names every part of the
-/// rule, and both name the identifier the way the SERVICE names it — for every kind of
-/// resource that takes a name, and whichever half of the rule the name broke (the
-/// model's `@pattern`, refused at the boundary, or the service's tighter rule, refused
-/// by the handler).
+/// rule, and each names what the SERVICE names when it refuses that kind of identifier —
+/// its own label, or, for a parameter group, the request member the name arrived in —
+/// for every kind of resource that takes a name, and whichever half of the rule the name
+/// broke (the model's `@pattern`, refused at the boundary, or the service's tighter rule,
+/// refused by the handler).
 #[tokio::test]
 async fn a_name_refusal_states_the_services_own_rule_for_that_resource() {
     let router = router();
@@ -140,19 +143,31 @@ async fn a_name_refusal_states_the_services_own_rule_for_that_resource() {
         ("two consecutive hyphens", "double--hyphen".to_string(), false),
     ];
     // One row per name-taking create, with the label the service gives that kind of
-    // resource's identifier.
-    let kinds: &[(&str, &str)] = &[
-        ("CreateUser", "User id"),
-        ("CreateACL", "ACL name"),
-        ("CreateParameterGroup", "Parameter group name"),
-        ("CreateCluster", "Cluster name"),
+    // resource's identifier and — where its spelling refusal is built from the request
+    // instead — the member the name arrived in.
+    let kinds: &[(&str, &str, Option<&str>)] = &[
+        ("CreateUser", "User id", None),
+        ("CreateACL", "ACL name", None),
+        (
+            "CreateParameterGroup",
+            "Parameter group name",
+            Some("ParameterGroupName"),
+        ),
+        ("CreateCluster", "Cluster name", None),
     ];
 
-    for (create, label) in kinds {
+    for (create, label, member) in kinds {
         for (name_case, name, breaks_length) in &names {
             let case = format!("{create}/{name_case}");
             let wanted = if *breaks_length {
                 format!("{label} length must be less than {MAX_RESOURCE_NAME_LEN}.")
+            } else if let Some(member) = member {
+                format!(
+                    "The parameter {member} is not a valid identifier. Identifiers must \
+                     begin with a letter; must contain only ASCII letters, digits, and \
+                     hyphens; and must not end with a hyphen or contain two consecutive \
+                     hyphens."
+                )
             } else {
                 format!(
                     "{label} must begin with a letter; must contain only ASCII letters, \

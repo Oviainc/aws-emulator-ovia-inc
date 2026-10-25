@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -742,15 +743,20 @@ async fn an_update_relays_out_the_shards_it_resizes() {
     }
 }
 
-/// Every listing pages over its whole set, in name order, for any `MaxResults`: each
-/// page is at most `MaxResults` long, the token resumes exactly where the page ended,
-/// and the pages concatenated are the full set with nothing repeated or dropped.
+/// Every listing pages over its whole set, in name order, for any `MaxResults` the
+/// service's page-size window admits: each page is at most `MaxResults` long, the token
+/// resumes exactly where the page ended, and the pages concatenated are the full set
+/// with nothing repeated or dropped.
 #[tokio::test]
 async fn listings_page_over_the_whole_set_for_any_page_size() {
     let router = router();
     acl(&router, "page-acl").await;
 
-    let names: Vec<String> = (0..7).map(|index| format!("page-{index}")).collect();
+    // More clusters than the SMALLEST page the service serves, so a page size at the
+    // bottom of the page-size window has to walk several pages to cover the set.
+    let names: Vec<String> = (0..MIN_MAX_RESULTS + 2)
+        .map(|index| format!("page-{index:02}"))
+        .collect();
     for name in &names {
         ok(
             &router,
@@ -765,7 +771,7 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
         .await;
     }
 
-    for max_results in [1_i64, 2, 3, 6, 7, 20] {
+    for max_results in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
         let case = format!("MaxResults={max_results}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -778,7 +784,7 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
             let body = ok(&router, "DescribeClusters", &request, &case).await;
             let page = body["Clusters"].as_array().expect("Clusters is a list");
             assert!(
-                page.len() <= max_results as usize,
+                i32::try_from(page.len()).unwrap_or(i32::MAX) <= max_results,
                 "case {case:?}: a page may hold at most {max_results} items, got {}",
                 page.len()
             );
@@ -802,14 +808,18 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
         );
     }
 
-    // The same rule on the other paginated listing in this slice.
-    for name in ["page-acl-b", "page-acl-c"] {
+    // The same rule on the other paginated listing in this slice, over a set larger than
+    // the smallest page it serves.
+    let acl_names: Vec<String> = (0..MIN_MAX_RESULTS)
+        .map(|index| format!("page-acl-{index:02}"))
+        .collect();
+    for name in &acl_names {
         ok(&router, "CreateACL", &json!({ "ACLName": name }), name).await;
     }
     let mut seen: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut request = json!({ "MaxResults": 2 });
+        let mut request = json!({ "MaxResults": MIN_MAX_RESULTS });
         if let Some(token) = &token {
             request["NextToken"] = json!(token);
         }
@@ -826,11 +836,14 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
             None => break,
         }
     }
+    let mut expected_acls: Vec<String> = acl_names.clone();
+    // The built-in `open-access` ACL every MemoryDB account already has pages with the
+    // created ones, as does the one the clusters above were created on.
+    expected_acls.push("open-access".to_string());
+    expected_acls.push("page-acl".to_string());
+    expected_acls.sort();
     assert_eq!(
-        seen,
-        // The built-in `open-access` ACL every MemoryDB account already has pages with
-        // the created ones, and sorts first.
-        vec!["open-access", "page-acl", "page-acl-b", "page-acl-c"],
+        seen, expected_acls,
         "case {:?}: paging must yield every ACL once, in name order",
         "acl paging"
     );

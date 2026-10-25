@@ -31,6 +31,7 @@
 //! every whole-set assertion below expects that user beside the created ones.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
 use smithy_server_runtime::MultiServiceRouter;
 
 // The suite-wide harness: ONE SigV4 request builder, ONE router constructor and ONE
@@ -553,11 +554,18 @@ async fn the_listing_pages_and_filters_over_every_user() {
         // The built-in user the account already had pages with the created ones.
         .chain([DEFAULT_USER.to_string()])
         .collect();
+    // More users than the SMALLEST page the service serves, so a page size at the bottom
+    // of the page-size window has to walk several pages to cover the set.
+    for index in 0..MIN_MAX_RESULTS {
+        let name = format!("paged-user-{index:02}");
+        create_user(&router, &name).await;
+        sorted.push(name);
+    }
     sorted.sort();
 
-    // Every page size from 1 to one past the number of users covers the whole set,
-    // in name order, exactly once.
-    for page_size in 1..=sorted.len() + 1 {
+    // At the bottom of the page-size window, one past it, and at the top: each covers
+    // the whole set, in name order, exactly once.
+    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
         let case = format!("MaxResults {page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -569,7 +577,7 @@ async fn the_listing_pages_and_filters_over_every_user() {
             let page = ok(&router, "DescribeUsers", &request, &case).await;
             let page_names = user_names(&page);
             assert!(
-                page_names.len() <= page_size,
+                i32::try_from(page_names.len()).unwrap_or(i32::MAX) <= page_size,
                 "case {case:?}: a page must hold at most {page_size} users, got {page}"
             );
             seen.extend(page_names);
