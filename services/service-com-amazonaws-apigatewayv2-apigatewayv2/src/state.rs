@@ -1105,12 +1105,30 @@ pub fn validate_route_authorization(
     if AUTHORIZER_BACKED_AUTHORIZATION_TYPES.contains(&authorization_type)
         && authorizer_id.is_none_or(str::is_empty)
     {
-        return Err(format!(
-            "AuthorizerId is required for a route whose AuthorizationType is \
-             {authorization_type}"
-        ));
+        return Err(invalid_authorizer_reference_message(authorization_type));
     }
     Ok(())
+}
+
+/// The sentence this service refuses a route that does not name a valid authorizer
+/// with, in the form for the `AuthorizationType` the request set.
+///
+/// The refusal is about the authorizer REFERENCE — a route of an authorizer-backed
+/// type that names no authorizer at all is as unauthorizable as one naming an id no
+/// authorizer carries — so the sentence states the requirement the type imposes and
+/// echoes no id back. `JWT` is the one authorizer-backed `AuthorizationType` that names
+/// an authorizer of its own kind (`Route$AuthorizationType`: "JWT for using JSON Web
+/// Tokens", and `AUTHORIZER_TYPE_VALUES` carries `JWT`), so its sentence names that
+/// kind; `CUSTOM` is "for using a Lambda authorizer", whose requirement is the one
+/// [`UNRESOLVED_AUTHORIZER_MESSAGE`] states.
+pub fn invalid_authorizer_reference_message(authorization_type: &str) -> String {
+    if authorization_type == AUTHORIZER_TYPE_JWT {
+        return format!(
+            "Invalid authorizer ID specified. Setting the authorization type to \
+             {AUTHORIZER_TYPE_JWT} requires a valid {AUTHORIZER_TYPE_JWT} authorizer."
+        );
+    }
+    UNRESOLVED_AUTHORIZER_MESSAGE.to_string()
 }
 
 /// The entry a CORS list carries to stand for "every value": the wildcard.
@@ -1217,10 +1235,12 @@ pub fn validate_payload_format_version(
         &[ONLY_PAYLOAD_FORMAT_VERSION]
     };
     if !supported.contains(&version) {
+        // The refusal names the pair that cannot hold together — the version the request
+        // sent and the type it sent it for — and nothing else: the cross-field rule is
+        // about those two members.
         return Err(format!(
-            "PayloadFormatVersion {version} is not supported for an integration of type \
-             {integration_type}; supported values are {}",
-            supported.join(", ")
+            "PayloadFormatVersion {version} is not supported for integration of type \
+             {integration_type}"
         ));
     }
     Ok(())
@@ -1234,6 +1254,50 @@ pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
 /// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the
 /// one that connects through a VPC link and so needs the link's id.
 pub const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
+
+/// Every `IntegrationType` an api whose protocol is not WebSocket may be associated
+/// with: the values of the modelled enum that [`WEBSOCKET_ONLY_INTEGRATION_TYPES`] does
+/// not claim, in the enum's own order.
+///
+/// Those are exactly the two the member documents as proxy integrations — "also
+/// referred to as a Lambda proxy integration" (`AWS_PROXY`) and "also referred to as the
+/// HTTP proxy integration" (`HTTP_PROXY`) — which is what the refusal below calls them.
+pub fn non_websocket_integration_types() -> Vec<&'static str> {
+    wire::INTEGRATION_TYPE_VALUES
+        .iter()
+        .copied()
+        .filter(|value| !WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(value))
+        .collect()
+}
+
+/// `Ok(())`, or why an api of this `ProtocolType` cannot be associated with an
+/// integration of this `IntegrationType` — the message for the operation's
+/// `BadRequestException`.
+///
+/// One rule: an api supports only the integration types its own protocol has behaviour
+/// for, and the three the member's documentation marks "Supported only for WebSocket
+/// APIs" ([`WEBSOCKET_ONLY_INTEGRATION_TYPES`]) are therefore not ones an api of any
+/// other protocol may carry. The refusal names the types that api MAY be associated
+/// with (see [`non_websocket_integration_types`]) rather than the value it refused, so
+/// what the caller has to send instead is in the message.
+///
+/// Every writer of an integration routes through here — the create, the update and an
+/// import — so the gate and its wording cannot differ between them.
+pub fn validate_integration_type_for_protocol(
+    protocol_type: &str,
+    integration_type: &str,
+) -> Result<(), String> {
+    if protocol_type == WEBSOCKET_PROTOCOL_TYPE
+        || !WEBSOCKET_ONLY_INTEGRATION_TYPES.contains(&integration_type)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Currently, an API with a protocol type of {protocol_type} may only be \
+         associated with proxy integrations ({})",
+        non_websocket_integration_types().join(", ")
+    ))
+}
 
 /// `Ok(())`, or why this integration's configuration cannot hold together — the message
 /// for the operation's `BadRequestException`.
@@ -1535,32 +1599,28 @@ pub fn is_json_media_type(content_type: Option<&str>) -> bool {
 /// gives it. A partial schema is legitimate input (`{}` matches everything), and the
 /// document is handed back verbatim by every reader of the model.
 ///
-/// `Ok(())` or the message for the operation's `BadRequestException`: it names the
-/// member and what was wrong with it, and echoes no schema back.
+/// `Ok(())` or the message for the operation's `BadRequestException`, which is the one
+/// sentence the whole class is refused with (see [`INVALID_MODEL_SCHEMA_MESSAGE`]).
 pub fn validate_model_schema(content_type: Option<&str>, schema: &str) -> Result<(), String> {
     if !is_json_media_type(content_type) {
         return Ok(());
     }
-    let document: ::serde_json::Value = ::serde_json::from_str(schema)
-        .map_err(|error| format!("Invalid model specified: Schema is not valid JSON: {error}"))?;
-    if document.is_object() {
+    let document = ::serde_json::from_str::<::serde_json::Value>(schema).ok();
+    if document.is_some_and(|document| document.is_object()) {
         return Ok(());
     }
-    // The JSON type the schema turned out to be, so the caller can see what it sent
-    // without the document being echoed back.
-    let kind = match document {
-        ::serde_json::Value::Null => "null",
-        ::serde_json::Value::Bool(_) => "a boolean",
-        ::serde_json::Value::Number(_) => "a number",
-        ::serde_json::Value::String(_) => "a string",
-        ::serde_json::Value::Array(_) => "an array",
-        ::serde_json::Value::Object(_) => "an object",
-    };
-    Err(format!(
-        "Invalid model specified: Schema is not a valid JSON schema document: a JSON schema \
-         is a JSON object, but this Schema is {kind}."
-    ))
+    Err(INVALID_MODEL_SCHEMA_MESSAGE.to_string())
 }
+
+/// The sentence API Gateway refuses a `Schema` that is no schema document with.
+///
+/// The service answers the RESULT of validating the model, and a document it could not
+/// read as a schema yields that result's one error and no warnings. It is one sentence
+/// for the whole class: it names nothing from the request, so neither the schema nor any
+/// reader's diagnostic (a parser's position, the JSON type the document turned out to
+/// be) is echoed back, and the refusal a caller sees does not vary with either.
+pub const INVALID_MODEL_SCHEMA_MESSAGE: &str = "Invalid model specified: Validation \
+    Result: warnings : [], errors : [Invalid model schema specified]";
 
 /// A persisted `Stage` resource, owned by its parent [`Api`].
 ///
@@ -1636,6 +1696,14 @@ impl Stage {
 /// The most stages one api may hold, after which CreateStage is refused. AWS's
 /// published API Gateway quota is 10 stages per API.
 pub const MAX_STAGES_PER_API: usize = 10;
+
+/// The sentence API Gateway refuses a `CreateStage` naming a stage its api already
+/// holds with.
+///
+/// A stage is identified by its name within its api, so the conflict is that the name
+/// is taken; the sentence states that and names nothing from the request, so it is the
+/// same for every name.
+pub const STAGE_ALREADY_EXISTS_MESSAGE: &str = "Stage already exists";
 
 /// The `StageName` of the stage that serves an api's root: "the $default stage"
 /// (`Stage$ApiGatewayManaged`), the one name that is not a plain stage name.

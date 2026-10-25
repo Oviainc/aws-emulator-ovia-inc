@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAggregateComplianceByConfigRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAggregateComplianceByConfigRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAggregateComplianceByConfigRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, rule by rule, whether the Config rules a configuration aggregator takes in
+//! are compliant: each reported entry names the rule, the source account and the source
+//! Region its data came from, and the `Compliance` the rule's recorded evaluation
+//! results roll up to ([`crate::state::ConfigRuleEntry::compliance_shape`]), so this
+//! aggregate read and the account's own `DescribeComplianceByConfigRule` cannot
+//! disagree about the same rule.
+//!
+//! A rule is reported only where its results place it in a compliance type an aggregate
+//! read holds ([`crate::state::AGGREGATE_RULE_COMPLIANCE_TYPES`]) — a rule nothing has
+//! evaluated, or whose results place it nowhere, has no compliance results and is left
+//! out rather than reported as undecided — and only while one of the aggregator's
+//! sources names this store's account and the Region the request is scoped to
+//! ([`crate::state::ConfigurationAggregatorEntry::aggregates_source`]) and the
+//! request's own `Filters` admit it. That is one way a caller is served the empty result
+//! page this operation documents.
+//!
+//! It is a REPORT: it writes nothing, so the rules and results a later caller sees are
+//! the ones this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +175,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAggregateComplianceByConfigRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAggregateComplianceByConfigRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAggregateComplianceByConfigRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `Limit` is the page size, and 0 asks for the default (`Limit`: "The default
+        // is maximum. If you specify 0, Config uses the default"). The modelled 0..1000
+        // range is refused before this handler runs; a value outside it reaching here
+        // is still the limit error this operation models, never a page.
+        let max = crate::state::GROUP_BY_API_MAX_LIMIT;
+        let page_size = match usize::try_from(input.limit)
+            .ok()
+            .filter(|limit| *limit <= max)
+        {
+            Some(0) => max,
+            Some(limit) => limit,
+            None => {
+                // Defensive, and unreachable in the assembled emulator: the shared
+                // request validation refuses the modelled 0..1000 range before this
+                // handler runs, so nothing reaches this arm.
+                return Err(
+                    DescribeAggregateComplianceByConfigRulesErrorModeled::InvalidLimitException(
+                        InvalidLimitException {
+                            message: Some(format!(
+                                "The specified Limit {} is outside the allowable range of \
+                                 0 to {max}.",
+                                input.limit
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(
+                        DescribeAggregateComplianceByConfigRulesErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "the specified NextToken is not valid; use the NextToken \
+                                     a previous DescribeAggregateComplianceByConfigRules \
+                                     response returned"
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // A filter may name only a compliance type an aggregate read holds, so one that
+        // names another is a bad request rather than a filter that matches nothing.
+        let filtered_compliance = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.compliance_type.as_deref())
+            .filter(|compliance_type| !compliance_type.is_empty());
+        if let Some(rejected) = filtered_compliance.filter(|compliance_type| {
+            !crate::state::AGGREGATE_RULE_COMPLIANCE_TYPES.contains(compliance_type)
+        }) {
+            return Err(
+                DescribeAggregateComplianceByConfigRulesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ComplianceType",
+                            rejected,
+                            &crate::state::AGGREGATE_RULE_COMPLIANCE_TYPES,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // This store stands for ONE account in ONE Region, so the Config data it holds
+        // is this account's, in the Region the request is signed for — which is what
+        // every reported entry names as its source.
+        let account_id = ::emulator_server::emulator_account_id();
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        let Some(aggregator) = store
+            .configuration_aggregators
+            .get(&input.configuration_aggregator_name)
+        else {
+            return Err(
+                DescribeAggregateComplianceByConfigRulesErrorModeled::NoSuchConfigurationAggregatorException(
+                    NoSuchConfigurationAggregatorException {
+                        message: Some(crate::state::no_such_configuration_aggregator_message(
+                            &input.configuration_aggregator_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Filters` narrows the results to one source account and/or one source Region
+        // ("Filters the compliance results based on account ID, region, compliance type,
+        // and rule name"), so a filter naming any other source leaves this store
+        // contributing nothing, exactly as a source the aggregator does not take in
+        // does.
+        let excluded_source = input.filters.as_ref().is_some_and(|filters| {
+            filters
+                .account_id
+                .as_deref()
+                .filter(|named| !named.is_empty())
+                .is_some_and(|named| named != account_id)
+                || filters
+                    .aws_region
+                    .as_deref()
+                    .filter(|named| !named.is_empty())
+                    .is_some_and(|named| named != region)
+        }) || !aggregator.aggregates_source(account_id, &region);
+
+        // The rule name filter selects ONE rule by name (`ConfigRuleName`: "The name of
+        // the Config rule"); a name this account holds no rule under selects none,
+        // which is an empty page rather than a refusal.
+        let filtered_name = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.config_rule_name.as_deref())
+            .filter(|name| !name.is_empty());
+
+        // A reporting operation: every entry is computed from the rules and the
+        // evaluation results already in state, and nothing is written. Paging follows
+        // the store's own name ordering, so a token holds the NAME the next page
+        // resumes at and survives rules created or deleted between pages.
+        let mut page = Vec::new();
+        let mut next_token = None;
+        if !excluded_source {
+            for (name, entry) in &store.config_rules {
+                if resume_at.as_ref().is_some_and(|resume_at| name < resume_at) {
+                    continue;
+                }
+                if filtered_name.is_some_and(|requested| requested != name) {
+                    continue;
+                }
+                // A rule whose results place it in no compliance type an aggregate read
+                // holds has no compliance result to report.
+                let compliance = entry.compliance_shape();
+                let Some(compliance_type) =
+                    compliance
+                        .compliance_type
+                        .as_deref()
+                        .filter(|compliance_type| {
+                            crate::state::AGGREGATE_RULE_COMPLIANCE_TYPES.contains(compliance_type)
+                        })
+                else {
+                    continue;
+                };
+                // The compliance filter selects on what the rule ROLLS UP TO, so a rule
+                // the filter does not place is left out rather than reported with
+                // another compliance type.
+                if filtered_compliance.is_some_and(|requested| requested != compliance_type) {
+                    continue;
+                }
+                if page.len() == page_size {
+                    next_token = Some(crate::state::encode_page_token(name));
+                    break;
+                }
+                page.push(AggregateComplianceByConfigRule {
+                    config_rule_name: Some(entry.name.clone()),
+                    compliance: Some(compliance),
+                    account_id: Some(account_id.to_string()),
+                    aws_region: Some(region.clone()),
+                });
+            }
+        }
+
+        Ok(DescribeAggregateComplianceByConfigRulesOutput {
+            aggregate_compliance_by_config_rules: Some(page),
+            next_token,
+        })
     }
 }

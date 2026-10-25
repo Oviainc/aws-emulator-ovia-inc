@@ -158,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     // [`crate::scaffolded::wire_status`].
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Delete the stored custom language model, or refuse a name this account holds
-    /// no model under.
+    /// Delete the stored custom language model, or refuse a name the Region this
+    /// request is served in holds no model under.
     ///
     /// The clock-owed status transition is materialised FIRST, so a model whose
     /// training was already due is deleted rather than refused for a status it had
@@ -169,7 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteLanguageModelErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -182,12 +181,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the models created through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The stored status is copied out of the lookup so the removal below does not
         // hold the borrow the lookup took.
         let stored_status = store
-            .language_model_mut(&input.model_name, now)
+            .language_model_mut(&region, &input.model_name, now)
             .map(|record| record.status.clone());
 
         match stored_status {
@@ -211,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             Some(_) => {
-                store.language_models.remove(&input.model_name);
+                store.language_models.remove(&region, &input.model_name);
                 ::tracing::info!(
                     operation = "DeleteLanguageModel",
                     model = %input.model_name,

@@ -298,8 +298,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // digits, and hyphens. It can't end with a hyphen or contain two consecutive
         // hyphens" — the rule the identifier members of this service share.
         for source_id in &source_ids {
-            crate::state::check_identifier("SourceIds", source_id, MAX_SOURCE_ID_LEN)
-                .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
+            crate::state::check_identifier(
+                "SourceIds",
+                source_id,
+                crate::state::MAX_SOURCE_ID_LEN,
+            )
+            .map_err(CreateEventSubscriptionError::invalid_parameter_value)?;
         }
 
         self.insert(
@@ -312,46 +316,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.enabled,
             tags,
         )
-    }
-}
-
-/// The longest `SourceIds` entry this operation accepts: the bound the identifier members
-/// of this service publish for the resources that member names
-/// (`DBInstanceIdentifier`, `DBSnapshotIdentifier`, `DBClusterIdentifier` — 255).
-const MAX_SOURCE_ID_LEN: usize = 255;
-
-/// The source types whose resources THIS service holds records of, with the stored
-/// identifiers each one's `SourceIds` entries resolve against.
-///
-/// `SourceIds`'s constraints bind an entry to one resource type per source type ("If the
-/// source type is a DB instance, a `DBInstanceIdentifier` value must be supplied"), so an
-/// entry that names no such resource is the modelled `SourceNotFoundFault` ("The requested
-/// source could not be found"). The other published source types name resources this
-/// service holds none of — DB clusters, DB parameter groups, DB security groups, DB
-/// cluster snapshots, proxies, zero-ETL integrations, custom engine versions and
-/// blue/green deployments, whose creates are all still scaffolded — so an entry for one of
-/// them is accepted rather than refused for a record this service could never have.
-fn stored_source_ids(
-    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
-    region: &str,
-    source_type: &str,
-) -> Option<Vec<String>> {
-    match source_type {
-        "db-instance" => Some(
-            store
-                .instances_in(region)
-                .into_iter()
-                .map(|instance| instance.identifier.clone())
-                .collect(),
-        ),
-        "db-snapshot" => Some(
-            store
-                .snapshots_in(region)
-                .into_iter()
-                .map(|snapshot| snapshot.snapshot_identifier.clone())
-                .collect(),
-        ),
-        _ => None,
     }
 }
 
@@ -386,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEventSubscr
         // type: a subscription whose source does not exist is one no event could ever
         // match.
         if let Some(source_type) = &source_type {
-            if let Some(stored) = stored_source_ids(&store, &region, source_type) {
+            if let Some(stored) = store.event_source_identifiers_in(&region, source_type) {
                 if let Some(missing) = source_ids
                     .iter()
                     .find(|source_id| !stored.contains(source_id))

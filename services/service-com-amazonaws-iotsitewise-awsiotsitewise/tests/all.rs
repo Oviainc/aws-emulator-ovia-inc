@@ -230,6 +230,8 @@ mod resource_tags;
 mod single_property_aggregates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/storage_configuration.rs"]
+mod storage_configuration;
 #[path = "all/support.rs"]
 mod support;
 #[path = "all/tag_key_refusals.rs"]

@@ -35,7 +35,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     METADATA_TRANSFER_JOB_STATE_VALIDATING,
 };
 
-use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator};
+use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, REGION};
 
 /// Wait until the outcome every accepted job is owed has fallen due.
 ///
@@ -702,6 +702,7 @@ async fn a_listing_mints_no_job_and_removes_none() {
     let before: Vec<String> = emulator
         .state()
         .lock()
+        .region(REGION)
         .metadata_transfer_jobs
         .keys()
         .cloned()
@@ -738,6 +739,7 @@ async fn a_listing_mints_no_job_and_removes_none() {
         let after: Vec<String> = emulator
             .state()
             .lock()
+            .region(REGION)
             .metadata_transfer_jobs
             .keys()
             .cloned()

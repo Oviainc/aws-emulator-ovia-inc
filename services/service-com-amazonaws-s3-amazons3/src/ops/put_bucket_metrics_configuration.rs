@@ -314,8 +314,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replacement of the existing metrics configuration": the stored container is
         // exactly the one this request carried, under the id it names.
         match bucket.put_metrics_configuration(input.id, input.metrics_configuration) {
-            crate::state::MetricsConfigurationWrite::Stored
-            | crate::state::MetricsConfigurationWrite::Replaced => Ok(
+            crate::state::BucketConfigurationWrite::Stored
+            | crate::state::BucketConfigurationWrite::Replaced => Ok(
                 // `Unit` output: success is the modelled 200 and an empty body.
                 PutBucketMetricsConfigurationOutput,
             ),
@@ -323,7 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the 1,000-configuration limit" — this operation's own special error, with the
             // status it documents. A REPLACEMENT never reaches here: it creates no new
             // configuration.
-            crate::state::MetricsConfigurationWrite::QuotaReached => {
+            crate::state::BucketConfigurationWrite::QuotaReached => {
                 Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::TOO_MANY_CONFIGURATIONS_CODE,
                     crate::state::TOO_MANY_CONFIGURATIONS_STATUS,

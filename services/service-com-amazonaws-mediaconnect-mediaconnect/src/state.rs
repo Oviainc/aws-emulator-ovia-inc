@@ -500,18 +500,40 @@ pub const MAX_BRIDGES: usize = 1_000;
 /// and it is high enough that no ordinary workflow meets it.
 pub const MAX_ROUTER_INPUTS: usize = 1_000;
 
-/// The ceiling on how many sources one bridge carries.
+/// The ceiling on how many sources ONE BRIDGE holds while its source failover is ACTIVE,
+/// however many calls fill it.
 ///
-/// AWS publishes no count for a bridge's sources and the model puts no `@length` on
-/// `__listOfAddBridgeSourceRequest`, so the bound is the one this crate already applies to
+/// A bridge's sources are governed by the same source failover setting a flow's are:
+/// `CreateBridgeRequest$SourceFailoverConfig` targets the very `FailoverConfig` shape whose
+/// `State` publishes the count — "if the state is inactive, the flow can have only one
+/// source. If the state is active, the flow can have one or two sources" — and UpdateBridge
+/// merges the same `UpdateFailoverConfig` into it. So a bridge ingests a single source or a
+/// failover pair rather than a request-sized collection, and the count is named through
+/// [`MAX_FLOW_SOURCES`] so the two resources this one rule governs cannot drift apart. See
+/// [`max_bridge_sources`], the one place that resolves the bound, and
+/// [`MAX_BRIDGE_SOURCES_FAILOVER_INACTIVE`] for the other half.
+///
+/// The bound is on the STORED bridge, so a sequence of adds cannot grow one past what a
+/// single create could store. Neither CreateBridge nor AddBridgeSources models a count
+/// exception for it, so both refuse past the bound with `BadRequestException`, the error the
+/// model describes for "a semantic error" in the request.
+pub const MAX_BRIDGE_SOURCES: usize = MAX_FLOW_SOURCES;
+
+/// The ceiling on how many sources ONE BRIDGE holds while its source failover is INACTIVE:
+/// "if the state is inactive, [it] can have only one source" (`FailoverConfig$State`). See
+/// [`MAX_BRIDGE_SOURCES`] and [`max_bridge_sources`].
+pub const MAX_BRIDGE_SOURCES_FAILOVER_INACTIVE: usize = MAX_FLOW_SOURCES_FAILOVER_INACTIVE;
+
+/// The ceiling on how many outputs one bridge carries.
+///
+/// AWS publishes no count for a bridge's outputs and the model puts no `@length` on
+/// `__listOfAddBridgeOutputRequest`, so the bound is the one this crate already applies to
 /// a request-sized collection ([`MAX_FLOW_COLLECTION_ENTRIES`]), named through that
-/// constant so the two cannot drift. CreateBridge refuses past it with
+/// constant so the two cannot drift. It is the only count a cloud-to-ground bridge's
+/// outputs are bounded by, its `EgressGatewayBridge` declaring none of its own (see
+/// [`bridge_output_capacity`]). AddBridgeOutputs refuses past it with
 /// `BadRequestException`, the error the model describes as the one for "a semantic error"
 /// in the request.
-pub const MAX_BRIDGE_SOURCES: usize = MAX_FLOW_COLLECTION_ENTRIES;
-
-/// The ceiling on how many outputs one bridge carries, for the same reason as
-/// [`MAX_BRIDGE_SOURCES`].
 pub const MAX_BRIDGE_OUTPUTS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
 /// How many outputs a bridge may hold, read off the bridge's own type.
@@ -591,6 +613,68 @@ pub fn request_bridge_output_rejection(
         ));
     }
     None
+}
+
+/// How many sources a bridge whose source failover config is `config` may hold:
+/// [`MAX_BRIDGE_SOURCES`] while failover is active, and
+/// [`MAX_BRIDGE_SOURCES_FAILOVER_INACTIVE`] while it is not — read off the bridge's own
+/// failover setting, exactly as a flow's bound is read off its own ([`max_flow_sources`]).
+///
+/// Every operation that decides a bridge's source count reads the bound HERE —
+/// CreateBridge's `Sources`, AddBridgeSources' append and UpdateBridge's
+/// `SourceFailoverConfig` (which moves the bound under the sources the bridge already
+/// holds) — so the add side, the create side and the failover side cannot drift apart.
+pub fn max_bridge_sources(config: Option<&FailoverConfig>) -> usize {
+    if source_failover_is_active(config) {
+        MAX_BRIDGE_SOURCES
+    } else {
+        MAX_BRIDGE_SOURCES_FAILOVER_INACTIVE
+    }
+}
+
+/// The detail a request is refused with when it would leave a bridge holding more sources
+/// than its failover state allows: `held` sources already stored, `adding` more requested
+/// (zero on a request that only moves the failover state), under `config`.
+pub fn bridge_source_bound_rejection(
+    config: Option<&FailoverConfig>,
+    held: usize,
+    adding: usize,
+) -> Option<String> {
+    source_failover_bound_rejection("bridge", max_bridge_sources(config), config, held, adding)
+}
+
+/// Why a bridge whose type is `bridge_type` ([`BRIDGE_TYPE_EGRESS`] /
+/// [`BRIDGE_TYPE_INGRESS`]) does not ingest `source`, or `None` when it does.
+///
+/// A bridge's DIRECTION decides the kind of source it ingests. A cloud-to-ground (egress)
+/// bridge's "content comes from an existing MediaConnect flow"
+/// (`AddEgressGatewayBridgeRequest`), which is what a `BridgeFlowSource` is — "a flow
+/// source originates in MediaConnect as an existing cloud flow". A ground-to-cloud
+/// (ingress) bridge's "content originates at your premises"
+/// (`AddIngressGatewayBridgeRequest`), which is what a `BridgeNetworkSource` is — "a
+/// network source originates at your premises". So one bridge never mixes the two kinds,
+/// and a source whose kind contradicts the bridge's direction describes content that
+/// bridge does not carry.
+///
+/// Every operation that puts a source on a bridge (CreateBridge's `Sources`,
+/// AddBridgeSources) refuses through this one function, with `BadRequestException` — the
+/// error the model describes as the one for "a semantic error" in the request. The same
+/// rule is why UpdateBridgeSource takes only the wrapper the addressed source already is.
+pub fn bridge_source_kind_rejection(bridge_type: &str, source: &BridgeSource) -> Option<String> {
+    let name = bridge_source_name(source);
+    match (bridge_type, source.flow_source.is_some()) {
+        (BRIDGE_TYPE_EGRESS, false) => Some(format!(
+            "A cloud-to-ground (egress) bridge takes its content from an existing \
+             MediaConnect flow, so its sources are flow sources. Source {name:?} is a \
+             network source, which originates at your premises."
+        )),
+        (BRIDGE_TYPE_INGRESS, true) => Some(format!(
+            "A ground-to-cloud (ingress) bridge takes content that originates at your \
+             premises, so its sources are network sources. Source {name:?} is a flow \
+             source, which originates in MediaConnect as an existing cloud flow."
+        )),
+        _ => None,
+    }
 }
 
 /// The most tags one resource carries, checked against the MERGED set a tag write would
@@ -846,7 +930,23 @@ pub fn flow_source_bound_rejection(
     held: usize,
     adding: usize,
 ) -> Option<String> {
-    let bound = max_flow_sources(config);
+    source_failover_bound_rejection("flow", max_flow_sources(config), config, held, adding)
+}
+
+/// The detail a request is refused with when it would leave `resource` — a flow or a
+/// bridge, the two resources whose sources one `SourceFailoverConfig` governs — holding
+/// more sources than `bound`, the count its failover state allows
+/// ([`max_flow_sources`] / [`max_bridge_sources`]).
+///
+/// One wording for one rule, so the create path, the add path and the update path of both
+/// resources state the same bound for the same reason.
+fn source_failover_bound_rejection(
+    resource: &str,
+    bound: usize,
+    config: Option<&FailoverConfig>,
+    held: usize,
+    adding: usize,
+) -> Option<String> {
     let total = held + adding;
     if total <= bound {
         return None;
@@ -860,10 +960,10 @@ pub fn flow_source_bound_rejection(
         }
     };
     Some(format!(
-        "A flow whose source failover state is {state} can hold at most {bound} \
+        "A {resource} whose source failover state is {state} can hold at most {bound} \
          source(s); this request would leave it with {total} ({held} already stored, \
-         {adding} requested). If the state is inactive, the flow can have only one \
-         source; if the state is active, the flow can have one or two sources."
+         {adding} requested). If the state is inactive, the {resource} can have only one \
+         source; if the state is active, the {resource} can have one or two sources."
     ))
 }
 

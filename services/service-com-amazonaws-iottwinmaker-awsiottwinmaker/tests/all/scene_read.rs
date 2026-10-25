@@ -20,7 +20,7 @@
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::harness::{scene_arn, Emulator};
+use crate::harness::{scene_arn, Emulator, REGION};
 
 /// The modelled constraints this suite asserts against, copied from the model:
 /// `smithy_query(query="shape", shape="Id,S3Url,TwinMakerArn,SceneCapabilities,
@@ -451,6 +451,7 @@ async fn a_scene_member_outside_its_modelled_constraint_is_refused() {
             !emulator
                 .state()
                 .lock()
+                .region(REGION)
                 .workspaces
                 .get(workspace_id)
                 .is_some_and(|workspace| workspace.scenes.contains_key(&scene_id)),
@@ -516,6 +517,7 @@ async fn reading_a_scene_changes_nothing_a_later_caller_sees() {
     let scenes_before = emulator
         .state()
         .lock()
+        .region(REGION)
         .workspaces
         .get(workspace_id)
         .map(|workspace| workspace.scenes.len());
@@ -550,6 +552,7 @@ async fn reading_a_scene_changes_nothing_a_later_caller_sees() {
     {
         let state = emulator.state();
         let state = state.lock();
+        let state = state.region(REGION);
         assert_eq!(
             state
                 .workspaces

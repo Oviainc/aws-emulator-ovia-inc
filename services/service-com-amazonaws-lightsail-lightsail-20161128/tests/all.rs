@@ -127,6 +127,8 @@ mod load_balancer_listing;
 mod load_balancer_provisioning;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]
 mod load_balancer_tls_certificate_delete;
+#[path = "all/operations_for_resource.rs"]
+mod operations_for_resource;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

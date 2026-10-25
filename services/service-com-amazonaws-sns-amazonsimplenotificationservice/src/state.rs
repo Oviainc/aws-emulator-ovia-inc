@@ -1619,6 +1619,93 @@ impl PhoneNumberRecord {
     }
 }
 
+// =============================================================================
+// Mobile push: platform applications and their device endpoints
+// =============================================================================
+
+/// The prefix the resource part of a platform application's ARN carries:
+/// `arn:aws:sns:<region>:<account>:app/<platform>/<name>`, from the
+/// `CreatePlatformApplicationResponse$PlatformApplicationArn` doc.
+pub const PLATFORM_APPLICATION_PREFIX: &str = "app/";
+
+/// The prefix the resource part of a platform ENDPOINT's ARN carries:
+/// `arn:aws:sns:<region>:<account>:endpoint/<platform>/<application>/<id>`, from the
+/// `CreatePlatformEndpointResponse$EndpointArn` doc.
+///
+/// Shared, because "is this string the ARN of a platform endpoint?" is asked both by
+/// `Subscribe`'s `application` protocol and by the mobile-push operations that act on
+/// an endpoint directly.
+pub const PLATFORM_ENDPOINT_PREFIX: &str = "endpoint/";
+
+/// A platform application's ARN, for the mobile push platform `platform` (`ADM`,
+/// `APNS`, `APNS_SANDBOX`, `GCM`) and the application's `name`.
+pub fn platform_application_arn(region: &str, platform: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(
+        "sns",
+        region,
+        &format!("{PLATFORM_APPLICATION_PREFIX}{platform}/{name}"),
+    )
+}
+
+/// A device endpoint's ARN: the endpoint resource of the platform application named by
+/// `platform` and `application`, plus the id that tells one of its devices from
+/// another.
+pub fn platform_endpoint_arn(
+    region: &str,
+    platform: &str,
+    application: &str,
+    endpoint_id: &str,
+) -> String {
+    ::emulator_server::emulator_arn(
+        "sns",
+        region,
+        &format!("{PLATFORM_ENDPOINT_PREFIX}{platform}/{application}/{endpoint_id}"),
+    )
+}
+
+/// The attribute names SNS defines for a device endpoint, from the
+/// `GetEndpointAttributesResponse$Attributes` doc: "CustomUserData – arbitrary user
+/// data to associate with the endpoint … Enabled – flag that enables/disables delivery
+/// to the endpoint … Token – device token, also referred to as a registration id".
+pub const ENDPOINT_ATTRIBUTE_NAMES: &[&str] = &[
+    ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE,
+    ENDPOINT_ENABLED_ATTRIBUTE,
+    ENDPOINT_TOKEN_ATTRIBUTE,
+];
+
+/// The arbitrary user data an endpoint's owner associated with it.
+pub const ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE: &str = "CustomUserData";
+
+/// Whether SNS delivers a notification to the endpoint. SNS sets it to `false` when
+/// the notification service reports the endpoint invalid, so an endpoint nobody has
+/// disabled is enabled.
+pub const ENDPOINT_ENABLED_ATTRIBUTE: &str = "Enabled";
+
+/// The device token the notification service issued for the endpoint's device: the
+/// value [`PlatformEndpointRecord::token`] holds.
+pub const ENDPOINT_TOKEN_ATTRIBUTE: &str = "Token";
+
+/// One device endpoint of a platform application: the device a mobile push
+/// notification is addressed to, as a registration call recorded it.
+#[derive(Debug, Clone)]
+pub struct PlatformEndpointRecord {
+    /// The endpoint's own ARN, in the form [`platform_endpoint_arn`] builds — also
+    /// this record's key in
+    /// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::platform_endpoints`].
+    pub arn: String,
+    /// The ARN of the platform application the endpoint belongs to, in the form
+    /// [`platform_application_arn`] builds.
+    pub platform_application_arn: String,
+    /// The device token the notification service issued for the device, which is what
+    /// identifies the device to that service.
+    pub token: String,
+    /// The endpoint's attributes, as `GetEndpointAttributes` reports them. Bounded by
+    /// [`MAX_ATTRIBUTE_BYTES_PER_RECORD`], like every other caller-sized attribute map
+    /// here.
+    pub attributes: HashMap<String, String>,
+    pub created_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
 /// Every CALLER-DRIVEN store here is therefore BOUNDED: `topics`,
@@ -1645,6 +1732,11 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// performs — `OptInPhoneNumber` only clears and annotates a record already here,
     /// and `CheckIfPhoneNumberIsOptedOut` only reads one.
     pub phone_numbers: HashMap<String, PhoneNumberRecord>,
+    /// The device endpoints of this account's platform applications, keyed by the
+    /// endpoint's own ARN: what `DeleteEndpoint` removes one of. A caller-grown store,
+    /// so the registration that adds a record is held to [`MAX_RECORDS_PER_STORE`]
+    /// records like every other store here.
+    pub platform_endpoints: HashMap<String, PlatformEndpointRecord>,
     /// Delivered messages by subscription ARN, oldest first. Bounded: write through
     /// [`Self::record_delivery`], never by hand.
     ///
@@ -2016,6 +2108,13 @@ pub const TOPIC_DOES_NOT_EXIST: &str = "Topic does not exist";
 /// The HTTP 404 and the `NotFound` code are the requirement; this is SNS's wording of
 /// the reason.
 pub const SUBSCRIPTION_DOES_NOT_EXIST: &str = "Subscription does not exist";
+
+/// The sentence SNS states for an ENDPOINT of a platform application this emulator
+/// holds no record of — the endpoint counterpart of [`TOPIC_DOES_NOT_EXIST`], worded
+/// the same way: the resource kind that is missing, with none of the caller's
+/// identifier echoed back. The HTTP 404 and the `NotFound` code are the requirement;
+/// this is SNS's wording of the reason.
+pub const ENDPOINT_DOES_NOT_EXIST: &str = "Endpoint does not exist";
 
 /// The sentence SNS states for a RESOURCE a call names and the account does not hold:
 /// the operations whose miss is the resource-scoped `ResourceNotFoundException` (the

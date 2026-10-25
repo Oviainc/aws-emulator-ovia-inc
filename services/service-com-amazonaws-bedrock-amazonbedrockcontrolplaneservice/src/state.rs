@@ -68,6 +68,12 @@
 //! definition it was created with and the hash of that definition, so the hash the create
 //! answered is the hash the read reports.
 //!
+//! And it holds the build workflows of those policies —
+//! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them and
+//! `ops/get_automated_reasoning_policy_build_workflow.rs` reads them back — each with the
+//! document the start named and the instant its non-terminal `status` is owed its move to
+//! `COMPLETED`.
+//!
 //! And it holds the Automated Reasoning policy tests
 //! `ops/create_automated_reasoning_policy_test_case.rs` mints and
 //! `ops/get_automated_reasoning_policy_test_case.rs` reads back, each keyed by the policy it
@@ -1490,6 +1496,101 @@ pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
 pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
 
+/// The most build workflows ONE Automated Reasoning policy may hold at once, past which a
+/// start is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota, and it is the length the
+/// listing that reports them is modelled with: `ListAutomatedReasoningPolicyBuildWorkflows`
+/// answers an `AutomatedReasoningPolicyBuildWorkflowSummaries` of `@length(min: 0, max:
+/// 1000)`
+/// (`smithy_query(query="operation",operation="ListAutomatedReasoningPolicyBuildWorkflows")`),
+/// so a policy that held more could not report them all. Without a server-side cap a
+/// caller could also grow this part of the store with nothing but fresh starts.
+pub const MAX_BUILD_WORKFLOWS_PER_POLICY: usize = 1000;
+
+/// How long after `StartAutomatedReasoningPolicyBuildWorkflow` accepts a build workflow
+/// its `status` is owed its move to [`BUILD_WORKFLOW_STATUS_COMPLETED`].
+///
+/// The emulator's own span, chosen like [`IMPORT_JOB_COMPLETE_AFTER`] rather than
+/// documented by AWS: a workflow AWS answers in a non-terminal status is owed a
+/// transition, and the span is non-zero so a caller reading straight after the start still
+/// sees the status the start answered.
+pub const BUILD_WORKFLOW_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+
+/// `AutomatedReasoningPolicyBuildWorkflowStatus$SCHEDULED` — the status a build workflow a
+/// start has just accepted carries, before the clock owes it its completion.
+pub const BUILD_WORKFLOW_STATUS_SCHEDULED: &str = "SCHEDULED";
+
+/// `AutomatedReasoningPolicyBuildWorkflowStatus$COMPLETED` — the terminal status the clock
+/// owes a build workflow [`BUILD_WORKFLOW_COMPLETE_AFTER`] from its start.
+pub const BUILD_WORKFLOW_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// One stored Automated Reasoning policy build workflow: the identity
+/// `StartAutomatedReasoningPolicyBuildWorkflow` minted, the document that request named,
+/// and the status `GetAutomatedReasoningPolicyBuildWorkflow` reports.
+///
+/// The source DOCUMENTS themselves are not kept: a build workflow's reads report only a
+/// document's name, content type and description
+/// (`smithy_query(query="operation",operation="GetAutomatedReasoningPolicyBuildWorkflow")`),
+/// so holding the up-to-5-MB blob a start carried would grow the store with bytes no
+/// operation reads.
+///
+/// `status` is a `&'static str` for the reason [`ModelImportJobRecord::status`] is: it is a
+/// value this emulator derives rather than one a request names.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyBuildWorkflowRecord {
+    /// The `AutomatedReasoningPolicyArn` of the policy this workflow builds — the first
+    /// half of the key this family's store is keyed by.
+    pub policy_arn: String,
+    /// `buildWorkflowId` — minted by
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::mint_build_workflow_id`],
+    /// and the second half of that key.
+    pub id: String,
+    /// `buildWorkflowType`, as the start request named it
+    /// (`AutomatedReasoningPolicyBuildWorkflowType`).
+    pub workflow_type: String,
+    /// `AutomatedReasoningPolicyBuildWorkflowStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to [`BUILD_WORKFLOW_STATUS_COMPLETED`], or
+    /// `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
+    /// `documentName` of the source document the start carried, or `None` when it carried
+    /// no document at all.
+    pub document_name: Option<String>,
+    /// `documentContentType` of that same document.
+    pub document_content_type: Option<String>,
+    /// `documentDescription` of that same document, absent when the document carried none.
+    pub document_description: Option<String>,
+    pub created_at: SystemTime,
+    /// When the workflow last changed: the start instant until the clock moves its status.
+    pub updated_at: SystemTime,
+}
+
+impl AutomatedReasoningPolicyBuildWorkflowRecord {
+    /// Whether this workflow is still working, so the policy it builds is in use by it.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.status != BUILD_WORKFLOW_STATUS_COMPLETED
+    }
+
+    /// Materialise the move to [`BUILD_WORKFLOW_STATUS_COMPLETED`] the clock has already
+    /// made due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the workflow reports as its last update.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
+            self.status = BUILD_WORKFLOW_STATUS_COMPLETED;
+            self.completed_due_at = None;
+            self.updated_at = due;
+        }
+    }
+}
+
 /// A stored Automated Reasoning policy: the identity `CreateAutomatedReasoningPolicy`
 /// minted, and the draft definition every later read of that policy reports.
 ///
@@ -1721,6 +1822,14 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
 ///   the same reason `create_tokens` does.
 ///
+/// * `automated_reasoning_policy_build_workflows` holds one entry per started build
+///   workflow, capped at [`MAX_BUILD_WORKFLOWS_PER_POLICY`] per policy by the quota
+///   `StartAutomatedReasoningPolicyBuildWorkflow` enforces — and so at that bound times
+///   [`MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT`] over the whole store — while
+///   `automated_reasoning_policy_build_workflow_tokens` holds at most one entry per
+///   started workflow for the same reason `create_tokens` does. No entry holds a source
+///   document's bytes, only the metadata a read reports.
+///
 /// * `automated_reasoning_policy_test_cases` holds one entry per stored test, capped per
 ///   policy at [`MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY`] by the quota
 ///   `CreateAutomatedReasoningPolicyTestCase` enforces — and the policies those tests hang
@@ -1930,6 +2039,20 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Automated Reasoning policy ids this store has minted; the uniqueness half
     /// of a minted id.
     pub minted_automated_reasoning_policies: u64,
+    /// Every stored Automated Reasoning policy build workflow, keyed by the
+    /// `(policyArn, buildWorkflowId)` pair every one of its operations addresses it by
+    /// (`smithy_query(query="operation",operation="GetAutomatedReasoningPolicyBuildWorkflow")`),
+    /// so a workflow is only ever read under the policy it was started for.
+    pub automated_reasoning_policy_build_workflows:
+        HashMap<(String, String), AutomatedReasoningPolicyBuildWorkflowRecord>,
+    /// `StartAutomatedReasoningPolicyBuildWorkflow` idempotency:
+    /// `(policyArn, clientRequestToken)` -> the `buildWorkflowId` that token started.
+    /// Scoped to that one operation, and to the policy the request addressed, the way the
+    /// policy create index is scoped to the region.
+    pub automated_reasoning_policy_build_workflow_tokens: HashMap<(String, String), String>,
+    /// How many build workflow ids this store has minted; the uniqueness half of a minted
+    /// id.
+    pub minted_automated_reasoning_policy_build_workflows: u64,
     /// Every stored Automated Reasoning policy test, keyed by
     /// `(AutomatedReasoningPolicyArn, testCaseId)` — the pair
     /// `GetAutomatedReasoningPolicyTestCase` addresses a test by, because a test belongs to
@@ -2054,6 +2177,63 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         policy_arn: &str,
     ) -> Option<&AutomatedReasoningPolicyRecord> {
         self.automated_reasoning_policies.get(policy_arn)
+    }
+
+    /// Mint a fresh `AutomatedReasoningPolicyBuildWorkflowId`: the lowercase hyphenated
+    /// UUIDv4 that member's pattern spells
+    /// (`^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`),
+    /// unique within this store because [`minted_uuid`] hashes this store's mint count in.
+    pub fn mint_build_workflow_id(&mut self, now: SystemTime) -> String {
+        self.minted_automated_reasoning_policy_build_workflows += 1;
+        minted_uuid(
+            self.minted_automated_reasoning_policy_build_workflows,
+            now,
+        )
+    }
+
+    /// The build workflow `(policy_arn, build_workflow_id)` names, with any status
+    /// transition the clock has made due at `now` materialised first — so every caller
+    /// reads the status the workflow holds at `now`, whichever operation asked.
+    pub fn automated_reasoning_policy_build_workflow(
+        &mut self,
+        policy_arn: &str,
+        build_workflow_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut AutomatedReasoningPolicyBuildWorkflowRecord> {
+        let record = self
+            .automated_reasoning_policy_build_workflows
+            .get_mut(&(policy_arn.to_string(), build_workflow_id.to_string()))?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every build workflow transition of the policy `policy_arn` names that
+    /// the clock has made due at `now`, so a caller asking about the POLICY sees the same
+    /// workflows a read of each one would.
+    pub fn settle_automated_reasoning_policy_build_workflows(
+        &mut self,
+        policy_arn: &str,
+        now: SystemTime,
+    ) {
+        for ((arn, _), record) in &mut self.automated_reasoning_policy_build_workflows {
+            if arn == policy_arn {
+                record.settle(now);
+            }
+        }
+    }
+
+    /// Every build workflow started for the policy `policy_arn` names, as this store holds
+    /// them now (settle first, with
+    /// [`Self::settle_automated_reasoning_policy_build_workflows`], to read them as of an
+    /// instant).
+    pub fn automated_reasoning_policy_build_workflows_of<'a>(
+        &'a self,
+        policy_arn: &'a str,
+    ) -> impl Iterator<Item = &'a AutomatedReasoningPolicyBuildWorkflowRecord> + 'a {
+        self.automated_reasoning_policy_build_workflows
+            .iter()
+            .filter(move |((arn, _), _)| arn == policy_arn)
+            .map(|(_, record)| record)
     }
 
     /// Mint a fresh Automated Reasoning policy test id, unique within this store.
@@ -2986,6 +3166,46 @@ fn minted_id(ordinal: u64, now: SystemTime) -> String {
         "{}{}",
         base36(ordinal, ID_HALF_WIDTH),
         base36(nanos, ID_HALF_WIDTH)
+    )
+}
+
+/// A minted UUIDv4-shaped resource id: the lowercase hyphenated form
+/// `AutomatedReasoningPolicyBuildWorkflowId` spells.
+///
+/// The 128 bits come from three sources hashed together with SHA-256 (the `sha2` crate)
+/// and hex-rendered (the `hex` crate), the way this repo's other services mint a
+/// UUID-shaped id (see
+/// `services/service-com-amazonaws-wafv2-awswaf-20190729/src/state.rs`): this store's mint
+/// `ordinal`, so two ids of one store can never collide; `now` in nanoseconds; and the
+/// OS-seeded randomness a `RandomState` draws, so an id is not a guessable sequence
+/// number. RFC 4122 §4.4's version nibble and variant bits are then set, which is what the
+/// `4` and the `[89ab]` in that pattern require. An id names a resource; a credential
+/// would come from `ctx.credential_store()`, never here.
+fn minted_uuid(ordinal: u64, now: SystemTime) -> String {
+    use ::sha2::{Digest, Sha256};
+    use ::std::collections::hash_map::RandomState;
+    use ::std::hash::BuildHasher;
+
+    let nanos = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(RandomState::new().hash_one(ordinal).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(ordinal.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let rendered = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &rendered[..8],
+        &rendered[8..12],
+        &rendered[12..16],
+        &rendered[16..20],
+        &rendered[20..]
     )
 }
 

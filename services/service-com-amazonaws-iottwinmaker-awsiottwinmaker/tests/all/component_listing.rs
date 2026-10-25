@@ -18,7 +18,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{Emulator, Resp};
+use crate::harness::{Emulator, Resp, REGION};
 
 /// The workspace every case below is created in.
 const WORKSPACE: &str = "components";
@@ -603,7 +603,7 @@ async fn a_page_follows_stored_state_and_changes_nothing() {
     {
         let state = emulator.state();
         let state = state.lock();
-        let stored: Vec<&String> = state.workspaces[WORKSPACE].entities["tree"]
+        let stored: Vec<&String> = state.region(REGION).workspaces[WORKSPACE].entities["tree"]
             .components
             .keys()
             .collect();
@@ -622,6 +622,7 @@ async fn a_page_follows_stored_state_and_changes_nothing() {
         let state = emulator.state();
         let mut state = state.lock();
         let components = &mut state
+            .region_mut(REGION)
             .workspaces
             .get_mut(WORKSPACE)
             .expect("the seeded workspace")

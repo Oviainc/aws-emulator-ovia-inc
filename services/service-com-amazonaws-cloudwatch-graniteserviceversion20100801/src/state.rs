@@ -23,6 +23,9 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
 //!   Contributor Insights rules written by `PutInsightRule` and read back by
 //!   `DescribeInsightRules`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dashboards`] — the
+//!   dashboards written by `PutDashboard` and read back by `GetDashboard` and
+//!   `ListDashboards`, each holding the `DashboardBody` document verbatim.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::dataset_kms_keys`] — the
 //!   customer managed KMS key each Region's default dataset is encrypted with, read back by
 //!   `GetDataset`.
@@ -557,6 +560,25 @@ pub struct ManagedRuleOrigin {
     pub resource_arn: String,
 }
 
+/// A stored dashboard: the `DashboardBody` document `PutDashboard` was given, when that
+/// write happened, and the tags the dashboard was created with.
+///
+/// The body is held verbatim, so `GetDashboard` returns "the data returned within
+/// DashboardBody as the template for the new dashboard when you call PutDashboard"
+/// (`GetDashboard`) — a document that round-trips character for character, which is what lets
+/// a caller copy a dashboard by putting back what it read.
+#[derive(Debug, Clone, Default)]
+pub struct StoredDashboard {
+    /// The dashboard document, exactly as the write that stored it was given.
+    pub body: String,
+    /// When this dashboard was last written, as epoch seconds: "The time stamp of when the
+    /// dashboard was last modified, either by an API call or through the console."
+    /// (`DashboardEntry$LastModified`)
+    pub last_modified_secs: f64,
+    /// The tags the dashboard was created with.
+    pub tags: Vec<Tag>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
@@ -577,6 +599,12 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub metric_streams: HashMap<String, StoredMetricStream>,
     /// Contributor Insights rules by rule name.
     pub insight_rules: HashMap<String, StoredInsightRule>,
+    /// Dashboards by dashboard name.
+    ///
+    /// Not keyed by Region: "All dashboards in your account are global, not region-specific."
+    /// (`PutDashboard`), so a dashboard written through one Region's endpoint is the same
+    /// dashboard every other Region's endpoint reads.
+    pub dashboards: HashMap<String, StoredDashboard>,
     /// The action notifications the alarm state transitions this store has materialised owe
     /// but nothing has delivered yet, oldest first. Bounded by
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
@@ -672,6 +700,100 @@ pub fn scheduled_query_arn(region: &str, alarm_name: &str) -> String {
 pub fn metric_stream_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("cloudwatch", region, &format!("metric-stream/{name}"))
 }
+
+/// A dashboard's ARN: `arn:aws:cloudwatch::<account>:dashboard/<DashboardName>`.
+///
+/// The Region segment is EMPTY because a dashboard is not a resource of one Region: "All
+/// dashboards in your account are global, not region-specific." (`PutDashboard`), and the ARN
+/// of a dashboard is documented as `arn:aws:cloudwatch::account-id:dashboard/dashboard-name`
+/// (`TagResourceInput$ResourceARN`).
+pub fn dashboard_arn(name: &str) -> String {
+    ::engine::emulator_arn("cloudwatch", "", &format!("dashboard/{name}"))
+}
+
+/// How long a dashboard name may be: "The maximum length is 255"
+/// (`PutDashboardInput$DashboardName`, `ListDashboardsInput$DashboardNamePrefix`).
+pub const MAX_DASHBOARD_NAME_LEN: usize = 255;
+
+/// How short a dashboard name may be: a dashboard is named, so a name of no characters names
+/// no dashboard.
+pub const MIN_DASHBOARD_NAME_LEN: usize = 1;
+
+/// Why `value` is not a dashboard name, or `None` when it is one.
+///
+/// "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, \"-\", and \"_\"."
+/// (`PutDashboardInput$DashboardName`) — prose the model carries no `length` or `pattern` for,
+/// so the boundary validator cannot refuse it and every operation that NAMES a dashboard
+/// refuses it through this one rule. `field` is the member the value arrived in, so the
+/// refusal names the field the caller got wrong.
+pub fn dashboard_name_error(field: &str, value: &str) -> Option<String> {
+    if value.chars().count() < MIN_DASHBOARD_NAME_LEN {
+        return Some(format!(
+            "The value for field {field} is too short. It must have length greater than or \
+             equal to {MIN_DASHBOARD_NAME_LEN}.\n"
+        ));
+    }
+    dashboard_name_characters_error(field, value, false)
+}
+
+/// Why `value` is not a dashboard name PREFIX, or `None` when it is one.
+///
+/// "The maximum length is 255, and valid characters are A-Z, a-z, 0-9, \".\", \"-\", and
+/// \"_\"." (`ListDashboardsInput$DashboardNamePrefix`) — the same rule as a name's, widened by
+/// the "." the prefix also allows, and satisfied by the empty prefix, which selects every
+/// dashboard.
+pub fn dashboard_name_prefix_error(field: &str, value: &str) -> Option<String> {
+    dashboard_name_characters_error(field, value, true)
+}
+
+/// The length and character rule both dashboard-name members state, with the "." only the
+/// prefix allows.
+///
+/// Both refusals are worded the way CloudWatch words a field whose value breaks its rule:
+/// "The value for field `<field>` is too long. It must have length less than or equal to
+/// `<max>`." and "The value for field `<field>` contains invalid characters. It can only
+/// contain alphanumerics, dash (-) and underscore (_).", each closed by a newline, so every
+/// field holding a dashboard name reports its rule the same way.
+fn dashboard_name_characters_error(field: &str, value: &str, allow_dot: bool) -> Option<String> {
+    if value.chars().count() > MAX_DASHBOARD_NAME_LEN {
+        return Some(format!(
+            "The value for field {field} is too long. It must have length less than or equal \
+             to {MAX_DASHBOARD_NAME_LEN}.\n"
+        ));
+    }
+    let valid = value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || character == '-'
+            || character == '_'
+            || (allow_dot && character == '.')
+    });
+    if valid {
+        return None;
+    }
+    let characters = if allow_dot {
+        "alphanumerics, dash (-), underscore (_) and period (.)"
+    } else {
+        "alphanumerics, dash (-) and underscore (_)"
+    };
+    Some(format!(
+        "The value for field {field} contains invalid characters. It can only contain \
+         {characters}.\n"
+    ))
+}
+
+/// How many dashboards one `ListDashboards` page holds: "ListDashboards returns up to 1000
+/// results on one page. If there are more than 1000 dashboards, you can call ListDashboards
+/// again and include the value you received for NextToken in the first call, to receive the
+/// next 1000 results." (`ListDashboards`)
+pub const DASHBOARDS_PAGE_SIZE: usize = 1_000;
+
+/// The largest number of dashboards this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the dashboard documents live in this process's memory,
+/// so their number has to be finite. `PutDashboard` answers `LimitExceededException` ("The
+/// operation exceeded one or more limits.") rather than growing without limit once it is
+/// reached; replacing a dashboard that already exists adds none, so it is unaffected.
+pub const MAX_DASHBOARDS: usize = 10_000;
 
 /// The identifier of the one dataset this service has: "Only the default dataset is
 /// supported." (`GetDataset`), and `GetDatasetOutput$DatasetId` is modelled `^default$`.
@@ -1131,8 +1253,8 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     ///
     /// There is ONE tag set per resource: the tags live on the stored resource its writer
     /// created (`PutMetricAlarm`, `PutCompositeAlarm`, `PutLogAlarm`, `PutMetricStream`,
-    /// `PutInsightRule`), so a tag written at create time and one written afterwards are
-    /// the same set, and deleting the resource takes its tags with it.
+    /// `PutInsightRule`, `PutDashboard`), so a tag written at create time and one written
+    /// afterwards are the same set, and deleting the resource takes its tags with it.
     pub fn resource_tags(&self, resource: &TaggableResource<'_>) -> Option<&[Tag]> {
         match resource.kind {
             // An alarm ARN does not say which KIND of alarm it names, and one name belongs
@@ -1159,9 +1281,13 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .insight_rules
                 .get(resource.name)
                 .map(|stored| stored.tags.as_slice()),
-            // Nothing in this store creates a dashboard, so no dashboard ARN names a
-            // resource it holds.
-            TaggableKind::Dashboard => None,
+            // A dashboard ARN carries no Region (dashboards are global), which the shared
+            // ARN parse and this store both already treat as part of the ARN rather than of
+            // the key: the name is what `PutDashboard` keyed the dashboard on.
+            TaggableKind::Dashboard => self
+                .dashboards
+                .get(resource.name)
+                .map(|stored| stored.tags.as_slice()),
         }
     }
 
@@ -1188,7 +1314,10 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .insight_rules
                 .get_mut(resource.name)
                 .map(|stored| &mut stored.tags),
-            TaggableKind::Dashboard => None,
+            TaggableKind::Dashboard => self
+                .dashboards
+                .get_mut(resource.name)
+                .map(|stored| &mut stored.tags),
         }
     }
 

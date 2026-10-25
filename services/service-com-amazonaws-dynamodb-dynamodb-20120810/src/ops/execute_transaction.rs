@@ -1,15 +1,53 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteTransaction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteTransaction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: runs a list of PartiQL statements as ONE transaction against the SAME
+//! item store the classic item API, `ExecuteStatement` and `TransactWriteItems` read
+//! and write, so what a transaction leaves is visible to every later read and what an
+//! earlier call wrote is what its statements are read against.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteTransaction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "The entire transaction must consist of either read statements or write statements,
+//! you cannot mix both in one transaction": a mixed list is refused as a whole, and the
+//! two shapes a well-formed transaction takes are
+//!
+//! * a READ transaction — every statement a `SELECT` that addresses ONE item by an
+//!   equality on every key attribute, reporting it (projected as the statement asks)
+//!   through `Responses` in statement order and nothing for a key that holds no item.
+//!   It writes nothing at all.
+//! * a WRITE transaction — `INSERT`, `UPDATE` and `DELETE`, applied all-or-nothing.
+//!   Every statement's `WHERE` clause is read against the item as it stood BEFORE the
+//!   transaction, and only when every one of them holds does any write land; otherwise
+//!   NOTHING is written and the call is `TransactionCanceledException`, whose
+//!   `CancellationReasons` carry one reason per statement in request order —
+//!   `ConditionalCheckFailed` for each predicate that was not met (with that statement's
+//!   item when its `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`) and `None` for
+//!   the rest. An `INSERT` is a put that must not replace, so a primary key that already
+//!   holds an item is such an unmet condition.
+//!
+//! The statements are parsed by [`crate::state::partiql`] and the writes land through
+//! the same store write sites `PutItem`, `UpdateItem` and `DeleteItem` use, so the
+//! dialect, number canonicalization, the documented item-size and index-key limits and
+//! the capacity accounting have ONE implementation in this crate, shared with
+//! `ExecuteStatement`, `BatchExecuteStatement` and the classic item API. A statement
+//! naming a table that is absent — or not yet `ACTIVE` — is
+//! `ResourceNotFoundException`, a table whose resource-based policy denies the caller
+//! the statement's own PartiQL action is `AccessDeniedException`, and a transaction
+//! addressing one item twice is a `ValidationException`.
+//!
+//! `ClientRequestToken` makes a write transaction idempotent: a repeat of a token
+//! inside the documented 10-minute window
+//! ([`crate::state::TRANSACTION_IDEMPOTENCY_WINDOW`]) applies NOTHING and answers from
+//! what that call DID, and a repeat carrying different statements is the documented
+//! `IdempotentParameterMismatchException`. What a token stands for is
+//! [`crate::state::CompletedTransaction`], remembered per REGION — a table name
+//! resolves inside one region — and keyed by a fingerprint of the statements the first
+//! call carried, so the store keeps a constant size per token. A read transaction
+//! changes nothing, so it records no token.
+//!
+//! A transactional read or write costs twice what the same single-item one costs
+//! ([`crate::state::TRANSACTIONAL_CAPACITY_FACTOR`]); `ReturnConsumedCapacity` reports
+//! it as one entry per statement, "ordered according to the ordering of the statements",
+//! each figure read back from the table the statement reached.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +232,745 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteTransaction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteTransactionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteTransaction"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let requested_capacity = input.return_consumed_capacity.as_deref();
+
+        // Every statement is parsed before any of them runs: what the statements ARE
+        // decides whether the TRANSACTION is well formed, and a transaction is applied
+        // only as a whole. A value a `?` marker stands for is held to the same rules a
+        // stored value is — the documented nesting depth, and this emulator's ceiling on
+        // a collection's members — before the statement is parsed.
+        let mut parsed: Vec<crate::state::PartiqlStatement> =
+            Vec::with_capacity(input.transact_statements.len());
+        for entry in &input.transact_statements {
+            // "An optional parameter that returns the item attributes for a PartiQL
+            // ParameterizedStatement operation that failed a condition check": the
+            // member carries two values.
+            if !matches!(
+                entry.return_values_on_condition_check_failure.as_deref(),
+                None | Some("NONE" | "ALL_OLD")
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "ReturnValuesOnConditionCheckFailure can only be ALL_OLD or NONE",
+                ));
+            }
+            let parameters = entry.parameters.clone().unwrap_or_default();
+            for (position, value) in parameters.iter().enumerate() {
+                crate::state::check_attribute_value(&format!("Parameters[{position}]"), value)
+                    .map_err(lift)?;
+            }
+            parsed
+                .push(crate::state::parse_statement(&entry.statement, &parameters).map_err(lift)?);
+        }
+
+        // "The entire transaction must consist of either read statements or write
+        // statements, you cannot mix both in one transaction" — a rule about the
+        // REQUEST, so a mixed transaction is refused whole and nothing of it is applied.
+        let reads = parsed
+            .iter()
+            .filter(|statement| matches!(statement, crate::state::PartiqlStatement::Select(_)))
+            .count();
+        if reads > 0 && reads < parsed.len() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                MIXED_TRANSACTION_MESSAGE,
+            ));
+        }
+
+        // The canonical form is built from the REQUEST's own statements — nothing of
+        // what the store holds — which is what makes it comparable across the retries a
+        // `ClientRequestToken` covers.
+        let canonical =
+            crate::state::action_fingerprint(&canonical_statements(&input.transact_statements));
+        let token = input
+            .client_request_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+
+        // A token still inside its window stands for the transaction it was first used
+        // for IN THIS REGION: identical statements are answered from what that call DID
+        // rather than applied again, and different statements are the documented
+        // mismatch. Both decisions precede every predicate below, because a retry must
+        // not be judged against the state its own first attempt left.
+        if let Some(token) = token {
+            if let Some(completed) = store.recorded_transaction(&region, token).cloned() {
+                if completed.actions != canonical {
+                    return Err(
+                        ExecuteTransactionErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(
+                                    crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // The repeat applies nothing, so it writes no capacity: "subsequent
+                // calls with the same client token return the number of READ capacity
+                // units consumed in reading the item", and "the responses to the calls
+                // might not be the same" even though the effect on the server is. The
+                // figure is the one the transaction's own items weigh, reported as the
+                // read it was.
+                return Ok(ExecuteTransactionOutput {
+                    responses: Some(vec![ItemResponse::default(); parsed.len()]),
+                    consumed_capacity: completed
+                        .ledger
+                        .consumed_capacity(requested_capacity)
+                        .map(|entries| entries.into_iter().map(read_units).collect()),
+                });
+            }
+        }
+
+        if reads == parsed.len() {
+            return read_transaction(&store, &region, now, &parsed, requested_capacity);
+        }
+        write_transaction(
+            &mut store,
+            &region,
+            now,
+            &input.transact_statements,
+            &parsed,
+            token,
+            &canonical,
+            requested_capacity,
+        )
+    }
+}
+
+/// This service's store, as the two transaction paths below take it.
+type Store = crate::state::ComAmazonawsDynamodbDynamodb20120810State;
+
+/// How a transaction that mixes reads and writes is refused: the rule the operation's
+/// own doc states.
+const MIXED_TRANSACTION_MESSAGE: &str =
+    "The entire transaction must consist of either read statements or write statements, you \
+     cannot mix both in one transaction";
+
+/// How a `SELECT` that does not address ONE item of the table is refused.
+///
+/// A transactional read reports the item its statement names, so the `WHERE` clause must
+/// pin every key attribute by equality — and a secondary index is not keyed by the
+/// table's primary key, so no clause over one addresses an item of the table.
+const SINGLE_ITEM_READ_MESSAGE: &str =
+    "a read statement in a transaction must address one item of the table: its WHERE clause \
+     states an equality on every key attribute, and its source is the table rather than an index";
+
+/// How a `SELECT` asking for an order is refused: `ORDER BY` orders a result set, and a
+/// transactional read reports at most one item, so an order is something no statement of
+/// a transaction can ask for.
+const ORDER_BY_MESSAGE: &str =
+    "ORDER BY is not supported for a read statement in a transaction, which reports at most one \
+     item";
+
+/// Report every figure of `entry` as READ capacity as well as in the aggregate, and
+/// [`write_units`] the same as WRITE capacity.
+///
+/// "The entire transaction must consist of either read statements or write statements":
+/// a transaction's capacity is therefore wholly read units or wholly write units, so
+/// each aggregate figure it reports is also that kind's figure
+/// (`ConsumedCapacity$ReadCapacityUnits` / `$WriteCapacityUnits`, "the total number of
+/// read/write capacity units consumed by the operation").
+fn read_units(entry: ConsumedCapacity) -> ConsumedCapacity {
+    by_kind(entry, false)
+}
+
+/// The same for a write transaction. See [`read_units`].
+fn write_units(entry: ConsumedCapacity) -> ConsumedCapacity {
+    by_kind(entry, true)
+}
+
+/// Fill the read or the write figure of every `Capacity` in `entry` from its aggregate.
+fn by_kind(mut entry: ConsumedCapacity, write: bool) -> ConsumedCapacity {
+    fn split(capacity: &mut Capacity, write: bool) {
+        if write {
+            capacity.write_capacity_units = capacity.capacity_units;
+        } else {
+            capacity.read_capacity_units = capacity.capacity_units;
+        }
+    }
+    if write {
+        entry.write_capacity_units = entry.capacity_units;
+    } else {
+        entry.read_capacity_units = entry.capacity_units;
+    }
+    if let Some(table) = entry.table.as_mut() {
+        split(table, write);
+    }
+    for indexes in [
+        entry.local_secondary_indexes.as_mut(),
+        entry.global_secondary_indexes.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for capacity in indexes.values_mut() {
+            split(capacity, write);
+        }
+    }
+    entry
+}
+
+/// The request's statements, canonically encoded: what a repeated `ClientRequestToken`
+/// is compared against (through [`crate::state::action_fingerprint`], which is what the
+/// store keeps).
+///
+/// Everything that decides what the transaction DOES is encoded, in request order: the
+/// statement text, the values its `?` markers stand for, and whether it reports its item
+/// when a condition is not met. Each statement's text is length-prefixed and the
+/// parameters go through [`crate::state::canonical_item_text`] under their POSITION, so
+/// two identical calls encode identically whatever order their JSON maps — or their set
+/// members — arrived in, and no two different requests encode the same way.
+fn canonical_statements(entries: &[ParameterizedStatement]) -> String {
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&format!("{}={};", entry.statement.len(), entry.statement));
+        // The position is zero-padded so the name order the canonical encoder emits in
+        // is the order the parameters were sent in; a statement cannot carry more
+        // markers than it has characters ([`crate::state::MAX_STATEMENT_BYTES`]), so six
+        // digits cover every position a request can reach.
+        let positional: crate::state::Item = entry
+            .parameters
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(position, value)| (format!("{position:06}"), value.clone()))
+            .collect();
+        text.push_str(&crate::state::canonical_item_text(&positional));
+        text.push_str(
+            entry
+                .return_values_on_condition_check_failure
+                .as_deref()
+                .unwrap_or("NONE"),
+        );
+        text.push('\n');
+    }
+    text
+}
+
+/// A READ transaction: each `SELECT` reports the ONE item it addresses, and the store is
+/// not written at all.
+fn read_transaction(
+    store: &Store,
+    region: &str,
+    now: ::std::time::SystemTime,
+    parsed: &[crate::state::PartiqlStatement],
+    requested_capacity: Option<&str>,
+) -> Result<ExecuteTransactionOutput, ExecuteTransactionError> {
+    let mut responses: Vec<ItemResponse> = Vec::with_capacity(parsed.len());
+    let mut consumed: Vec<ConsumedCapacity> = Vec::new();
+    let mut keyed: ::std::collections::BTreeSet<(String, crate::state::ItemKey)> =
+        ::std::collections::BTreeSet::new();
+    for statement in parsed {
+        let crate::state::PartiqlStatement::Select(select) = statement else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                MIXED_TRANSACTION_MESSAGE,
+            ));
+        };
+        let name = crate::state::resolve_table_name(&select.table).map_err(lift)?;
+        let table = store.active_table(region, &name, now).map_err(lift)?;
+        // A table whose resource-based policy denies the caller this statement's own
+        // action is not read at all. PartiQL has its own four actions.
+        if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+        if select.index.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                SINGLE_ITEM_READ_MESSAGE,
+            ));
+        }
+        if select.order_by.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(ORDER_BY_MESSAGE));
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                SINGLE_ITEM_READ_MESSAGE,
+            ));
+        };
+        let condition = crate::state::parsed_condition(filter).map_err(lift)?;
+        let key = crate::state::singleton_key(table, filter).map_err(lift)?;
+        // "Transaction request cannot include multiple operations on one item."
+        if !keyed.insert((name.clone(), key.clone())) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
+            ));
+        }
+        // The key equalities address the item, and any further predicate the stored item
+        // does not satisfy reports no item — exactly as the single-statement path reports
+        // none.
+        let found = match table.items.get(&key) {
+            Some(item) if condition.evaluate(Some(item)).map_err(lift)? => Some(item.clone()),
+            _ => None,
+        };
+        // A key that holds no item still consumed the read it asked for, which is why
+        // capacity is charged for every statement and only the ones that found an item
+        // report one. "Transactional read requests require two read capacity units."
+        let units =
+            crate::state::read_capacity_units(found.as_ref().map_or(0, crate::state::item_size), true)
+                * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
+        consumed.extend(
+            crate::state::consumed_capacity(requested_capacity, &name, units).map(read_units),
+        );
+        responses.push(ItemResponse {
+            item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
+        });
+    }
+    Ok(ExecuteTransactionOutput {
+        responses: Some(responses),
+        // "The values of the list are ordered according to the ordering of the
+        // statements": one entry per statement, and no member at all when the request
+        // asked for no capacity detail.
+        consumed_capacity: (!consumed.is_empty()).then_some(consumed),
+    })
+}
+
+/// A WRITE transaction: every statement resolved and read against the state as it stood
+/// BEFORE the transaction, then applied all-or-nothing.
+#[allow(clippy::too_many_arguments)]
+fn write_transaction(
+    store: &mut Store,
+    region: &str,
+    now: ::std::time::SystemTime,
+    entries: &[ParameterizedStatement],
+    parsed: &[crate::state::PartiqlStatement],
+    token: Option<&str>,
+    canonical: &str,
+    requested_capacity: Option<&str>,
+) -> Result<ExecuteTransactionOutput, ExecuteTransactionError> {
+    let elements = parsed.len();
+    // Pass one resolves every statement against the stored items and reads its
+    // predicate, writing NOTHING: a transaction only lands once all of it is known to be
+    // applicable.
+    let mut planned: Vec<Planned> = Vec::with_capacity(elements);
+    let mut keyed: ::std::collections::BTreeSet<(String, crate::state::ItemKey)> =
+        ::std::collections::BTreeSet::new();
+    for (at, (entry, statement)) in entries.iter().zip(parsed).enumerate() {
+        // A refusal the ITEM this statement writes carries against the TABLE's own
+        // schema — a key attribute of a type the table does not declare for it, its own
+        // key's or a secondary index's — is decided when the transaction prepares that
+        // item, so it cancels the transaction. A refusal about the VALUE the request
+        // carried needs no table to decide, so it stays a request-level refusal.
+        let keying = |error| cancelled_by_element(at, elements, error);
+        let name = crate::state::resolve_table_name(statement.table()).map_err(lift)?;
+        let returns_old_on_failure =
+            entry.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
+        {
+            let table = store.active_table(region, &name, now).map_err(lift)?;
+            if let Some(denial) = crate::state::policy_denial(table, statement.action(), now) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
+        }
+        let prepared = match statement {
+            // Guarded by the read/write split above; stated so this match names every
+            // statement the dialect parses.
+            crate::state::PartiqlStatement::Select(_) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    MIXED_TRANSACTION_MESSAGE,
+                ))
+            }
+            crate::state::PartiqlStatement::Insert(insert) => {
+                let mut item = insert.item.clone();
+                for (attribute, value) in &item {
+                    crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                }
+                crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                    ));
+                }
+                let table = store.active_table(region, &name, now).map_err(lift)?;
+                table.check_index_key_types(&item).map_err(keying)?;
+                table.check_index_key_values(&item).map_err(lift)?;
+                let key = table.key_of_item(&item).map_err(keying)?;
+                let before = table.items.get(&key).cloned();
+                // An `INSERT` is a put that must not replace, so a primary key that
+                // already holds an item is a condition this statement did not meet —
+                // which cancels the transaction rather than overwriting that item.
+                let satisfied = before.is_none();
+                Planned {
+                    table: name,
+                    key,
+                    write: if satisfied {
+                        PlannedWrite::Put(item)
+                    } else {
+                        PlannedWrite::Nothing
+                    },
+                    before,
+                    satisfied,
+                    returns_old_on_failure,
+                    // An `INSERT` states no `RETURNING` clause, so it reports no item.
+                    reported: None,
+                }
+            }
+            crate::state::PartiqlStatement::Update(update) => {
+                let condition = crate::state::parsed_condition(&update.filter).map_err(lift)?;
+                let clauses = crate::state::parsed_update(&update.clauses).map_err(lift)?;
+                let (key, partition_key, sort_key) = {
+                    let table = store.active_table(region, &name, now).map_err(lift)?;
+                    (
+                        crate::state::singleton_key(table, &update.filter).map_err(lift)?,
+                        table.partition_key_name().to_string(),
+                        table.sort_key_name().map(ToString::to_string),
+                    )
+                };
+                let before = store
+                    .active_table(region, &name, now)
+                    .map_err(lift)?
+                    .items
+                    .get(&key)
+                    .cloned();
+                // The `WHERE` clause is read against the item as it stood BEFORE the
+                // transaction, which is the only state it can speak about — so a
+                // statement whose predicate the stored item does not satisfy, and one
+                // whose key holds no item at all, both cancel the transaction rather
+                // than write.
+                let satisfied = before
+                    .as_ref()
+                    .map(|item| condition.evaluate(Some(item)))
+                    .transpose()
+                    .map_err(lift)?
+                    .unwrap_or(false);
+                if !satisfied {
+                    Planned {
+                        table: name,
+                        key,
+                        write: PlannedWrite::Nothing,
+                        before,
+                        satisfied,
+                        returns_old_on_failure,
+                        reported: None,
+                    }
+                } else {
+                    let mut item = before.clone().unwrap_or_default();
+                    let touched = clauses.apply(&mut item).map_err(lift)?;
+                    for attribute in &touched {
+                        if attribute.as_str() == partition_key.as_str()
+                            || Some(attribute.as_str()) == sort_key.as_deref()
+                        {
+                            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                                "One or more parameter values were invalid: Cannot update \
+                                 attribute {attribute}. This attribute is part of the key"
+                            )));
+                        }
+                    }
+                    // The item the statement leaves is held to exactly what a `PutItem`
+                    // of it would be: the documented nesting, the 400 KB item size, and
+                    // the key limits of every index it is projected into.
+                    for (attribute, value) in &item {
+                        crate::state::check_attribute_value(attribute, value).map_err(lift)?;
+                    }
+                    crate::state::canonicalize_item(&mut item).map_err(lift)?;
+                    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                        ));
+                    }
+                    {
+                        let table = store.active_table(region, &name, now).map_err(lift)?;
+                        table.check_index_key_types(&item).map_err(keying)?;
+                        table.check_index_key_values(&item).map_err(lift)?;
+                    }
+                    let reported = crate::state::projected_return_values(
+                        update
+                            .returning
+                            .map(crate::state::ReturnedValues::as_return_value),
+                        before.as_ref(),
+                        Some(&item),
+                        &touched,
+                    );
+                    Planned {
+                        table: name,
+                        key,
+                        write: PlannedWrite::Put(item),
+                        before,
+                        satisfied,
+                        returns_old_on_failure,
+                        reported,
+                    }
+                }
+            }
+            crate::state::PartiqlStatement::Delete(delete) => {
+                let condition = crate::state::parsed_condition(&delete.filter).map_err(lift)?;
+                let key = {
+                    let table = store.active_table(region, &name, now).map_err(lift)?;
+                    crate::state::singleton_key(table, &delete.filter).map_err(lift)?
+                };
+                let before = store
+                    .active_table(region, &name, now)
+                    .map_err(lift)?
+                    .items
+                    .get(&key)
+                    .cloned();
+                let satisfied = before
+                    .as_ref()
+                    .map(|item| condition.evaluate(Some(item)))
+                    .transpose()
+                    .map_err(lift)?
+                    .unwrap_or(false);
+                // A delete removes every attribute of the item, so the `MODIFIED OLD`
+                // projection of what it changed IS the item as it stood — both OLD forms
+                // report that item.
+                let reported = delete
+                    .returning
+                    .and_then(|_| before.clone())
+                    .filter(|item| satisfied && !item.is_empty());
+                Planned {
+                    table: name,
+                    key,
+                    write: if satisfied {
+                        PlannedWrite::Delete
+                    } else {
+                        PlannedWrite::Nothing
+                    },
+                    before,
+                    satisfied,
+                    returns_old_on_failure,
+                    reported,
+                }
+            }
+        };
+
+        // "Transaction request cannot include multiple operations on one item."
+        if !keyed.insert((prepared.table.clone(), prepared.key.clone())) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::DUPLICATE_TRANSACT_ITEM_MESSAGE,
+            ));
+        }
+        planned.push(prepared);
+    }
+
+    // "All of which must either succeed or fail": one unmet predicate cancels the whole
+    // transaction, and the reasons report what each statement's own outcome was, in
+    // request order.
+    if planned.iter().any(|statement| !statement.satisfied) {
+        let codes: Vec<&str> = planned.iter().map(Planned::cancellation_code).collect();
+        let cancellation_reasons: Vec<CancellationReason> = planned
+            .iter()
+            .map(|statement| CancellationReason {
+                code: Some(statement.cancellation_code().to_string()),
+                message: (!statement.satisfied)
+                    .then(|| crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                item: (!statement.satisfied && statement.returns_old_on_failure)
+                    .then(|| statement.before.clone())
+                    .flatten(),
+            })
+            .collect();
+        return Err(
+            ExecuteTransactionErrorModeled::TransactionCanceledException(
+                TransactionCanceledException {
+                    message: Some(crate::state::transaction_cancelled_message(&codes)),
+                    cancellation_reasons: Some(cancellation_reasons),
+                },
+            )
+            .into(),
+        );
+    }
+
+    // Pass two applies them. Each figure is read back from the table the write landed
+    // in, so the capacity fan-out is computed from stored state rather than from the
+    // request.
+    let mut consumed: Vec<ConsumedCapacity> = Vec::new();
+    let mut recorded = crate::state::WriteLedger::default();
+    let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
+    let mut refused: Option<ExecuteTransactionError> = None;
+    for statement in &planned {
+        let after = match &statement.write {
+            PlannedWrite::Put(item) => Some(item.clone()),
+            PlannedWrite::Delete | PlannedWrite::Nothing => None,
+        };
+        undo.push((
+            statement.table.clone(),
+            statement.key.clone(),
+            statement.before.clone(),
+        ));
+        let landed = match &after {
+            Some(item) => store
+                .put_item(
+                    region,
+                    &statement.table,
+                    now,
+                    statement.key.clone(),
+                    item.clone(),
+                )
+                .map(|_| ()),
+            None => store
+                .delete_item(region, &statement.table, now, &statement.key)
+                .map(|_| ()),
+        };
+        if let Err(error) = landed {
+            refused = Some(lift(error));
+            break;
+        }
+        // Reading the table back is on the same all-or-nothing path as the write itself:
+        // a failure here must roll back too, never return early past the undo below.
+        match store.active_table(region, &statement.table, now) {
+            Ok(table) => {
+                let capacity = table.write_capacity(statement.before.as_ref(), after.as_ref());
+                // "Transactional write requests require two write capacity units": what
+                // this statement consumed is twice the same single-item write, reported
+                // in its own entry.
+                let mut per_statement = crate::state::WriteLedger::default();
+                per_statement.record(&statement.table, &capacity);
+                per_statement.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+                consumed.extend(
+                    per_statement
+                        .consumed_capacity(requested_capacity)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(write_units),
+                );
+                recorded.record(&statement.table, &capacity);
+            }
+            Err(error) => {
+                refused = Some(lift(error));
+                break;
+            }
+        }
+    }
+    if let Some(refused) = refused {
+        // A transaction is all-or-nothing, so a refusal from the store's own budgets
+        // part-way through puts back exactly what stood at every key it had already
+        // reached — each of which fitted the store a moment ago.
+        for (table, key, before) in undo.into_iter().rev() {
+            let restored = match before {
+                Some(item) => store.put_item(region, &table, now, key, item).map(|_| ()),
+                None => store.delete_item(region, &table, now, &key).map(|_| ()),
+            };
+            if let Err(error) = restored {
+                // Nothing a caller can be told makes this right, so it is LOGGED: a
+                // store that could not be put back is observable to whoever runs the
+                // emulator rather than silent.
+                ::tracing::error!(
+                    table = %table,
+                    error = %error.message(),
+                    "a cancelled transaction could not be rolled back"
+                );
+            }
+        }
+        return Err(refused);
+    }
+
+    recorded.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+    if let Some(token) = token {
+        store.record_transaction(
+            region,
+            token,
+            crate::state::CompletedTransaction {
+                actions: canonical.to_string(),
+                completed_at: now,
+                ledger: recorded,
+            },
+        );
+    }
+
+    Ok(ExecuteTransactionOutput {
+        // A write reports one response per statement either way: what its `RETURNING`
+        // clause asked for, or nothing when it states none.
+        responses: Some(
+            planned
+                .into_iter()
+                .map(|statement| ItemResponse {
+                    item: statement.reported,
+                })
+                .collect(),
+        ),
+        consumed_capacity: (!consumed.is_empty()).then_some(consumed),
+    })
+}
+
+/// One statement of a write transaction, resolved against the state as it stood before
+/// the transaction and ready to apply.
+struct Planned {
+    /// The resolved name of the table it writes to.
+    table: String,
+    key: crate::state::ItemKey,
+    write: PlannedWrite,
+    /// The item that stood at `key` before the transaction: what the predicate was read
+    /// against, what the capacity weighs, and what an unmet predicate reports.
+    before: Option<crate::state::Item>,
+    satisfied: bool,
+    returns_old_on_failure: bool,
+    /// What this statement's `RETURNING` clause asked to see, when it states one.
+    reported: Option<crate::state::Item>,
+}
+
+impl Planned {
+    /// The `CancellationReason$Code` this statement reports when the transaction is
+    /// cancelled: the predicate it failed, or `None` for a statement nothing was wrong
+    /// with.
+    fn cancellation_code(&self) -> &'static str {
+        if self.satisfied {
+            crate::state::CANCELLATION_CODE_NONE
+        } else {
+            crate::state::CANCELLATION_CODE_CONDITION_FAILED
+        }
+    }
+}
+
+/// What one statement writes once every predicate has held.
+enum PlannedWrite {
+    /// The item an `INSERT` or an `UPDATE` leaves at its key.
+    Put(crate::state::Item),
+    /// A `DELETE`, which removes whatever its key held.
+    Delete,
+    /// A statement whose predicate was not met, which writes nothing because the
+    /// transaction carrying it is cancelled.
+    Nothing,
+}
+
+/// Report a refusal the transaction decided for ONE statement — the item it writes
+/// carrying a key attribute of a type the table does not declare, for its own key schema
+/// or for a secondary index's — as the cancellation it is.
+///
+/// "All of which must either succeed or fail": a statement the transaction itself
+/// refuses when it prepares that statement's item against the TABLE's schema cancels the
+/// whole request, so the answer is the `TransactionCanceledException`
+/// [`crate::state::cancelled_by_element_reasons`] builds — the documented reason shape,
+/// shared with `TransactWriteItems` — wrapped in this operation's error. A refusal about
+/// the REQUEST rather than about the item as the table's schema sees it is still
+/// answered directly, which is what [`lift`] does with it.
+fn cancelled_by_element(
+    at: usize,
+    elements: usize,
+    error: crate::state::RequestError,
+) -> ExecuteTransactionError {
+    let crate::state::RequestError::Validation(message) = error else {
+        return lift(error);
+    };
+    let (message, cancellation_reasons) =
+        crate::state::cancelled_by_element_reasons(at, elements, &message);
+    ExecuteTransactionErrorModeled::TransactionCanceledException(TransactionCanceledException {
+        message: Some(message),
+        cancellation_reasons: Some(cancellation_reasons),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ExecuteTransactionError {
+    ExecuteTransactionErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> ExecuteTransactionError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            ExecuteTransactionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

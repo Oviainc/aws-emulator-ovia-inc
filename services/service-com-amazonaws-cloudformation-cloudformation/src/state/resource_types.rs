@@ -592,8 +592,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Logs::ResourcePolicy",
     "AWS::Logs::SubscriptionFilter",
     // Amazon MSK
+    "AWS::MSK::BatchScramSecret",
     "AWS::MSK::Cluster",
+    "AWS::MSK::ClusterPolicy",
     "AWS::MSK::Configuration",
+    "AWS::MSK::Replicator",
+    "AWS::MSK::ServerlessCluster",
+    "AWS::MSK::VpcConnection",
     // Amazon Macie
     "AWS::Macie::AllowList",
     "AWS::Macie::CustomDataIdentifier",

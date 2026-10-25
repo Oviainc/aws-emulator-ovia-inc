@@ -290,6 +290,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => bridge.source_failover_config.clone(),
         };
 
+        // "If the state is inactive, [a resource] can have only one source. If the state is
+        // active, [it] can have one or two sources." (`UpdateFailoverConfig$State`). The
+        // request moves the bound rather than the source count, so it is checked against
+        // the failover config the bridge ENDS UP with, under the sources it already holds —
+        // through the one function the create and add paths read the bound from
+        // (`crate::state::max_bridge_sources`). A request that does not touch the failover
+        // setting is never refused for the source count already in the store.
+        let bound_rejection = input.source_failover_config.as_ref().and_then(|_| {
+            crate::state::bridge_source_bound_rejection(
+                source_failover_config.as_ref(),
+                bridge.sources.len(),
+                0,
+            )
+        });
+        if let Some(rejection) = bound_rejection {
+            return Err(bad_request(rejection));
+        }
+
         bridge.egress_gateway_bridge = egress_gateway_bridge;
         bridge.ingress_gateway_bridge = ingress_gateway_bridge;
         bridge.source_failover_config = source_failover_config;

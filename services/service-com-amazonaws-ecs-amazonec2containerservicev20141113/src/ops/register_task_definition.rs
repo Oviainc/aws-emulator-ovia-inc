@@ -512,6 +512,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             registered_by: crate::state::caller_identity_arn(),
             registered_at: crate::state::now(),
             deregistered_at: None,
+            delete_requested_at: None,
         };
         let view = record.view();
         let tags = record.tags.clone();
