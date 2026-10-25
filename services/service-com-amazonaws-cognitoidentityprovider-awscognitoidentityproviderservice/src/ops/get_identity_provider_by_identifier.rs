@@ -190,17 +190,19 @@ fn user_pool_not_found(user_pool_id: &str) -> GetIdentityProviderByIdentifierErr
 }
 
 /// This operation's `ResourceNotFoundException` for an identifier no provider of
-/// the named pool carries. The message is built from the request: it names the
-/// identifier that was looked up and the pool it was looked up in, so a caller
-/// can tell which of the two it asked with is unknown here.
+/// the named pool carries. The message is built from the request by
+/// [`crate::state::identity_provider_not_found_message`]: it names the identifier
+/// that was looked up and the pool it was looked up in, so a caller can tell
+/// which of the two it asked with is unknown here.
 fn identifier_not_found(
     idp_identifier: &str,
     user_pool_id: &str,
 ) -> GetIdentityProviderByIdentifierError {
     GetIdentityProviderByIdentifierErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(format!(
-                "Identity provider {idp_identifier} for tenantId {user_pool_id} does not exist."
+            message: Some(crate::state::identity_provider_not_found_message(
+                idp_identifier,
+                user_pool_id,
             )),
         },
     )
