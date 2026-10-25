@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    ExportFilter, ImportOptions, ResourceNotFoundException, VectorSearchConfiguration,
+    ConflictException, ExportFilter, ImportOptions, ResourceNotFoundException,
+    VectorSearchConfiguration,
 };
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
@@ -2378,6 +2379,44 @@ pub fn private_endpoint_not_found(graph_identifier: &str, vpc_id: &str) -> Resou
 /// the only place either fact can go.
 pub fn resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
     resource_not_found_for_caller("resource", "arn", resource_arn)
+}
+
+/// The modelled `ConflictException` for a create call whose requested name is already
+/// held by a stored resource of the same kind.
+///
+/// `resource` is the kind of resource whose namespace the name belongs to, capitalised
+/// as the refusal names it ("Graph", "Snapshot"). The message is derived from the
+/// REQUESTED name and nothing else: the conflict is a statement about the name the
+/// caller sent, and the record that already holds it is a resource this request never
+/// addressed, so its identifier is not reported. Written once here and reached by every
+/// name-uniqueness check in the service, so no two of them word one refusal differently
+/// or disclose different amounts about the record they collided with.
+fn duplicate_name_conflict(resource: &str, name: &str) -> ConflictException {
+    ConflictException {
+        message: format!("{resource} with name {name} already exists!"),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`
+        // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a name
+        // that is simply already taken is not a concurrent modification of anything, so
+        // the member is left absent.
+        reason: None,
+    }
+}
+
+/// The modelled `ConflictException` for a `graphName` the account already holds in the
+/// Region — raised by every operation that mints a graph (`CreateGraph`,
+/// `CreateGraphUsingImportTask`, `RestoreGraphFromSnapshot`), which all key uniqueness
+/// on the same index
+/// ([`ComAmazonawsNeptunegraphAmazonneptunegraphState::graph_id_named`]).
+pub fn graph_name_conflict(graph_name: &str) -> ConflictException {
+    duplicate_name_conflict("Graph", graph_name)
+}
+
+/// The modelled `ConflictException` for a `snapshotName` the account already holds in
+/// the Region
+/// ([`ComAmazonawsNeptunegraphAmazonneptunegraphState::snapshot_id_named`]) — the
+/// snapshot namespace's half of the same rule [`graph_name_conflict`] states for graphs.
+pub fn snapshot_name_conflict(snapshot_name: &str) -> ConflictException {
+    duplicate_name_conflict("Snapshot", snapshot_name)
 }
 
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).

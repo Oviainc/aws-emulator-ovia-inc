@@ -305,16 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `graphName` is unique per account PER REGION, exactly as it is for
         // `CreateGraph`: a second graph by the same name conflicts only with a stored
-        // graph of the SAME Region.
-        if let Some(existing) = store.graph_id_named(&input.graph_name, &region) {
+        // graph of the SAME Region. The refusal is worded from the requested name alone
+        // by the one builder every name-uniqueness check in this service reaches
+        // (`crate::state::graph_name_conflict`), so it discloses nothing about the
+        // graph that holds the name.
+        if store.graph_id_named(&input.graph_name, &region).is_some() {
             return Err(CreateGraphUsingImportTaskErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "a graph named '{}' already exists with id {existing}",
-                        input.graph_name
-                    ),
-                    reason: None,
-                },
+                crate::state::graph_name_conflict(&input.graph_name),
             )
             .into());
         }
