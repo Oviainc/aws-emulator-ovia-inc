@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDisks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDisks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the block storage disks the account holds, one page at a time, each
+//! entry read out of the same stored record `GetDisk` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDisks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDisks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDisksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDisks"))
+        // This operation reports what the account holds and takes nothing but a
+        // page token, so nothing here reads the request metadata.
+        let _ = ctx;
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // the stored disks from that name onward in the store's own total order.
+        // Using the name rather than an index means a disk created or deleted
+        // between two pages cannot make the walk skip or repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let mut disks = Vec::new();
+            let mut next_page_token = None;
+            for (name, disk) in store.disks.range(page_token..) {
+                if disks.len() == crate::state::DISK_PAGE_SIZE {
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                // The SAME view `GetDisk` reports: one stored record read by two
+                // operations, never a second rendering of a disk.
+                disks.push(disk.view());
+            }
+            GetDisksOutput {
+                // An account with no disks reports an empty list, not an absent
+                // one: the caller asked what it has, and the answer is
+                // "nothing".
+                disks: Some(disks),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetDisksError {
+    GetDisksErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
