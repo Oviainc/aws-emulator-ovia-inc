@@ -38,6 +38,7 @@ const MAX_ATTACHMENTS: usize = 100;
 /// The key names (`core-network-configuration`, `asn-ranges`, `edge-locations`,
 /// `location`, `segments`, `name`) are the published Cloud WAN core network policy
 /// schema's, the same source `crate::core_network_lifecycle` builds its documents from.
+/// Shared with the suites that need a core network with edges to attach or peer at.
 pub(crate) fn policy_document(locations: &[&str]) -> String {
     let edges: Vec<Value> = locations
         .iter()
@@ -55,7 +56,8 @@ pub(crate) fn policy_document(locations: &[&str]) -> String {
 }
 
 /// Create a global network and, inside it, a core network whose policy configures an edge
-/// in each of `locations`. Answers `(global network id, core network id)`.
+/// in each of `locations`. Answers `(global network id, core network id)`. Shared with the
+/// suites that need such a core network.
 pub(crate) async fn core_network_at(
     emulator: &Emulator,
     name: &str,

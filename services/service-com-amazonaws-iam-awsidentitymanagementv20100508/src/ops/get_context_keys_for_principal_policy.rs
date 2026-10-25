@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContextKeysForPrincipalPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContextKeysForPrincipalPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContextKeysForPrincipalPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +87,10 @@
 //!   out-of-range value was supplied for an input parameter.
 //! * `NoSuchEntityException` (HTTP 404) — The request was rejected because it referenced a
 //!   resource entity that does not exist. The error message describes the resource.
+//! * `ServiceFailureException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the model's `errors` list for this operation omits it, but the SERVICE models it and
+//!   every other implemented handler in this crate answers it when the store is
+//!   unreachable.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -111,11 +106,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iam-awsidentitymanageme
 // here — hence the `GetContextKeysForPrincipalPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iam#GetContextKeysForPrincipalPolicy")]
+// `ServiceFailureException` is widened in through `extra_errors`: the SERVICE models
+// that shape ("the request processing has failed because of an unknown error,
+// exception or failure") and most of its operations list it, but this operation's own
+// list omits it — and a store this handler cannot reach is exactly that failure.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iam#GetContextKeysForPrincipalPolicy",
+    extra_errors = ["ServiceFailureException"]
+)]
 #[derive(Debug)]
 pub enum GetContextKeysForPrincipalPolicyErrorModeled {
     InvalidInputException(InvalidInputException),
     NoSuchEntityException(NoSuchEntityException),
+    ServiceFailureException(ServiceFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -132,6 +135,13 @@ impl From<GetContextKeysForPrincipalPolicyErrorModeled> for GetContextKeysForPri
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// What IAM answers when `PolicySourceArn` names no entity whose policies it can
+/// read: this refusal carries one fixed sentence, describing the resource — an IAM
+/// entity the service could not retrieve — rather than naming the ARN the request
+/// supplied, which is what `NoSuchEntityException`'s "the error message describes
+/// the resource" comes to for an operation addressed by ARN.
+const ENTITY_NOT_RETRIEVABLE: &str = "Unable to retrieve specified IAM entity.";
 
 /// The `GetContextKeysForPrincipalPolicy` operation.
 ///
@@ -169,18 +179,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContextKeysForPrincipalPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContextKeysForPrincipalPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContextKeysForPrincipalPolicy"))
+        // `ctx` carries request metadata only; nothing here depends on it — the
+        // principal and the extra policies are both named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetContextKeysForPrincipalPolicyErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "An optional list of additional policies for which you want the list of
+        // context keys that are referenced" — each entry has to BE an IAM JSON policy
+        // document, which `policyDocumentType`'s own pattern does not ask for, so one
+        // that is not is an "invalid … value … supplied for an input parameter". The
+        // rule is the shared one every operation taking a policy document applies.
+        let supplied = input.policy_input_list.unwrap_or_default();
+        if let Some(position) = supplied
+            .iter()
+            .position(|document| !crate::state::is_policy_document(document))
+        {
+            return Err(
+                GetContextKeysForPrincipalPolicyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Syntax errors in policy: PolicyInputList member {} must be a \
+                             JSON object carrying a Statement element",
+                            position + 1
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An ARN that is not a user's, a group's or a role's names no principal whose
+        // policies could be read, which is an invalid input rather than a missing
+        // entity.
+        if crate::state::parse_entity_arn(&input.policy_source_arn).is_none() {
+            return Err(
+                GetContextKeysForPrincipalPolicyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ARN {} is not valid: PolicySourceArn must be the ARN of an IAM \
+                             user, group or role",
+                            input.policy_source_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A read: it reports the context keys the stored policies reference and
+        // writes nothing.
+        let store = state.lock();
+        let Some(carried) = store.principal_policies(&input.policy_source_arn) else {
+            return Err(
+                GetContextKeysForPrincipalPolicyErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        // IAM answers this refusal with ONE fixed sentence: the
+                        // operation is addressed by ARN rather than by name, and the
+                        // message says the entity could not be retrieved without
+                        // echoing the ARN back.
+                        message: Some(ENTITY_NOT_RETRIEVABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An attached policy AWS owns that this emulator's catalog is short of: its
+        // document is not held, so the keys it references cannot be reported, and the
+        // honest answer is that nobody has written that entry down yet — never a key
+        // list that silently omits it.
+        if let Some(uncarried) = carried.uncarried.first() {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::state::uncarried_aws_managed_policy(uncarried, "document"),
+            ));
+        }
+
+        // "You can optionally include a list of one or more additional policies,
+        // specified as strings": the keys reported are those of the principal's own
+        // policies TOGETHER with the supplied ones, as one set.
+        let documents = carried
+            .documents
+            .iter()
+            .chain(supplied.iter())
+            .map(String::as_str);
+        Ok(GetContextKeysForPrincipalPolicyOutput {
+            context_key_names: Some(crate::state::context_keys_in_policies(documents)),
+        })
     }
 }

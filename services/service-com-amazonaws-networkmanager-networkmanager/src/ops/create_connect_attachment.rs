@@ -290,6 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             *transport_attachment_id == input.transport_attachment_id
                                 && crate::state::same_connect_options(options, &input.options)
                         }
+                        // An attachment of another kind is not this request, whatever the
+                        // token says.
                         crate::state::AttachmentDetail::Vpc { .. }
                         | crate::state::AttachmentDetail::SiteToSiteVpn
                         | crate::state::AttachmentDetail::DirectConnectGateway { .. }
