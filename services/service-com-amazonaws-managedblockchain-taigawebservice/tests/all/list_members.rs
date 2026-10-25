@@ -2,8 +2,9 @@
 
 //! `ListMembers`, end to end over HTTP: the page it answers with is cut from the members
 //! stored on one network, every summary member comes from that record, each input filter
-//! selects on the stored value it names, and a `NetworkId` that names no network is the
-//! modelled 404 rather than an empty page.
+//! selects on the stored value it names, and a `NetworkId` that names no network is
+//! refused with a shape this operation's own error list declares rather than answered
+//! with an empty page.
 //!
 //! The tables below span the classes the rules generalise over: the member
 //! configurations a Fabric network is created with, every value `MemberStatus` declares,
@@ -525,10 +526,14 @@ async fn list_members_pages_through_every_member() {
     }
 }
 
-/// A `NetworkId` that names no stored network is the modelled `ResourceNotFoundException`
-/// with HTTP 404, never an empty page.
+/// A `NetworkId` that names no stored network is refused with a shape this operation's
+/// MODELLED error list declares — `InvalidRequestException`, HTTP 400, naming the network
+/// the request asked about — never an empty page, and never the `ResourceNotFoundException`
+/// the operation does not model (smithy_query: operation ListMembers declares
+/// AccessDeniedException 403, InternalServiceErrorException 500, InvalidRequestException
+/// 400 and ThrottlingException 429, and no not-found).
 #[tokio::test]
-async fn a_network_id_that_names_nothing_stored_is_a_404() {
+async fn a_network_id_that_names_nothing_stored_is_the_modelled_invalid_request() {
     let router = crate::network_and_node_lifecycle::new_router();
     let (network_id, _) =
         create_network(&router, create_network_body("missing-1", "present-net")).await;
@@ -546,27 +551,36 @@ async fn a_network_id_that_names_nothing_stored_is_a_404() {
         let answer = list_members(&router, unknown, "").await;
         assert_eq!(
             (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {unknown}: expected 404 ResourceNotFoundException, got {} {:?}",
+            (400, "InvalidRequestException"),
+            "case {unknown}: expected 400 InvalidRequestException, got {} {:?}",
             answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.text(&["__type"]),
+            "InvalidRequestException",
+            "case {unknown}: expected the body to name the modelled shape, got {:?}",
             answer.body
         );
         assert!(
             answer.text(&["Message"]).contains(unknown),
-            "case {unknown}: expected a Message naming the resource that was not found, got {:?}",
+            "case {unknown}: expected a Message naming the network that was not resolved, \
+             got {:?}",
             answer.body
         );
-        // `ResourceNotFoundException$ResourceName` is `ArnString`
-        // (`@pattern ^arn:.+:.+:.+:.+:.+$`), and no ARN exists for a network that does
-        // not: the member is omitted rather than filled with a bare id.
-        assert!(
-            answer.body["ResourceName"].is_null(),
-            "case {unknown}: expected no ResourceName, got {:?}",
+        // `InvalidRequestException` declares `Message` and nothing else, so no member of
+        // the not-found shape leaks into the refusal.
+        assert_eq!(
+            answer.body.get("ResourceName"),
+            None,
+            "case {unknown}: expected no ResourceName member, got {:?}",
             answer.body
         );
     }
 
     // And the refusals changed nothing: the network that does exist still lists.
+    // A network that DOES exist and holds members is the other half of the rule: the
+    // refusal is about resolving the network, not about the page being empty.
     let answer = list_members(&router, &network_id, "").await;
     assert_eq!(
         (answer.status, listed_ids(&answer).len()),

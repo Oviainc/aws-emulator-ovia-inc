@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_sns_amazonsimplenotificationservice::ops::types::S_M_S_SANDBOX_PHONE_NUMBER_VERIFICATION_STATUS_VALUES;
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
-    SandboxPhoneNumberRecord, MAX_RECORDS_PER_STORE, PAGE_SIZE, SANDBOX_NUMBER_PENDING,
-    SANDBOX_RESOURCE_DOES_NOT_EXIST,
+    SandboxPhoneNumberRecord, MAX_RECORDS_PER_STORE, PAGE_SIZE, RESOURCE_DOES_NOT_EXIST,
+    SANDBOX_NUMBER_PENDING,
 };
 
 use super::topics_subscriptions_publish::{xml_unescape, Answer, Sns};
@@ -205,7 +205,7 @@ async fn an_added_number_is_listed_as_pending_until_it_is_deleted() {
         );
         assert_eq!(
             again.element("Message").as_deref(),
-            Some(SANDBOX_RESOURCE_DOES_NOT_EXIST),
+            Some(RESOURCE_DOES_NOT_EXIST),
             "case {case:?}: expected the fixed missing-resource sentence, got {}",
             again.body
         );

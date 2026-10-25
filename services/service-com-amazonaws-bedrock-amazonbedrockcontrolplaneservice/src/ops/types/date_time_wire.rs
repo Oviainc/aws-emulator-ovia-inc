@@ -81,6 +81,9 @@ macro_rules! bedrock_shape_type {
     (list_of_string) => {
         ::aws_smithy_schema::ShapeType::List
     };
+    (map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
     (list_of_struct) => {
         ::aws_smithy_schema::ShapeType::List
     };
@@ -96,7 +99,7 @@ macro_rules! bedrock_shape_type {
 /// `@timestampFormat("date-time")` chain call it cannot.
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `boolean`, `integer`, `date_time`, `list_of_string`,
+/// string-encoded), `boolean`, `integer`, `date_time`, `list_of_string`, `map_of_string`,
 /// `list_of_struct(T)`, `struct_of(T)` or `union_of(T)`.
 macro_rules! bedrock_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
@@ -154,6 +157,18 @@ macro_rules! bedrock_write_member {
             Ok(())
         })?;
     };
+    // A map of strings writes each entry as the vendored codegen's `emit_write` does for
+    // `ShapeKind::Map`: the key as a string, then the value, both against the MEMBER's
+    // schema (`vendor/smithy-macros/src/codegen.rs`, the `ShapeKind::Map` arm).
+    ($s:ident, $m:expr, $v:expr, map_of_string) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __v) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_string($m, __v.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
     // A union takes the same path as a structure: the vendored codegen's `emit_write`
     // writes `ShapeKind::Structure | ShapeKind::Union` alike (`write_struct`), and the
@@ -186,6 +201,16 @@ macro_rules! bedrock_read_member {
             __out.push(
                 <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dl)?,
             );
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, map_of_string) => {{
+        let mut __out: ::std::collections::HashMap<::std::string::String, ::std::string::String> =
+            ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            let __value = __dm.read_string($m)?;
+            __out.insert(__k, __value);
             Ok(())
         })?;
         __out

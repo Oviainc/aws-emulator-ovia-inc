@@ -102,15 +102,25 @@ fn reported_names(reply: &Reply) -> Vec<String> {
 }
 
 /// A store holding the whole containment lattice the rule ranges over: a group whose
-/// member cell nests another cell, a group holding that nested cell directly, a group
-/// with no cells at all, and a cell belonging to no group — with one resource set, and
-/// one check watching it, per kind of scope a resource can carry.
+/// member cell nests another cell, a group holding a cell directly, a group with no
+/// cells at all, a group holding two sibling cells, and a cell belonging to no group —
+/// with one resource set, and one check watching it, per kind of scope a resource can
+/// carry.
+///
+/// Every cell here is held by AT MOST ONE scope, which is all this API's containment
+/// tree admits: a cell's readiness scope "is a list but currently can have only one
+/// element" (model: `smithy_query(query="doc", shape="CellOutput",
+/// member="ParentReadinessScopes")`), so a second container for one cell is refused and
+/// a fixture cannot be built that way.
 async fn lattice() -> Emulator {
     let emulator = Emulator::new();
 
     for (cell, nested) in [
         ("leaf_cell", vec![]),
         ("mid_cell", vec![arn("cell", "leaf_cell")]),
+        ("flat_cell", vec![]),
+        ("wide_cell_a", vec![]),
+        ("wide_cell_b", vec![]),
         ("lone_cell", vec![]),
     ] {
         create(
@@ -124,11 +134,11 @@ async fn lattice() -> Emulator {
 
     for (group, cells) in [
         ("group_deep", vec![arn("cell", "mid_cell")]),
-        ("group_flat", vec![arn("cell", "leaf_cell")]),
+        ("group_flat", vec![arn("cell", "flat_cell")]),
         ("group_empty", vec![]),
         (
             "group_wide",
-            vec![arn("cell", "leaf_cell"), arn("cell", "lone_cell")],
+            vec![arn("cell", "wide_cell_a"), arn("cell", "wide_cell_b")],
         ),
     ] {
         create(
@@ -155,6 +165,9 @@ async fn lattice() -> Emulator {
         ),
         ("set_mid", "check_mid", vec![arn("cell", "mid_cell")]),
         ("set_leaf", "check_leaf", vec![arn("cell", "leaf_cell")]),
+        ("set_flat", "check_flat", vec![arn("cell", "flat_cell")]),
+        ("set_wide_a", "check_wide_a", vec![arn("cell", "wide_cell_a")]),
+        ("set_wide_b", "check_wide_b", vec![arn("cell", "wide_cell_b")]),
         ("set_lone", "check_lone", vec![arn("cell", "lone_cell")]),
         ("set_unscoped", "check_unscoped", vec![]),
     ] {
@@ -196,7 +209,7 @@ async fn a_recovery_group_summary_names_the_checks_scoped_to_that_group() {
         (
             "a group holding one cell, which nests nothing",
             "group_flat",
-            vec!["check_leaf"],
+            vec!["check_flat"],
         ),
         (
             "a group holding no cells, scoped only by its own ARN",
@@ -206,7 +219,7 @@ async fn a_recovery_group_summary_names_the_checks_scoped_to_that_group() {
         (
             "a group holding two sibling cells",
             "group_wide",
-            vec!["check_leaf", "check_lone"],
+            vec!["check_wide_a", "check_wide_b"],
         ),
     ] {
         let reply = summary(&emulator, group, "").await;

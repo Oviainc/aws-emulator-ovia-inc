@@ -39,6 +39,8 @@ mod job_listing;
 mod job_runs;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/schema_registry.rs"]
+mod schema_registry;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]

@@ -91,7 +91,12 @@ async fn poll(emulator: &Emulator, activity_arn: &str, worker: Option<&str>) -> 
 }
 
 /// The `(taskToken, input)` a poll that must have been handed a task answered.
-async fn claimed(emulator: &Emulator, case: &str, activity_arn: &str, worker: Option<&str>) -> (String, Value) {
+async fn claimed(
+    emulator: &Emulator,
+    case: &str,
+    activity_arn: &str,
+    worker: Option<&str>,
+) -> (String, Value) {
     let answer = poll(emulator, activity_arn, worker).await;
     let token = answer
         .get("taskToken")

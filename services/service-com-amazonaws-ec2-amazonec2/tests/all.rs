@@ -181,6 +181,8 @@ mod ipam_byoasn_associations;
 // Allocating unused capacity out of a Capacity Reservation into an interruptible one.
 #[path = "all/interruptible_capacity_reservation_allocations.rs"]
 mod interruptible_capacity_reservation_allocations;
+#[path = "all/ipam_lifecycle.rs"]
+mod ipam_lifecycle;
 #[path = "all/ipam_policies.rs"]
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]
@@ -236,6 +238,8 @@ mod security_group_filter_limits;
 mod security_groups;
 #[path = "all/snapshot_block_public_access.rs"]
 mod snapshot_block_public_access;
+#[path = "all/spot_datafeed_subscription.rs"]
+mod spot_datafeed_subscription;
 #[path = "all/spot_instance_requests.rs"]
 mod spot_instance_requests;
 #[path = "all/spot_placement_scores.rs"]

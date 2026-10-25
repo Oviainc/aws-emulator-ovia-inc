@@ -469,6 +469,14 @@ pub const MIN_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 1;
 /// [`MIN_SERVICE_JOB_RETRY_ATTEMPTS`].
 pub const MAX_SERVICE_JOB_RETRY_ATTEMPTS: i32 = 10;
 
+/// The fewest results `ListServiceJobs$maxResults` accepts, from the member's doc: "This
+/// value can be between 1 and 100." The model types it as a plain `Integer`, so the bound
+/// is applied in the handler.
+pub const MIN_LIST_SERVICE_JOBS_RESULTS: i32 = 1;
+/// The most results `ListServiceJobs$maxResults` accepts; see
+/// [`MIN_LIST_SERVICE_JOBS_RESULTS`].
+pub const MAX_LIST_SERVICE_JOBS_RESULTS: i32 = 100;
+
 /// The longest scheduling policy `name` the service accepts, from the member's doc: "The
 /// name of the fair-share scheduling policy. It can be up to 128 letters long. It can
 /// contain uppercase and lowercase letters, numbers, hyphens (-), and underscores (_)."
@@ -598,6 +606,10 @@ pub const JOB_FAILED: &str = "FAILED";
 pub const SERVICE_JOB_SUBMITTED: &str = "SUBMITTED";
 /// `ServiceJobStatus` of a service job the scheduler may place.
 pub const SERVICE_JOB_RUNNABLE: &str = "RUNNABLE";
+/// `ServiceJobStatus` of a service job whose work is running, and the status
+/// `ListServiceJobs` selects when a request names none (`ListServiceJobs$jobStatus`: "If
+/// you don't specify a status, only RUNNING jobs are returned").
+pub const SERVICE_JOB_RUNNING: &str = "RUNNING";
 /// Terminal `ServiceJobStatus`: the service job completed successfully.
 pub const SERVICE_JOB_SUCCEEDED: &str = "SUCCEEDED";
 /// Terminal `ServiceJobStatus`: the service job did not complete successfully.
@@ -3383,6 +3395,57 @@ pub fn merged_parameters(
         }
     }
     Some(merged)
+}
+
+/// Whether `candidate` matches a listing filter `value` the way the `JOB_NAME` filter is
+/// documented: case-insensitively, and matching any candidate that begins with the text
+/// before a trailing `*` ("If the value ends with an asterisk (*), the filter matches any
+/// job name that begins with the string before the '*'").
+///
+/// Shared by every listing operation that documents that filter, so the two spell one
+/// rule once.
+pub fn matches_name_filter(candidate: &str, value: &str) -> bool {
+    match value.strip_suffix('*') {
+        // Compared byte-wise rather than through two lowercased copies: a job name is
+        // ASCII (`^[A-Za-z0-9][A-Za-z0-9_-]*$`), and `is_char_boundary` keeps the slice
+        // valid for anything else.
+        Some(prefix) => {
+            candidate.len() >= prefix.len()
+                && candidate.is_char_boundary(prefix.len())
+                && candidate[..prefix.len()].eq_ignore_ascii_case(prefix)
+        }
+        None => candidate.eq_ignore_ascii_case(value),
+    }
+}
+
+/// The instants a `BEFORE_CREATED_AT` or `AFTER_CREATED_AT` filter's `values` name, from
+/// the filter's own doc: each is "a string representation of the number of milliseconds
+/// since 00:00:00 UTC (midnight) on January 1, 1970".
+///
+/// A value that is not one is the message a `ClientException` carries, built from the
+/// filter name and the value the request gave.
+pub fn created_at_filter_bounds(name: &str, values: &[String]) -> Result<Vec<i64>, String> {
+    values
+        .iter()
+        .map(|value| {
+            value.parse::<i64>().map_err(|_| {
+                format!(
+                    "The {name} filter value {value} is not a number of milliseconds since the epoch"
+                )
+            })
+        })
+        .collect()
+}
+
+/// Whether a record created at `created_at` passes the created-at filter `name` with
+/// `bounds`: `BEFORE_CREATED_AT` keeps what was created no later than a bound,
+/// `AFTER_CREATED_AT` what was created no earlier than one.
+pub fn matches_created_at_filter(name: &str, created_at: i64, bounds: &[i64]) -> bool {
+    if name == "BEFORE_CREATED_AT" {
+        bounds.iter().any(|bound| created_at <= *bound)
+    } else {
+        bounds.iter().any(|bound| created_at >= *bound)
+    }
 }
 
 /// One page of `items`, plus the `nextToken` that resumes after it.

@@ -17,6 +17,9 @@ mod error_envelope;
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
 
+#[path = "all/refusal_sentences.rs"]
+mod refusal_sentences;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

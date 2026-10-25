@@ -407,6 +407,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         username: username.clone(),
                         challenge_name: NEW_PASSWORD_REQUIRED.to_string(),
                         expires_at: now + session_validity,
+                        // This challenge is answered with a password the user
+                        // chooses, not with a code anything delivered.
+                        code: None,
                     },
                 );
                 let mut challenge_parameters = ::std::collections::HashMap::new();

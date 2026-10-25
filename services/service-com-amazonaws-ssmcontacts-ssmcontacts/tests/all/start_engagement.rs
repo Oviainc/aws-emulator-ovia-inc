@@ -55,7 +55,10 @@ use crate::contact_updates::{active_replication_set, onboard, set_replication_se
 ///
 /// `contact_type` spans the model's whole `ContactType` value set (rendered into
 /// `src/ops/types/shared_types.rs` as `CONTACT_TYPE_VALUES`), and `plan` spans both shapes
-/// the modelled `Plan` admits — a `Stages` list and a `RotationIds` list.
+/// the modelled `Plan` admits — a `Stages` list and a `RotationIds` list. No plan here NAMES
+/// a channel, contact or rotation: a plan's references are resolved when it is written
+/// (`tests/all/contact_plan_references.rs` is the suite about that rule), and this suite is
+/// about what a START does, which for a plan with no channel target is page nothing.
 struct ContactFixture {
     alias: &'static str,
     contact_type: &'static str,
@@ -73,17 +76,15 @@ const CONTACT_FIXTURES: &[ContactFixture] = &[
         contact_type: "ESCALATION",
         plan: r#"{"Stages": [
             {"DurationInMinutes": 10, "Targets": []},
-            {"DurationInMinutes": 30, "Targets": [{"ContactTargetInfo": {"IsEssential": true}}]}
+            {"DurationInMinutes": 30, "Targets": []}
         ]}"#,
     },
     ContactFixture {
         alias: "weekday_schedule-1",
         contact_type: "ONCALL_SCHEDULE",
-        // `RotationIds` is an `SsmContactsArn` list; the value only has to satisfy that
-        // shape's pattern, which `CreateContact` stores as given.
-        plan: r#"{"RotationIds": [
-            "arn:aws:ssm-contacts:us-east-1:000000000000:rotation/00000000-0000-4000-8000-000000000001"
-        ]}"#,
+        // The `RotationIds` SHAPE with no entry: the modelled length is 0..25, and an entry
+        // would have to name a rotation this store holds.
+        plan: r#"{"RotationIds": []}"#,
     },
 ];
 

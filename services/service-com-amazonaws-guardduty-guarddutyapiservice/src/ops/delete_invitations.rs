@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes from the current account's inbox the invitation each named account sent
+//! it, out of stored state: an account the inbox holds no invitation from is
+//! reported as unprocessed, so the call answers what it did rather than refusing.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +136,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInvitations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteInvitationsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // A parameter failure first, before anything is looked up or written: the
+        // model constrains an `AccountIds` entry to its LENGTH only
+        // (`smithy_query(shape="AccountIds")`), so a 12-character value that is not
+        // an account id at all reaches this handler. It is refused whole rather than
+        // reported, because `UnprocessedAccounts` reports accounts that were not
+        // PROCESSED, never a request that was not understood.
+        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
+        // The operation names no detector (`POST /invitation/delete` —
+        // `smithy_query(operation="DeleteInvitations")`), so the inbox it deletes
+        // from is the one the Region the request was signed for serves — the same
+        // inbox `ListInvitations` reports and `GetInvitationsCount` counts.
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: one account's invitation is
+            // deleted once, so a repeated id cannot be reported twice either.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            if !state.delete_received_invitation_in(&region, account_id) {
+                // Nothing to delete: this account has sent the current one no
+                // invitation, or the one it sent has already been answered or
+                // deleted. Reported, and nothing is persisted for it.
+                unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::NO_INVITATION_FROM_ACCOUNT_MESSAGE.to_string(),
+                });
+            }
+        }
+
+        Ok(DeleteInvitationsOutput {
+            // Present and empty when every named account's invitation was deleted:
+            // an empty list is the answer, and a client reads it the same way as a
+            // full one.
+            unprocessed_accounts: unprocessed,
+        })
     }
 }

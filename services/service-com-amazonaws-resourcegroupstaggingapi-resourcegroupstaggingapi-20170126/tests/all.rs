@@ -22,3 +22,11 @@ mod tag_read_write_loop;
 
 #[path = "all/tagging_api_fidelity.rs"]
 mod tagging_api_fidelity;
+
+// Declared after the sorted list on purpose: every owner this API gains adds its suite
+// inside that list, so a line inserted there collides with every other suite landing in
+// the same window. Appending keeps this change out of the contended region; the suite
+// itself is an ordinary `tests/all/<name>.rs` file. Fold it into the sorted list whenever
+// the list is next touched for another reason.
+#[path = "all/apigateway_tagged_resource_index.rs"]
+mod apigateway_tagged_resource_index;

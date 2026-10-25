@@ -23,6 +23,8 @@ mod automation_event_completion;
 mod automation_event_rollback;
 #[path = "all/automation_event_steps.rs"]
 mod automation_event_steps;
+#[path = "all/automation_event_summaries.rs"]
+mod automation_event_summaries;
 #[path = "all/automation_events.rs"]
 mod automation_events;
 #[path = "all/automation_rule_lifecycle.rs"]

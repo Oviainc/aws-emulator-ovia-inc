@@ -430,6 +430,9 @@ pub const EVENT_ACTIVITY_STARTED: &str = "ActivityStarted";
 /// The history event an activity task that ran out of time writes.
 pub const EVENT_ACTIVITY_TIMED_OUT: &str = "ActivityTimedOut";
 
+/// The history event an activity task a worker reported as FAILED writes.
+pub const EVENT_ACTIVITY_FAILED: &str = "ActivityFailed";
+
 /// The history event an execution that one of its states failed ends on.
 pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 
@@ -1024,8 +1027,9 @@ const TASK_TOKEN_CHARS: usize = 4 * (36 + 1 + MAX_ARN_BYTES).div_ceil(3) + 4;
 
 /// What a scheduled task reserves for the history events its own life appends to the
 /// execution waiting on it: the `ActivityStarted` a claim writes, and the two a
-/// closure by the clock writes. Reserved where the task is admitted, so those writes
-/// cannot take the store past [`MAX_STORE_BYTES`] either.
+/// closure writes — whether the clock closed it or a worker's reply did. Reserved
+/// where the task is admitted, so those writes cannot take the store past
+/// [`MAX_STORE_BYTES`] either.
 const ACTIVITY_TASK_EVENT_RESERVE_BYTES: usize =
     3 * (std::mem::size_of::<HistoryEvent>() + "ActivityTimedOut".len());
 
@@ -4865,6 +4869,61 @@ pub fn plan_reply(
         None,
         previous_event_id,
     ))
+}
+
+/// What a worker's reply that reports its activity task FAILED leaves for the store
+/// to record.
+///
+/// There is no walk to interpret: a `Task` state whose `Resource` is an activity
+/// declares no `Retry` and no `Catch` in the definitions this emulator runs (see
+/// [`asl`]), so a task its worker reports as failed has no state to be retried at and
+/// no catcher to be handed to — the execution waiting at it fails, carrying the
+/// reply's own `error` and `cause`. That outcome is owed to the clock one
+/// [`EXECUTION_SETTLE_DELAY`] after the reply, exactly as the outcome a SUCCESSFUL
+/// reply continues to is ([`plan_reply`]), so one rule covers both replies: the
+/// execution is `RUNNING` until the instant the reply made its outcome due.
+///
+/// `state_name` is the state that scheduled the task, as the stored task names it,
+/// and `previous_event_id` the last event the execution's history holds, so the two
+/// events this appends continue that numbering.
+pub fn plan_task_failure(
+    state_name: &str,
+    now: SystemTime,
+    error: Option<String>,
+    cause: Option<String>,
+    previous_event_id: i64,
+) -> Planned {
+    let due_at = after(now, EXECUTION_SETTLE_DELAY);
+    // The task failed when the worker said so; the execution ends when its outcome
+    // comes due — the same two instants [`plan_from_run`] stamps a walked state and a
+    // terminal event with.
+    let failed = HistoryEvent {
+        id: previous_event_id + 1,
+        previous_event_id,
+        event_type: EVENT_ACTIVITY_FAILED.to_string(),
+        timestamp: now,
+        state_name: Some(state_name.to_string()),
+    };
+    let ended = HistoryEvent {
+        id: failed.id + 1,
+        previous_event_id: failed.id,
+        event_type: EVENT_EXECUTION_FAILED.to_string(),
+        timestamp: due_at,
+        state_name: None,
+    };
+    Planned {
+        opening: vec![failed],
+        pending: Some(PendingOutcome {
+            due_at,
+            status: EXECUTION_STATUS_FAILED.to_string(),
+            output: None,
+            error,
+            cause,
+            events: vec![ended],
+        }),
+        waiting: None,
+        map_runs: Vec::new(),
+    }
 }
 
 /// What one walk left for the store to record: its events numbered after

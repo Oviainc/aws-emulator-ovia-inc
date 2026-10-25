@@ -100,7 +100,12 @@ fn listed_endpoint(body: &Value, arn: &str) -> Option<Value> {
 
 /// Assert `ListLicenseServerEndpoints` reports `arn` with `expected_status`, and that an
 /// endpoint on its way out reports no network address.
-async fn assert_listed_with_status(h: &Harness, case: &str, arn: &str, expected_status: &str) {
+pub(crate) async fn assert_listed_with_status(
+    h: &Harness,
+    case: &str,
+    arn: &str,
+    expected_status: &str,
+) {
     let reply = list_endpoints(h, &json!({})).await;
     let body = reply.ok(case);
     let listed = listed_endpoint(body, arn).unwrap_or_else(|| {

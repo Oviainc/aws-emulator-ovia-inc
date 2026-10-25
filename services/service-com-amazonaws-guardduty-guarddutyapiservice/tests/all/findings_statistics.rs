@@ -737,16 +737,16 @@ async fn finding_criteria_restricts_the_counted_findings() {
     }
 }
 
-/// A criterion this service cannot evaluate is REFUSED, in both answer shapes: counting
+/// A criterion this service cannot answer is REFUSED, in both answer shapes: counting
 /// findings the caller asked to exclude would be worse than refusing. The rows are
-/// attribute paths outside the catalogue this service filters on, including a numeric
-/// comparison on a textual attribute.
+/// criterion keys that name no field of a finding, plus a numeric comparison on a
+/// textual field.
 #[tokio::test]
 async fn a_criterion_this_service_cannot_evaluate_is_refused() {
     let cases: [(&str, Value); 4] = [
         (
-            "an attribute path this emulator does not model",
-            json!({"criterion": {"resource.instanceDetails.instanceId": {"equals": ["i-1"]}}}),
+            "a detail document rather than a field in it",
+            json!({"criterion": {"resource.instanceDetails": {"equals": ["i-1"]}}}),
         ),
         (
             "an attribute that is not a finding attribute at all",

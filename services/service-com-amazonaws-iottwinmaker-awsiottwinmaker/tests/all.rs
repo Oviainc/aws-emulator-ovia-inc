@@ -17,6 +17,9 @@ mod abstract_component_types;
 #[path = "all/component_listing.rs"]
 mod component_listing;
 
+#[path = "all/component_type_create_references.rs"]
+mod component_type_create_references;
+
 #[path = "all/component_type_delete.rs"]
 mod component_type_delete;
 

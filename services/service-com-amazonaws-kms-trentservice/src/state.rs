@@ -37,8 +37,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AliasListEntry, GrantConstraints, GrantListEntry, KeyMetadata, MultiRegionConfiguration,
-    MultiRegionKey, Tag, CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
+    AliasListEntry, CustomKeyStoresListEntry, GrantConstraints, GrantListEntry, KeyMetadata,
+    MultiRegionConfiguration, MultiRegionKey, Tag, XksProxyConfigurationType,
+    CUSTOMER_MASTER_KEY_SPEC_VALUES, DATA_KEY_SPEC_VALUES,
 };
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
@@ -184,6 +185,14 @@ pub struct ComAmazonawsKmsTrentserviceState {
     /// boundary is stable across calls and a new grant never reshuffles earlier
     /// pages.
     pub grant_order: Vec<String>,
+    /// Every persisted custom key store, keyed by its minted key store id. A custom
+    /// key store is a regional resource, so each record carries the Region whose
+    /// endpoint created it and a reader serves only its own
+    /// ([`Self::custom_key_stores_in`]).
+    pub custom_key_stores: HashMap<String, CustomKeyStore>,
+    /// The custom key store ids in creation order, so a custom key store reader
+    /// pages over a stable order rather than the hash map's.
+    pub custom_key_store_order: Vec<String>,
 }
 
 impl ComAmazonawsKmsTrentserviceState {
@@ -363,6 +372,32 @@ impl ComAmazonawsKmsTrentserviceState {
         let removed = self.grants.remove(grant_id)?;
         self.grant_order.retain(|held| held != grant_id);
         Some(removed)
+    }
+
+    /// Persist a freshly created custom key store, remembering its place in
+    /// creation order.
+    pub fn insert_custom_key_store(&mut self, store: CustomKeyStore) {
+        self.custom_key_store_order
+            .push(store.custom_key_store_id.clone());
+        self.custom_key_stores
+            .insert(store.custom_key_store_id.clone(), store);
+    }
+
+    /// The custom key stores `region`'s endpoint serves, in creation order — what a
+    /// custom key store reader pages over, so a page boundary is stable across
+    /// calls.
+    ///
+    /// "You cannot perform this operation on a custom key store in a different
+    /// Amazon Web Services account"
+    /// (`smithy_query(query="doc",shape="DescribeCustomKeyStores")`), and a custom
+    /// key store belongs to one Region, so a key store created through another
+    /// Region's endpoint is not served here.
+    pub fn custom_key_stores_in(&self, region: &str) -> Vec<&CustomKeyStore> {
+        self.custom_key_store_order
+            .iter()
+            .filter_map(|id| self.custom_key_stores.get(id))
+            .filter(|store| store.region == region)
+            .collect()
     }
 
     /// The key a `KeyId` request member names, accepting every form KMS does:
@@ -740,6 +775,243 @@ impl Alias {
             target_key_id: Some(self.target_key_id.clone()),
             creation_date: Some(date_time(self.creation_date)),
             last_updated_date: Some(date_time(self.last_updated_date)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom key stores
+// ---------------------------------------------------------------------------
+
+/// The `ConnectionStateType` of a custom key store that is not connected to its
+/// backing key store: "The `ConnectionState` value is `DISCONNECTED` only if the
+/// key store has never been connected or you use the DisconnectCustomKeyStore
+/// operation to disconnect it"
+/// (`smithy_query(query="doc",shape="CustomKeyStoresListEntry",member="ConnectionState")`),
+/// so it is the state a freshly created key store is in.
+pub const CONNECTION_STATE_DISCONNECTED: &str = "DISCONNECTED";
+
+/// The `ConnectionStateType` of a custom key store connected to its backing key
+/// store: "You can create and use KMS keys in your custom key stores only when its
+/// `ConnectionState` is `CONNECTED`" (the same member's documentation).
+pub const CONNECTION_STATE_CONNECTED: &str = "CONNECTED";
+
+/// The `ConnectionStateType` of a custom key store whose connection attempt did not
+/// succeed: "A value of `FAILED` indicates that an attempt to connect was
+/// unsuccessful. The `ConnectionErrorCode` field in the response indicates the cause
+/// of the failure" (the same member's documentation).
+pub const CONNECTION_STATE_FAILED: &str = "FAILED";
+
+/// The `CustomKeyStoreType` of a key store backed by a CloudHSM cluster, from
+/// `smithy_query(shape="CustomKeyStoreType")`.
+pub const CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM: &str = "AWS_CLOUDHSM";
+
+/// The `CustomKeyStoreType` of a key store backed by an external key store proxy
+/// and an external key manager. See [`CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM`].
+pub const CUSTOM_KEY_STORE_TYPE_EXTERNAL_KEY_STORE: &str = "EXTERNAL_KEY_STORE";
+
+/// The `XksProxyConnectivityType` of an external key store proxy reached through an
+/// Amazon VPC endpoint service, from
+/// `smithy_query(shape="XksProxyConnectivityType")`.
+pub const XKS_PROXY_CONNECTIVITY_VPC_ENDPOINT_SERVICE: &str = "VPC_ENDPOINT_SERVICE";
+
+/// What every custom key store id starts with, as AWS's own ids do.
+const CUSTOM_KEY_STORE_ID_PREFIX: &str = "cks-";
+
+/// A freshly minted custom key store id, drawn from the OS CSPRNG so two key
+/// stores never share one.
+///
+/// `CustomKeyStoreIdType` is only "a unique identifier for the custom key store"
+/// (`smithy_query(shape="CustomKeyStoresListEntry")`) with a modelled 1..64 length
+/// and no pattern, so the form is this emulator's: the `cks-` prefix followed by 16
+/// lowercase hex characters.
+///
+/// `None` means the platform refused to produce entropy; the caller answers a
+/// modelled server error rather than minting a predictable id.
+pub fn mint_custom_key_store_id() -> Option<String> {
+    let mut bytes = [0u8; 8];
+    SystemRandom::new().fill(&mut bytes).ok()?;
+    Some(format!(
+        "{CUSTOM_KEY_STORE_ID_PREFIX}{}",
+        hex::encode(bytes)
+    ))
+}
+
+/// One custom key store: a key store the customer owns and manages, which KMS
+/// reports and connects to but holds no key material of.
+#[derive(Debug, Clone)]
+pub struct CustomKeyStore {
+    /// The minted key store id, which is also this record's map key.
+    pub custom_key_store_id: String,
+    /// "The user-specified friendly name for the custom key store"
+    /// (`smithy_query(shape="CustomKeyStoresListEntry")`), unique per account and
+    /// Region.
+    pub custom_key_store_name: String,
+    /// The Region whose endpoint created it; a custom key store is a regional
+    /// resource.
+    pub region: String,
+    pub creation_date: SystemTime,
+    /// A `ConnectionStateType` value: whether the key store is connected to its
+    /// backing key store.
+    pub connection_state: String,
+    /// The `ConnectionErrorCodeType` of the last failed connection attempt, which
+    /// is reported only while [`Self::connection_state`] is
+    /// [`CONNECTION_STATE_FAILED`].
+    pub connection_error_code: Option<String>,
+    /// What backs the key store, which is also what its `CustomKeyStoreType` is:
+    /// the two are one field, so a key store can never report a type that
+    /// disagrees with the configuration it holds.
+    pub backing: CustomKeyStoreBacking,
+}
+
+impl CustomKeyStore {
+    /// A freshly created custom key store, which "has never been connected" and so
+    /// starts [`CONNECTION_STATE_DISCONNECTED`].
+    pub fn new(
+        custom_key_store_id: String,
+        region: String,
+        custom_key_store_name: String,
+        backing: CustomKeyStoreBacking,
+    ) -> Self {
+        Self {
+            custom_key_store_id,
+            custom_key_store_name,
+            region,
+            creation_date: SystemTime::now(),
+            connection_state: CONNECTION_STATE_DISCONNECTED.to_string(),
+            connection_error_code: None,
+            backing,
+        }
+    }
+
+    /// This key store's `CustomKeyStoreType`, which follows from what backs it:
+    /// "`AWS_CLOUDHSM` indicates a custom key store backed by an CloudHSM cluster.
+    /// `EXTERNAL_KEY_STORE` indicates a custom key store backed by an external key
+    /// store proxy and external key manager"
+    /// (`smithy_query(query="doc",shape="CustomKeyStoresListEntry",member="CustomKeyStoreType")`).
+    pub fn custom_key_store_type(&self) -> &'static str {
+        match self.backing {
+            CustomKeyStoreBacking::CloudHsm(_) => CUSTOM_KEY_STORE_TYPE_AWS_CLOUDHSM,
+            CustomKeyStoreBacking::External(_) => CUSTOM_KEY_STORE_TYPE_EXTERNAL_KEY_STORE,
+        }
+    }
+
+    /// This custom key store as `DescribeCustomKeyStores` reports it — the one place
+    /// a key store is projected onto the wire, so two readers cannot disagree.
+    ///
+    /// A member a key store of this type has no value for is ABSENT rather than
+    /// empty: the CloudHSM cluster and its trust anchor "appear only when the
+    /// `CustomKeyStoreType` is `AWS_CLOUDHSM`", the proxy configuration "only when
+    /// the `CustomKeyStoreType` is `EXTERNAL_KEY_STORE`", and the connection error
+    /// code "only when the `ConnectionState` is `FAILED`"
+    /// (`smithy_query(shape="CustomKeyStoresListEntry")`).
+    pub fn list_entry(&self) -> CustomKeyStoresListEntry {
+        let cloud_hsm = match &self.backing {
+            CustomKeyStoreBacking::CloudHsm(cluster) => Some(cluster),
+            CustomKeyStoreBacking::External(_) => None,
+        };
+        let proxy = match &self.backing {
+            CustomKeyStoreBacking::External(proxy) => Some(proxy),
+            CustomKeyStoreBacking::CloudHsm(_) => None,
+        };
+        CustomKeyStoresListEntry {
+            custom_key_store_id: Some(self.custom_key_store_id.clone()),
+            custom_key_store_name: Some(self.custom_key_store_name.clone()),
+            cloud_hsm_cluster_id: cloud_hsm.map(|cluster| cluster.cloud_hsm_cluster_id.clone()),
+            trust_anchor_certificate: cloud_hsm
+                .map(|cluster| cluster.trust_anchor_certificate.clone()),
+            connection_state: Some(self.connection_state.clone()),
+            connection_error_code: self
+                .connection_error_code
+                .clone()
+                .filter(|_| self.connection_state == CONNECTION_STATE_FAILED),
+            creation_date: Some(date_time(self.creation_date)),
+            custom_key_store_type: Some(self.custom_key_store_type().to_string()),
+            xks_proxy_configuration: proxy.map(XksProxy::configuration),
+        }
+    }
+}
+
+/// What backs a custom key store, and so what it reports about itself.
+#[derive(Debug, Clone)]
+pub enum CustomKeyStoreBacking {
+    /// An CloudHSM cluster the customer owns.
+    CloudHsm(CloudHsmCluster),
+    /// An external key store proxy in front of an external key manager.
+    External(XksProxy),
+}
+
+/// The CloudHSM cluster behind an `AWS_CLOUDHSM` custom key store.
+#[derive(Debug, Clone)]
+pub struct CloudHsmCluster {
+    /// "A unique identifier for the CloudHSM cluster that is associated with an
+    /// CloudHSM key store" (`smithy_query(shape="CustomKeyStoresListEntry")`).
+    pub cloud_hsm_cluster_id: String,
+    /// "The trust anchor certificate of the CloudHSM cluster associated with an
+    /// CloudHSM key store" (the same shape).
+    pub trust_anchor_certificate: String,
+}
+
+/// The external key store proxy behind an `EXTERNAL_KEY_STORE` custom key store.
+///
+/// `Debug` is written by hand rather than derived so the proxy's access key id is
+/// REDACTED: the model marks it sensitive
+/// (`smithy_query(shape="XksProxyConfigurationType")`), and a derived one would
+/// print it into any log line or panic message that formats a key store record.
+#[derive(Clone)]
+pub struct XksProxy {
+    /// An `XksProxyConnectivityType` value: "whether the external key store proxy
+    /// uses a public endpoint or an Amazon VPC endpoint service to communicate with
+    /// KMS" (`smithy_query(shape="XksProxyConfigurationType")`).
+    pub connectivity: String,
+    /// The access key id half of the proxy's authentication credential, which is
+    /// the half `DescribeCustomKeyStores` reports.
+    pub access_key_id: String,
+    pub uri_endpoint: String,
+    pub uri_path: String,
+    /// The VPC endpoint service the proxy is reached through, and the account that
+    /// owns it — set only for [`XKS_PROXY_CONNECTIVITY_VPC_ENDPOINT_SERVICE`].
+    pub vpc_endpoint_service_name: Option<String>,
+    pub vpc_endpoint_service_owner: Option<String>,
+}
+
+impl std::fmt::Debug for XksProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XksProxy")
+            .field("connectivity", &self.connectivity)
+            .field("access_key_id", &"<redacted>")
+            .field("uri_endpoint", &self.uri_endpoint)
+            .field("uri_path", &self.uri_path)
+            .field("vpc_endpoint_service_name", &self.vpc_endpoint_service_name)
+            .field(
+                "vpc_endpoint_service_owner",
+                &self.vpc_endpoint_service_owner,
+            )
+            .finish()
+    }
+}
+
+impl XksProxy {
+    /// This proxy as `DescribeCustomKeyStores` reports it. The VPC endpoint service
+    /// members "appear only when the external key store proxy uses an Amazon VPC
+    /// endpoint service" (`smithy_query(shape="XksProxyConfigurationType")`), so a
+    /// proxy on a public endpoint reports neither.
+    pub fn configuration(&self) -> XksProxyConfigurationType {
+        let through_vpc_endpoint_service =
+            self.connectivity == XKS_PROXY_CONNECTIVITY_VPC_ENDPOINT_SERVICE;
+        XksProxyConfigurationType {
+            connectivity: Some(self.connectivity.clone()),
+            access_key_id: Some(self.access_key_id.clone()),
+            uri_endpoint: Some(self.uri_endpoint.clone()),
+            uri_path: Some(self.uri_path.clone()),
+            vpc_endpoint_service_name: self
+                .vpc_endpoint_service_name
+                .clone()
+                .filter(|_| through_vpc_endpoint_service),
+            vpc_endpoint_service_owner: self
+                .vpc_endpoint_service_owner
+                .clone()
+                .filter(|_| through_vpc_endpoint_service),
         }
     }
 }
@@ -2886,6 +3158,21 @@ pub fn encode_retirable_grant_marker(grant_id: &str) -> String {
 /// [`decode_marker`], for the retirable-grant list.
 pub fn decode_retirable_grant_marker(marker: &str) -> Option<String> {
     decode_marker_for(RETIRABLE_GRANT_MARKER_PREFIX, marker)
+}
+
+/// [`MARKER_PREFIX`], for the custom key store list, which pages over custom key
+/// stores rather than keys and so mints its own tokens.
+const CUSTOM_KEY_STORE_MARKER_PREFIX: &str = "custom-key-stores/1/";
+
+/// [`encode_marker`], for the custom key store list: the token resumes after the
+/// key store whose id is `custom_key_store_id`.
+pub fn encode_custom_key_store_marker(custom_key_store_id: &str) -> String {
+    encode_marker_for(CUSTOM_KEY_STORE_MARKER_PREFIX, custom_key_store_id)
+}
+
+/// [`decode_marker`], for the custom key store list.
+pub fn decode_custom_key_store_marker(marker: &str) -> Option<String> {
+    decode_marker_for(CUSTOM_KEY_STORE_MARKER_PREFIX, marker)
 }
 
 /// One encoding for every list, so no two pagers mint tokens a reader must handle

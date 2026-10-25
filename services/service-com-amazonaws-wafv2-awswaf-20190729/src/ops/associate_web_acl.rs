@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Puts a web ACL in front of a protected resource, so later reads report the
+//! binding and the resource is covered by that web ACL.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The binding is stored in
+//! [`crate::state::ComAmazonawsWafv2Awswaf20190729State::web_acl_associations`],
+//! keyed by the protected resource: a resource has at most one web ACL in front of
+//! it, so binding one that is already protected REPLACES its binding. It is the
+//! same record `GetWebACLForResource`, `ListResourcesForWebACL` and
+//! `DisassociateWebACL` read, so no two of them can disagree.
+//!
+//! Both ARNs the call names are judged before anything is bound:
+//!
+//! * `ResourceArn` must name a resource kind a web ACL can be put in front of —
+//!   [`crate::state::PROTECTED_RESOURCE_FORMS`], the catalogue of the ARN formats
+//!   this parameter documents. Whether that resource EXISTS is not decided here:
+//!   it belongs to another service and possibly another account, so this
+//!   deployment cannot show it absent.
+//! * `WebACLArn` must name a web ACL this service holds, which it can show, so an
+//!   ARN naming none is `WAFNonexistentItemException`; and it must be a REGIONAL
+//!   one, because a CLOUDFRONT-scoped web ACL is bound through the distribution's
+//!   own configuration rather than through this API.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +201,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateWebACL"))
+        // A mutation: it writes the binding the association reads report. `ctx`
+        // carries only request metadata, which this operation does not need.
+        let _ = ctx;
+
+        // "Your request references an ARN that is malformed, or corresponds to a
+        // resource with which a web ACL can't be associated"
+        // (`WAFInvalidParameterException`) — one refusal for both ways either ARN
+        // can fail, judged before anything is resolved or stored.
+        if !crate::state::is_wafv2_resource_arn(&input.web_acl_arn) {
+            return Err(AssociateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.web_acl_arn),
+            )
+            .into());
+        }
+        let Some(resource_type) = crate::state::protected_resource_type(&input.resource_arn) else {
+            return Err(AssociateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_arn_exception(&input.resource_arn),
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateWebACLErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The web ACL is this service's own resource, so a `WebACLArn` naming none
+        // is a resource this deployment CAN show does not exist.
+        let Some(entry) = state.web_acl_by_arn(&input.web_acl_arn) else {
+            crate::state::audit(
+                "AssociateWebACL",
+                "",
+                "",
+                "",
+                "WAFNonexistentItemException",
+            );
+            return Err(AssociateWebACLErrorModeled::WAFNonexistentItemException(
+                crate::state::nonexistent_item_exception(),
+            )
+            .into());
+        };
+        // Read out of the entry before the store is written through, so the audit
+        // record below does not hold a borrow of it.
+        let scope = entry.scope.clone();
+        let name = entry.web_acl.name.clone();
+        let id = entry.web_acl.id.clone();
+
+        // "Use this for all resource types except for Amazon CloudFront
+        // distributions. For Amazon CloudFront, call UpdateDistribution" (the
+        // operation's own doc): a CLOUDFRONT-scoped web ACL protects distributions,
+        // which carry their web ACL in their own configuration, so it is not what
+        // this call binds.
+        if scope == crate::state::SCOPE_CLOUDFRONT {
+            crate::state::audit(
+                "AssociateWebACL",
+                &scope,
+                &name,
+                &id,
+                "WAFInvalidParameterException",
+            );
+            return Err(AssociateWebACLErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_WEB_ACL,
+                    &input.web_acl_arn,
+                    "a CLOUDFRONT-scoped web ACL is put in front of a CloudFront \
+                     distribution through the distribution's own configuration, not \
+                     through this operation",
+                ),
+            )
+            .into());
+        }
+
+        if !state.associate_web_acl(&input.resource_arn, &input.web_acl_arn) {
+            crate::state::audit(
+                "AssociateWebACL",
+                &scope,
+                &name,
+                &id,
+                "WAFLimitsExceededException",
+            );
+            return Err(AssociateWebACLErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+        crate::state::audit(
+            "AssociateWebACL",
+            &scope,
+            &name,
+            &id,
+            &format!("associated with a {resource_type} resource"),
+        );
+
+        // `AssociateWebACLResponse` models no members: the success is the empty body.
+        Ok(AssociateWebACLOutput {})
     }
 }

@@ -85,7 +85,11 @@
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::destinations`], each one a
 //! [`DestinationRecord`], keyed by the `destinationName` that identifies one. A destination
 //! names a physical resource of another service, so it is an account-level resource and no
-//! log group owns it.
+//! log group owns it. Its access policy lives on that destination
+//! ([`DestinationRecord::access_policy`]), because `PutDestinationPolicy` creates or updates
+//! "an access policy associated with an existing destination" and nothing but the destination
+//! names one: one destination holds at most one, and removing the destination takes its policy
+//! with it.
 //!
 //! The account's log anomaly detectors — "one anomaly detector in the account", which
 //! `CreateLogAnomalyDetector` creates and `GetLogAnomalyDetector` reports — live in
@@ -1727,6 +1731,59 @@ pub fn destination_arn(region: &str, name: &str) -> String {
 /// service parses the destination's two ARNs together and reports the failure of either
 /// without naming which one failed.
 pub const DESTINATION_ARN_PARSE_FAILED: &str = "Error parsing ARN from given role or target";
+
+/// The size of the access policy one destination can carry:
+/// `PutDestinationPolicy$accessPolicy` is documented "This can be up to 5120 bytes", a ceiling
+/// the model's `AccessPolicy` shape does not express (`@length` min 1 only), so the handler
+/// holds the document to it. It bounds this store too, since the document is kept verbatim on
+/// the destination record.
+pub const MAX_ACCESS_POLICY_BYTES: usize = 5_120;
+
+/// The IAM condition key an access policy names an ORGANIZATION by, which is what
+/// `PutDestinationPolicy$forceUpdate` ("grant permission to an organization ID instead of
+/// granting permission to individual Amazon Web Services accounts") distinguishes a policy by.
+const ORGANIZATION_PRINCIPAL_CONDITION_KEY: &str = "aws:PrincipalOrgID";
+
+/// Whether an access policy grants permission to an organization rather than to individual
+/// accounts, read off the document itself: a policy names the organization through the
+/// [`ORGANIZATION_PRINCIPAL_CONDITION_KEY`] condition key.
+///
+/// The key is matched without regard to case, because IAM condition keys are
+/// case-insensitive, and wherever in the document it appears, because a condition can sit
+/// under any condition operator of any statement. The walk carries its own stack rather than
+/// recursing, so a deeply nested document costs heap instead of call frames. A document that
+/// is not JSON at all grants nothing: the handler refuses it before asking.
+pub fn access_policy_grants_organization(document: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
+        return false;
+    };
+    let mut pending = vec![parsed];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(members) => {
+                for (key, nested) in members {
+                    if key.eq_ignore_ascii_case(ORGANIZATION_PRINCIPAL_CONDITION_KEY) {
+                        return true;
+                    }
+                    pending.push(nested);
+                }
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The refusal CloudWatch Logs answers a `PutDestinationPolicy` that would replace a
+/// destination's account-granting access policy with one granting an organization without the
+/// `forceUpdate` affirmation that the senders' subscription filters have already been updated.
+/// The message names the parameter the caller has to set, so one request carries the whole
+/// rule; it says it per CLASS of update rather than per request value, so every such put is
+/// refused identically.
+pub const DESTINATION_POLICY_FORCE_UPDATE_REQUIRED: &str =
+    "forceUpdate must be true to update an existing destination policy to grant permission to \
+     an organization ID instead of individual accounts";
 
 /// One log anomaly detector — "one anomaly detector in the account" — as it is stored.
 /// Every member of the model's `AnomalyDetector` shape is reported from this record, so

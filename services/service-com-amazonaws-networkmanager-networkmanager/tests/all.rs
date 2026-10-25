@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_scoping.rs"]
 mod arn_scoping;
+#[path = "all/associate_customer_gateway_scoping.rs"]
+mod associate_customer_gateway_scoping;
 #[path = "all/attachment_acceptance.rs"]
 mod attachment_acceptance;
 #[path = "all/attachment_lifecycle.rs"]

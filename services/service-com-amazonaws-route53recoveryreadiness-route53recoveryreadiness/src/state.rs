@@ -115,6 +115,22 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 /// own fixed sentence.
 pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
+/// The sentence a write is refused with when it would place a cell into a SECOND
+/// readiness scope.
+///
+/// A cell belongs to one parent cell or to one recovery group: a cell's readiness scope
+/// "is a list but currently can have only one element"
+/// (`smithy_query(query="doc", shape="CellOutput", member="ParentReadinessScopes")`), so
+/// a containment that would give one cell two scopes names a hierarchy this API has no
+/// way to report and is refused instead of stored. See
+/// [`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::check_containment_available`].
+///
+/// A CONSTANT, resource-agnostic text like this service's other refusals: neither the
+/// cell nor the scope that already contains it is echoed back, so the error body cannot
+/// leak which names this account uses.
+pub const CELL_ALREADY_CONTAINED_MESSAGE: &str =
+    "A cell can be contained by only one readiness scope.";
+
 /// The sentence a list operation answers when the `NextToken` it was handed is not one
 /// this service minted. Also a constant: the rejected token is NOT echoed back.
 pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token.";
@@ -479,32 +495,90 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
         }
     }
 
-    /// The readiness scopes that CONTAIN the cell whose ARN is `cell_arn`: the ARN of
-    /// every stored cell that names it as a nested cell, and of every stored recovery
-    /// group that names it as one of its cells — the two kinds of scope the member's
-    /// own documentation allows ("a cell Amazon Resource Name (ARN) or a recovery group
-    /// ARN").
+    /// The readiness scope that CONTAINS the cell whose ARN is `cell_arn`, or `None`
+    /// when no stored record does: the ARN of the stored cell that names it as a nested
+    /// cell, or of the stored recovery group that names it as one of its cells — the two
+    /// kinds of scope the member's own documentation allows ("a cell Amazon Resource
+    /// Name (ARN) or a recovery group ARN"), of which the same sentence says the member
+    /// "is a list but currently can have only one element".
+    ///
+    /// AT MOST ONE, because containment here is a TREE: a cell belongs to one parent
+    /// cell or to one recovery group, never to two. [`Self::check_containment_available`]
+    /// is what keeps it so — every write that would place a cell into a second container
+    /// is refused — and `Option` carries that cardinality in the type, so a handler
+    /// cannot report a shape of answer the API does not produce.
     ///
     /// Derived on every read rather than stored, so a cell reports the containment the
     /// store actually holds — a parent created after the child included.
+    pub fn parent_readiness_scope(&self, cell_arn: &str) -> Option<String> {
+        self.containing_scope_arns(cell_arn)
+            .next()
+            .map(str::to_string)
+    }
+
+    /// [`Self::parent_readiness_scope`] as the modelled `ParentReadinessScopes` member:
+    /// the one containing scope, or no element at all. This is what the handlers that
+    /// report a cell put into the member, so all of them report the same cardinality.
     pub fn parent_readiness_scopes(&self, cell_arn: &str) -> Vec<String> {
+        self.parent_readiness_scope(cell_arn).into_iter().collect()
+    }
+
+    /// Every stored record that contains the cell whose ARN is `cell_arn`, in store
+    /// order: the cells that name it as a nested cell, then the recovery groups that
+    /// name it as one of their cells.
+    ///
+    /// A cell is never its own container, so a record naming its own ARN among its
+    /// nested cells is not reported as a scope of itself.
+    fn containing_scope_arns<'a>(
+        &'a self,
+        cell_arn: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         let nesting_cells = self
             .cells
             .values()
-            .filter(|candidate| {
+            .filter(move |candidate| {
                 candidate.arn != cell_arn
                     && candidate
                         .nested_cell_arns
                         .iter()
                         .any(|nested| nested == cell_arn)
             })
-            .map(|parent| parent.arn.clone());
+            .map(|parent| parent.arn.as_str());
         let owning_groups = self
             .recovery_groups
             .values()
-            .filter(|group| group.cell_arns.iter().any(|cell| cell == cell_arn))
-            .map(|group| group.arn.clone());
-        nesting_cells.chain(owning_groups).collect()
+            .filter(move |group| group.cell_arns.iter().any(|cell| cell == cell_arn))
+            .map(|group| group.arn.as_str());
+        nesting_cells.chain(owning_groups)
+    }
+
+    /// The CONTAINMENT GATE every write that places cells into a container passes
+    /// through, after its input has been validated and BEFORE anything is written:
+    /// `container_arn` is the cell or recovery group doing the containing and
+    /// `contained` the cell ARNs it will hold.
+    ///
+    /// `Err` carries [`CELL_ALREADY_CONTAINED_MESSAGE`] when one of those cells is
+    /// already held by a DIFFERENT record; each write answers it as its own modelled
+    /// `ValidationException` (HTTP 400). Re-writing a containment this same container
+    /// already has is not a second container, so it passes.
+    ///
+    /// One gate in one place, so no write can leave the store holding a cell with two
+    /// containers — the configuration whose report
+    /// [`Self::parent_readiness_scope`] could not express.
+    pub fn check_containment_available(
+        &self,
+        container_arn: &str,
+        contained: &[String],
+    ) -> Result<(), &'static str> {
+        for cell_arn in contained {
+            if self
+                .containing_scope_arns(cell_arn)
+                .any(|scope| scope != container_arn)
+            {
+                return Err(CELL_ALREADY_CONTAINED_MESSAGE);
+            }
+        }
+        Ok(())
     }
 
     /// Every readiness scope the cell named `cell_name` covers: its own ARN plus the

@@ -327,7 +327,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 due_at: now + crate::state::SETTLE_AFTER,
                 next_status: crate::state::STATUS_ACTIVE,
             }),
-            delete_client_token: None,
             identifier: identifier.clone(),
         };
         // A policy supplied at creation is attached with its first version, so

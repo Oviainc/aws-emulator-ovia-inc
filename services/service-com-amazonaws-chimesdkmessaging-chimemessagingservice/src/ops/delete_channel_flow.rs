@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteChannelFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteChannelFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteChannelFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the channel flow [`crate::state`] holds under the `ChannelFlowArn` the request
+//! names, so `DescribeChannelFlow` and `ListChannelFlows` no longer report it.
+//!
+//! An ARN that names no channel flow this account holds is answered with the modelled
+//! `ForbiddenException` (HTTP 403, `Code` `Forbidden`), for the reason
+//! `DescribeChannelFlow` gives: this operation's error set carries no
+//! `NotFoundException` either, so that is the terminal client error the service states
+//! for an ARN it cannot resolve for the caller.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +174,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteChannelFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteChannelFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteChannelFlow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteChannelFlowErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The model documents that this works only while the channel flow is associated
+        // with no channel. `AssociateChannelFlow` is still a 501 in this emulator, so no
+        // stored channel can carry an association and that conflict is unreachable — when
+        // associations are served, the `ConflictException` this operation models belongs
+        // here.
+        if store.channel_flows.remove(&input.channel_flow_arn).is_none() {
+            return Err(DeleteChannelFlowErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::UNRESOLVABLE_APP_INSTANCE.to_string()),
+            })
+            .into());
+        }
+
+        Ok(DeleteChannelFlowOutput)
     }
 }

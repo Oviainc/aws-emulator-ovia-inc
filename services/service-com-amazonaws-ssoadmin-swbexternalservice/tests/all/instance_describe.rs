@@ -203,10 +203,10 @@ async fn describe_instance_reports_the_stored_instance_and_denies_every_other_ar
         );
         assert_eq!(
             body["PermissionSetsEnabled"],
-            Value::Bool(true),
-            "case {:?}: the instance a client discovers through ListInstances is the \
-             organization instance, which serves multi-account permissions, so it must \
-             report permission sets enabled, got {:?}",
+            Value::Bool(false),
+            "case {:?}: the instance a client discovers through ListInstances is an \
+             account instance, which serves no multi-account permissions, so it must \
+             report permission sets disabled, got {:?}",
             case.label,
             body["PermissionSetsEnabled"]
         );

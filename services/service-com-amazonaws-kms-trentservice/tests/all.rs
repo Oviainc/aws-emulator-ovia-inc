@@ -17,6 +17,8 @@ mod alias_lifecycle;
 mod aliases;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/custom_key_stores.rs"]
+mod custom_key_stores;
 #[path = "all/data_key_without_plaintext.rs"]
 mod data_key_without_plaintext;
 #[path = "all/decrypt_key_origin.rs"]

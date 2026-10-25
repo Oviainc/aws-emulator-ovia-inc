@@ -999,9 +999,9 @@ async fn paging_a_findings_list_yields_each_finding_exactly_once() {
     }
 }
 
-/// `ListFindings` applies `FindingCriteria` rather than ignoring it, and refuses an
-/// attribute path it cannot evaluate rather than returning findings the caller asked
-/// it to exclude.
+/// `ListFindings` applies `FindingCriteria` rather than ignoring it, and refuses a
+/// criterion key that names no field of a finding rather than returning findings the
+/// caller asked to exclude.
 #[tokio::test]
 async fn list_findings_applies_the_finding_criteria_it_is_given() {
     let router = new_router();
@@ -1056,17 +1056,17 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
         &router,
         "POST",
         &format!("/detector/{detector_id}/findings"),
-        Some(json!({"findingCriteria": {"criterion": {"service.action.actionType": {"equals": ["DNS_REQUEST"]}}}})),
+        Some(json!({"findingCriteria": {"criterion": {"service.actionType": {"equals": ["DNS_REQUEST"]}}}})),
     )
     .await;
     assert_eq!(
         status, 400,
-        "a criterion this emulator cannot evaluate must be refused, not ignored: got {status} {body:?}"
+        "a criterion key that names no finding field must be refused, not ignored: got {status} {body:?}"
     );
     assert_eq!(
         error_code(&body),
         "InvalidInputException",
-        "an unevaluable criterion: got {body:?}"
+        "a criterion key naming no finding field: got {body:?}"
     );
 
     // An ordering condition only applies to an attribute that HAS a numeric form.
@@ -1087,7 +1087,7 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
     let empty_router = new_router();
     let empty_detector = enabled_detector(&empty_router).await;
     for case in [
-        json!({"service.action.actionType": {"equals": ["DNS_REQUEST"]}}),
+        json!({"service.actionType": {"equals": ["DNS_REQUEST"]}}),
         json!({"type": {"greaterThan": 1}}),
     ] {
         let (status, body) = call(
@@ -1170,20 +1170,20 @@ async fn a_matches_condition_follows_the_wildcard_pattern_it_is_given() {
     }
 }
 
-/// `SortCriteria` orders the result, and an attribute this emulator cannot evaluate
+/// `SortCriteria` orders the result, and an attribute that names no field of a finding
 /// is refused even when the result would have been empty.
 #[tokio::test]
 async fn list_findings_orders_the_result_by_the_sort_criteria_it_is_given() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
 
-    // A sort attribute the emulator cannot evaluate is refused BEFORE any finding
-    // exists, so the refusal is about the attribute and not about the data.
+    // A sort attribute naming no finding field is refused BEFORE any finding exists,
+    // so the refusal is about the attribute and not about the data.
     let (status, body) = call(
         &router,
         "POST",
         &format!("/detector/{detector_id}/findings"),
-        Some(json!({"sortCriteria": {"attributeName": "service.action.actionType"}})),
+        Some(json!({"sortCriteria": {"attributeName": "service.actionType"}})),
     )
     .await;
     assert_eq!(

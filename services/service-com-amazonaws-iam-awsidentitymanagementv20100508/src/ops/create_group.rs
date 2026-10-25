@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: "creates a new group", so the lock is held for write across the
+        // uniqueness check, the quota check and the insert.
+        let mut store = state.lock();
+
+        // `Path` "is optional. If it is not included, it defaults to a slash (/)".
+        let path = input
+            .path
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before the group is minted, on the group this request names.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_GROUP,
+            &crate::state::group_arn(&path, &input.group_name),
+        )?;
+
+        // IAM entity names are unique within the account and "are not distinguished
+        // by case", so the case-folded name is the identity.
+        let key = crate::state::name_key(&input.group_name);
+        if store.groups.contains_key(&key) {
+            return Err(CreateGroupErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!(
+                        "Group with name {} already exists.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of groups, so a caller cannot grow the
+        // account without limit; past the quota IAM refuses the create.
+        if store.groups.len() >= crate::state::MAX_GROUPS_PER_ACCOUNT {
+            return Err(CreateGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for GroupsPerAccount: {}",
+                        crate::state::MAX_GROUPS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let group = Group {
+            arn: crate::state::group_arn(&path, &input.group_name),
+            path,
+            group_name: input.group_name,
+            group_id: store.next_group_id(),
+            create_date: crate::state::now(),
+        };
+
+        store.groups.insert(key, group.clone());
+        // Audit record for the change: the acting principal, the operation and what it
+        // created, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreateGroup",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            group_name = %group.group_name,
+            "a group was created"
+        );
+        Ok(CreateGroupOutput { group })
     }
 }

@@ -190,20 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // other, the computed ones (`SubscriptionArn`, `Protocol`, `Endpoint`, …)
         // included: those are properties of the subscription, not settings of it.
         if !state::is_subscription_attribute(&input.attribute_name) {
-            return Err(invalid_parameter(format!(
-                "Invalid parameter: AttributeName Reason: {} is not a subscription \
-                 attribute this operation sets",
-                input.attribute_name
-            )));
+            return Err(invalid_parameter(
+                state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string(),
+            ));
         }
         // And each attribute accepts only the values SNS documents for it.
         if let Some(value) = input.attribute_value.as_deref() {
-            if let Some(reason) =
-                state::subscription_attribute_value_reason(&input.attribute_name, value)
+            if let Some(message) =
+                state::subscription_attribute_refusal(&input.attribute_name, value)
             {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: AttributeValue Reason: {reason}"
-                )));
+                return Err(invalid_parameter(message));
             }
         }
 
@@ -248,6 +244,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.attribute_value.as_deref(),
         ) {
             return Err(invalid_parameter(refusal));
+        }
+
+        // The filter policy and its scope constrain each other, so the pair the write
+        // WOULD leave is judged — whichever of the two this request carried.
+        let mut would_hold = subscription.attributes.clone();
+        match input.attribute_value.as_deref() {
+            Some(value) => {
+                would_hold.insert(input.attribute_name.clone(), value.to_string());
+            }
+            None => {
+                would_hold.remove(&input.attribute_name);
+            }
+        }
+        if let Some(message) = state::filter_policy_pair_refusal(&would_hold) {
+            return Err(invalid_parameter(message));
         }
 
         // "The new value for the attribute" (`AttributeValue` doc) — and a request that
