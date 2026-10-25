@@ -40,18 +40,33 @@ pub const STATUS_INITIALIZING: &str = "INITIALIZING";
 /// The status a deployment settles into, from the same enum.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
-/// How long a deployment stays in its transient status before the clock owes it the
-/// settled one.
+/// The status the work on a manager (and on each configuration it owns) is in while
+/// the service tears that manager's deployed resources down, from the same enum.
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// How long a deployment or a teardown stays in its transient status before the clock
+/// owes it what comes next.
 ///
-/// `CreateConfigurationManager` starts a deployment, so the manager and its
+/// `CreateConfigurationManager` starts a deployment and
+/// `DeleteConfigurationManager` starts a teardown, so the manager and its
 /// configurations are reported in a non-terminal `Status` first: that is a
 /// transition the clock owes. The span is this emulator's own choice (AWS documents
-/// no duration for a Quick Setup deployment) and is deliberately non-zero, so a
-/// caller reading straight after the create still observes the transient status, as
-/// it does against the real service. The instant it comes due is stored on the
-/// summary ([`StatusSummaryRecord::settles`]) and materialised by
+/// no duration for a Quick Setup deployment or teardown) and is deliberately
+/// non-zero, so a caller reading straight after the call still observes the
+/// transient status, as it does against the real service. The instant it comes due is
+/// stored on the summary ([`StatusSummaryRecord::settles`]) — or, for a teardown, on
+/// the manager ([`ConfigurationManagerRecord::deletes_at`]) — and materialised by
 /// [`ComAmazonawsSsmquicksetupQuicksetupState::settle`]; nothing sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// Why a mutation of a configuration manager whose teardown is in flight is refused.
+///
+/// The wording is what the model documents for `ConflictException`: a teardown the
+/// service accepted IS another request being processed, and it is the one the caller
+/// has to wait out before the manager takes any further mutation. The one place the
+/// message lives, so every operation that mutates a manager refuses the same way.
+pub const TEARDOWN_IN_FLIGHT_MESSAGE: &str =
+    "Another request is being processed. Wait a few minutes and try again.";
 
 /// Largest page either list operation will build, and the page size applied when the
 /// request names no `MaxItems`: the maximum of that member's modelled `@range(1,
@@ -571,6 +586,21 @@ impl StatusSummaryRecord {
         }
     }
 
+    /// The summary the work on a configuration manager (or on one of its
+    /// configurations) carries from the moment a delete is accepted: `DELETING`,
+    /// with nothing to settle into — the record it belongs to is removed when the
+    /// teardown completes, so no later status is ever reported for it.
+    pub fn teardown(now: SystemTime) -> Self {
+        Self {
+            status_type: STATUS_TYPE_DEPLOYMENT.to_string(),
+            status: STATUS_DELETING.to_string(),
+            status_message: None,
+            last_updated_at: now,
+            status_details: BTreeMap::new(),
+            settles: None,
+        }
+    }
+
     /// Materialise the change the clock already owes this summary.
     ///
     /// This is the ONLY write a reporting operation makes: the change was owed at
@@ -610,7 +640,21 @@ impl StatusSummaryRecord {
 /// and the same clock-owed transition serve both; this is the one place that
 /// construction lives.
 pub fn restart_deployment(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime) {
-    let fresh = StatusSummaryRecord::deployment(now);
+    replace_deployment_summary(summaries, StatusSummaryRecord::deployment(now));
+}
+
+/// Report `summaries` as being torn down: the `Deployment` summary becomes the
+/// transient teardown one, and every other kind of summary is left as it was.
+///
+/// A manager and each configuration it owns are torn down together, so the same
+/// record serves both; this is the one place that construction lives.
+pub fn start_teardown(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime) {
+    replace_deployment_summary(summaries, StatusSummaryRecord::teardown(now));
+}
+
+/// Put `fresh` in place of the `Deployment` summary of `summaries`, adding it when
+/// there is none; summaries of every other `StatusType` are left alone.
+fn replace_deployment_summary(summaries: &mut Vec<StatusSummaryRecord>, fresh: StatusSummaryRecord) {
     match summaries
         .iter_mut()
         .find(|summary| summary.status_type == STATUS_TYPE_DEPLOYMENT)
@@ -687,9 +731,25 @@ pub struct ConfigurationManagerRecord {
     pub tags: BTreeMap<String, String>,
     pub definitions: Vec<ConfigurationDefinitionRecord>,
     pub status_summaries: Vec<StatusSummaryRecord>,
+    /// When the teardown a `DeleteConfigurationManager` started comes due, or `None`
+    /// while no delete has been accepted for this manager.
+    ///
+    /// Removing a manager's deployed resources is work the service does after it has
+    /// answered the delete, so the record stays readable in its `DELETING` status
+    /// until this instant, at which point
+    /// [`ComAmazonawsSsmquicksetupQuicksetupState::settle`] removes it and the
+    /// configurations it owns. Nothing sleeps: the removal is owed from this instant
+    /// on whether or not anybody calls.
+    pub deletes_at: Option<SystemTime>,
 }
 
 impl ConfigurationManagerRecord {
+    /// Whether the teardown of this manager is in flight: a delete has been accepted
+    /// for it, so it takes no further mutation and is on its way out of the store.
+    pub fn is_deleting(&self) -> bool {
+        self.deletes_at.is_some()
+    }
+
     /// The modelled `ConfigurationManagerSummary` for this record.
     pub fn to_summary(&self) -> ConfigurationManagerSummary {
         ConfigurationManagerSummary {
@@ -920,6 +980,17 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
     /// operation answers with what is due at `now` rather than with what the last
     /// mutating call left behind.
     pub fn settle(&mut self, now: SystemTime) {
+        // A teardown the clock has made due is the removal of the manager and of the
+        // configurations it owns: owed at this instant whether or not anybody called.
+        let torn_down: Vec<String> = self
+            .managers
+            .iter()
+            .filter(|(_, manager)| manager.deletes_at.is_some_and(|due_at| due_at <= now))
+            .map(|(manager_arn, _)| manager_arn.clone())
+            .collect();
+        for manager_arn in &torn_down {
+            self.remove_manager(manager_arn);
+        }
         for manager in self.managers.values_mut() {
             for summary in &mut manager.status_summaries {
                 summary.settle(now);
@@ -929,6 +1000,31 @@ impl ComAmazonawsSsmquicksetupQuicksetupState {
             for summary in &mut configuration.status_summaries {
                 summary.settle(now);
             }
+        }
+    }
+
+    /// Accept the teardown of the manager `manager_arn` names: it and every
+    /// configuration it owns report the transient teardown status from now on, and
+    /// their removal comes due [`TRANSITION_SPAN`] later. Nothing to do when no
+    /// manager has that ARN.
+    ///
+    /// A configuration is the deployment of one of its manager's definitions, so the
+    /// two are torn down as one: what a caller polling after a delete observes is
+    /// every record of that manager winding down together.
+    pub fn begin_teardown(&mut self, manager_arn: &str, now: SystemTime) {
+        let Some(manager) = self.managers.get_mut(manager_arn) else {
+            return;
+        };
+        start_teardown(&mut manager.status_summaries, now);
+        // Monotonic: the stamp never moves backwards, whatever the host clock does.
+        manager.last_modified_at = now.max(manager.last_modified_at);
+        manager.deletes_at = Some(now + TRANSITION_SPAN);
+        for configuration in self.configurations.values_mut() {
+            if configuration.manager_arn != manager_arn {
+                continue;
+            }
+            start_teardown(&mut configuration.status_summaries, now);
+            configuration.last_modified_at = now.max(configuration.last_modified_at);
         }
     }
 

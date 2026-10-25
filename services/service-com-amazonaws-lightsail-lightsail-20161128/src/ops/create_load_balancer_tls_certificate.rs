@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLoadBalancerTlsCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLoadBalancerTlsCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds ONE SSL/TLS certificate to the load balancer the request names, in the Region
+//! the request is made in, and answers the operation-log entry the addition appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLoadBalancerTlsCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The certificate is created UNATTACHED: Lightsail validates it first, and
+//! `AttachLoadBalancerTlsCertificate` is what puts it in front of traffic — so a load
+//! balancer that just got a certificate still serves plain `HTTP`.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +177,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLoadBalancerTlsCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLoadBalancerTlsCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A load balancer is a REGIONAL resource, so its certificate is created
+        // on the load balancer addressed in the Region the request is signed for
+        // — the same Region `CreateLoadBalancer` stored the record in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName`, `certificateName` and `certificateDomainName` are
+        // modelled `@required` members and the two names carry the modelled
+        // `ResourceName` pattern, so the centralized walk refused anything
+        // outside them before this body ran. What is left is what the model
+        // cannot express: the domains have to be domain names, the alternative
+        // domains have to be within the documented nine once de-duped, the tags
+        // within their bound, the load balancer has to be one this account holds
+        // in this Region, the certificate name has to still be free on it, and
+        // both documented certificate quotas have to have room. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        let load_balancer_name = input.load_balancer_name;
+        let certificate_name = input.certificate_name;
+        let domain_name = input.certificate_domain_name;
+        crate::state::validate_domain_name(&domain_name).map_err(|detail| {
+            invalid(format!(
+                "certificateDomainName '{domain_name}' is not the domain name of a \
+                 certificate: {detail}"
+            ))
+        })?;
+        // Each alternative domain has to be a domain name too, which is also
+        // what refuses the wildcards the documentation says are not supported,
+        // because `*` is not a character a DNS label carries.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLoadBalancerTlsCertificate"))
+        // "Lightsail will de-dupe the names for you": a name the list repeats,
+        // and a name that already IS the certificate's primary domain, add no
+        // domain to the certificate — so the list is reduced, through the one
+        // owner of that rule, to the domains the certificate covers BEYOND its
+        // primary one, and the documented maximum is applied to what is left
+        // rather than to a list whose repeats Lightsail itself would have
+        // dropped.
+        //
+        // Whether an entry is a repeat is only known once it has been examined,
+        // so how many entries the list may carry is bounded HERE, before a
+        // single one is looked at: every validation and every de-dupe comparison
+        // below is then bounded by that constant rather than by what the caller
+        // sent.
+        let requested_alternatives = input.certificate_alternative_names.unwrap_or_default();
+        if requested_alternatives.len() > crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES {
+            return Err(invalid(format!(
+                "certificateAlternativeNames carries {} entries, more than the {} this service \
+                 reads for one certificate",
+                requested_alternatives.len(),
+                crate::state::MAX_DOMAIN_NAME_LIST_ENTRIES
+            )));
+        }
+        for requested in &requested_alternatives {
+            crate::state::validate_domain_name(requested).map_err(|detail| {
+                invalid(format!(
+                    "certificateAlternativeNames entry '{requested}' is not an alternative \
+                     domain of this certificate: {detail}"
+                ))
+            })?;
+        }
+        let alternative_names =
+            crate::state::alternative_domain_names(&domain_name, requested_alternatives);
+        if alternative_names.len()
+            > crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES
+        {
+            return Err(invalid(format!(
+                "certificateAlternativeNames names {} alternative domains, more than the {} a \
+                 certificate may have in addition to its primary domain",
+                alternative_names.len(),
+                crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATE_ALTERNATIVE_NAMES
+            )));
+        }
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The account-wide count is taken before the load balancer is
+            // borrowed mutably: it counts every load balancer's certificates,
+            // this one's included.
+            let held = store.load_balancer_tls_certificate_count();
+            // The load balancer is the resource this operation acts through, and
+            // the one tag-based access control is evaluated against ("supports
+            // tag-based access control via resource tags applied to the resource
+            // identified by load balancer name"), so a name this account holds no
+            // load balancer of in this Region creates nothing.
+            let balancer = store
+                .load_balancer_mut(&region, &load_balancer_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                        &load_balancer_name,
+                    )
+                })?;
+            let location = balancer.location.clone();
+            // A certificate name addresses one of this load balancer's
+            // certificates, so asking for one it already holds is refused rather
+            // than silently replacing the record — which would take the domains
+            // the first request asked for away from a certificate something may
+            // already have attached.
+            if balancer.certificate(&certificate_name).is_some() {
+                return Err(invalid(format!(
+                    "a certificate named '{certificate_name}' is already associated with the \
+                     load balancer '{load_balancer_name}'"
+                )));
+            }
+            if balancer.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER {
+                return Err(invalid(format!(
+                    "the load balancer '{load_balancer_name}' already has the {} certificates \
+                     one Lightsail load balancer may have associated with it at one time",
+                    crate::state::MAX_CERTIFICATES_PER_LOAD_BALANCER
+                )));
+            }
+            if held >= crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES {
+                return Err(invalid(format!(
+                    "this account already has the {} certificates it may have at one time",
+                    crate::state::MAX_LOAD_BALANCER_TLS_CERTIFICATES
+                )));
+            }
+
+            // The certificate exists from here on — the load balancer reports a
+            // summary for it — but it is NOT attached: Lightsail validates it
+            // first and `AttachLoadBalancerTlsCertificate` is what attaches it,
+            // which is why a load balancer that just got a certificate still
+            // serves plain `HTTP` on port 80 alone.
+            balancer
+                .certificates
+                .push(crate::state::StoredLoadBalancerCertificate {
+                    name: certificate_name.clone(),
+                    domain_name,
+                    alternative_names,
+                    is_attached: false,
+                    tags,
+                });
+
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one adds exactly one certificate, so it
+            // answers exactly one entry, logged against the certificate it
+            // created and located where the load balancer that holds it is. The
+            // certificate is on the record as this call returns, so the work the
+            // entry describes is already done and the entry is terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_LOAD_BALANCER_TLS_CERTIFICATE,
+                crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+                &certificate_name,
+                &location,
+                None,
+            );
+            Ok(CreateLoadBalancerTlsCertificateOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateLoadBalancerTlsCertificateError {
+    CreateLoadBalancerTlsCertificateErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name.
+fn not_found(resource_type: &str, name: &str) -> CreateLoadBalancerTlsCertificateError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateLoadBalancerTlsCertificateError {
+    CreateLoadBalancerTlsCertificateErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
