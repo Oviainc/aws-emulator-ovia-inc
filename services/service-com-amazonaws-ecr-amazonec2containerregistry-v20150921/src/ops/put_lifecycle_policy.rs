@@ -2,12 +2,13 @@
 
 //! @op PutLifecyclePolicy
 //! Creates or replaces a repository's lifecycle policy: the document is validated
-//! against the ECR lifecycle policy template, then stored verbatim on the repository, so
-//! `GetLifecyclePolicy` reports exactly the text that was put.
+//! against the ECR lifecycle policy template, then stored as ECR reports it — the same
+//! document with the whitespace between its JSON tokens removed — so
+//! `GetLifecyclePolicy` reports exactly the text this call answers with.
 //!
-//! A caller that only reads the policy back gets exactly this text; nothing here
-//! evaluates the policy or expires an image, so `lastEvaluatedAt` stays absent until
-//! something actually runs it.
+//! Storing a policy is also what evaluates it, so the stored record carries this call's
+//! instant as the policy's `lastEvaluatedAt` — the member `GetLifecyclePolicy` and
+//! `DeleteLifecyclePolicy` report and this operation's own output does not model.
 //!
 //! ## Shape of an operation
 //!
@@ -192,24 +193,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::parse_lifecycle_policy(&input.lifecycle_policy_text)
             .map_err(fault_error)?;
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let repo = store
             .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
 
-        // A put REPLACES the policy, and the text is stored VERBATIM: `GetLifecyclePolicy`
-        // reports "The JSON lifecycle policy text", so re-rendering the parsed document
-        // would make the read differ from the write over nothing but formatting.
-        // `insert` answers the document just written, which is what the response reports.
-        let written = repo
-            .lifecycle_policy
-            .insert(input.lifecycle_policy_text)
-            .clone();
+        // A put REPLACES the policy. What is stored is the document as ECR reports it:
+        // the whitespace between its JSON tokens is removed and nothing else about it is
+        // touched, so the read cannot differ from the write. `insert` answers the record
+        // just written, which is what the response reports. The policy is evaluated by
+        // being set, so the record carries this instant as the one it was last evaluated
+        // at.
+        let written = repo.lifecycle_policy.insert(crate::state::StoredLifecyclePolicy {
+            text: crate::state::normalize_lifecycle_policy(&input.lifecycle_policy_text),
+            last_evaluated_at: now,
+        });
+        let text = written.text.clone();
 
         Ok(PutLifecyclePolicyOutput {
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
-            lifecycle_policy_text: Some(written),
+            lifecycle_policy_text: Some(text),
         })
     }
 }

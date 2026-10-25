@@ -267,12 +267,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetLifecyclePolicyPreviewErrorModeled::LifecyclePolicyPreviewNotFoundException(
                     LifecyclePolicyPreviewNotFoundException {
-                        message: Some(format!(
-                            "There is no dry run for the repository with name '{}' in \
-                             the registry with id '{}'",
-                            repo.name,
-                            crate::state::registry_id()
-                        )),
+                        // The sentence ECR builds from the request, naming the preview,
+                        // the repository that carries none and this registry — the same
+                        // template `LifecyclePolicyNotFoundException` uses. The model's
+                        // own summary of this error ("There is no dry run for this
+                        // repository") is a description of it, not the wording it
+                        // answers with.
+                        message: Some(
+                            crate::state::lifecycle_policy_preview_not_found_message(
+                                &repo.name,
+                            ),
+                        ),
                     },
                 )
                 .into(),

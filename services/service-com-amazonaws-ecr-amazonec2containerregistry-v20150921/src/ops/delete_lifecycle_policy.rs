@@ -204,10 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteLifecyclePolicyOutput {
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
-            lifecycle_policy_text: Some(removed),
-            // See `GetLifecyclePolicy`: no policy has been run, so there is no
-            // evaluation instant to report for the one just removed.
-            last_evaluated_at: None,
+            lifecycle_policy_text: Some(removed.text),
+            // The policy that was just removed carries the instant it was last evaluated
+            // (see `PutLifecyclePolicy`), and this farewell response is the last place a
+            // caller can read it.
+            last_evaluated_at: Some(::aws_smithy_types::DateTime::from(
+                removed.last_evaluated_at,
+            )),
         })
     }
 }
