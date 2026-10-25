@@ -3862,6 +3862,28 @@ impl Bucket {
         IntelligentTieringWrite::Stored
     }
 
+    /// The one S3 Intelligent-Tiering configuration the bucket carries under `id`, or
+    /// `None` when it carries none under that id.
+    ///
+    /// The stored container itself, so what a reader reports is what the put recorded
+    /// rather than a re-derived copy — the reading [`Self::replication`] gives.
+    pub fn intelligent_tiering_configuration(
+        &self,
+        id: &str,
+    ) -> Option<&crate::ops::types::IntelligentTieringConfiguration> {
+        self.intelligent_tiering.get(id)
+    }
+
+    /// Drop the S3 Intelligent-Tiering configuration the bucket carries under `id`,
+    /// reporting whether there was one to drop.
+    ///
+    /// Per-ID, the way [`Self::put_intelligent_tiering_configuration`] records one: every
+    /// other configuration the bucket carries stays exactly as it was, so a bucket whose
+    /// last configuration is removed carries none again.
+    pub fn delete_intelligent_tiering_configuration(&mut self, id: &str) -> bool {
+        self.intelligent_tiering.remove(id).is_some()
+    }
+
     /// The default encryption rules IN FORCE on the bucket: the ones a
     /// `PutBucketEncryption` associated with it, or the single SSE-S3 rule every bucket
     /// carries until one does ([`default_encryption_rule`]).
@@ -5810,6 +5832,59 @@ pub const TOO_MANY_CONFIGURATIONS_MESSAGE: &str =
 /// special-errors list.
 pub const TOO_MANY_CONFIGURATIONS_STATUS: u16 = 400;
 
+/// The code S3 answers a `Tiering` whose `Days` is not a number of days that tier accepts
+/// with: `InvalidAccessTier`, under "HTTP 400 Bad Request".
+///
+/// The range a tiering may name is a property of the ACCESS TIER it names — "the minimum
+/// number of days specified for Archive Access tier must be at least 90 days and Deep
+/// Archive Access tier must be at least 180 days. The maximum can be up to 2 years (730
+/// days)" (`Tiering$Days`) — so a pair outside it is reported against the tier rather than
+/// as a bare bad argument.
+pub const INVALID_ACCESS_TIER_CODE: &str = "InvalidAccessTier";
+
+/// The HTTP status [`INVALID_ACCESS_TIER_CODE`] is rendered with: 400, the status S3 gives
+/// a configuration it cannot apply.
+pub const INVALID_ACCESS_TIER_STATUS: u16 = 400;
+
+/// The code S3 answers a put whose configuration id is not one it can record with:
+/// `InvalidConfigId`, under "HTTP 400 Bad Request".
+///
+/// The id is what identifies the configuration on the bucket, so a refusal about the id
+/// itself — one longer than [`MAX_CONFIGURATION_ID_CHARS`] — is reported against the id
+/// rather than as a bare bad argument.
+pub const INVALID_CONFIG_ID_CODE: &str = "InvalidConfigId";
+
+/// See [`INVALID_CONFIG_ID_CODE`] — the fixed text S3 sends for that condition, which
+/// states the bound rather than repeating the id the request named, so nothing of the
+/// request reaches it.
+///
+/// Its wording is NOT literal at either end, and the enforced bound is the inclusive range
+/// `1..=`[`MAX_CONFIGURATION_ID_CHARS`]: an id of exactly that many characters is recorded,
+/// and the shortest id S3 records is one character. Do not narrow the check to match the
+/// prose.
+pub const INVALID_CONFIG_ID_MESSAGE: &str =
+    "Config Id should be more than 1 character and less than 64 characters in length.";
+
+/// The HTTP status [`INVALID_CONFIG_ID_CODE`] is rendered with: 400, the status S3 gives a
+/// configuration it cannot apply.
+pub const INVALID_CONFIG_ID_STATUS: u16 = 400;
+
+/// The most characters a bucket configuration id may carry.
+///
+/// 64, the limit AWS publishes on the id members themselves: "The ID has a 64 character
+/// limit" (`MetricsConfiguration$Id`), and the same 64 for an S3 Intelligent-Tiering
+/// configuration id. Neither `MetricsId` nor `IntelligentTieringId` is constrained in the
+/// model — `smithy_query(query="shape",shape="IntelligentTieringId")` reports a bare string
+/// — so nothing refuses a longer id before a handler does, and ONE constant serves both
+/// families so the two cannot drift. A put naming a longer id is refused rather than
+/// recorded, so what one bucket's maps key on is bounded whatever a caller does.
+///
+/// The LENGTH is shared; the CODE a refusal carries is each family's own, since AWS answers
+/// an over-long id per family ([`INVALID_CONFIG_ID_CODE`] for an S3 Intelligent-Tiering id,
+/// [`INVALID_ARGUMENT_CODE`] for a metrics id, whose rule also constrains the character
+/// set).
+pub const MAX_CONFIGURATION_ID_CHARS: usize = 64;
+
 /// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
 /// configuration with: "ReplicationConfigurationNotFoundError - There is no replication
 /// configuration for this bucket" (Amazon S3 "Error responses", list of error codes), with
@@ -5838,8 +5913,10 @@ pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// contain letters, numbers, periods, dashes, and underscores" (`MetricsConfiguration$Id`).
 /// The model constrains `MetricsId` no further — `smithy_query(query="shape",
 /// shape="MetricsId")` reports a plain string with no `length` or `pattern` — so nothing
-/// refuses a longer or oddly spelled id before [`is_valid_metrics_id`] does.
-pub const MAX_METRICS_ID_CHARS: usize = 64;
+/// refuses a longer or oddly spelled id before [`is_valid_metrics_id`] does. The length
+/// half is [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares;
+/// the character set is this family's own.
+pub const MAX_METRICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
 
 /// Whether `value` is an id a metrics configuration may be identified by: at most
 /// [`MAX_METRICS_ID_CHARS`] characters, every one of them a letter, a number, a period, a

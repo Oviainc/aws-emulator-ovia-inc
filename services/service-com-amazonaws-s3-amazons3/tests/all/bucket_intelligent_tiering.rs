@@ -27,20 +27,31 @@
 //! * A tiering's `Days` is bounded by what that member documents: "The minimum number of
 //!   days specified for Archive Access tier must be at least 90 days and Deep Archive
 //!   Access tier must be at least 180 days. The maximum can be up to 2 years (730 days)" —
-//!   a value outside the range, a `Status` or an `AccessTier` outside its enum, or a
-//!   payload `Id` that is not the one the request identifies, is refused with
-//!   `InvalidArgument` (HTTP 400) and nothing is recorded.
+//!   a value outside that range answers `InvalidAccessTier` (HTTP 400), since the range is
+//!   the access tier's own, and an `Id` past the published 64-character maximum answers
+//!   `InvalidConfigId` (HTTP 400), while a `Status` or an `AccessTier` outside its enum or
+//!   a payload `Id` that is not the one the request identifies is refused with
+//!   `InvalidArgument` (HTTP 400) — and nothing is recorded in any of those cases.
 //! * A call naming a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404);
 //!   one naming an `ExpectedBucketOwner` that is not the account's answers HTTP 403
 //!   `AccessDenied`.
 //! * The listing is a REPORT: two identical listings of an unchanged bucket answer the
 //!   same thing.
+//! * A configuration is also addressed ON ITS OWN by the id that identifies it:
+//!   `GetBucketIntelligentTieringConfiguration` reports the one container the bucket
+//!   carries under that id — the same entry the listing carries for it — and
+//!   `DeleteBucketIntelligentTieringConfiguration` drops that one alone (HTTP 204, empty
+//!   body), leaving every other configuration the bucket carries in place.
+//! * A per-id call naming a configuration the bucket does not carry — one never put, one
+//!   already deleted, or one only another bucket carries — answers `NoSuchConfiguration`
+//!   (HTTP 404) and changes nothing.
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use service_com_amazonaws_s3_amazons3::state::{
-    INVALID_ARGUMENT_CODE, MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET,
-    NO_SUCH_BUCKET_CODE,
+    INVALID_ACCESS_TIER_CODE, INVALID_ARGUMENT_CODE, INVALID_CONFIG_ID_CODE,
+    MAX_CONFIGURATION_ID_CHARS, MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET,
+    NO_SUCH_BUCKET_CODE, NO_SUCH_CONFIGURATION_CODE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -465,6 +476,12 @@ fn round_trip_rows() -> Vec<(&'static str, ConfigurationRow)> {
                 .with_filter(FilterRow::and(None, &[("retain", "long")]))
                 .with_status("Disabled"),
         ),
+        (
+            // The published id ceiling itself: the longest id S3 records, which must round
+            // trip like any other.
+            "an id exactly as long as the published maximum",
+            ConfigurationRow::enabled(&"i".repeat(MAX_CONFIGURATION_ID_CHARS)),
+        ),
     ]
 }
 
@@ -702,25 +719,29 @@ async fn the_listing_pages_over_the_configurations() {
 /// the error code the refusal must answer with — `None` where the value is refused at the
 /// request boundary against the model (an enum member outside its value set), whose code is
 /// the framework's own, so the row pins the 400 and that nothing was recorded.
-type RefusalRow<'a> = (&'a str, &'a str, String, Option<&'static str>);
+type RefusalRow<'a> = (&'a str, String, String, Option<&'static str>);
 
 /// The puts that must be refused, spanning the rule each refusal states: the payload id
-/// must be the one the request identifies, `Status` and `AccessTier` must name a value of
-/// their enum, and `Days` must sit inside the range its documentation publishes — one row
-/// just below each tier's floor and one just past the maximum.
+/// must be the one the request identifies and no longer than the published maximum,
+/// `Status` and `AccessTier` must name a value of their enum, and `Days` must sit inside
+/// the range the access tier it names publishes — one row just below each tier's floor and
+/// one just past the maximum.
 fn refusal_rows() -> Vec<RefusalRow<'static>> {
     let (archive, archive_floor) = ACCESS_TIER_FLOORS[0];
     let (deep, deep_floor) = ACCESS_TIER_FLOORS[1];
+    // One character past the published id ceiling, with the payload's own `Id` the same, so
+    // the row is refused on the LENGTH rather than on the two ids disagreeing.
+    let over_long = "i".repeat(MAX_CONFIGURATION_ID_CHARS + 1);
     vec![
         (
             "a payload naming another id",
-            "wanted",
+            "wanted".to_string(),
             ConfigurationRow::enabled("other").xml(),
             Some(INVALID_ARGUMENT_CODE),
         ),
         (
             "a status outside the enum",
-            "bad-status",
+            "bad-status".to_string(),
             ConfigurationRow::enabled("bad-status")
                 .with_status("Paused")
                 .xml(),
@@ -728,7 +749,7 @@ fn refusal_rows() -> Vec<RefusalRow<'static>> {
         ),
         (
             "an access tier outside the enum",
-            "bad-tier",
+            "bad-tier".to_string(),
             ConfigurationRow::enabled("bad-tier")
                 .with_tierings(vec![TieringRow::new(200, "FROZEN_ACCESS")])
                 .xml(),
@@ -736,27 +757,33 @@ fn refusal_rows() -> Vec<RefusalRow<'static>> {
         ),
         (
             "archive access one day below its floor",
-            "archive-too-soon",
+            "archive-too-soon".to_string(),
             ConfigurationRow::enabled("archive-too-soon")
                 .with_tierings(vec![TieringRow::new(archive_floor - 1, archive)])
                 .xml(),
-            Some(INVALID_ARGUMENT_CODE),
+            Some(INVALID_ACCESS_TIER_CODE),
         ),
         (
             "deep archive access one day below its floor",
-            "deep-too-soon",
+            "deep-too-soon".to_string(),
             ConfigurationRow::enabled("deep-too-soon")
                 .with_tierings(vec![TieringRow::new(deep_floor - 1, deep)])
                 .xml(),
-            Some(INVALID_ARGUMENT_CODE),
+            Some(INVALID_ACCESS_TIER_CODE),
         ),
         (
             "one day past the published maximum",
-            "too-late",
+            "too-late".to_string(),
             ConfigurationRow::enabled("too-late")
                 .with_tierings(vec![TieringRow::new(MAX_DAYS + 1, deep)])
                 .xml(),
-            Some(INVALID_ARGUMENT_CODE),
+            Some(INVALID_ACCESS_TIER_CODE),
+        ),
+        (
+            "an id one character past the published maximum",
+            over_long.clone(),
+            ConfigurationRow::enabled(&over_long).xml(),
+            Some(INVALID_CONFIG_ID_CODE),
         ),
     ]
 }
@@ -780,7 +807,7 @@ async fn a_configuration_outside_its_published_bounds_is_refused() {
     );
 
     for (case, id, payload, code) in refusal_rows() {
-        let refused = put_payload(&router, name, id, &payload, &[]).await;
+        let refused = put_payload(&router, name, &id, &payload, &[]).await;
         assert_eq!(
             refused.status,
             400,
@@ -891,4 +918,594 @@ async fn the_per_bucket_ceiling_is_the_published_one() {
         MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET, 1_000,
         "a bucket may carry up to 1,000 S3 Intelligent-Tiering configurations, got {MAX_INTELLIGENT_TIERING_CONFIGURATIONS_PER_BUCKET}"
     );
+    // The published id ceiling, likewise: an S3 Intelligent-Tiering configuration id is up
+    // to 64 characters long.
+    assert_eq!(
+        MAX_CONFIGURATION_ID_CHARS, 64,
+        "a configuration id may carry up to 64 characters, got {MAX_CONFIGURATION_ID_CHARS}"
+    );
+}
+
+/// The text S3 sends with `InvalidConfigId`, written out here rather than read from the
+/// crate so that a change to the handler's wording fails this suite — the way the
+/// subresource-message suite beside this one pins its published texts.
+const PUBLISHED_INVALID_CONFIG_ID_MESSAGE: &str =
+    "Config Id should be more than 1 character and less than 64 characters in length.";
+
+/// The published id-length bound, tested at each end and one past it.
+///
+/// The bound's wording — "Config Id should be more than 1 character and less than 64
+/// characters in length." — is not literal at either end: a 64-character id IS recorded, so
+/// `64` is the inclusive maximum, and by the same reading a one-character id is inside the
+/// bound while an empty one is not.
+#[tokio::test]
+async fn an_id_outside_the_published_length_bound_is_refused() {
+    let router = router();
+    let name = "itc-id-length";
+    bucket(&router, name).await;
+
+    // Inside the bound at each end: the shortest id and the longest one.
+    for (case, length) in [
+        ("the shortest id inside the bound", 1usize),
+        (
+            "an id exactly at the published maximum",
+            MAX_CONFIGURATION_ID_CHARS,
+        ),
+    ] {
+        let id = "i".repeat(length);
+        let configuration = ConfigurationRow::enabled(&id);
+        let put = put_configuration(&router, name, &id, &configuration).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {case:?}: expected the put to answer 200, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+        let read = reported_configuration(&get_configuration(&router, name, &id, &[]).await);
+        assert_eq!(
+            read, configuration,
+            "case {case:?}: the configuration must read back, got {read:?}"
+        );
+        let deleted = delete_configuration(&router, name, &id, &[]).await;
+        assert_eq!(
+            deleted.status,
+            204,
+            "case {case:?}: expected the delete to answer 204, got {} ({})",
+            deleted.status,
+            body_of(&deleted)
+        );
+    }
+
+    // One past each end: nothing is recorded, and the refusal carries the fixed wording
+    // published for the code, which names neither the id nor the bucket.
+    for (case, length) in [
+        ("an empty id", 0usize),
+        (
+            "an id one character past the published maximum",
+            MAX_CONFIGURATION_ID_CHARS + 1,
+        ),
+    ] {
+        let id = "i".repeat(length);
+        let refused = put_payload(
+            &router,
+            name,
+            &id,
+            &ConfigurationRow::enabled(&id).xml(),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: expected 400, got {} ({})",
+            refused.status,
+            body_of(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            INVALID_CONFIG_ID_CODE,
+            "case {case:?}: expected {INVALID_CONFIG_ID_CODE}, got {}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            PUBLISHED_INVALID_CONFIG_ID_MESSAGE,
+            "case {case:?}: expected {PUBLISHED_INVALID_CONFIG_ID_MESSAGE:?}, got {:?}",
+            refused.error_message()
+        );
+
+        let after = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+        assert!(
+            after.is_empty(),
+            "case {case:?}: a refused put records nothing, got {after:?}"
+        );
+    }
+}
+
+/// One out-of-range tiering: the access tier it names, the days it asks for and the bound
+/// the refusal must state.
+struct DayBoundRow {
+    case: &'static str,
+    access_tier: &'static str,
+    days: i32,
+    bound: String,
+}
+
+#[tokio::test]
+async fn a_tiering_outside_its_tiers_day_range_states_the_bound_it_missed() {
+    let router = router();
+    let name = "itc-day-bounds";
+    bucket(&router, name).await;
+
+    // Both tiers, both ends: the floor is the tier's own (90 days for one, 180 for the
+    // other) and the maximum is the same for either, so the refusal names the tier it was
+    // asked for and the bound that tier publishes.
+    let mut rows: Vec<DayBoundRow> = Vec::new();
+    for (access_tier, floor) in ACCESS_TIER_FLOORS {
+        rows.push(DayBoundRow {
+            case: "one day below the tier's floor",
+            access_tier,
+            days: floor - 1,
+            bound: format!("should not be less than {floor}"),
+        });
+        rows.push(DayBoundRow {
+            case: "one day past the published maximum",
+            access_tier,
+            days: MAX_DAYS + 1,
+            bound: format!("should not be more than {MAX_DAYS}"),
+        });
+    }
+
+    for row in &rows {
+        let DayBoundRow {
+            case,
+            access_tier,
+            days,
+            bound,
+        } = row;
+        let id = format!("day-bound-{access_tier}-{days}");
+        let configuration = ConfigurationRow::enabled(&id)
+            .with_tierings(vec![TieringRow::new(*days, access_tier)]);
+        let refused = put_configuration(&router, name, &id, &configuration).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?} on {access_tier}: expected 400, got {} ({})",
+            refused.status,
+            body_of(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            INVALID_ACCESS_TIER_CODE,
+            "case {case:?} on {access_tier}: expected {INVALID_ACCESS_TIER_CODE}, got {}",
+            refused.error_code()
+        );
+        let expected = format!("Days specified in {access_tier} tier {bound}.");
+        assert_eq!(
+            refused.error_message(),
+            expected,
+            "case {case:?} on {access_tier}: expected {expected:?}, got {:?}",
+            refused.error_message()
+        );
+
+        // A refused put records nothing.
+        let after = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+        assert!(
+            after.is_empty(),
+            "case {case:?} on {access_tier}: a refused put records nothing, got {after:?}"
+        );
+    }
+}
+
+/// `GET /<bucket>?intelligent-tiering&id=<id>` —
+/// `GetBucketIntelligentTieringConfiguration`, which addresses ONE configuration by its own
+/// id rather than the bucket's whole set.
+async fn get_configuration(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    id: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    send(
+        router,
+        "GET",
+        &format!("/{bucket}?intelligent-tiering&id={id}"),
+        headers,
+        "",
+    )
+    .await
+}
+
+/// `DELETE /<bucket>?intelligent-tiering&id=<id>` —
+/// `DeleteBucketIntelligentTieringConfiguration`, likewise per-id.
+async fn delete_configuration(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    id: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    send(
+        router,
+        "DELETE",
+        &format!("/{bucket}?intelligent-tiering&id={id}"),
+        headers,
+        "",
+    )
+    .await
+}
+
+/// The single configuration a per-id read reports.
+///
+/// `GetBucketIntelligentTieringConfigurationOutput$IntelligentTieringConfiguration` is the
+/// `@httpPayload`, so the body IS one `<IntelligentTieringConfiguration>` container — read
+/// with the same parser the listing is read with, so what is compared is the container, not
+/// the envelope it arrived in.
+fn reported_configuration(answer: &Answer) -> ConfigurationRow {
+    let reported = reported_configurations(answer);
+    assert_eq!(
+        reported.len(),
+        1,
+        "a per-id read reports exactly one configuration, got {reported:?} from {:?}",
+        body_of(answer)
+    );
+    reported.into_iter().next().expect("one configuration")
+}
+
+#[tokio::test]
+async fn each_configuration_is_read_back_under_its_own_id() {
+    let router = router();
+    let name = "itc-per-id-read";
+    bucket(&router, name).await;
+
+    // Every row of the round-trip table on ONE bucket, so each per-id read is seen to
+    // address its own configuration while the others are carried alongside it.
+    let rows = round_trip_rows();
+    for (case, configuration) in &rows {
+        let put = put_configuration(&router, name, &configuration.id, configuration).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {case:?}: expected the put to answer 200, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+    }
+
+    // The listing is the other reader: a per-id read must report exactly the entry the
+    // listing carries for that id, member for member.
+    let listed = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+    assert_eq!(
+        listed.len(),
+        rows.len(),
+        "the bucket must carry every configuration that was put, got {listed:?}"
+    );
+
+    for (case, configuration) in &rows {
+        let read = get_configuration(&router, name, &configuration.id, &[]).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: expected the per-id read to answer 200, got {} ({})",
+            read.status,
+            body_of(&read)
+        );
+        let reported = reported_configuration(&read);
+        assert_eq!(
+            &reported, configuration,
+            "case {case:?}: expected the configuration that was put, got {reported:?}"
+        );
+        let from_listing = listed
+            .iter()
+            .find(|entry| entry.id == configuration.id)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the listing must carry an entry for this id, got {listed:?}")
+            });
+        assert_eq!(
+            &reported, from_listing,
+            "case {case:?}: the per-id read and the listing entry must agree, got \
+             {reported:?} and {from_listing:?}"
+        );
+
+        // A read is a REPORT: reading again answers the same thing, and the bucket still
+        // carries every configuration it did.
+        let again = reported_configuration(&get_configuration(&router, name, &configuration.id, &[]).await);
+        assert_eq!(
+            again, reported,
+            "case {case:?}: a second read must report the same configuration, got {again:?}"
+        );
+    }
+
+    let after = reported_configurations(&list_configurations(&router, name, None, &[]).await);
+    assert_eq!(
+        after, listed,
+        "the per-id reads must leave the bucket's configurations as they were, got {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_configuration_removes_that_one_alone() {
+    let router = router();
+    let name = "itc-per-id-delete";
+    bucket(&router, name).await;
+
+    let rows = round_trip_rows();
+    for (case, configuration) in &rows {
+        let put = put_configuration(&router, name, &configuration.id, configuration).await;
+        assert_eq!(
+            put.status,
+            200,
+            "case {case:?}: expected the put to answer 200, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+    }
+
+    // Delete them one at a time, each one a different FORM of configuration, so what is
+    // pinned is "the id this request names, and only that one" rather than one shape of
+    // payload.
+    let mut remaining: Vec<ConfigurationRow> =
+        rows.iter().map(|(_, row)| row.clone()).collect();
+    remaining.sort_by(|left, right| left.id.cmp(&right.id));
+
+    for (case, configuration) in &rows {
+        let deleted = delete_configuration(&router, name, &configuration.id, &[]).await;
+        assert_eq!(
+            deleted.status,
+            204,
+            "case {case:?}: expected the delete to answer 204, got {} ({})",
+            deleted.status,
+            body_of(&deleted)
+        );
+        assert!(
+            deleted.body.is_empty(),
+            "case {case:?}: a successful delete carries no body, got {:?}",
+            body_of(&deleted)
+        );
+
+        remaining.retain(|row| row.id != configuration.id);
+
+        // The deleted id is gone from both readers; every other configuration is untouched.
+        let read = get_configuration(&router, name, &configuration.id, &[]).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case:?}: a deleted configuration is no longer there, got {} ({})",
+            read.status,
+            body_of(&read)
+        );
+        assert_eq!(
+            read.error_code(),
+            NO_SUCH_CONFIGURATION_CODE,
+            "case {case:?}: expected {NO_SUCH_CONFIGURATION_CODE}, got {}",
+            read.error_code()
+        );
+
+        let listing = list_configurations(&router, name, None, &[]).await;
+        let reported = reported_configurations(&listing);
+        assert_eq!(
+            reported, remaining,
+            "case {case:?}: expected the configurations that were not deleted, got {reported:?}"
+        );
+
+        if remaining.is_empty() {
+            // Nothing left: the listing reports no configuration container at all, rather
+            // than an entry for one the bucket no longer carries.
+            assert!(
+                !body_of(&listing).contains("<IntelligentTieringConfiguration"),
+                "case {case:?}: a bucket carrying none reports no configuration container, \
+                 got {:?}",
+                body_of(&listing)
+            );
+        }
+
+        // A delete is not idempotent on the wire: the second one has nothing to delete.
+        let repeated = delete_configuration(&router, name, &configuration.id, &[]).await;
+        assert_eq!(
+            repeated.status,
+            404,
+            "case {case:?}: a repeated delete has nothing to delete, got {} ({})",
+            repeated.status,
+            body_of(&repeated)
+        );
+        assert_eq!(
+            repeated.error_code(),
+            NO_SUCH_CONFIGURATION_CODE,
+            "case {case:?}: expected {NO_SUCH_CONFIGURATION_CODE}, got {}",
+            repeated.error_code()
+        );
+    }
+
+    // And the bucket takes a configuration again afterwards, so the deletes left it usable.
+    let fresh = ConfigurationRow::enabled("after-the-deletes");
+    let put = put_configuration(&router, name, &fresh.id, &fresh).await;
+    assert_eq!(
+        put.status,
+        200,
+        "a bucket whose configurations were all deleted still takes one, got {} ({})",
+        put.status,
+        body_of(&put)
+    );
+    let read = reported_configuration(&get_configuration(&router, name, &fresh.id, &[]).await);
+    assert_eq!(
+        read, fresh,
+        "the configuration put after the deletes must read back, got {read:?}"
+    );
+}
+
+/// Which per-id operation a refusal row drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerIdOperation {
+    Read,
+    Delete,
+}
+
+/// One per-id request that must be refused, and the status and wire code it must answer.
+struct PerIdRefusal<'a> {
+    case: &'a str,
+    /// Carried as data rather than inferred from [`Self::case`], so renaming a case cannot
+    /// change which operation the row exercises.
+    operation: PerIdOperation,
+    bucket: &'a str,
+    id: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+    status: u16,
+    code: &'a str,
+}
+
+#[tokio::test]
+async fn a_per_id_call_naming_nothing_the_bucket_carries_is_refused() {
+    let router = router();
+    let name = "itc-per-id-refusals";
+    bucket(&router, name).await;
+    // A second bucket carrying its OWN configuration, so an id is seen to be scoped to the
+    // bucket that carries it.
+    let neighbour = "itc-per-id-neighbour";
+    bucket(&router, neighbour).await;
+
+    let held = ConfigurationRow::enabled("held");
+    for on in [name, neighbour] {
+        let put = put_configuration(&router, on, &held.id, &held).await;
+        assert_eq!(
+            put.status,
+            200,
+            "the held configuration must be recorded on {on:?}, got {} ({})",
+            put.status,
+            body_of(&put)
+        );
+    }
+    let only_on_the_neighbour = ConfigurationRow::enabled("neighbour-only");
+    let put = put_configuration(
+        &router,
+        neighbour,
+        &only_on_the_neighbour.id,
+        &only_on_the_neighbour,
+    )
+    .await;
+    assert_eq!(
+        put.status,
+        200,
+        "the neighbour's own configuration must be recorded, got {} ({})",
+        put.status,
+        body_of(&put)
+    );
+
+    // An expected owner that is not this account's.
+    let other_account: &[(&str, &str)] = &[("x-amz-expected-bucket-owner", "209876543210")];
+    let none: &[(&str, &str)] = &[];
+
+    // The conditions differ along WHICH one refuses the call: an id the bucket never
+    // carried, an id only another bucket carries, a bucket this emulator does not hold, and
+    // an owner that is not the account's — each driven through the read AND the delete.
+    let conditions = [
+        (
+            "an id the bucket never carried",
+            name,
+            "never-put",
+            none,
+            404,
+            NO_SUCH_CONFIGURATION_CODE,
+        ),
+        (
+            "an id only another bucket carries",
+            name,
+            only_on_the_neighbour.id.as_str(),
+            none,
+            404,
+            NO_SUCH_CONFIGURATION_CODE,
+        ),
+        (
+            "a bucket this emulator does not hold",
+            "itc-per-id-no-such-bucket",
+            held.id.as_str(),
+            none,
+            404,
+            NO_SUCH_BUCKET_CODE,
+        ),
+        (
+            "an owner that is not the account's",
+            name,
+            held.id.as_str(),
+            other_account,
+            403,
+            "AccessDenied",
+        ),
+    ];
+    let mut rows: Vec<PerIdRefusal> = Vec::new();
+    for (case, on, id, headers, status, code) in conditions {
+        for operation in [PerIdOperation::Read, PerIdOperation::Delete] {
+            rows.push(PerIdRefusal {
+                case,
+                operation,
+                bucket: on,
+                id,
+                headers,
+                status,
+                code,
+            });
+        }
+    }
+
+    for row in &rows {
+        let PerIdRefusal {
+            case,
+            operation,
+            bucket: on,
+            id,
+            headers,
+            status,
+            code,
+        } = row;
+        let answer = match operation {
+            PerIdOperation::Read => get_configuration(&router, on, id, headers).await,
+            PerIdOperation::Delete => delete_configuration(&router, on, id, headers).await,
+        };
+        assert_eq!(
+            answer.status, *status,
+            "case {case:?} via {operation:?}: expected HTTP {status}, got {} ({})",
+            answer.status,
+            body_of(&answer)
+        );
+        assert_eq!(
+            answer.error_code(),
+            *code,
+            "case {case:?} via {operation:?}: expected {code}, got {}",
+            answer.error_code()
+        );
+        // The wording is a constant for the condition: nothing the request named reaches
+        // it.
+        for fragment in [*on, *id] {
+            assert!(
+                !answer.error_message().contains(fragment),
+                "case {case:?} via {operation:?}: the message must carry nothing from the \
+                 request, but {fragment:?} is in {:?}",
+                answer.error_message()
+            );
+        }
+
+        // A refused call deletes nothing and reports nothing: both buckets still carry
+        // exactly what they did.
+        let still_held = get_configuration(&router, name, &held.id, &[]).await;
+        assert_eq!(
+            still_held.status,
+            200,
+            "case {case:?} via {operation:?}: a refused call must leave the held \
+             configuration, got {} ({})",
+            still_held.status,
+            body_of(&still_held)
+        );
+        assert_eq!(
+            reported_configuration(&still_held),
+            held,
+            "case {case:?} via {operation:?}: the held configuration must be unchanged"
+        );
+        let neighbours =
+            reported_configurations(&list_configurations(&router, neighbour, None, &[]).await);
+        assert_eq!(
+            neighbours.len(),
+            2,
+            "case {case:?} via {operation:?}: the neighbouring bucket must keep both its \
+             configurations, got {neighbours:?}"
+        );
+    }
 }
