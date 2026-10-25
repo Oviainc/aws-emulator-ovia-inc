@@ -2434,6 +2434,44 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         format!("approver-{}", self.next_approver_seq)
     }
 
+    /// The approver set a requested configuration produces: an approver `requested` names
+    /// that `existing` already holds — the same identity from the same identity source —
+    /// keeps its stored record, and therefore its id and its invitation response, while
+    /// one the request adds is newly invited under a fresh id.
+    ///
+    /// Minting an id advances this store's approver sequence, so building a set is a WRITE
+    /// to the store and not a local computation: this is the one place either write path
+    /// that builds an approver set calls, and a handler calls it only once every refusal
+    /// the request can earn has been decided.
+    pub fn invite_requested_approvers<'a, I>(
+        &mut self,
+        requested: I,
+        existing: &[Approver],
+        now: SystemTime,
+    ) -> Vec<Approver>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        requested
+            .into_iter()
+            .map(|(identity_id, source_arn)| {
+                let retained = existing.iter().find(|stored| {
+                    stored.primary_identity_id == identity_id
+                        && stored.primary_identity_source_arn == source_arn
+                });
+                match retained {
+                    Some(stored) => stored.clone(),
+                    None => Approver::invited(
+                        self.mint_approver_id(),
+                        identity_id.to_string(),
+                        source_arn.to_string(),
+                        now,
+                    ),
+                }
+            })
+            .collect()
+    }
+
     /// The stored session with this ARN.
     #[must_use]
     pub fn session(&self, arn: &str) -> Option<&Session> {
@@ -2491,6 +2529,30 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     pub fn next_session_seq(&mut self) -> u64 {
         self.next_session_seq += 1;
         self.next_session_seq
+    }
+
+    /// Record a NEW session for `team` and answer its ARN — the one path every operation
+    /// of this service that starts a session goes through.
+    ///
+    /// The initiation-order sequence number the session's ARN carries is consumed by a
+    /// session that is really stored and by nothing else: when the session cannot be built
+    /// ([`Session::for_team`] answers `None` because `now` names no instant its expiration
+    /// could be recorded at) nothing is written, so the refusal the calling operation
+    /// answers with leaves the store — and the next session's ARN — exactly as they were.
+    pub fn start_session(
+        &mut self,
+        kind: SessionKind,
+        team: &ApprovalTeam,
+        approvers: Vec<SessionApprover>,
+        requester_region: String,
+        now: SystemTime,
+    ) -> Option<String> {
+        let seq = self.next_session_seq + 1;
+        let session = Session::for_team(kind, team, approvers, requester_region, now, seq)?;
+        let arn = session.arn.clone();
+        self.next_session_seq = seq;
+        self.insert_session(session);
+        Some(arn)
     }
 }
 

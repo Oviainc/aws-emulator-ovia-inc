@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteCommand
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteCommand`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Runs a command remotely on a container within a task.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteCommand::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this operation can answer here is decided by what a task of this emulator IS: a
+//! record of a placement, with no container process behind it and so no managed
+//! execute-command agent to open a session on. The refusals below are therefore the whole
+//! of its behaviour, and each is computed from the stored cluster, task and containers:
+//! the cluster the request names, the task in it, the container of that task, and finally
+//! the agent that is not running. A `session` is an SSM Session Manager stream, so
+//! answering one would mean handing the caller a `streamUrl` nothing serves.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +177,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteCommand` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteCommandErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteCommand"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ExecuteCommandErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(ExecuteCommandErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The Amazon Resource Name (ARN) or ID of the task the container is part of",
+        // scoped by the cluster the request named: a task of another cluster is not one
+        // this request names.
+        let task_arn = crate::state::task_arn_from_reference(&region, &cluster_name, &input.task);
+        let task = guard
+            .tasks
+            .get(&task_arn)
+            .filter(|task| task.cluster_name == cluster_name);
+        let Some(task) = task else {
+            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "A container name only needs to be specified for tasks containing multiple
+        // containers": a request that names none runs on the task's only container, and
+        // one that names a container has to name a container the task really holds.
+        let names_a_container = match input.container.as_deref() {
+            Some(requested) => task
+                .containers
+                .iter()
+                .any(|container| container.name.as_deref() == Some(requested)),
+            None => !task.containers.is_empty(),
+        };
+        if !names_a_container {
+            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The session itself needs the task's own execute-command agent, which runs
+        // INSIDE the container. A task here is a record of a placement and runs no
+        // container, so that agent is never running — the same condition a task run
+        // without `enableExecuteCommand` meets, and the one this refusal states.
+        Err(ExecuteCommandErrorModeled::InvalidParameterException(
+            InvalidParameterException {
+                message: Some(
+                    crate::state::EXECUTE_COMMAND_AGENT_NOT_RUNNING_MESSAGE.to_string(),
+                ),
+            },
+        )
+        .into())
     }
 }

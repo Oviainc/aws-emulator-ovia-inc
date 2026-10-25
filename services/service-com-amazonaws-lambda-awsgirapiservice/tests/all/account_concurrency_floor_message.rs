@@ -34,7 +34,7 @@ use crate::function_concurrency::{
 };
 
 /// The `Message` of a wire error, under either casing the JSON envelopes use.
-fn message(answer: &Answer) -> String {
+pub(crate) fn message(answer: &Answer) -> String {
     let body: Value = serde_json::from_slice(&answer.body).unwrap_or_else(|error| {
         panic!("expected a JSON error body, got {error}: {}", answer.text())
     });

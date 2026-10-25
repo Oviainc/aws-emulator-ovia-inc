@@ -44,7 +44,7 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 
 /// `PublishVersion` (`POST /2015-03-31/functions/{FunctionName}/versions`), once per
 /// version the row needs.
-async fn publish_version(router: &MultiServiceRouter, function: &str, ordinal: u32) {
+pub(crate) async fn publish_version(router: &MultiServiceRouter, function: &str, ordinal: u32) {
     let answer = call(
         router,
         "POST",
@@ -62,7 +62,12 @@ async fn publish_version(router: &MultiServiceRouter, function: &str, ordinal: u
 }
 
 /// `CreateAlias` (`POST /2015-03-31/functions/{FunctionName}/aliases`).
-async fn create_alias(router: &MultiServiceRouter, function: &str, name: &str, version: &str) {
+pub(crate) async fn create_alias(
+    router: &MultiServiceRouter,
+    function: &str,
+    name: &str,
+    version: &str,
+) {
     let answer = call(
         router,
         "POST",
@@ -81,7 +86,7 @@ async fn create_alias(router: &MultiServiceRouter, function: &str, name: &str, v
 
 /// `PutProvisionedConcurrencyConfig`
 /// (`PUT /2019-09-30/functions/{FunctionName}/provisioned-concurrency?Qualifier=`).
-async fn put_provisioned(
+pub(crate) async fn put_provisioned(
     router: &MultiServiceRouter,
     function: &str,
     qualifier: &str,
@@ -99,7 +104,11 @@ async fn put_provisioned(
 }
 
 /// `GetProvisionedConcurrencyConfig` (`GET` of the same resource).
-async fn get_provisioned(router: &MultiServiceRouter, function: &str, qualifier: &str) -> Answer {
+pub(crate) async fn get_provisioned(
+    router: &MultiServiceRouter,
+    function: &str,
+    qualifier: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -142,7 +151,7 @@ async fn delete_reservation(router: &MultiServiceRouter, function: &str) -> Answ
 /// Move every stored function's activation instant into the past, so the next read
 /// materialises the `Pending` -> `Active` transition the clock owes: a function is not
 /// modifiable until it is active. This is what waiting would do, without waiting.
-fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn make_activation_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
     let past = SystemTime::now() - Duration::from_secs(1);

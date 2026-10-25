@@ -343,7 +343,7 @@ fn refusal_rows() -> Vec<RefusalRow> {
             code: "InvalidInputException",
         },
         RefusalRow {
-            case: "a CatalogId no Data Catalog in this account answers to",
+            case: "a CatalogId of another account, which no resource policy grants",
             request: json!({
                 "CatalogId": "210987654321",
                 "Name": "standing",
@@ -353,7 +353,7 @@ fn refusal_rows() -> Vec<RefusalRow> {
                     "ConnectionProperties": { "JDBC_CONNECTION_URL": "jdbc:mysql://elsewhere" },
                 },
             }),
-            code: "InvalidInputException",
+            code: "AccessDeniedException",
         },
     ]
 }

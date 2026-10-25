@@ -539,6 +539,121 @@ pub fn job_not_found_message(job_arn: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The sampling call, once
+// ---------------------------------------------------------------------------
+
+/// How a sampling call whose `Body` carries no inference request is reported.
+///
+/// `Body` is `@required` and `@httpPayload`, so a request without one is already
+/// refused at the boundary; a request WITH an empty payload gets this far and
+/// carries no inference request to capture.
+pub const EMPTY_BODY_MESSAGE: &str = "Body must carry the inference request payload; it was empty.";
+
+/// Why a sampling call was not served, in the only terms the two sampling
+/// operations differ on when they report it: whether a quota was reached, and
+/// the sentence to report.
+///
+/// Each operation renders this as one of its OWN modelled errors — a quota as
+/// its `ServiceQuotaExceededException`, anything else as its
+/// `ValidationException` — so the decision lives here and only the error enum
+/// is named at the handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingRefusal {
+    message: String,
+    quota: bool,
+}
+
+impl SamplingRefusal {
+    /// A refusal of the request itself, or of what it conflicts with.
+    fn invalid(message: String) -> Self {
+        Self {
+            message,
+            quota: false,
+        }
+    }
+
+    /// A refusal because a bound was reached.
+    fn quota(message: String) -> Self {
+        Self {
+            message,
+            quota: true,
+        }
+    }
+
+    /// Whether a quota was reached, rather than the request being invalid or
+    /// conflicting with the trajectory's state.
+    #[must_use]
+    pub const fn is_quota(&self) -> bool {
+        self.quota
+    }
+
+    /// The sentence this refusal is reported with, consuming the refusal.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        self.message
+    }
+}
+
+/// Serve one sampling call: the pre-flight and the capture that `Sample` and
+/// `SampleWithResponseStream` share, answering what was served or why it was
+/// refused.
+///
+/// The two operations reach the SAME state through this, so one trajectory can
+/// mix turns served by either of them and neither can drift from the other on
+/// which calls are refused, in which order, or with which sentence. What is
+/// left to each of them is what genuinely differs: the response body it renders
+/// (`respond`), the `Content-Type` that body carries, the `streamed` flag the
+/// captured turn records, and the modelled error enum it reports a
+/// [`SamplingRefusal`] through.
+///
+/// In order: a request carrying no inference request payload is refused; then
+/// the `JobArn` is resolved, because it names the job the turn belongs to,
+/// created in the SageMaker control plane — this service's model binds no
+/// operation that creates, lists or deletes one, so the job is resolved against
+/// the directory that control plane writes ([`job_exists`]). The member's
+/// modelled constraints (`@length` 1..256 and the ARN `@pattern`) are already
+/// enforced by the time a handler runs, and they admit any partition, region,
+/// account and job name: an ARN no create ever minted is well formed and still
+/// names no job, so the request cannot be routed to a model session and is
+/// refused rather than served an inference. Only then is the turn captured, with
+/// [`ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState::append_turn`]
+/// refusing it — writing nothing — on the trajectory's own state and the
+/// emulator's bounds.
+pub fn serve_sampling_turn<Eng, F>(
+    engine: &Eng,
+    state: &::engine::ServiceState<ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState>,
+    request: &TurnRequest<'_>,
+    respond: F,
+) -> Result<ServedTurn, SamplingRefusal>
+where
+    Eng: Send + Sync + 'static,
+    F: FnOnce(usize) -> (Vec<u8>, String),
+{
+    if request.request_body.is_empty() {
+        return Err(SamplingRefusal::invalid(EMPTY_BODY_MESSAGE.to_string()));
+    }
+    if !job_exists(engine, request.job_arn) {
+        return Err(SamplingRefusal::invalid(job_not_found_message(
+            request.job_arn,
+        )));
+    }
+    state
+        .lock()
+        .append_turn(request, respond)
+        .map_err(|refusal| {
+            let message = refusal.message(request.trajectory_id);
+            if refusal.is_quota() {
+                SamplingRefusal::quota(message)
+            } else {
+                // Neither sampling operation models a `ConflictException`, so a
+                // request that conflicts with the trajectory's sealed state is
+                // refused with the client error they do model.
+                SamplingRefusal::invalid(message)
+            }
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Inference bodies
 // ---------------------------------------------------------------------------
 

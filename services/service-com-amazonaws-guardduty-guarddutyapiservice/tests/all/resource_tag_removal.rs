@@ -24,6 +24,11 @@
 //!    partition's, another Region's, an id nothing minted, a resource type GuardDuty
 //!    does not tag — is refused with HTTP 400 under the `InvalidInputException`
 //!    class, which names the member and never echoes the ARN, and persists nothing.
+//!
+//! The fixture that creates one resource of every class a tag ARN can name, and the
+//! ARN/read-URI helpers around it, are `pub(crate)` so the `resource_tag_addition`
+//! suite drives `TagResource` against the SAME set of resources: the two operations
+//! must agree about which ARNs resolve and where each resource's tags live.
 
 use serde_json::{json, Value};
 
@@ -70,7 +75,7 @@ fn base_tags() -> Value {
     tag_map(&BASE_TAGS)
 }
 
-fn tag_map(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(&str, &str)]) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
         map.insert((*key).to_string(), json!(value));
@@ -92,14 +97,14 @@ fn remaining_after(removed: &[&str]) -> Value {
 /// The ARN of the resource at `path`, built exactly as this emulator builds every
 /// ARN it reports (`engine::emulator_arn`), so a test ARN cannot drift from the one
 /// the service resolves.
-fn arn_of(region: &str, path: &str) -> String {
+pub(crate) fn arn_of(region: &str, path: &str) -> String {
     engine::emulator_arn(ARN_SERVICE, region, path)
 }
 
 /// A `ResourceArn` as the wire carries it. `/tags/{ResourceArn}` binds a
 /// NON-GREEDY URI label (`smithy_query(operation="UntagResource")`), so the ARN
 /// occupies one path segment and its `/` separators travel percent-encoded.
-fn uri_label(arn: &str) -> String {
+pub(crate) fn uri_label(arn: &str) -> String {
     arn.replace('/', "%2F")
 }
 
@@ -121,17 +126,17 @@ fn query_value(key: &str) -> String {
 /// It carries only its resource PATH, because the ARN's resource path IS the
 /// resource's own REST URI: `arn:…:detector/{id}/ipset/{id}` for the resource read
 /// at `/detector/{id}/ipset/{id}`.
-struct Tagged {
-    case: &'static str,
-    path: String,
+pub(crate) struct Tagged {
+    pub(crate) case: &'static str,
+    pub(crate) path: String,
 }
 
 impl Tagged {
-    fn arn(&self, region: &str) -> String {
+    pub(crate) fn arn(&self, region: &str) -> String {
         arn_of(region, &self.path)
     }
 
-    fn read_path(&self) -> String {
+    pub(crate) fn read_path(&self) -> String {
         format!("/{}", self.path)
     }
 }
@@ -157,7 +162,11 @@ async fn minted(
 
 /// Create one resource of every class a tag ARN can name, each carrying `tags`, and
 /// return the detector's id beside them.
-async fn tagged_resources(router: &Router, region: &str, tags: &Value) -> (String, Vec<Tagged>) {
+pub(crate) async fn tagged_resources(
+    router: &Router,
+    region: &str,
+    tags: &Value,
+) -> (String, Vec<Tagged>) {
     let detector = minted(
         router,
         region,
@@ -294,7 +303,12 @@ async fn untag_in(router: &Router, region: &str, arn: &str, keys: &[&str]) -> (u
 ///
 /// A read that reports no `tags` member at all reports an empty map: `TagMap` is
 /// `len 1..200`, so a resource carrying nothing has no map to report.
-async fn tags_of(router: &Router, region: &str, resource: &Tagged, case: &str) -> Value {
+pub(crate) async fn tags_of(
+    router: &Router,
+    region: &str,
+    resource: &Tagged,
+    case: &str,
+) -> Value {
     let (status, body) = call_in(router, region, "GET", &resource.read_path(), None).await;
     assert_eq!(
         status, 200,

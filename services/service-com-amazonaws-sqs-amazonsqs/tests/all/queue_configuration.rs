@@ -344,7 +344,10 @@ async fn a_non_integer_attribute_accepts_exactly_the_values_its_documentation_li
         ("DeduplicationScope", "queue", true, true),
         ("DeduplicationScope", "perQueue", true, false),
         ("FifoThroughputLimit", "perQueue", true, true),
-        ("FifoThroughputLimit", "perMessageGroupId", true, true),
+        // `perMessageGroupId` is in the value set too, but "is allowed only when the
+        // value for DeduplicationScope is messageGroup", so a row that supplies it alone
+        // belongs to the pair rule rather than to this value-set table: it is covered,
+        // with both halves of the pair, in `fifo_receive_idempotency`.
         ("FifoThroughputLimit", "messageGroup", true, false),
         ("Policy", QUEUE_POLICY, false, true),
         ("Policy", "{}", false, true),

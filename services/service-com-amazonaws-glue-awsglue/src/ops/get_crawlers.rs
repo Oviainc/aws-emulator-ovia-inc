@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCrawlers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCrawlers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCrawlers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the crawlers this account holds, in name order, one bounded page at a time:
+//! "Retrieves metadata for all crawlers defined in the customer account." Each element is
+//! the same projection the single-crawler read serves, so a client that works from the
+//! listing is never less informed than one that re-reads each crawler.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +66,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `PageSize`, whose range
+/// is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -137,18 +140,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCrawlers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCrawlersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCrawlers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as its own timeout error rather than as a shape the model does not declare
+            // for it — the same way `CreateCrawler` reports it.
+            return Err(GetCrawlersErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`PageSize`, range 1..1000). The clamp re-states that range in the handler so
+        // the page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        // Name order, so one page follows another deterministically however the store
+        // happens to hash its keys.
+        let mut ordered: Vec<&crate::state::CrawlerEntry> = store.crawlers.values().collect();
+        ordered.sort_by(|left, right| left.name.cmp(&right.name));
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first stored name strictly after it — which stays correct across crawlers
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|crawler| crawler.name.as_str() <= cursor),
+            None => 0,
+        };
+        let page = &ordered[start.min(ordered.len())..];
+        let page: Vec<&crate::state::CrawlerEntry> =
+            page.iter().take(page_size).copied().collect();
+        let end = start.saturating_add(page.len());
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < ordered.len() {
+            page.last().map(|crawler| crawler.name.clone())
+        } else {
+            None
+        };
+
+        Ok(GetCrawlersOutput {
+            // The listing serves the SAME projection as the single-crawler read, element
+            // by element, so a client that works from a listing is never less informed
+            // than one that re-reads each crawler.
+            crawlers: Some(page.iter().map(|crawler| crawler.to_crawler()).collect()),
+            next_token,
+        })
     }
 }

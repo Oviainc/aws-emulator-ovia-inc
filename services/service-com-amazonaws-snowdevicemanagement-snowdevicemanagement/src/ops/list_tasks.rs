@@ -3,9 +3,10 @@
 //! @op ListTasks
 //! Enumerates the tasks created in the signed Region as `TaskSummary`, in `taskId`
 //! order, narrowed to one `TaskState` when the request names one:
-//! `@paginated(items: tasks)`, so a page is cut at `maxResults` and `nextToken`
-//! carries the task id the next page resumes at. A Region no task was created in
-//! answers an empty page.
+//! `@paginated(items: tasks)`, so a page is cut at `maxResults` and `nextToken` is an
+//! opaque cursor — bound to this operation, the signed Region and the `state` filter
+//! the page was served under — naming where the next page resumes. A Region no task
+//! was created in answers an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -171,19 +172,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The token carries the task id the next page resumes at; a value this
-        // service never issued is refused rather than silently serving page one.
+        // The token is an opaque cursor this operation minted for THIS enumeration:
+        // the signed Region's tasks, narrowed by the `state` the previous page was
+        // served under. A value this service never issued — and one it issued for
+        // another operation, Region or filter — names no position here and is refused
+        // rather than reinterpreted as a resume key.
+        let cursor = crate::state::CursorScope {
+            operation: Self::NAME,
+            region: &region,
+            filters: &[input.state.as_deref()],
+        };
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_token(token) {
+            Some(token) => match crate::state::decode_token(token, &cursor) {
                 Some(key) => Some(key),
                 None => {
                     return Err(ListTasksErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token:?} is not a token returned by ListTasks"
-                            ),
-                        },
+                        crate::state::invalid_next_token(Self::NAME),
                     )
                     .into())
                 }
@@ -214,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if tasks.len() == page_size {
-                next_token = Some(crate::state::encode_token(task_id));
+                next_token = Some(crate::state::encode_token(&cursor, task_id));
                 break;
             }
             tasks.push(task.to_summary());

@@ -15,8 +15,9 @@
 //!   nothing in the request and nothing in the store.
 //! * Quick Setup's service settings are persisted per account and Region: a read
 //!   reports exactly what the last accepted update wrote for the Region the request
-//!   was signed for, a Region never configured reports no `ServiceSettings` at all,
-//!   and a read changes nothing a later caller sees.
+//!   was signed for, every read carries the `ServiceSettings` structure (a Region no
+//!   update has configured carries it with `ExplorerEnablingRoleArn` unset), and a
+//!   read changes nothing a later caller sees.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -196,8 +197,8 @@ fn reported_catalog(case: &str, answer: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The role ARN a `GetServiceSettings` answer reports, or `None` when the answer
-/// carries no `ServiceSettings` member at all.
+/// The role ARN a `GetServiceSettings` answer reports, or `None` when its
+/// `ServiceSettings` structure names none.
 fn reported_role_arn(answer: &Value) -> Option<String> {
     answer
         .get("ServiceSettings")
@@ -205,6 +206,21 @@ fn reported_role_arn(answer: &Value) -> Option<String> {
         .and_then(|settings| settings.get("ExplorerEnablingRoleArn"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The `ServiceSettings` structure a `GetServiceSettings` answer carries.
+///
+/// `GetServiceSettings` binds no not-found and no validation error
+/// (`smithy_query(query="operation", operation="GetServiceSettings")` reports only
+/// AccessDenied/Conflict/InternalServer/Throttling), so the structure is part of
+/// every answer and this panics rather than returning an absence.
+fn reported_settings(case: &str, answer: &Value) -> Value {
+    let settings = answer.get("ServiceSettings").cloned().unwrap_or(Value::Null);
+    assert!(
+        settings.is_object(),
+        "case {case}: expected a ServiceSettings structure in every answer, got {answer:?}"
+    );
+    settings
 }
 
 // ---------------------------------------------------------------------------
@@ -390,12 +406,12 @@ async fn configured_service_settings_are_read_back_exactly_as_the_update_wrote_t
     }
 }
 
-/// A Region that was never configured reports no `ServiceSettings` at all — a 200
-/// whose optional member is absent, which is how a client tells "Quick Setup is not
-/// configured here" from "it is" — and configuring one Region leaves every other
-/// Region untouched.
+/// A Region that was never configured reports an EMPTY `ServiceSettings` structure —
+/// a 200 carrying the structure with `ExplorerEnablingRoleArn` unset, because the
+/// operation models no way for settings to be absent — and configuring one Region
+/// leaves every other Region unconfigured.
 #[tokio::test]
-async fn an_unconfigured_region_reports_no_service_settings() {
+async fn an_unconfigured_region_reports_empty_service_settings() {
     let router = emulator();
 
     let regions = ["us-west-2", "eu-west-1", "ap-southeast-2"];
@@ -406,9 +422,10 @@ async fn an_unconfigured_region_reports_no_service_settings() {
             "case {region}: a read before any update must answer 200, got {status} / {answer:?}"
         );
         assert_eq!(
-            reported_role_arn(&answer),
-            None,
-            "case {region}: an unconfigured Region must report no ServiceSettings, got {answer:?}"
+            reported_settings(region, &answer),
+            json!({}),
+            "case {region}: an unconfigured Region must report an empty ServiceSettings \
+             structure, got {answer:?}"
         );
     }
 
@@ -433,6 +450,124 @@ async fn an_unconfigured_region_reports_no_service_settings() {
             expected,
             "case {region}: settings are per Region; expected {expected:?}, got {answer:?}"
         );
+        assert_eq!(
+            reported_settings(region, &answer),
+            match expected {
+                Some(arn) => json!({ "ExplorerEnablingRoleArn": arn }),
+                None => json!({}),
+            },
+            "case {region}: every answer carries the ServiceSettings structure, got {answer:?}"
+        );
+    }
+}
+
+/// Every `GetServiceSettings` answer carries the `ServiceSettings` structure, and the
+/// unconfigured state is expressed INSIDE it by leaving `ExplorerEnablingRoleArn`
+/// unset — never by omitting the structure.
+///
+/// The rows differ along everything the rule generalises over: whether this Region
+/// was ever written to at all, whether the write named a member, whether a DIFFERENT
+/// Region holds settings, how many reads precede this one, and the Region string
+/// itself.
+#[tokio::test]
+async fn every_read_reports_a_service_settings_structure() {
+    /// What happened in the store before the read under test.
+    #[derive(Debug, Clone, Copy)]
+    enum Setup {
+        /// Nothing at all: an empty store.
+        Untouched,
+        /// A `PUT /serviceSettings` naming no member, which writes nothing.
+        EmptyUpdate,
+        /// Another Region was configured; this one never was.
+        OnlyAnotherRegionConfigured,
+        /// This Region was configured with the given role ARN.
+        Configured(&'static str),
+    }
+
+    let cases: [(&str, &str, Setup, usize); 7] = [
+        ("untouched store", "us-west-2", Setup::Untouched, 1),
+        ("untouched store, read twice", "eu-west-1", Setup::Untouched, 2),
+        (
+            "no-member update writes nothing",
+            "ap-southeast-2",
+            Setup::EmptyUpdate,
+            1,
+        ),
+        (
+            "another Region configured",
+            "eu-central-1",
+            Setup::OnlyAnotherRegionConfigured,
+            1,
+        ),
+        ("us-east-1, untouched", "us-east-1", Setup::Untouched, 1),
+        (
+            "configured here",
+            "us-west-2",
+            Setup::Configured("arn:aws:iam::000000000000:role/Explorer"),
+            1,
+        ),
+        (
+            "configured here, read three times",
+            "sa-east-1",
+            Setup::Configured("arn:aws-cn:iam::123456789012:role/path/Explorer"),
+            3,
+        ),
+    ];
+
+    for (case, region, setup, reads) in cases {
+        let router = emulator();
+        match setup {
+            Setup::Untouched => {}
+            Setup::EmptyUpdate => {
+                let (status, answer) = update_settings(&router, region, &json!({})).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: the setup update must answer 200, got {status} / {answer:?}"
+                );
+            }
+            Setup::OnlyAnotherRegionConfigured => {
+                let (status, answer) = update_settings(
+                    &router,
+                    "ca-central-1",
+                    &json!({ "ExplorerEnablingRoleArn": "arn:aws:iam::000000000000:role/Elsewhere" }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: the setup update must answer 200, got {status} / {answer:?}"
+                );
+            }
+            Setup::Configured(role_arn) => {
+                let (status, answer) = update_settings(
+                    &router,
+                    region,
+                    &json!({ "ExplorerEnablingRoleArn": role_arn }),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: the setup update must answer 200, got {status} / {answer:?}"
+                );
+            }
+        }
+
+        let expected = match setup {
+            Setup::Configured(role_arn) => json!({ "ExplorerEnablingRoleArn": role_arn }),
+            _ => json!({}),
+        };
+        for read in 1..=reads {
+            let (status, answer) = get_settings(&router, region).await;
+            assert_eq!(
+                status, 200,
+                "case {case} (read {read}): GetServiceSettings must answer 200, got \
+                 {status} / {answer:?}"
+            );
+            assert_eq!(
+                reported_settings(case, &answer),
+                expected,
+                "case {case} (read {read}): expected ServiceSettings {expected:?}, got {answer:?}"
+            );
+        }
     }
 }
 

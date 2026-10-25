@@ -516,12 +516,11 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
 
     // Every row is a `ClientException` — the error for a request "specifying an identifier
     // that isn't valid" — because none of these entries names the ONE revision the call
-    // acts on: "You must specify a revision." The last row is the documented batch size,
-    // which is a property of the request rather than of one entry.
+    // acts on: "You must specify a revision."
     let eleven: Vec<String> = (1..=11).map(|slot| format!("{family}:{slot}")).collect();
     let arn_without_revision =
         format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}");
-    let rows: [(&str, Vec<String>); 7] = [
+    let rows: [(&str, Vec<String>); 6] = [
         ("family only", vec![family.to_string()]),
         ("revision zero", vec![format!("{family}:0")]),
         (
@@ -537,7 +536,6 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
             "a deletable entry beside one that names no revision",
             vec![format!("{family}:1"), family.to_string()],
         ),
-        ("eleven entries", eleven),
     ];
 
     for (case, references) in rows {
@@ -560,6 +558,26 @@ async fn an_entry_that_names_no_one_revision_is_refused_and_deletes_nothing() {
             "case {case:?}: expected the refusal to name the member, got {message:?}"
         );
     }
+
+    // The documented batch size is a property of the REQUEST rather than of one entry, so
+    // its refusal states the entries and the bound instead of naming a member: "You can
+    // specify up to 10 task definitions as a comma separated list."
+    let (code, message) = refusal(
+        &router,
+        "DeleteTaskDefinitions",
+        json!({ "taskDefinitions": eleven.clone() }),
+        "eleven entries",
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "ClientException",
+            "task definitions can have at most 10 items."
+        ),
+        "case \"eleven entries\": expected the batch-size refusal, got {code} with \
+         {message:?}"
+    );
 
     // A refusal deletes nothing: both revisions are still INACTIVE.
     for slot in 1..=2 {

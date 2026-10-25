@@ -97,9 +97,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `DeleteTableError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#DeleteTable")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#DeleteTable",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum DeleteTableErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
     FederationSourceException(FederationSourceException),
@@ -161,7 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // A transactional delete needs a transaction log this emulator does not keep,
         // so the request is refused rather than applied unconditionally.
         if input.transaction_id.is_some() {
@@ -179,6 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // entity lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(DeleteTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let folded_table = crate::state::fold_name(&input.name);
 
         let mut store = state.lock();

@@ -27,6 +27,8 @@ mod config_listing;
 mod contact_cancellation;
 #[path = "all/contact_dataflows_and_pass_stages.rs"]
 mod contact_dataflows_and_pass_stages;
+#[path = "all/contact_version_description.rs"]
+mod contact_version_description;
 #[path = "all/contact_version_listing.rs"]
 mod contact_version_listing;
 #[path = "all/contact_versions.rs"]

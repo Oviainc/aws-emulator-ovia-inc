@@ -27,6 +27,8 @@ mod cluster_job_listing;
 mod cluster_listing;
 #[path = "all/cluster_node_cancellation.rs"]
 mod cluster_node_cancellation;
+#[path = "all/cluster_node_creation_window.rs"]
+mod cluster_node_creation_window;
 #[path = "all/cluster_node_job_members.rs"]
 mod cluster_node_job_members;
 #[path = "all/cluster_node_updates.rs"]

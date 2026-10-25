@@ -29,6 +29,8 @@ mod own_account_target_refusal;
 mod pattern_validation_messages;
 #[path = "all/phone_number_verification.rs"]
 mod phone_number_verification;
+#[path = "all/primary_email_address_syntax.rs"]
+mod primary_email_address_syntax;
 #[path = "all/primary_email_read.rs"]
 mod primary_email_read;
 #[path = "all/primary_email_update.rs"]

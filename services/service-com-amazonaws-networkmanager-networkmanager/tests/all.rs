@@ -79,6 +79,8 @@ mod get_connect_attachment;
 mod get_connections;
 #[path = "all/get_core_network_policy_selection.rs"]
 mod get_core_network_policy_selection;
+#[path = "all/get_direct_connect_gateway_attachment.rs"]
+mod get_direct_connect_gateway_attachment;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
 #[path = "all/link_association_lifecycle.rs"]

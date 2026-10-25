@@ -1632,13 +1632,29 @@ async fn a_reporting_operation_does_not_change_what_a_later_caller_sees() {
     )
     .await;
 
+    // Retrieving a value records the date of that retrieval, the one thing
+    // `LastAccessedDate` reports ("This field is omitted if the secret has never
+    // been retrieved in the Region", `DescribeSecretResponse$LastAccessedDate`).
+    // The baseline below is therefore taken once a retrieval has happened: what
+    // no read may change is everything else, this read included.
+    ok(
+        &router,
+        "GetSecretValue",
+        json!({"SecretId": "stable"}),
+        "the first retrieval",
+    )
+    .await;
     let first = ok(
         &router,
         "DescribeSecret",
         json!({"SecretId": "stable"}),
-        "first describe",
+        "describe after the first retrieval",
     )
     .await;
+    assert!(
+        first.get("LastAccessedDate").is_some(),
+        "expected the retrieval to be recorded as a LastAccessedDate, got {first}"
+    );
     for case in ["after a get", "after a list", "after a second describe"] {
         match case {
             "after a get" => {

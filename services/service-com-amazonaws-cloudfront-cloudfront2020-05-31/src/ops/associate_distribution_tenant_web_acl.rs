@@ -248,13 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The ID of the distribution tenant" — read from the record that was written.
             id: Some(tenant.id.clone()),
             // "The ARN of the WAF web ACL that you associated with the distribution
-            // tenant", read back out of the record, so what this call reports is what the
+            // tenant", read back out of the record through the one accessor that states how
+            // a tenant's stored web ACL ARN is read, so what this call reports is what the
             // tenant now runs under.
             web_acl_arn: tenant
-                .customizations
-                .as_ref()
-                .and_then(|customizations| customizations.web_acl.as_ref())
-                .and_then(|web_acl| web_acl.arn.clone()),
+                .customization_web_acl_arn()
+                .map(ToString::to_string),
             // "The current version of the distribution tenant": the token this mutation
             // just minted, so the version from before it no longer satisfies an `If-Match`.
             e_tag: Some(tenant.etag.clone()),

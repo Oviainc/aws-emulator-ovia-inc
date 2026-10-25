@@ -417,3 +417,8 @@ mod ipam_byoasns;
 // associating a route server with a VPC, and reading one route server's associations back.
 #[path = "all/route_server_associations.rs"]
 mod route_server_associations;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DeleteTrafficMirrorSession` deletes out of
+// the Traffic Mirror session store, and what it refuses.
+#[path = "all/traffic_mirror_sessions.rs"]
+mod traffic_mirror_sessions;

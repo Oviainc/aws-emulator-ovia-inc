@@ -902,6 +902,15 @@ pub const EXPORT_SNAPSHOT_RECORD_PAGE_SIZE: usize = 10;
 /// the same way.
 pub const DOMAIN_PAGE_SIZE: usize = 10;
 
+/// How many resource names one `GetActiveNames` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more names remain — "A next page
+/// token is not returned if there are no more results to display." Matches
+/// [`INSTANCE_PAGE_SIZE`], so every paged listing in this slice pages the same
+/// way.
+pub const ACTIVE_NAME_PAGE_SIZE: usize = 10;
+
 /// How many log entries one `GetOperationsForResource` page carries.
 ///
 /// CHOSEN: Lightsail publishes a page size for `GetOperations` only ("Results
@@ -11581,6 +11590,71 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.registry_logins.retain(|_, logins| !logins.is_empty());
     }
 
+    /// The name of every resource this account holds that a request made in
+    /// `region` addresses — what `GetActiveNames` reports: "the names of all
+    /// active (not deleted) resources" as one flat list, with no resource type
+    /// qualifying them.
+    ///
+    /// A SET, so the names come back in the store's own total order and a name
+    /// two kinds of record somehow both hold is reported once: the answer is a
+    /// set of NAMES, not one entry per record.
+    ///
+    /// Which records are the account's resources is the same question
+    /// [`Self::with_tagged_record`] answers for one name, so this walks the same
+    /// maps the same way: the ones keyed by name alone hold the resources every
+    /// operation of theirs serves by name whichever Region the request is made
+    /// from, and the ones keyed by the Region together with the name hold the
+    /// resources whose identity includes a Region, of which only `region`'s own
+    /// are addressable there. Beside them are the kinds whose modelled shape
+    /// carries no `tags` member, so no tag operation resolves them — the static
+    /// IP, the export snapshot record, the CloudFormation stack record, and the
+    /// SSL/TLS certificate a load balancer holds. A resource a delete removed is
+    /// held by no map, so its name is gone from here with it, which is what
+    /// makes these the ACTIVE names.
+    ///
+    /// Every walk is bounded by the `MAX_` of the map it walks.
+    pub fn active_names(&self, region: &str) -> BTreeSet<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        // The maps keyed by name alone: the key IS the name the resource's own
+        // reader serves it under.
+        names.extend(self.instances.keys().cloned());
+        names.extend(self.disks.keys().cloned());
+        names.extend(self.disk_snapshots.keys().cloned());
+        names.extend(self.instance_snapshots.keys().cloned());
+        names.extend(self.export_snapshot_records.keys().cloned());
+        names.extend(self.cloud_formation_stack_records.keys().cloned());
+        names.extend(self.domains.keys().cloned());
+        names.extend(self.relational_databases.keys().cloned());
+        names.extend(self.relational_database_snapshots.keys().cloned());
+        names.extend(self.static_ips.keys().cloned());
+        names.extend(self.alarms.keys().cloned());
+        names.extend(self.distributions.keys().cloned());
+        names.extend(self.certificates.keys().cloned());
+        // The maps keyed by the Region together with the name.
+        names.extend(names_in_region(&self.buckets, region));
+        names.extend(names_in_region(&self.container_services, region));
+        names.extend(names_in_region(&self.load_balancers, region));
+        // A load balancer's SSL/TLS certificate is a resource of its own, named
+        // by the request that asked for it and gone once it is deleted — and the
+        // certificates live on the load balancer's record, which is held under
+        // the Region they therefore belong to as well.
+        names.extend(
+            self.load_balancers_in(region)
+                .into_iter()
+                .flat_map(|balancer| balancer.certificates.iter())
+                .map(|certificate| certificate.name.clone()),
+        );
+        // A contact method is held under its Region and its PROTOCOL, so its
+        // name is the one on the record — the name this store minted, which
+        // `GetContactMethods` reports.
+        names.extend(
+            self.contact_methods_in(region)
+                .into_iter()
+                .map(|method| method.name.clone()),
+        );
+        names
+    }
+
     /// Run `body` against the tag-carrying record `name` names in `region` —
     /// whichever kind of resource that turns out to be — together with the
     /// `ResourceType` that kind reports. `None` when this account holds no
@@ -11701,6 +11775,23 @@ impl ComAmazonawsLightsailLightsail20161128State {
         }
         None
     }
+}
+
+/// The names of the records of a `(region, name)`-keyed map that belong to
+/// `region`.
+///
+/// What a resource whose identity includes a Region is named by there: the
+/// second half of its store key. Used by
+/// [`ComAmazonawsLightsailLightsail20161128State::active_names`], which walks
+/// three such maps and so asks the question three times.
+fn names_in_region<'a, R>(
+    records: &'a BTreeMap<(String, String), R>,
+    region: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+    records
+        .keys()
+        .filter(move |(record_region, _)| record_region == region)
+        .map(|(_, name)| name.clone())
 }
 
 // ---------------------------------------------------------------------------

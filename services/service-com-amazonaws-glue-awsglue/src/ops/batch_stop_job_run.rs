@@ -146,7 +146,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `StartJobRun` reports it.
@@ -163,11 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary: reaching here, the only question is which of the named runs this job
         // holds and which of those can still be stopped.
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let mut submissions: Vec<BatchStopJobRunSuccessfulSubmission> = Vec::new();
         let mut errors: Vec<BatchStopJobRunError2> = Vec::new();
 
-        match store.jobs.get_mut(&input.job_name) {
+        // A job definition exists only in the Region it was created in, so a stop
+        // addressed to another Region's endpoint names no job this endpoint holds.
+        match store.job_mut(&region, &input.job_name) {
             Some(job) => {
                 // Everything the clock already owed this job's runs is materialised
                 // first, so a run the clock has already finished is seen as finished and

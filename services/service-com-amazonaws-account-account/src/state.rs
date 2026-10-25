@@ -41,7 +41,10 @@
 //! and what it reports before any opt call.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
+
+use ::aws_smithy_schema_server::constraints::{validate, PatternTrait};
 
 use crate::ops::types::{
     AccessDeniedException, AlternateContact, ConflictException, ContactInformation,
@@ -1251,10 +1254,139 @@ pub fn primary_email_does_not_match_request() -> ValidationException {
         message: RULE.to_string(),
         reason: Some(FIELD_VALIDATION_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
-            name: "PrimaryEmail".to_string(),
+            name: PRIMARY_EMAIL_MEMBER.to_string(),
             message: RULE.to_string(),
         }]),
     }
+}
+
+/// The Smithy member name the primary-email operations take their address in,
+/// which a refusal about that address names in its `fieldList`.
+pub const PRIMARY_EMAIL_MEMBER: &str = "PrimaryEmail";
+
+/// The Smithy member whose `@pattern` is this service's own expression of an
+/// email address: `PutAlternateContactRequest$EmailAddress`, whose target
+/// (`EmailAddress`) is the one address shape in this model that carries one.
+const EMAIL_ADDRESS_MEMBER: &str = "EmailAddress";
+
+/// That expression, as the model declares it, or `None` when the model declares
+/// none — read off the member's own schema rather than restated here, so the
+/// syntax this service enforces and the syntax its model declares cannot drift
+/// apart.
+fn modelled_email_expression() -> Option<&'static str> {
+    let member = crate::ops::types::PUT_ALTERNATE_CONTACT_INPUT_SCHEMA
+        .members()
+        .iter()
+        .find(|candidate| candidate.member_name() == Some(EMAIL_ADDRESS_MEMBER))?;
+    let declared = member.traits()?.get(&PatternTrait::TRAIT_ID)?;
+    Some(declared.as_any().downcast_ref::<PatternTrait>()?.regex)
+}
+
+/// The email-address expression this service enforces, as the model declares it,
+/// or `None` when the model declares none at all.
+///
+/// Public because `None` would admit every value: a test asserts the model still
+/// declares an expression and that it is the one this service enforces, so a
+/// renamed member or an unreadable expression fails a test rather than silently
+/// stopping the refusal below.
+pub fn email_address_expression() -> Option<&'static str> {
+    *EMAIL_ADDRESS_EXPRESSION
+}
+
+/// [`modelled_email_expression`] resolved once, so the schema below and every
+/// caller read the same answer.
+static EMAIL_ADDRESS_EXPRESSION: LazyLock<Option<&'static str>> =
+    LazyLock::new(modelled_email_expression);
+
+/// That expression in the framework's own form, hung on the member schema the
+/// walk below is driven over.
+///
+/// NOTHING about pattern checking is reimplemented here: the expression is the
+/// model's, carried by the framework's [`PatternTrait`], and the check is
+/// [`validate`] — the same walk the request boundary runs — so a refusal decided
+/// here reads exactly like one decided there.
+static EMAIL_ADDRESS_TRAITS: LazyLock<::aws_smithy_schema::TraitMap> = LazyLock::new(|| {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    if let Some(declared) = *EMAIL_ADDRESS_EXPRESSION {
+        traits.insert(Box::new(PatternTrait::new(declared)));
+    }
+    traits
+});
+
+/// The member schema the walk reads: a string carrying the email-address
+/// expression. Its shape id is deliberately one the model does not declare, so
+/// it cannot collide with a modelled shape, and the member name is the one both
+/// address members of the primary-email operations are called.
+static M_PRIMARY_EMAIL: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.account#CheckedAddress$PrimaryEmail",
+        "com.amazonaws.account",
+        "PrimaryEmail",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "PrimaryEmail",
+    0,
+)
+.with_traits(&EMAIL_ADDRESS_TRAITS);
+
+/// The root of the shadow input the walk is driven over. Its member list is
+/// empty on purpose: the walk visits what [`CheckedAddress`] WRITES, and a root
+/// struct schema carries no member name of its own.
+static CHECKED_ADDRESS_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.account#CheckedAddress",
+            "com.amazonaws.account",
+            "CheckedAddress",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    );
+
+/// One address written for the validating walk the way the codec writes a string
+/// member, against the member schema whose expression the walk is to apply.
+struct CheckedAddress<'a> {
+    value: &'a str,
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CheckedAddress<'_> {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&M_PRIMARY_EMAIL, self.value)
+    }
+}
+
+/// Refuse `value` for the member named `member` unless it is an email address by
+/// that expression, or pass it through.
+///
+/// `PrimaryEmailAddress` carries only `@length(min: 5, max: 64)`, so WHICH
+/// strings of that size name a mailbox is a rule this service enforces itself:
+/// the address becomes the root user email address of an account. With no
+/// expression to apply there is nothing to refuse on, so the value passes.
+///
+/// `Err` is the modelled 400 `ValidationException`, and its message is the one
+/// this service words for the violations the walk found
+/// ([`crate::service::constraint_refusal_message`]) — the message the request
+/// boundary answers with for the member the expression is DECLARED on, so one
+/// expression produces one wording whichever address member was refused, and the
+/// refused value is echoed there exactly as the boundary echoes it. `reason` is
+/// `fieldValidationFailed` and `fieldList` names the member, which a refusal the
+/// boundary raises carries no room for.
+pub fn validated_email_address(member: &str, value: &str) -> Result<(), ValidationException> {
+    let violations = validate(&CheckedAddress { value }, &CHECKED_ADDRESS_SCHEMA);
+    let Some(stated) = crate::service::constraint_refusal_message(&violations) else {
+        return Ok(());
+    };
+    Err(ValidationException {
+        message: stated.clone(),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: stated,
+        }]),
+    })
 }
 
 /// The `ConflictException` payload for a primary email change to an address that
