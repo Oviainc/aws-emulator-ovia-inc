@@ -18,6 +18,8 @@
 //! compliant has nothing to remediate, and one whose previous execution has not
 //! finished cannot be started again ("An existing StartRemediationExecution call for
 //! the specified resource keys must complete before you can call the API again").
+//! `FailedItems` is the per-resource outcome of an accepted request, so an accepted
+//! request always reports it — empty when every resource key started.
 //!
 //! ## Shape of an operation
 //!
@@ -280,9 +282,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "For resources that have failed to start execution, the API returns a resource
-        // key object": a request every resource of which started reports none.
+        // key object": the member reports the per-resource outcome of an accepted
+        // request, so it is always there to be read — EMPTY when every resource the
+        // request named started, which is what tells a caller "all accepted" apart from
+        // a partial acceptance. `FailureMessage` stays absent while there is no failure
+        // to explain.
         Ok(StartRemediationExecutionOutput {
-            failed_items: (!failed.is_empty()).then_some(failed),
+            failed_items: Some(failed),
             failure_message,
         })
     }

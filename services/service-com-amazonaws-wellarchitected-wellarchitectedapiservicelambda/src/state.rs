@@ -13,10 +13,12 @@
 //! reviews (`ListLensReviewImprovements`) and the answers of a review template's lens
 //! reviews (`ListReviewTemplateAnswers`, `GetReviewTemplateAnswer`,
 //! `UpdateReviewTemplateAnswer`) are backed entirely by the maps below, so a
-//! create is visible to the next request on the same engine. A template's lens review is
-//! held against the lens VERSION it was applied at, which
-//! `UpgradeReviewTemplateLensReview` moves to the lens's latest
-//! ([`ReviewTemplateLensReviewRecord::lens_version`]). The custom lenses
+//! create is visible to the next request on the same engine. A lens review — of a
+//! workload or of a template — is held against the lens VERSION it was applied at, which
+//! `UpgradeLensReview` ([`LensReviewRecord::lens_version`]) and
+//! `UpgradeReviewTemplateLensReview` ([`ReviewTemplateLensReviewRecord::lens_version`])
+//! each move to the lens's latest, keeping the review as it stood in a milestone of the
+//! workload in the first case. The custom lenses
 //! `ImportLens`
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
@@ -1807,16 +1809,16 @@ enum TaggedResource {
     Lens,
 }
 
-/// What a caller has WRITTEN to ONE lens review of a workload: the review's own notes,
-/// the notes of each pillar of the lens under review, and the Jira question selection
-/// recorded against it.
+/// ONE lens review of a workload as the store holds it: the version of the lens the
+/// review is against, the review's own notes, the notes of each pillar of the lens under
+/// review, and the Jira question selection recorded against it.
 ///
 /// A lens review of a workload is not a resource of its own — it exists exactly while
 /// that lens is associated with the workload ([`WorkloadRecord::reviews_lens`]) — so what
-/// this record holds is only what a caller has written to it. Everything else a lens
-/// review reports — the lens's name, version and status, its pillars and its risk roll-up
-/// — is DERIVED from the lens content and the workload's stored answers by
-/// [`WorkloadRecord::to_lens_review`].
+/// this record holds is the version that association pinned and what a caller has written
+/// to the review. Everything else a lens review reports — the lens's name and currency,
+/// its pillars and its risk roll-up — is DERIVED from the lens content and the workload's
+/// stored answers by [`WorkloadRecord::to_lens_review`].
 ///
 /// The mirror of [`ReviewTemplateLensReviewRecord`], which holds the same notes for a review
 /// TEMPLATE's lens review, with two differences the two shapes make: a workload's review
@@ -1834,6 +1836,15 @@ pub struct LensReviewRecord {
     /// `LensReview$JiraConfiguration`: the pillars and questions of this review a caller
     /// has selected, absent until one is written.
     pub jira_configuration: Option<JiraSelectedQuestionConfiguration>,
+    /// The `LensVersion` this review is against: the version the lens's content was
+    /// published as when the lens was associated with the workload
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::applied_lens_version`]),
+    /// which `UpgradeLensReview` moves to the lens's latest version. `None` for a lens
+    /// this emulator holds no content for, which has no version to be at, and for a
+    /// review whose record was first written to before any version was pinned — which
+    /// reads as the lens's latest, exactly as a review template's unpinned review does
+    /// ([`ReviewTemplateLensReviewRecord::lens_version`]).
+    pub lens_version: Option<String>,
 }
 
 /// The pillars ONE lens review reports a summary for, each with the `PillarName` the lens
@@ -2149,8 +2160,7 @@ impl WorkloadRecord {
         counts
     }
 
-    /// What a caller has written to ONE of this workload's lens reviews, if anything has
-    /// been.
+    /// ONE of this workload's lens reviews as the store holds it, if the store holds one.
     ///
     /// `lens` is a lens as a request names it — an alias or an ARN — and resolves through
     /// [`lens_alias`], so the same record is found by either name.
@@ -2160,12 +2170,20 @@ impl WorkloadRecord {
 
     /// [`Self::lens_review_record`] for a caller about to WRITE it, created empty on the
     /// first write: the lens review itself exists as soon as the lens is associated with
-    /// the workload, and this record is only how the store remembers what was written to
-    /// it.
+    /// the workload, and this record is only how the store remembers that review's own
+    /// state.
     pub fn lens_review_record_mut(&mut self, lens: &str) -> &mut LensReviewRecord {
         self.lens_review_records
             .entry(lens_alias(lens).to_string())
             .or_default()
+    }
+
+    /// The `LensVersion` ONE lens review of this workload is against, as it was pinned
+    /// when the lens was associated or last moved by an upgrade — the mirror of
+    /// [`ReviewTemplateRecord::lens_review_version`], because a workload's lens review and
+    /// a review template's are both reviews against ONE version of the lens.
+    pub fn lens_review_version(&self, lens: &str) -> Option<&str> {
+        self.lens_review_record(lens)?.lens_version.as_deref()
     }
 
     /// The pillars ONE lens review of this workload reports a summary for, through the
@@ -2183,24 +2201,23 @@ impl WorkloadRecord {
     ///
     /// `lens` is the lens AS THE REQUEST NAMED IT — `LensAlias` is "either the lens alias
     /// … or the lens ARN" (`LensAlias` doc) and this shape models no member to resolve one
-    /// spelling into the other — and `lens_arn` is the ARN that lens is reported by
-    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    /// spelling into the other — and `reviewed` is what the lens catalog says about the
+    /// lens this review is against, resolved for the version the review is at
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens_at`]).
     ///
-    /// Everything but what a caller wrote to the review ([`LensReviewRecord`]) is DERIVED
-    /// on every read: the lens's own name, version and status from the lens content this
-    /// emulator holds ([`lens_metadata`], absent for a lens it holds none for), one pillar
-    /// summary per pillar of the lens ([`Self::lens_review_pillars`]) and the risk
-    /// roll-ups of the lens's and each pillar's questions from this workload's stored
-    /// answers — so a review moves when an answer does.
-    pub fn to_lens_review(&self, lens: &str, lens_arn: String) -> LensReview {
-        let metadata = lens_metadata(lens);
+    /// Everything but the review's own state ([`LensReviewRecord`]) is DERIVED on every
+    /// read: the lens's name, version and currency from `reviewed`, one pillar summary per
+    /// pillar of the lens ([`Self::lens_review_pillars`]) and the risk roll-ups of the
+    /// lens's and each pillar's questions from this workload's stored answers — so a
+    /// review moves when an answer does.
+    pub fn to_lens_review(&self, lens: &str, reviewed: &ReviewedLens) -> LensReview {
         let written = self.lens_review_record(lens);
         LensReview {
             lens_alias: Some(lens.to_string()),
-            lens_arn: Some(lens_arn),
-            lens_version: metadata.map(|metadata| metadata.version.to_string()),
-            lens_name: metadata.map(|metadata| metadata.name.to_string()),
-            lens_status: metadata.map(|metadata| metadata.status.to_string()),
+            lens_arn: Some(reviewed.lens_arn.clone()),
+            lens_version: reviewed.lens_version.clone(),
+            lens_name: reviewed.lens_name.clone(),
+            lens_status: reviewed.lens_status.clone(),
             pillar_review_summaries: Some(
                 self.lens_review_pillars(lens)
                     .into_iter()
@@ -2443,6 +2460,27 @@ impl MilestoneRecord {
             workload_summary: Some(self.workload.to_summary()),
         }
     }
+}
+
+/// How recording a milestone of a workload is refused: the modelled exception for the
+/// case, for the calling operation to lift into its own error enum.
+///
+/// Shared by every operation that records one — `CreateMilestone` and the upgrades that
+/// keep the review as it stood before they moved it — so all of them word the same
+/// refusal identically ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::record_milestone`]).
+#[derive(Debug, Clone)]
+pub enum MilestoneRefusal {
+    /// No workload is stored under the id the milestone would be recorded against, so
+    /// there is no workload to record: a `ResourceNotFoundException` (HTTP 404).
+    NotFound(ResourceNotFoundException),
+    /// A milestone of that workload already holds the name: "Milestone names must be
+    /// unique within a workload" (`smithy_query(query="shape", shape="MilestoneName")`),
+    /// so the name is taken — a `ConflictException` (HTTP 409).
+    NameTaken(ConflictException),
+    /// The workload already holds [`MAX_MILESTONES_PER_WORKLOAD`] milestones, which is
+    /// "the user has reached their resource quota" — a `ServiceQuotaExceededException`
+    /// (HTTP 402).
+    QuotaExceeded(crate::ops::types::ServiceQuotaExceededException),
 }
 
 /// One lens review of a review template, as the store holds it.
@@ -5086,6 +5124,13 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateMilestone`'s `ClientRequestToken` -> what the original request recorded.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_milestone_tokens: TokenLedger<CreateMilestoneToken>,
+    /// `UpgradeLensReview`'s `ClientRequestToken` -> the upgrade the original request
+    /// completed, held exactly as [`Self::upgrade_review_template_lens_review_tokens`] is
+    /// and for the same reason: an upgrade answers an empty success, so the completed
+    /// upgrade is what a retry is served from ([`CompletedUpgradeToken`]) rather than the
+    /// request being run a second time — which would move the review again and collide
+    /// with the milestone the original request recorded.
+    pub upgrade_lens_review_tokens: TokenLedger<CompletedUpgradeToken>,
     /// Every share recorded against a workload, keyed by `WorkloadId` then by `ShareId`.
     /// A `BTreeMap` because `ShareId` order is the stable order `ListWorkloadShares`
     /// pages over.
@@ -5979,6 +6024,36 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .collect()
     }
 
+    /// The lens reviews a workload associating `lenses` carries the moment it is created:
+    /// one per associated lens, keyed by lens ALIAS, each against the version of that
+    /// lens's content as of `now` ([`Self::applied_lens_version`]) and with nothing
+    /// written to it yet.
+    ///
+    /// The mirror of [`Self::applied_lens_reviews`], which does the same for a review
+    /// TEMPLATE's lens reviews: a lens review is a review against ONE version of the
+    /// lens, so associating a lens pins the version its content is published as right
+    /// then, whichever resource the review belongs to.
+    pub fn applied_workload_lens_reviews(
+        &self,
+        lenses: &[String],
+        now: SystemTime,
+    ) -> BTreeMap<String, LensReviewRecord> {
+        lenses
+            .iter()
+            .map(|lens| {
+                (
+                    lens_alias(lens).to_string(),
+                    LensReviewRecord {
+                        notes: None,
+                        pillar_notes: BTreeMap::new(),
+                        jira_configuration: None,
+                        lens_version: self.applied_lens_version(lens, now),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// What the lens catalog says about the lens ONE lens review of the stored review
     /// template `template_arn` is a review of, for the version that review is against
     /// ([`ReviewTemplateRecord::lens_review_version`]).
@@ -5992,6 +6067,23 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .review_templates
             .get(template_arn)
             .and_then(|template| template.lens_review_version(lens));
+        self.reviewed_lens_at(lens, pinned, region)
+    }
+
+    /// What the lens catalog says about the lens ONE lens review is a review of, for the
+    /// version that review PINS (`pinned`) — the one place that resolution lives, so a
+    /// workload's lens review and a review template's cannot disagree about which version
+    /// a review is against or whether that version is current.
+    ///
+    /// `lens` is the lens as the request named it, which is the spelling its `LensArn` is
+    /// resolved from. A review that pins no version is against the lens's LATEST version,
+    /// and a lens this emulator holds no content for has no version to be at.
+    pub fn reviewed_lens_at(
+        &self,
+        lens: &str,
+        pinned: Option<&str>,
+        region: &str,
+    ) -> ReviewedLens {
         let latest = self.latest_lens_version(lens);
         // The version the review is AGAINST: the one it pins, or the lens's latest for a
         // review that pins none.
@@ -6216,6 +6308,10 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // it goes with the associations the record above carried.
         self.upgrade_profile_version_tokens
             .retain(|token| token.workload_id != workload_id);
+        // A lens-review upgrade token resolves to a lens review OF this workload, so it
+        // cannot outlive it either: the next request carrying one acts afresh.
+        self.upgrade_lens_review_tokens
+            .retain(|token| token.resource_id != workload_id);
         Some(record)
     }
 
@@ -6316,6 +6412,79 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .and_then(|recorded| recorded.keys().next_back().copied())
             .unwrap_or(0)
             .saturating_add(1)
+    }
+
+    /// Record a milestone of the workload `workload_id` as it stands at `now`, under
+    /// `milestone_name`, and answer the `MilestoneNumber` it took.
+    ///
+    /// The ONE place a milestone comes into existence, so every operation that records one
+    /// — `CreateMilestone` and the upgrades that keep the review as it stood before they
+    /// moved it — records it under the same rules and refuses it with the same wording
+    /// ([`MilestoneRefusal`]): "A milestone records the state of a workload at a
+    /// particular point in time" (`CreateMilestone` doc), so the workload is copied BY
+    /// VALUE and a later update cannot change what this milestone reports; "milestone
+    /// names must be unique within a workload" (`smithy_query(query="shape",
+    /// shape="MilestoneName")`), compared the way this service compares a name it meters
+    /// for uniqueness ([`normalize_unique_name`]); and a workload holds at most
+    /// [`MAX_MILESTONES_PER_WORKLOAD`] of them.
+    ///
+    /// Every refusal is decided BEFORE anything is written, and a refused request consumes
+    /// no milestone number, so a caller that is refused leaves the workload exactly as it
+    /// stood.
+    pub fn record_milestone(
+        &mut self,
+        workload_id: &str,
+        milestone_name: String,
+        now: SystemTime,
+    ) -> Result<i32, MilestoneRefusal> {
+        if !self.workloads.contains_key(workload_id) {
+            return Err(MilestoneRefusal::NotFound(workload_not_found(workload_id)));
+        }
+        if let Some(existing) = self.milestone_holding_name(workload_id, &milestone_name) {
+            return Err(MilestoneRefusal::NameTaken(milestone_name_conflict(
+                &existing.milestone_name,
+                workload_id,
+                existing.milestone_number,
+            )));
+        }
+        let milestone_number = self.next_milestone_number(workload_id);
+        if milestone_number > MAX_MILESTONES_PER_WORKLOAD {
+            return Err(MilestoneRefusal::QuotaExceeded(
+                crate::ops::types::ServiceQuotaExceededException {
+                    message: format!(
+                        "The workload with ID {workload_id} already holds the maximum of \
+                         {MAX_MILESTONES_PER_WORKLOAD} milestones"
+                    ),
+                    resource_id: Some(workload_id.to_string()),
+                    resource_type: Some(WORKLOAD_RESOURCE_TYPE.to_string()),
+                    // The model publishes no numeric Service Quotas code for this quota,
+                    // so it is named by what it meters; the service code is this
+                    // service's own signing name.
+                    quota_code: "MilestonesPerWorkload".to_string(),
+                    service_code: ARN_NAMESPACE.to_string(),
+                },
+            ));
+        }
+        let Some(workload) = self.workloads.get(workload_id).cloned() else {
+            // Defensive, and worded as the first lookup above is: that lookup already
+            // resolved the workload under this same borrow, so nothing can have removed
+            // it in between, and a milestone is recorded only of a workload that is
+            // there.
+            return Err(MilestoneRefusal::NotFound(workload_not_found(workload_id)));
+        };
+        self.milestones
+            .entry(workload_id.to_string())
+            .or_default()
+            .insert(
+                milestone_number,
+                MilestoneRecord {
+                    milestone_number,
+                    milestone_name,
+                    recorded_at: now,
+                    workload,
+                },
+            );
+        Ok(milestone_number)
     }
 
     /// Every share recorded against `workload_id`, in `ShareId` order.

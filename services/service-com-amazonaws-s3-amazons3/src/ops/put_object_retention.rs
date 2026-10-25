@@ -6,6 +6,11 @@
 //! the one `versionId` names, or the key's current object — and answers 200.
 //! `GetObjectRetention` reads the same state back.
 //!
+//! A retention is part of S3 Object Lock, so it is served only by a bucket that has an
+//! Object Lock configuration: a call addressed to a bucket without one is refused 400
+//! [`crate::state::INVALID_REQUEST_CODE`] with
+//! [`crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE`], and nothing is written.
+//!
 //! A retention already IN FORCE on that version bounds what this write may do: a call that
 //! would end the period earlier than it does now, take the retention away, or put
 //! `GOVERNANCE` where `COMPLIANCE` is in force protects the version less than it is
@@ -301,6 +306,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(PutObjectRetentionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+        // A retention is one half of S3 Object Lock, which a bucket has only once an Object
+        // Lock configuration is on it: the configuration's rule "will be applied by default
+        // to every new object placed in the specified bucket"
+        // (`PutObjectLockConfiguration`'s own documentation), and a bucket carrying none
+        // locks nothing. Placing a retention there is a request S3 cannot carry out as
+        // given, which is what `InvalidRequest` reports — the refusal `PutObjectLegalHold`
+        // answers the same cause with.
+        if !bucket.object_lock_enabled() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::OBJECT_LOCK_CONFIGURATION_MISSING_MESSAGE,
+            ));
+        }
         // A delete marker is a version with no object behind it, so there is nothing to
         // place a retention on: 405, the status S3 answers an object-level call on a marker
         // with, as `HeadObject` already answers it for the same cause.

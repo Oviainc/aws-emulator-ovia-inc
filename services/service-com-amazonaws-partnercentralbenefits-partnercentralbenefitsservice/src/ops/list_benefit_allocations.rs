@@ -198,16 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results);
 
         let mut store = state.lock();
-        if !store.catalogs.contains_key(&input.catalog) {
-            return Err(ListBenefitAllocationsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::not_found_message(
-                        crate::state::CATALOG_KIND,
-                        &input.catalog,
-                    ),
-                },
-            )
-            .into());
+        // The catalog the request names is resolved FIRST: the allocations this reports
+        // live inside a catalog, so a catalog that does not exist is the missing resource
+        // and is what the answer names — see [`crate::state::catalog_refusal`].
+        if let Some(missing) = store.catalog_refusal(&input.catalog) {
+            return Err(
+                ListBenefitAllocationsErrorModeled::ResourceNotFoundException(missing).into(),
+            );
         }
         // An allocation past its `ExpiresAt` is no longer usable whether or not anybody
         // has looked at it, so this report first materialises the expiries the clock has

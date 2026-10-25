@@ -654,12 +654,6 @@ async fn a_request_that_addresses_nothing_stored_is_refused_as_a_miss() {
             "Table no_such_table not found.",
         ),
         (
-            "a catalog this emulator does not hold",
-            "StartColumnStatisticsTaskRun",
-            start_body("miss_db", "miss_table", json!({ "CatalogID": "210987654321" })),
-            "Database miss_db not found.",
-        ),
-        (
             "a run id nothing minted",
             "GetColumnStatisticsTaskRun",
             json!({ "ColumnStatisticsTaskRunId": "ffffffffffffffffffffffffffffffff" }),
@@ -684,4 +678,32 @@ async fn a_request_that_addresses_nothing_stored_is_refused_as_a_miss() {
             "case {case:?}: expected a refusal carrying {expected:?}, got {message:?}"
         );
     }
+
+    // A `CatalogID` naming another account's Data Catalog is not a miss: the caller
+    // holds no grant on that catalog, which is decided before any lookup, so the start
+    // is refused as unauthorized and names the catalog ARN it addressed.
+    let foreign = "210987654321";
+    let (status, parsed) = call(
+        &router,
+        "StartColumnStatisticsTaskRun",
+        &start_body("miss_db", "miss_table", json!({ "CatalogID": foreign })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {:?}: expected 400, got {status} with {parsed}",
+        "a catalog of another account"
+    );
+    assert!(
+        error_code(&parsed).ends_with("AccessDeniedException"),
+        "case {:?}: expected AccessDeniedException, got {}",
+        "a catalog of another account",
+        error_code(&parsed)
+    );
+    assert!(
+        error_message(&parsed).contains(foreign),
+        "case {:?}: the refusal names the catalog it refused, got {:?}",
+        "a catalog of another account",
+        error_message(&parsed)
+    );
 }

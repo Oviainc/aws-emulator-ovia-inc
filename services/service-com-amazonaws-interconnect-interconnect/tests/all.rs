@@ -15,6 +15,8 @@
 mod accept_connection_proposal;
 #[path = "all/arn_scope_refusals.rs"]
 mod arn_scope_refusals;
+#[path = "all/arn_scope_is_relative_to_the_request.rs"]
+mod arn_scope_is_relative_to_the_request;
 #[path = "all/attach_points.rs"]
 mod attach_points;
 #[path = "all/billing_tier.rs"]

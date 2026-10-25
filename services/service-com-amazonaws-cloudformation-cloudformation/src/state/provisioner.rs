@@ -187,6 +187,19 @@
 //!   association is removed by the rule/VPC PAIR its declaration carries rather than by its
 //!   own id.
 //!
+//! * the three `AWS::CodeDeploy::*` types' properties are their creates' own members with the
+//!   initial letter lower-cased — EXCEPT the ones whose nested structures CodeDeploy ITSELF
+//!   spells in upper camel, its `Tag`, `EC2TagFilter` and `TagFilter` shapes each spelling
+//!   `Key`, `Value` and `Type` — so every property of those types carries the rule saying
+//!   which of the two it is ([`CodeDeployMember`]), and a property no entry names is REFUSED
+//!   rather than dropped. A deployment group's `Deployment` property is no member of its
+//!   create at all: it is an application revision deployed as soon as the group exists, so it
+//!   is a `CreateDeployment` of its own on the group just created — the same second call a
+//!   client makes. An application and a deployment configuration are keyed by their names,
+//!   which is what each type's `Ref` returns; a group is keyed by the PAIR of the application
+//!   and the group name ([`codedeploy_application_of`]), so its delete and its drift read
+//!   carry both.
+//!
 //! ## The tags every created resource carries
 //!
 //! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
@@ -225,7 +238,8 @@ use super::provisioning::{
 };
 use super::template::{
     ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_DASHBOARD,
-    CLOUDWATCH_METRIC_STREAM,
+    CLOUDWATCH_METRIC_STREAM, CODEDEPLOY_APPLICATION, CODEDEPLOY_DEPLOYMENT_CONFIG,
+    CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -316,6 +330,9 @@ pub(super) enum Provisioner {
     ElasticBeanstalkApplication,
     ElasticBeanstalkApplicationVersion,
     ElasticBeanstalkEnvironment,
+    CodeDeployApplication,
+    CodeDeployDeploymentGroup,
+    CodeDeployDeploymentConfig,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -363,6 +380,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::ElasticBeanstalkApplicationVersion)
         }
         ELASTIC_BEANSTALK_ENVIRONMENT => Some(Provisioner::ElasticBeanstalkEnvironment),
+        CODEDEPLOY_APPLICATION => Some(Provisioner::CodeDeployApplication),
+        CODEDEPLOY_DEPLOYMENT_GROUP => Some(Provisioner::CodeDeployDeploymentGroup),
+        CODEDEPLOY_DEPLOYMENT_CONFIG => Some(Provisioner::CodeDeployDeploymentConfig),
         _ => None,
     }
 }
@@ -513,6 +533,19 @@ impl Provisioner {
             }
             Self::ElasticBeanstalkEnvironment => {
                 create_eb_environment(ctx, region, resource, propagated).await
+            }
+            Self::CodeDeployApplication => {
+                create_codedeploy_application(ctx, region, resource, propagated).await
+            }
+            Self::CodeDeployDeploymentGroup => {
+                create_codedeploy_deployment_group(ctx, region, resource, propagated).await
+            }
+            // `AWS::CodeDeploy::DeploymentConfig` publishes `ComputePlatform`,
+            // `DeploymentConfigName`, `MinimumHealthyHosts`, `TrafficRoutingConfig` and
+            // `ZonalConfig` and no `Tags`: the type is not taggable, so no tags are
+            // propagated to a deployment configuration.
+            Self::CodeDeployDeploymentConfig => {
+                create_codedeploy_deployment_config(ctx, region, resource).await
             }
         }
     }
@@ -798,6 +831,17 @@ impl Provisioner {
             Self::ElasticBeanstalkEnvironment => {
                 terminate_eb_environment(ctx, region, physical_resource_id).await
             }
+            Self::CodeDeployApplication => {
+                delete_codedeploy_application(ctx, region, physical_resource_id).await
+            }
+            // The delete addresses the group by the PAIR that identifies it, and the
+            // application half of that pair is on the resource's own declaration.
+            Self::CodeDeployDeploymentGroup => {
+                delete_codedeploy_deployment_group(ctx, region, resource).await
+            }
+            Self::CodeDeployDeploymentConfig => {
+                delete_codedeploy_deployment_config(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -927,6 +971,17 @@ impl Provisioner {
             }
             Self::ElasticBeanstalkEnvironment => {
                 describe_eb_environment(ctx, region, physical_resource_id).await
+            }
+            Self::CodeDeployApplication => {
+                describe_codedeploy_application(ctx, region, physical_resource_id).await
+            }
+            // The read is addressed by the group's name AND the application that holds it,
+            // which only the resource's own record carries.
+            Self::CodeDeployDeploymentGroup => {
+                describe_codedeploy_deployment_group(ctx, region, resource).await
+            }
+            Self::CodeDeployDeploymentConfig => {
+                describe_codedeploy_deployment_config(ctx, region, physical_resource_id).await
             }
         }
     }
@@ -8796,6 +8851,612 @@ async fn eb_reported_entry(
         return Ok(None);
     }
     Ok(Some(Value::Object(xml_scalar_children(&answered, "member"))))
+}
+
+// ---------------------------------------------------------------------------
+// CodeDeploy: AWS::CodeDeploy::Application / ::DeploymentGroup / ::DeploymentConfig
+// ---------------------------------------------------------------------------
+
+/// CodeDeploy's signing name and `X-Amz-Target` prefix, from its model
+/// (`sigv4Name: codedeploy`, service shape `CodeDeploy_20141006`), which speaks
+/// `awsJson1_1`.
+const CODEDEPLOY_SIGNING_NAME: &str = "codedeploy";
+const CODEDEPLOY_TARGET_PREFIX: &str = "CodeDeploy_20141006";
+
+/// The error codes CodeDeploy answers for the resources these types are, when it does not
+/// hold them: `ApplicationDoesNotExistException`, `DeploymentGroupDoesNotExistException` and
+/// `DeploymentConfigDoesNotExistException`, each a modelled error of the matching read.
+const APPLICATION_DOES_NOT_EXIST: &str = "ApplicationDoesNotExistException";
+const DEPLOYMENT_GROUP_DOES_NOT_EXIST: &str = "DeploymentGroupDoesNotExistException";
+const DEPLOYMENT_CONFIG_DOES_NOT_EXIST: &str = "DeploymentConfigDoesNotExistException";
+
+/// How one declared property reaches the CodeDeploy create that takes it — the one thing
+/// the properties of these types differ in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeDeployMember {
+    /// The value as the template wrote it: the property is a scalar or a list of scalars,
+    /// or the members inside it are spelled by CodeDeploy exactly as the property spells
+    /// them (its `EC2TagFilter` and `TagFilter` shapes both spell `Key`, `Value` and
+    /// `Type`).
+    Verbatim,
+    /// The value with every member name inside it lower-camel cased, which is how
+    /// CodeDeploy spells the members a property names in upper camel
+    /// (`DeploymentStyle: {DeploymentType}` is `deploymentStyle: {deploymentType}`).
+    LowerCamel,
+    /// A WRAPPER structure whose own member is lower-camel cased while what it holds is
+    /// carried verbatim: an `Ec2TagSet`'s `Ec2TagSetList` is `ec2TagSetList`, and the
+    /// `EC2TagFilter` groups inside it keep their upper-camel members.
+    WrappedVerbatim,
+}
+
+/// The `AWS::CodeDeploy::Application` properties `CreateApplication` takes, as
+/// `(property, member, rule)`.
+///
+/// Source: that type's CloudFormation resource reference (`ApplicationName`,
+/// `ComputePlatform`, `Tags`) against `CreateApplicationInput`. The two the arm pushes
+/// itself are in [`CODEDEPLOY_APPLICATION_PROPERTIES_NOT_SENT`].
+const CODEDEPLOY_APPLICATION_MEMBERS: &[(&str, &str, CodeDeployMember)] =
+    &[("ComputePlatform", "computePlatform", CodeDeployMember::Verbatim)];
+
+/// The `AWS::CodeDeploy::Application` properties the arm pushes itself: the application's
+/// name, which is this resource's physical id, and its tags, which reach the create merged
+/// with the ones CloudFormation gives the resource ([`tags_of`]).
+const CODEDEPLOY_APPLICATION_PROPERTIES_NOT_SENT: &[&str] = &["ApplicationName", "Tags"];
+
+/// The `AWS::CodeDeploy::DeploymentGroup` properties `CreateDeploymentGroup` takes.
+///
+/// Source: that type's CloudFormation resource reference against
+/// `CreateDeploymentGroupInput`, member by member. Every one of them is the property with
+/// its initial letter lower-cased except `ECSServices`, whose member CodeDeploy spells
+/// `ecsServices`; the rule beside each says how far INTO the value that re-casing goes
+/// ([`CodeDeployMember`]).
+const CODEDEPLOY_DEPLOYMENT_GROUP_MEMBERS: &[(&str, &str, CodeDeployMember)] = &[
+    (
+        "AlarmConfiguration",
+        "alarmConfiguration",
+        CodeDeployMember::LowerCamel,
+    ),
+    (
+        "AutoRollbackConfiguration",
+        "autoRollbackConfiguration",
+        CodeDeployMember::LowerCamel,
+    ),
+    (
+        "AutoScalingGroups",
+        "autoScalingGroups",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "BlueGreenDeploymentConfiguration",
+        "blueGreenDeploymentConfiguration",
+        CodeDeployMember::LowerCamel,
+    ),
+    (
+        "DeploymentConfigName",
+        "deploymentConfigName",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "DeploymentStyle",
+        "deploymentStyle",
+        CodeDeployMember::LowerCamel,
+    ),
+    ("ECSServices", "ecsServices", CodeDeployMember::LowerCamel),
+    (
+        "Ec2TagFilters",
+        "ec2TagFilters",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "Ec2TagSet",
+        "ec2TagSet",
+        CodeDeployMember::WrappedVerbatim,
+    ),
+    (
+        "LoadBalancerInfo",
+        "loadBalancerInfo",
+        CodeDeployMember::LowerCamel,
+    ),
+    (
+        "OnPremisesInstanceTagFilters",
+        "onPremisesInstanceTagFilters",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "OnPremisesTagSet",
+        "onPremisesTagSet",
+        CodeDeployMember::WrappedVerbatim,
+    ),
+    (
+        "OutdatedInstancesStrategy",
+        "outdatedInstancesStrategy",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "ServiceRoleArn",
+        "serviceRoleArn",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "TerminationHookEnabled",
+        "terminationHookEnabled",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "TriggerConfigurations",
+        "triggerConfigurations",
+        CodeDeployMember::LowerCamel,
+    ),
+];
+
+/// The `AWS::CodeDeploy::DeploymentGroup` properties the arm does not send to
+/// `CreateDeploymentGroup`: the two that make the group's identity (the application it
+/// belongs to and its own name, which is this resource's physical id), its tags — which
+/// reach the create merged with CloudFormation's ([`tags_of`]) — and `Deployment`, which is
+/// a `CreateDeployment` of its own ([`create_codedeploy_deployment`]).
+const CODEDEPLOY_DEPLOYMENT_GROUP_PROPERTIES_NOT_SENT: &[&str] = &[
+    "ApplicationName",
+    "DeploymentGroupName",
+    "Deployment",
+    "Tags",
+];
+
+/// The members of a deployment group's `Deployment` property, as `CreateDeployment` takes
+/// them.
+///
+/// Source: that property's own reference (`Description`,
+/// `IgnoreApplicationStopFailures`, `Revision`) against `CreateDeploymentInput`. A
+/// revision's members are CodeDeploy's `RevisionLocation` in lower camel all the way down
+/// (`S3Location.ETag` is `s3Location.eTag`), so the whole value is re-cased.
+const CODEDEPLOY_DEPLOYMENT_MEMBERS: &[(&str, &str, CodeDeployMember)] = &[
+    ("Description", "description", CodeDeployMember::Verbatim),
+    (
+        "IgnoreApplicationStopFailures",
+        "ignoreApplicationStopFailures",
+        CodeDeployMember::Verbatim,
+    ),
+    ("Revision", "revision", CodeDeployMember::LowerCamel),
+];
+
+/// The `AWS::CodeDeploy::DeploymentConfig` properties `CreateDeploymentConfig` takes.
+///
+/// Source: that type's CloudFormation resource reference against
+/// `CreateDeploymentConfigInput`. `MinimumHealthyHosts`, `TrafficRoutingConfig` and
+/// `ZonalConfig` are structures CodeDeploy spells in lower camel all the way down
+/// (`MinimumHealthyHosts: {Type, Value}` is `minimumHealthyHosts: {type, value}`).
+const CODEDEPLOY_DEPLOYMENT_CONFIG_MEMBERS: &[(&str, &str, CodeDeployMember)] = &[
+    (
+        "ComputePlatform",
+        "computePlatform",
+        CodeDeployMember::Verbatim,
+    ),
+    (
+        "MinimumHealthyHosts",
+        "minimumHealthyHosts",
+        CodeDeployMember::LowerCamel,
+    ),
+    (
+        "TrafficRoutingConfig",
+        "trafficRoutingConfig",
+        CodeDeployMember::LowerCamel,
+    ),
+    ("ZonalConfig", "zonalConfig", CodeDeployMember::LowerCamel),
+];
+
+/// The one `AWS::CodeDeploy::DeploymentConfig` property the arm pushes itself: the
+/// configuration's name, which is this resource's physical id.
+const CODEDEPLOY_DEPLOYMENT_CONFIG_PROPERTIES_NOT_SENT: &[&str] = &["DeploymentConfigName"];
+
+/// Create the application an `AWS::CodeDeploy::Application` declares, so a client that
+/// deployed the stack and then calls `codedeploy GetApplication` with the name the stack
+/// publishes reads the application back rather than an `ApplicationDoesNotExistException`.
+///
+/// "Ref returns the application name", which is this resource's physical id, so the
+/// application is created under the name CloudFormation decided and the type publishes no
+/// `Fn::GetAtt` attribute for the arm to adopt. It carries the tags the declaration asks
+/// for plus the ones CloudFormation gives the resource ([`tags_of`]), as the `[{Key,
+/// Value}]` list CodeDeploy's own `Tag` shape spells.
+async fn create_codedeploy_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = codedeploy_request(
+        &resource.properties,
+        CODEDEPLOY_APPLICATION_MEMBERS,
+        CODEDEPLOY_APPLICATION_PROPERTIES_NOT_SENT,
+        CODEDEPLOY_APPLICATION,
+    )?;
+    request.insert(
+        "applicationName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    call_codedeploy(ctx, region, "CreateApplication", &Value::Object(request)).await?;
+    Ok(Created::default())
+}
+
+/// Create the deployment group an `AWS::CodeDeploy::DeploymentGroup` declares, under the
+/// application its declaration names.
+///
+/// "Ref returns the deployment group name", which is this resource's physical id, so the
+/// group is created under the name CloudFormation decided. A group is addressed by the pair
+/// `(applicationName, deploymentGroupName)` and the application half is a required property
+/// of the type: a declaration carrying none describes no group that could be created, so it
+/// is refused here rather than sent as a request CodeDeploy would have to reject
+/// ([`codedeploy_application_of`]).
+///
+/// The group's `Deployment` property is the one thing `CreateDeploymentGroup` has no member
+/// for: it is an application revision to deploy to the group once it exists, so it is a
+/// `CreateDeployment` on the group just created ([`create_codedeploy_deployment`]) — the
+/// same second call a client makes.
+async fn create_codedeploy_deployment_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let application = codedeploy_application_of(resource)?;
+    let mut request = codedeploy_request(
+        &resource.properties,
+        CODEDEPLOY_DEPLOYMENT_GROUP_MEMBERS,
+        CODEDEPLOY_DEPLOYMENT_GROUP_PROPERTIES_NOT_SENT,
+        CODEDEPLOY_DEPLOYMENT_GROUP,
+    )?;
+    request.insert(
+        "applicationName".to_string(),
+        Value::String(application.clone()),
+    );
+    request.insert(
+        "deploymentGroupName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    call_codedeploy(
+        ctx,
+        region,
+        "CreateDeploymentGroup",
+        &Value::Object(request),
+    )
+    .await?;
+    if let Some(declared) = resource.properties.get("Deployment") {
+        create_codedeploy_deployment(
+            ctx,
+            region,
+            &application,
+            &resource.physical_resource_id,
+            declared,
+        )
+        .await?;
+    }
+    // The type's identity is the pair the stack already records (its physical id and its
+    // declared `ApplicationName`), so there is no identifier to adopt from the answer.
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Deploy the revision a deployment group's `Deployment` property declares to the group the
+/// stack has just created, through CodeDeploy's own `CreateDeployment`.
+///
+/// The property's members are that call's own ([`CODEDEPLOY_DEPLOYMENT_MEMBERS`]) beside the
+/// two that say WHERE the deployment goes, which are the group's identity rather than
+/// anything the property states.
+async fn create_codedeploy_deployment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    application: &str,
+    deployment_group: &str,
+    declared: &Value,
+) -> Result<(), Refusal> {
+    let mut request = codedeploy_request(
+        declared,
+        CODEDEPLOY_DEPLOYMENT_MEMBERS,
+        &[],
+        CODEDEPLOY_DEPLOYMENT_GROUP,
+    )?;
+    request.insert(
+        "applicationName".to_string(),
+        Value::String(application.to_string()),
+    );
+    request.insert(
+        "deploymentGroupName".to_string(),
+        Value::String(deployment_group.to_string()),
+    );
+    call_codedeploy(ctx, region, "CreateDeployment", &Value::Object(request)).await?;
+    Ok(())
+}
+
+/// Create the deployment configuration an `AWS::CodeDeploy::DeploymentConfig` declares, so
+/// a deployment group of the same stack can name it and `codedeploy GetDeploymentConfig`
+/// resolves it.
+///
+/// "Ref returns the deployment configuration name", which is this resource's physical id.
+async fn create_codedeploy_deployment_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = codedeploy_request(
+        &resource.properties,
+        CODEDEPLOY_DEPLOYMENT_CONFIG_MEMBERS,
+        CODEDEPLOY_DEPLOYMENT_CONFIG_PROPERTIES_NOT_SENT,
+        CODEDEPLOY_DEPLOYMENT_CONFIG,
+    )?;
+    request.insert(
+        "deploymentConfigName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    call_codedeploy(
+        ctx,
+        region,
+        "CreateDeploymentConfig",
+        &Value::Object(request),
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Delete the application a stack created, addressed by its name — this resource's physical
+/// id.
+///
+/// `DeleteApplication` models no does-not-exist error at all (`ApplicationNameRequired`,
+/// `InvalidApplicationName` and `InvalidRole` are its whole error list), so an application
+/// CodeDeploy no longer holds is already in the state the delete asks for and the call says
+/// so itself.
+async fn delete_codedeploy_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "applicationName": physical_resource_id });
+    call_codedeploy(ctx, region, "DeleteApplication", &request).await?;
+    Ok(())
+}
+
+/// Delete the deployment group a stack created, addressed by the pair that identifies it:
+/// the application its declaration names and its own name, which is this resource's
+/// physical id.
+///
+/// `DeleteDeploymentGroup` models no does-not-exist error either, for the application or
+/// for the group, so one CodeDeploy no longer holds is already in the state the delete asks
+/// for.
+async fn delete_codedeploy_deployment_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({
+        "applicationName": codedeploy_application_of(resource)?,
+        "deploymentGroupName": resource.physical_resource_id.clone(),
+    });
+    call_codedeploy(ctx, region, "DeleteDeploymentGroup", &request).await?;
+    Ok(())
+}
+
+/// Delete the deployment configuration a stack created, addressed by its name — this
+/// resource's physical id.
+///
+/// `DeleteDeploymentConfig` models no does-not-exist error (`DeploymentConfigInUse`,
+/// `DeploymentConfigNameRequired`, `InvalidDeploymentConfigName` and `InvalidOperation` are
+/// its whole error list), so one CodeDeploy no longer holds is already in the state the
+/// delete asks for; one a deployment group still uses is NOT deleted, and that refusal is
+/// what the stack reports.
+async fn delete_codedeploy_deployment_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "deploymentConfigName": physical_resource_id });
+    call_codedeploy(ctx, region, "DeleteDeploymentConfig", &request).await?;
+    Ok(())
+}
+
+/// The application's configuration as CodeDeploy reports it, for drift detection. One it no
+/// longer holds (`ApplicationDoesNotExistException`, judged on the CODE and never on a
+/// message that carries the request's own name) was deleted.
+///
+/// `GetApplication` answers an `ApplicationInfo` whose `applicationName` and
+/// `computePlatform` are the two properties of this type CodeDeploy reports; the rest of
+/// that structure is the application's own history (its id, its creation time, its GitHub
+/// link), which no property declares.
+async fn describe_codedeploy_application(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "applicationName": physical_resource_id });
+    match call_codedeploy(ctx, region, "GetApplication", &request).await {
+        Ok(answer) => {
+            let Some(application) = answer.get("application") else {
+                return Ok(None);
+            };
+            Ok(Some(reported_as_properties(
+                application,
+                &[
+                    ("ApplicationName", "applicationName"),
+                    ("ComputePlatform", "computePlatform"),
+                ],
+            )))
+        }
+        Err(refusal) if refusal.code == APPLICATION_DOES_NOT_EXIST => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The deployment group's configuration as CodeDeploy reports it, for drift detection,
+/// addressed by the pair that identifies it. A group it no longer holds — and an
+/// application it no longer holds, which cannot hold the group either — was deleted.
+///
+/// The properties reported are the SCALAR members `GetDeploymentGroup` answers under a name
+/// this type declares its properties with. Its instance-selection lists are deliberately
+/// not among them: CodeDeploy answers an `autoScalingGroups` list of structures where the
+/// property is a list of names, and a property the read does not report is not evidence of
+/// anything ([`super::drift`]).
+async fn describe_codedeploy_deployment_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({
+        "applicationName": codedeploy_application_of(resource)?,
+        "deploymentGroupName": resource.physical_resource_id.clone(),
+    });
+    match call_codedeploy(ctx, region, "GetDeploymentGroup", &request).await {
+        Ok(answer) => {
+            let Some(group) = answer.get("deploymentGroupInfo") else {
+                return Ok(None);
+            };
+            Ok(Some(reported_as_properties(
+                group,
+                &[
+                    ("ApplicationName", "applicationName"),
+                    ("DeploymentGroupName", "deploymentGroupName"),
+                    ("DeploymentConfigName", "deploymentConfigName"),
+                    ("ServiceRoleArn", "serviceRoleArn"),
+                    ("OutdatedInstancesStrategy", "outdatedInstancesStrategy"),
+                    ("TerminationHookEnabled", "terminationHookEnabled"),
+                ],
+            )))
+        }
+        Err(refusal)
+            if refusal.code == DEPLOYMENT_GROUP_DOES_NOT_EXIST
+                || refusal.code == APPLICATION_DOES_NOT_EXIST =>
+        {
+            Ok(None)
+        }
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The deployment configuration as CodeDeploy reports it, for drift detection. One it no
+/// longer holds (`DeploymentConfigDoesNotExistException`) was deleted.
+///
+/// The two properties reported are the scalar members `GetDeploymentConfig` answers under a
+/// name this type declares: its name and its compute platform. Its
+/// `minimumHealthyHosts`, `trafficRoutingConfig` and `zonalConfig` are answered with
+/// CodeDeploy's own lower-camel member names inside them, which the type's properties spell
+/// in upper camel, so comparing the two spellings would report drift where there is none.
+async fn describe_codedeploy_deployment_config(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "deploymentConfigName": physical_resource_id });
+    match call_codedeploy(ctx, region, "GetDeploymentConfig", &request).await {
+        Ok(answer) => {
+            let Some(configuration) = answer.get("deploymentConfigInfo") else {
+                return Ok(None);
+            };
+            Ok(Some(reported_as_properties(
+                configuration,
+                &[
+                    ("DeploymentConfigName", "deploymentConfigName"),
+                    ("ComputePlatform", "computePlatform"),
+                ],
+            )))
+        }
+        Err(refusal) if refusal.code == DEPLOYMENT_CONFIG_DOES_NOT_EXIST => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The application a deployment group's declaration names — the other half of the group's
+/// identity.
+///
+/// `ApplicationName` is a required property of the type, so a declaration carrying none is
+/// refused here, naming that property, rather than sent as a request CodeDeploy would
+/// reject.
+fn codedeploy_application_of(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "ApplicationName").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no ApplicationName", resource.resource_type),
+    })
+}
+
+/// The request one evaluated property document is, against the member catalogue of the
+/// CodeDeploy call that takes it.
+///
+/// `not_sent` are the properties the ARM itself pushes or that belong to another call.
+/// Every other property has to be in `members`: one that is not is REFUSED, for the reason
+/// [`query_members`] records — a resource created without a property its declaration asked
+/// for is configured differently from what the template declared, and the stack would have
+/// reported it as created.
+fn codedeploy_request(
+    properties: &Value,
+    members: &[(&str, &str, CodeDeployMember)],
+    not_sent: &[&str],
+    resource_type: &str,
+) -> Result<Map<String, Value>, Refusal> {
+    let mut request = Map::new();
+    let Some(properties) = properties.as_object() else {
+        return Ok(request);
+    };
+    for (property, value) in properties {
+        if not_sent.contains(&property.as_str()) {
+            continue;
+        }
+        let Some((_, member, rule)) = members
+            .iter()
+            .find(|(declared, _, _)| *declared == property.as_str())
+        else {
+            return Err(Refusal {
+                code: NOT_IMPLEMENTED.to_string(),
+                message: format!(
+                    "this emulator does not send {resource_type}'s {property} property to \
+                     the service that owns the type, so the resource was not created"
+                ),
+            });
+        };
+        let carried = match rule {
+            CodeDeployMember::Verbatim => value.clone(),
+            CodeDeployMember::LowerCamel => lower_camel_members(value, 0)?,
+            CodeDeployMember::WrappedVerbatim => wrapped_verbatim(value),
+        };
+        request.insert((*member).to_string(), carried);
+    }
+    Ok(request)
+}
+
+/// One wrapper structure under the member names its API spells — the property's initial
+/// letter lower-cased — with each value carried as the template wrote it.
+///
+/// That is what an `Ec2TagSet` and an `OnPremisesTagSet` need: the wrapper's own member is
+/// `ec2TagSetList`/`onPremisesTagSetList`, while the tag-filter groups inside it keep the
+/// `Key`/`Value`/`Type` members CodeDeploy's own filter shapes spell.
+fn wrapped_verbatim(value: &Value) -> Value {
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, inner)| (lower_initial(name), inner.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Call one CodeDeploy operation on the awsJson1_1 wire its model declares.
+async fn call_codedeploy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        CODEDEPLOY_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{CODEDEPLOY_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 #[cfg(test)]

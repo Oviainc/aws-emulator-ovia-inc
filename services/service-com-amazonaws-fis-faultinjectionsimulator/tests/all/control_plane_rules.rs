@@ -253,20 +253,22 @@ async fn the_wait_actions_duration_is_bounded_when_the_template_is_created() {
     }
 }
 
-/// RULE: the duration bound belongs to the `aws:fis:wait` action, not to every parameter
-/// called `duration`: an action FIS defines elsewhere carries its own parameter catalog,
-/// which this service does not hold, so its parameters are stored as sent.
+/// RULE: the documented 1-to-720-minute range belongs to the `aws:fis:wait` action's
+/// `duration`, not to every parameter called `duration`: FIS publishes a range for the
+/// wait's own duration and none for another action's, so another action's is stored as
+/// sent.
 #[tokio::test]
 async fn another_actions_parameters_are_stored_as_sent() {
     let router = emulator();
 
-    // The rows differ along the action id, including two that take a duration-shaped
-    // parameter well outside the wait action's bound.
+    // The rows differ along the action id and along what its published contract says about
+    // a `duration`: one whose contract records no such parameter, one that takes no
+    // parameter at all, and one that REQUIRES a duration — each carrying a span well
+    // outside the wait action's bound.
     let rows = [
         ("stop-instances", "aws:ec2:stop-instances", "PT13H"),
         ("reboot-instances", "aws:ec2:reboot-instances", "P2Y"),
-        (
-            "ssm-command", "aws:ssm:send-command", "PT0S"),
+        ("pause-volume-io", "aws:ebs:pause-volume-io", "PT0S"),
     ];
 
     for (case, action_id, duration) in rows {
@@ -449,15 +451,17 @@ async fn reusing_a_client_token_for_a_different_create_request_is_a_conflict() {
             }
         },
         "actions": {
-            "wait": {
-                "actionId": "aws:fis:wait",
-                "parameters": { "duration": WAIT_DURATION },
-                "targets": { "Instances": "web", "Spare": "web" }
+            "stop": {
+                "actionId": "aws:ec2:stop-instances",
+                "parameters": { "startInstancesAfterDuration": WAIT_DURATION },
+                // The one target key `aws:ec2:stop-instances` publishes, naming the target
+                // this template declares for it.
+                "targets": { "Instances": "web" }
             },
             "second": {
                 "actionId": "aws:fis:wait",
                 "parameters": { "duration": "PT9M" },
-                "startAfter": ["wait"]
+                "startAfter": ["stop"]
             }
         },
         "tags": { "Owner": "chaos", "Stage": "test", "Tier": "web" }

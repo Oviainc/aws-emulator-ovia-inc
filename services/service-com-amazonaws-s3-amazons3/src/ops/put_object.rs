@@ -596,6 +596,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // above, and a retention is placed on a stored version afterwards, by
             // `PutObjectRetention`.
             retention: None,
+            // Nor a legal hold, for the same reason: `PutObjectLegalHold` is what applies
+            // one to a stored version.
+            legal_hold: None,
             // A write initiates no restore either: a restore is asked for on an
             // already-archived version afterwards, by `RestoreObject`.
             restore: None,

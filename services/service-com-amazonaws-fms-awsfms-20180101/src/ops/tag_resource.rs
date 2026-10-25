@@ -128,22 +128,6 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 /// "the operation exceeds a resource limit".
 const MAX_TAGS_PER_RESOURCE: usize = 200;
 
-/// The first tag key `tag_list` carries more than once, if any.
-///
-/// Keys are case-SENSITIVE (`com.amazonaws.fms#Tag$Key`: "Tag keys are
-/// case-sensitive"), so `env` and `Env` are two keys, not one repeated.
-fn first_duplicate_key(tag_list: &[Tag]) -> Option<&str> {
-    tag_list
-        .iter()
-        .enumerate()
-        .find(|(index, tag)| {
-            tag_list[..*index]
-                .iter()
-                .any(|earlier| earlier.key == tag.key)
-        })
-        .map(|(_, tag)| tag.key.as_str())
-}
-
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -200,13 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // One key cannot carry two values, so a request listing a key twice has
-        // no single outcome: it is refused rather than silently resolved.
-        if let Some(duplicate) = first_duplicate_key(&input.tag_list) {
+        // no single outcome: it is refused rather than silently resolved. The
+        // check and its wording live in `crate::state`, shared with every other
+        // operation that writes a `TagList`.
+        if let Some(message) = crate::state::duplicate_tag_key_message(&input.tag_list) {
             return Err(TagResourceErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(format!(
-                        "TagList contains the tag key {duplicate} more than once"
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

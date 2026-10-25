@@ -51,6 +51,8 @@ mod restore_table;
 mod service_managed_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/static_columns_require_clustering_keys.rs"]
+mod static_columns_require_clustering_keys;
 #[path = "all/type_lifecycle.rs"]
 mod type_lifecycle;
 #[path = "all/update_keyspace.rs"]

@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnomalyDetectors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnomalyDetectors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the anomaly detectors the named workspace HOLDS, read off the
+//! persisted records — narrowed to the detectors whose stored `alias` IS the one the
+//! request names when it names one, ordered by `anomalyDetectorId` and served one
+//! bounded page at a time with `nextToken` as the cursor.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnomalyDetectors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every caller-supplied input only NARROWS that page: `alias` and `nextToken` are
+//! filters over the detectors the workspace `{workspaceId}` names holds, so no value on
+//! the query string can make this read report a detector the request did not name, and
+//! nothing it carries reaches anything outside this service's own store. A value outside
+//! a member's modelled constraint is refused with the modelled `ValidationException`
+//! (400) before any record is reported, and a `{workspaceId}` this account does not hold
+//! with the modelled `ResourceNotFoundException` (404), as every other operation under
+//! `/workspaces/{workspaceId}` answers it. `tests/all/anomaly_detector_listing.rs` pins
+//! the rule over the aliases, page sizes and cursors a caller can send.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +164,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnomalyDetectors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnomalyDetectorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnomalyDetectors"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAnomalyDetectorsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The transitions the clock already owes (a detector's move out of CREATING or
+        // UPDATING, and the removal of one whose DELETING span is up) are materialised
+        // first, so this listing reports the same state a caller would read through
+        // `DescribeAnomalyDetector` at this instant.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The detectors listed are the ones "in a workspace", so without that workspace
+        // there is nothing to list: `ResourceNotFoundException` (404), the same refusal
+        // every per-workspace operation in this crate answers with.
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(ListAnomalyDetectorsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: input.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "Filters the results to anomaly detectors with the specified alias" — the
+        // detectors whose stored alias IS that value, not the ones it is a prefix of,
+        // which is how this service's other alias filter (`ListScrapers`' `alias` key)
+        // selects too.
+        let alias = input.alias.as_deref();
+
+        let mut detectors: Vec<&crate::state::AnomalyDetector> = workspace
+            .anomaly_detectors
+            .values()
+            .filter(|detector| alias.is_none_or(|wanted| detector.alias == wanted))
+            .collect();
+        // The detector map is keyed by id but unordered, so the page is put in ONE stable
+        // order here: a page boundary then means the same thing on every call, which is
+        // what makes `nextToken` a usable cursor.
+        detectors.sort_by(|left, right| left.anomaly_detector_id.cmp(&right.anomaly_detector_id));
+
+        // `nextToken` is the cursor this operation itself emitted: the id of the last
+        // summary of the previous page, so the next page starts after it. It is a FILTER
+        // over the records already selected above, never a key into the store: whatever a
+        // caller sends — including a token another workspace's listing minted — can only
+        // drop entries from this workspace's page.
+        if let Some(cursor) = input.next_token.as_deref() {
+            detectors.retain(|detector| detector.anomaly_detector_id.as_str() > cursor);
+        }
+
+        // "The maximum number of results to return in a single call. Valid range is 1 to
+        // 1000." (`ListAnomalyDetectorsRequest$maxResults`, modelled
+        // `@range(min: 1, max: 1000)`.) Clamped here rather than trusted from the
+        // request, so the amount of work one call does is bounded by this service.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::ANOMALY_DETECTOR_PAGE_DEFAULT, |max| {
+                max.clamp(1, crate::state::ANOMALY_DETECTOR_PAGE_LIMIT)
+            }) as usize;
+
+        let has_more = detectors.len() > page_size;
+        detectors.truncate(page_size);
+        // "The pagination token to retrieve the next set of results" — emitted ONLY when
+        // a further page exists, never on the last one.
+        let next_token = if has_more {
+            detectors
+                .last()
+                .map(|detector| detector.anomaly_detector_id.clone())
+        } else {
+            None
+        };
+
+        Ok(ListAnomalyDetectorsOutput {
+            anomaly_detectors: detectors
+                .into_iter()
+                .map(|detector| AnomalyDetectorSummary {
+                    arn: detector.arn.clone(),
+                    anomaly_detector_id: detector.anomaly_detector_id.clone(),
+                    alias: detector.alias.clone(),
+                    status: AnomalyDetectorStatus {
+                        status_code: detector.status_code.clone(),
+                        // Nothing in this emulator fails a detector, so there is no
+                        // reason to report beside the status code.
+                        status_reason: None,
+                    },
+                    created_at: ::aws_smithy_types::DateTime::from(detector.created_at),
+                    modified_at: ::aws_smithy_types::DateTime::from(detector.modified_at),
+                    tags: crate::state::tag_map(&detector.tags),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
+

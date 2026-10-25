@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProperties
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProperties`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the properties of ONE component — "lists the properties of a component" — a
+//! page at a time, each row read out of stored state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProperties::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which properties those are is the whole of this operation. A component HAS the
+//! properties it stores itself AND the ones the component type it instantiates — or a
+//! type that type extends — defines and it never restated, because naming a
+//! `componentTypeId` is what gives a component that type's properties
+//! ([`crate::state::Workspace::component_property_names`]). Each one is reported with
+//! the definition that gives it its meaning (the component's own, else the inherited
+//! one — [`crate::state::Workspace::effective_property_definition`]) and the value it
+//! reads as: the value written to the property, else the default its definition
+//! declares, and no `value` member at all when neither exists
+//! ([`crate::state::latest_property_value`]) — the same answer `GetPropertyValue`
+//! gives for the same property.
+//!
+//! The component is addressed the way every reader of this service's component tree
+//! addresses one: `componentPath` names a component anywhere in the tree ("the path to
+//! the composite component, starting from the top-level component"), and
+//! `componentName` names a top-level component. A path takes precedence over a name,
+//! as it does on `GetPropertyValue`, since it is the more specific address. A request
+//! carrying neither addresses no component and is refused with the modelled
+//! `ValidationException` (HTTP 400): a `PropertySummary` names no component, so a page
+//! is the properties of one component or of nothing. A workspace, entity or component
+//! this service holds nothing at is the modelled `ResourceNotFoundException`
+//! (HTTP 404); a component with no property at all is a page of no rows, not a
+//! refusal.
+//!
+//! `maxResults` caps the page. This member's documentation publishes a default of 25
+//! and no minimum, so a zero is a page of no rows — the maximum number of results
+//! returned, literally — and a request naming none is served
+//! [`crate::state::DEFAULT_PAGE_SIZE`] rather than every property; the service never
+//! serves more than [`crate::state::MAX_PAGE_SIZE`] rows whatever is asked for. The
+//! opaque `nextToken` resumes at the next property NAME rather than at an offset, so a
+//! page boundary survives a property being added or removed between two pages; it is
+//! bound to the workspace, entity and component address it was minted for, and a token
+//! this listing did not mint is refused with the modelled `ValidationException`.
+//!
+//! This is a REPORTING operation: it writes nothing, and a property has no lifecycle of
+//! its own for the clock to settle.
+//!
+//! The modelled `AccessDeniedException` and `ThrottlingException` are deliberately
+//! unreachable here: this emulator models no caller principal and no rate state, so
+//! nothing this handler can read would decide either, and a served page is never
+//! evidence that a real authorization or quota check passed.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +193,289 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProperties` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPropertiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProperties"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListProperties",
+            workspace_id = %input.workspace_id,
+            entity_id = %input.entity_id,
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so neither are its entities' properties.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPropertiesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        // A read, so the store is borrowed immutably: a property carries no
+        // state of its own, so this call has no transition to materialise and
+        // nothing a later caller sees changes because a page was served.
+        let state = state.lock();
+        let state = state.region(&region);
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(not_found(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            )));
+        };
+        let Some(entity) = workspace.entities.get(&input.entity_id) else {
+            return Err(not_found(crate::state::entity_not_found_message(
+                &input.workspace_id,
+                &input.entity_id,
+            )));
+        };
+        let component = addressed_component(entity, &input)?;
+
+        // A `nextToken` carries the property NAME the page resumes AT
+        // (inclusive), not an offset, so a page boundary survives a property
+        // being added or removed between two pages. It is bound to the
+        // workspace, entity and component it was minted for, so a token from
+        // another listing — or from this listing taken over another component —
+        // is refused rather than silently resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(decode_next_token(&input, token).ok_or_else(|| {
+                // The token itself is NOT echoed back: it is opaque to the
+                // caller and modelled up to 17880 characters, so the refusal
+                // names the member and what is wrong with it rather than
+                // copying an arbitrary request string into the response.
+                invalid("nextToken is not a token this listing minted".to_string())
+            })?),
+        };
+
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member's
+        // documentation publishes a default of 25 and no minimum, so a zero is
+        // served as what it says — a page of no rows — rather than refused, and
+        // a request naming no `maxResults` is served this service's own default
+        // instead of every property the component has. Whatever is asked for,
+        // the service serves at most `crate::state::MAX_PAGE_SIZE`, so the page
+        // this call BUILDS is bounded by that code and not only by the boundary
+        // validator.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_zero(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
+
+        // Every property the component has, in name order — which is what this
+        // listing pages by, so resuming is a skip to the first name at or past
+        // the token's.
+        let property_names =
+            workspace.component_property_names(component.component_type_id, component.properties);
+        let mut remaining = property_names.into_iter().skip_while(|property_name| {
+            resume_at
+                .as_deref()
+                .is_some_and(|from| property_name.as_str() < from)
+        });
+
+        let mut property_summaries = Vec::new();
+        for property_name in remaining.by_ref().take(page_size) {
+            property_summaries.push(property_summary(workspace, &component, property_name));
+        }
+        // The token the next call resumes at: the first property this page left
+        // over. Absent on the last page, which is how a caller knows to stop.
+        let next_token = remaining
+            .next()
+            .map(|property_name| encode_next_token(&input, &property_name));
+
+        Ok(ListPropertiesOutput {
+            property_summaries,
+            next_token,
+        })
     }
+}
+
+/// Refuse the request, naming what about it cannot be served. The operation
+/// models `ValidationException` itself, so the refusal is the modelled shape
+/// rather than the scaffold wrapper's.
+fn invalid(message: String) -> ListPropertiesError {
+    ListPropertiesErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Answer that something the request named does not exist. Unlike this
+/// service's workspace-scoped listings, this operation DOES model a
+/// `ResourceNotFoundException`, so a component it holds nothing at is reported
+/// as the missing resource it is rather than as a bad request.
+fn not_found(message: String) -> ListPropertiesError {
+    ListPropertiesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The component a page is taken over: the two things deciding which properties
+/// it has and what each of them reads as — the component type it instantiates
+/// (whose definitions it inherits) and the property records it stores itself.
+/// Both a top-level and a composite component carry exactly these, which is why
+/// one page is built from either.
+struct AddressedComponent<'a> {
+    component_type_id: Option<&'a str>,
+    properties: &'a ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+}
+
+/// The component the request addresses: the one `componentPath` leads to, else
+/// the top-level component `componentName` names.
+///
+/// A path is the more specific address, so it takes precedence — the same
+/// precedence `GetPropertyValue` gives it. A path of one segment names a
+/// top-level component ("the path to the composite component, STARTING FROM the
+/// top-level component", so the top-level component is the path's first
+/// segment); a longer one names the composite component stored under the rest of
+/// the path inside it, which is the key
+/// [`crate::state::ComponentRecord::composite_components`] holds it under.
+fn addressed_component<'a>(
+    entity: &'a crate::state::Entity,
+    input: &ListPropertiesInput,
+) -> Result<AddressedComponent<'a>, ListPropertiesError> {
+    match (
+        input.component_path.as_deref(),
+        input.component_name.as_deref(),
+    ) {
+        (Some(component_path), _) => component_at_path(entity, component_path).ok_or_else(|| {
+            not_found(format!(
+                "entity {} of workspace {} has no component at componentPath \
+                 {component_path}",
+                input.entity_id, input.workspace_id
+            ))
+        }),
+        (None, Some(component_name)) => entity
+            .components
+            .get(component_name)
+            .map(|component| AddressedComponent {
+                component_type_id: component.component_type_id.as_deref(),
+                properties: &component.properties,
+            })
+            .ok_or_else(|| {
+                not_found(format!(
+                    "entity {} of workspace {} has no component {component_name}",
+                    input.entity_id, input.workspace_id
+                ))
+            }),
+        // A `PropertySummary` names no component, so a page is the properties of
+        // ONE component: with neither member the request addresses none.
+        (None, None) => Err(invalid(
+            "componentName or componentPath is required: one of them is what addresses \
+             the component whose properties are listed"
+                .to_string(),
+        )),
+    }
+}
+
+/// The component `component_path` leads to, or `None` when the entity holds none
+/// there. See [`addressed_component`] for how a path is read.
+fn component_at_path<'a>(
+    entity: &'a crate::state::Entity,
+    component_path: &str,
+) -> Option<AddressedComponent<'a>> {
+    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
+        None => {
+            let component = entity.components.get(component_path)?;
+            Some(AddressedComponent {
+                component_type_id: component.component_type_id.as_deref(),
+                properties: &component.properties,
+            })
+        }
+        Some((component_name, composite_path)) => {
+            let composite = entity
+                .components
+                .get(component_name)?
+                .composite_components
+                .get(composite_path)?;
+            Some(AddressedComponent {
+                component_type_id: Some(&composite.component_type_id),
+                properties: &composite.properties,
+            })
+        }
+    }
+}
+
+/// One property of the addressed component as the modelled `PropertySummary`.
+///
+/// Every member is read through the projection its kind of reader shares, so one
+/// property says the same thing here as it does through `GetEntity` and
+/// `GetPropertyValue`: the definition that gives the property its meaning —
+/// the component's own, else the one it inherits from the component type it
+/// instantiates — the value the property reads as, and whether every value of a
+/// list- or map-typed one was reported.
+fn property_summary(
+    workspace: &crate::state::Workspace,
+    component: &AddressedComponent<'_>,
+    property_name: String,
+) -> PropertySummary {
+    let definition = workspace.effective_property_definition(
+        component.component_type_id,
+        component.properties,
+        &property_name,
+    );
+    let value =
+        crate::state::latest_property_value(component.properties.get(&property_name), definition);
+    PropertySummary {
+        definition: definition.and_then(crate::state::property_definition_response),
+        property_name,
+        are_all_property_values_returned: Some(crate::state::all_property_values_returned(
+            value.as_ref(),
+        )),
+        value,
+    }
+}
+
+/// The top of the `maxResults` member's modelled `range` (0..200), which is the
+/// only maximum published for it — its documentation names none.
+///
+/// This listing never serves a page larger than [`crate::state::MAX_PAGE_SIZE`],
+/// so that ceiling must be EXACTLY what this operation's member admits — no
+/// larger, or a page could leave the range the model allows; no smaller, or a
+/// `maxResults` this member admits would be silently narrowed — and the default
+/// may never exceed it. Checked at COMPILE time, so moving either past what the
+/// model allows fails the build instead of serving a page the member could not
+/// have asked for or quietly shortening one it did.
+const MODELLED_MAX_RESULTS: usize = 200;
+const _: () = assert!(crate::state::MAX_PAGE_SIZE == MODELLED_MAX_RESULTS);
+const _: () = assert!(crate::state::DEFAULT_PAGE_SIZE <= MODELLED_MAX_RESULTS);
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — by another listing of this service, for another component, or by
+/// hand — is recognisably not one of ours. The token itself is the shape every
+/// paginated operation of this service mints
+/// ([`crate::state::encode_page_token`]), scoped to the component whose
+/// properties the page is.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:properties:1:";
+
+/// The whole address of the component a page was taken over: the entity, and
+/// whichever of `componentName` and `componentPath` named it, so a token is
+/// bound to the component it was minted for.
+fn token_scope(input: &ListPropertiesInput) -> String {
+    format!(
+        "{}|{}|{}",
+        input.entity_id,
+        input.component_name.as_deref().unwrap_or_default(),
+        input.component_path.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The opaque `nextToken` for a page of one component's properties, starting at
+/// `property_name`.
+fn encode_next_token(input: &ListPropertiesInput, property_name: &str) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        property_name,
+    )
+}
+
+/// The property name inside a `nextToken` minted for this component, or `None`
+/// when the token is not one this listing minted for it.
+fn decode_next_token(input: &ListPropertiesInput, token: &str) -> Option<String> {
+    crate::state::decode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        token,
+    )
 }

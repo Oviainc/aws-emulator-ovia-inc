@@ -218,7 +218,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, reported through this
             // operation's own server error, the same way `CreateJob` reports it.
@@ -259,11 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(job) = store.jobs.get_mut(&input.job_name) else {
+        // A job definition exists only in the Region it was created in, so a request to
+        // another Region's endpoint names no job this endpoint can run. AWS words this
+        // refusal after the metadata the start could not read, not after the name.
+        let Some(job) = store.job_mut(&region, &input.job_name) else {
             return Err(StartJobRunErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(format!("Job {} not found", input.job_name)),
+                    message: Some(crate::state::messages::JOB_METADATA_MISSING.to_string()),
                     from_federation_source: None,
                 },
             )

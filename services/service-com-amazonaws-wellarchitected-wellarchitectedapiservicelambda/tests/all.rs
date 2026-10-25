@@ -259,3 +259,8 @@ mod global_settings;
 // Declared last for the same reason as the declarations above.
 #[path = "all/agent_context_updates.rs"]
 mod agent_context_updates;
+
+// Declared last for the same reason as the declarations above: the sorted position for a
+// workload suite falls in a crowded run of this list.
+#[path = "all/workload_lens_review_upgrade.rs"]
+mod workload_lens_review_upgrade;

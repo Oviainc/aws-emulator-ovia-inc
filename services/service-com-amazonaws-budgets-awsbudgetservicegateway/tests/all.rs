@@ -81,3 +81,5 @@ mod subscriber_creation;
 mod subscriber_notification_reads;
 #[path = "all/subscriber_set_identity.rs"]
 mod subscriber_set_identity;
+#[path = "all/subscriber_update.rs"]
+mod subscriber_update;

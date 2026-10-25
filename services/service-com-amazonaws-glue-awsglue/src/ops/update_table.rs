@@ -104,9 +104,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `UpdateTableError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#UpdateTable")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#UpdateTable",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum UpdateTableErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     AlreadyExistsException(AlreadyExistsException),
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
@@ -171,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // An Iceberg/open-table-format update needs the table-metadata layer this
         // emulator does not maintain, the same layer `CreateTable` refuses its
         // `OpenTableFormatInput` for.
@@ -263,6 +266,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // entity lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(UpdateTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         // The store keeps every definition an update replaces, and this update is
