@@ -156,6 +156,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A `tags` map is checked before anything else about the request, the same gate
+        // every other operation of this service that accepts one goes through: `TagsMap`
+        // carries no constraint in the model, so the boundary validator passed it, and the
+        // platform's tagging rules are the only thing that refuses a reserved `aws:` key,
+        // an out-of-bounds key or value, or more tags than a resource may carry. Refused
+        // HERE, before an id and an ARN are minted, so a caller never holds an agent AWS
+        // would not have tagged that way.
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(RegisterAgentErrorModeled::InvalidParameterException)?;
+
         // The discovery data's addresses are IPv4 addresses (`IpAddressList`'s member is
         // `IpV4Address` — `smithy_query(query="shape", shape="IpAddressList")`), and that
         // shape's pattern only holds them to four dot-separated runs of up to three

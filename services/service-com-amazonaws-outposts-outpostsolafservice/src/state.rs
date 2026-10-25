@@ -1791,6 +1791,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region_mut(&mut self.quotes, region, quote_id)
     }
 
+    /// Every quote of `region`, in the store's creation order — what `ListQuotes`
+    /// pages through. See [`RegionalRecord`].
+    pub fn quotes_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a QuoteRecord> + 'a {
+        all_in_region(&self.quotes, region)
+    }
+
     /// The connection `connection_id` names in `region`. See [`Self::site`].
     pub fn connection(&self, region: &str, connection_id: &str) -> Option<&ConnectionRecord> {
         in_region(&self.connections, region, connection_id)
@@ -3138,6 +3144,9 @@ pub const OUTPOST_PAGE: &str = "outposts";
 
 /// The stamp a `ListSites` page token carries. See [`OUTPOST_PAGE`].
 pub const SITE_PAGE: &str = "sites";
+
+/// The stamp a `ListQuotes` page token carries. See [`OUTPOST_PAGE`].
+pub const QUOTE_PAGE: &str = "quotes";
 
 /// The stamp a `ListOrderableInstanceTypes` page token carries. See [`OUTPOST_PAGE`].
 pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";

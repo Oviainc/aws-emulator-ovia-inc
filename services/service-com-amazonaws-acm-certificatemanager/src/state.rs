@@ -43,10 +43,13 @@
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
 //! `GetAccountConfiguration` reports it, so that round trip reads one record too.
 //!
-//! A requested certificate does not stay `PENDING_VALIDATION`: ACM resolves its
-//! validation on its own, so the record carries the outcome the clock owes it and the
-//! instant it falls due ([`PendingValidation`]), and — for a certificate it validates
-//! by EMAIL — the instant the initial validation mail it owes falls due
+//! A requested certificate's record carries the outcome the clock owes it and the
+//! instant it falls due ([`PendingValidation`]) — issuance for a request that needs no
+//! proof of domain control, the up-front refusal of a name nobody can be delegated
+//! ([`domain_control_is_unprovable`]), and otherwise the timeout at the end of the
+//! documented [`VALIDATION_WINDOW`], which is what a request waiting for evidence from
+//! outside is owed. Beside it — for a certificate ACM validates by EMAIL — sits the
+//! instant the initial validation mail it owes falls due
 //! ([`Certificate::pending_validation_email`]). Nothing sleeps for those instants —
 //! [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] applies whatever was
 //! already due, and every handler calls it before reading or writing the store.
@@ -106,6 +109,14 @@ pub const STATUS_ISSUED: &str = "ISSUED";
 /// (`CertificateDetail$Status` doc).
 pub const STATUS_FAILED: &str = "FAILED";
 
+/// `CertificateStatus` of a request whose domain validation never completed: "ACM
+/// makes repeated attempts to validate a certificate for 72 hours and then times out"
+/// (`CertificateDetail$Status` doc), which is where a request waiting on proof nobody
+/// supplied ends up. `FailureReason` "exists only when the certificate status is
+/// FAILED" (`CertificateDetail$FailureReason` doc), so a timed-out request carries
+/// none.
+pub const STATUS_VALIDATION_TIMED_OUT: &str = "VALIDATION_TIMED_OUT";
+
 /// `CertificateStatus` of a certificate whose revocation ACM has recorded:
 /// `RevokedAt` and `RevocationReason` "exist only when the certificate status is
 /// REVOKED" (`CertificateDetail$RevokedAt` / `$RevocationReason` docs), so the two
@@ -121,26 +132,29 @@ pub const DOMAIN_STATUS_SUCCESS: &str = "SUCCESS";
 /// `DomainStatus` of a domain whose validation did not complete.
 pub const DOMAIN_STATUS_FAILED: &str = "FAILED";
 
-/// `FailureReason` of a public certificate request this emulator cannot carry
-/// through: validating a domain name means proving control of it out of band — a DNS
-/// record, a mailbox or an HTTP token on the domain itself — and this emulator makes
-/// no outbound connection, so no requested domain can ever be proven here. ACM's
-/// modelled reason for a request it cannot process without information it has to
-/// obtain elsewhere is `ADDITIONAL_VERIFICATION_REQUIRED`, and it is what the
-/// recorded AWS responses for unverifiable domains carry. `FailureReason` "exists
-/// only when the certificate status is FAILED" (`CertificateDetail$FailureReason`
-/// doc), so it is set only beside [`STATUS_FAILED`].
+/// `FailureReason` of a request ACM refuses up front, before it ever waits on proof
+/// of domain control: "A certificate enters status PENDING_VALIDATION upon being
+/// requested, UNLESS it fails for any of the reasons given in the troubleshooting
+/// topic Certificate request fails" (`CertificateDetail$Status` doc). The reason ACM
+/// models for a request it cannot process without information it has to obtain
+/// elsewhere is `ADDITIONAL_VERIFICATION_REQUIRED`, and it is what the recorded AWS
+/// responses for a name whose control can never be delegated to the requester carry
+/// ([`domain_control_is_unprovable`]). `FailureReason` "exists only when the
+/// certificate status is FAILED" (`CertificateDetail$FailureReason` doc), so it is set
+/// only beside [`STATUS_FAILED`].
 pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
     "ADDITIONAL_VERIFICATION_REQUIRED";
 
-/// How long after `RequestCertificate` the validation outcome falls due.
+/// How long after `RequestCertificate` an outcome ACM reaches WITHOUT waiting on proof
+/// of domain control falls due — issuance for a request that needs no validation, and
+/// the up-front refusal of a name that can never be validated.
 ///
-/// A CHOSEN span, not a documented one: AWS takes minutes to hours ("ACM makes
-/// repeated attempts to validate a certificate for 72 hours"), which no client could
-/// poll through here. It is never zero, so a caller that reads straight after
-/// requesting still observes `PENDING_VALIDATION`, and it is never slept on: the due
-/// instant is stored on the record and materialised by whichever call next touches
-/// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+/// A CHOSEN span, not a documented one: AWS takes seconds to minutes to answer either,
+/// which no client could poll through here. It is never zero, so a caller that reads
+/// straight after requesting still observes `PENDING_VALIDATION`, and it is never
+/// slept on: the due instant is stored on the record and materialised by whichever call
+/// next touches the store (see
+/// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
 ///
 /// It sits ABOVE [`VALIDATION_EMAIL_DISPATCH_DELAY`] because the two owed transitions
 /// happen in that order at AWS: ACM dispatches a request's validation mail first and
@@ -157,6 +171,59 @@ pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(750);
 /// on the record ([`Certificate::pending_validation_email`]) and materialised by
 /// whichever call next touches the store.
 pub const VALIDATION_EMAIL_DISPATCH_DELAY: Duration = Duration::from_millis(250);
+
+/// How long ACM waits for proof of domain control before the request times out.
+///
+/// A DOCUMENTED span, not a chosen one: "ACM makes repeated attempts to validate a
+/// certificate for 72 hours and then times out" (`CertificateDetail$Status` doc). Until
+/// it elapses the request stays `PENDING_VALIDATION` with its evidence live — the CNAME
+/// to publish, the mailboxes ACM wrote to — and past it the request is
+/// [`STATUS_VALIDATION_TIMED_OUT`]. Stored and never slept on, exactly as the other
+/// owed transitions are.
+pub const VALIDATION_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
+
+/// Domain names reserved by the IANA Special-Use Domain Names registry as whole
+/// top-level labels: `.example`, `.invalid`, `.localhost` and `.test` are "reserved
+/// for ... testing and documentation" and are never delegated (RFC 2606 §2, RFC 6761
+/// §6), and `.local` (RFC 6762 §3) and `.onion` (RFC 7686) likewise name no domain in
+/// the public DNS.
+///
+/// Nobody can be delegated control of a name under one of them, so no certificate
+/// authority can ever validate one — see [`domain_control_is_unprovable`].
+pub const RESERVED_DOMAIN_SUFFIXES: &[&str] = &[
+    "example", "invalid", "localhost", "test", "local", "onion",
+];
+
+/// The second-level names RFC 2606 §3 reserves for documentation —
+/// "example.com, example.net, example.org" — which, like
+/// [`RESERVED_DOMAIN_SUFFIXES`], no requester can be delegated control of.
+pub const RESERVED_DOMAIN_NAMES: &[&str] = &["example.com", "example.net", "example.org"];
+
+/// Whether control of `domain_name` can never be proven, because the name sits under a
+/// reserved domain nobody can be delegated ([`RESERVED_DOMAIN_SUFFIXES`],
+/// [`RESERVED_DOMAIN_NAMES`]).
+///
+/// A certificate request for such a name is one ACM cannot carry through at all, so it
+/// is refused up front rather than left waiting for evidence that cannot arrive — "a
+/// certificate enters status PENDING_VALIDATION upon being requested, unless it fails
+/// for any of the reasons given in the troubleshooting topic Certificate request fails"
+/// (`CertificateDetail$Status` doc). Every other name is one whose owner could publish
+/// the evidence, so its request waits the documented [`VALIDATION_WINDOW`] out.
+///
+/// Matched on DOT BOUNDARIES and case-insensitively, as a DNS suffix is, and through
+/// the name ACM actually proves control of ([`validation_target`]), so a wildcard is
+/// judged by the domain it covers.
+pub fn domain_control_is_unprovable(domain_name: &str) -> bool {
+    let name = validation_target(domain_name).to_ascii_lowercase();
+    let under = |reserved: &str| {
+        name == reserved
+            || name
+                .strip_suffix(reserved)
+                .is_some_and(|higher| higher.ends_with('.'))
+    };
+    RESERVED_DOMAIN_SUFFIXES.iter().any(|tld| under(tld))
+        || RESERVED_DOMAIN_NAMES.iter().any(|second| under(second))
+}
 
 /// How long after the domain-validation email was last sent ACM will send it again.
 ///
@@ -481,11 +548,33 @@ pub enum ValidationOutcome {
     /// domain validation is not required" (`RequestCertificate` doc), so there is
     /// nothing left to prove and the request completes.
     Issued,
-    /// The request fails with [`FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED`]:
-    /// "If you are requesting a public certificate, each domain name that you specify
-    /// must be validated to verify that you own or control the domain"
-    /// (`RequestCertificate` doc), and that proof is out of band.
+    /// The request fails with [`FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED`]
+    /// before ACM waits on anything: the request names a domain whose control can
+    /// never be proven ([`domain_control_is_unprovable`]), which is one of the reasons
+    /// a request fails "upon being requested" rather than entering
+    /// `PENDING_VALIDATION` (`CertificateDetail$Status` doc).
     Failed,
+    /// The request times out unvalidated: "If you are requesting a public certificate,
+    /// each domain name that you specify must be validated to verify that you own or
+    /// control the domain" (`RequestCertificate` doc) — proof that arrives out of band,
+    /// which this emulator cannot observe — and "ACM makes repeated attempts to
+    /// validate a certificate for 72 hours and then times out"
+    /// (`CertificateDetail$Status` doc). Until then the request stays
+    /// `PENDING_VALIDATION`, so everything a pending validation is for (the published
+    /// CNAME, the approval mail `ResendValidationEmail` resends) stays reachable.
+    TimedOut,
+}
+
+impl ValidationOutcome {
+    /// How long after the request this outcome falls due: an outcome ACM reaches on its
+    /// own after [`VALIDATION_SETTLE_DELAY`], and the unvalidated timeout at the end of
+    /// the documented [`VALIDATION_WINDOW`].
+    pub fn settles_in(self) -> Duration {
+        match self {
+            Self::Issued | Self::Failed => VALIDATION_SETTLE_DELAY,
+            Self::TimedOut => VALIDATION_WINDOW,
+        }
+    }
 }
 
 /// The validation outcome the clock already owes a requested certificate.
@@ -501,11 +590,11 @@ pub struct PendingValidation {
 }
 
 impl PendingValidation {
-    /// The outcome owed to a certificate requested at `requested_at`, due
-    /// [`VALIDATION_SETTLE_DELAY`] later.
+    /// The outcome owed to a certificate requested at `requested_at`, due the span that
+    /// outcome takes later ([`ValidationOutcome::settles_in`]).
     pub fn starting_at(requested_at: SystemTime, outcome: ValidationOutcome) -> Self {
         Self {
-            due_at: requested_at + VALIDATION_SETTLE_DELAY,
+            due_at: requested_at + outcome.settles_in(),
             outcome,
         }
     }
@@ -640,6 +729,7 @@ impl Certificate {
             ValidationOutcome::Failed => {
                 self.fail(FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED);
             }
+            ValidationOutcome::TimedOut => self.time_out(),
         }
     }
 
@@ -737,6 +827,24 @@ impl Certificate {
     fn fail(&mut self, reason: &str) {
         self.status = STATUS_FAILED.to_string();
         self.failure_reason = Some(reason.to_string());
+        for validation in &mut self.domain_validations {
+            validation.validation_status = DOMAIN_STATUS_FAILED.to_string();
+        }
+    }
+
+    /// Record this certificate's request as timed out: "ACM makes repeated attempts to
+    /// validate a certificate for 72 hours and then times out"
+    /// (`CertificateDetail$Status` doc), so no domain was proven and nothing was
+    /// issued.
+    ///
+    /// `FailureReason` stays absent — it "exists only when the certificate status is
+    /// FAILED" (`CertificateDetail$FailureReason` doc) — and each domain's
+    /// `ValidationStatus` is the `DomainStatus` of a validation that did not complete,
+    /// exactly as in [`Self::fail`]. The mailbox lists are left as the dispatches that
+    /// wrote them left them, for the same reason.
+    fn time_out(&mut self) {
+        self.status = STATUS_VALIDATION_TIMED_OUT.to_string();
+        self.failure_reason = None;
         for validation in &mut self.domain_validations {
             validation.validation_status = DOMAIN_STATUS_FAILED.to_string();
         }
@@ -1530,6 +1638,25 @@ fn acm_resource_id<'arn>(arn: &'arn str, resource_type: &str) -> Option<&'arn st
     (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
+/// The resource TYPE in an ACM ARN (`certificate`, `acme-endpoint`,
+/// `acme-domain-validation`, …), or `None` when `arn` is not an ACM ARN or its resource
+/// section names no type.
+///
+/// The counterpart of [`acm_resource_id`] for a caller that has to report which kind of
+/// resource an ARN addressed rather than look one type up — the ARN is the only place
+/// that type comes from, so the reporting path reads it here rather than guessing from
+/// which store answered.
+///
+/// An ACM resource section is a `<type>/<id>` path, and a sub-resource extends its
+/// parent's with another such pair (`acme-endpoint/<id>/acme-domain-validation/<id>`),
+/// so the type is the segment immediately before the trailing id — the type of the
+/// resource the ARN NAMES, not of the parent it hangs under.
+pub fn acm_arn_resource_type(arn: &str) -> Option<&str> {
+    let (path, id) = acm_arn_resource(arn)?.rsplit_once('/')?;
+    let resource_type = path.rsplit('/').next()?;
+    (!resource_type.is_empty() && !id.is_empty()).then_some(resource_type)
+}
+
 /// The certificate id in an ACM certificate ARN, or `None` when `arn` names
 /// something that is not one (the caller answers `InvalidArnException`).
 ///
@@ -1572,19 +1699,46 @@ pub fn certificate_not_found_message(certificate_arn: &str) -> String {
     format!("Could not find certificate {certificate_arn}.")
 }
 
+/// The `ResourceNotFoundException` message for a lookup that resolves a DOMAIN inside a
+/// certificate the account holds — a certificate whose domain validations do not cover
+/// the name the request asked for.
+///
+/// Built from the request, as the certificate-ARN form above is: what is missing is not
+/// the certificate but the pair the request named, so the sentence names the
+/// certificate, the domain it was asked for and the account holding it — read off the
+/// requested ARN, which carries that account, so the sentence cannot name an account the
+/// request did not address. Rendered here so every domain-scoped lookup reports one
+/// template.
+pub fn certificate_domain_not_found_message(certificate_arn: &str, domain_name: &str) -> String {
+    let account =
+        acm_arn_account(certificate_arn).unwrap_or_else(|| ::engine::emulator_account_id());
+    format!(
+        "Could not find certificate {certificate_arn} with domain {domain_name} in account \
+         {account}"
+    )
+}
+
 /// The `ResourceNotFoundException` message for an ACM resource ARN that names no
 /// resource this account holds, built from the ARN the request asked for.
 ///
 /// Rendered by the operations that address an ACM resource by type-agnostic ARN
-/// (`TagResource`, `UntagResource`, `ListTagsForResource`), which is why it names a
-/// "resource" rather than one type. `ResourceNotFoundException` carries one modelled
-/// member (`message: String`) and the model documents no text for it, so the sentence
-/// follows the template every other lookup in this service renders
-/// ([`certificate_not_found_message`]): one complete sentence naming the requested ARN
-/// and terminated by a period.
+/// (`TagResource`, `UntagResource`, `ListTagsForResource`), so the sentence names the
+/// resource TYPE the ARN itself carries ([`acm_arn_resource_type`]) — which is what
+/// says WHICH kind of ACM resource was missing when the member admits several.
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence follows the template every other
+/// lookup in this service renders ([`certificate_not_found_message`]): one complete
+/// sentence naming the type and the requested ARN, terminated by a period. An ARN whose
+/// resource section carries no type at all is named by the generic noun, since there is
+/// no type in the request to report.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
-    format!("Could not find resource {resource_arn}.")
+    let resource_type = acm_arn_resource_type(resource_arn).unwrap_or(UNTYPED_RESOURCE_NOUN);
+    format!("Could not find {resource_type} {resource_arn}.")
 }
+
+/// How a not-found sentence names a resource whose ARN carries no resource type to
+/// report.
+const UNTYPED_RESOURCE_NOUN: &str = "resource";
 
 /// The `ValidationException` message for a CERTIFICATE ARN handed to one of the
 /// generic resource-tagging operations, naming the certificate-specific operation to
@@ -1842,11 +1996,10 @@ pub fn domain_validation_record(
     match validation_method {
         "DNS" => {
             let name = validation_label(certificate_id, domain_name, "dns-name");
-            let value = validation_label(certificate_id, domain_name, "dns-value");
             record.resource_record = Some(ResourceRecord {
                 name: format!("_{name}.{target}."),
                 r#type: RECORD_TYPE_CNAME.to_string(),
-                value: format!("_{value}.{ACM_VALIDATIONS_ZONE}."),
+                value: acm_validations_cname_target(certificate_id, domain_name),
             });
         }
         "HTTP" => {
@@ -1873,23 +2026,52 @@ pub fn domain_validation_record(
 ///
 /// SERVER-MANAGED, like the CNAME a certificate's DNS validation publishes
 /// ([`domain_validation_record`]) and in the same form: a `_<label>` prefixed name
-/// under the domain being validated, pointing at a `_<label>` name in
-/// [`ACM_VALIDATIONS_ZONE`]. Both labels are derived from the validation's OWN id
-/// through [`validation_label`], so repeated reads of one validation report the same
-/// record, two validations of the same domain differ, and no part of the record comes
-/// from anything the caller sent.
+/// under the domain being validated, pointing at the challenge target
+/// [`acm_validations_cname_target`] mints. Every label is derived from the validation's
+/// OWN id through [`validation_label`], so repeated reads of one validation report the
+/// same record, two validations of the same domain differ, and no part of the record
+/// comes from anything the caller sent.
 pub fn acme_prevalidation_resource_record(
     validation_id: &str,
     domain_name: &str,
 ) -> ResourceRecord {
     let target = validation_target(domain_name);
     let name = validation_label(validation_id, domain_name, "dns-name");
-    let value = validation_label(validation_id, domain_name, "dns-value");
     ResourceRecord {
         name: format!("_{name}.{target}."),
         r#type: RECORD_TYPE_CNAME.to_string(),
-        value: format!("_{value}.{ACM_VALIDATIONS_ZONE}."),
+        value: acm_validations_cname_target(validation_id, domain_name),
     }
+}
+
+/// The number of label characters a validation's own subdomain under
+/// [`ACM_VALIDATIONS_ZONE`] carries, as the recorded targets show that label: a short
+/// run of lower-case alphanumerics, far shorter than the 32-character challenge token
+/// beside it.
+const VALIDATION_ZONE_LABEL_LENGTH: usize = 10;
+
+/// The CNAME target a DNS validation's challenge record points at:
+/// `_<token>.<per-validation label>.acm-validations.<zone>.`
+///
+/// Three parts, and every one of them is required: the challenge TOKEN, then the
+/// validation's OWN label, then [`ACM_VALIDATIONS_ZONE`]. The middle label is what
+/// makes the target a name under the validation's own subdomain of the ACM validation
+/// zone rather than a name directly in it — the shape a client that publishes the
+/// record and then checks the delegation structure reads it as.
+///
+/// Both labels are derived from the id of whatever the validation belongs to (a
+/// certificate, an ACME domain validation) through [`validation_label`], so repeated
+/// reads report the same target, two validations of the same domain differ, and no part
+/// of it comes from anything the caller sent. Rendered here so the certificate path
+/// ([`domain_validation_record`]) and the ACME prevalidation path
+/// ([`acme_prevalidation_resource_record`]) publish one shape.
+pub fn acm_validations_cname_target(owner_id: &str, domain_name: &str) -> String {
+    let token = validation_label(owner_id, domain_name, "dns-value");
+    let label: String = validation_label(owner_id, domain_name, "dns-zone-label")
+        .chars()
+        .take(VALIDATION_ZONE_LABEL_LENGTH)
+        .collect();
+    format!("_{token}.{label}.{ACM_VALIDATIONS_ZONE}.")
 }
 
 /// The tag-key prefix Amazon Web Services reserves for its own tags: neither half of

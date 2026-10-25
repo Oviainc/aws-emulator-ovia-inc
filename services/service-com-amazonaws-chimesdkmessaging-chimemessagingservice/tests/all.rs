@@ -13,7 +13,11 @@
 // points it into `tests/all/`.
 #[path = "all/channel_flows.rs"]
 mod channel_flows;
+#[path = "all/channel_membership.rs"]
+mod channel_membership;
 #[path = "all/channel_messaging.rs"]
 mod channel_messaging;
+#[path = "all/service_claim.rs"]
+mod service_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

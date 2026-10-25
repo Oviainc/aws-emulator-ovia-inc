@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannelModerator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannelModerator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannelModerator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the moderator stored on the channel: who moderates it, who made them a
+//! moderator and when. A PRIVATE channel is readable only by its members and moderators.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +152,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannelModerator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelModeratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannelModerator"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeChannelModeratorErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let store = state.lock();
+        let channel = store
+            .channels
+            .get(&input.channel_arn)
+            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(DescribeChannelModeratorErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(reason.to_string()),
+                },
+            )
+            .into());
+        }
+        let moderator = channel
+            .moderator(&input.channel_moderator_arn)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "{} does not moderate channel {}",
+                    input.channel_moderator_arn, channel.arn
+                ))
+            })?;
+
+        Ok(DescribeChannelModeratorOutput {
+            channel_moderator: Some(moderator.to_channel_moderator(&channel.arn)),
+        })
     }
+}
+
+/// The modelled 404 for a channel or a moderator this service does not hold.
+fn not_found(message: String) -> DescribeChannelModeratorError {
+    DescribeChannelModeratorErrorModeled::NotFoundException(NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

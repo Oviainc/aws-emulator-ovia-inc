@@ -39,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The percent-encoder and the body accessors are shared by every suite of this
 // test binary; ONE copy lives in `tests/all/support.rs` and is re-exported here, so
 // the sibling suites that import them from this module keep working.
-pub(crate) use crate::support::{error_code, field_name, message, pct};
+pub(crate) use crate::support::{error_code, field_name, message, pct, rfc3339};
 
 /// The region every request below signs for; every minted ARN must carry it.
 pub(crate) const REGION: &str = "us-west-2";
@@ -296,12 +296,10 @@ struct Lifecycle {
     parameter: String,
     secret: String,
     put_tags: BTreeMap<String, String>,
-    /// `expirationDate` as epoch seconds.
+    /// The instant `expirationDate` names, as an epoch second.
     ///
-    /// The model marks the member `@timestampFormat("date-time")`, but the
-    /// generated schema this emulator deserializes against carries no timestamp
-    /// format (the scaffold's `smithy-macros` codegen does not emit the trait), so
-    /// the restJson1 default — epoch seconds — is what the wire accepts here.
+    /// The member is `@timestampFormat("date-time")`, so it reaches the wire as the
+    /// RFC 3339 string `support::rfc3339` renders — the form an AWS SDK sends.
     expiration_date: Option<i64>,
 }
 
@@ -395,7 +393,7 @@ impl Lifecycle {
             );
         }
         if let Some(expiration) = self.expiration_date {
-            map.insert("expirationDate".to_string(), json!(expiration));
+            map.insert("expirationDate".to_string(), json!(rfc3339(expiration)));
         }
         body
     }

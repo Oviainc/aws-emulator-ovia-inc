@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketIntelligentTieringConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketIntelligentTieringConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: drops the ONE S3 Intelligent-Tiering configuration an existing bucket
+//! carries under the `Id` the request names, leaving every other configuration the bucket
+//! carries in place, and answers the modelled 204 with an empty body. A bucket that
+//! carries none under that id answers `NoSuchConfiguration` (HTTP 404) — there is nothing
+//! to delete — and a request naming a bucket this emulator does not hold answers the
+//! service-wide `NoSuchBucket` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketIntelligentTieringConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The write side is `PutBucketIntelligentTieringConfiguration` and the read sides are
+//! `GetBucketIntelligentTieringConfiguration` and
+//! `ListBucketIntelligentTieringConfigurations`, so a delete is read back through either.
 //!
 //! ## Shape of an operation
 //!
@@ -117,9 +118,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteBucketIntelligentT
 // here — hence the `DeleteBucketIntelligentTieringConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteBucketIntelligentTieringConfiguration")]
+// Widened by `NoSuchBucket` the way `PutBucketIntelligentTieringConfiguration` widens it:
+// the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteBucketIntelligentTieringConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` (`httpError 404`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteBucketIntelligentTieringConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteBucketIntelligentTieringConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -173,18 +183,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketIntelligentTieringConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketIntelligentTieringConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketIntelligentTieringConfiguration"))
+        // Everything this delete needs is in its deserialized input: the expected owner and
+        // the id travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner … the request fails with the HTTP
+        // status code 403 Forbidden (access denied)", judged as every other bucket-scoped
+        // operation in this crate judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no bucket store to delete from, and
+            // this operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBucketIntelligentTieringConfiguration",
+            ));
+        };
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does
+        // not hold answers that rather than "no such configuration" — the order the put
+        // beside this one keeps.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                DeleteBucketIntelligentTieringConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        };
+
+        // Per-ID: the store drops only the configuration this request identifies and
+        // reports whether there was one, so a delete naming an id the bucket does not carry
+        // deletes nothing and answers the same per-ID refusal the read beside it answers.
+        if !bucket.delete_intelligent_tiering_configuration(&input.id) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CONFIGURATION_CODE,
+                crate::state::NO_SUCH_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+            ));
+        }
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketIntelligentTieringConfigurationOutput)
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

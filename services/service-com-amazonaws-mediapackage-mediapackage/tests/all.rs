@@ -41,6 +41,8 @@ mod origin_endpoint_defaults;
 mod origin_endpoint_durations;
 #[path = "all/reserved_and_malformed_tags.rs"]
 mod reserved_and_malformed_tags;
+#[path = "all/resource_id_rule.rs"]
+mod resource_id_rule;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rotate_channel_credentials.rs"]

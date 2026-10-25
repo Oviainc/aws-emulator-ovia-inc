@@ -10,9 +10,11 @@
 //!    position — `Value '<value>' at '<member path>' failed to satisfy constraint:
 //!    <requirement>` — except at a position whose value ACM withholds, which reads
 //!    `Value of the input at '<member path>'`: a resource identifier (a `…Arn`
-//!    member), a request token (a `…Token` member), and a value the validating walk
+//!    member), a request token (a `…Token` member), a value the validating walk
 //!    holds no submitted text for (a collection, whose only rendering is its element
-//!    count, and a value past the walk's own echo cap). The rows span both subjects,
+//!    count, and a value past the walk's own echo cap), and a clause collapsed onto a
+//!    collection member, where the submitted scalar is an element inside the position
+//!    named rather than its value. The rows span both subjects,
 //!    the constraint kinds (`@length` minimum and maximum, `@pattern`, `@range`), the
 //!    member depth (a top-level member, a member of a structure under a UNION member, a
 //!    collection element) and the value forms (empty, short, at a bound, past a bound,
@@ -172,17 +174,22 @@ fn subject_cases(endpoint: &str) -> Vec<SubjectCase<'static>> {
             requirements: vec!["Member must have value greater than or equal to 1".to_string()],
             echoed: Some("0".to_string()),
         },
-        // A collection ELEMENT: the clause is reported at the collection, and the value
-        // it states is the element the caller sent.
+        // A collection ELEMENT: the clause is reported at the COLLECTION, so the value
+        // it would state is one element inside the position it names rather than the
+        // value submitted there — ACM withholds it, and states the element shape's
+        // whole constraint set instead (the recorded `tagKeys` envelope in
+        // [`crate::pending_validation_and_tag_envelopes`]).
         SubjectCase {
             what: "a list element outside its own pattern",
             operation: "UntagResource",
             body: json!({ "ResourceArn": certificate_arn, "TagKeys": ["{nope}"] }),
             path: "tagKeys",
-            requirements: vec!["Member must satisfy constraint: [Member must satisfy regular \
-                                expression pattern: ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*)]"
+            requirements: vec!["Member must satisfy constraint: [Member must have length less \
+                                than or equal to 128, Member must have length greater than or \
+                                equal to 1, Member must satisfy regular expression pattern: \
+                                ([\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*), Member must not be null]"
                 .to_string()],
-            echoed: Some("{nope}".to_string()),
+            echoed: None,
         },
         // A resource identifier: withheld, on a THIRD ARN shape beside the `Arn` and
         // `PcaArn` the other suite covers.

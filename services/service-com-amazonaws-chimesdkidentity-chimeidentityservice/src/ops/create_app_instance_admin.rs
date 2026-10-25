@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppInstanceAdmin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppInstanceAdmin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppInstanceAdmin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Promotes an identity of the named `AppInstance` to an administrator of it, and
+//! PERSISTS the promotion in the shared app-instance admin directory
+//! ([`crate::state::app_instance_admins`]) — so `DescribeAppInstanceAdmin` reads it back,
+//! and so the Chime SDK Messaging service, which reserves an app instance's
+//! private-channel listing and its message deletion for an administrator, sees the same
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +161,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppInstanceAdmin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppInstanceAdminErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppInstanceAdmin"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceAdminErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        let directory = crate::state::app_instance_admins(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceAdminErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstanceAdmin directory is unavailable".to_string()),
+            })
+        })?;
+
+        // An administrator is an identity OF the app instance it administers, so the
+        // promoted ARN has to be one of its children (`<AppInstanceArn>/user/<id>` for an
+        // `AppInstanceUser`, `/bot/<id>` for an `AppInstanceBot`).
+        let child_prefix = format!("{}/", input.app_instance_arn);
+        let name = {
+            let store = state.lock();
+            if !store.app_instances.contains_key(&input.app_instance_arn) {
+                // This operation models no 404 shape, so an unknown ARN is refused with
+                // the modelled `BadRequestException` carrying the `NotFound` error code.
+                return Err(not_found(format!(
+                    "AppInstance {} does not exist",
+                    input.app_instance_arn
+                )));
+            }
+            if !input.app_instance_admin_arn.starts_with(&child_prefix) {
+                return Err(CreateAppInstanceAdminErrorModeled::BadRequestException(
+                    BadRequestException {
+                        code: Some("BadRequest".to_string()),
+                        message: Some(format!(
+                            "AppInstanceAdminArn {} is not an identity of AppInstance {}",
+                            input.app_instance_admin_arn, input.app_instance_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            match store.user(&input.app_instance_admin_arn) {
+                Some(user) => Some(user.name.clone()),
+                // An `AppInstanceUser` has to exist to be promoted; an
+                // `AppInstanceBot` is not a resource this emulator stores yet, so its
+                // promotion is recorded without a name rather than refused.
+                None if input.app_instance_admin_arn.starts_with(&format!(
+                    "{}/user/",
+                    input.app_instance_arn
+                )) =>
+                {
+                    return Err(not_found(format!(
+                        "AppInstanceUser {} does not exist",
+                        input.app_instance_admin_arn
+                    )));
+                }
+                None => None,
+            }
+        };
+
+        // Recording the promotion is idempotent: an identity already promoted keeps the
+        // first record, so repeating the request neither duplicates it nor moves the
+        // instant `DescribeAppInstanceAdmin` reports.
+        directory.lock().promote(
+            &input.app_instance_arn,
+            &input.app_instance_admin_arn,
+            crate::state::now_millis(),
+        );
+
+        Ok(CreateAppInstanceAdminOutput {
+            app_instance_admin: Some(Identity {
+                arn: Some(input.app_instance_admin_arn),
+                name,
+            }),
+            app_instance_arn: Some(input.app_instance_arn),
+        })
     }
+}
+
+/// Refuse the request for a resource this service does not hold.
+///
+/// This operation models no 404 shape, so an absent resource is reported the way the rest
+/// of this service reports one: the modelled `BadRequestException` carrying the `NotFound`
+/// error code.
+fn not_found(message: String) -> CreateAppInstanceAdminError {
+    CreateAppInstanceAdminErrorModeled::BadRequestException(BadRequestException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

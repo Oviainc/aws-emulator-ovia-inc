@@ -103,8 +103,8 @@ pub(crate) fn tag_pairs(tags: &Value) -> Vec<(String, String)> {
 }
 
 /// The resource's stored tags, read back through `ListTagsForResource`, in the order it
-/// reported them. An untagged resource reports no `Tags` member, which is the empty
-/// vector here.
+/// reported them. An untagged resource reports the empty `Tags` list, which is the
+/// empty vector here.
 pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     case: &str,
@@ -254,8 +254,8 @@ async fn tag_resource_writes_the_tags_list_tags_for_resource_reports() {
     for (case, request_tags, expected) in cases {
         let arn = create_endpoint(&router, case).await;
 
-        // A freshly created resource carries no tags, so `Tags` is absent rather than
-        // an empty list (`TagList`'s minimum length is 1).
+        // A freshly created resource carries no tags, which `ListTagsForResource`
+        // reports as the empty `Tags` list.
         let before = stored_tags(&router, case, &arn).await;
         assert!(
             before.is_empty(),
@@ -388,8 +388,9 @@ async fn tagging_merges_by_key_and_untagging_drops_named_keys() {
         );
     }
 
-    // The map is empty now, so `ListTagsForResource` reports no `Tags` member at all:
-    // `TagList` has a minimum length of one, so an empty list is not a legal value.
+    // The map is empty now, and `ListTagsForResource` reports that as the EMPTY `Tags`
+    // list: the response IS the stored map, so "no tags" is a value the member states
+    // rather than a member a client has to infer from absence.
     let (status, response) = call(
         &router,
         "ListTagsForResource",
@@ -397,9 +398,9 @@ async fn tagging_merges_by_key_and_untagging_drops_named_keys() {
     )
     .await;
     assert_eq!(
-        (status, response["Tags"].is_null()),
-        (200, true),
-        "expected no Tags member once every tag was removed, got {status} {response}"
+        (status, &response["Tags"]),
+        (200, &json!([])),
+        "expected the empty Tags list once every tag was removed, got {status} {response}"
     );
 }
 

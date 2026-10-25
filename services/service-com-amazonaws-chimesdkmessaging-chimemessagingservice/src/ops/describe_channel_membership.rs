@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannelMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannelMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannelMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the membership `CreateChannelMembership` (or `CreateChannel`'s `MemberArns`)
+//! stored on the channel: the member, who invited them, the membership type and the
+//! instants it was created and last updated. A PRIVATE channel is readable only by its
+//! members and moderators, the rule the model states on `CreateChannelMembership`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +157,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannelMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannelMembership"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeChannelMembershipErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Sub-channels exist only on elastic channels, which this slice does not serve.
+        if let Some(sub_channel_id) = &input.sub_channel_id {
+            return Err(DescribeChannelMembershipErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("BadRequest".to_string()),
+                    message: Some(format!(
+                        "SubChannelId {sub_channel_id:?} is not supported: this emulator does not serve elastic channels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let channel = store
+            .channels
+            .get(&input.channel_arn)
+            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
+        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
+            return Err(DescribeChannelMembershipErrorModeled::ForbiddenException(
+                ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(reason.to_string()),
+                },
+            )
+            .into());
+        }
+        let membership = channel.membership(&input.member_arn).ok_or_else(|| {
+            not_found(format!(
+                "{} is not a member of channel {}",
+                input.member_arn, channel.arn
+            ))
+        })?;
+
+        Ok(DescribeChannelMembershipOutput {
+            channel_membership: Some(membership.to_channel_membership(&channel.arn)),
+        })
     }
+}
+
+/// The modelled 404 for a channel or a membership this service does not hold.
+fn not_found(message: String) -> DescribeChannelMembershipError {
+    DescribeChannelMembershipErrorModeled::NotFoundException(NotFoundException {
+        code: Some("NotFound".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

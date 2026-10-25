@@ -132,9 +132,25 @@ pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> String {
         .to_string()
 }
 
-/// A minimal valid create body (`ManagedInstance` is the only required member).
+/// The `ImageId` every fixture here boots from: inside the modelled
+/// `^ami-[0-9a-zA-Z]{1,63}$` (`smithy_query(query="shape",shape="ImageId")`).
+pub(crate) const TEST_IMAGE_ID: &str = "ami-0123456789abcdef0";
+
+/// The instance type every fixture here launches: one row of the catalog this
+/// service publishes through `ListInstanceTypes`.
+pub(crate) const TEST_INSTANCE_TYPE: &str = "t3.medium";
+
+/// The smallest `ManagedInstance` this service can launch: the image the instance
+/// boots and the published instance type it runs on, which a launch cannot be made
+/// without.
+pub(crate) fn launchable_managed_instance() -> Value {
+    json!({ "ImageId": TEST_IMAGE_ID, "InstanceType": TEST_INSTANCE_TYPE })
+}
+
+/// A minimal valid create body (`ManagedInstance` is the only required member, and
+/// it has to describe a launch this service can carry out).
 pub(crate) fn minimal_create() -> Value {
-    json!({ "ManagedInstance": {} })
+    json!({ "ManagedInstance": launchable_managed_instance() })
 }
 
 /// The tags `ListTagsForResource` reports, as a map.
@@ -199,8 +215,8 @@ fn create_rows() -> Vec<CreateRow> {
         .collect();
     vec![
         CreateRow {
-            case: "no configuration at all",
-            managed_instance: json!({}),
+            case: "only the members a launch cannot be made without",
+            managed_instance: launchable_managed_instance(),
             tags: vec![],
             billing_mode: None,
             // The model documents hourly billing as the default when no
@@ -217,6 +233,7 @@ fn create_rows() -> Vec<CreateRow> {
         CreateRow {
             case: "nested structures",
             managed_instance: json!({
+                "ImageId": "ami-0a1b2c3d4e5f60718",
                 "InstanceType": "m5.large",
                 "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
                 "CpuOptions": { "CoreCount": 2, "ThreadsPerCore": 2 },
@@ -233,6 +250,7 @@ fn create_rows() -> Vec<CreateRow> {
             case: "list-valued members",
             managed_instance: json!({
                 "ImageId": "ami-deadbeef01",
+                "InstanceType": "c5.large",
                 "SecurityGroupIds": ["sg-111111", "sg-222222"],
                 "BlockDeviceMappings": [
                     { "DeviceName": "/dev/sda1", "Ebs": { "VolumeType": "gp3", "VolumeSize": 100 } }
@@ -247,7 +265,7 @@ fn create_rows() -> Vec<CreateRow> {
         },
         CreateRow {
             case: "the modelled maximum of 50 tags",
-            managed_instance: json!({ "InstanceType": "t3.small" }),
+            managed_instance: json!({ "ImageId": TEST_IMAGE_ID, "InstanceType": "t3.small" }),
             tags: fifty_tags,
             billing_mode: None,
             expected_billing_mode: "HOURLY",
@@ -345,7 +363,7 @@ async fn an_idempotency_token_replays_one_instance() {
     for token in &tokens {
         let body = json!({
             "ClientToken": token,
-            "ManagedInstance": { "InstanceType": "t3.medium" },
+            "ManagedInstance": launchable_managed_instance(),
             "Tags": [{ "Key": "env", "Value": "dev" }]
         });
         let first = create(&router, body.clone()).await;
@@ -369,7 +387,7 @@ async fn an_idempotency_token_replays_one_instance() {
     // A token this service has not seen creates a NEW instance.
     let fresh = create(
         &router,
-        json!({ "ClientToken": "tok-fresh", "ManagedInstance": {} }),
+        json!({ "ClientToken": "tok-fresh", "ManagedInstance": launchable_managed_instance() }),
     )
     .await;
     assert!(
@@ -670,7 +688,10 @@ async fn tag_resource_merges_onto_the_stored_tags() {
     let router = router();
     let id = create(
         &router,
-        json!({ "ManagedInstance": {}, "Tags": [{ "Key": "env", "Value": "dev" }] }),
+        json!({
+            "ManagedInstance": launchable_managed_instance(),
+            "Tags": [{ "Key": "env", "Value": "dev" }],
+        }),
     )
     .await;
 
@@ -717,7 +738,7 @@ async fn the_stored_tag_set_cannot_grow_past_what_the_model_can_report() {
         .collect();
     let id = create(
         &router,
-        json!({ "ManagedInstance": {}, "Tags": tag_list(&full) }),
+        json!({ "ManagedInstance": launchable_managed_instance(), "Tags": tag_list(&full) }),
     )
     .await;
     let expected: BTreeMap<String, String> = full.iter().cloned().collect();
@@ -783,7 +804,14 @@ async fn the_stored_tag_set_cannot_grow_past_what_the_model_can_report() {
 #[tokio::test]
 async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes() {
     let router = router();
-    let doomed = create(&router, json!({ "ClientToken": "tok-doomed", "ManagedInstance": {} })).await;
+    let doomed = create(
+        &router,
+        json!({
+            "ClientToken": "tok-doomed",
+            "ManagedInstance": launchable_managed_instance(),
+        }),
+    )
+    .await;
     let survivor = create(&router, minimal_create()).await;
 
     ok(
@@ -839,7 +867,10 @@ async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes
     // create does not hand back an id that no longer exists.
     let replayed = create(
         &router,
-        json!({ "ClientToken": "tok-doomed", "ManagedInstance": {} }),
+        json!({
+            "ClientToken": "tok-doomed",
+            "ManagedInstance": launchable_managed_instance(),
+        }),
     )
     .await;
     assert_ne!(

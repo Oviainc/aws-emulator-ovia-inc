@@ -209,8 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store copies these strings verbatim, so one request must not decide how much
         // memory its record occupies. Each refusal is this service's own envelope, keyed
         // by the member path the wire names.
+        // The id this job is stored under is the `{Id}` label of its own reads and the
+        // last segment of its ARN, so it is judged by the identifier rule all three
+        // creates share, before anything else about the submission.
+        crate::state::check_created_id(&input.id)?;
         for (member, value) in [
-            ("id", &input.id),
             ("originEndpointId", &input.origin_endpoint_id),
             ("startTime", &input.start_time),
             ("endTime", &input.end_time),

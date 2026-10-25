@@ -65,9 +65,9 @@ const RETENTION_SLACK: i64 = 5;
 /// retention period above, which is what makes it the largest the listing serves.
 const MAX_DURATION_MINUTES: i64 = RETENTION_DAYS * 24 * 60;
 
-/// The page-size window every MemoryDB listing serves ("Must be between 20 and 100"),
-/// mirrored from `crate::state::MIN_MAX_RESULTS` / `MAX_MAX_RESULTS`. Exercised AT each
-/// bound and one past it.
+/// The page-size window the CLUSTER-side MemoryDB listings serve, this one among them
+/// ("Must be between 20 and 100"), mirrored from
+/// `crate::state::CLUSTER_PAGE_SIZE_WINDOW`. Exercised AT each bound and one past it.
 const MIN_MAX_RESULTS: i64 = 20;
 const MAX_MAX_RESULTS: i64 = 100;
 

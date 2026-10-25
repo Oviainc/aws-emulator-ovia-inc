@@ -258,7 +258,7 @@ pub(crate) fn expected_arn(name: &str) -> String {
 }
 
 /// The instant a reported `dateType` member names, parsed back from the wire.
-fn reported_instant(text: &str) -> DateTime {
+pub(crate) fn reported_instant(text: &str) -> DateTime {
     DateTime::from_str(text, Format::DateTime)
         .unwrap_or_else(|error| panic!("{text:?} is not a wire date-time: {error}"))
 }

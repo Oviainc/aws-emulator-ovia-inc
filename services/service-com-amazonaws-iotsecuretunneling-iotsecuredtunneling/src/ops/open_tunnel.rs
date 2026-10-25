@@ -205,16 +205,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The tunnel's identity, computed before the tag check below so that
+        // check can ask the store how many distinct keys this resource would end
+        // up carrying. Minting an id and formatting an ARN store nothing, so a
+        // request refused below still writes no record and hands out no token.
+        let tunnel_id = crate::state::mint_tunnel_id();
+        let tunnel_arn = crate::state::tunnel_arn(&region, &tunnel_id);
+
         // A tunnel carries at most `MAX_TAGS_PER_TUNNEL` tags, and the two tagging
-        // entry points agree: refused here as well as in `TagResource`, before
-        // anything is minted or stored. The modelled `TagList` length bounds one
+        // entry points agree because both count through
+        // `state::merged_tag_count`: refused here as well as in `TagResource`,
+        // before anything is stored. The modelled `TagList` length bounds one
         // request's list; this bounds what one tunnel accumulates.
-        let tag_count = input.tags.as_deref().map_or(0, |tags| {
-            tags.iter()
-                .map(|tag| tag.key.as_str())
-                .collect::<::std::collections::BTreeSet<&str>>()
-                .len()
-        });
+        let tag_count = store.merged_tag_count(&tunnel_arn, input.tags.as_deref().unwrap_or(&[]));
         if tag_count > crate::state::MAX_TAGS_PER_TUNNEL {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "tags carries {tag_count} tags; a tunnel carries at most {}",
@@ -222,8 +225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let tunnel_id = crate::state::mint_tunnel_id();
-        let tunnel_arn = crate::state::tunnel_arn(&region, &tunnel_id);
         // Two independently minted tokens: the source and destination proxies each
         // authenticate with their own.
         let source_access_token = crate::state::mint_access_token();

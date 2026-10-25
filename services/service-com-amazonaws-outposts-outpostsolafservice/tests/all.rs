@@ -47,6 +47,8 @@ mod private_connectivity;
 mod private_connectivity_ownership;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
+#[path = "all/quote_listing.rs"]
+mod quote_listing;
 #[path = "all/quote_update.rs"]
 mod quote_update;
 #[path = "all/regional_scope.rs"]
@@ -65,5 +67,7 @@ mod site_and_outpost_projection;
 mod state_roundtrip;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
+#[path = "all/tagging_resource_arn.rs"]
+mod tagging_resource_arn;
 #[path = "all/update_persistence.rs"]
 mod update_persistence;

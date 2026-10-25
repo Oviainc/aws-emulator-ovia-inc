@@ -184,8 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetWorkspaceInstanceOutput {
-            // This slice models no lifecycle failure, so neither error list ever
-            // carries an entry; both stay absent rather than empty.
+            // Both error lists report what the stored record carries. A launch this
+            // service cannot carry out is refused by `CreateWorkspaceInstance` before
+            // anything is stored, so every record here is one of a configuration this
+            // service launched: none of them carries a WorkSpace Instance or an EC2
+            // failure, and both lists stay absent rather than empty.
             workspace_instance_errors: None,
             ec2_instance_errors: None,
             provision_state: Some(record.provision_state.clone()),

@@ -177,21 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The configuration the request asks for, as the store keeps one. Checked by the
-        // rule both this operation and `EnableControl` apply to a control's parameter
-        // list, so the same lists are refused in the same words from either call.
+        // The configuration the request asks for, as the store keeps one. Checked against
+        // the control this enablement applies, below, by the rule both this operation and
+        // `EnableControl` apply to a control's parameter list, so the same lists are refused
+        // in the same words from either call.
         let requested: Vec<(String, ::aws_smithy_types::Document)> = input
             .parameters
             .into_iter()
             .map(|parameter| (parameter.key, parameter.value))
             .collect();
-
-        if let Some(message) = crate::state::unacceptable_control_parameters_message(&requested) {
-            return Err(UpdateEnabledControlErrorModeled::ValidationException(
-                ValidationException { message },
-            )
-            .into());
-        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -215,6 +209,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The parameters are checked against the CATALOG entry of the control this
+        // enablement applies — the one the enable was accepted for — so an update cannot
+        // configure a control with a parameter that control does not declare.
+        let Some(catalogued) = crate::state::resolve_control(&control.control_identifier) else {
+            // Every stored enablement was written by `EnableControl`, which refuses a
+            // control the catalog does not publish, so this is unreachable from the wire;
+            // the modelled 404 is the answer if a store ever held such an enablement.
+            return Err(UpdateEnabledControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no control matches controlIdentifier {}, which enabled control {} \
+                         applies",
+                        control.control_identifier, control.arn
+                    ),
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) =
+            crate::state::unacceptable_control_parameters_message(catalogued, &requested)
+        {
+            return Err(UpdateEnabledControlErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
 
         // A drifted control cannot be updated through this call — its configuration has
         // diverged from the one the service deployed, so applying a new one on top would

@@ -154,6 +154,7 @@ use crate::state::{
     OPT_IDENTITY_CENTER_OPTIONS, OPT_IP_ADDRESS_TYPE, OPT_LOG_PUBLISHING_OPTIONS,
     OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS, OPT_OFF_PEAK_WINDOW_OPTIONS, OPT_SNAPSHOT_OPTIONS,
     OPT_SOFTWARE_UPDATE_OPTIONS, OPT_USE_CASE, OPT_VPC_OPTIONS, PROCESSING_STATUS_CREATING,
+    TAG_QUOTA,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -280,6 +281,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A domain is created carrying the tags the request named, and the same bound
+        // holds on them as on a later `AddTags`: a resource carries at most
+        // `TAG_QUOTA` tags, so a create naming more is refused rather than storing a
+        // set no `AddTags` could have built.
+        let tags = crate::state::tag_set(input.tag_list.unwrap_or_default());
+        if tags.len() > TAG_QUOTA {
+            return Err(CreateDomainErrorModeled::LimitExceededException(
+                crate::state::tag_quota_exceeded(&domain_arn(&name, &region), tags.len()),
+            )
+            .into());
+        }
+
         let suffix = store.mint_endpoint_suffix();
         let engine_version = input
             .engine_version
@@ -343,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             automated_snapshot_pause_options: input
                 .automated_snapshot_pause_options
                 .map(stored_automated_snapshot_pause_options),
-            tags: input.tag_list.unwrap_or_default(),
+            tags,
             created_at: now,
             updated_at: now,
             option_versions: BTreeMap::new(),

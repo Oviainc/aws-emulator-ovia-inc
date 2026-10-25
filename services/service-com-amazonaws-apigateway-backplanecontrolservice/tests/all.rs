@@ -170,3 +170,5 @@ mod stage_invoke_shared_stage_names;
 mod request_validator_collection;
 #[path = "all/api_key_gate.rs"]
 mod api_key_gate;
+#[path = "all/update_request_validator.rs"]
+mod update_request_validator;

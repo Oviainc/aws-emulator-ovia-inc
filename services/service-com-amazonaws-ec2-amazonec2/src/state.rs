@@ -1086,7 +1086,8 @@ use crate::ops::types::{
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SnapshotTaskDetail, SpotDatafeedSubscription, SpotPlacementScore, StateReason,
-    Subnet, SubnetAssociation, SubnetCidrReservation, Subscription, Tag,
+    Subnet, SubnetAssociation, SubnetCidrBlockState, SubnetCidrReservation,
+    SubnetIpv6CidrBlockAssociation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment, TransitGatewayConnect,
     TransitGatewayConnectPeer,
@@ -2162,6 +2163,17 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Amazon EVS provisions into this account as part of an environment it is still
     /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
+    /// When each subnet's IPv6 CIDR block association moves `associating` ->
+    /// `associated`, for the subnets that have an association still on its way.
+    ///
+    /// The subnet counterpart of the IPv6 move a `pending` VPC's association makes with it
+    /// (see [`Self::vpc_available_at`]), on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`]: `AssociateSubnetCidrBlock` answers an association in the
+    /// non-terminal `associating` state, so the clock owes it `associated` whether or not
+    /// anybody calls again. Keyed by `SubnetId` — "you can only associate a single IPv6
+    /// CIDR block with your subnet" (`AssociateSubnetCidrBlock`), so one subnet has at
+    /// most one such move owed, and [`Self::remove_subnet`] drops it with the subnet.
+    pub subnet_ipv6_associated_at: BTreeMap<String, Instant>,
     /// Every subnet CIDR reservation the account holds, by `SubnetCidrReservationId`, as
     /// the modelled [`SubnetCidrReservation`] shape itself — so a member a writer sets
     /// round-trips through `GetSubnetCidrReservations` without a field-by-field copy.
@@ -2806,6 +2818,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             default_vpc_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            subnet_ipv6_associated_at: BTreeMap::new(),
             // A fresh account has reserved no part of any subnet's CIDR range.
             subnet_cidr_reservations: BTreeMap::new(),
             carrier_gateways: BTreeMap::new(),
@@ -3234,6 +3247,57 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()));
         self.subnets.insert(subnet_id.clone(), subnet);
         subnet_id
+    }
+
+    /// Associate `ipv6_cidr_block` with the subnet `subnet_id` and answer the association
+    /// as it was stored, or `None` when the store holds no such subnet.
+    ///
+    /// The one writer of a subnet's `Ipv6CidrBlockAssociationSet`, so
+    /// `AssociateSubnetCidrBlock` and `DescribeSubnets` cannot report one association
+    /// differently. The association id is minted here out of the store's own counter, and
+    /// the state starts at [`CIDR_BLOCK_STATE_ASSOCIATING`] with the move to
+    /// [`CIDR_BLOCK_STATE_ASSOCIATED`] recorded in [`Self::subnet_ipv6_associated_at`] one
+    /// [`TRANSITION_DELAY`] out — the same arrangement a VPC's own IPv6 association has.
+    ///
+    /// `ipv6_address_attribute` and `ip_source` are facts of the VPC block this one is cut
+    /// out of, so the caller reads them off that association rather than this writer
+    /// guessing them.
+    ///
+    /// The caller-chosen bytes the block string retains are charged against the store's
+    /// byte budget HERE, which is what [`subnet_payload_bytes`] gives back on delete; a
+    /// writer still asks [`Self::would_exceed_stored_bytes`] first so it can refuse
+    /// instead of overshooting.
+    pub fn associate_subnet_ipv6_cidr_block(
+        &mut self,
+        subnet_id: &str,
+        ipv6_cidr_block: String,
+        ipv6_address_attribute: Option<String>,
+        ip_source: Option<String>,
+    ) -> Option<SubnetIpv6CidrBlockAssociation> {
+        if !self.subnets.contains_key(subnet_id) {
+            return None;
+        }
+        let association_id = self.next_id("subnet-cidr-assoc");
+        let charged_bytes = ipv6_cidr_block.len();
+        let association = SubnetIpv6CidrBlockAssociation {
+            association_id: Some(association_id),
+            ipv6_cidr_block: Some(ipv6_cidr_block),
+            ipv6_cidr_block_state: Some(SubnetCidrBlockState {
+                state: Some(CIDR_BLOCK_STATE_ASSOCIATING.to_string()),
+                status_message: None,
+            }),
+            ipv6_address_attribute,
+            ip_source,
+        };
+        let subnet = self.subnets.get_mut(subnet_id)?;
+        subnet
+            .ipv6_cidr_block_association_set
+            .get_or_insert_with(Vec::new)
+            .push(association.clone());
+        self.add_stored_bytes(charged_bytes);
+        self.subnet_ipv6_associated_at
+            .insert(subnet_id.to_string(), Instant::now() + TRANSITION_DELAY);
+        Some(association)
     }
 
     /// Whether another subnet CIDR reservation fits inside the store's ceiling
@@ -4820,7 +4884,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
     /// its IPv6 association moving `associating` -> `associated`, a `pending` carrier
     /// gateway becoming `available`, a subnet another service
-    /// handed over `pending` becoming `available`, a `pending` transit
+    /// handed over `pending` becoming `available` and a subnet's own IPv6 association
+    /// making that same `associating` -> `associated` move, a `pending` transit
     /// gateway with the route tables that come up
     /// with it, a `pending` route server endpoint or route server peer becoming
     /// `available` (a route server's own two states are derived on read by
@@ -4902,6 +4967,26 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
             // The transition is applied once; nothing is owed on this subnet any more.
+            false
+        });
+        // The IPv6 CIDR block association a subnet is given reaches `associated` on the
+        // same terms its VPC's own does above: owed at its due instant whether or not
+        // anybody called.
+        let subnets = &mut self.subnets;
+        self.subnet_ipv6_associated_at.retain(|subnet_id, due_at| {
+            if now < *due_at {
+                return true;
+            }
+            if let Some(subnet) = subnets.get_mut(subnet_id) {
+                for association in subnet.ipv6_cidr_block_association_set.iter_mut().flatten() {
+                    if let Some(state) = association.ipv6_cidr_block_state.as_mut() {
+                        if state.state.as_deref() == Some(CIDR_BLOCK_STATE_ASSOCIATING) {
+                            state.state = Some(CIDR_BLOCK_STATE_ASSOCIATED.to_string());
+                        }
+                    }
+                }
+            }
+            // The transition is applied once; nothing is owed on this association any more.
             false
         });
         // A VPN static route `CreateVpnConnectionRoute` answered as `pending` is
@@ -13357,6 +13442,30 @@ pub fn canonical_subnet_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
     Ok(canonical)
 }
 
+/// The one prefix length an IPv6 SUBNET CIDR block may have.
+///
+/// "The IPv6 CIDR block size is fixed at /64" (Amazon VPC User Guide, "IP addressing for
+/// your VPCs and subnets" → "Subnet CIDR blocks"), so unlike the IPv4 side this is a
+/// single size rather than a range: an IPv6 subnet block is a /64 of one of the IPv6
+/// blocks associated with its VPC.
+pub const SUBNET_IPV6_PREFIX_LENGTH: u8 = 64;
+
+/// A requested IPv6 SUBNET CIDR block in the canonical form AWS stores it in.
+///
+/// The same canonicalisation every IPv6 block of this crate goes through
+/// ([`canonical_ipv6_cidr`] — the host bits cleared, the address rendered the one way
+/// `Ipv6Addr` renders it), held to the one published subnet block size
+/// ([`SUBNET_IPV6_PREFIX_LENGTH`]). It is the IPv6 counterpart of
+/// [`canonical_subnet_ipv4_cidr`], so the two families differ only in the published size.
+pub fn canonical_subnet_ipv6_cidr(value: &str) -> Result<String, CidrProblem> {
+    let canonical = canonical_ipv6_cidr(value)?;
+    let (_, prefix_length) = split_ipv6_cidr(&canonical).ok_or(CidrProblem::Malformed)?;
+    if prefix_length != SUBNET_IPV6_PREFIX_LENGTH {
+        return Err(CidrProblem::PrefixLength);
+    }
+    Ok(canonical)
+}
+
 /// The smallest IPv4 prefix length a SECONDARY NETWORK CIDR block may have: "The allowed
 /// size for a secondary network CIDR block is between /28 netmask (16 IP addresses) and /12
 /// netmask (1,048,576 IP addresses)" (`CreateSecondaryNetwork`), also stated on the member
@@ -14000,6 +14109,10 @@ pub enum SubnetRangeProblem<'a> {
     /// The block parses and is of a permitted size, but lies outside the CIDR block of the
     /// VPC the subnet would sit in.
     OutsideVpc(&'a str),
+    /// The block is an IPv6 block of a size other than the one an IPv6 subnet may have
+    /// ([`SUBNET_IPV6_PREFIX_LENGTH`]) — the IPv6 counterpart of [`Self::BlockSize`],
+    /// separate because the two families publish different sizes.
+    Ipv6BlockSize,
 }
 
 /// Refuse a subnet CIDR block the subnet's range rules do not admit: HTTP 400
@@ -14018,8 +14131,25 @@ pub fn invalid_subnet_range<E>(
         SubnetRangeProblem::OutsideVpc(vpc_id) => {
             format!("The CIDR '{cidr_block}' is not within the CIDR block of VPC '{vpc_id}'")
         }
+        SubnetRangeProblem::Ipv6BlockSize => format!(
+            "The CIDR '{cidr_block}' is invalid. The allowed block size for an IPv6 subnet \
+             is /{SUBNET_IPV6_PREFIX_LENGTH}."
+        ),
     };
     Scaffolded::service_error(INVALID_SUBNET_RANGE, 400, message)
+}
+
+/// EC2's error code for a request that would take a resource past the number of CIDR
+/// blocks it may have associated with it — "CidrLimitExceeded: You've reached the limit on
+/// the number of CIDR blocks you can associate with the resource" (EC2 API "Error codes").
+/// For a subnet that limit is one IPv6 block: "You can only associate a single IPv6 CIDR
+/// block with your subnet" (`AssociateSubnetCidrBlock`).
+pub const CIDR_LIMIT_EXCEEDED: &str = "CidrLimitExceeded";
+
+/// Refuse an association past the number of CIDR blocks the resource may hold: HTTP 400
+/// [`CIDR_LIMIT_EXCEEDED`].
+pub fn cidr_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(CIDR_LIMIT_EXCEEDED, 400, message)
 }
 
 /// Refuse a create that would take the store past [`MAX_SUBNETS`]: HTTP 400
@@ -14237,9 +14367,19 @@ pub fn vpc_payload_bytes(vpc: &Vpc) -> usize {
 }
 
 /// The caller-chosen bytes a stored subnet retains: its tags, which is what
-/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged.
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet`] charged, plus the IPv6 block an
+/// association holds, which is what
+/// [`ComAmazonawsEc2Amazonec2State::associate_subnet_ipv6_cidr_block`] charged — so
+/// [`ComAmazonawsEc2Amazonec2State::remove_subnet`] gives back exactly what was taken,
+/// the same arrangement [`vpc_payload_bytes`] has for a VPC.
 pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
-    tag_list_bytes(subnet.tags.as_deref().unwrap_or_default())
+    let ipv6_bytes: usize = subnet
+        .ipv6_cidr_block_association_set
+        .iter()
+        .flatten()
+        .map(|association| association.ipv6_cidr_block.as_deref().map_or(0, str::len))
+        .sum();
+    tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()).saturating_add(ipv6_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -14536,11 +14676,13 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Remove the subnet `subnet_id` and answer it as it was last reported, or `None` when
     /// the store holds no such subnet. The bytes the record held go back to the store's
-    /// budget, and the `available` transition the clock may still owe it goes with it, so a
-    /// later materialisation cannot resurrect a deleted subnet's state.
+    /// budget, and every transition the clock may still owe it — its `available` move and
+    /// its IPv6 association's `associated` one — goes with it, so a later materialisation
+    /// cannot resurrect a deleted subnet's state.
     pub fn remove_subnet(&mut self, subnet_id: &str) -> Option<Subnet> {
         let subnet = self.subnets.remove(subnet_id)?;
         self.subnet_available_at.remove(subnet_id);
+        self.subnet_ipv6_associated_at.remove(subnet_id);
         self.release_stored_bytes(subnet_payload_bytes(&subnet));
         Some(subnet)
     }

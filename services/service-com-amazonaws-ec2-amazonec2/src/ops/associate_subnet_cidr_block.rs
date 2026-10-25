@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSubnetCidrBlock
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateSubnetCidrBlock`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates the request's IPv6 CIDR block with a stored subnet, as a block
+//! cut out of one of the IPv6 blocks associated with that subnet's VPC, and answers the
+//! association in `associating` with the instant the clock owes it `associated` recorded
+//! beside it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_ipv6_associated_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateSubnetCidrBlock::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +133,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateSubnetCidrBlock` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateSubnetCidrBlockErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateSubnetCidrBlock"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // subnet is named by the request and the block it associates comes from the
+        // request and the subnet's own VPC. This operation models no `DryRun` member.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // The clock-owed transitions every path that reads a subnet applies: a subnet
+        // `CreateSubnet` answered as `pending` is `available`, and an association answered
+        // as `associating` is `associated`, once the due instant has passed — whether or
+        // not anybody called.
+        store.materialize_due_transitions();
+
+        // "Associates a CIDR block with your subnet": a subnet id this account holds no
+        // subnet for is a refusal, read BEFORE anything about the requested block, since
+        // the request is about that subnet.
+        let Some(subnet) = store.subnets.get(&input.subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        let Some(vpc_id) = subnet.vpc_id.clone() else {
+            return Err(state::internal_error(format!(
+                "the subnet '{subnet_id}' is in no VPC",
+                subnet_id = input.subnet_id,
+            )));
+        };
+        // The block already associated with this subnet, if any, which decides whether
+        // another one may be added at all. An association only HOLDS its block while its
+        // state says so: one on its way in or already in does, and one on its way out or
+        // gone does not — nothing writes those two states today
+        // (`DisassociateSubnetCidrBlock` is still a scaffold), so the filter is what keeps
+        // this rule true the moment one does.
+        let held_block: Option<String> = subnet
+            .ipv6_cidr_block_association_set
+            .iter()
+            .flatten()
+            .filter(|association| {
+                holds_its_block(
+                    association
+                        .ipv6_cidr_block_state
+                        .as_ref()
+                        .and_then(|state| state.state.as_deref()),
+                )
+            })
+            .find_map(|association| association.ipv6_cidr_block.clone());
+
+        // "An IPv6 netmask length" (`Ipv6NetmaskLength`) is the SIZE to cut out of a pool,
+        // so it says nothing without the pool to cut it from: that combination is the
+        // caller's error, not something unwritten.
+        if input.ipv6_netmask_length.is_some() && input.ipv6_ipam_pool_id.is_none() {
+            return Err(state::invalid_parameter_combination(
+                "You must specify Ipv6IpamPoolId when you specify Ipv6NetmaskLength",
+            ));
+        }
+        // Allocating the block out of an IPAM pool needs that pool's free space, and this
+        // emulator holds no IPAM pools (every IPAM pool operation is still a scaffold), so
+        // a 501 ("nobody has written this yet") is the honest answer rather than a refusal
+        // that blames the caller.
+        if input.ipv6_ipam_pool_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "AssociateSubnetCidrBlock with an IPAM-allocated CIDR block",
+            ));
+        }
+
+        // No IPAM pool was named, so the request has to carry the block itself.
+        let Some(requested_cidr) = input
+            .ipv6_cidr_block
+            .as_deref()
+            .filter(|cidr| !cidr.is_empty())
+        else {
+            return Err(state::missing_parameter(
+                "Either 'ipv6CidrBlock' or 'ipv6IpamPoolId' must be specified",
+            ));
+        };
+        // The block in the canonical form AWS stores it in, at the one published size an
+        // IPv6 subnet block has ([`crate::state::SUBNET_IPV6_PREFIX_LENGTH`]).
+        let ipv6_cidr_block = match state::canonical_subnet_ipv6_cidr(requested_cidr) {
+            Ok(canonical) => canonical,
+            Err(state::CidrProblem::Malformed) => {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({requested_cidr}) for parameter ipv6CidrBlock is invalid. \
+                     This is not a valid IPv6 CIDR block."
+                )))
+            }
+            // A block of a size this service does not permit is a RANGE violation, the
+            // same answer `CreateSubnet` gives an IPv4 block outside the published subnet
+            // block size — and it is worded at the one site for that code.
+            Err(state::CidrProblem::PrefixLength) => {
+                return Err(state::invalid_subnet_range(
+                    requested_cidr,
+                    state::SubnetRangeProblem::Ipv6BlockSize,
+                ))
+            }
+        };
+
+        // "You can only associate a single IPv6 CIDR block with your subnet"
+        // (`AssociateSubnetCidrBlock`), so a subnet that already has one is at its limit.
+        if let Some(held) = held_block.as_deref() {
+            return Err(state::cidr_limit_exceeded(format!(
+                "The subnet '{subnet_id}' already has the IPv6 CIDR block '{held}' \
+                 associated with it, and only a single IPv6 CIDR block can be associated \
+                 with a subnet",
+                subnet_id = input.subnet_id,
+            )));
+        }
+
+        // A subnet's block is a block OF its VPC's, so it has to sit inside one of the
+        // IPv6 blocks associated with the VPC — exactly the containment `CreateSubnet`
+        // checks for an IPv4 block. Where the block comes from and whether it is
+        // advertised on the internet are facts of THAT block, so they are read off the
+        // VPC's association rather than invented here.
+        let Some(vpc) = store.vpcs.get(&vpc_id) else {
+            return Err(state::internal_error(format!(
+                "the VPC '{vpc_id}' of subnet '{subnet_id}' could not be read",
+                subnet_id = input.subnet_id,
+            )));
+        };
+        let Some(vpc_association) = vpc
+            .ipv6_cidr_block_association_set
+            .iter()
+            .flatten()
+            // Only a block the VPC still HOLDS can have a subnet's block cut out of it,
+            // on the same reading of an association's state as the subnet's own above.
+            .filter(|association| {
+                holds_its_block(
+                    association
+                        .ipv6_cidr_block_state
+                        .as_ref()
+                        .and_then(|state| state.state.as_deref()),
+                )
+            })
+            .find(|association| {
+                association
+                    .ipv6_cidr_block
+                    .as_deref()
+                    .is_some_and(|associated| {
+                        state::ipv6_cidr_block_contains(associated, &ipv6_cidr_block)
+                    })
+            })
+        else {
+            return Err(state::invalid_subnet_range(
+                &ipv6_cidr_block,
+                state::SubnetRangeProblem::OutsideVpc(&vpc_id),
+            ));
+        };
+        let ipv6_address_attribute = vpc_association.ipv6_address_attribute.clone();
+        let ip_source = vpc_association.ip_source.clone();
+
+        // "A subnet CIDR block must not overlap the CIDR block of an existing subnet in
+        // the VPC" (`CreateSubnet`) — the conflict is per VPC and per family, so the same
+        // block under another VPC is not one.
+        if let Some(conflicting) = store
+            .subnets
+            .iter()
+            .filter(|(_, subnet)| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
+            .find(|(_, subnet)| {
+                subnet
+                    .ipv6_cidr_block_association_set
+                    .iter()
+                    .flatten()
+                    // Only a block another subnet still HOLDS can be overlapped, on the
+                    // same reading of an association's state as the two checks above:
+                    // one rule for all three sites.
+                    .filter(|association| {
+                        holds_its_block(
+                            association
+                                .ipv6_cidr_block_state
+                                .as_ref()
+                                .and_then(|state| state.state.as_deref()),
+                        )
+                    })
+                    .filter_map(|association| association.ipv6_cidr_block.as_deref())
+                    .any(|held| state::ipv6_cidr_blocks_overlap(held, &ipv6_cidr_block))
+            })
+            .map(|(subnet_id, _)| subnet_id.clone())
+        {
+            return Err(state::invalid_subnet_conflict(
+                &ipv6_cidr_block,
+                &conflicting,
+            ));
+        }
+
+        // The caller-chosen bytes the association retains, against the crate's one byte
+        // budget: a request-sized string is stored, so it is charged for like any other.
+        let payload_bytes = ipv6_cidr_block.len();
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The one writer of a subnet's association set, so this operation and
+        // `DescribeSubnets` cannot report the association differently.
+        let Some(association) = store.associate_subnet_ipv6_cidr_block(
+            &input.subnet_id,
+            ipv6_cidr_block,
+            ipv6_address_attribute,
+            ip_source,
+        ) else {
+            return Err(state::internal_error(format!(
+                "the subnet '{subnet_id}' could not be read back to associate its IPv6 \
+                 CIDR block",
+                subnet_id = input.subnet_id,
+            )));
+        };
+        Ok(AssociateSubnetCidrBlockOutput {
+            ipv6_cidr_block_association: Some(association),
+            subnet_id: Some(input.subnet_id),
+        })
+    }
+}
+
+/// Does an association in this `SubnetCidrBlockStateCode` / `VpcCidrBlockStateCode` state
+/// still HOLD the block it names?
+///
+/// `associating` and `associated` do — the block is on its way in or in — while
+/// `disassociating`, `disassociated`, `failing` and `failed` do not: the block is on its
+/// way out, gone, or was never taken. An association carrying no state at all is read as
+/// holding its block, since every writer of this crate sets one. The two enums share these
+/// words (`smithy_query(query="shape",shape="SubnetCidrBlockStateCode,VpcCidrBlockStateCode")`),
+/// so one reader answers for a subnet's association and for its VPC's.
+fn holds_its_block(state: Option<&str>) -> bool {
+    match state {
+        None => true,
+        Some(state) => {
+            state == crate::state::CIDR_BLOCK_STATE_ASSOCIATING
+                || state == crate::state::CIDR_BLOCK_STATE_ASSOCIATED
+        }
     }
 }

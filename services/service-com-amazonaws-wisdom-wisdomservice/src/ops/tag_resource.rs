@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: MERGES the requested tag map into the tags persisted on the resource the
+//! `resourceArn` names, as an upsert — a key the resource does not hold is added, a key
+//! it already holds has its value replaced, and every other tag is left alone.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `resourceArn` is a full `Arn`, not one family's path label, so the write goes through
+//! the same cross-family lookup the reporting path uses
+//! ([`crate::state::ComAmazonawsWisdomWisdomserviceState::tags_of_resource_mut`]): an
+//! assistant, a knowledge base, a session or an assistant association. There is only one
+//! copy of a resource's tags, so what this merge stores is exactly what a later
+//! `ListTagsForResource` — or a read of the resource itself — reports. An ARN that names
+//! no resource this account holds is the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! A resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, and a request
+//! that would leave it holding more is refused with HTTP 400 and the error code this
+//! endpoint words a tag set past that ceiling with
+//! ([`crate::scaffolded::Scaffolded::bad_request`]) — which is what the recorded wire
+//! answer of this endpoint for exactly this case carries, so the code travels from there
+//! rather than from the `TooManyTagsException` shape the operation's `errors` list names:
+//! a client branches on the code it is actually sent. The request's OWN map is counted
+//! before the ARN is resolved, so a map larger than the ceiling is refused whether or not
+//! it named a resource that exists; the merge is counted after, against what the resource
+//! holds. A refused call stores NOTHING: both counts happen before any pair is written,
+//! and only a key the resource does not already hold grows the set, so re-valuing stored
+//! keys is accepted even at the ceiling.
+//!
+//! The operation is `@idempotent` (`smithy_query(query="operation",
+//! operation="TagResource")`), so merging pairs the resource already carries changes
+//! nothing and answers alike however often it is repeated.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +156,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Every modelled constraint on `resourceArn` and on the `Tags` map's keys and
+        // values (`smithy_query(query="shape",shape="Tags")`) is refused before this
+        // handler runs, so what is left here is the store's own rules.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to write to,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"));
+        };
+        // A request carrying more pairs than a resource may hold cannot be served
+        // whatever it addressed, so it is refused before the ARN is resolved — the answer
+        // does not depend on whether the request named a resource that exists.
+        if input.tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::message_too_many_tags(),
+            ));
+        }
+        let mut store = state.lock();
+        let resource_arn = input.resource_arn;
+        let Some(tags) = store.tags_of_resource_mut(&resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_RESOURCE_NOT_FOUND.to_string()),
+                    resource_name: Some(resource_arn),
+                },
+            )
+            .into());
+        };
+
+        // Only a key the resource does not already hold grows its tag set, so a merge
+        // that re-values stored keys cannot carry it past the ceiling.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(key.as_str()))
+            .count();
+        if tags.len() + added > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::message_too_many_tags(),
+            ));
+        }
+
+        // Counted first, written second: a refused merge leaves the stored map as it was.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
