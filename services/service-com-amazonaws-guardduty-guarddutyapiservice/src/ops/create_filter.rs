@@ -4,7 +4,7 @@
 //! IMPLEMENTED: saves a finding filter on the detector and answers with the name it
 //! was saved under, so a later `GetFilter` reports exactly what this call stored. A
 //! filter name outside the documented alphabet, and a `FindingCriteria` criterion
-//! keyed by anything that is not a finding attribute, are refused with the
+//! keyed by anything that is not a field of a finding, are refused with the
 //! `BadRequestException` envelope and persist no filter.
 //! This is the ONLY file to touch for this operation.
 //!
@@ -189,25 +189,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The second such rule: a `FindingCriteria.Criterion` key must NAME a
-        // finding attribute. The model types the criterion as a map keyed by a
-        // plain string, so the boundary validator accepts any key at all, and a
-        // filter saved under a key that names no attribute would select nothing —
-        // the findings it was built to suppress or route go unsuppressed and
-        // unrouted, with nothing in the response to say why. The attribute
-        // CATALOGUE is the one `ListFindings` and `GetFindings` evaluate against
+        // The second such rule: a `FindingCriteria.Criterion` key must NAME a FIELD
+        // OF A FINDING. The model types the criterion as a map keyed by a plain
+        // string, so the boundary validator accepts any key at all, and a filter
+        // saved under a key that names no field would select nothing — the findings
+        // it was built to suppress or route go unsuppressed and unrouted, with
+        // nothing in the response to say why. The field check is the one
+        // `ListFindings` and `GetFindings` apply
         // (`crate::state::validate_finding_criteria`), so there is ONE answer on
-        // this service to "is this a finding attribute": a criterion a saved
-        // filter carries is one a findings read can evaluate.
+        // this service to "is this a finding field": a criterion a saved filter
+        // carries is one a findings read accepts. A field a finding may carry but
+        // this emulator's records do not populate is SAVED and selects nothing,
+        // which is what the same filter does on the real service against findings
+        // that have no value for it.
         //
         // Validated before the store is touched, so a refused request leaves no
         // filter behind.
-        crate::state::validate_finding_criteria(Some(&input.finding_criteria)).map_err(|path| {
-            bad_request(format!(
-                "findingCriteria.criterion: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
-                crate::state::FINDING_ATTRIBUTES.join(", ")
-            ))
-        })?;
+        crate::state::validate_finding_criteria(Some(&input.finding_criteria))
+            .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
 
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
@@ -279,10 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Rank` is optional and GuardDuty invents none: a filter created
             // without one reports none.
             rank: input.rank,
-            // Stored as sent, once every criterion key has been resolved against
-            // the finding-attribute catalogue above: a saved filter carries only
-            // criteria a findings read can evaluate, so `GetFilter` reports back
-            // exactly what the create accepted.
+            // Stored as sent, once every criterion key has been resolved as a field
+            // of a finding above: a saved filter carries only criteria a findings
+            // read accepts, so `GetFilter` reports back exactly what the create
+            // accepted.
             finding_criteria: input.finding_criteria.clone(),
             tags: input
                 .tags
@@ -320,3 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn bad_request(message: impl Into<String>) -> CreateFilterError {
     crate::scaffolded::Scaffolded::invalid_input(message)
 }
+
+/// The wire path of the criterion map a refusal names: `FindingCriteria` has
+/// `jsonName` `findingCriteria` and carries the keys under `criterion`
+/// (`smithy_query(operation="CreateFilter")`).
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria.criterion";
