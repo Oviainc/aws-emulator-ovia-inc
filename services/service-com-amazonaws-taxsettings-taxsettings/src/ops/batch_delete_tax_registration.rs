@@ -8,9 +8,13 @@
 //! `ListTaxRegistrations`.
 //!
 //! An account the service could not delete — one holding no registration, which
-//! is what `DeleteTaxRegistration` answers 404 for — is reported in the
-//! response's `errors` list naming that account, and the rest of the batch is
-//! still deleted. `accountIds` carries the model's `@length` 1..=5, which the
+//! is what `DeleteTaxRegistration` answers 404 for, or one whose registration is
+//! held in a jurisdiction this API cannot remove one from, which
+//! `DeleteTaxRegistration` refuses with its modelled `ValidationException` — is
+//! reported in the response's `errors` list naming that account with the code
+//! that single-account delete would have failed with, its record left in place,
+//! and the rest of the batch is still deleted.
+//! `accountIds` carries the model's `@length` 1..=5, which the
 //! boundary validator refuses outside of before this handler runs, and is a list
 //! of UNIQUE account identifiers: an id named more than once names one account
 //! and one deletion, so it is performed and reported once.
@@ -171,17 +175,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !addressed.insert(account_id.as_str()) {
                 continue;
             }
-            if store.registrations.remove(account_id).is_none() {
-                let missing = crate::state::no_tax_registration();
-                errors.push(BatchDeleteTaxRegistrationError2 {
+            // Exactly what this account's own single-account delete would have
+            // answered, so the two delete paths cannot disagree about one
+            // record: the code is the modelled error that delete raises and the
+            // record is left in place whenever one is raised.
+            let refused: Option<(&str, String)> = match store.registrations.get(account_id) {
+                None => Some((
+                    "ResourceNotFoundException",
+                    crate::state::no_tax_registration().message,
+                )),
+                Some(stored) => crate::state::check_registration_deletable(stored)
+                    .err()
+                    .map(|refusal| ("ValidationException", refusal.message)),
+            };
+            match refused {
+                Some((code, message)) => errors.push(BatchDeleteTaxRegistrationError2 {
                     account_id: account_id.clone(),
-                    message: missing.message,
-                    // The code this account's own single-account delete would
-                    // have failed with: `DeleteTaxRegistration` answers an
-                    // account holding no registration with its modelled
-                    // `ResourceNotFoundException`.
-                    code: Some("ResourceNotFoundException".to_string()),
-                });
+                    message,
+                    code: Some(code.to_string()),
+                }),
+                None => {
+                    store.registrations.remove(account_id);
+                }
             }
         }
         drop(store);
