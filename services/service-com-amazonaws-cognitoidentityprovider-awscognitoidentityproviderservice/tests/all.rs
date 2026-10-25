@@ -53,6 +53,8 @@ mod state_roundtrip;
 mod token_signing;
 #[path = "all/update_group.rs"]
 mod update_group;
+#[path = "all/update_user_attributes.rs"]
+mod update_user_attributes;
 #[path = "all/update_user_pool.rs"]
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]

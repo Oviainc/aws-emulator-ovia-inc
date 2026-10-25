@@ -4,7 +4,8 @@
 //!
 //! Route 53 is a control plane over the hosted zone and, inside it, the
 //! resource record set, plus the traffic policy a record set can be generated
-//! from. They all live here, in ONE store, so every operation reads the records
+//! from and the health check a record set can be routed by. They all live here,
+//! in ONE store, so every operation reads the records
 //! another operation wrote. The helpers in this module are the
 //! shared vocabulary the handlers in `src/ops/` use for them — DNS name
 //! normalization, the sort key `ListResourceRecordSets` orders by, the
@@ -29,8 +30,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
-    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, NoSuchHostedZone, NoSuchTrafficPolicy,
-    ResourceRecordSet, Tag, TrafficPolicy, VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
+    ChangeInfo, DelegationSet, HealthCheck, HealthCheckConfig, HostedZone, HostedZoneConfig,
+    NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, ResourceRecordSet, Tag, TrafficPolicy,
+    VPC, R_R_TYPE_VALUES, V_P_C_REGION_VALUES,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -111,6 +113,46 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 10;
 /// Route 53's documented account quota ("Health checks: 200 per account"), and
 /// the model declares `TooManyHealthChecks` for the refusal that enforces it.
 pub const MAX_HEALTH_CHECKS: usize = 200;
+
+/// The `HealthCheckType` values that check an endpoint of the caller's, rather
+/// than reading a CloudWatch alarm, combining other health checks or following a
+/// routing control (`HealthCheckType` enum).
+///
+/// These are the types whose `HealthCheckConfig` is about reaching an endpoint,
+/// so they are the ones that need an endpoint to reach and that carry the
+/// `RequestInterval` / `FailureThreshold` defaults below.
+pub const ENDPOINT_HEALTH_CHECK_TYPES: &[&str] =
+    &["HTTP", "HTTPS", "HTTP_STR_MATCH", "HTTPS_STR_MATCH", "TCP"];
+
+/// The `HealthCheckType` values that search the response body for a string
+/// (`HealthCheckType` enum).
+pub const STRING_MATCH_HEALTH_CHECK_TYPES: &[&str] = &["HTTP_STR_MATCH", "HTTPS_STR_MATCH"];
+
+/// The `HealthCheckType` that reads a CloudWatch alarm (`HealthCheckType` enum).
+pub const HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC: &str = "CLOUDWATCH_METRIC";
+/// The `HealthCheckType` that combines other health checks (`HealthCheckType` enum).
+pub const HEALTH_CHECK_TYPE_CALCULATED: &str = "CALCULATED";
+/// The `HealthCheckType` that follows a routing control (`HealthCheckType` enum).
+pub const HEALTH_CHECK_TYPE_RECOVERY_CONTROL: &str = "RECOVERY_CONTROL";
+
+/// The `RequestInterval`, in seconds, a health check that asks for none gets.
+///
+/// `HealthCheckConfig$RequestInterval`'s own documentation: "If you don't specify
+/// a value for RequestInterval, the default value is 30 seconds."
+pub const DEFAULT_REQUEST_INTERVAL: i32 = 30;
+
+/// The `FailureThreshold` a health check that asks for none gets.
+///
+/// `HealthCheckConfig$FailureThreshold`'s own documentation: "if you don't
+/// specify a value for FailureThreshold, the default value is three health
+/// checks."
+pub const DEFAULT_FAILURE_THRESHOLD: i32 = 3;
+
+/// The version a newly created health check carries.
+///
+/// `HealthCheckVersion` is `range 1..`, and `UpdateHealthCheck` moves it on, so a
+/// health check starts at the bottom of that range.
+pub const FIRST_HEALTH_CHECK_VERSION: i64 = 1;
 
 /// The most Amazon VPCs one private hosted zone may be associated with.
 ///
@@ -512,6 +554,76 @@ pub fn vpc_position_in(vpcs: &[VPC], vpc_id: &str) -> Option<usize> {
         .position(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
 }
 
+/// A health check of the account's, as `GetHealthCheck` reports it.
+///
+/// The configuration is held as the modelled `HealthCheckConfig`, with the
+/// defaults the service fills in already applied (see
+/// [`health_check_config_with_defaults`]), so the create that persisted it and
+/// every later read report the same configuration.
+#[derive(Debug, Clone)]
+pub struct StoredHealthCheck {
+    /// The health check id, which is also this record's key in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::health_checks`].
+    pub id: String,
+    /// The `CallerReference` the health check was created with.
+    pub caller_reference: String,
+    /// The health check's configuration, as the service holds it.
+    pub config: HealthCheckConfig,
+    /// The `HealthCheckVersion`, starting at [`FIRST_HEALTH_CHECK_VERSION`].
+    pub version: i64,
+    /// The tags on this health check, keyed by tag key so one key carries one
+    /// value (`ChangeTagsForResource`).
+    pub tags: BTreeMap<String, String>,
+}
+
+impl StoredHealthCheck {
+    /// The modelled `HealthCheck` for this record.
+    ///
+    /// The ONE projection every health-check response is built from, so a create
+    /// and a later read cannot report one health check differently.
+    pub fn to_health_check(&self) -> HealthCheck {
+        HealthCheck {
+            id: self.id.clone(),
+            caller_reference: self.caller_reference.clone(),
+            // `LinkedService` is "If the health check was created by another
+            // service, the service that created the health check": a health
+            // check this API created for the account was created by no other
+            // service, so the member is absent.
+            linked_service: None,
+            health_check_config: self.config.clone(),
+            health_check_version: self.version,
+            // The alarm's own configuration belongs to CloudWatch, which is
+            // where Route 53 reads it from; this store holds the alarm's
+            // identity (`HealthCheckConfig$AlarmIdentifier`), not its settings.
+            cloud_watch_alarm_configuration: None,
+        }
+    }
+
+    /// This health check's tags as the modelled `Tag` list.
+    pub fn to_tag_list(&self) -> Vec<Tag> {
+        tags_to_list(&self.tags)
+    }
+}
+
+/// `config` with the values the service fills in for a member the caller left
+/// out, so what the store holds is what the service would report.
+///
+/// Only the endpoint-based types take these two members —
+/// `HealthCheckConfig$RequestInterval` and `$FailureThreshold` both state that
+/// they are "not supported when you specify a value for Type of
+/// RECOVERY_CONTROL", and the other two types read a CloudWatch alarm or combine
+/// child health checks rather than probing an endpoint — so a check of another
+/// type keeps exactly the configuration it was created with.
+pub fn health_check_config_with_defaults(config: &HealthCheckConfig) -> HealthCheckConfig {
+    let mut filled = config.clone();
+    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&filled.r#type.as_str()) {
+        filled.request_interval = Some(filled.request_interval.unwrap_or(DEFAULT_REQUEST_INTERVAL));
+        filled.failure_threshold =
+            Some(filled.failure_threshold.unwrap_or(DEFAULT_FAILURE_THRESHOLD));
+    }
+    filled
+}
+
 /// One version of a traffic policy: the document that version holds, and the
 /// values read off it.
 ///
@@ -585,6 +697,13 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// over a stable total order of policy ids. Bounded by
     /// [`MAX_TRAFFIC_POLICIES`].
     pub traffic_policies: BTreeMap<String, StoredTrafficPolicy>,
+    /// Every health check of the account's, keyed by its id. A `BTreeMap` so a
+    /// listing pages over a stable total order of health-check ids. Bounded by
+    /// [`MAX_HEALTH_CHECKS`].
+    pub health_checks: BTreeMap<String, StoredHealthCheck>,
+    /// `CallerReference` -> health-check id, the index `CreateHealthCheck`
+    /// recognises a repeated request by.
+    pub health_check_by_caller_reference: HashMap<String, String>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
     /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
@@ -604,6 +723,8 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             changes: HashMap::new(),
             change_order: VecDeque::new(),
             traffic_policies: BTreeMap::new(),
+            health_checks: BTreeMap::new(),
+            health_check_by_caller_reference: HashMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
         }
@@ -629,6 +750,17 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
         loop {
             let id = self.ids.mint_uuid();
             if !self.traffic_policies.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint a health-check id: 8-4-4-4-12 lowercase hex, the form Route 53
+    /// returns for one. Retried until it is unused.
+    pub fn mint_health_check_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint_uuid();
+            if !self.health_checks.contains_key(&id) {
                 return id;
             }
         }
@@ -706,13 +838,12 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES => {
                 (MAX_TRAFFIC_POLICIES, self.traffic_policies.len())
             }
+            ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, self.health_checks.len()),
             // The entity kinds below have no collection in this store yet —
-            // `CreateHealthCheck`, `CreateReusableDelegationSet` and
-            // `CreateTrafficPolicyInstance` are all still scaffolds, so nothing
-            // can bring one into being and the account holds none of them. Each
-            // gets its count from the collection this struct grows when its
-            // create is implemented.
-            ACCOUNT_LIMIT_MAX_HEALTH_CHECKS => (MAX_HEALTH_CHECKS, 0),
+            // `CreateReusableDelegationSet` and `CreateTrafficPolicyInstance`
+            // are both still scaffolds, so nothing can bring one into being and
+            // the account holds none of them. Each gets its count from the
+            // collection this struct grows when its create is implemented.
             ACCOUNT_LIMIT_MAX_REUSABLE_DELEGATION_SETS => (MAX_REUSABLE_DELEGATION_SETS, 0),
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (MAX_TRAFFIC_POLICY_INSTANCES, 0),
             _ => return None,
@@ -786,10 +917,11 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
 /// resource id (`Z1D633PJN98FT9`, `C2682N5HXP0BZ4`).
 const ID_BODY_LEN: usize = 14;
 
-/// A count or a quota as the `long` the limit shapes carry (`UsageCount` is
+/// A count or a quota as the `long` the count and limit shapes carry
+/// (`HealthCheckCount` and `HostedZoneCount` are `long`, `UsageCount` is
 /// `range 0..`, `LimitValue` is `range 1..`), saturating rather than wrapping on
 /// a count no store this size can reach.
-fn count_as_i64(count: usize) -> i64 {
+pub fn count_as_i64(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
 
@@ -1243,6 +1375,24 @@ pub fn no_such_hosted_zone(requested_id: &str) -> NoSuchHostedZone {
 pub fn no_such_change(requested_id: &str) -> NoSuchChange {
     NoSuchChange {
         message: Some(format!("Could not find resource with ID: {requested_id}")),
+    }
+}
+
+/// The modelled `NoSuchHealthCheck` (HTTP 404) for a health-check id that names
+/// no health check in this store.
+///
+/// The ONE place this service words that refusal, beside
+/// [`no_such_hosted_zone`] and [`no_such_change`], so every health-check-addressed
+/// operation answers a missing health check identically. The message is
+/// REQUEST-DERIVED: it names the id the request asked about, as the request wrote
+/// it, which is what lets a caller tell which of a batch of ids was the missing
+/// one. The shape's own documentation states the rule it reports: "No health
+/// check exists with the specified ID."
+pub fn no_such_health_check(requested_id: &str) -> NoSuchHealthCheck {
+    NoSuchHealthCheck {
+        message: Some(format!(
+            "no health check exists with the ID {requested_id}"
+        )),
     }
 }
 

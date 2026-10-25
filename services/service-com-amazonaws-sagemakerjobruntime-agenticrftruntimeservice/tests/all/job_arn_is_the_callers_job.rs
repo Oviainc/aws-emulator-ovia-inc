@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The job a sampling call names is the job the caller is running under.
+//! `JobArn` is read in TWO stages, and the two refusals are distinct.
 //!
-//! RULE: `Sample` and `SampleWithResponseStream` serve the job their `JobArn` names and
-//! capture the turn on that job's `(JobArn, TrajectoryId)` trajectory for EVERY value
-//! the member's own modelled constraints admit, and for no other: `JobArn` carries
+//! RULE: an identifier member is first checked against the constraints its model
+//! declares, and only a value that satisfies them is resolved against the resource it
+//! names — so a value outside the constraints is refused as MALFORMED (it denotes nothing
+//! at all), while a well-formed value that resolves to no resource is refused as
+//! unresolvable. Here that is `JobArn` on `Sample` and `SampleWithResponseStream`:
 //! `@length` 1..256 plus
 //! `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`
-//! (`smithy_query(query="shape",shape="JobArn")`), which admit any partition, region,
-//! account and job/run name. This service's model binds no operation that creates,
-//! lists or deletes a job — the job is created in the SageMaker control plane and this
-//! is its data plane — so a freshly mounted runtime holds no job of its own and nothing
-//! has to be registered before the first call: a caller sampling against the ARN its
-//! own job execution was handed is served, whatever that ARN is. A value the
-//! constraints do NOT admit is still refused `400 ValidationException`, and nothing is
-//! written for it.
+//! (`smithy_query(query="shape",shape="JobArn")`) decide the first stage, and the jobs the
+//! SageMaker control plane created decide the second. Both refusals are
+//! `400 ValidationException` and neither writes anything, but they state different facts,
+//! so a client can tell a typo'd ARN from a job that is gone.
 //!
-//! The rows span what the rule generalises over, not one request: the partition
-//! (`aws`, `aws-cn`, `aws-us-gov`, `aws-iso-b`), the region (including the EMPTY region
-//! the pattern's `*` admits), the account, the job-name segment's character classes
-//! (letters, digits, `_`, `-`), the run segment's length (one character and its
-//! 63-character maximum), the whole ARN's length (at the modelled 256 maximum and one
-//! past it), and which of the two sampling operations serves the call.
+//! This suite pins the FIRST stage and the boundary between the two. The second stage —
+//! which ARNs resolve to a created job and which do not — is `job_resolution.rs`: this
+//! file used to assert that every pattern-valid ARN is SERVED, which the recorded service
+//! does not do.
 //!
-//! Every answer goes over the wire through a [`MultiServiceRouter`], and the store is
-//! read afterwards the way the NEXT request would read it, so what is pinned is the
-//! emulator's HTTP behaviour and that the answer came from persisted state.
+//! The rows span what each stage generalises over: for the first, WHICH constraint the
+//! value misses (the `@length` maximum and minimum, and the pattern in its partition,
+//! service namespace, account, resource type and missing name segment); for the boundary,
+//! ARNs that satisfy the data plane's own pattern but can name no job the control plane
+//! could mint (its `JobArn` puts the `JobCategory`, `[a-zA-Z0-9]+`, where the data plane
+//! admits `[a-zA-Z0-9_\-]+`).
+//!
+//! Every answer goes over the wire through a [`MultiServiceRouter`], and the store is read
+//! afterwards the way the NEXT request would read it, so what is pinned is the emulator's
+//! HTTP behaviour.
 
 use std::sync::Arc;
 
@@ -33,6 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
+use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// This service's own endpoint host, built from the model's endpoint prefix.
@@ -80,13 +84,27 @@ impl Reply {
             .to_string()
     }
 
+    /// The `Message` member of a restJson1 error document, read under the name the MODEL
+    /// declares (`Message`) and no other.
+    fn message(&self) -> String {
+        serde_json::from_slice::<Value>(&self.body)
+            .ok()
+            .and_then(|body| {
+                body.get("Message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_default()
+    }
+
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 }
 
 /// A router carrying exactly this service over one shared engine. The engine comes back
-/// too, so a test can read this service's store the way the next request would.
+/// too, so a test can create a job the way the control plane does and read this service's
+/// store the way the next request would.
 fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -94,6 +112,17 @@ fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
         .set_request_authentication(false)
         .register_service(EmulatedService::new(Arc::clone(&engine)));
     (engine, router)
+}
+
+/// Create the job `category` / `name` in the shared job directory — the registration the
+/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable
+/// here.
+fn create_job(engine: &engine::InMemoryEngine, category: &str, name: &str) {
+    engine.state::<JobDirectory>().lock().register(JobRecord {
+        name: name.to_string(),
+        category: category.to_string(),
+        arn: format!("arn:aws:sagemaker:us-east-1:000000000000:job/{category}/{name}"),
+    });
 }
 
 async fn sample(
@@ -143,9 +172,9 @@ fn job_arn(partition: &str, region: &str, account: &str, job: &str, run: &str) -
     format!("arn:{partition}:sagemaker:{region}:{account}:job/{job}/{run}")
 }
 
-/// A job ARN of exactly `total` characters, padded in the job-name segment — which the
-/// pattern leaves unbounded (`[a-zA-Z0-9_\-]+`), so the only thing a long ARN can fail
-/// is the `@length` maximum.
+/// A job ARN of exactly `total` characters, padded in the job-category segment — which
+/// the data plane's pattern leaves unbounded (`[a-zA-Z0-9_\-]+`), so the only thing a long
+/// ARN can fail is the `@length` maximum.
 fn job_arn_of_length(total: usize) -> String {
     let fixed = job_arn("aws", "us-east-1", "000000000000", "", "r");
     let padding = total
@@ -167,195 +196,11 @@ fn job_arn_of_length(total: usize) -> String {
     arn
 }
 
-/// RULE (served half): every `JobArn` the modelled constraints admit names the job the
-/// call is served for, on both sampling operations, with nothing registered first.
+/// RULE (stage one): a `JobArn` outside the modelled constraints is refused
+/// `400 ValidationException` as MALFORMED — before any job is resolved, so the refusal
+/// does not depend on which jobs exist — and nothing is written.
 #[tokio::test]
-async fn every_modelled_job_arn_is_sampled_and_captured_on_its_own_trajectory() {
-    // The run segment at its 63-character maximum: `[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}`.
-    let long_run = format!("r{}", "a".repeat(62));
-    let at_max_length = job_arn_of_length(JOB_ARN_MAX);
-
-    // Rows differ along partition, region (including the empty one the pattern admits),
-    // account, job-name characters, run length and whole-ARN length.
-    let rows: Vec<(&str, String)> = vec![
-        (
-            "the caller's own job in another region",
-            job_arn("aws", "us-west-2", "123456789012", "agentic-rft", "run-1"),
-        ),
-        (
-            "the emulator's own account and region",
-            job_arn("aws", "us-east-1", "000000000000", "AgentRFT", "rollout-1"),
-        ),
-        (
-            "the China partition",
-            job_arn("aws-cn", "cn-north-1", "123456789012", "AgentRFT", "run-1"),
-        ),
-        (
-            "the GovCloud partition",
-            job_arn("aws-us-gov", "us-gov-west-1", "123456789012", "AgentRFT", "run-1"),
-        ),
-        (
-            "an ISO partition",
-            job_arn("aws-iso-b", "us-isob-east-1", "123456789012", "AgentRFT", "run-1"),
-        ),
-        (
-            "the empty region the pattern admits",
-            job_arn("aws", "", "123456789012", "AgentRFT", "run-1"),
-        ),
-        (
-            "a job name carrying underscores and digits",
-            job_arn("aws", "eu-central-1", "123456789012", "rft_job_2", "run-1"),
-        ),
-        (
-            "a run name of one character",
-            job_arn("aws", "ap-southeast-2", "123456789012", "AgentRFT", "r"),
-        ),
-        (
-            "a run name at its 63-character maximum",
-            job_arn("aws", "us-east-1", "123456789012", "AgentRFT", &long_run),
-        ),
-        (
-            "an ARN at the modelled 256-character maximum",
-            at_max_length,
-        ),
-    ];
-
-    for (case, arn) in rows {
-        for (path, streamed, expected_content_type) in [
-            (SAMPLE_PATH, false, state::JSON_CONTENT_TYPE),
-            (
-                SAMPLE_STREAM_PATH,
-                true,
-                state::EVENT_STREAM_CONTENT_TYPE,
-            ),
-        ] {
-            let (engine, router) = mounted_service();
-
-            // Nothing is registered first, and the runtime holds no job or trajectory
-            // of its own: whatever this call is served comes from the ARN it carries.
-            {
-                let store = engine.state::<ServiceState>();
-                let guard = store.lock();
-                assert!(
-                    guard.trajectories.is_empty(),
-                    "case {case:?} on {path}: expected a freshly mounted runtime to hold no \
-                     trajectory, got {}",
-                    guard.trajectories.len()
-                );
-            }
-
-            let first = sample(&router, path, &arn, "traj-1", &chat_payload("go")).await;
-            assert_eq!(
-                first.status,
-                200,
-                "case {case:?} on {path}: expected 200 for a job the caller names, got {} {:?} \
-                 / {}",
-                first.status,
-                first.error_type,
-                first.text()
-            );
-            assert_eq!(
-                first.content_type.as_deref(),
-                Some(expected_content_type),
-                "case {case:?} on {path}: expected Content-Type {expected_content_type:?}, got \
-                 {:?}",
-                first.content_type
-            );
-            assert!(
-                !first.body.is_empty(),
-                "case {case:?} on {path}: expected a payload, got an empty body"
-            );
-            if streamed {
-                let text = first.text();
-                assert!(
-                    text.starts_with("data: ") && text.ends_with("data: [DONE]\n\n"),
-                    "case {case:?} on {path}: expected a server-sent-event stream terminated by \
-                     [DONE], got {text:?}"
-                );
-            }
-
-            // The turn the call served is the one the store holds, under THIS ARN.
-            {
-                let store = engine.state::<ServiceState>();
-                let guard = store.lock();
-                let trajectory = guard.trajectory(&arn, "traj-1").unwrap_or_else(|| {
-                    panic!(
-                        "case {case:?} on {path}: expected a trajectory under the ARN the call \
-                         carried"
-                    )
-                });
-                assert_eq!(
-                    trajectory.turns.len(),
-                    1,
-                    "case {case:?} on {path}: expected one captured turn, got {}",
-                    trajectory.turns.len()
-                );
-                let turn = &trajectory.turns[0];
-                assert_eq!(
-                    turn.streamed, streamed,
-                    "case {case:?} on {path}: expected streamed={streamed}, got {}",
-                    turn.streamed
-                );
-                assert_eq!(
-                    turn.response_body, first.body,
-                    "case {case:?} on {path}: expected the served body to be the recorded one, \
-                     got {} served vs {} recorded byte(s)",
-                    first.body.len(),
-                    turn.response_body.len()
-                );
-                assert_eq!(
-                    trajectory.job_arn, arn,
-                    "case {case:?} on {path}: expected the trajectory to record the ARN the call \
-                     carried, got {:?}",
-                    trajectory.job_arn
-                );
-            }
-
-            // The answer is derived from the ARN the request carried: the turn's
-            // completion id is the one that ARN hashes to.
-            let expected_id = state::completion_id(&arn, "traj-1", 0);
-            assert!(
-                first.text().contains(&expected_id),
-                "case {case:?} on {path}: expected the completion id {expected_id:?} derived from \
-                 the request's own job ARN, got {:?}",
-                first.text()
-            );
-
-            // A second call appends to the SAME trajectory, so the first call is what
-            // created it rather than a fixture.
-            let second = sample(&router, path, &arn, "traj-1", &chat_payload("again")).await;
-            assert_eq!(
-                second.status,
-                200,
-                "case {case:?} on {path}: expected 200 for the second turn, got {} / {}",
-                second.status,
-                second.text()
-            );
-            let store = engine.state::<ServiceState>();
-            let guard = store.lock();
-            let turns = guard
-                .trajectory(&arn, "traj-1")
-                .map_or(0, |trajectory| trajectory.turns.len());
-            assert_eq!(
-                turns, 2,
-                "case {case:?} on {path}: expected two captured turns, got {turns}"
-            );
-            let second_id = state::completion_id(&arn, "traj-1", 1);
-            assert!(
-                second.text().contains(&second_id),
-                "case {case:?} on {path}: expected the second turn's completion id \
-                 {second_id:?}, got {:?}",
-                second.text()
-            );
-        }
-    }
-}
-
-/// RULE (refused half): a `JobArn` the modelled constraints do NOT admit is refused
-/// `400 ValidationException` and nothing is written — so the rows above are about what
-/// the model admits, not about accepting any header at all.
-#[tokio::test]
-async fn a_job_arn_outside_the_modelled_constraints_is_still_refused() {
+async fn a_job_arn_outside_the_modelled_constraints_is_refused_as_malformed() {
     // Rows differ along WHICH constraint the value misses: the `@length` maximum (one
     // character past it), the `@length` minimum (the empty value), and the pattern — in
     // the partition, the service namespace, the account's digit count, the resource
@@ -387,6 +232,10 @@ async fn a_job_arn_outside_the_modelled_constraints_is_still_refused() {
     for (case, arn) in rows {
         for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
             let (engine, router) = mounted_service();
+            // A job DOES exist, under the ARN a correct request would carry, so a row is
+            // refused because of its own value and not because the account holds no job.
+            create_job(&engine, "AgentRFT", "run-1");
+
             let reply = sample(&router, path, &arn, "traj-1", &chat_payload("go")).await;
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
@@ -396,12 +245,82 @@ async fn a_job_arn_outside_the_modelled_constraints_is_still_refused() {
                 reply.error_type,
                 reply.text()
             );
-            let document: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
             assert!(
-                document.get("Message").and_then(Value::as_str).is_some(),
-                "case {case:?} on {path}: expected a restJson1 error document with a Message, \
-                 got {:?}",
+                !reply.message().is_empty()
+                    && reply.message() != state::job_not_found_message(&arn),
+                "case {case:?} on {path}: expected the malformed-value refusal rather than the \
+                 job-not-found one, got {:?}",
+                reply.message()
+            );
+            assert_eq!(
+                reply.content_type.as_deref(),
+                Some("application/json"),
+                "case {case:?} on {path}: expected a restJson1 error document, got {:?}",
+                reply.content_type
+            );
+            let held = engine.state::<ServiceState>().lock().trajectories.len();
+            assert_eq!(
+                held, 0,
+                "case {case:?} on {path}: expected a refused call to write nothing, got {held} \
+                 trajectory/ies"
+            );
+        }
+    }
+}
+
+/// RULE (the boundary between the stages): an ARN this data plane's own pattern admits but
+/// whose job segments can name no job the control plane could mint passes stage one and is
+/// refused by stage two — as unresolvable, naming the ARN the request carried.
+#[tokio::test]
+async fn a_well_formed_arn_that_can_name_no_created_job_is_refused_as_unresolvable() {
+    // The control plane's `JobArn` carries the `JobCategory` (`[a-zA-Z0-9]+`) where this
+    // data plane's pattern admits `[a-zA-Z0-9_\-]+`
+    // (smithy_query(query="shape",shape="JobArn") on each service's own model), so a
+    // category segment carrying `_` or `-` is well formed here and belongs to no job.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a category segment carrying an underscore",
+            job_arn("aws", "eu-central-1", "123456789012", "rft_job_2", "run-1"),
+        ),
+        (
+            "a category segment carrying a hyphen",
+            job_arn("aws", "us-west-2", "123456789012", "agentic-rft", "run-1"),
+        ),
+        (
+            "the empty region the data plane's pattern admits",
+            job_arn("aws", "", "123456789012", "AgentRFT", "never-created"),
+        ),
+        (
+            "an ARN at the modelled 256-character maximum",
+            job_arn_of_length(JOB_ARN_MAX),
+        ),
+    ];
+
+    for (case, arn) in rows {
+        for path in [SAMPLE_PATH, SAMPLE_STREAM_PATH] {
+            let (engine, router) = mounted_service();
+            create_job(&engine, "AgentRFT", "run-1");
+
+            let reply = sample(&router, path, &arn, "traj-1", &chat_payload("go")).await;
+            assert_eq!(
+                (reply.status, reply.error_code().as_str()),
+                (400, "ValidationException"),
+                "case {case:?} on {path}: expected 400 ValidationException, got {} {:?} / {}",
+                reply.status,
+                reply.error_type,
                 reply.text()
+            );
+            assert!(
+                reply.message().contains(&arn),
+                "case {case:?} on {path}: expected the unresolvable-job refusal to name the \
+                 requested ARN {arn:?}, got {:?}",
+                reply.message()
+            );
+            assert_eq!(
+                reply.content_type.as_deref(),
+                Some("application/json"),
+                "case {case:?} on {path}: expected a restJson1 error document, got {:?}",
+                reply.content_type
             );
             let held = engine.state::<ServiceState>().lock().trajectories.len();
             assert_eq!(

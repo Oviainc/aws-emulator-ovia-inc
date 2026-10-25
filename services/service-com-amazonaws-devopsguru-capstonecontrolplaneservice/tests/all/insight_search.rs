@@ -55,7 +55,7 @@ const INSIGHT_LISTS: [&str; 2] = ["/ProactiveInsights", "/ReactiveInsights"];
 /// The app-boundary key the seeded insights are tagged under. `AppBoundaryKey` is
 /// length 1..128 matching `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, from
 /// `smithy_query(query="shape",shape="TagCollection")`.
-const APP_BOUNDARY_KEY: &str = "devops-guru-app";
+pub(crate) const APP_BOUNDARY_KEY: &str = "devops-guru-app";
 
 /// An instant of the grid, `minutes` from [`BASE_MILLIS`].
 fn at(minutes: i64) -> i64 {
@@ -129,7 +129,7 @@ impl Seed<'_> {
 /// The eight insights every row is asserted against: both types, both statuses, all three
 /// severities, start instants spread over a known grid, and resource collections that are
 /// a stack, a tag pair, or nothing at all.
-fn search_fixture() -> Vec<InsightRecord> {
+pub(crate) fn search_fixture() -> Vec<InsightRecord> {
     [
         Seed {
             id: "proactive-early-low-ongoing-gamma",

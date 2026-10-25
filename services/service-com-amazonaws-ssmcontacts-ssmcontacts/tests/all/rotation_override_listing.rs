@@ -39,7 +39,10 @@ use crate::contact_updates::set_replication_set;
 use crate::rotation_overrides::{create_override, create_rotation, ensure_contacts};
 
 /// A rotation ARN this service never minted, for the "no such rotation" rows.
-fn absent_rotation_arn() -> String {
+///
+/// `pub(crate)` because the sibling override suites need the same ARN: one spelling of "a
+/// rotation the store does not hold" rather than one per suite.
+pub(crate) fn absent_rotation_arn() -> String {
     format!(
         "arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:rotation/\
          00000000-0000-0000-0000-000000000000"

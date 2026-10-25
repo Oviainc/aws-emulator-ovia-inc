@@ -999,7 +999,7 @@ use crate::ops::types::{
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     SnapshotTaskDetail, SpotPlacementScore, StateReason,
-    Subnet, SubnetAssociation, Subscription, Tag,
+    Subnet, SubnetAssociation, SubnetCidrReservation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
     TransitGatewayMulticastDomainAssociation, TransitGatewayOptions,
@@ -2074,6 +2074,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Amazon EVS provisions into this account as part of an environment it is still
     /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
+    /// Every subnet CIDR reservation the account holds, by `SubnetCidrReservationId`, as
+    /// the modelled [`SubnetCidrReservation`] shape itself — so a member a writer sets
+    /// round-trips through `GetSubnetCidrReservations` without a field-by-field copy.
+    /// Ordered by id, which is the order that get reports and pages over.
+    ///
+    /// A reservation names the subnet it reserves part of ([`SubnetCidrReservation::subnet_id`]),
+    /// which is how `GetSubnetCidrReservations` narrows this one store to the subnet a
+    /// request asks about, rather than a second map per subnet that could drift from it.
+    pub subnet_cidr_reservations: BTreeMap<String, SubnetCidrReservation>,
     /// Every carrier gateway the account holds, by `CarrierGatewayId`, as the modelled
     /// `CarrierGateway` shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeCarrierGateways` reports and pages over.
@@ -2647,6 +2656,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             default_vpc_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            // A fresh account has reserved no part of any subnet's CIDR range.
+            subnet_cidr_reservations: BTreeMap::new(),
             carrier_gateways: BTreeMap::new(),
             carrier_gateway_available_at: BTreeMap::new(),
             carrier_gateway_client_tokens: HashMap::new(),
@@ -3059,6 +3070,54 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(tag_list_bytes(subnet.tags.as_deref().unwrap_or_default()));
         self.subnets.insert(subnet_id.clone(), subnet);
         subnet_id
+    }
+
+    /// Whether another subnet CIDR reservation fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of [`Self::has_subnet_capacity`]:
+    /// a create asks first so it can refuse instead of overshooting.
+    pub fn has_subnet_cidr_reservation_capacity(&self) -> bool {
+        self.subnet_cidr_reservations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Insert a subnet CIDR reservation, and answer the `SubnetCidrReservationId` it was
+    /// given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the reservation id and the owning account — so two writers cannot report
+    /// the same reservation differently, exactly as [`Self::insert_subnet`] does for a
+    /// subnet. The caller-chosen bytes of the reservation are charged against the store's
+    /// byte budget here, so a writer cannot store them uncharged.
+    ///
+    /// `None` means the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was
+    /// stored: the ceiling is enforced here, the way [`Self::insert_coip_pool`] enforces
+    /// its own, so a writer that forgets to ask cannot grow the store without bound.
+    pub fn insert_subnet_cidr_reservation(
+        &mut self,
+        spec: SubnetCidrReservationSpec,
+    ) -> Option<String> {
+        if !self.has_subnet_cidr_reservation_capacity() {
+            return None;
+        }
+        let reservation_id = self.next_id(SUBNET_CIDR_RESERVATION_ID_PREFIX);
+        self.add_stored_bytes(subnet_cidr_reservation_payload_bytes(
+            &spec.cidr,
+            spec.description.as_deref(),
+            &spec.tags,
+        ));
+        let reservation = SubnetCidrReservation {
+            subnet_cidr_reservation_id: Some(reservation_id.clone()),
+            subnet_id: Some(spec.subnet_id),
+            cidr: Some(spec.cidr),
+            reservation_type: Some(spec.reservation_type),
+            // "The ID of the account that owns the subnet CIDR reservation"
+            // (`SubnetCidrReservation$OwnerId`): this emulator serves one account.
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            description: spec.description,
+            tags: Some(spec.tags),
+        };
+        self.subnet_cidr_reservations
+            .insert(reservation_id.clone(), reservation);
+        Some(reservation_id)
     }
 
     /// Insert a customer-owned IP (CoIP) address pool, and answer the `PoolId` it was
@@ -4250,6 +4309,56 @@ pub struct SubnetSpec {
     pub map_public_ip_on_launch: bool,
     /// The tags the subnet carries.
     pub tags: Vec<Tag>,
+}
+
+/// The prefix of a `SubnetCidrReservationId`, as EC2 spells one (`scr-…`), and the segment
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`] mints the id from.
+pub const SUBNET_CIDR_RESERVATION_ID_PREFIX: &str = "scr";
+
+/// The `ResourceType` a `CreateSubnetCidrReservation` tag specification may name: the
+/// reservation it creates (`ResourceType` enum member `subnet-cidr-reservation`, in
+/// [`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+pub const RESOURCE_TYPE_SUBNET_CIDR_RESERVATION: &str = "subnet-cidr-reservation";
+
+/// One subnet CIDR reservation as a writer asks for it: the members a creator chooses.
+/// Everything the service derives — the reservation id and the owning account — is minted
+/// by [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`].
+#[derive(Debug, Clone)]
+pub struct SubnetCidrReservationSpec {
+    /// The subnet whose CIDR range this reservation is part of.
+    pub subnet_id: String,
+    /// The reserved range, in the canonical form the create read it in.
+    pub cidr: String,
+    /// One value of the `SubnetCidrReservationType` enum
+    /// ([`crate::ops::types::SUBNET_CIDR_RESERVATION_TYPE_VALUES`]).
+    pub reservation_type: String,
+    /// The description the request assigned, for a reservation that carries one.
+    pub description: Option<String>,
+    /// The tags the reservation carries.
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes one stored subnet CIDR reservation holds, plus the fixed
+/// overhead the record itself costs.
+///
+/// Only the members whose length the REQUEST chose are counted on top of
+/// [`STORED_RECORD_OVERHEAD_BYTES`]: the reservation id and the owner are minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_subnet_cidr_reservation`]. The ONE definition of
+/// that charge, the way [`coip_pool_payload_bytes`] is for a CoIP pool, so a create charges
+/// exactly what a delete would give back.
+///
+/// It takes the caller-chosen members themselves rather than a stored record, so the create
+/// can ask about a reservation it has not stored yet — the budget has to be asked BEFORE the
+/// write — and a later delete can ask about the record it is removing.
+pub fn subnet_cidr_reservation_payload_bytes(
+    cidr: &str,
+    description: Option<&str>,
+    tags: &[Tag],
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(cidr.len())
+        .saturating_add(description.map_or(0, str::len))
+        .saturating_add(tag_list_bytes(tags))
 }
 
 /// The caller-chosen bytes one stored customer-owned IP address pool holds, plus the fixed
@@ -12950,7 +13059,12 @@ pub fn canonical_secondary_network_ipv4_cidr(value: &str) -> Result<String, Cidr
 /// `value` as an IPv4 CIDR block with its host bits cleared, with NO rule on the prefix
 /// length: the one reader [`canonical_vpc_ipv4_cidr`], [`canonical_subnet_ipv4_cidr`] and
 /// [`canonical_secondary_network_ipv4_cidr`] put their own published block size on top of.
-fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
+///
+/// Public, like its IPv6 twin [`canonical_ipv6_cidr`], for the ranges the model and the
+/// docs publish no size for at all — a subnet CIDR reservation's range, whose only stated
+/// rule is the subnet range it has to sit inside — where a bound invented here would refuse
+/// blocks AWS accepts.
+pub fn canonical_ipv4_cidr(value: &str) -> Result<String, CidrProblem> {
     let (address, prefix_length) = value.split_once('/').ok_or(CidrProblem::Malformed)?;
     let base = u32::from(
         address

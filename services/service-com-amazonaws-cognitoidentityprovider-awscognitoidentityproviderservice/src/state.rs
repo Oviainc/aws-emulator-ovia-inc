@@ -15,7 +15,8 @@ use ::sha2::Digest;
 
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
-    AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
+    AnalyticsConfigurationType, AttributeType, AuthenticationResultType,
+    CodeDeliveryDetailsType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, GroupType, IdentityProviderType, IssuerConfigurationType,
     KeyConfigurationType, LambdaConfigType, MFAOptionType, NewDeviceMetadataType,
@@ -984,6 +985,65 @@ impl UserPool {
             .unwrap_or(false)
     }
 
+    /// Whether a sign-in name of this pool resolves to `name`'s value:
+    /// `AliasAttributes` are "attributes supported as an alias for this user
+    /// pool" and `UsernameAttributes` "specifies whether a user can use an email
+    /// address or phone number as a username when they sign up" (this service's
+    /// model). Either way the value names at most one user of the pool.
+    pub fn is_alias_attribute(&self, name: &str) -> bool {
+        self.alias_attributes
+            .iter()
+            .chain(self.username_attributes.iter())
+            .any(|attribute| attribute == name)
+    }
+
+    /// Whether this pool verifies `name` itself: `AutoVerifiedAttributes` are
+    /// "the attributes that are auto-verified in a user pool" (this service's
+    /// model), so a new value of one of them is what a verification message is
+    /// sent for.
+    pub fn auto_verifies(&self, name: &str) -> bool {
+        self.auto_verified_attributes
+            .iter()
+            .any(|attribute| attribute == name)
+    }
+
+    /// Whether this pool holds a new value of `name` PENDING until the user
+    /// confirms it:
+    /// `UserAttributeUpdateSettings.AttributesRequireVerificationBeforeUpdate`
+    /// "requires that your user verifies their email address, phone number, or
+    /// both before Amazon Cognito updates the value of that attribute" (this
+    /// service's model).
+    pub fn requires_verification_before_update(&self, name: &str) -> bool {
+        self.user_attribute_update_settings
+            .as_ref()
+            .and_then(|settings| {
+                settings
+                    .attributes_require_verification_before_update
+                    .as_ref()
+            })
+            .is_some_and(|names| names.iter().any(|attribute| attribute == name))
+    }
+
+    /// Whether a user of this pool OTHER than `except_username` already holds
+    /// `value` as its active alias value of `name`.
+    ///
+    /// An alias value identifies ONE user of the pool, so no two users may hold
+    /// the same one at once: for `email` and `phone_number` the value is an
+    /// alias only while the user's matching verified flag says the value was
+    /// confirmed, and an alias attribute with no such flag counts whatever its
+    /// value (see [`User::alias_is_active`]).
+    pub fn alias_taken(&self, name: &str, value: &str, except_username: &str) -> bool {
+        let except = self.user_key(except_username);
+        self.users.iter().any(|(key, user)| {
+            key != &except
+                && user
+                    .attributes
+                    .get(name)
+                    .is_some_and(|stored| stored == value)
+                && user.alias_is_active(name)
+        })
+    }
+
     /// The names of the attributes this pool's schema marks required that `user`
     /// has no value for: what a `NEW_PASSWORD_REQUIRED` challenge asks the user
     /// to supply. `sub` is never among them — the pool mints it.
@@ -1365,6 +1425,15 @@ pub struct User {
     pub sub: String,
     /// Attributes keyed by name, `sub` included, ordered so a read is stable.
     pub attributes: BTreeMap<String, String>,
+    /// The values this user has asked for but not confirmed yet, keyed by
+    /// attribute name: a pool that requires verification before an update
+    /// "doesn't change the value of the attribute until your user responds to
+    /// the verification message and confirms the new value"
+    /// (`UserAttributeUpdateSettings.AttributesRequireVerificationBeforeUpdate`),
+    /// and `VerifyUserAttribute` "updates the affected attribute to its pending
+    /// value" (this service's model). Never rendered: a pending value is not
+    /// the user's value yet.
+    pub pending_attributes: BTreeMap<String, String>,
     pub password: Option<String>,
     /// Whether [`User::password`] is permanent; a temporary one must be changed
     /// at the next sign-in and expires with the pool's policy.
@@ -1406,6 +1475,21 @@ impl User {
             enabled: self.enabled,
             user_status: Some(self.status.as_str().to_string()),
             mfa_options: non_empty(&self.mfa_options),
+        }
+    }
+
+    /// Whether this user's stored value of `name` is an ACTIVE alias value: an
+    /// `email` or a `phone_number` counts only while its verified flag says the
+    /// value was confirmed ([`verified_flag`]), since an unconfirmed value is
+    /// not one a sign-in resolves; an alias attribute that carries no such flag
+    /// counts whatever its value.
+    pub fn alias_is_active(&self, name: &str) -> bool {
+        match verified_flag(name) {
+            Some(flag) => self
+                .attributes
+                .get(flag)
+                .is_some_and(|value| value == FLAG_CONFIRMED),
+            None => true,
         }
     }
 
@@ -1897,6 +1981,89 @@ const STANDARD_SCHEMA: [(&str, &str, bool, bool); 20] = [
 /// Whether `name` is one of the standard attributes every pool carries.
 pub fn is_standard_attribute(name: &str) -> bool {
     STANDARD_SCHEMA.iter().any(|(standard, ..)| *standard == name)
+}
+
+/// The attribute that records whether `attribute`'s stored value was confirmed,
+/// for the two attributes this API verifies (`VerifiedAttributeType`: `email`
+/// and `phone_number`, whose flags are the standard `email_verified` and
+/// `phone_number_verified`), or `None` for an attribute that carries no such
+/// flag.
+pub fn verified_flag(attribute: &str) -> Option<&'static str> {
+    match attribute {
+        "email" => Some("email_verified"),
+        "phone_number" => Some("phone_number_verified"),
+        _ => None,
+    }
+}
+
+/// The value a verified flag carries once the attribute's value is confirmed.
+/// `email_verified` and `phone_number_verified` are `Boolean` schema
+/// attributes, whose values are carried as the strings every attribute value
+/// is.
+pub const FLAG_CONFIRMED: &str = "true";
+
+/// The value a verified flag carries while the attribute's value is not
+/// confirmed.
+pub const FLAG_UNCONFIRMED: &str = "false";
+
+/// The `DeliveryMediumType` a verification message for `attribute` travels by —
+/// an email address is mailed and a phone number is texted — or `None` for an
+/// attribute no message is sent for.
+pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
+    match attribute {
+        "email" => Some("EMAIL"),
+        "phone_number" => Some("SMS"),
+        _ => None,
+    }
+}
+
+/// How many trailing characters of a masked phone number stay readable, which
+/// is what identifies the number to the user who gave it.
+const UNMASKED_DESTINATION_SUFFIX: usize = 4;
+
+/// `destination` as a `CodeDeliveryDetailsType.Destination`.
+///
+/// Amazon Cognito reports the address it sent the code to MASKED, so the reply
+/// tells the caller which of the user's addresses was used without disclosing
+/// an address the caller does not already hold. An email address keeps the
+/// first character of its local part, the first of its domain and the domain's
+/// last label; anything else keeps a leading `+` and its last
+/// [`UNMASKED_DESTINATION_SUFFIX`] characters.
+pub fn masked_destination(destination: &str) -> String {
+    if let Some((local, domain)) = destination.split_once('@') {
+        let local_initial = local.chars().next().unwrap_or('*');
+        let domain_initial = domain.chars().next().unwrap_or('*');
+        let last_label = domain.rfind('.').map_or("", |dot| &domain[dot..]);
+        return format!("{local_initial}***@{domain_initial}***{last_label}");
+    }
+    let characters: Vec<char> = destination.chars().collect();
+    let readable_from = characters
+        .len()
+        .saturating_sub(UNMASKED_DESTINATION_SUFFIX);
+    characters
+        .iter()
+        .enumerate()
+        .map(|(index, character)| {
+            if index >= readable_from || (index == 0 && *character == '+') {
+                *character
+            } else {
+                '*'
+            }
+        })
+        .collect()
+}
+
+/// The delivery details for a verification message sent to `value` for
+/// `attribute`, or `None` for an attribute no message is sent for.
+///
+/// Rendered from the value the message goes to, masked as
+/// [`masked_destination`] reports it.
+pub fn code_delivery_details(attribute: &str, value: &str) -> Option<CodeDeliveryDetailsType> {
+    Some(CodeDeliveryDetailsType {
+        destination: Some(masked_destination(value)),
+        delivery_medium: Some(delivery_medium(attribute)?.to_string()),
+        attribute_name: Some(attribute.to_string()),
+    })
 }
 
 /// The schema a new pool is created with: the standard attributes, with a
