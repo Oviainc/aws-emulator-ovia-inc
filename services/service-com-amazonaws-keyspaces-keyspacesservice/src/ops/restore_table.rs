@@ -543,6 +543,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // restored table is created with no warm throughput configuration.
                 warm_throughput_specification: None,
                 tags,
+                // A restore reproduces a table's settings, and CDC is not among the ones
+                // this operation's documentation says it reproduces: the restored table has
+                // no stream, so it carries no stream's tags either.
+                cdc_stream_tags: ::std::collections::BTreeMap::new(),
                 // Nothing has superseded the restored table's own settings since this call
                 // put them there.
                 superseded: Vec::new(),

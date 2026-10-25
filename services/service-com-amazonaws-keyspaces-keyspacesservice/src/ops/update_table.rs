@@ -9,11 +9,11 @@
 //! Every table setting the model gives this operation is applied here — added columns,
 //! capacity mode, auto scaling, per-Region replica settings, warm throughput, encryption,
 //! point-in-time recovery, ttl, default ttl and client-side timestamps — and is reported
-//! back by `GetTable` or `GetTableAutoScalingSettings`. The ONE exception is
-//! `cdcSpecification`, which no report here can answer for (`GetTable` has no CDC summary
-//! to carry yet) and which is refused with a 501 that says so rather than stored and
-//! forgotten; `CreateTable` refuses the same member. See the open issue "Keyspaces CDC
-//! never enabled".
+//! back by `GetTable` or `GetTableAutoScalingSettings`. `cdcSpecification` is served too:
+//! it enables or disables the table's change data capture stream in the stream store
+//! shared with KeyspacesStreams, the one `GetTable` reports as
+//! `cdcSpecification`/`latestStreamArn`. Nothing in this operation's surface answers the
+//! scaffold's 501.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -225,21 +225,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // The ONE member this slice cannot serve faithfully yet, the same one `CreateTable`
-        // refuses: a CDC stream has no summary any report here carries, so accepting it
-        // would mean storing a setting nothing can answer for. The honest 501 says so, and
-        // is worded so it is not read as "UpdateTable is a stub": the operation IS
-        // implemented, this part of its surface is not.
-        if input.cdc_specification.is_some() {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::scaffolded::NotImplemented {
-                    message: "UpdateTable is implemented in this emulator, but not its \
-                              cdcSpecification member: omit it, or the table would be stored \
-                              with a CDC stream setting no operation here can report."
+        // The CDC stream store, shared with KeyspacesStreams: resolved before either
+        // store is locked, and locked AFTER this service's own — one lock order
+        // everywhere, so two handlers can never wait on each other.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            UpdateTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
                         .to_string(),
-                },
-            ));
-        }
+                ),
+            })
+        })?;
 
         let invalid = |message: String| -> UpdateTableError {
             UpdateTableErrorModeled::ValidationException(ValidationException {
@@ -275,6 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "clientSideTimestamps",
                 input.client_side_timestamps.is_some(),
             ),
+            ("cdcSpecification", input.cdc_specification.is_some()),
         ]
         .iter()
         .filter(|(_, present)| *present)
@@ -285,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "UpdateTable requires one table setting to update: addColumns, \
                  capacitySpecification, autoScalingSpecification, replicaSpecifications, \
                  warmThroughputSpecification, encryptionSpecification, pointInTimeRecovery, \
-                 ttl, defaultTimeToLive or clientSideTimestamps"
+                 ttl, defaultTimeToLive, clientSideTimestamps or cdcSpecification"
                     .to_string()
             } else {
                 format!(
@@ -310,6 +307,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(crate::state::resolve_encryption(Some(supplied)).map_err(invalid)?)
             }
             None => None,
+        };
+        // "The CDC stream settings of the table": whether the table captures its changes
+        // to a stream from now on, and (for one being created) which images it publishes.
+        let cdc = crate::state::resolve_cdc(input.cdc_specification.as_ref());
+        let to_tag_failure = |rejection: crate::state::TagRejection| -> UpdateTableError {
+            let message = Some(rejection.message());
+            match rejection.is_quota() {
+                true => UpdateTableErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException { message },
+                )
+                .into(),
+                false => {
+                    UpdateTableErrorModeled::ValidationException(ValidationException { message })
+                        .into()
+                }
+            }
         };
 
         let now = ::std::time::SystemTime::now();
@@ -417,6 +430,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
+
+        // `cdcSpecification` is served by the CDC stream store, not by a field on the
+        // table: a table's CDC status IS the `StreamStatus` of the stream held there, and
+        // `GetTable` reports it from that one copy. ONE guard on that store spans the
+        // read, every refusal and the write, so nothing can change the table's stream
+        // between the view type this checks and the stream it then mints — and every
+        // refusal still happens before either store is written, so a refused update
+        // leaves both the table and its stream exactly as they were. (Nothing below can
+        // refuse a CDC request either: a request names exactly ONE setting, so for this
+        // one every block below is a no-op.)
+        if let Some(cdc) = cdc {
+            let mut stream_store = streams.lock();
+            let live = stream_store
+                .live_stream_for_table(&region, &input.keyspace_name, &input.table_name)
+                .map(|stream| (stream.stream_arn.clone(), stream.stream_view_type.clone()));
+            // "The view type specifies the changes Amazon Keyspaces records for each
+            // changed row in the stream. After you create the stream, you can't make
+            // changes to this selection." A request naming a different view type for a
+            // stream that already exists is refused, rather than silently ignored or
+            // applied to records the consumer is already reading.
+            if let Some((_, view_type)) = live.as_ref().filter(|_| cdc.enabled) {
+                if view_type != &cdc.view_type {
+                    return Err(invalid(format!(
+                        "cdcSpecification.viewType is '{}' for the stream of table \
+                         '{}.{}' and cannot be changed to '{}' while that stream exists",
+                        view_type, input.keyspace_name, input.table_name, cdc.view_type
+                    )));
+                }
+            }
+            // The tags the specification applies to the stream, under the same
+            // per-resource rules wherever they are supplied — checked whatever the status
+            // asks for, because a reserved key or an oversized list is the same bad input
+            // either way — onto the tags that stream already holds when it is one that
+            // already exists.
+            let mut stream_tags = live
+                .as_ref()
+                .filter(|_| cdc.enabled)
+                .and_then(|(stream_arn, _)| table.cdc_stream_tags.get(stream_arn))
+                .cloned()
+                .unwrap_or_default();
+            let applied =
+                crate::state::new_stream_tag_set(&cdc, &table.tags).map_err(to_tag_failure)?;
+            crate::state::merge_tags(
+                &mut stream_tags,
+                &applied
+                    .iter()
+                    .map(|(key, value)| Tag {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect::<Vec<Tag>>(),
+            )
+            .map_err(to_tag_failure)?;
+
+            match cdc.enabled {
+                true => {
+                    let enabled = stream_store.enable_stream(
+                        &region,
+                        &input.keyspace_name,
+                        &input.table_name,
+                        &cdc.view_type,
+                    );
+                    let Some(stream_arn) = enabled else {
+                        // The store refuses only a view type outside the model's
+                        // `StreamViewType` set, which the boundary validator has already
+                        // refused: this is a server error, not a caller's mistake.
+                        return Err(UpdateTableErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: Some(format!(
+                                    "Amazon Keyspaces could not enable a CDC stream \
+                                     publishing viewType '{}' for table '{}.{}'.",
+                                    cdc.view_type, input.keyspace_name, input.table_name
+                                )),
+                            },
+                        )
+                        .into());
+                    };
+                    let held = stream_store.stream_arns_for_table(
+                        &region,
+                        &input.keyspace_name,
+                        &input.table_name,
+                    );
+                    table.register_stream_tags(&stream_arn, stream_tags, &held);
+                }
+                // A table with no live stream has nothing to disable, which is why that
+                // answers nothing: asking for CDC a table does not have is the state it
+                // is already in. A stream that is gone carries no tags either, so the
+                // specification's tags are validated above and stored nowhere.
+                false => {
+                    stream_store.disable_stream(
+                        &region,
+                        &input.keyspace_name,
+                        &input.table_name,
+                    );
+                }
+            }
+        }
 
         // What `addColumns` would do to the stored schema, checked BEFORE anything is
         // written: a refused update leaves the table, and its revision history, exactly as
