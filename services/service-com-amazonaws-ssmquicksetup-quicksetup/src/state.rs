@@ -1001,6 +1001,56 @@ fn echoed_value(value: &str) -> String {
     format!("{}... [{} bytes]", &value[..end], value.len())
 }
 
+/// The tag-key prefix Amazon Web Services reserves for its own tags.
+///
+/// Nothing in the model keeps such a key out: `TagsMap`'s key `@pattern`
+/// (`^[A-Za-z0-9 _=@:.+-/]+$`) admits `:`, and `UntagResource$TagKeys` is a bare
+/// `list<String>` with no pattern at all, so the boundary walk admits a key under this
+/// prefix and the rule has to live here. The AWS General Reference's tag naming limits
+/// reserve the prefix for Amazon Web Services' own tags, in any combination of upper and
+/// lower case, and a tag under it is not the caller's to assign, edit or delete.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// Whether `key` falls under [`RESERVED_TAG_PREFIX`].
+///
+/// Compared case-INSENSITIVELY, because the prefix is reserved however it is spelled,
+/// even though a tag key is otherwise a case-sensitive string. A key whose first bytes
+/// are the middle of a multi-byte character cannot spell the ASCII prefix, so such a key
+/// is the caller's own.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_PREFIX))
+}
+
+/// Why a set of caller-supplied tag keys cannot be served, or `None` when every key is
+/// the caller's own to write.
+///
+/// The one place this rule lives, so every member that takes tag keys from the caller
+/// refuses the same ones: `CreateConfigurationManager$Tags`, `TagResource$Tags` and
+/// `UntagResource$TagKeys`. Applied BEFORE the named resource is resolved and before the
+/// store lock is taken, so a refused request neither stores nor removes anything.
+///
+/// The named key is the lexically first reserved one, so one request always answers the
+/// same way however the collection it came from is iterated. The message names the
+/// member, the requirement and the key, the way this service's other refusals do; the
+/// echoed key is bounded for the reason [`MAX_ECHOED_VALUE`] gives.
+pub fn reserved_tag_key_rejection<'k>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'k str>,
+) -> Option<String> {
+    keys.into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .min()
+        .map(|key| {
+            format!(
+                "{member} must not name a tag key under the '{RESERVED_TAG_PREFIX}' prefix, \
+                 which is reserved for Amazon Web Services use and cannot be edited or \
+                 deleted, got '{}'",
+                echoed_value(key)
+            )
+        })
+}
+
 /// Why a `Filters` list is unacceptable, or `None` when this operation can serve it.
 ///
 /// Two rules, both applied BEFORE the store lock is taken, so a refused request never
