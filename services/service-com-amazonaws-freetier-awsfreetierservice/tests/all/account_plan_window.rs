@@ -267,7 +267,11 @@ fn expiry_secs(payload: &Value) -> Option<i64> {
 /// Rows differ in how much of the window is left when the repeats happen.
 #[tokio::test]
 async fn repeating_the_free_upgrade_neither_extends_nor_reopens_the_window() {
-    for remaining in [1_i64, 3_600, DAY, 180 * DAY] {
+    // Rows differ in how much of the window is left. The smallest row still has to
+    // outlast the calls this loop then makes against it — a window that elapses
+    // mid-row would refuse a call the row expects to be accepted, which says nothing
+    // about the rule — so the "barely open" row leaves a minute rather than a second.
+    for remaining in [60_i64, 3_600, DAY, 180 * DAY] {
         let case = format!("a free plan with {remaining}s of its window left");
         let mounted = store_plan(&Row {
             case: "",

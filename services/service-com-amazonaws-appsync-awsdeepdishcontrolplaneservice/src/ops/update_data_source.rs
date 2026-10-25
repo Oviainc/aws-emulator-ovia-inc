@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataSource
-//! Implemented: enforces the same service-role requirement as the create, then
-//! replaces the stored `DataSource`'s settings in [`crate::state`]. This is the ONLY
-//! file to touch for this operation.
+//! Implemented: judges the data source the request describes the way the create does —
+//! the per-type configuration first, then the service-role requirement — and replaces
+//! the stored `DataSource`'s settings in [`crate::state`]. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -189,13 +190,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The same requirement as the create: a data source of a type AppSync can
-        // only reach by assuming a role cannot be left without one, so an update that
-        // would do so is refused before the stored record is touched.
+        let mut guard = state.lock();
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        let Some(stored) = api.data_sources.get(&input.name) else {
+            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::data_source_not_found_message(&input.name)),
+            })
+            .into());
+        };
+
+        // Every settable member of the request is "the new …" value, so the update
+        // REPLACES what was stored rather than merging into it: a configuration the
+        // request omits is gone from the data source. The name and the ARN identify
+        // the record and are not settable, so the candidate keeps the stored ones —
+        // and `description` takes the same projection as on the create, where an
+        // empty description describes nothing.
+        let updated = crate::state::DataSourceRecord {
+            arn: stored.arn.clone(),
+            name: stored.name.clone(),
+            description: crate::state::data_source_description(input.description),
+            r#type: input.r#type,
+            service_role_arn: input.service_role_arn,
+            dynamodb_config: input.dynamodb_config,
+            lambda_config: input.lambda_config,
+            elasticsearch_config: input.elasticsearch_config,
+            open_search_service_config: input.open_search_service_config,
+            http_config: input.http_config,
+            relational_database_config: input.relational_database_config,
+            event_bridge_config: input.event_bridge_config,
+            metrics_config: input.metrics_config,
+        };
+
+        // The candidate has to describe a data source AppSync could reach, exactly as
+        // the create's does, and it is judged in the same order: a data source of a
+        // type that is set up through a configuration member cannot be left without
+        // it — the request names a backend it does not say where to find, so it is not
+        // well formed whatever else it carries.
+        if let Some(member) = updated.missing_config() {
+            return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::missing_data_source_config_message(member)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // Then the service role: a data source of a type AppSync can only reach by
+        // assuming one cannot be left without it, so an update that would do so is
+        // refused before the stored record is replaced.
         if crate::state::data_source_needs_service_role(
-            &input.r#type,
-            crate::state::selects_iam_authorization(input.http_config.as_ref()),
-        ) && input
+            &updated.r#type,
+            crate::state::selects_iam_authorization(updated.http_config.as_ref()),
+        ) && updated
             .service_role_arn
             .as_deref()
             .is_none_or(str::is_empty)
@@ -207,40 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut guard = state.lock();
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
-            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
-            })
-            .into());
-        };
-        let Some(data_source) = api.data_sources.get_mut(&input.name) else {
-            return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::data_source_not_found_message(&input.name)),
-            })
-            .into());
-        };
+        // Answer from the record this update STORES, so this body is the one
+        // `GetDataSource` and `ListDataSources` answer with next. The projection is
+        // taken from the record itself, before the map takes ownership of it.
+        let data_source = updated.to_data_source();
+        api.data_sources.insert(updated.name.clone(), updated);
 
-        // Every settable member of the request is "the new …" value, so the update
-        // REPLACES what was stored rather than merging into it: a configuration the
-        // request omits is gone from the data source. The name and the ARN identify
-        // the record and are not settable.
-        data_source.description = input.description;
-        data_source.r#type = input.r#type;
-        data_source.service_role_arn = input.service_role_arn;
-        data_source.dynamodb_config = input.dynamodb_config;
-        data_source.lambda_config = input.lambda_config;
-        data_source.elasticsearch_config = input.elasticsearch_config;
-        data_source.open_search_service_config = input.open_search_service_config;
-        data_source.http_config = input.http_config;
-        data_source.relational_database_config = input.relational_database_config;
-        data_source.event_bridge_config = input.event_bridge_config;
-        data_source.metrics_config = input.metrics_config;
-
-        // Answer from the STORED record, so this body is the one `GetDataSource` and
-        // `ListDataSources` answer with next.
         Ok(UpdateDataSourceOutput {
-            data_source: Some(data_source.to_data_source()),
+            data_source: Some(data_source),
         })
     }
 }

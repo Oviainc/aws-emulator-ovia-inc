@@ -360,6 +360,10 @@ pub const VALIDATION_REASON_INVALID_PAGE_TOKEN: &str = "INVALID_PAGE_TOKEN";
 /// Source: smithy_query(query="shape", shape="ConflictExceptionReason").
 pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
 
+/// `ResourceNotFoundExceptionReason`'s sole value.
+/// Source: smithy_query(query="shape", shape="ResourceNotFoundExceptionReason").
+pub const NOT_FOUND_REASON_RULE_NOT_FOUND: &str = "RULE_NOT_FOUND";
+
 /// The modelled 404 for a retention rule the request addressed and this Region does
 /// not hold — one that was never created, or one already deleted.
 ///
@@ -368,13 +372,15 @@ pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
 /// The message is composed from it, so a rule that does not exist reads the same way
 /// whichever operation reports it.
 ///
-/// `Reason` is deliberately left UNSET: Recycle Bin does not populate the modelled
-/// `ResourceNotFoundExceptionReason` on this path, and sending it would have a client
-/// branch on a field the real service never gives it.
+/// `Reason` is the fault class the model names for this condition. The service holds one
+/// kind of resource, a retention rule, so the single value
+/// `ResourceNotFoundExceptionReason` declares describes every 404 this service can
+/// raise, and a caller that branches on the member reads it on the only path that can
+/// set it.
 pub fn rule_not_found(addressed: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Recycle Bin Rule '{addressed}' does not exist.")),
-        reason: None,
+        reason: Some(NOT_FOUND_REASON_RULE_NOT_FOUND.to_string()),
     }
 }
 

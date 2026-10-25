@@ -316,10 +316,28 @@ pub fn data_source_exists_message(name: &str) -> String {
 
 /// The text a `BadRequestException` (HTTP 400) carries for a data source whose type
 /// is configured through a member the request did not carry
-/// ([`DataSourceRecord::missing_config`]): the member and the type that needs it, so
-/// the caller can fix the request from the message alone.
-pub fn missing_data_source_config_message(member: &str, data_source_type: &str) -> String {
-    format!("{member} is required for a data source of type {data_source_type}")
+/// ([`DataSourceRecord::missing_config`]): the backend that configuration describes,
+/// so the caller can fix the request from the message alone.
+///
+/// The backend each member names is the subject of that member's own doc on
+/// `CreateDataSourceRequest` / `UpdateDataSourceRequest` — `lambdaConfig` "the new
+/// Lambda configuration", `dynamodbConfig` "the new Amazon DynamoDB configuration",
+/// `elasticsearchConfig` and `openSearchServiceConfig` "the new OpenSearch
+/// configuration", `httpConfig` "the new HTTP endpoint configuration",
+/// `relationalDatabaseConfig` "the new relational database configuration" and
+/// `eventBridgeConfig` "the new Amazon EventBridge settings". A configuration member
+/// added to the request later falls back to its own name.
+pub fn missing_data_source_config_message(member: &str) -> String {
+    let subject = match member {
+        "lambdaConfig" => "Lambda",
+        "dynamodbConfig" => "Amazon DynamoDB",
+        "elasticsearchConfig" | "openSearchServiceConfig" => "OpenSearch",
+        "httpConfig" => "HTTP endpoint",
+        "relationalDatabaseConfig" => "relational database",
+        "eventBridgeConfig" => "Amazon EventBridge",
+        other => other,
+    };
+    format!("Missing {subject} data source config")
 }
 
 /// One stored `Api`: an AppSync API created with an Event API configuration

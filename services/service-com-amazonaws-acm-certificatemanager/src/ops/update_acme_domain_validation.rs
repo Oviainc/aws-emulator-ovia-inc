@@ -5,8 +5,8 @@
 //! stored ACME domain validation its `AcmeDomainValidationArn` identifies, leaves every
 //! other member of the record (and everything this operation models no input member
 //! for) exactly as it stands, and answers an empty body. An ARN with no record behind it
-//! is `ResourceNotFoundException`; a validation ACM is itself still acting on is a
-//! conflict.
+//! is `ResourceNotFoundException`; a validation ACM is itself still acting on is refused
+//! `ValidationException`, with nothing written.
 //!
 //! A changed prevalidation configuration is evidence ACM has not checked yet, so the
 //! call puts the validation back into `VALIDATING` and records the `VALID` transition
@@ -218,18 +218,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // shape="com.amazonaws.acm#AcmeDomainValidationStatus")`: VALIDATING | VALID |
         // INVALID | DELETING) exactly two are settled — `VALID`, where prevalidation
         // succeeded, and `INVALID`, where it failed. In the other two ACM is still
-        // working the validation through, which is what this operation's
-        // `ConflictException` names: "you are trying to update a resource or
-        // configuration that is already being created or updated. Wait for the previous
-        // operation to finish and try again."
+        // working the validation through, and the call is refused outright with the
+        // request-validation verdict ACM answers for it (`ValidationException`, HTTP
+        // 400): the status the resource is in is what makes the update an input the
+        // service will not act on. Nothing is written, so the configuration and the
+        // status a reader sees are the ones the refused call found.
         if validation.status != crate::state::ACME_DOMAIN_VALIDATION_STATUS_VALID
             && validation.status != crate::state::ACME_DOMAIN_VALIDATION_STATUS_INVALID
         {
-            return Err(UpdateAcmeDomainValidationErrorModeled::ConflictException(
-                ConflictException {
+            return Err(UpdateAcmeDomainValidationErrorModeled::ValidationException(
+                ValidationException {
+                    // The status that blocks the update, and nothing of the request: the
+                    // ARN a caller sent is not reflected back into a 400 body.
                     message: Some(format!(
-                        "ACME domain validation {} is {} and cannot be updated. Wait for the previous operation to finish and try again.",
-                        validation.arn, validation.status
+                        "An ACME domain validation that is {} cannot be updated. Wait for the previous operation to finish and try again.",
+                        validation.status
                     )),
                 },
             )
