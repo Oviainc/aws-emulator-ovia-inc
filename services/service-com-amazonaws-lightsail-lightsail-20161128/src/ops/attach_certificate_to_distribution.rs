@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachCertificateToDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachCertificateToDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches the SSL/TLS certificate the request names to one stored
+//! distribution, so every later read of that distribution reports the
+//! certificate and the domains it covers, and answers the operation-log entry
+//! the attachment appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachCertificateToDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachCertificateToDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachCertificateToDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachCertificateToDistribution"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE — the modelled `InvalidInputException` documentation covers
+        // "Domain and distribution APIs" together and says to set the Region to
+        // us-east-1 "to create, view, or edit these resources" — so the Region
+        // the request was signed for decides whether this call is served at all.
+        // Checked BEFORE anything is read or written, through the crate's one
+        // owner of that rule, so a refused request attaches nothing.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // Past that guard neither resource is addressed per-Region: "Only
+        // certificates created in the us-east-1 Amazon Web Services Region can be
+        // attached to Lightsail distributions … all distributions are located in
+        // the us-east-1 Region" (see `crate::state::DISTRIBUTION_REGION_NAME`),
+        // so each name names one record of the account.
+
+        // `distributionName` and `certificateName` are modelled `@required`
+        // members and both carry the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: both resources have to
+        // be ones this account holds, and the certificate has to be ISSUED —
+        // "Only certificates with a status of ISSUED can be attached to a
+        // distribution". Both are checked BEFORE the write, so a refused request
+        // attaches nothing.
+        let distribution_name = input.distribution_name;
+        let certificate_name = input.certificate_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The certificate is read first, so the one mutable handle the
+            // attachment needs is taken once and there is no second lookup of
+            // the distribution to keep correct.
+            let certificate = store.certificate(&certificate_name).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::resource_does_not_exist(
+                    crate::state::RESOURCE_TYPE_CERTIFICATE,
+                    &certificate_name,
+                )
+            })?;
+            // A certificate the certificate authority has not issued yet secures
+            // nothing, so there is no HTTPS traffic the distribution could accept
+            // with it.
+            if !certificate.is_issued() {
+                return Err(operation_failure(format!(
+                    "The certificate {certificate_name} is {}: only certificates with a \
+                     status of {} can be attached to a distribution.",
+                    certificate.status,
+                    crate::state::CERTIFICATE_STATUS_ISSUED
+                )));
+            }
+            // The domains the attachment publishes on the distribution: "After
+            // the certificate is attached, your distribution accepts HTTPS
+            // traffic for all of the domains that are associated with the
+            // certificate."
+            let alternative_domain_names = certificate.domain_names();
+
+            // The attachment itself, on the one distribution the name
+            // addresses — a name this account holds no distribution under is
+            // the same `DoesNotExist` rejection the certificate gets. A
+            // distribution holds ONE attached certificate
+            // (`LightsailDistribution$certificateName` is a single name), so
+            // attaching one replaces whatever was attached before. Attaching the
+            // one already attached asks for the configuration this distribution
+            // already has, and is applied the same way rather than
+            // short-circuited: the request is accepted, the record keeps that
+            // certificate, and the change is logged and rolled out like any
+            // other. Changing which certificate a distribution serves IS a
+            // configuration change, so the distribution is `InProgress` again
+            // until the clock owes it the deployment.
+            let due =
+                crate::state::DueNamedState::after(now, crate::state::DISTRIBUTION_STATUS_DEPLOYED);
+            let distribution = store.distribution_mut(&distribution_name).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::resource_does_not_exist(
+                    crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                    &distribution_name,
+                )
+            })?;
+            distribution.certificate_name = Some(certificate_name.clone());
+            distribution.alternative_domain_names = alternative_domain_names;
+            distribution.status = crate::state::DISTRIBUTION_STATUS_IN_PROGRESS;
+            // This rollout replaces any the distribution was still owed: a
+            // configuration change starts the deployment again, so the instant
+            // the distribution settles is the one THIS change is owed, never an
+            // earlier one a superseded configuration was waiting on.
+            distribution.due = Some(due);
+            let location = distribution.location.clone();
+
+            // One log entry, for the distribution the certificate was attached to
+            // — this operation's output carries a single `operation`, not a list
+            // — left non-terminal until that deployment is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION,
+                crate::state::RESOURCE_TYPE_DISTRIBUTION,
+                &distribution_name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(AttachCertificateToDistributionOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message states the
+/// rule the request broke.
+fn invalid(message: String) -> AttachCertificateToDistributionError {
+    AttachCertificateToDistributionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> AttachCertificateToDistributionError {
+    AttachCertificateToDistributionErrorModeled::OperationFailureException(
+        OperationFailureException {
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> AttachCertificateToDistributionError {
+    AttachCertificateToDistributionErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

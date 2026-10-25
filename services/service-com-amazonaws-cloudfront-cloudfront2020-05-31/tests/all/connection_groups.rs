@@ -60,7 +60,11 @@ use crate::response_headers_policy_lifecycle::{assert_absent, text};
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/connection-group` with the request document `body`.
-async fn create_connection_group(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that needs a connection group of its own — one whose
+/// ROUTING ENDPOINT it compares something against — creates one over the same wire path
+/// rather than growing a copy of this.
+pub(crate) async fn create_connection_group(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",

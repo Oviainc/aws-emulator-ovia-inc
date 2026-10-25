@@ -29,8 +29,15 @@ pub const IDENTIFIER_LEN: usize = 11;
 
 /// The alphabet `^[0-9a-zA-Z]{11}$` allows, in the digit order used to render a
 /// minted identifier. 62^11 exceeds `u64::MAX`, so every seed renders in 11 digits.
+///
+/// The digits are listed in ASCENDING BYTE order — `'0'..='9'` (0x30..=0x39), then
+/// `'A'..='Z'` (0x41..=0x5a), then `'a'..='z'` (0x61..=0x7a) — so a higher digit value
+/// always renders a higher byte. That is what makes [`base62_identifier`] order
+/// preserving: [`ComAmazonawsRbinAmazonrecyclebinState::rules`] compares its keys by
+/// bytes, so any alphabet that interleaved the two letter ranges would render a higher
+/// seed as a key that sorts BEFORE a lower one.
 const BASE62_DIGITS: &[u8; 62] =
-    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /// `ListRules` page size when the caller names none. The model bounds `MaxResults`
 /// at 1000, so an unbounded page can never be larger than this.
@@ -606,8 +613,11 @@ pub struct ComAmazonawsRbinAmazonrecyclebinState {
 impl ComAmazonawsRbinAmazonrecyclebinState {
     /// Mint an identifier no stored rule holds, as 11 base62 digits.
     ///
-    /// Monotonic, so the map's key order is also creation order; the loop skips a
-    /// candidate that is somehow already taken rather than overwriting a rule.
+    /// The seed only ever rises and [`base62_identifier`] renders it order preserving
+    /// under the byte comparison [`Self::rules`] orders its keys by, so the map's key
+    /// order is also creation order and a freshly minted identifier sorts after every
+    /// stored one; the loop skips a candidate that is somehow already taken rather than
+    /// overwriting a rule.
     pub fn mint_identifier(&mut self) -> String {
         loop {
             self.next_identifier_seed = self.next_identifier_seed.wrapping_add(1);
@@ -694,6 +704,12 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
 /// Render `seed` as exactly [`IDENTIFIER_LEN`] base62 digits, most significant
 /// first and left-padded with `0`, so the result satisfies `^[0-9a-zA-Z]{11}$` and
 /// sorts in the same order as the seed.
+///
+/// Order preserving under BYTE comparison, which is how the rule map compares its keys:
+/// every rendering is the same length, the digits are most significant first, and
+/// [`BASE62_DIGITS`] maps a higher digit value to a higher byte. So `seed_a < seed_b`
+/// implies `base62_identifier(seed_a) < base62_identifier(seed_b)` as strings, and a
+/// freshly minted identifier sorts after every identifier minted before it.
 fn base62_identifier(seed: u64) -> String {
     // Built as `char`s so the result needs no UTF-8 validation step — and so a future
     // change to the alphabet cannot turn into replacement characters.

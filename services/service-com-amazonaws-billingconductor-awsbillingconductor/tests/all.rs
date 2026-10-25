@@ -21,6 +21,8 @@ mod auto_associate_billing_group_cap;
 mod batch_disassociate_resources_from_custom_line_item;
 #[path = "all/billing_group_core_loop.rs"]
 mod billing_group_core_loop;
+#[path = "all/billing_group_cost_report.rs"]
+mod billing_group_cost_report;
 #[path = "all/billing_transfer_preference.rs"]
 mod billing_transfer_preference;
 #[path = "all/custom_line_item_and_create_name_refusals.rs"]

@@ -340,6 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The change this create starts is recorded by `begin_change` below,
             // once every option it set has a revision.
             changes: VecDeque::new(),
+            // Nothing is scheduled on a domain this create has just minted: a
+            // scheduled action is put there by the call that schedules the change.
+            scheduled_actions: BTreeMap::new(),
         };
 
         // Every option the new domain holds a value for starts at revision 1, so

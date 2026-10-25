@@ -100,7 +100,10 @@ pub(crate) fn encode_label(value: &str) -> String {
 }
 
 /// Escape the five entities XML predefines, so any text may travel in an element.
-fn escape(text: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that sends caller text through this wire path escapes
+/// it the same way.
+pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -366,7 +369,10 @@ fn create_table() -> Vec<Create> {
 /// The longest domain name a tenant may claim: labels of the longest admissible length
 /// (`MAX_DOMAIN_LABEL_LEN`) packed up to the whole-name bound (`MAX_DOMAIN_NAME_LEN`),
 /// both RFC 1035's.
-fn longest_domain() -> String {
+///
+/// `pub(crate)` so a sibling suite that exercises the same published bounds names the
+/// same row rather than building a second one.
+pub(crate) fn longest_domain() -> String {
     let label = "d".repeat(MAX_DOMAIN_LABEL_LEN);
     let mut domain = format!("{label}.{label}.{label}");
     // Fill the rest with one final label that takes the name exactly to the bound.

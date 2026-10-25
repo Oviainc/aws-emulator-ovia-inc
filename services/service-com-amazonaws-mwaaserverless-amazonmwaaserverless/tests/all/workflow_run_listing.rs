@@ -61,7 +61,10 @@ pub(crate) async fn created_workflow(harness: &Harness, name: &str) -> String {
 }
 
 /// Append a version to a workflow and report the new `WorkflowVersion`.
-async fn appended_version(harness: &Harness, arn: &str, object_key: &str) -> String {
+///
+/// `pub(crate)` so a suite that needs a workflow holding several versions grows one
+/// through the wire path rather than writing a second helper for it.
+pub(crate) async fn appended_version(harness: &Harness, arn: &str, object_key: &str) -> String {
     let (status, updated) = harness
         .call(
             "UpdateWorkflow",
