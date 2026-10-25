@@ -41,6 +41,8 @@ mod item_write_vocabularies;
 mod key_schema_element_refusals;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
+#[path = "all/on_demand_backups.rs"]
+mod on_demand_backups;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
 #[path = "all/region_from_the_request_endpoint.rs"]
