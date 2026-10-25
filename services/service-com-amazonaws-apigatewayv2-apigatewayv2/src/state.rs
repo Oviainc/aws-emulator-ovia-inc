@@ -660,6 +660,22 @@ impl Api {
             .collect()
     }
 
+    /// The names of this api's stages that are serving `deployment_id`, in the store's
+    /// stable `StageName` order.
+    ///
+    /// A stage holds the reference (through its `DeploymentId`: "The identifier of the
+    /// Deployment that the Stage is associated with"), so the deployment is the one that
+    /// cannot be removed while any of them serves it: removing it would leave those
+    /// stages serving nothing, and "A Deployment must be associated with a Stage for it
+    /// to be callable over the internet" (the `Deployment` shape's own doc).
+    pub fn stages_serving_deployment(&self, deployment_id: &str) -> Vec<String> {
+        self.stages
+            .values()
+            .filter(|stage| stage.deployment_id.as_deref() == Some(deployment_id))
+            .map(|stage| stage.stage_name.clone())
+            .collect()
+    }
+
     /// The route KEYS of this api's routes that are associated with `authorizer_id`, in
     /// the store's stable `RouteId` order.
     ///
