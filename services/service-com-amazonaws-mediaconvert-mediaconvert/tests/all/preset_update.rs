@@ -202,11 +202,11 @@ fn update_cases() -> Vec<Case> {
             settings: original_settings(),
         },
         Case {
-            label: "an empty settings object: no member of PresetSettings given",
-            request: json!({ "settings": {} }),
+            label: "a settings graph naming only the container, with no other member",
+            request: json!({ "settings": { "containerSettings": { "container": "OGG" } } }),
             category: Some("web"),
             description: Some("the original"),
-            settings: json!({}),
+            settings: json!({ "containerSettings": { "container": "OGG" } }),
         },
     ]
 }
@@ -464,7 +464,9 @@ async fn updating_a_preset_that_does_not_exist_is_not_found() {
 ///
 /// The bounded rows use `VideoDescription`'s published `Width`/`Height` range, 32 to 8192
 /// (`smithy_query(query="shape",shape="VideoDescription")`): one step past each bound is
-/// refused, and each bound itself is accepted and stored.
+/// refused, and each bound itself is accepted and stored. A `Settings` graph that names no
+/// container is refused for a reason of its own, which
+/// `tests/all/preset_settings_validation.rs` covers over the whole class.
 #[tokio::test]
 async fn an_update_the_model_refuses_changes_nothing() {
     let emulator = Emulator::new();
@@ -478,15 +480,29 @@ async fn an_update_the_model_refuses_changes_nothing() {
     let refusals: Vec<(&str, Value)> = vec![
         (
             "Width one below the 32 minimum",
-            json!({ "settings": { "videoDescription": { "width": 31 } } }),
+            json!({
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "width": 31 }
+                }
+            }),
         ),
         (
             "Height one above the 8192 maximum",
-            json!({ "settings": { "videoDescription": { "height": 8193 } } }),
+            json!({
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "height": 8193 }
+                }
+            }),
         ),
         (
             "Container outside the enumerated set",
             json!({ "settings": { "containerSettings": { "container": "MKV" } } }),
+        ),
+        (
+            "Settings naming no container, so describing no output",
+            json!({ "settings": {} }),
         ),
     ];
     for (label, request) in refusals {
@@ -516,7 +532,12 @@ async fn an_update_the_model_refuses_changes_nothing() {
         let reply = update_preset(
             &emulator,
             "guarded",
-            json!({ "settings": { "videoDescription": { "width": edge, "height": edge } } }),
+            json!({
+                "settings": {
+                    "containerSettings": { "container": "MP4" },
+                    "videoDescription": { "width": edge, "height": edge }
+                }
+            }),
         )
         .await;
         assert_eq!(

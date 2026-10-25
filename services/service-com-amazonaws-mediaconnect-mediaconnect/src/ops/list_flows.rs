@@ -84,9 +84,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page ListFlows returns, and the page size it uses when the request names
-/// none: the maximum of the modelled `MaxResults` range (1..1000).
+/// The largest page ListFlows returns: the maximum of the modelled `MaxResults` range
+/// (1..1000).
 const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The page size ListFlows uses when the request names none: "If MaxResults is not
+/// included in the request, the service defaults to pagination with a maximum of 10
+/// results per page"
+/// (`smithy_query(query="doc",shape="ListFlowsRequest",member="MaxResults")`).
+const DEFAULT_PAGE_SIZE: i32 = 10;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -196,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(
             input
                 .max_results
-                .unwrap_or(MAX_PAGE_SIZE)
+                .unwrap_or(DEFAULT_PAGE_SIZE)
                 .clamp(1, MAX_PAGE_SIZE),
         )
         .unwrap_or(1);

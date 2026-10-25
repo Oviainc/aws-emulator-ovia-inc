@@ -30,15 +30,8 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
-    account, all_attributes, as_map, call, create_ok, emulator, error_code, ok, HOST,
+    account, all_attributes, as_map, call, create_ok, emulator, error_code, list_tags, ok, HOST,
 };
-
-/// The tags `ListQueueTags` reports for the queue at `url`, as a sorted map. A queue
-/// with no tag reports no `Tags` member at all, which is the empty map here.
-async fn list_tags(router: &MultiServiceRouter, url: &str) -> BTreeMap<String, String> {
-    let reported = ok(router, "ListQueueTags", json!({"QueueUrl": url})).await;
-    as_map(reported.get("Tags").unwrap_or(&Value::Null))
-}
 
 /// Whether `ListQueueTags` reported a `Tags` member at all for the queue at `url`.
 async fn reports_a_tags_member(router: &MultiServiceRouter, url: &str) -> bool {
@@ -488,8 +481,8 @@ async fn tag_queue_enforces_the_published_tag_restrictions() {
         } else {
             assert_eq!(
                 (status, error_code(&parsed).as_str()),
-                (400, "ValidationException"),
-                "case {}: expected a 400 ValidationException, got {status} with {parsed}",
+                (400, "InvalidParameterValue"),
+                "case {}: expected a 400 InvalidParameterValue, got {status} with {parsed}",
                 row.case
             );
             assert_eq!(
@@ -556,8 +549,8 @@ async fn create_queue_enforces_the_same_tag_restrictions() {
         } else {
             assert_eq!(
                 (status, error_code(&parsed).as_str()),
-                (400, "ValidationException"),
-                "case {case}: expected a 400 ValidationException, got {status} with {parsed}"
+                (400, "InvalidParameterValue"),
+                "case {case}: expected a 400 InvalidParameterValue, got {status} with {parsed}"
             );
             // A refused create made no queue at all.
             let (status, parsed) = call(&router, "GetQueueUrl", &json!({"QueueName": name})).await;

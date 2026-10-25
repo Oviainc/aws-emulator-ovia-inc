@@ -21,6 +21,8 @@ mod composition_tag_lifetime;
 mod compositions;
 #[path = "all/create_ingest_configuration_inputs.rs"]
 mod create_ingest_configuration_inputs;
+#[path = "all/create_storage_configuration_inputs.rs"]
+mod create_storage_configuration_inputs;
 #[path = "all/delete_ingest_configuration.rs"]
 mod delete_ingest_configuration;
 #[path = "all/delete_stage_associations.rs"]
