@@ -14,6 +14,13 @@
 //! select the series `Filters` names, clip its points to `[StartDate, EndDate]`, report
 //! one statistic per forecast type. The handler writes nothing.
 //!
+//! Everything it decides once that ARN has been looked up — whether the resource is
+//! there, whether it is readable yet, whether a supplied `NextToken` can be one this
+//! service minted, and how a projection it cannot answer is classified — is the decision
+//! `QueryForecast` must answer identically, so it is stated once in
+//! [`crate::state::ResourceKind::resolve_query`] and this handler only renders the
+//! [`crate::state::QueryOutcome`] it returns into this operation's own modelled errors.
+//!
 //! ## Pagination
 //!
 //! `QueryWhatIfForecastResponse` models exactly one member, `Forecast`, and `Forecast`
@@ -235,75 +242,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // One lock, one read: everything below is computed from the what-if forecast as
-        // stored.
-        let projection = {
+        // stored. WHICH condition is judged, in which order, and with which message is the
+        // decision both query operations must answer identically, so it is stated once in
+        // [`crate::state::ResourceKind::resolve_query`] and this handler only renders the
+        // outcome it hands back into this operation's own modelled errors. Reading it
+        // from the store writes nothing, so two identical calls answer identically.
+        let outcome = {
             let state = state.lock();
-            let Some(forecast) = state.what_if_forecasts.get(&input.what_if_forecast_arn) else {
-                // Worded by the one rule every ARN member of this service follows: the
-                // submitted ARN quoted back verbatim after `No resource found`, with no
-                // other prose ([`crate::state::ResourceKind::not_found_message`]).
-                return Err(QueryWhatIfForecastErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(
-                            crate::state::WHAT_IF_FORECAST
-                                .not_found_message(&input.what_if_forecast_arn),
-                        ),
-                    },
-                )
-                .into());
-            };
-
-            // A what-if forecast the control plane has minted but whose creation run has
-            // not reached `ACTIVE` yet is not readable ("The Status of the forecast must be
-            // ACTIVE before you can query or export the forecast"), which is the modelled
-            // `ResourceInUseException` (409): the resource exists, so it is not a 404, and
-            // the request is well formed, so it is not a 400. Checked from the stored due
-            // instant, so no read has to write anything to move the forecast on.
-            if !forecast.is_active_at(::std::time::SystemTime::now()) {
-                return Err(QueryWhatIfForecastErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
-                        message: Some(
-                            crate::state::WHAT_IF_FORECAST
-                                .not_active_message(&input.what_if_forecast_arn),
-                        ),
-                    },
-                )
-                .into());
-            }
-
-            // The what-if forecast is readable, so a continuation token can now be judged
-            // against it. The order matters and is not an accident: a token
-            // only means anything as a position inside one resource's results, so the
-            // resource is resolved first and an ARN that names nothing is answered
-            // `ResourceNotFoundException` even when the request also carries a token this
-            // service could not have issued. No token this operation could have issued
-            // exists (see the module docs), so any `NextToken` that gets this far is one
-            // this service did not mint.
-            if input.next_token.is_some() {
-                return Err(QueryWhatIfForecastErrorModeled::InvalidNextTokenException(
-                    InvalidNextTokenException {
-                        message: Some(
-                            "The token is not valid. Tokens expire after 24 hours. \
-                             QueryWhatIfForecast returns the complete date range for the \
-                             filtered what-if forecast, so it returns no NextToken to \
-                             resume from."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-
-            forecast.query(
-                &input.filters,
-                input.start_date.as_deref(),
-                input.end_date.as_deref(),
+            crate::state::WHAT_IF_FORECAST.resolve_query(
+                state.what_if_forecasts.get(&input.what_if_forecast_arn),
+                &crate::state::QueryRequest {
+                    arn: &input.what_if_forecast_arn,
+                    filters: &input.filters,
+                    start_date: input.start_date.as_deref(),
+                    end_date: input.end_date.as_deref(),
+                    next_token: input.next_token.as_deref(),
+                },
+                ::std::time::SystemTime::now(),
             )
         };
 
-        let predictions = match projection {
-            Ok(predictions) => predictions,
-            Err(rejection) => return Err(reject(&rejection)),
+        let predictions = match outcome {
+            crate::state::QueryOutcome::Predictions(predictions) => predictions,
+            // The what-if forecast, or the series within it, is not there (404).
+            crate::state::QueryOutcome::NotFound(message) => {
+                return Err(QueryWhatIfForecastErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            // It exists and its creation run is not due yet (409).
+            crate::state::QueryOutcome::NotActive(message) => {
+                return Err(QueryWhatIfForecastErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            // It carried a continuation token this service never issued (400).
+            crate::state::QueryOutcome::UnmintedNextToken(message) => {
+                return Err(QueryWhatIfForecastErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            // The request is not one this what-if forecast can be queried with (400).
+            crate::state::QueryOutcome::Unqueryable(message) => {
+                return Err(QueryWhatIfForecastErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(QueryWhatIfForecastOutput {
@@ -316,22 +312,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             }),
         })
-    }
-}
-
-/// The modelled error a [`crate::state::QueryRejection`] is reported as: a series the
-/// what-if forecast does not hold is "we can't find that resource" (404); everything else
-/// is a request this forecast cannot be queried with (400).
-fn reject(rejection: &crate::state::QueryRejection) -> QueryWhatIfForecastError {
-    let message = Some(rejection.message());
-    if rejection.is_not_found() {
-        QueryWhatIfForecastErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-            message,
-        })
-        .into()
-    } else {
-        QueryWhatIfForecastErrorModeled::InvalidInputException(InvalidInputException { message })
-            .into()
     }
 }
 

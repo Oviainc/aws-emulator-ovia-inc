@@ -32,8 +32,11 @@
 //! IDENTICALLY, so that they cannot drift apart: which resource an ARN names
 //! ([`ResourceKind`]), how an ARN they cannot read and a resource they cannot find are
 //! worded ([`ResourceKind::invalid_arn_message`], [`ResourceKind::not_found_message`]),
-//! and the shape-level validation that runs before either resolves anything
-//! ([`shape_validation_message`]).
+//! the shape-level validation that runs before either resolves anything
+//! ([`shape_validation_message`]), and the whole decision each one makes once it has
+//! looked its ARN up in the store ([`ResourceKind::resolve_query`], answered as a
+//! [`QueryOutcome`] a handler renders into its own modelled errors) — which condition is
+//! judged, in which order, and with which message.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
@@ -122,6 +125,13 @@ pub struct ResourceKind {
     pub resource_type: &'static str,
     /// How many non-empty `/`-separated name segments follow that type.
     pub name_segments: usize,
+    /// The operation that queries a resource of this kind, as the model names it. A
+    /// message that states what the OPERATION does — rather than what the resource is —
+    /// names it from here.
+    pub operation: &'static str,
+    /// How a sentence names a resource of this kind, which is the resource type as prose
+    /// rather than as the hyphenated word an ARN spells it with.
+    pub noun: &'static str,
 }
 
 /// The resource `QueryForecast`'s `ForecastArn` must name:
@@ -130,6 +140,8 @@ pub const FORECAST: ResourceKind = ResourceKind {
     member: "ForecastArn",
     resource_type: "forecast",
     name_segments: 1,
+    operation: "QueryForecast",
+    noun: "forecast",
 };
 
 /// The resource `QueryWhatIfForecast`'s `WhatIfForecastArn` must name:
@@ -138,6 +150,8 @@ pub const WHAT_IF_FORECAST: ResourceKind = ResourceKind {
     member: "WhatIfForecastArn",
     resource_type: "what-if-forecast",
     name_segments: 2,
+    operation: "QueryWhatIfForecast",
+    noun: "what-if forecast",
 };
 
 /// Every resource kind one of this service's operations resolves an ARN member by — the
@@ -220,6 +234,72 @@ impl ResourceKind {
         )
     }
 
+    /// The `Message` a request carrying a `NextToken` is refused with.
+    ///
+    /// Neither query operation can issue one: the response shape models a single member
+    /// and that member models no token, matching the operation's own doc — it returns the
+    /// complete date range for the filtered resource — so no token a caller supplies can
+    /// be one this service minted. The documented sentence of the modelled
+    /// `InvalidNextTokenException` comes first, then why this operation has no token to
+    /// resume from.
+    pub fn unminted_next_token_message(&self) -> String {
+        format!(
+            "The token is not valid. Tokens expire after 24 hours. {} returns the \
+             complete date range for the filtered {}, so it returns no NextToken to \
+             resume from.",
+            self.operation, self.noun
+        )
+    }
+
+    /// The whole decision both query operations make once the ARN they name has been
+    /// looked up in this service's store — stated ONCE here so the two cannot drift into
+    /// different conditions, a different order or different wording, and rendered by each
+    /// handler into its own modelled errors.
+    ///
+    /// In order, because each step only means anything once the one before it has passed:
+    ///
+    /// 1. the store's answer — an ARN of this kind it holds nothing under is an absent
+    ///    resource ([`ResourceKind::not_found_message`]);
+    /// 2. the resolved resource's readiness — "The Status of the forecast must be ACTIVE
+    ///    before you can query or export the forecast", read from the stored due instant
+    ///    at `now` so no read has to write anything
+    ///    ([`ResourceKind::not_active_message`]);
+    /// 3. the continuation token — a position inside ONE resource's results, so it is
+    ///    judged only against a resource that is readable
+    ///    ([`ResourceKind::unminted_next_token_message`]);
+    /// 4. the projection itself ([`StoredForecast::query`]), whose
+    ///    [`QueryRejection`] is classified by [`QueryRejection::is_not_found`].
+    ///
+    /// Reads only: nothing here mutates the stored resource, so two identical queries
+    /// answer identically.
+    pub fn resolve_query(
+        &self,
+        stored: Option<&StoredForecast>,
+        request: &QueryRequest<'_>,
+        now: SystemTime,
+    ) -> QueryOutcome {
+        let Some(forecast) = stored else {
+            return QueryOutcome::NotFound(self.not_found_message(request.arn));
+        };
+        if !forecast.is_active_at(now) {
+            return QueryOutcome::NotActive(self.not_active_message(request.arn));
+        }
+        if request.next_token.is_some() {
+            return QueryOutcome::UnmintedNextToken(self.unminted_next_token_message());
+        }
+        match forecast.query(request.filters, request.start_date, request.end_date) {
+            Ok(predictions) => QueryOutcome::Predictions(predictions),
+            Err(rejection) => {
+                let message = rejection.message();
+                if rejection.is_not_found() {
+                    QueryOutcome::NotFound(message)
+                } else {
+                    QueryOutcome::Unqueryable(message)
+                }
+            }
+        }
+    }
+
     /// The dotted member path a boundary refusal names this ARN member under.
     ///
     /// Spelled by the framework's OWN path writer (lowerCamel), so this service's table
@@ -227,6 +307,64 @@ impl ResourceKind {
     /// spellings of one position.
     pub fn member_path(&self) -> String {
         aws_smithy_schema_server::constraints::path::member(self.member)
+    }
+}
+
+/// The members of a query request that [`ResourceKind::resolve_query`] reads.
+///
+/// Both operations carry the same five, under their own ARN member name, so the shared
+/// decision takes them as one value instead of a parameter list each handler fills in its
+/// own order.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryRequest<'a> {
+    /// The ARN the request named, as submitted — quoted back by the refusals that report
+    /// it.
+    pub arn: &'a str,
+    /// `Filters`: the criteria that select the one time series to retrieve.
+    pub filters: &'a HashMap<String, String>,
+    /// `StartDate`, the inclusive lower bound of the window, when the request carried one.
+    pub start_date: Option<&'a str>,
+    /// `EndDate`, the inclusive upper bound of the window, when the request carried one.
+    pub end_date: Option<&'a str>,
+    /// `NextToken`, which neither operation mints.
+    pub next_token: Option<&'a str>,
+}
+
+/// What a query answers with, as [`ResourceKind::resolve_query`] decided it: neutral
+/// about which operation asked, because the decision is the same for both.
+///
+/// Each handler renders one of these into its OWN modelled errors — the variants carry
+/// the message, the handler picks the error shape its model declares — so the statuses
+/// and codes stay a property of this decision and not of either handler.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryOutcome {
+    /// The projection to report: one entry per statistic the forecast was created with,
+    /// clipped to the requested window (`Forecast.Predictions`, HTTP 200).
+    Predictions(Vec<(String, Vec<StoredPoint>)>),
+    /// The resource, or the time series within it, is not there — the modelled
+    /// `ResourceNotFoundException` (HTTP 404).
+    NotFound(String),
+    /// The resource exists but its creation run has not reached `ACTIVE` yet — the
+    /// modelled `ResourceInUseException` (HTTP 409).
+    NotActive(String),
+    /// The request carried a continuation token this service never issued — the modelled
+    /// `InvalidNextTokenException` (HTTP 400).
+    UnmintedNextToken(String),
+    /// The request is one this resource cannot be queried with — the modelled
+    /// `InvalidInputException` (HTTP 400).
+    Unqueryable(String),
+}
+
+impl QueryOutcome {
+    /// The `Message` a refusal reports, or `None` for the answered projection.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Predictions(_) => None,
+            Self::NotFound(message)
+            | Self::NotActive(message)
+            | Self::UnmintedNextToken(message)
+            | Self::Unqueryable(message) => Some(message),
+        }
     }
 }
 
