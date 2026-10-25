@@ -172,3 +172,5 @@ mod request_validator_collection;
 mod api_key_gate;
 #[path = "all/update_request_validator.rs"]
 mod update_request_validator;
+#[path = "all/update_stage_variables.rs"]
+mod update_stage_variables;

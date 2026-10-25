@@ -98,6 +98,41 @@ fn apply(expected: &mut Value, member: &str, value: &Value) {
     }
 }
 
+/// The `EgressEndpoints` of one channel-shaped body, as a client reads them: the
+/// member carries one entry per pipeline, so a body reports none only if it has
+/// no pipelines.
+fn egress_endpoints(body: &Value) -> Vec<Value> {
+    body["egressEndpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One egress endpoint per pipeline of the channel's class, with every pipeline
+/// that survived the class change still egressing from the endpoint it already
+/// reported: a class change re-provisions the endpoints along with the
+/// pipelines, it does not move the ones a surviving pipeline uses.
+fn assert_egress_endpoints(
+    case: &str,
+    read: &str,
+    body: &Value,
+    before: &[Value],
+    pipelines: usize,
+) {
+    let reported = egress_endpoints(body);
+    assert_eq!(
+        reported.len(),
+        pipelines,
+        "case {case:?}: {read}: expected one egress endpoint per pipeline ({pipelines}), got {reported:?}"
+    );
+    let kept = before.len().min(pipelines);
+    assert_eq!(
+        reported[..kept],
+        before[..kept],
+        "case {case:?}: {read}: expected the surviving pipelines to keep the egress endpoints {before:?}, got {reported:?}"
+    );
+}
+
 /// Rule: `UpdateChannelClass` stores the class its request names on the stored
 /// channel and changes nothing else about it, which re-provisions the channel's
 /// encoding pipelines — the `ChannelClass` doc: "A standard channel has two
@@ -126,11 +161,16 @@ async fn a_class_update_re_provisions_the_pipelines_the_new_class_gives_the_chan
         let router = medialive();
         let id = idle_channel(&router, case, baseline_body(created_class)).await;
         let (_, before) = describe(&router, &id).await;
+        let endpoints_before = egress_endpoints(&before);
 
         // The class is the ONE member this operation writes, so everything else
-        // the channel reported must read back unchanged.
+        // the channel reported must read back unchanged — except its
+        // `EgressEndpoints`, which carry one entry per pipeline, so
+        // re-provisioning the pipelines re-provisions them too. Those are
+        // asserted on their own, against the new class's pipeline count.
         let mut expected = before.clone();
         apply(&mut expected, "channelClass", &json!(requested));
+        apply(&mut expected, "egressEndpoints", &Value::Null);
 
         let (status, response) = update_class(&router, &id, requested, None).await;
         assert_eq!(
@@ -148,6 +188,8 @@ async fn a_class_update_re_provisions_the_pipelines_the_new_class_gives_the_chan
         // before the two are compared member by member.
         let mut answered = response["channel"].clone();
         apply(&mut answered, "state", &before["state"]);
+        assert_egress_endpoints(case, "the answer", &answered, &endpoints_before, pipelines);
+        apply(&mut answered, "egressEndpoints", &Value::Null);
         assert_eq!(
             answered, expected,
             "case {case:?}: expected the answer to be the stored channel with the new class, got {answered:?}"
@@ -156,11 +198,13 @@ async fn a_class_update_re_provisions_the_pipelines_the_new_class_gives_the_chan
         // Round trip: the class is what is STORED, not just what was answered —
         // and the `UPDATING` the change owes settles back into `IDLE`.
         wait_for_the_clock();
-        let (status, after) = describe(&router, &id).await;
+        let (status, mut after) = describe(&router, &id).await;
         assert_eq!(
             status, 200,
             "case {case:?}: DescribeChannel after the class update: got {status}: {after}"
         );
+        assert_egress_endpoints(case, "DescribeChannel", &after, &endpoints_before, pipelines);
+        apply(&mut after, "egressEndpoints", &Value::Null);
         assert_eq!(
             after, expected,
             "case {case:?}: expected the new class to read back through DescribeChannel, got {after:?}"

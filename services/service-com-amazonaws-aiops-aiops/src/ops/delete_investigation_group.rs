@@ -174,10 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        // `identifier` is either the group's name or its ARN (the member's own
-        // documentation), and both forms resolve the same record. The whole record
-        // goes: the group, its resource policy and its tags, so the Region's single
-        // group slot and the name become available to a later create.
+        // `identifier` addresses the group through its ARN, the one address this
+        // service resolves (`crate::state`). The whole record goes: the group, its
+        // resource policy and its tags, so the Region's single group slot and the name
+        // become available to a later create.
         if store.remove_group(&input.identifier, &region).is_none() {
             return Err(DeleteInvestigationGroupErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),

@@ -6,6 +6,11 @@
 //! configuration onto the new record, stamps `creationTime` / `startTime` and persists it
 //! with `state.status` `initiating`.
 //!
+//! A template that configures `logConfiguration` makes the run DELIVER its records to the
+//! destination it names, so this call also writes the records the start makes true — the
+//! experiment and what its targets resolved to — to the emulator's own CloudWatch Logs
+//! and Amazon S3 services. See [`crate::state::experiment_logs`].
+//!
 //! The move to `running`, the span the run lasts and the terminal status it earns after it
 //! are owed to the clock rather than to this call, so a caller reading the experiment
 //! immediately still sees it initiating; see [`crate::state::ExperimentRecord::settle`].
@@ -147,46 +152,34 @@ impl<Eng> StartExperiment<Eng> {
     }
 }
 
-impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
-    for StartExperiment<Eng>
-{
-    type Input = StartExperimentInput;
-    type Output = StartExperimentOutput;
-    type Error = StartExperimentError;
-
-    const NAME: &'static str = "StartExperiment";
-    const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_EXPERIMENT_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_EXPERIMENT_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
-
-    async fn handle(
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<Eng> {
+    /// Everything this start does to the STORE, under ONE guard that this call takes and
+    /// releases: the settle, the idempotency check, the template lookup, the role checks,
+    /// the quotas and the experiment this start persists.
+    ///
+    /// It hands back the `Experiment` the response reports and the log records the start
+    /// left for the destination the template configured — written by the caller, with no
+    /// guard held (see [`crate::state::experiment_logs`]). Splitting it out is what keeps
+    /// the guard out of `handle`'s future, which has to be `Send`.
+    #[allow(clippy::type_complexity)]
+    fn start_under_guard(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
-    ) -> Result<Self::Output, Self::Error> {
+        input: &StartExperimentInput,
+        actions_mode: &str,
+        region: &str,
+        now: ::std::time::SystemTime,
+    ) -> Result<
+        (
+            Experiment,
+            Vec<crate::state::experiment_logs::PendingDelivery>,
+        ),
+        StartExperimentError,
+    > {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::internal_failure(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
-
-        // `actionsMode` is enum-typed, which the boundary validator does not check, and
-        // it is persisted on the experiment — so a value `ActionsMode` does not admit is
-        // refused here rather than stored.
-        let actions_mode = match crate::state::resolve_actions_mode(
-            input
-                .experiment_options
-                .as_ref()
-                .and_then(|options| options.actions_mode.as_deref()),
-        ) {
-            Ok(mode) => mode,
-            Err(refusal) => {
-                return Err(StartExperimentErrorModeled::ValidationException(refusal).into())
-            }
-        };
-
-        let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // Settle first: an experiment whose run already elapsed is no longer active, so
@@ -198,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the experiment the first call started, while reusing it for a different request
         // is the parameter mismatch FIS answers with `ConflictException` rather than
         // reporting another template's run.
-        let fingerprint = crate::state::start_experiment_fingerprint(&input);
+        let fingerprint = crate::state::start_experiment_fingerprint(input);
         match store.replayed(
             crate::state::IdempotentResource::Experiment,
             &input.client_token,
@@ -206,9 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             crate::state::TokenReplay::Replay(id) => {
                 if let Some(record) = store.experiments.get(&id) {
-                    return Ok(StartExperimentOutput {
-                        experiment: Some(record.to_experiment()),
-                    });
+                    let experiment = record.to_experiment();
+                    // A replay starts nothing, so it produces no record of its own; what
+                    // the settle above materialised is still delivered.
+                    let deliveries = store.take_pending_log_deliveries();
+                    return Ok((experiment, deliveries));
                 }
             }
             crate::state::TokenReplay::Mismatch => {
@@ -309,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // action the experiment options skip is never run under the role, so nothing the
         // role may not do can be attributed to it. Under `actionsMode: skip-all` that is
         // every action, so no permission failure is possible at all.
-        let plan = crate::state::plan_run(&template, &actions_mode);
+        let plan = crate::state::plan_run(&template, actions_mode);
         let permission_failure = role_documents.and_then(|documents| {
             crate::state::action_permissions::permission_failure(
                 &template.role_arn,
@@ -320,12 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         let id = store.mint_experiment_id();
-        let arn = crate::state::experiment_arn(&region, &id);
+        let arn = crate::state::experiment_arn(region, &id);
         let record = crate::state::ExperimentRecord::from_template(
             id.clone(),
             arn,
             &template,
-            &actions_mode,
+            actions_mode,
             input.tags.clone(),
             now,
             permission_failure,
@@ -338,6 +333,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &id,
             &fingerprint,
         );
+
+        // Every record the START of this run makes true — the experiment itself and what
+        // its targets resolved to — is already parked on the record `from_template` built,
+        // beside anything the settle above materialised for a run already under way.
+        let deliveries = store.take_pending_log_deliveries();
+        Ok((experiment, deliveries))
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
+    for StartExperiment<Eng>
+{
+    type Input = StartExperimentInput;
+    type Output = StartExperimentOutput;
+    type Error = StartExperimentError;
+
+    const NAME: &'static str = "StartExperiment";
+    const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_EXPERIMENT_INPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::START_EXPERIMENT_OUTPUT_SCHEMA;
+    const SUCCESS_STATUS: u16 = 200u16;
+
+    async fn handle(
+        &self,
+        input: Self::Input,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        // `actionsMode` is enum-typed, which the boundary validator does not check, and
+        // it is persisted on the experiment — so a value `ActionsMode` does not admit is
+        // refused here rather than stored.
+        let actions_mode = match crate::state::resolve_actions_mode(
+            input
+                .experiment_options
+                .as_ref()
+                .and_then(|options| options.actions_mode.as_deref()),
+        ) {
+            Ok(mode) => mode,
+            Err(refusal) => {
+                return Err(StartExperimentErrorModeled::ValidationException(refusal).into())
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let (experiment, deliveries) =
+            self.start_under_guard(&input, &actions_mode, &region, now)?;
+
+        // The run's first records, written with the state guard released, to the
+        // destination the template configured (see [`crate::state::experiment_logs`]).
+        crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
         Ok(StartExperimentOutput {
             experiment: Some(experiment),

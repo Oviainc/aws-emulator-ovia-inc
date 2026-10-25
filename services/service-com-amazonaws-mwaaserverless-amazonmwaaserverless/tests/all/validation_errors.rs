@@ -954,9 +954,11 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
     }
 
     // A paginated child listing declares no not-found error of its own
-    // (`smithy_query(query="operation", operation="ListWorkflowRuns,ListWorkflowVersions")`),
-    // so a well-formed ARN naming no stored workflow is the empty page it models — still
-    // not a validation failure. `child_listing_error_set` carries that rule in full.
+    // (`smithy_query(query="operation",
+    // operation="ListWorkflowRuns,ListWorkflowVersions,ListTaskInstances")`), so a
+    // well-formed ARN naming no stored workflow is the empty page it models — still not a
+    // validation failure. `child_listing_error_set` and `task_instance_listing` carry that
+    // rule in full.
     let listing_cases: Vec<(&str, serde_json::Value, &str)> = vec![
         (
             "ListWorkflowRuns",
@@ -967,6 +969,11 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "ListWorkflowVersions",
             serde_json::json!({"WorkflowArn": arn.clone()}),
             "WorkflowVersions",
+        ),
+        (
+            "ListTaskInstances",
+            serde_json::json!({"WorkflowArn": arn.clone(), "RunId": "run-01"}),
+            "TaskInstances",
         ),
     ];
     for (operation, body, items) in listing_cases {
@@ -993,10 +1000,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         (
             "UntagResource",
             serde_json::json!({"ResourceArn": arn.clone(), "TagKeys": ["team"]}),
-        ),
-        (
-            "ListTaskInstances",
-            serde_json::json!({"WorkflowArn": arn.clone(), "RunId": "run-01"}),
         ),
     ];
     for (operation, body) in stub_cases {

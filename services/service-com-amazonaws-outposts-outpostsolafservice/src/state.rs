@@ -3044,6 +3044,30 @@ pub fn site_address_conflict(site_id: &str, outpost_id: &str) -> String {
     )
 }
 
+/// How this service states that a site cannot be deleted while an Outpost still
+/// belongs to it.
+///
+/// An Outpost names the site it lives at, so deleting that site would leave the
+/// Outpost pointing at nothing: the delete is held until no Outpost belongs to the
+/// site. AWS publishes no wording for the refusal, so the sentence is the
+/// emulator's own; what a caller branches on is the `ConflictException` code (HTTP
+/// 409) and the `ResourceId` / `ResourceType` members naming the Outpost that
+/// still belongs to the site, which is the one the caller has to delete first. The
+/// same rule and the same naming as [`site_address_conflict`], stated for the other
+/// call a site's Outposts hold back.
+///
+/// `outpost_id` is what the dependent is named BY, so it is optional exactly as the
+/// modelled `ResourceId` member is: what the refusal is about is that a dependent is
+/// still there, which the sentence states either way.
+pub fn site_dependents_conflict(site_id: &str, outpost_id: Option<&str>) -> String {
+    match outpost_id {
+        Some(outpost_id) => {
+            format!("site {site_id} cannot be deleted while Outpost {outpost_id} belongs to it")
+        }
+        None => format!("site {site_id} cannot be deleted while an Outpost belongs to it"),
+    }
+}
+
 /// The `ResourceType` a capacity-task conflict on an Outpost names, from the
 /// modelled `ResourceType` enum (`ORDER | OUTPOST`).
 pub const RESOURCE_TYPE_OUTPOST: &str = "OUTPOST";

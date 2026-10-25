@@ -99,6 +99,8 @@ mod state_roundtrip;
 mod transit_gateway_peering;
 #[path = "all/transit_gateway_peering_create_bounds.rs"]
 mod transit_gateway_peering_create_bounds;
+#[path = "all/transit_gateway_registration_lifecycle.rs"]
+mod transit_gateway_registration_lifecycle;
 #[path = "all/transit_gateway_route_table_attachment.rs"]
 mod transit_gateway_route_table_attachment;
 #[path = "all/transit_gateway_route_table_attachment_lifecycle.rs"]

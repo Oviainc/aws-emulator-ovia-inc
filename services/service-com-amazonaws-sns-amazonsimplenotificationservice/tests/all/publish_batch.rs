@@ -601,7 +601,7 @@ async fn publish_batch_reports_a_failed_entry_beside_the_published_ones() {
     assert!(
         delivered
             .iter()
-            .all(|message| ["first body", "last body"].contains(&message.message.as_str())),
+            .all(|message| ["first body", "last body"].contains(&&*message.message)),
         "a refused entry must deliver nothing"
     );
 }

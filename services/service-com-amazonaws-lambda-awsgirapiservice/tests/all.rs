@@ -43,6 +43,8 @@ mod function_aliases;
 mod function_code_update;
 #[path = "all/function_concurrency.rs"]
 mod function_concurrency;
+#[path = "all/function_concurrency_removal.rs"]
+mod function_concurrency_removal;
 #[path = "all/function_configuration.rs"]
 mod function_configuration;
 #[path = "all/function_lifecycle.rs"]
