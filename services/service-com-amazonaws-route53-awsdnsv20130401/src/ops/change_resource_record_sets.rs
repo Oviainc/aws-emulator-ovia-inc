@@ -107,11 +107,12 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, dns_sort_key, name_is_in_zone, no_such_hosted_zone, normalize_zone_id,
-    DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE,
-    MAX_REPORTED_CHANGE_PROBLEMS,
+    canonical_dns_name, dns_name_fault, dns_sort_key, name_is_in_zone, no_such_hosted_zone,
+    normalize_zone_id, DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
+    MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// An `InvalidChangeBatch` naming one problem per refused change.
 ///
@@ -175,15 +176,40 @@ impl Problems {
 /// sentence the label sits in, and a member the request did not give is not
 /// reported as a literal `null`.
 fn change_label(record: &ResourceRecordSet) -> String {
-    let set_identifier = record
-        .set_identifier
-        .as_deref()
-        .filter(|id| !id.is_empty())
+    let set_identifier = set_identifier_of(record)
         .map(|id| format!(", set-identifier='{id}'"))
         .unwrap_or_default();
     format!(
         "[name='{}', type='{}'{set_identifier}]",
         record.name, record.r#type
+    )
+}
+
+/// The `SetIdentifier` a record set carries, if it carries one.
+///
+/// A member the request left out and a member it sent empty are the same thing
+/// here: neither identifies a member of a routing group, and `SetIdentifier`'s
+/// modelled `@length` starts at 1.
+fn set_identifier_of(record: &ResourceRecordSet) -> Option<&str> {
+    record.set_identifier.as_deref().filter(|id| !id.is_empty())
+}
+
+/// How a refusal of a change's own SHAPE names the change: `[Action=<action>,
+/// Name=<name>, Type=<type>, SetIdentifier=<identifier>]`, with `null` where
+/// the request gave no identifier.
+///
+/// These refusals are about the request rather than about the zone the batch
+/// would be applied to, so the change is named by the four members that
+/// identify it IN THE REQUEST — including the identifier reported as the literal
+/// `null` when none was sent, because a missing member is exactly what some of
+/// them are about. The name is reported in its canonical form, the one form
+/// every spelling of a name maps onto.
+fn change_descriptor(action: &str, record: &ResourceRecordSet) -> String {
+    format!(
+        "[Action={action}, Name={}, Type={}, SetIdentifier={}]",
+        canonical_dns_name(&record.name),
+        record.r#type,
+        set_identifier_of(record).unwrap_or("null")
     )
 }
 
@@ -238,6 +264,83 @@ fn surviving_group<'a>(
         )
 }
 
+/// The record sets at one record set's NAME, whatever their type — the same
+/// contiguous `BTreeMap` range as [`group_members`], one key field wider,
+/// since the key order opens with the name. Walking it is therefore bounded by
+/// the name, not by the zone.
+fn name_members<'a, V>(
+    map: &'a BTreeMap<RecordKey, V>,
+    of: &RecordKey,
+) -> impl Iterator<Item = (&'a RecordKey, &'a V)> + 'a {
+    let name_sort_key = of.name_sort_key.clone();
+    let from = RecordKey {
+        name_sort_key: name_sort_key.clone(),
+        // Every modelled `RRType` sorts after the empty string, so the range
+        // opens before the first type at this name.
+        rr_type: String::new(),
+        set_identifier: None,
+    };
+    map.range(from..)
+        .take_while(move |(key, _)| key.name_sort_key == name_sort_key)
+}
+
+/// The record types the state the batch would LEAVE holds at one name: those
+/// `stored` record sets the overlay does not touch, plus those it WRITES.
+fn surviving_types_at_name(
+    stored: &BTreeMap<RecordKey, ResourceRecordSet>,
+    staged: &BTreeMap<RecordKey, Option<ResourceRecordSet>>,
+    of: &RecordKey,
+) -> BTreeSet<String> {
+    name_members(stored, of)
+        .filter(|(member, _)| !staged.contains_key(*member))
+        .map(|(member, _)| member.rr_type.clone())
+        .chain(
+            name_members(staged, of)
+                .filter(|(_, pending)| pending.is_some())
+                .map(|(member, _)| member.rr_type.clone()),
+        )
+        .collect()
+}
+
+/// Why the record sets at one name may not stand together, if they may not.
+///
+/// A `CNAME` says that its name IS another name, so every query for that name
+/// is answered from the name it points at — which leaves no room for data of
+/// any other type at the same name. One name therefore holds either a `CNAME`
+/// or records of other types, never both, and the rule is symmetric: the
+/// `CNAME` beside an existing record of another type is refused exactly as a
+/// record of another type beside an existing `CNAME` is. The two directions
+/// state the refusal from the record set the change WROTE: the `CNAME` conflicts
+/// with whatever else that name answers for, while a record of another type
+/// collides with the one `CNAME` already there, which the refusal names.
+/// Judged against the state the batch would LEAVE, so a batch that replaces one
+/// with the other is accepted whatever order its changes are written in.
+fn cname_conflict(
+    stored: &BTreeMap<RecordKey, ResourceRecordSet>,
+    staged: &BTreeMap<RecordKey, Option<ResourceRecordSet>>,
+    key: &RecordKey,
+    record: &ResourceRecordSet,
+    zone_name: &str,
+) -> Option<String> {
+    const CNAME: &str = "CNAME";
+    let types = surviving_types_at_name(stored, staged, key);
+    if !types.contains(CNAME) || types.len() < 2 {
+        return None;
+    }
+    if record.r#type == CNAME {
+        return Some(format!(
+            "RRSet of type CNAME with DNS name {} is not permitted as it conflicts with other \
+             records with the same DNS name in zone {zone_name}",
+            record.name
+        ));
+    }
+    Some(format!(
+        "RRSet of type {} with DNS name {} is not permitted because a conflicting RRSet of type \
+         {CNAME} with the same DNS name already exists in zone {zone_name}",
+        record.r#type, record.name
+    ))
+}
+
 /// Why the record sets at one name and type may not stand together, if they may
 /// not.
 ///
@@ -276,30 +379,166 @@ fn routing_conflict(
     })
 }
 
-/// Why this record set cannot be written, if it cannot.
+/// The member that gives a record set a routing policy other than simple, if it
+/// carries one.
 ///
-/// A record set routes either to record data of its own (`ResourceRecords`, with
-/// the `TTL` that data is cached for) or to an `AliasTarget`; one of the two has
-/// to be there for the record set to answer a query at all.
-fn rdata_problem(record: &ResourceRecordSet) -> Option<String> {
+/// `SetIdentifier`'s own documentation is about exactly this split: it belongs
+/// to "resource record sets that have a routing policy other than simple" and
+/// "differentiates among multiple resource record sets that have the same
+/// combination of name and type". Each member below selects one such policy —
+/// weighted, latency, geolocation, failover, multivalue answer, geoproximity
+/// and IP-based routing — so a record set carrying any of them is one member of
+/// a group, while a record set carrying none of them is the single simple
+/// record set at its name and type. Reported in the modelled member order, so
+/// the refusal does not depend on the order a request wrote them in.
+fn routing_policy_member(record: &ResourceRecordSet) -> Option<&'static str> {
+    [
+        ("Weight", record.weight.is_some()),
+        ("Region", record.region.is_some()),
+        ("GeoLocation", record.geo_location.is_some()),
+        ("Failover", record.failover.is_some()),
+        ("MultiValueAnswer", record.multi_value_answer.is_some()),
+        ("CidrRoutingConfig", record.cidr_routing_config.is_some()),
+        (
+            "GeoProximityLocation",
+            record.geo_proximity_location.is_some(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(member, given)| given.then_some(member))
+}
+
+/// Why one change is not a well-formed change at all, if it is not.
+///
+/// A fault in the REQUEST's shape, not in what the batch would do to a zone: it
+/// is decided from the change alone, without reading the zone, so it is raised
+/// as `InvalidInput` on the first change that carries one rather than collected
+/// per change. Two rules, both read off the model:
+///
+/// * a record set whose routing policy is not simple is one of several at its
+///   name and type, so it must carry the `SetIdentifier` that tells it from its
+///   siblings ([`routing_policy_member`]);
+/// * a record set answers a query from EXACTLY ONE source of record data — its
+///   own `ResourceRecords` with the `TTL` they are cached for, the `AliasTarget`
+///   it routes to ("If you're creating an alias resource record set, omit
+///   `ResourceRecords`" / "If you're creating or updating an alias resource
+///   record set, omit `TTL`"), or the traffic policy instance that generated it
+///   — so naming more than one source, or naming none, or naming only half of
+///   the `TTL`-and-`ResourceRecords` pair, all leave it with no one source.
+fn shape_problem(action: &str, record: &ResourceRecordSet) -> Option<String> {
+    if routing_policy_member(record).is_some() && set_identifier_of(record).is_none() {
+        return Some(format!(
+            "Invalid request: Missing field 'SetIdentifier' in Change with {}",
+            change_descriptor(action, record)
+        ));
+    }
+
     let has_records = record.resource_records.iter().flatten().next().is_some();
-    if record.alias_target.is_some() {
+    let own_data = record.ttl.is_some() || has_records;
+    let sources = usize::from(record.alias_target.is_some())
+        + usize::from(own_data)
+        + usize::from(
+            record
+                .traffic_policy_instance_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+        );
+    let found = if sources > 1 {
+        "more than one"
+    } else if sources == 0 || (own_data && !(record.ttl.is_some() && has_records)) {
+        "none"
+    } else {
         return None;
+    };
+    Some(format!(
+        "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and \
+         ResourceRecords], or TrafficPolicyInstanceId], but found {found} in Change with {}",
+        change_descriptor(action, record)
+    ))
+}
+
+/// Why one record data VALUE is not record data of the type it was submitted
+/// for, if it is not.
+///
+/// Every record type fixes the syntax of the data it carries ("For information
+/// about different record types and how data is encoded for them, see Supported
+/// DNS Resource Record Types", `Type`'s own documentation), so a submitted
+/// value is parsed against the syntax of ITS type and the batch is refused when
+/// it does not parse. The refusal names the syntax rule that was broken and
+/// quotes the value that broke it, so it is built wholly from the request.
+///
+/// Judged here are the types whose record data is ONE literal of a documented
+/// syntax: an address (`A`, `AAAA`), a character string (`TXT`, `SPF`) or a
+/// domain name (`CNAME`, `NS`, `PTR`). A type whose data is a compound of
+/// several fields is left to the record-set rules above it, which do not depend
+/// on its internal syntax.
+fn record_value_problem(rr_type: &str, value: &str) -> Option<String> {
+    let fault = match rr_type {
+        "A" => value
+            .parse::<Ipv4Addr>()
+            .is_err()
+            .then_some("ARRDATAIllegalIPv4Address (Value is not a valid IPv4 address)"),
+        "AAAA" => value
+            .parse::<Ipv6Addr>()
+            .is_err()
+            .then_some("AAAARRDATAIllegalIPv6Address (Value is not a valid IPv6 address)"),
+        "TXT" | "SPF" => (!is_quoted_character_strings(value))
+            .then_some("InvalidCharacterString (Value should be enclosed in quotation marks)"),
+        "CNAME" | "NS" | "PTR" => match dns_name_fault(value) {
+            Some(DnsNameFault::EmptyLabel) => Some("DomainLabelEmpty (Domain label is empty)"),
+            Some(DnsNameFault::LabelTooLong(_)) => {
+                Some("DomainLabelTooLong (Domain label is too long)")
+            }
+            Some(DnsNameFault::NameTooLong(_)) => Some("DomainTooLong (Domain name is too long)"),
+            None => None,
+        },
+        _ => None,
+    }?;
+    Some(format!(
+        "Invalid Resource Record: 'FATAL problem: {fault} encountered with '{value}''"
+    ))
+}
+
+/// Whether a value is a sequence of quoted character strings.
+///
+/// The record data of a `TXT` (and of the `SPF` type it replaced) is one or
+/// more character strings, and Route 53's API takes each of them enclosed in
+/// quotation marks — which is what lets one value carry several strings, and
+/// one string carry the spaces that would otherwise separate them. A quotation
+/// mark inside a string is escaped with a backslash, so the string ends at the
+/// first UNESCAPED one. A value that carries no string at all is no character
+/// string either.
+fn is_quoted_character_strings(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut at = 0;
+    let mut strings = 0;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        if bytes[at] != b'"' {
+            return false;
+        }
+        at += 1;
+        let mut closed = false;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' => at += 2,
+                b'"' => {
+                    at += 1;
+                    closed = true;
+                    break;
+                }
+                _ => at += 1,
+            }
+        }
+        if !closed {
+            return false;
+        }
+        strings += 1;
     }
-    if !has_records {
-        return Some(format!(
-            "Invalid request: Expected exactly one of [AliasTarget, all of [TTL, and \
-             ResourceRecords]], but found none in Change with {}",
-            change_label(record)
-        ));
-    }
-    if record.ttl.is_none() {
-        return Some(format!(
-            "Invalid request: Expected a TTL alongside ResourceRecords in Change with {}",
-            change_label(record)
-        ));
-    }
-    None
+    strings > 0
 }
 
 /// Why this DELETE does not name the record set it is deleting, if it does not.
@@ -429,6 +668,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let zone_id = normalize_zone_id(&input.hosted_zone_id).to_string();
+
+        // THE REQUEST'S OWN SHAPE FIRST, before any zone is read: a change that
+        // is not a well-formed change at all is a fault in the request, so it
+        // answers `InvalidInput` and names the FIRST change that carries one,
+        // rather than being collected with the problems a batch evaluation
+        // finds. Decided from the request alone, so it is settled before the
+        // shared state lock is taken.
+        if let Some(problem) = input
+            .change_batch
+            .changes
+            .iter()
+            .find_map(|change| shape_problem(&change.action, &change.resource_record_set))
+        {
+            return Err(ChangeResourceRecordSetsErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         let zone = store.zones.get(&zone_id).ok_or_else(|| {
             ChangeResourceRecordSetsErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
@@ -492,6 +752,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
 
+            // THE RECORD DATA'S OWN SYNTAX, value by value: a value that is no
+            // record data of the type it was submitted for is refused whatever
+            // the batch would otherwise do with it. The first offending value
+            // of a change is the one reported, so one change contributes one
+            // problem.
+            if let Some(problem) = record
+                .resource_records
+                .iter()
+                .flatten()
+                .find_map(|resource_record| {
+                    record_value_problem(&record.r#type, &resource_record.value)
+                })
+            {
+                problems.push(problem);
+                continue;
+            }
+
+            // A latency record set routes by "the Amazon EC2 Region where you
+            // created the resource that this resource record set refers to"
+            // (`Region`'s own documentation), so the region has to be one Amazon
+            // EC2 has. Defence in depth: `ResourceRecordSetRegion` is a modelled
+            // enum whose value set is exactly those regions, so the boundary
+            // validator refuses a value outside it before this handler runs and
+            // this branch is unreachable today.
+            if let Some(region) = record
+                .region
+                .as_deref()
+                .filter(|region| !RESOURCE_RECORD_SET_REGION_VALUES.contains(region))
+            {
+                problems.push(format!("Cannot find region '{region}'. No changes made."));
+                continue;
+            }
+
             // What this key holds right now: the staged value if the batch has
             // already touched it, else the stored one. At most one record set is
             // cloned per change, so this is bounded by the batch length.
@@ -507,22 +800,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "Tried to create resource record set {} but it already exists",
                             change_label(&record)
                         ));
-                    } else if let Some(problem) = rdata_problem(&record) {
-                        problems.push(problem);
                     } else {
                         record_count += 1;
                         staged.insert(key, Some(record));
                     }
                 }
                 "UPSERT" => {
-                    if let Some(problem) = rdata_problem(&record) {
-                        problems.push(problem);
-                    } else {
-                        if current.is_none() {
-                            record_count += 1;
-                        }
-                        staged.insert(key, Some(record));
+                    if current.is_none() {
+                        record_count += 1;
                     }
+                    staged.insert(key, Some(record));
                 }
                 "DELETE" => match &current {
                     None => problems.push(format!(
@@ -534,9 +821,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // DELETE has to carry the record's data, and it has to be
                     // the data the zone holds.
                     Some(stored) => {
-                        if let Some(problem) = rdata_problem(&record) {
-                            problems.push(problem);
-                        } else if let Some(reason) = delete_mismatch(stored, &record) {
+                        if let Some(reason) = delete_mismatch(stored, &record) {
                             problems.push(format!(
                                 "Tried to delete resource record set {} but {reason}",
                                 change_label(&record)
@@ -556,16 +841,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Routing exclusivity, over the state the batch would LEAVE: each
-        // (name, type) the batch wrote to is checked once, so the outcome does
-        // not depend on the order the changes were written in.
+        // What the record sets the batch wrote may stand beside, over the state
+        // the batch would LEAVE: each (name, type) the batch wrote to is checked
+        // once, so the outcome does not depend on the order the changes were
+        // written in.
         let mut groups_checked: BTreeSet<(DnsNameKey, String)> = BTreeSet::new();
+        let mut names_checked: BTreeSet<DnsNameKey> = BTreeSet::new();
         for (key, record) in staged
             .iter()
             .filter_map(|(key, pending)| pending.as_ref().map(|record| (key, record)))
         {
             if !groups_checked.insert((key.name_sort_key.clone(), key.rr_type.clone())) {
                 continue;
+            }
+            // The zone's apex answers for the zone itself, so it holds the
+            // zone's own SOA and NS records — and a CNAME there would redirect
+            // every query for the zone to another name, the zone's own
+            // delegation included. Reported as the apex rule rather than as the
+            // type conflict below, which the apex records would also raise.
+            if record.r#type == "CNAME" && key.name_sort_key == apex {
+                problems.push(format!(
+                    "RRSet of type CNAME with DNS name {} is not permitted at apex in zone \
+                     {zone_name}",
+                    record.name
+                ));
+                continue;
+            }
+            if names_checked.insert(key.name_sort_key.clone()) {
+                if let Some(problem) =
+                    cname_conflict(&zone.records, &staged, key, record, &zone_name)
+                {
+                    problems.push(problem);
+                    continue;
+                }
             }
             if let Some(problem) =
                 routing_conflict(&zone.records, &staged, key, record, &zone_name)

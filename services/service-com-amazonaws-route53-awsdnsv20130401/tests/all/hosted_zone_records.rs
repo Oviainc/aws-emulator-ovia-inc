@@ -730,7 +730,7 @@ async fn each_change_action_is_applied_to_the_stored_zone() {
             name: "notes.example.com",
             rr_type: "TXT",
             ttl: 120,
-            values: &["'a note'"],
+            values: &["\"a note\""],
         },
         RecordRow {
             name: "alias.example.com",
@@ -1033,7 +1033,10 @@ async fn a_change_batch_is_refused_whole_when_any_change_is_invalid() {
     let before = list_records(&router, &zone_id, "").await;
     let before_names = before.all("ResourceRecordSet/Name").join(",");
 
-    let cases: [(&str, String); 4] = [
+    // (label, the offending change, the error class it is refused with) — a change
+    // that is not a well-formed change at all is a REQUEST fault (`InvalidInput`);
+    // the others are refused by the batch evaluation.
+    let cases: [(&str, String, &str); 4] = [
         (
             "a name outside the zone",
             change_element(
@@ -1045,16 +1048,19 @@ async fn a_change_batch_is_refused_whole_when_any_change_is_invalid() {
                     values: &["192.0.2.5"],
                 },
             ),
+            "InvalidChangeBatch",
         ),
         (
             "no record data and no alias",
             "<Change><Action>CREATE</Action><ResourceRecordSet><Name>bare.example.com</Name>\
              <Type>A</Type></ResourceRecordSet></Change>"
                 .to_string(),
+            "InvalidInput",
         ),
         (
             "a CREATE over an existing key",
             change_element("CREATE", &good),
+            "InvalidChangeBatch",
         ),
         (
             "a DELETE of an absent key",
@@ -1067,10 +1073,11 @@ async fn a_change_batch_is_refused_whole_when_any_change_is_invalid() {
                     values: &["192.0.2.6"],
                 },
             ),
+            "InvalidChangeBatch",
         ),
     ];
 
-    for (label, offending) in &cases {
+    for (label, offending, expect_code) in &cases {
         // Each batch pairs a VALID change with the offending one, so a batch
         // that was not atomic would leave the valid half behind.
         let valid = change_element(
@@ -1079,7 +1086,7 @@ async fn a_change_batch_is_refused_whole_when_any_change_is_invalid() {
                 name: "partial.example.com",
                 rr_type: "TXT",
                 ttl: 60,
-                values: &["'should not land'"],
+                values: &["\"should not land\""],
             },
         );
         let reply = call(
@@ -1096,8 +1103,8 @@ async fn a_change_batch_is_refused_whole_when_any_change_is_invalid() {
         );
         assert_eq!(
             reply.error_code(),
-            "InvalidChangeBatch",
-            "case {label}: expected InvalidChangeBatch, got {}",
+            *expect_code,
+            "case {label}: expected {expect_code}, got {}",
             reply.body
         );
         let after = list_records(&router, &zone_id, "").await;
@@ -1187,7 +1194,7 @@ async fn record_paging_covers_every_record_exactly_once() {
         RecordRow { name: "a.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.1"] },
         RecordRow { name: "b.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.2"] },
         RecordRow { name: "c.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.3"] },
-        RecordRow { name: "c.example.com", rr_type: "TXT", ttl: 300, values: &["'c'"] },
+        RecordRow { name: "c.example.com", rr_type: "TXT", ttl: 300, values: &["\"c\""] },
         RecordRow { name: "d.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.4"] },
         RecordRow { name: "e.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.5"] },
     ];
@@ -1765,7 +1772,7 @@ async fn the_zones_own_delegation_records_cannot_be_deleted() {
     // The same types one label down are ordinary records the caller owns.
     for (label, rr_type, ttl, value) in [
         ("a delegated subdomain NS record", "NS", 300, "ns1.example.net."),
-        ("a subdomain TXT record", "TXT", 300, "owned"),
+        ("a subdomain TXT record", "TXT", 300, "\"owned\""),
     ] {
         let row = format!(
             "<Change><Action>{{}}</Action><ResourceRecordSet><Name>sub.example.com</Name>\
@@ -1813,13 +1820,18 @@ async fn a_delete_must_name_the_record_it_deletes() {
         200
     );
 
-    let cases: [(&str, String, u16); 5] = [
+    // (label, the change, the expected status, the expected error code) — a change
+    // that is not a well-formed change at all is refused as a REQUEST fault
+    // (`InvalidInput`), while a change the zone cannot apply is refused by the batch
+    // evaluation (`InvalidChangeBatch`).
+    let cases: [(&str, String, u16, &str); 5] = [
         (
             "no record data at all",
             "<Change><Action>DELETE</Action><ResourceRecordSet>\
              <Name>www.example.com</Name><Type>A</Type></ResourceRecordSet></Change>"
                 .to_string(),
             400,
+            "InvalidInput",
         ),
         (
             "a different value",
@@ -1831,6 +1843,7 @@ async fn a_delete_must_name_the_record_it_deletes() {
                 },
             ),
             400,
+            "InvalidChangeBatch",
         ),
         (
             "only one of the two values",
@@ -1842,11 +1855,13 @@ async fn a_delete_must_name_the_record_it_deletes() {
                 },
             ),
             400,
+            "InvalidChangeBatch",
         ),
         (
             "a different TTL",
             change_element("DELETE", &RecordRow { ttl: 60, ..STORED }),
             400,
+            "InvalidChangeBatch",
         ),
         (
             "the stored values, in a different order",
@@ -1858,10 +1873,11 @@ async fn a_delete_must_name_the_record_it_deletes() {
                 },
             ),
             200,
+            "",
         ),
     ];
 
-    for (label, change, expect_status) in &cases {
+    for (label, change, expect_status, expect_code) in &cases {
         let reply = call(
             &router,
             "POST",
@@ -1877,8 +1893,8 @@ async fn a_delete_must_name_the_record_it_deletes() {
         if *expect_status == 400 {
             assert_eq!(
                 reply.error_code(),
-                "InvalidChangeBatch",
-                "case {label}: expected InvalidChangeBatch, got {}",
+                *expect_code,
+                "case {label}: expected {expect_code}, got {}",
                 reply.body
             );
             assert!(
@@ -2039,7 +2055,7 @@ async fn a_zone_is_deletable_only_once_it_holds_only_its_default_records() {
     // span the kinds of record that keep a zone non-empty.
     const BLOCKERS: [RecordRow; 3] = [
         RecordRow { name: "www.example.com", rr_type: "A", ttl: 300, values: &["192.0.2.1"] },
-        RecordRow { name: "example.com", rr_type: "TXT", ttl: 60, values: &["'apex txt'"] },
+        RecordRow { name: "example.com", rr_type: "TXT", ttl: 60, values: &["\"apex txt\""] },
         RecordRow { name: "deep.sub.example.com", rr_type: "CNAME", ttl: 60, values: &["www.example.com."] },
     ];
 
