@@ -41,6 +41,10 @@
 //! length from 0 to two past each published bound) rather than randomly sampled: the rule
 //! generalises over one ordered dimension, so walking it leaves no gap for a generator to
 //! find.
+//!
+//! The OTHER rule the same shared check applies — the tag-key namespace the service
+//! reserves for itself — has its own suite (`tests/all/reserved_tag_key_prefix.rs`); no
+//! row here spells that prefix, so the two suites pin the two rules independently.
 
 use std::collections::BTreeMap;
 
