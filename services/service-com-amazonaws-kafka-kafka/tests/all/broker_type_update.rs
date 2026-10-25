@@ -467,6 +467,9 @@ async fn an_update_to_a_cluster_this_endpoint_does_not_hold_is_refused() {
     let deleted_arn = emulator
         .create_ok(&ClusterRequest::named("deleted-cluster"))
         .await;
+    // A cluster is deletable once it has finished provisioning, so it is waited
+    // out of `CREATING` before the delete that makes its ARN unresolvable.
+    sleep_past_activation();
     let deleted = emulator
         .call("DELETE", &format!("/v1/clusters/{}", pct(&deleted_arn)), None)
         .await;
