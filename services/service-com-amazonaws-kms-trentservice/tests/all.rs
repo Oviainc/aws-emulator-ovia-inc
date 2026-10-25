@@ -37,6 +37,8 @@ mod key_rotation_on_demand;
 mod key_rotation_schedule;
 #[path = "all/key_specs.rs"]
 mod key_specs;
+#[path = "all/list_resource_tags_reads.rs"]
+mod list_resource_tags_reads;
 #[path = "all/multi_region_primary.rs"]
 mod multi_region_primary;
 #[path = "all/resource_tags.rs"]
