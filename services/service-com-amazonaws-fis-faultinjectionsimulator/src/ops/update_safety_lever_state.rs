@@ -2,6 +2,11 @@
 
 //! @op UpdateSafetyLeverState
 //!
+//! Engaging the lever STOPS the experiments that are running, which is a move of each
+//! stopped experiment's own lifecycle — so this call also delivers those experiments'
+//! records to the destinations their templates configured. See
+//! [`crate::state::experiment_logs`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,25 +186,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        // The guard is taken, spent and RELEASED inside this block: the log records the
+        // stops below produced are written after it, so nothing is delivered while the
+        // store is locked.
+        let (safety_lever, deliveries) = {
+            let mut store = state.lock();
 
-        let engaging = input.state.status == crate::state::SafetyLeverStatusKind::Engaged.as_wire();
-        // Engaging the lever stops the experiments that are running. Done before the
-        // lever's own state is written, and on the same clock a `StopExperiment` puts an
-        // experiment on, so the lever reports `engaging` exactly while the experiments it
-        // stopped are on their way to `stopped`.
-        if engaging {
-            store.stop_experiments_for_safety_lever(now);
-        }
-        let record = store.settled_safety_lever(now);
-        if engaging {
-            record.engage(&input.state.reason, now);
-        } else {
-            record.disengage(&input.state.reason);
-        }
+            let engaging =
+                input.state.status == crate::state::SafetyLeverStatusKind::Engaged.as_wire();
+            // Engaging the lever stops the experiments that are running. Done before the
+            // lever's own state is written, and on the same clock a `StopExperiment` puts an
+            // experiment on, so the lever reports `engaging` exactly while the experiments it
+            // stopped are on their way to `stopped`.
+            if engaging {
+                store.stop_experiments_for_safety_lever(now);
+            }
+            let record = store.settled_safety_lever(now);
+            if engaging {
+                record.engage(&input.state.reason, now);
+            } else {
+                record.disengage(&input.state.reason);
+            }
+            let safety_lever = record.to_safety_lever(&input.id, &region);
+            let deliveries = store.take_pending_log_deliveries();
+            (safety_lever, deliveries)
+        };
+
+        // A stop the lever performed is a move of the stopped experiment's OWN lifecycle,
+        // so it is delivered to the destination that experiment's template configured,
+        // exactly as a `StopExperiment` of the same experiment would be. Best effort, and
+        // never the caller's problem: see [`crate::state::experiment_logs`].
+        crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
 
         Ok(UpdateSafetyLeverStateOutput {
-            safety_lever: Some(record.to_safety_lever(&input.id, &region)),
+            safety_lever: Some(safety_lever),
         })
     }
 }
