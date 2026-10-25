@@ -15,12 +15,18 @@
 mod block_public_access;
 #[path = "all/emr_control_plane.rs"]
 mod emr_control_plane;
+#[path = "all/input_refusals.rs"]
+mod input_refusals;
 #[path = "all/instance_groups.rs"]
 mod instance_groups;
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
+#[path = "all/job_flow_role.rs"]
+mod job_flow_role;
 #[path = "all/managed_scaling_policy.rs"]
 mod managed_scaling_policy;
+#[path = "all/notebook_executions.rs"]
+mod notebook_executions;
 #[path = "all/release_label_catalog.rs"]
 mod release_label_catalog;
 #[path = "all/release_labels.rs"]

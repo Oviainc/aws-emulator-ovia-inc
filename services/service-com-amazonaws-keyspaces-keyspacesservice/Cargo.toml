@@ -25,6 +25,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for the opaque `nextToken` ListTables issues (encode/decode only).
 hex = { workspace = true }
+# The CDC STREAM STORE, which that crate owns: Amazon Keyspaces creates a table's CDC
+# stream when `CreateTable`/`UpdateTable` is given a `cdcSpecification`, and
+# KeyspacesStreams reports that stream and serves its records. Both sides reach the ONE
+# store in the shared engine (`state::enable_stream` / `state::disable_stream`), so the
+# stream this control plane enables is the stream that data plane answers for.
+service-com-amazonaws-keyspacesstreams-keyspacesstreams = { workspace = true }
 # A table's auto scaling settings ARE Application Auto Scaling resources — a scalable
 # target per capacity dimension, plus the target-tracking policy that steers it — so they
 # are written into, and read back out of, that emulator's own store through the shared

@@ -1443,6 +1443,33 @@ pub fn storage_lens_group_already_exists<E>(name: &str) -> crate::scaffolded::Sc
     )
 }
 
+/// `InvalidRequestException` (HTTP 400): an `UpdateStorageLensGroup` whose URI
+/// names one Storage Lens group and whose document names another.
+///
+/// Both members are documented as the name OF the Storage Lens group
+/// (`UpdateStorageLensGroupRequest$Name`, `StorageLensGroup$Name`), and the name
+/// is the group's identity — it is what the store keys a record by and what the
+/// read-only `StorageLensGroupArn` is built from — so a request carrying two
+/// different names names no one group, and an update is not a rename. The code
+/// and status are the ones this service already answers the same disagreement
+/// one resource over with (see [`storage_lens_configuration_id_mismatch`]):
+/// this service's own modelled `InvalidRequestException`
+/// (`com.amazonaws.s3control#InvalidRequestException`, a 400 client error),
+/// which this operation's model does not list.
+pub fn storage_lens_group_name_mismatch<E>(
+    name: &str,
+    document_name: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequestException",
+        400,
+        format!(
+            "Name is {name} but the submitted StorageLensGroup's Name is {document_name}; \
+             they must name the same Storage Lens group."
+        ),
+    )
+}
+
 /// `InvalidRequest` (HTTP 400): the account the request names owns no job of
 /// that id.
 ///

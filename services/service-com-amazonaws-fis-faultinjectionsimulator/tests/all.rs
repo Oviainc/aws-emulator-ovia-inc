@@ -29,6 +29,8 @@ mod experiment_run;
 mod experiment_target_account_configurations;
 #[path = "all/experiment_template_not_found.rs"]
 mod experiment_template_not_found;
+#[path = "all/experiment_template_shape_floors.rs"]
+mod experiment_template_shape_floors;
 #[path = "all/get_target_resource_type.rs"]
 mod get_target_resource_type;
 #[path = "all/list_experiment_resolved_targets.rs"]

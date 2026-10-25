@@ -158,7 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         Ok(GetReviewTemplateOutput {
-            review_template: Some(record.to_review_template()),
+            review_template: Some(
+                record.to_review_template(store.review_template_update_status(record)),
+            ),
         })
     }
 }

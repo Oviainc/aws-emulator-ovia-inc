@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Change the settings for a Cluster: the members the request CARRIES are
+//! written to the stored cluster and the ones it omits are left alone, then the
+//! cluster is read back out of the store and reported.
+//!
+//! The cluster slice owns the rules (which member an omitted parameter leaves
+//! alone, the documented account-wide name uniqueness and the mapping bound the
+//! create holds a stored cluster to), checked before the first write:
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::apply_cluster_changes`].
+//! This handler validates the request's lengths and turns a
+//! [`crate::state::ClusterUpdateRefusal`] into this operation's own modelled
+//! error.
+//!
+//! `Name` IS writable here. The member's documentation (quoted in full below)
+//! says both "Include this parameter only if you want to change the current name
+//! of the Cluster" and "You can't change the name": the second sentence is the
+//! CREATE's own wording carried over — a create's name cannot be changed *by the
+//! create* — and taking it as binding here would make a member of the update
+//! request inert, which no request member is. So a rename is accepted, and held
+//! to the account-wide uniqueness the same documentation states.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +177,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `Name` targets bare `__string`, so the request boundary refuses nothing
+        // for it: the bound every named MediaLive resource of this emulator is
+        // held to is named here, exactly as `CreateCluster` names it, so a rename
+        // cannot store a name a create could not. The message names the member,
+        // the bound and the length that broke it, all read off the request.
+        bounded(
+            "name",
+            input.name.as_deref(),
+            1,
+            crate::state::MAX_RESOURCE_NAME_LEN,
+        )?;
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only what the clock had already made due, so it never
+        // changes what a later caller would otherwise have seen — and the cluster
+        // this update reports carries the `State` the clock had already given it.
+        state.settle(::std::time::SystemTime::now());
+
+        let changes = crate::state::ClusterChanges {
+            name: input.name,
+            // Handed to the slice as the request shaped it, so the per-member
+            // "include this parameter only if you want to change the current
+            // ..." rule is applied in the one place that owns the stored
+            // settings rather than rebuilt here.
+            network_settings: input.network_settings,
+        };
+        // The slice checks every refusal BEFORE the first write, so a refused
+        // update leaves the stored cluster exactly as it was.
+        state
+            .apply_cluster_changes(&input.cluster_id, changes)
+            .map_err(|refusal| refused(refusal, &input.cluster_id))?;
+
+        // Read back out of the store, so the response reports what was written
+        // rather than what the request asked for: `Id`, `Arn`, `State`,
+        // `ClusterType` and the derived `ChannelIds` are all the store's, and so
+        // is every member this request did not carry.
+        let cluster = state
+            .cluster_description(&input.cluster_id)
+            .ok_or_else(|| unreportable(&input.cluster_id))?;
+        // This operation's response shape declares no `InstanceRoleArn`, so the
+        // seven members it does declare come off the one stored projection every
+        // cluster-reporting operation answers from.
+        Ok(crate::state::cluster_description_output!(
+            UpdateClusterOutput,
+            cluster,
+            without_instance_role_arn
+        ))
     }
+}
+
+/// Refuse a member whose length is outside the bounds every named MediaLive
+/// resource holds it to, with this operation's own modelled client error.
+fn bounded(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), UpdateClusterError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(
+        UpdateClusterErrorModeled::BadRequestException(BadRequestException {
+            message: Some(format!(
+                "{member} must be between {min} and {max} characters long, but was {len}"
+            )),
+        })
+        .into(),
+    )
+}
+
+/// The modelled error a [`crate::state::ClusterUpdateRefusal`] is answered with.
+///
+/// This operation models NO 404, so a `ClusterId` the store holds no cluster for
+/// is a request that cannot be processed at all: the modelled 400
+/// `BadRequestException`, worded by the shared not-found helper every reader of
+/// this service uses and carrying the id that was asked for — the same answer
+/// `ListChannelPlacementGroups`, which models no 404 either, gives for a
+/// `ClusterId` naming nothing. A `Name` another cluster of the account holds is a
+/// clash with the stored state, which is what this operation's
+/// `ConflictException` (409) is for, worded exactly as the create words the same
+/// clash. More `InterfaceMappings` than this emulator stores for one cluster is
+/// the create's own refusal, reported with the create's wording so an update
+/// cannot be refused differently from a create carrying the same list.
+fn refused(
+    refusal: crate::state::ClusterUpdateRefusal,
+    cluster_id: &str,
+) -> UpdateClusterError {
+    use crate::state::ClusterUpdateRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchCluster => {
+            UpdateClusterErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message("Cluster", cluster_id)),
+            })
+        }
+        Refusal::NameTaken => UpdateClusterErrorModeled::ConflictException(ConflictException {
+            message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+        }),
+        Refusal::TooManyInterfaceMappings { count } => {
+            UpdateClusterErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "networkSettings.interfaceMappings takes at most {} entries, but was {count}",
+                    crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the cluster in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateClusterError {
+    UpdateClusterErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
+}
+
+/// The cluster the write above accepted could not be read back out of the store,
+/// which the store's own invariant makes unreachable: the write resolved that id
+/// under the same lock this read holds. A modelled server error of its own rather
+/// than the "no store" one, so the two cannot be mistaken for each other in a log.
+fn unreportable(cluster_id: &str) -> UpdateClusterError {
+    UpdateClusterErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(format!(
+            "Cluster {cluster_id} could not be read back after the update"
+        )),
+    })
+    .into()
 }

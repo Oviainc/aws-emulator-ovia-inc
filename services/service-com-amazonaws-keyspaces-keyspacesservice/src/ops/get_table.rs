@@ -2,9 +2,11 @@
 
 //! @op GetTable
 //! IMPLEMENTED: reports one table from [`crate::state`] — exactly what `CreateTable`
-//! stored, plus the status the clock has settled it into, plus (for a table of a
-//! `MULTI_REGION` keyspace, which is a multi-Region table) one Region-specific summary per
-//! Region the keyspace replicates it to. This is the ONLY file to touch for `GetTable`.
+//! stored, plus the status the clock has settled it into, the table's CDC stream
+//! (`cdcSpecification`, `latestStreamArn`) as the shared CDC stream store holds it, and
+//! (for a table of a `MULTI_REGION` keyspace, which is a multi-Region table) one
+//! Region-specific summary per Region the keyspace replicates it to. This is the ONLY
+//! file to touch for `GetTable`.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -193,6 +195,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
+        // The CDC stream store, shared with KeyspacesStreams: a table's CDC status, view
+        // type and `latestStreamArn` are read off the stream itself, so no copy of them
+        // here can disagree with what that service reports. Resolved before either store
+        // is locked, and locked AFTER this service's own — one lock order everywhere.
+        let streams = crate::state::cdc_stream_state(&*self.engine).ok_or_else(|| {
+            GetTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach the CDC stream store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
         let region = crate::state::request_region(ctx);
 
         let mut store = state.lock();
@@ -217,6 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The table's latest CDC stream, if it ever had one. Reporting, not mutating: the
+        // stream store materialises only the status changes the clock had already made
+        // due at this instant, exactly as this service's own `settle` does.
+        let mut stream_store = streams.lock();
+        stream_store.materialise_due_transitions(::std::time::SystemTime::now());
+        let cdc_stream =
+            stream_store.stream_for_table(&region, &input.keyspace_name, &input.table_name);
 
         // The table's throughput summary, reported both for the table as a whole and, for a
         // multi-Region table, once per Region it is replicated in — there with that Region's
@@ -309,11 +331,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect()
             }),
-            // A stream ARN and a CDC stream are never configured by anything this slice
-            // implements: `CreateTable`, `UpdateTable` and `RestoreTable` answer 501 for
-            // `cdcSpecification` rather than storing a setting no operation can report.
-            latest_stream_arn: None,
-            cdc_specification: None,
+            // CDC IS served: a table that has a stream reports that stream's ARN as the
+            // latest one and its status and view type as the table's CDC specification. A
+            // table no `cdcSpecification` ever enabled a stream for has no CDC settings to
+            // report, which is what the two optional members being absent says.
+            latest_stream_arn: cdc_stream.map(|stream| stream.stream_arn.clone()),
+            cdc_specification: cdc_stream.map(crate::state::cdc_specification_summary),
             warm_throughput_specification,
         })
     }

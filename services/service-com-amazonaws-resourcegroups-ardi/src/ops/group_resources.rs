@@ -6,6 +6,11 @@
 //! [`crate::state`], and reports the memberships that now hold in `Succeeded`. Adding an
 //! ARN that is already a member is a no-op, so a repeated call does not duplicate it.
 //!
+//! Only a group whose stored service configuration declares one of the supported
+//! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) accepts a
+//! static membership; any other group — one populated from a resource query, or one with no
+//! configuration — is refused with `BadRequestException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -219,6 +224,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let key = store.lookup(&region, input.group.as_str()).ok_or_else(not_found)?;
         let group = store.groups.get_mut(&key).ok_or_else(not_found)?;
+        // Documented: this operation can only be used with a group whose service
+        // configuration declares one of the supported configuration types, and
+        // "other resource group types … are not currently supported by this
+        // operation". A group populated from a resource query, or created with no
+        // configuration at all, is not one of them, so no static membership is
+        // recorded against it.
+        if group.static_membership_configuration_type().is_none() {
+            return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::unsupported_group_message(Self::NAME)),
+            })
+            .into());
+        }
         // The emulator's own ceiling on stored state (see `MAX_MEMBERS_PER_GROUP`),
         // so a client looping on this operation is refused instead of growing one
         // group's membership without end. Counted over a SET, because `add_member` is

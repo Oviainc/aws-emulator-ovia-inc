@@ -348,16 +348,17 @@ async fn an_unset_contact_on_a_known_account_is_still_not_found() {
         created.status, created.body
     );
 
-    for account in [default_account_id(), member] {
+    // The caller's own account is reached by OMITTING `AccountId`; a member
+    // account by naming it.
+    for account in [None, Some(member)] {
         for contact_type in ALTERNATE_CONTACT_TYPES {
             for uri in ["/getAlternateContact", "/deleteAlternateContact"] {
-                let case = format!("{uri} {contact_type} on the known account {account}");
-                let answer = call(
-                    &router,
-                    uri,
-                    json!({"AccountId": account, "AlternateContactType": contact_type}),
-                )
-                .await;
+                let case = format!("{uri} {contact_type} on the known account {account:?}");
+                let mut request = json!({"AlternateContactType": contact_type});
+                if let Some(account_id) = account {
+                    request["AccountId"] = json!(account_id);
+                }
+                let answer = call(&router, uri, request).await;
                 assert_eq!(
                     answer.status, 404,
                     "case {case:?}: expected HTTP 404, got {} with {:?}",

@@ -1,16 +1,59 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: emr.op-list-clusters-rejects-invalid-state-filter emr.list-notebook-executions-invalid-status-filter-rejected emr.op-run-job-flow-rejects-unknown-instance-profile emr.emr-serverless-spark-job-run-reaches-success emr.emr-serverless-failing-script-reports-failed-and-writes-no-output
+Issue-Trace-Ids: emr.op-list-clusters-rejects-invalid-state-filter emr.list-notebook-executions-invalid-status-filter-rejected emr.op-run-job-flow-rejects-unknown-instance-profile
 Issue-Shape-Id: com.amazonaws.emr#ElasticMapReduce
 Issue-Key: emr.op-list-clusters-rejects-invalid-state-filter|run#3|AssertionError|assert code == "InvalidRequestException", f"expected InvalidRequestException, got {code}"
 Issue-Key: emr.list-notebook-executions-invalid-status-filter-rejected|run#3|AssertionError|assert code == "InvalidRequestException", f"expected InvalidRequestException, got {code!r}"
 Issue-Key: emr.op-run-job-flow-rejects-unknown-instance-profile|_rejects_bogus_profile#6|AssertionError|raise AssertionError("expected the operation to be rejected, but it succeeded")
-Issue-Key: emr.emr-serverless-spark-job-run-reaches-success|run#25|AssertionError|assert final == "SUCCESS", (
-Issue-Key: emr.emr-serverless-failing-script-reports-failed-and-writes-no-output|run#28|AssertionError|assert fail_job.get("totalExecutionDurationSeconds", 0) > 0, (
 Issue-Commit: db1fbaa8559703996072fdf323a0d84f8f863f33
 
-# EMR enum-filter refusals use unmodeled ValidationException, RunJobFlow accepts an unknown instance profile, and EMR Serverless job runs never execute (4 causes)
+# EMR enum-filter refusals use unmodeled ValidationException and RunJobFlow accepts an unknown instance profile (3 causes; the EMR Serverless cause is split out and still open)
+
+## Resolution
+
+Causes 1, 2 and 3 are FIXED. Cause 4 is NOT fixed: it belongs to another service and
+needs a runtime this platform does not have, so it has been SPLIT OUT into its own open
+report (see below) rather than counted as resolved here — and the two Issue-Keys and two
+trace ids it owns moved with it, out of this record's header.
+
+* Causes 1 and 2 — EMR now words a refusal of a value outside a modelled ENUM with
+  its own `InvalidRequestException` (HTTP 400) rather than the framework's synthetic
+  `ValidationException`, service-wide
+  (`services/service-com-amazonaws-emr-elasticmapreduce/src/service.rs`,
+  `override_refusal` keyed on `ViolationKind::EnumValue`). Every other modelled
+  constraint — a `@length`, a `@range`, a required member absent — keeps the generic
+  validator's `ValidationException`, which is what EMR is recorded answering for one.
+  `ListNotebookExecutions` was additionally still a 501 scaffold, so the refusal it
+  owes was never observable on a served operation: it is now implemented (and so is
+  `StartNotebookExecution`, which is what puts an execution in the store for it to
+  report), with the filters, the newest-first order and the 50-per-page marker the
+  operation documents.
+  The refusal MESSAGE is declined under the message rule: the recorded prose
+  ("Cluster states [NOPE] are not valid.") is per-member AWS wording that no rule
+  produces for the service's other enum members, and the message now carried is
+  itself built from the request, naming the member path the model spells, the
+  offending value and the constraint it failed.
+* Cause 3 — `RunJobFlow` resolves `JobFlowRole` to an EC2 instance profile in IAM,
+  through the in-process callback, before any cluster state is written, and refuses
+  the launch with 400 `ValidationException` `Invalid InstanceProfile: <value>.`
+  when IAM reports none.
+* Cause 4 — NOT FIXED, and SPLIT OUT so it stays filed: its two Issue-Keys
+  (`emr.emr-serverless-spark-job-run-reaches-success`,
+  `emr.emr-serverless-failing-script-reports-failed-and-writes-no-output`) now have
+  their own open report,
+  `issues/things-that-do-not-work/20261022T154846Z-emr-serverless-job-runs-are-recorded-but-never-executed.md`.
+  It belongs to a different service (`com.amazonaws.emrserverless#AwsToledoWebService`),
+  and a job run reaching `SUCCESS` with a non-zero `totalExecutionDurationSeconds`
+  requires a Spark or Hive runtime to actually run the submitted entry point, which
+  this platform does not provide (no containers and no external processes).
+  Reporting `SUCCESS` or stamping a duration anyway would be a status and a duration
+  for work nothing ran, so the behaviour is left exactly as it was: the run ends in
+  the service's modelled failure state with a reason that says so, pinned by
+  `services/service-com-amazonaws-emrserverless-awstoledowebservice/tests/all/application_lifecycle.rs`'s
+  `a_submitted_job_run_ends_in_the_modelled_failure_state`. That crate is untouched by
+  this change, and those two checks still fail — against the split-out report, not
+  this one.
 
 > _Note: this issue was identified against the code base at commit `db1fbaa8559703996072fdf323a0d84f8f863f33`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

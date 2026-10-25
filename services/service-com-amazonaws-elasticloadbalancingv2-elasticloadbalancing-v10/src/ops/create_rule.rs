@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one rule to the listener `ListenerArn` names: the priority it is evaluated at,
+//! the conditions a request must meet and the actions taken when it does. "Rules are
+//! evaluated in priority order, from the lowest value to the highest value", and a
+//! listener "can't have multiple rules with the same priority" — so a priority already
+//! in use on that listener is the modelled `PriorityInUseException`.
+//!
+//! The rule is stored on its listener's record, which is the one rule store
+//! `DescribeRules` walks, so a rule this operation persists is the rule that read
+//! reports; releasing the listener releases its rules with it. An action may forward
+//! only to a target group that exists (`TargetGroupNotFoundException`), and what one
+//! load balancer's rules grow to is bounded by
+//! [`crate::state::RULES_PER_LOAD_BALANCER`] (`TooManyRulesException`).
 //!
 //! ## Shape of an operation
 //!
@@ -107,6 +111,29 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The condition fields a rule may match on, from `RuleCondition$Field`'s documented
+/// list: `http-header`, `http-request-method`, `host-header`, `path-pattern`,
+/// `query-string` and `source-ip`. The model types that member as a plain string, so a
+/// value outside the list is refused here rather than by the boundary validator.
+const CONDITION_FIELDS: &[&str] = &[
+    "host-header",
+    "http-header",
+    "http-request-method",
+    "path-pattern",
+    "query-string",
+    "source-ip",
+];
+
+/// The condition fields a rule carries AT MOST ONE of: "each rule can optionally include
+/// up to one of each of the following conditions: `http-request-method`, `host-header`,
+/// `path-pattern`, and `source-ip`" — while `http-header` and `query-string` may repeat.
+const SINGLE_USE_CONDITION_FIELDS: &[&str] = &[
+    "host-header",
+    "http-request-method",
+    "path-pattern",
+    "source-ip",
+];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -189,18 +216,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("CreateRule")
+        })?;
+
+        // Everything read off the REQUEST alone is checked before the store is reached:
+        // a value that is no listener ARN at all names no listener this API can have,
+        // and whether a rule's own shape holds together does not depend on the store.
+        crate::state::check_listener_arn(&input.listener_arn)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        check_conditions(&input.conditions)?;
+
+        let mut guard = state.lock();
+
+        let Some(listener) = guard.listeners.get(&input.listener_arn) else {
+            return Err(CreateRuleErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(
+                        &input.listener_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let load_balancer_arn = listener.load_balancer_arn.clone();
+        // "A listener can't have multiple rules with the same priority." The priority
+        // lives in its listener's own namespace: the same number on another listener is
+        // free.
+        if listener
+            .rules
+            .iter()
+            .any(|rule| rule.priority == input.priority)
+        {
+            return Err(CreateRuleErrorModeled::PriorityInUseException(
+                PriorityInUseException {
+                    message: Some(format!(
+                        "Priority '{}' is in use on listener '{}'",
+                        input.priority, input.listener_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An action may forward only to a target group that exists, exactly as a
+        // listener's default actions may.
+        let forwarded = crate::state::action_target_group_arns(&input.actions);
+        for target_group_arn in &forwarded {
+            if !guard.target_groups.contains_key(target_group_arn) {
+                return Err(CreateRuleErrorModeled::TargetGroupNotFoundException(
+                    TargetGroupNotFoundException {
+                        message: Some(format!("Target group '{target_group_arn}' not found")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The bound on what one load balancer's rules grow to, enforced before the
+        // insert: past it the emulator answers the modelled quota error instead of
+        // growing without end.
+        if guard.rule_count_of_load_balancer(&load_balancer_arn)
+            >= crate::state::RULES_PER_LOAD_BALANCER
+        {
+            return Err(CreateRuleErrorModeled::TooManyRulesException(
+                TooManyRulesException {
+                    message: Some(format!(
+                        "A load balancer holds at most {} rules",
+                        crate::state::RULES_PER_LOAD_BALANCER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = guard.mint_id();
+        let Some(listener) = guard.listeners.get_mut(&input.listener_arn) else {
+            // The listener was resolved above under this same lock, so nothing can have
+            // released it; were it ever gone, that is the modelled refusal for it.
+            return Err(CreateRuleErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(
+                        &input.listener_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let record = crate::state::RuleRecord {
+            arn: listener.rule_arn(&id),
+            priority: input.priority,
+            conditions: input.conditions,
+            actions: input.actions,
+            transforms: input.transforms.unwrap_or_default(),
+            tags: input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
+                .collect(),
+        };
+        let stored = record.to_shape();
+        listener.rules.push(record);
+        // A load balancer routes to every target group one of its rules forwards to, so
+        // the association that target group reports follows this rule.
+        for target_group_arn in &forwarded {
+            guard.associate_target_group(target_group_arn, &load_balancer_arn);
+        }
+
+        Ok(CreateRuleOutput {
+            rules: Some(vec![stored]),
+        })
     }
+}
+
+/// Enforce what the model states about a rule's CONDITIONS in prose and declares no
+/// error shape for: every condition names a field this service matches on, a field that
+/// may appear only once appears at most once, and the values the whole rule carries stay
+/// inside the published bound ([`crate::state::CONDITION_VALUES_PER_RULE`]). Each
+/// refusal names the member, the value and the rule it broke, because that text is all
+/// the caller has to fix the request from.
+///
+/// That a rule carries conditions and actions at all is the model's own requirement on
+/// both members, so the boundary validator refuses a request naming neither before this
+/// runs.
+fn check_conditions(conditions: &[RuleCondition]) -> Result<(), CreateRuleError> {
+    let mut values = 0usize;
+    let mut single_use_seen: Vec<&str> = Vec::new();
+    for condition in conditions {
+        let field = condition.field.as_deref().unwrap_or_default();
+        if !CONDITION_FIELDS.contains(&field) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Condition field '{field}' is not valid; it must be one of {}",
+                CONDITION_FIELDS.join(", ")
+            )));
+        }
+        if SINGLE_USE_CONDITION_FIELDS.contains(&field) {
+            if single_use_seen.contains(&field) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "A rule carries at most one '{field}' condition"
+                )));
+            }
+            single_use_seen.push(field);
+        }
+        values += condition_values(condition);
+    }
+    if values > crate::state::CONDITION_VALUES_PER_RULE {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "A rule's conditions carry at most {} values in total, got {values}",
+            crate::state::CONDITION_VALUES_PER_RULE
+        )));
+    }
+    Ok(())
+}
+
+/// How many values one condition matches on, whether they were given directly in
+/// `Values` or through the field's own configuration shape.
+fn condition_values(condition: &RuleCondition) -> usize {
+    let listed = |values: Option<&Vec<String>>| values.map_or(0, Vec::len);
+    let direct = listed(condition.values.as_ref()) + listed(condition.regex_values.as_ref());
+    let configured = condition.host_header_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition.path_pattern_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition.http_header_config.as_ref().map_or(0, |config| {
+        listed(config.values.as_ref()) + listed(config.regex_values.as_ref())
+    }) + condition
+        .query_string_config
+        .as_ref()
+        .map_or(0, |config| config.values.as_ref().map_or(0, Vec::len))
+        + condition
+            .http_request_method_config
+            .as_ref()
+            .map_or(0, |config| listed(config.values.as_ref()))
+        + condition
+            .source_ip_config
+            .as_ref()
+            .map_or(0, |config| listed(config.values.as_ref()));
+    direct + configured
 }

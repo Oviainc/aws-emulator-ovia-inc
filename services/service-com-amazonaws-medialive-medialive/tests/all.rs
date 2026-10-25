@@ -68,6 +68,9 @@ mod cluster_creation;
 #[path = "all/cluster_listing.rs"]
 mod cluster_listing;
 
+#[path = "all/cluster_update.rs"]
+mod cluster_update;
+
 #[path = "all/deleted_resource_mutation.rs"]
 mod deleted_resource_mutation;
 

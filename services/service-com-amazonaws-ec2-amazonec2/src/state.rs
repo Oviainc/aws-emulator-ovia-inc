@@ -133,6 +133,22 @@
 //! counted off the subnet's `AvailableIpAddressCount`, so the subnet, interface, instance
 //! and route server stores cannot disagree about which addresses are in use.
 //!
+//! ## EC2 Fleets
+//!
+//! [`ComAmazonawsEc2Amazonec2State::fleets`] holds the account's EC2 Fleets as
+//! [`FleetRecord`]s: the modelled [`FleetData`](crate::ops::types::FleetData) every
+//! operation that reports a fleet answers with, plus the instances the fleet has launched
+//! ([`FleetInstanceRecord`]), which the modelled shape carries no member for outside an
+//! `instant` fleet. Keyed by `FleetId`
+//! in a [`BTreeMap`], the same stable order the other stores are kept in.
+//!
+//! A fleet record names its instances by id rather than copying them: the instance itself
+//! stays in [`ComAmazonawsEc2Amazonec2State::instances`], so [`fleet_active_instances`] —
+//! the projection of a fleet's instances into the modelled
+//! [`ActiveInstance`](crate::ops::types::ActiveInstance) shape every operation that reports
+//! one answers with — reads the instance type and the state out of the SAME record
+//! `DescribeInstances` reports, and the two can never disagree about one instance.
+//!
 //! ## Windows fast launch
 //!
 //! [`ComAmazonawsEc2Amazonec2State::fast_launch_images`] holds the Windows fast launch
@@ -2202,6 +2218,9 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
+    /// Every EC2 Fleet the account holds, by `FleetId` — see the module docs. Ordered by
+    /// id, which is the order `DescribeFleets` reports and pages over.
+    pub fleets: BTreeMap<String, FleetRecord>,
     /// Every Capacity Reservation the account holds, by `CapacityReservationId`, as
     /// [`CapacityReservationRecord`]s — see the "Capacity Reservations" section below.
     /// Ordered by id, the stable order a report of them pages over.
@@ -2650,6 +2669,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             public_ipv4_pools: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
+            fleets: BTreeMap::new(),
             capacity_reservations: BTreeMap::new(),
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
@@ -24467,6 +24487,415 @@ impl ComAmazonawsEc2Amazonec2State {
         self.placement_groups.insert(group_id, group);
         Some(stored)
     }
+}
+
+// =============================================================================
+// EC2 Fleets
+// =============================================================================
+
+/// The prefix of every EC2 Fleet id.
+pub const FLEET_ID_PREFIX: &str = "fleet-";
+
+/// The hexadecimal-digit groups of the UUID an EC2 Fleet id carries after
+/// [`FLEET_ID_PREFIX`]: AWS issues a fleet id as `fleet-` followed by a UUID — five
+/// hyphen-separated groups of 8, 4, 4, 4 and 12 lowercase hexadecimal digits, as in
+/// `fleet-73fbd2ce-aa30-494c-8788-1cee4048d614`.
+///
+/// This is NOT the `<prefix>-<8|17 hex>` long-id form [`prefixed_id_is_well_formed`] reads
+/// for the rest of EC2's resources: a 17-hexadecimal-digit `fleet-…` id is not a fleet id
+/// at all, and the recorded unit `ec2-fleet-describe-lifecycle#task#13` has AWS answering
+/// `InvalidFleetId.Malformed` for exactly that. The model publishes no `@pattern` for
+/// `FleetId` (`smithy_query(query="shape",shape="FleetId")` is a plain `String`), so the
+/// form lives here.
+///
+/// Only LOWERCASE hexadecimal digits, the case AWS renders a UUID in and the case
+/// [`prefixed_id_is_well_formed`] holds every other EC2 resource id to, so one choice is
+/// made once for the whole module; the recorded unit does not settle case either way.
+const FLEET_ID_UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `id` is a well-formed EC2 Fleet id: [`FLEET_ID_PREFIX`] and the UUID
+/// [`FLEET_ID_UUID_GROUPS`] describes.
+///
+/// EC2 answers [`INVALID_FLEET_ID_MALFORMED`] for anything else, BEFORE it looks the id up,
+/// so a caller can tell "not a fleet id" from "no such fleet".
+pub fn fleet_id_is_well_formed(id: &str) -> bool {
+    let Some(uuid) = id.strip_prefix(FLEET_ID_PREFIX) else {
+        return false;
+    };
+    let mut groups = uuid.split('-');
+    for length in FLEET_ID_UUID_GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length
+            || !group
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return false;
+        }
+    }
+    // Nothing may follow the fifth group: `fleet-<uuid>-<anything>` is not a fleet id.
+    groups.next().is_none()
+}
+
+/// `InvalidFleetId.Malformed` (HTTP 400): the request named something that is not an EC2
+/// Fleet id at all, so there is nothing to look up.
+pub const INVALID_FLEET_ID_MALFORMED: &str = "InvalidFleetId.Malformed";
+
+/// `InvalidFleetId.NotFound` (HTTP 400): the request named a fleet id this account holds no
+/// EC2 Fleet for.
+pub const INVALID_FLEET_ID_NOT_FOUND: &str = "InvalidFleetId.NotFound";
+
+/// `UnsupportedOperation` (HTTP 400): the request asked for something this service does not
+/// support for the resource it named — EC2's own code for an operation that is not
+/// applicable, as opposed to a parameter whose value is wrong.
+pub const UNSUPPORTED_OPERATION: &str = "UnsupportedOperation";
+
+/// The catalogs of the modelled fleet enums, re-exported from the generated types so this
+/// module names the ONE copy of each: `FleetType` (`FleetData$Type`), `FleetStateCode`
+/// (`FleetData$FleetState`) and `FleetActivityStatus` (`FleetData$ActivityStatus`). The
+/// single-member aliases below name a member of one of them; a second array here could
+/// drift from the model.
+pub use crate::ops::types::{
+    FLEET_ACTIVITY_STATUS_VALUES, FLEET_STATE_CODE_VALUES, FLEET_TYPE_VALUES,
+};
+
+/// The `instant` member of [`FLEET_TYPE_VALUES`]: a fleet that places its requests once and
+/// reports the instances it launched on the fleet itself.
+pub const FLEET_TYPE_INSTANT: &str = "instant";
+
+/// The `maintain` member of [`FLEET_TYPE_VALUES`], which is also what a `CreateFleet`
+/// request that names no type gets: "Default: `maintain`" (`FleetData$Type`).
+pub const FLEET_TYPE_MAINTAIN: &str = "maintain";
+
+/// The `active` member of [`FLEET_STATE_CODE_VALUES`].
+pub const FLEET_STATE_ACTIVE: &str = "active";
+
+/// The `fulfilled` member of [`FLEET_ACTIVITY_STATUS_VALUES`]: "`fulfilled` when the fleet
+/// size meets or exceeds target capacity" (`FleetData$ActivityStatus`).
+pub const FLEET_ACTIVITY_STATUS_FULFILLED: &str = "fulfilled";
+
+/// The `healthy` member of the modelled `InstanceHealthStatus` catalog
+/// ([`crate::ops::types::INSTANCE_HEALTH_STATUS_VALUES`]).
+///
+/// "If the status of either the instance status check or the system status check is
+/// `impaired`, the health status of the instance is `unhealthy`. Otherwise, the health
+/// status is `healthy`" (`ActiveInstance$InstanceHealth`). No operation of this emulator
+/// impairs either status check — nothing stores a status check at all — so an instance it
+/// reports is healthy; this is the ONE place that derivation lives, for status checks to be
+/// read from once something models them.
+pub const INSTANCE_HEALTH_HEALTHY: &str = "healthy";
+
+/// One instance an EC2 Fleet has launched.
+///
+/// The instance ITSELF is a record of [`ComAmazonawsEc2Amazonec2State::instances`], named
+/// here by id: a fleet keeps only what is true of the instance *as the fleet's* — the Spot
+/// request it was placed through — so the type and the state a fleet reports for an
+/// instance are always the ones the instance store holds.
+#[derive(Debug, Clone)]
+pub struct FleetInstanceRecord {
+    /// The `InstanceId`, a key of [`ComAmazonawsEc2Amazonec2State::instances`].
+    pub instance_id: String,
+    /// "The ID of the Spot Instance request" (`ActiveInstance$SpotInstanceRequestId`) the
+    /// instance was placed through, or `None` for an On-Demand instance, which is placed
+    /// through no Spot request.
+    pub spot_instance_request_id: Option<String>,
+}
+
+/// One stored EC2 Fleet: the modelled [`FleetData`](crate::ops::types::FleetData) every
+/// operation that reports a fleet answers with, plus the instances it has launched.
+#[derive(Debug, Clone)]
+pub struct FleetRecord {
+    /// The fleet as `DescribeFleets` reports it.
+    pub fleet: crate::ops::types::FleetData,
+    /// The instances the fleet has launched, in launch order.
+    pub instances: Vec<FleetInstanceRecord>,
+}
+
+impl FleetRecord {
+    /// This fleet's `FleetId`.
+    pub fn fleet_id(&self) -> &str {
+        self.fleet.fleet_id.as_deref().unwrap_or_default()
+    }
+
+    /// This fleet's `FleetType` — one of [`FLEET_TYPE_VALUES`].
+    pub fn fleet_type(&self) -> &str {
+        self.fleet.r#type.as_deref().unwrap_or_default()
+    }
+}
+
+/// What one stored EC2 Fleet is created with, for
+/// [`ComAmazonawsEc2Amazonec2State::insert_fleet`].
+///
+/// One field per `FleetData` member a writer decides, with the instants as [`SystemTime`]s
+/// rather than modelled timestamps because every writer computes them from the clock it
+/// already holds; the store converts them once. The `FleetId` is NOT here: it is minted by
+/// the store ([`ComAmazonawsEc2Amazonec2State::mint_fleet_id`]), never taken from a request.
+#[derive(Debug, Clone)]
+pub struct FleetSpec {
+    /// `FleetData$Type` — one of [`FLEET_TYPE_VALUES`].
+    pub fleet_type: String,
+    /// `FleetData$FleetState` — one of [`FLEET_STATE_CODE_VALUES`].
+    pub fleet_state: String,
+    /// `FleetData$ActivityStatus` — one of [`FLEET_ACTIVITY_STATUS_VALUES`].
+    pub activity_status: Option<String>,
+    /// `FleetData$ClientToken`, the idempotency token the create carried.
+    pub client_token: Option<String>,
+    /// `FleetData$CreateTime`.
+    pub create_time: SystemTime,
+    /// `FleetData$LaunchTemplateConfigs`, "the launch template and overrides".
+    pub launch_template_configs: Vec<crate::ops::types::FleetLaunchTemplateConfig>,
+    /// `FleetData$TargetCapacitySpecification`, "the number of units to request".
+    pub target_capacity_specification: Option<crate::ops::types::TargetCapacitySpecification>,
+    /// `FleetData$FulfilledCapacity`.
+    pub fulfilled_capacity: Option<f64>,
+    /// `FleetData$FulfilledOnDemandCapacity`.
+    pub fulfilled_on_demand_capacity: Option<f64>,
+    /// `FleetData$TerminateInstancesWithExpiration`.
+    pub terminate_instances_with_expiration: Option<bool>,
+    /// `FleetData$ReplaceUnhealthyInstances`.
+    pub replace_unhealthy_instances: Option<bool>,
+    /// `FleetData$ExcessCapacityTerminationPolicy`.
+    pub excess_capacity_termination_policy: Option<String>,
+    /// `FleetData$ValidFrom`, when the request starts being fulfilled.
+    pub valid_from: Option<SystemTime>,
+    /// `FleetData$ValidUntil`, after which no new instance requests are placed.
+    pub valid_until: Option<SystemTime>,
+    /// `FleetData$Tags`, "the tags for an EC2 Fleet resource".
+    pub tags: Vec<Tag>,
+    /// `FleetData$Context` — "Reserved".
+    pub context: Option<String>,
+    /// The instances the fleet has launched, in launch order.
+    pub instances: Vec<FleetInstanceRecord>,
+}
+
+/// The caller-chosen bytes one stored fleet holds: its client token, its context, its tags
+/// and the launch template names, versions and overrides it keeps, plus the id of each
+/// instance and Spot request it names.
+///
+/// The ONE definition of that charge, the way [`capacity_block_payload_bytes`] is for a
+/// Capacity Block: a writer charges exactly it, on top of the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+pub fn fleet_payload_bytes(
+    fleet: &crate::ops::types::FleetData,
+    instances: &[FleetInstanceRecord],
+) -> usize {
+    let text = |value: Option<&String>| value.map_or(0, String::len);
+    let template_bytes: usize = fleet
+        .launch_template_configs
+        .iter()
+        .flatten()
+        .map(|config| {
+            let specification = config
+                .launch_template_specification
+                .as_ref()
+                .map_or(0, |specification| {
+                    text(specification.launch_template_id.as_ref())
+                        .saturating_add(text(specification.launch_template_name.as_ref()))
+                        .saturating_add(text(specification.version.as_ref()))
+                });
+            let overrides: usize = config
+                .overrides
+                .iter()
+                .flatten()
+                .map(|overridden| {
+                    text(overridden.instance_type.as_ref())
+                        .saturating_add(text(overridden.availability_zone.as_ref()))
+                        .saturating_add(text(overridden.subnet_id.as_ref()))
+                        .saturating_add(text(overridden.max_price.as_ref()))
+                })
+                .fold(0usize, usize::saturating_add);
+            specification.saturating_add(overrides)
+        })
+        .fold(0usize, usize::saturating_add);
+    let instance_bytes: usize = instances
+        .iter()
+        .map(|instance| {
+            instance.instance_id.len().saturating_add(
+                instance
+                    .spot_instance_request_id
+                    .as_ref()
+                    .map_or(0, String::len),
+            )
+        })
+        .fold(0usize, usize::saturating_add);
+    text(fleet.client_token.as_ref())
+        .saturating_add(text(fleet.context.as_ref()))
+        .saturating_add(tag_list_bytes(fleet.tags.as_deref().unwrap_or_default()))
+        .saturating_add(template_bytes)
+        .saturating_add(instance_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A fresh, unused `FleetId`.
+    ///
+    /// The form [`fleet_id_is_well_formed`] reads — `fleet-` and a UUID — with the store's
+    /// own monotonic counter rendered into the UUID's first and last groups, so the id is
+    /// unique without being drawn from a request and is never the null UUID. The three
+    /// middle groups are deliberately reserved zeros: nothing distinguishes two fleets but
+    /// the counter, and a reader comparing ids never needs them.
+    pub fn mint_fleet_id(&mut self) -> String {
+        self.id_counter = self.id_counter.saturating_add(1);
+        let counter = self.id_counter;
+        format!(
+            "{FLEET_ID_PREFIX}{:08x}-0000-0000-0000-{:012x}",
+            counter >> 48,
+            counter & 0xffff_ffff_ffff
+        )
+    }
+
+    /// Whether another EC2 Fleet fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_transit_gateway_attachment_capacity`]: a writer asks this BEFORE storing
+    /// anything and refuses the request with EC2's own quota code when it answers `false`.
+    pub fn has_fleet_capacity(&self) -> bool {
+        self.fleets.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Store one EC2 Fleet and answer the `FleetId` it was given — or `None` when the store
+    /// is at [`MAX_STORED_RECORDS_PER_STORE`], or the fleet's caller-chosen bytes would
+    /// cross [`MAX_STORED_BYTES`], and NOTHING was stored.
+    ///
+    /// The one place a fleet enters this store, so every writer of one — and every operation
+    /// that reports what this wrote — agrees on the id form, the stored shape and which
+    /// members a fleet carries. Both ceilings are asked BEFORE anything is written, the way
+    /// [`Self::insert_capacity_block`]'s caller does, so a refused write charges nothing and
+    /// no path can store caller-chosen bytes uncharged.
+    pub fn insert_fleet(&mut self, spec: FleetSpec) -> Option<String> {
+        if !self.has_fleet_capacity() {
+            return None;
+        }
+        let fleet_id = self.mint_fleet_id();
+        let fleet = crate::ops::types::FleetData {
+            activity_status: spec.activity_status,
+            create_time: Some(system_time_to_date_time(spec.create_time)),
+            fleet_id: Some(fleet_id.clone()),
+            fleet_state: Some(spec.fleet_state),
+            client_token: spec.client_token,
+            excess_capacity_termination_policy: spec.excess_capacity_termination_policy,
+            fulfilled_capacity: spec.fulfilled_capacity,
+            fulfilled_on_demand_capacity: spec.fulfilled_on_demand_capacity,
+            launch_template_configs: Some(spec.launch_template_configs),
+            target_capacity_specification: spec.target_capacity_specification,
+            terminate_instances_with_expiration: spec.terminate_instances_with_expiration,
+            r#type: Some(spec.fleet_type),
+            valid_from: spec.valid_from.map(system_time_to_date_time),
+            valid_until: spec.valid_until.map(system_time_to_date_time),
+            replace_unhealthy_instances: spec.replace_unhealthy_instances,
+            // The option structures, the launch errors and the per-fleet instance report
+            // belong to the operations that create and report a fleet; a fleet carries none
+            // of them just by being stored.
+            spot_options: None,
+            on_demand_options: None,
+            reserved_capacity_options: None,
+            tags: Some(spec.tags),
+            errors: None,
+            instances: None,
+            context: spec.context,
+        };
+        let charge = STORED_RECORD_OVERHEAD_BYTES + fleet_payload_bytes(&fleet, &spec.instances);
+        // The byte ceiling is asked before the record is stored, not after: a fleet carries
+        // caller-chosen text (its tags, its client token, its launch-template overrides), so
+        // a write that would cross [`MAX_STORED_BYTES`] stores nothing at all and its caller
+        // refuses the request.
+        if self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        self.add_stored_bytes(charge);
+        self.fleets.insert(
+            fleet_id.clone(),
+            FleetRecord {
+                fleet,
+                instances: spec.instances,
+            },
+        );
+        Some(fleet_id)
+    }
+}
+
+/// The running instances of `record`, as the modelled
+/// [`ActiveInstance`](crate::ops::types::ActiveInstance) shape.
+///
+/// "Describes the running instances for the specified EC2 Fleet" (`DescribeFleetInstances`),
+/// so an instance of the fleet that the instance store reports in any other state — one
+/// still `pending`, one `stopped`, one the account has terminated — is not an active
+/// instance, and one the store no longer holds at all is not one either.
+///
+/// Projected from the INSTANCE store rather than from anything the fleet record copies, so
+/// the instance type a fleet reports for an instance is the one `DescribeInstances` reports
+/// for it. The caller sees them in launch order; a report that pages puts them in id order
+/// itself.
+pub fn fleet_active_instances(
+    store: &ComAmazonawsEc2Amazonec2State,
+    record: &FleetRecord,
+) -> Vec<crate::ops::types::ActiveInstance> {
+    record
+        .instances
+        .iter()
+        .filter_map(|launched| {
+            let instance = store.instances.get(&launched.instance_id)?;
+            (instance.state == InstanceStateName::Running).then(|| {
+                crate::ops::types::ActiveInstance {
+                    instance_id: Some(instance.instance_id.clone()),
+                    instance_type: Some(instance.instance_type.clone()),
+                    spot_instance_request_id: launched.spot_instance_request_id.clone(),
+                    instance_health: Some(INSTANCE_HEALTH_HEALTHY.to_string()),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Refuse a request that named something that is not an EC2 Fleet id: HTTP 400
+/// `InvalidFleetId.Malformed`, with the message naming the value the request sent.
+pub fn invalid_fleet_id_malformed<E>(fleet_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FLEET_ID_MALFORMED,
+        400,
+        format!("The fleet ID '{fleet_id}' is malformed"),
+    )
+}
+
+/// Refuse a request that named a fleet id no EC2 Fleet of the account has: HTTP 400
+/// `InvalidFleetId.NotFound`, through the one helper that words every such refusal
+/// ([`id_not_found`]).
+pub fn invalid_fleet_id_not_found<E>(fleet_id: &str) -> Scaffolded<E> {
+    id_not_found(INVALID_FLEET_ID_NOT_FOUND, "fleet ID", fleet_id)
+}
+
+/// Refuse `fleet_id` unless it is a well-formed EC2 Fleet id, BEFORE any lookup: the
+/// question "is this a fleet id at all" is asked ahead of "does this account hold it", so
+/// "not an id of this kind" is never reported as "no such fleet".
+///
+/// A handler calls this to refuse a malformed id WITHOUT taking the state lock;
+/// [`require_known_fleet`] asks it again, so the ordering holds even for a caller that
+/// goes straight to the lookup.
+pub fn require_well_formed_fleet_id<E>(fleet_id: &str) -> Result<(), Scaffolded<E>> {
+    if fleet_id_is_well_formed(fleet_id) {
+        return Ok(());
+    }
+    Err(invalid_fleet_id_malformed(fleet_id))
+}
+
+/// The EC2 Fleet `fleet_id` names, refusing a malformed id first and an id this account
+/// holds no fleet for second — the order [`require_well_formed_id`] establishes for every
+/// resource of this module.
+pub fn require_known_fleet<'a, E>(
+    store: &'a ComAmazonawsEc2Amazonec2State,
+    fleet_id: &str,
+) -> Result<&'a FleetRecord, Scaffolded<E>> {
+    require_well_formed_fleet_id(fleet_id)?;
+    store
+        .fleets
+        .get(fleet_id)
+        .ok_or_else(|| invalid_fleet_id_not_found(fleet_id))
+}
+
+/// Refuse a request this service does not serve for the resource it named: HTTP 400
+/// `UnsupportedOperation`.
+pub fn unsupported_operation<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(UNSUPPORTED_OPERATION, 400, message)
 }
 
 // ---------------------------------------------------------------------------

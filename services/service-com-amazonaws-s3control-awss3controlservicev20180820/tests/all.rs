@@ -29,3 +29,5 @@ mod storage_lens_configuration;
 mod storage_lens_configuration_list;
 #[path = "all/storage_lens_group.rs"]
 mod storage_lens_group;
+#[path = "all/storage_lens_group_update.rs"]
+mod storage_lens_group_update;
