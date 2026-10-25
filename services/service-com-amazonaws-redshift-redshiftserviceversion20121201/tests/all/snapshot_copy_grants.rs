@@ -14,10 +14,14 @@
 //! default key; the NAME being what an account's grants are unique on, so a
 //! second create under one name is refused and overwrites nothing; the
 //! documented name syntax; a name that identifies no grant being refused by the
-//! read; the creation order, the `TagKeys` / `TagValues` filter, the service's
+//! read and by the delete; a delete making the grant absent from every later
+//! read while leaving every other record where it was, and freeing the name; a
+//! grant a cluster's snapshot copy is configured with being refused by the
+//! delete; the creation order, the `TagKeys` / `TagValues` filter, the service's
 //! `MaxRecords` window and its `Marker` cursor; and the documented tag
 //! restrictions being refused with nothing stored.
 
+use service_com_amazonaws_redshift_redshiftserviceversion20121201::ops::types::ClusterSnapshotCopyStatus;
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
 use crate::cluster_lifecycle::{all_text, Answer, Emulator};
@@ -70,6 +74,16 @@ async fn call_with(emulator: &Emulator, action: &str, params: &[(String, String)
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
     emulator.call(action, &borrowed).await
+}
+
+/// `DeleteSnapshotCopyGrant` for one name.
+async fn delete_one(emulator: &Emulator, name: &str) -> Answer {
+    emulator
+        .call(
+            "DeleteSnapshotCopyGrant",
+            &[("SnapshotCopyGrantName", name)],
+        )
+        .await
 }
 
 /// `DescribeSnapshotCopyGrants` for one name.
@@ -765,4 +779,313 @@ async fn refused_tags_store_no_grant() {
         "case the whole account: expected only {stored:?}, got {:?}",
         listed_grants(&listed.body)
     );
+}
+
+/// A delete removes the grant from the store, so every later read reports it
+/// absent while every grant it did not name is left exactly where it was.
+///
+/// The rows differ along everything the rule generalises over: the form and size
+/// of the name deleted, the form of the key the grant named, how many tags it
+/// carried, and its position in the account's sequence (first, middle, last) —
+/// and the deletes are taken out of creation order, so the order the surviving
+/// records keep is the creation order and not an artefact of the walk.
+#[tokio::test]
+async fn a_delete_removes_the_grant_from_every_later_read() {
+    let emulator = Emulator::new();
+
+    let rows = vec![
+        simple_case("the minimal grant", "grant-del-one"),
+        CreateCase {
+            case: "a bare key id and one tag",
+            name: "grant-del-2-west-01".to_string(),
+            kms_key_id: Some("1234abcd-12ab-34cd-56ef-1234567890ab".to_string()),
+            tags: vec![("owner", "admin")],
+        },
+        CreateCase {
+            case: "an alias and two tags",
+            name: "grant-del-alias".to_string(),
+            kms_key_id: Some("alias/copy-grants".to_string()),
+            tags: vec![("owner", "admin"), ("environment", "test")],
+        },
+        CreateCase {
+            case: "a name at the documented maximum length",
+            name: name_of_length(state::SNAPSHOT_COPY_GRANT_NAME_RULE.max_len),
+            kms_key_id: None,
+            tags: Vec::new(),
+        },
+        CreateCase {
+            case: "a one-character name",
+            name: "d".to_string(),
+            kms_key_id: Some("alias/one-character".to_string()),
+            tags: vec![("environment", "production")],
+        },
+    ];
+
+    for row in &rows {
+        assert_eq!(
+            create_grant(&emulator, row).await.status,
+            200,
+            "case {}: the create must be served",
+            row.case
+        );
+    }
+
+    // Out of creation order: a middle record, then the last, then the first,
+    // then what is left.
+    let order = [2usize, 4, 0, 1, 3];
+    let mut remaining: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+    for ordinal in order {
+        let row = &rows[ordinal];
+        let case = row.case;
+        let name = row.name.as_str();
+
+        let deleted = delete_one(&emulator, name).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case}: expected the delete of {name:?} served with 200, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        // The deletion is observable: the read of the name is refused, the
+        // store holds no record for it, and a second delete of the same name
+        // has nothing left to remove.
+        assert_refused(
+            case,
+            &describe_one(&emulator, name).await,
+            400,
+            "SnapshotCopyGrantNotFoundFault",
+        );
+        let stored = stored_key(&emulator, name);
+        assert_eq!(
+            stored, None,
+            "case {case}: expected the store to hold no record for {name:?}, got {stored:?}"
+        );
+        assert_refused(
+            case,
+            &delete_one(&emulator, name).await,
+            400,
+            "SnapshotCopyGrantNotFoundFault",
+        );
+
+        // Every grant the delete did not name is untouched, in creation order.
+        remaining.retain(|held| held != name);
+        let listed = emulator.call("DescribeSnapshotCopyGrants", &[]).await;
+        assert_eq!(
+            listed_grants(&listed.body),
+            remaining,
+            "case {case}: expected the remaining grants {remaining:?}, got {:?}",
+            listed_grants(&listed.body)
+        );
+    }
+
+    // A name freed by a delete can be created again, carrying whatever the new
+    // request configures: the delete released the identity with the record.
+    let reused = CreateCase {
+        case: "a name freed by a delete",
+        name: rows[0].name.clone(),
+        kms_key_id: Some("alias/after-delete".to_string()),
+        tags: vec![("owner", "fleet")],
+    };
+    assert_eq!(
+        create_grant(&emulator, &reused).await.status,
+        200,
+        "case a name freed by a delete: expected the create served"
+    );
+    assert_eq!(
+        stored_key(&emulator, &reused.name),
+        Some("alias/after-delete".to_string()),
+        "case a name freed by a delete: expected the new key stored, got {:?}",
+        stored_key(&emulator, &reused.name)
+    );
+}
+
+/// A `SnapshotCopyGrantName` that identifies no grant is refused by the delete,
+/// which removes nothing.
+#[tokio::test]
+async fn deleting_a_name_that_identifies_no_grant_is_refused() {
+    let emulator = Emulator::new();
+
+    // On an empty account every name identifies nothing.
+    for (case, name) in [
+        ("an empty account", "grant-absent"),
+        ("a name with separators", "grant-absent-2"),
+    ] {
+        let answer = delete_one(&emulator, name).await;
+        assert_refused(case, &answer, 400, "SnapshotCopyGrantNotFoundFault");
+        let message = answer.text("Message").unwrap_or_default();
+        assert!(
+            message.contains(name),
+            "case {case}: expected the message to name {name:?}, got {message:?}"
+        );
+    }
+
+    let present = simple_case("a stored grant", "grant-kept");
+    assert_eq!(
+        create_grant(&emulator, &present).await.status,
+        200,
+        "case a stored grant: the create must be served"
+    );
+
+    // One stored grant does not make a different name resolve, and the match is
+    // exact: a prefix, a neighbouring name, a name differing only in case and a
+    // name outside the documented syntax all identify no record.
+    for (case, name) in [
+        ("a neighbouring name", "grant-kept-2"),
+        ("a prefix of the stored name", "grant-ke"),
+        ("the stored name in another case", "GRANT-KEPT"),
+        ("a name outside the documented syntax", "grant_kept"),
+    ] {
+        let answer = delete_one(&emulator, name).await;
+        assert_refused(case, &answer, 400, "SnapshotCopyGrantNotFoundFault");
+    }
+
+    // Every refused delete removed nothing.
+    let listed = emulator.call("DescribeSnapshotCopyGrants", &[]).await;
+    assert_eq!(
+        listed_grants(&listed.body),
+        vec![present.name.clone()],
+        "case the whole account: expected the stored grant to survive, got {:?}",
+        listed_grants(&listed.body)
+    );
+}
+
+/// A grant a cluster's snapshot copy is configured with is still what Amazon
+/// Redshift encrypts that cluster's copied snapshots with, so the delete is
+/// refused and the record stays readable; a grant no cluster uses is removed.
+///
+/// The rows differ along how many clusters hold the grant — none, one, and more
+/// than one, "used by one or more clusters" — and one row has a cluster copying
+/// under ANOTHER grant, so the refusal follows the grant a cluster names and not
+/// the mere presence of a cluster.
+///
+/// `EnableSnapshotCopy`, the operation that records a grant on a cluster's
+/// `ClusterSnapshotCopyStatus`, is still a scaffold, so the configuration is
+/// seeded straight into the same shared store the handlers read.
+#[tokio::test]
+async fn a_grant_a_cluster_copies_under_cannot_be_deleted() {
+    let emulator = Emulator::new();
+
+    for (case, name, clusters) in [
+        ("no cluster uses it", "grant-used-by-none", &[][..]),
+        ("one cluster uses it", "grant-used-by-one", &["copy-cluster-a"][..]),
+        (
+            "two clusters use it",
+            "grant-used-by-two",
+            &["copy-cluster-b", "copy-cluster-c"][..],
+        ),
+    ] {
+        assert_eq!(
+            create_grant(&emulator, &simple_case(case, name)).await.status,
+            200,
+            "case {case}: the create must be served"
+        );
+        for cluster in clusters {
+            create_cluster(&emulator, case, cluster).await;
+            configure_snapshot_copy(&emulator, cluster, name);
+        }
+
+        let answer = delete_one(&emulator, name).await;
+        if clusters.is_empty() {
+            assert_eq!(
+                answer.status, 200,
+                "case {case}: expected the delete served, got {} with body {}",
+                answer.status, answer.body
+            );
+            assert_refused(
+                case,
+                &describe_one(&emulator, name).await,
+                400,
+                "SnapshotCopyGrantNotFoundFault",
+            );
+            continue;
+        }
+
+        assert_refused(case, &answer, 400, "InvalidSnapshotCopyGrantStateFault");
+        let message = answer.text("Message").unwrap_or_default();
+        for cluster in clusters {
+            assert!(
+                message.contains(cluster),
+                "case {case}: expected the message to name the cluster {cluster}, got {message:?}"
+            );
+        }
+
+        // The refused delete removed nothing: the grant is still the record a
+        // read reports.
+        let read = describe_one(&emulator, name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected the grant to still be readable, got {} with body {}",
+            read.status, read.body
+        );
+        assert_eq!(
+            listed_grants(&read.body),
+            vec![name.to_string()],
+            "case {case}: expected the read to report {name}, got {:?}",
+            listed_grants(&read.body)
+        );
+    }
+
+    // A cluster copying under ANOTHER grant does not hold this one: the delete
+    // is served and the other grant is untouched.
+    let case = "a cluster copying under another grant";
+    for name in ["grant-other-held", "grant-other-free"] {
+        assert_eq!(
+            create_grant(&emulator, &simple_case(case, name)).await.status,
+            200,
+            "case {case}: the create of {name} must be served"
+        );
+    }
+    create_cluster(&emulator, case, "copy-cluster-d").await;
+    configure_snapshot_copy(&emulator, "copy-cluster-d", "grant-other-held");
+    let answer = delete_one(&emulator, "grant-other-free").await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected the delete of the unheld grant served, got {} with body {}",
+        answer.status, answer.body
+    );
+    let read = describe_one(&emulator, "grant-other-held").await;
+    assert_eq!(
+        listed_grants(&read.body),
+        vec!["grant-other-held".to_string()],
+        "case {case}: expected the held grant untouched, got {:?}",
+        listed_grants(&read.body)
+    );
+}
+
+/// Create one cluster, the minimum a `CreateCluster` request carries.
+async fn create_cluster(emulator: &Emulator, case: &str, identifier: &str) {
+    let created = emulator
+        .call(
+            "CreateCluster",
+            &[
+                ("ClusterIdentifier", identifier),
+                ("NodeType", "ra3.xlplus"),
+                ("MasterUsername", "admin"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case}: the cluster {identifier} must be created, got {} with body {}",
+        created.status, created.body
+    );
+}
+
+/// Record on a stored cluster that its cross-region snapshot copy encrypts
+/// copied snapshots under the snapshot copy grant `grant` names, which is what
+/// `EnableSnapshotCopy` writes to a cluster's `ClusterSnapshotCopyStatus`.
+fn configure_snapshot_copy(emulator: &Emulator, cluster: &str, grant: &str) {
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    let mut store = store.lock();
+    let position = store
+        .cluster_position(cluster)
+        .unwrap_or_else(|| panic!("the created cluster {cluster}"));
+    store.clusters[position]
+        .cluster
+        .cluster_snapshot_copy_status = Some(ClusterSnapshotCopyStatus {
+        destination_region: Some("us-east-1".to_string()),
+        retention_period: Some(7),
+        manual_snapshot_retention_period: Some(-1),
+        snapshot_copy_grant_name: Some(grant.to_string()),
+    });
 }
