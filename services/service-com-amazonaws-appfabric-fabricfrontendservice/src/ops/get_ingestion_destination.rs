@@ -6,13 +6,18 @@
 //! [`crate::state::IngestionDestinationRecord::to_ingestion_destination`]), so a read
 //! never changes what a later caller sees.
 //!
-//! A destination is reachable only THROUGH its parents, and every link of the
-//! chain (app bundle -> ingestion -> destination) is a resource of its own, so
-//! the read is refused at the FIRST link that resolves to nothing, with the HTTP
-//! 404 `ResourceNotFoundException` ABOUT THAT link: its own `resourceType`, the
-//! identifier the caller supplied for it in `resourceId`, and that resource
-//! kind's read-path sentence — the same way the sibling reads of this chain
-//! (`ListIngestionDestinations`, `GetIngestion`) report it.
+//! The app bundle is the SCOPE every path under `/appbundles/{appBundleIdentifier}`
+//! is rooted at, so a bundle identifier naming nothing stored is the HTTP 404
+//! `ResourceNotFoundException` about the APP BUNDLE. Inside a bundle that does
+//! resolve, the destination is resolved as ONE lookup in its own identifier
+//! scope: whatever part of `ingestion -> destination` fails to resolve, the
+//! refusal is about the resource this read TARGETS — `resourceType`
+//! `IngestionDestination`, the `ingestionDestinationIdentifier` the caller
+//! supplied in `resourceId`, and that kind's read-path sentence
+//! ([`crate::state::ingestion_destination_not_found`]). The sibling reads of
+//! this chain report the same way, because each one's target is the deepest
+//! resource its request names: `GetIngestion` and `ListIngestionDestinations`
+//! name the ingestion, so theirs is the ingestion's refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -171,12 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure report: this handler only reads the store.
         let store = state.lock();
-        // Each link of the chain is a resource of its own, so the refusal names
-        // the link that is actually absent rather than the one the caller asked
-        // about: a client reading `resourceType`/`resourceId` (or the message)
-        // learns which level of the chain it got wrong. (The write path refuses
-        // a missing child as a validation failure instead; see
-        // `create_ingestion_destination` and `update_ingestion_destination`.)
+        // The app bundle is the SCOPE of the path, so an identifier naming no
+        // stored bundle is refused as the bundle. Below it the refusal is about
+        // the resource this read TARGETS: the destination is resolved in one
+        // step, and a chain that does not lead to it — whether the ingestion
+        // above it or the destination itself is the part that does not resolve
+        // — is the destination's own not-found, so a client reading
+        // `resourceType`/`resourceId` (or the message) is told the resource it
+        // asked for does not exist. (The write path refuses a missing child as
+        // a validation failure instead; see `create_ingestion_destination` and
+        // `update_ingestion_destination`.)
         let Some(bundle) = store.resolve_bundle(&input.app_bundle_identifier) else {
             return Err(
                 GetIngestionDestinationErrorModeled::ResourceNotFoundException(
@@ -185,16 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let Some(ingestion) = bundle.resolve_ingestion(&input.ingestion_identifier) else {
-            return Err(
-                GetIngestionDestinationErrorModeled::ResourceNotFoundException(
-                    crate::state::ingestion_not_found(&input.ingestion_identifier),
-                )
-                .into(),
-            );
-        };
-        let Some(destination) =
-            ingestion.resolve_destination(&input.ingestion_destination_identifier)
+        let Some(destination) = bundle
+            .resolve_ingestion(&input.ingestion_identifier)
+            .and_then(|ingestion| {
+                ingestion.resolve_destination(&input.ingestion_destination_identifier)
+            })
         else {
             return Err(
                 GetIngestionDestinationErrorModeled::ResourceNotFoundException(
