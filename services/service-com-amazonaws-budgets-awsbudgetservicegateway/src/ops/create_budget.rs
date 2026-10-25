@@ -170,7 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -233,81 +232,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = (input.account_id.clone(), input.budget.budget_name.clone());
         let now = ::std::time::SystemTime::now();
-        let mut store = crate::state::store_at(&state, now);
-        if store.budgets.contains_key(&key) {
-            return Err(CreateBudgetErrorModeled::DuplicateRecordException(
-                DuplicateRecordException {
-                    message: Some(format!(
-                        "Error creating budget: {} - the budget already exists.",
-                        input.budget.budget_name
-                    )),
-                },
-            )
-            .into());
-        }
-        // The store is bounded: both halves of the key come from the request, so without
-        // a ceiling a caller could grow this process without limit. The account's own
-        // quota is AWS's documented one; the total is the emulator's memory bound.
-        if crate::state::budget_count_for_account(&store, &input.account_id)
-            >= crate::state::MAX_BUDGETS_PER_ACCOUNT
-        {
-            return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "Error creating budget: {} - the account has reached its quota of {} \
-                         budgets.",
-                        input.budget.budget_name,
-                        crate::state::MAX_BUDGETS_PER_ACCOUNT
-                    )),
-                },
-            )
-            .into());
-        }
-        if store.budgets.len() >= crate::state::MAX_BUDGETS_TOTAL {
-            return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "Error creating budget: {} - this emulator holds its maximum of {} \
-                         budgets.",
-                        input.budget.budget_name,
-                        crate::state::MAX_BUDGETS_TOTAL
-                    )),
-                },
-            )
-            .into());
-        }
+        // Every write this call makes is made under the store's lock, and the lock is
+        // released at the end of this block: the alerts it leaves owed are published
+        // afterwards, so no delivery is made while the store is held.
+        let alerts = {
+            let mut store = crate::state::store_at(&state, now);
+            if store.budgets.contains_key(&key) {
+                return Err(CreateBudgetErrorModeled::DuplicateRecordException(
+                    DuplicateRecordException {
+                        message: Some(format!(
+                            "Error creating budget: {} - the budget already exists.",
+                            input.budget.budget_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The store is bounded: both halves of the key come from the request, so
+            // without a ceiling a caller could grow this process without limit. The
+            // account's own quota is AWS's documented one; the total is the emulator's
+            // memory bound.
+            if crate::state::budget_count_for_account(&store, &input.account_id)
+                >= crate::state::MAX_BUDGETS_PER_ACCOUNT
+            {
+                return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Error creating budget: {} - the account has reached its quota of {} \
+                             budgets.",
+                            input.budget.budget_name,
+                            crate::state::MAX_BUDGETS_PER_ACCOUNT
+                        )),
+                    },
+                )
+                .into());
+            }
+            if store.budgets.len() >= crate::state::MAX_BUDGETS_TOTAL {
+                return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "Error creating budget: {} - this emulator holds its maximum of {} \
+                             budgets.",
+                            input.budget.budget_name,
+                            crate::state::MAX_BUDGETS_TOTAL
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let mut budget = input.budget;
-        // The members the service, not the caller, decides — the `LastUpdatedTime` it
-        // stamps, the defaulted `TimePeriod` / `CostTypes` / utilization `BudgetLimit`,
-        // the `HealthStatus`, and the spend and auto-adjust figures it derives from the
-        // cost it tracks (dropped, not echoed) — are materialised here, so every later
-        // read reports what was stored rather than recomputing anything per request.
-        crate::state::stamp_service_owned(&mut budget, now, None);
-        let notifications = input
-            .notifications_with_subscribers
-            .unwrap_or_default()
-            .into_iter()
-            .map(|supplied| {
-                let mut notification = supplied.notification;
-                crate::state::stamp_notification(&mut notification);
-                crate::state::StoredNotification {
-                    notification,
-                    subscribers: supplied.subscribers,
-                }
-            })
-            .collect();
-        store.budgets.insert(
-            key,
-            crate::state::StoredBudget {
-                budget,
-                notifications,
-                // A budget is created with no actions: an action is created by its own
-                // `CreateBudgetAction` call, against a budget that already exists.
-                actions: Vec::new(),
-                tags: input.resource_tags.unwrap_or_default(),
-            },
-        );
+            let mut budget = input.budget;
+            // The members the service, not the caller, decides — the `LastUpdatedTime` it
+            // stamps, the defaulted `TimePeriod` / `CostTypes` / utilization `BudgetLimit`,
+            // the `HealthStatus`, and the spend and auto-adjust figures it derives from
+            // the cost it tracks (dropped, not echoed) — are materialised here, so every
+            // later read reports what was stored rather than recomputing anything per
+            // request.
+            crate::state::stamp_service_owned(&mut budget, now, None);
+            let notifications: Vec<crate::state::StoredNotification> = input
+                .notifications_with_subscribers
+                .unwrap_or_default()
+                .into_iter()
+                .map(|supplied| {
+                    let mut notification = supplied.notification;
+                    crate::state::stamp_notification(&mut notification);
+                    crate::state::StoredNotification {
+                        notification,
+                        subscribers: supplied.subscribers,
+                    }
+                })
+                .collect();
+            // A notification attached in alarm has passed its threshold, so it owes its
+            // alert to the subscribers attached with it, exactly as one attached by
+            // `CreateNotification` does.
+            let source = crate::state::alerts::source(&input.account_id, &budget);
+            let alerts: Vec<crate::state::alerts::BudgetAlert> = notifications
+                .iter()
+                .flat_map(|held| {
+                    crate::state::alerts::owed(&source, &held.notification, &held.subscribers)
+                })
+                .collect();
+            store.budgets.insert(
+                key,
+                crate::state::StoredBudget {
+                    budget,
+                    notifications,
+                    // A budget is created with no actions: an action is created by its own
+                    // `CreateBudgetAction` call, against a budget that already exists.
+                    actions: Vec::new(),
+                    tags: input.resource_tags.unwrap_or_default(),
+                },
+            );
+            alerts
+        };
+
+        crate::state::alerts::deliver(ctx, &alerts).await;
 
         Ok(CreateBudgetOutput {})
     }

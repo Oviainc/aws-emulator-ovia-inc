@@ -18,6 +18,12 @@
 //! An `ExclusionList` is stored as given — each service's codes in the order the
 //! caller named them — the way `StartAutoManagement` stores it.
 //!
+//! Only SOME of the modes the `OptInType` enum declares are available yet: the
+//! member's own documentation (below) names the available subset, so an update naming
+//! a mode outside it is refused with the modelled `IllegalArgumentException` and
+//! changes nothing at all — see [`crate::state::AVAILABLE_OPT_IN_TYPES`], the rule
+//! `StartAutoManagement` applies to the same member.
+//!
 //! ---
 //!
 //! # Modeled contract for `UpdateAutoManagement`
@@ -116,6 +122,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // An opt-in type the service does not offer yet is refused before anything is
+        // read or written: it is a fact of the REQUEST, the way the constraints the
+        // boundary validator checks just before this are, so it is refused whatever
+        // the account's configuration is.
+        if input
+            .opt_in_type
+            .as_deref()
+            .is_some_and(|opt_in_type| !crate::state::opt_in_type_is_available(opt_in_type))
+        {
+            return Err(UpdateAutoManagementErrorModeled::IllegalArgumentException(
+                IllegalArgumentException {
+                    message: Some(crate::state::unavailable_opt_in_type_message()),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateAutoManagementErrorModeled::ServiceException(ServiceException {
                 message: Some("the Service Quotas state store is unavailable".to_string()),

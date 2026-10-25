@@ -220,9 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A group MemoryDB itself provides carries its family's engine defaults and is
         // not the caller's to change, through the same rule the tag mutations refuse one
         // with — so the group's values are left exactly as the family publishes them.
-        if let Some(message) =
-            crate::state::immutable_parameter_group_rejection(&parameter_group_name)
-        {
+        if let Some(message) = crate::state::immutable_parameter_group_rejection(
+            &parameter_group_name,
+            crate::state::Mutation::Modify,
+        ) {
             return Err(
                 UpdateParameterGroupErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {

@@ -2,21 +2,20 @@
 
 //! End-to-end tests for `ImportHypervisorConfiguration` reached CONCURRENTLY.
 //!
-//! The rule under test: an import mints one persisted hypervisor record per HOST and
-//! nothing else — the record stands for the machine reachable at `Host`, so imports of
-//! DISTINCT hosts are independent of one another (each mints its own record and its own
-//! `HypervisorArn`, whatever `Name`, `KmsKeyArn` or `Tags` they share), while imports of
-//! ONE host can only ever leave one record behind, so exactly one of them succeeds and
-//! every other is refused with the modelled `ConflictException`. That holds however many
-//! callers arrive at the same instant: the host lookup, the store bound and the insert
-//! are one atomic step, not three a second caller can interleave with.
+//! The rule under test: an import mints one persisted hypervisor record PER CALL, keyed
+//! by the `HypervisorArn` it mints for it and by nothing else — so concurrent imports are
+//! independent of one another whatever they share, each minting its own record under its
+//! own ARN, whether their `Host`, `Name`, `KmsKeyArn` or `Tags` differ or are identical.
+//! That holds however many callers arrive at the same instant: the store bound and the
+//! insert are one atomic step, so N racing callers leave exactly N records and no caller
+//! loses its work.
 //!
 //! The sibling suite `hypervisor_reads` pins the same rule for imports issued one after
-//! another; these cases arrive at once, on a multi-threaded runtime, which is where a
-//! lookup-then-insert that is not atomic reports two records for one host (or two
-//! winners). The rows span the number of racing callers, the host form (IPv4, FQDN, the
-//! modelled 3-character minimum), whether the racers share a `Name`, and whether they
-//! carry a `KmsKeyArn` (in both forms its pattern accepts).
+//! another; these cases arrive at once, on a multi-threaded runtime, which is where an
+//! insert that is not atomic drops a racer's record or lands it on another's. The rows
+//! span the number of racing callers, the host form (IPv4, FQDN, the modelled 3-character
+//! minimum), whether the racers share a `Name` or a `Host`, and whether they carry a
+//! `KmsKeyArn` (in both forms its pattern accepts).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -103,13 +102,16 @@ fn stored_hypervisors(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .hypervisor_count()
 }
 
-/// The ARN the store holds the record for `host` under, if it holds one.
-fn stored_arn_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> Option<String> {
+/// The ARNs the store holds records for `host` under. A set, because `Host` is not a
+/// key: any number of records may carry one host.
+fn stored_arns_for_host(engine: &Arc<engine::InMemoryEngine>, host: &str) -> BTreeSet<String> {
     service_state(&**engine)
         .expect("the in-memory engine must expose this state")
         .lock()
-        .hypervisor_by_host(host)
+        .hypervisors_for_host(host)
+        .iter()
         .map(|record| record.arn.clone())
+        .collect()
 }
 
 async fn get_hypervisor(router: &MultiServiceRouter, arn: &str) -> Reply {
@@ -200,23 +202,23 @@ async fn concurrent_imports_of_distinct_hosts_are_all_independent() {
         );
         for (index, (_, host, _)) in requests.iter().enumerate() {
             assert_eq!(
-                stored_arn_for_host(&engine, host).as_ref(),
-                Some(&arns[index]),
+                stored_arns_for_host(&engine, host),
+                BTreeSet::from([arns[index].clone()]),
                 "case {case:?}: host {host:?} must be held under racer {index}'s ARN {:?}, \
                  got {:?}",
                 arns[index],
-                stored_arn_for_host(&engine, host)
+                stored_arns_for_host(&engine, host)
             );
         }
     }
 }
 
-/// RULE: one host, one record — concurrent imports of the SAME host have exactly one
-/// winner, and every loser is refused with the modelled `ConflictException` (HTTP 409)
-/// while writing nothing.
+/// RULE: one call, one record — concurrent imports of the SAME host all succeed, each
+/// minting its own `HypervisorArn`, because the ARN is a record's only identity and
+/// `Host` constrains nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_imports_of_one_host_leave_exactly_one_record() {
-    // (case, the contested host, how many callers race, do they all share one Name?)
+async fn concurrent_imports_of_one_host_each_mint_their_own_record() {
+    // (case, the shared host, how many callers race, do they all share one Name?)
     let cases: [(&str, &str, usize, bool); 5] = [
         ("two callers, an IPv4 host", "198.51.100.10", 2, false),
         (
@@ -252,89 +254,71 @@ async fn concurrent_imports_of_one_host_leave_exactly_one_record() {
 
         let replies = race_imports(&router, requests.clone()).await;
 
-        let mut winners = Vec::new();
-        for (index, reply) in &replies {
-            if reply.status == 200 {
-                winners.push((
-                    *index,
-                    reply
-                        .str_at("/HypervisorArn")
-                        .unwrap_or_else(|| {
-                            panic!("case {case:?}: winner {index}: no HypervisorArn in {:?}", reply.body)
-                        })
-                        .to_string(),
-                ));
-                continue;
-            }
+        let mut arns = Vec::new();
+        for ((index, reply), (name, _, kms_key_arn)) in replies.iter().zip(&requests) {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: racer {index} must answer 200 — one host constrains no \
+                 import — got {} {:?}",
+                reply.status, reply.body
+            );
+            let arn = reply
+                .str_at("/HypervisorArn")
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: racer {index}: no HypervisorArn in {:?}", reply.body)
+                })
+                .to_string();
+            // Each record reports the members ITS request carried, so no racer's write
+            // landed on another's record.
+            let read = get_hypervisor(&router, &arn).await;
             assert_eq!(
                 (
-                    reply.status,
-                    reply.code.as_deref(),
-                    reply.str_at("/ErrorCode"),
+                    read.status,
+                    read.str_at("/Hypervisor/Name"),
+                    read.str_at("/Hypervisor/Host"),
+                    read.str_at("/Hypervisor/KmsKeyArn"),
+                    read.str_at("/Hypervisor/State"),
                 ),
-                (409, Some("ConflictException"), Some("HypervisorAlreadyExists")),
-                "case {case:?}: loser {index} must be refused with 409 ConflictException, \
-                 got {} {:?}",
-                reply.status,
-                reply.body
+                (
+                    200,
+                    Some(name.as_str()),
+                    Some(host),
+                    kms_key_arn.as_deref(),
+                    Some(HYPERVISOR_PENDING),
+                ),
+                "case {case:?}: racer {index} must read back its own record, got {} {:?}",
+                read.status,
+                read.body
             );
-            assert!(
-                reply.str_at("/HypervisorArn").is_none(),
-                "case {case:?}: loser {index} must hand back no HypervisorArn, got {:?}",
-                reply.body
-            );
+            arns.push(arn);
         }
 
+        let unique: BTreeSet<String> = arns.iter().cloned().collect();
         assert_eq!(
-            winners.len(),
-            1,
-            "case {case:?}: {racers} callers racing for one host must have exactly one \
-             winner, got {winners:?}"
+            unique.len(),
+            racers,
+            "case {case:?}: {racers} callers must mint {racers} distinct ARNs, got {arns:?}"
         );
-        let (winner_index, winner_arn) = &winners[0];
         assert_eq!(
             stored_hypervisors(&engine),
-            1,
-            "case {case:?}: one host must leave exactly one record, got {}",
+            racers,
+            "case {case:?}: {racers} imports must leave {racers} records, got {}",
             stored_hypervisors(&engine)
         );
         assert_eq!(
-            stored_arn_for_host(&engine, host).as_ref(),
-            Some(winner_arn),
-            "case {case:?}: the store must hold the host under the winner's ARN \
-             {winner_arn:?}, got {:?}",
-            stored_arn_for_host(&engine, host)
-        );
-
-        // The record the host is held under is the WINNER's request, not a loser's: it
-        // reads back with the name and KMS key that caller asked for.
-        let (name, _, kms_key_arn) = &requests[*winner_index];
-        let read = get_hypervisor(&router, winner_arn).await;
-        assert_eq!(
-            (
-                read.status,
-                read.str_at("/Hypervisor/Name"),
-                read.str_at("/Hypervisor/Host"),
-                read.str_at("/Hypervisor/KmsKeyArn"),
-            ),
-            (
-                200,
-                Some(name.as_str()),
-                Some(host),
-                kms_key_arn.as_deref(),
-            ),
-            "case {case:?}: the surviving record must be racer {winner_index}'s, got {} {:?}",
-            read.status,
-            read.body
+            stored_arns_for_host(&engine, host),
+            unique,
+            "case {case:?}: every racer's record must be stored for host {host:?}, got {:?}",
+            stored_arns_for_host(&engine, host)
         );
     }
 }
 
-/// RULE (the refusal is about the host alone, and it survives the race): once one caller
-/// holds a host, EVERY later import of that host is refused however many arrive at once,
-/// and deleting the record makes the host importable again.
+/// RULE (a stored record constrains no later call): once one caller holds a host, every
+/// later import of that host mints its own record however many arrive at once, and
+/// deleting one of them leaves the others exactly as they were.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_held_host_refuses_every_racing_import_until_it_is_deleted() {
+async fn a_held_host_does_not_refuse_a_later_import() {
     let engine = build_engine();
     let router = Arc::new(build_router(&engine));
     let host = "198.51.100.42";
@@ -347,7 +331,7 @@ async fn a_held_host_refuses_every_racing_import_until_it_is_deleted() {
     .await;
     assert_eq!(
         first.status, 200,
-        "the first import of a free host must answer 200, got {} {:?}",
+        "the first import of a host must answer 200, got {} {:?}",
         first.status, first.body
     );
     let held = first
@@ -355,40 +339,63 @@ async fn a_held_host_refuses_every_racing_import_until_it_is_deleted() {
         .unwrap_or_else(|| panic!("no HypervisorArn in {:?}", first.body))
         .to_string();
 
-    // Rows: how many callers race for the host that is already held. None of them may
-    // win, whatever their count.
+    // Rows: how many callers race for the host that is already held. Every one of them
+    // mints its own record, whatever their count.
+    let mut minted: BTreeSet<String> = BTreeSet::from([held.clone()]);
     for racers in [1usize, 2, 5] {
         let requests: Vec<(String, String, Option<String>)> = (0..racers)
             .map(|index| (format!("hv-late-{index}"), host.to_string(), kms_key_of(index)))
             .collect();
         for (index, reply) in race_imports(&router, requests).await {
             assert_eq!(
-                (reply.status, reply.code.as_deref()),
-                (409, Some("ConflictException")),
-                "case {racers} late callers: racer {index} must be refused with 409 \
-                 ConflictException, got {} {:?}",
-                reply.status,
-                reply.body
+                reply.status, 200,
+                "case {racers} late callers: racer {index} must answer 200, got {} {:?}",
+                reply.status, reply.body
+            );
+            let arn = reply
+                .str_at("/HypervisorArn")
+                .unwrap_or_else(|| {
+                    panic!("case {racers} late callers: racer {index}: no HypervisorArn in {:?}", reply.body)
+                })
+                .to_string();
+            assert!(
+                minted.insert(arn.clone()),
+                "case {racers} late callers: racer {index} must mint an ARN of its own, got \
+                 {arn:?} again"
             );
         }
         assert_eq!(
             stored_hypervisors(&engine),
-            1,
-            "case {racers} late callers: the refused imports must have written nothing, \
-             got {} records",
-            stored_hypervisors(&engine)
+            minted.len(),
+            "case {racers} late callers: every import must have left a record, got {} for \
+             {} ARNs",
+            stored_hypervisors(&engine),
+            minted.len()
+        );
+        assert_eq!(
+            stored_arns_for_host(&engine, host),
+            minted,
+            "case {racers} late callers: every record must be stored for host {host:?}, \
+             got {:?}",
+            stored_arns_for_host(&engine, host)
         );
     }
 
-    // The conflict is keyed on a record the store HOLDS, so removing the record frees
-    // the host: the next import of it succeeds and mints a new ARN.
+    // Deleting ONE of the records that share the host removes that record and no other.
     let deleted = call(&router, "DeleteHypervisor", &json!({ "HypervisorArn": held })).await;
     assert_eq!(
         (deleted.status, deleted.str_at("/HypervisorArn")),
         (200, Some(held.as_str())),
-        "deleting the holder must answer 200 with its ARN, got {} {:?}",
+        "deleting one of the records must answer 200 with its ARN, got {} {:?}",
         deleted.status,
         deleted.body
+    );
+    minted.remove(&held);
+    assert_eq!(
+        stored_arns_for_host(&engine, host),
+        minted,
+        "the records that were not deleted must still be stored for host {host:?}, got {:?}",
+        stored_arns_for_host(&engine, host)
     );
 
     let again = call(
@@ -397,15 +404,15 @@ async fn a_held_host_refuses_every_racing_import_until_it_is_deleted() {
         &import_body("hv-reimported", host, None),
     )
     .await;
+    assert_eq!(
+        again.status, 200,
+        "the host must still be importable, got {} {:?}",
+        again.status, again.body
+    );
     let reimported = again
         .str_at("/HypervisorArn")
         .unwrap_or_else(|| panic!("no HypervisorArn in {:?}", again.body))
         .to_string();
-    assert_eq!(
-        again.status, 200,
-        "a host whose record was deleted must be importable again, got {} {:?}",
-        again.status, again.body
-    );
     assert_ne!(
         reimported, held,
         "the re-import must mint its own record, got the deleted ARN {held:?} again"

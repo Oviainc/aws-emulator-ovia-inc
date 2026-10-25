@@ -26,6 +26,16 @@ hex = { workspace = true }
 # Mints the UUID `ActionId` CreateBudgetAction gives a new budget action — "a
 # system-generated universally unique identifier (UUID) for the action" (`Action$ActionId`).
 uuid = { version = "1", features = ["v4"] }
+# `arn`: the ONE parse of a caller-supplied resource ARN, shared with every other
+# service — the topic an SNS subscriber's `Address` names is read through it rather
+# than split here.
+service-common = { path = "../common" }
+# The AWS SDK for Amazon SNS, driven over the in-process callback
+# (`OperationContext::callback`): a notification in the `ALARM` state publishes its
+# budget alert to each `SNS` subscriber's topic (`state::alerts`). Only the generated
+# client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack
+# and runtime are left out.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +43,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# SNS is mounted beside budgets on one engine in the alert-delivery suite, because a
+# budget alert is asserted where a client sees it: on the topic the subscriber named.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

@@ -16,9 +16,9 @@
 //! * the account ALREADY HAS the `open-access` ACL (whose only member is the built-in
 //!   `default` user) before any `CreateACL` call: a describe answers with it, a create
 //!   naming it collides, and a cluster can be created with it;
-//! * every paginated listing accepts `MaxResults` in 1..=50 and refuses anything outside
-//!   that window with the modelled `InvalidParameterValueException`, at each bound and
-//!   one past it;
+//! * every paginated listing accepts `MaxResults` in 20..=100 and refuses anything
+//!   outside that window with the modelled `InvalidParameterValueException`, at each
+//!   bound and one past it;
 //! * a parameter group created without a `Description` reads back with the service's own
 //!   default, and one created with any description reads that back verbatim;
 //! * a user, ACL, cluster or parameter-group name is refused unless it is at most 40

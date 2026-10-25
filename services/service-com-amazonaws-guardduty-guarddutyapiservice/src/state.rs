@@ -1168,12 +1168,27 @@ pub fn publishing_destination_limit_message() -> String {
 /// `smithy_query(query="doc",shape="DestinationProperties",member="DestinationArn")`),
 /// and the resource keeps any further `:` it carries.
 pub fn is_arn_for(service: &str, arn: &str) -> bool {
+    arn_fields(arn).is_some_and(|[_, partition, arn_service, _, _, resource]| {
+        !partition.is_empty() && arn_service == service && !resource.is_empty()
+    })
+}
+
+/// The six fields of `arn` — `arn`, partition, service, region, account id and
+/// resource — or `None` unless it has all six and opens with `arn`.
+///
+/// The ONE definition of how an ARN splits in this crate: [`is_arn_for`] judges
+/// the fields and [`parse_tagged_resource_arn`] reads them, so the two cannot
+/// disagree about what a well-formed ARN is. The resource keeps any further `:`
+/// it carries.
+fn arn_fields(arn: &str) -> Option<[&str; 6]> {
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    fields.len() == 6
-        && fields[0] == "arn"
-        && !fields[1].is_empty()
-        && fields[2] == service
-        && !fields[5].is_empty()
+    let [prefix, partition, service, region, account_id, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *prefix != "arn" {
+        return None;
+    }
+    Some([prefix, partition, service, region, account_id, resource])
 }
 
 // ---------------------------------------------------------------------------
@@ -4052,7 +4067,10 @@ pub const MALWARE_SCAN_CATEGORY_INCREMENTAL: &str = "INCREMENTAL_SCAN";
 /// (`smithy_query(operation="GetMalwareScan")`), for a rejection to name.
 pub const SCAN_ID_MEMBER: &str = "scanId";
 
-/// The wire name of `StartMalwareScan`'s `ResourceArn` member, for the same reason.
+/// The wire name of `StartMalwareScan`'s `ResourceArn` member, for the same
+/// reason. The tagging operations carry a `ResourceArn` of their own — the URI
+/// label of `/tags/{ResourceArn}` (`smithy_query(operation="UntagResource")`) —
+/// and a rejection names it by the same wire name.
 pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 
 /// The message a read of a scan this account and Region does not hold answers with.
@@ -7078,6 +7096,178 @@ pub const NOT_THE_ORGANIZATION_ADMIN_MESSAGE: &str = "The request is rejected be
 /// ([`MAX_ORGANIZATION_ADMIN_REGIONS`]). States the rule without quoting the
 /// caller's Region back, like [`DETECTOR_REGION_LIMIT_MESSAGE`].
 pub const ORGANIZATION_ADMIN_REGION_LIMIT_MESSAGE: &str = "The request is rejected because this emulator will not hold a GuardDuty delegated administrator for any further Regions.";
+
+// ---------------------------------------------------------------------------
+// Resource tagging
+//
+// A tagging operation names its resource by ARN rather than by id: `TagResource`,
+// `UntagResource` and `ListTagsForResource` all carry a `GuardDutyArn`
+// `ResourceArn` whose pattern confines it to the detector resource path
+// (`smithy_query(operation="UntagResource")`). The parse and the tag-map lookup
+// live here, once, so the operations that add, remove and report tags cannot
+// disagree about which resource an ARN names or where its tags are kept.
+// ---------------------------------------------------------------------------
+
+/// A detector sub-resource that carries tags of its own.
+///
+/// One variant per collection hanging off [`Detector`] whose record has a tag
+/// map; the detector itself is the ARN that carries no sub-resource path at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedSubResource {
+    Filter,
+    IpSet,
+    ThreatIntelSet,
+    TrustedEntitySet,
+    ThreatEntitySet,
+    PublishingDestination,
+}
+
+/// The ARN resource-path segment that names each sub-resource, which is the
+/// segment that resource's own REST URI uses: `GetFilter` is bound to
+/// `/detector/{DetectorId}/filter/{FilterName}`, `GetIPSet` to
+/// `.../ipset/{IpSetId}`, `GetThreatIntelSet` to
+/// `.../threatintelset/{ThreatIntelSetId}`, `GetTrustedEntitySet` to
+/// `.../trustedentityset/{TrustedEntitySetId}`, `GetThreatEntitySet` to
+/// `.../threatentityset/{ThreatEntitySetId}` and
+/// `DescribePublishingDestination` to
+/// `.../publishingDestination/{DestinationId}`
+/// (`smithy_query(operation="GetFilter,GetIPSet,GetThreatIntelSet,GetTrustedEntitySet,GetThreatEntitySet,DescribePublishingDestination")`).
+pub const TAGGED_SUB_RESOURCE_SEGMENTS: [(&str, TaggedSubResource); 6] = [
+    ("filter", TaggedSubResource::Filter),
+    ("ipset", TaggedSubResource::IpSet),
+    ("threatintelset", TaggedSubResource::ThreatIntelSet),
+    ("trustedentityset", TaggedSubResource::TrustedEntitySet),
+    ("threatentityset", TaggedSubResource::ThreatEntitySet),
+    (
+        "publishingDestination",
+        TaggedSubResource::PublishingDestination,
+    ),
+];
+
+/// The resource a tagging operation's `ResourceArn` names, as the ARN spells it
+/// out: the scope it claims plus the detector and — for a sub-resource — which
+/// one of the detector's collections holds it, under which id.
+///
+/// Form only. Nothing here is resolved against the store, and the claimed scope
+/// is not checked either: both are the job of
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::tagged_resource_tags_mut`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    /// The partition the ARN claims.
+    pub partition: String,
+    /// The Region the ARN claims.
+    pub region: String,
+    /// The account the ARN claims.
+    pub account_id: String,
+    /// The `DetectorId` the resource path names.
+    pub detector_id: String,
+    /// The sub-resource the path continues into and the id that names it within
+    /// the detector, or `None` when the ARN names the detector itself.
+    pub sub_resource: Option<(TaggedSubResource, String)>,
+}
+
+/// The resource `arn` names, when `arn` is the ARN of a GuardDuty resource that
+/// carries tags.
+///
+/// `None` when it is not: a resource path that is not a detector's, or one whose
+/// type segment is none of [`TAGGED_SUB_RESOURCE_SEGMENTS`] — the Malware
+/// Protection plan and custom-detection-rule ARNs
+/// ([`malware_protection_plan_arn`], [`custom_detection_rule_arn`]) are of that
+/// kind, and are not reachable through `/tags/{ResourceArn}` at all because the
+/// member's pattern admits only the detector path.
+pub fn parse_tagged_resource_arn(arn: &str) -> Option<TaggedResource> {
+    let [_, partition, service, region, account_id, resource] = arn_fields(arn)?;
+    if service != GUARDDUTY_ARN_SERVICE {
+        return None;
+    }
+    let segments: Vec<&str> = resource.split('/').collect();
+    let (detector_id, sub_resource) = match segments.as_slice() {
+        ["detector", detector_id] if !detector_id.is_empty() => ((*detector_id).to_string(), None),
+        ["detector", detector_id, kind, id] if !detector_id.is_empty() && !id.is_empty() => {
+            let sub_resource = TAGGED_SUB_RESOURCE_SEGMENTS
+                .iter()
+                .find(|(segment, _)| segment == kind)
+                .map(|(_, sub_resource)| *sub_resource)?;
+            (
+                (*detector_id).to_string(),
+                Some((sub_resource, (*id).to_string())),
+            )
+        }
+        _ => return None,
+    };
+    Some(TaggedResource {
+        partition: partition.to_string(),
+        region: region.to_string(),
+        account_id: account_id.to_string(),
+        detector_id,
+        sub_resource,
+    })
+}
+
+/// Classify a `ResourceArn` this endpoint resolves no taggable resource for, the
+/// way [`minted_id_rejection`] classifies an id: an ARN that names no resource
+/// this service tags is a parameter failure, a well-formed one this
+/// account/Region does not hold an ownership failure. The class comes from the
+/// REQUEST, and neither message quotes the ARN back.
+pub fn resource_arn_rejection(arn: &str) -> String {
+    if parse_tagged_resource_arn(arn).is_some() {
+        not_owned_message(RESOURCE_ARN_MEMBER)
+    } else {
+        invalid_parameter_message(RESOURCE_ARN_MEMBER)
+    }
+}
+
+impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
+    /// The tag map of the resource `arn` names, as `region`'s endpoint holds it,
+    /// for an operation that WRITES tags.
+    ///
+    /// `None` unless the ARN names a resource this endpoint serves: the scope it
+    /// claims must be this emulator's partition and account
+    /// ([`::engine::emulator_arn`] mints every ARN here under them) and the
+    /// Region serving the request, because a detector and everything hanging off
+    /// it are regional — "you must create a detector in each Region where you
+    /// enable the service" (`smithy_query(query="doc",shape="CreateDetector")`) —
+    /// and the record must exist.
+    ///
+    /// Tags are kept on the resource's own record, so the map this hands back is
+    /// the one its read reports: nothing can tag a resource in a place its
+    /// `Get`/`Describe` does not look.
+    pub fn tagged_resource_tags_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        let resource = parse_tagged_resource_arn(arn)?;
+        if resource.partition != PARTITION
+            || resource.region != region
+            || resource.account_id != ::engine::emulator_account_id()
+        {
+            return None;
+        }
+        let detector = self.detector_in_mut(region, &resource.detector_id)?;
+        let Some((sub_resource, id)) = &resource.sub_resource else {
+            return Some(&mut detector.tags);
+        };
+        match sub_resource {
+            TaggedSubResource::Filter => detector.filters.get_mut(id).map(|f| &mut f.tags),
+            TaggedSubResource::IpSet => detector.ip_sets.get_mut(id).map(|s| &mut s.tags),
+            TaggedSubResource::ThreatIntelSet => {
+                detector.threat_intel_sets.get_mut(id).map(|s| &mut s.tags)
+            }
+            TaggedSubResource::TrustedEntitySet => detector
+                .trusted_entity_sets
+                .get_mut(id)
+                .map(|s| &mut s.tags),
+            TaggedSubResource::ThreatEntitySet => {
+                detector.threat_entity_sets.get_mut(id).map(|s| &mut s.tags)
+            }
+            TaggedSubResource::PublishingDestination => detector
+                .publishing_destinations
+                .get_mut(id)
+                .map(|d| &mut d.tags),
+        }
+    }
+}
 
 /// The AWS Region a request was signed for, which is the Region the resources it
 /// creates live in. Falls back to the emulator's default Region for an unsigned

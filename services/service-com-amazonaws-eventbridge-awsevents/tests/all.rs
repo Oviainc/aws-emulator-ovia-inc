@@ -23,6 +23,8 @@ mod event_bus_lifecycle;
 mod input_validation;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
+#[path = "all/partner_event_source.rs"]
+mod partner_event_source;
 #[path = "all/reserved_event_source.rs"]
 mod reserved_event_source;
 #[path = "all/resource_tagging.rs"]

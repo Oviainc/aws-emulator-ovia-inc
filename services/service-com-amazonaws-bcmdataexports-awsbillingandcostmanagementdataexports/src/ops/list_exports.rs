@@ -176,24 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
-        let (exports, next_token) = crate::state::page(
+        let (exports, next_token) = crate::state::page_or_token_refusal(
             crate::state::PageTokenKind::Exports,
             &references,
             input.max_results,
             input.next_token.as_deref(),
-        )
-        .ok_or_else(|| {
-            ListExportsErrorModeled::ValidationException(ValidationException {
-                message: "NextToken is not a pagination token issued by this service."
-                    .to_string(),
-                reason: Some("fieldValidationFailed".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "The token must be one returned by a previous ListExports call."
-                        .to_string(),
-                }]),
-            })
-        })?;
+            "The token must be one returned by a previous ListExports call.",
+            ListExportsErrorModeled::ValidationException,
+        )?;
 
         Ok(ListExportsOutput {
             exports: Some(exports),

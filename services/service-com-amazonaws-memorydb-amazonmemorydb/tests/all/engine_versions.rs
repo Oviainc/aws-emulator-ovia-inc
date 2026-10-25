@@ -19,10 +19,12 @@
 //!   the service does not run at all is the modelled
 //!   `InvalidParameterCombinationException` naming it;
 //! * `DefaultOnly` reports the greatest minor version of each parameter group family;
-//! * the listing pages over the whole catalog in catalog order for any `MaxResults`;
+//! * the listing pages over the whole catalog in catalog order for any `MaxResults` the
+//!   service's page-size window admits;
 //! * describing engine versions is a READ: it changes nothing a later caller sees.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
@@ -345,15 +347,23 @@ async fn default_only_reports_the_latest_version_of_each_family() {
     }
 }
 
-/// The listing pages over the whole catalog in catalog order for ANY page size, and a
-/// page size below the minimum of 1, or a token naming no position, is refused.
+/// The listing pages over the whole catalog in catalog order for any page size the
+/// service's window admits, and a page size outside that window, or a token naming no
+/// position, is refused.
 #[tokio::test]
 async fn the_listing_pages_over_the_whole_catalog() {
     let router = router();
     let catalog = catalog(&router).await;
 
-    // Every page size from the published minimum of 1 up to one past the catalog size.
-    for max_results in 1..=catalog.len() + 1 {
+    // At the bottom of the page-size window, one past it, and at the top: the catalog is
+    // smaller than the smallest page the service serves, so every one of them is a page
+    // that holds it whole — which is the rule under test.
+    for max_results in [
+        MIN_MAX_RESULTS,
+        MIN_MAX_RESULTS + 1,
+        (MIN_MAX_RESULTS + MAX_MAX_RESULTS) / 2,
+        MAX_MAX_RESULTS,
+    ] {
         let case = format!("MaxResults {max_results}");
         let mut collected: Vec<Reported> = Vec::new();
         let mut token: Option<String> = None;
@@ -366,7 +376,7 @@ async fn the_listing_pages_over_the_whole_catalog() {
             let body = ok(&router, "DescribeEngineVersions", &request, &case).await;
             let page = reported(&body, &case);
             assert!(
-                page.len() <= max_results,
+                i32::try_from(page.len()).unwrap_or(i32::MAX) <= max_results,
                 "case {case:?}: a page must hold at most {max_results} entries, got {page:?}"
             );
             collected.extend(page);
@@ -390,9 +400,10 @@ async fn the_listing_pages_over_the_whole_catalog() {
         );
     }
 
-    let refused: [Value; 3] = [
-        // One past the minimum page size of 1.
-        json!({ "MaxResults": 0 }),
+    let refused: [Value; 4] = [
+        // Outside the page-size window, on each side of it.
+        json!({ "MaxResults": MIN_MAX_RESULTS - 1 }),
+        json!({ "MaxResults": MAX_MAX_RESULTS + 1 }),
         json!({ "MaxResults": -1 }),
         // A token no page of this listing ever handed out.
         json!({ "NextToken": "zzz-no-such-position" }),

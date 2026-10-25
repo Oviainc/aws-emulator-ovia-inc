@@ -44,7 +44,7 @@ use crate::ssoadmin_permission_sets::{
 /// one. The delete path itself is driven over the wire in `instance_delete.rs`; this
 /// helper sets the same two fields directly so a create can be tested without waiting out
 /// a deletion, and everything it then asserts goes over the wire.
-fn empty_account_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn empty_account_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     with_store(&engine, |store| {
         store.instances.clear();
@@ -57,7 +57,7 @@ fn empty_account_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// clock owes can be observed on both sides of it without the test sleeping. The
 /// transition itself is still applied by the service's own `materialize_due`, exactly as
 /// in production.
-fn hold_activation(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
+pub(crate) fn hold_activation(engine: &Arc<engine::InMemoryEngine>, due_at: SystemTime) {
     with_store(engine, |store| {
         for instance in store.instances.values_mut() {
             instance.active_due = Some(due_at);
