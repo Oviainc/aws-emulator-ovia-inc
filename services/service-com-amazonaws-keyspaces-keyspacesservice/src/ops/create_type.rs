@@ -290,18 +290,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keyspace, or that names one which is not `ACTIVE` yet, is a type "that doesn't
         // exist. The resource might not be specified correctly, or its status might not
         // be ACTIVE" (`ResourceNotFoundException`). Nothing is stored in that case.
+        let usable_type_names = keyspace.usable_type_names();
         for field in &input.field_definitions {
-            for referenced in crate::state::referenced_type_names(&field.r#type) {
-                let usable = keyspace
-                    .types
-                    .get(&referenced)
-                    .is_some_and(|udt| udt.status == crate::state::TYPE_STATUS_ACTIVE);
-                if !usable {
-                    return Err(CreateTypeErrorModeled::ResourceNotFoundException(
-                        crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
-                    )
-                    .into());
-                }
+            if let Some(referenced) =
+                crate::state::unresolvable_type_reference(&field.r#type, &usable_type_names)
+            {
+                return Err(CreateTypeErrorModeled::ResourceNotFoundException(
+                    crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
+                )
+                .into());
             }
         }
 

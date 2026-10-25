@@ -210,15 +210,15 @@ pub(crate) async fn list_providers(h: &Harness, body: &Value) -> Reply {
     call(h, "/identity-provider/ListIdentityProviders", body).await
 }
 
-async fn start_subscription(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn start_subscription(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/StartProductSubscription", body).await
 }
 
-async fn stop_subscription(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn stop_subscription(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/StopProductSubscription", body).await
 }
 
-async fn list_subscriptions(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn list_subscriptions(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/ListProductSubscriptions", body).await
 }
 

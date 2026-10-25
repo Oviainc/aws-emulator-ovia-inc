@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{
     ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, RateBasedRule,
     RegexPatternSet, Rule, RuleGroup, RuleSummary, SizeConstraint, SizeConstraintSet,
-    SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
+    SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, WebACLSummary, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
 
@@ -562,6 +562,84 @@ pub fn parse_rule_group_arn(arn: &str) -> Option<&str> {
     (resource_type == ARN_TYPE_RULE_GROUP).then_some(resource_id)
 }
 
+/// The `ResourceType` wire value of an application load balancer, from the model's
+/// generated `RESOURCE_TYPE_VALUES` (`APPLICATION_LOAD_BALANCER`, `API_GATEWAY`).
+pub const RESOURCE_TYPE_APPLICATION_LOAD_BALANCER: &str = "APPLICATION_LOAD_BALANCER";
+/// The `ResourceType` wire value of an Amazon API Gateway stage — see
+/// [`RESOURCE_TYPE_APPLICATION_LOAD_BALANCER`].
+pub const RESOURCE_TYPE_API_GATEWAY: &str = "API_GATEWAY";
+
+/// The `ResourceType` of the resource `arn` names, or `None` when `arn` is malformed or
+/// names a resource a regional web ACL cannot protect.
+///
+/// Source: `AssociateWebACL$ResourceArn`'s own documentation — "The ARN (Amazon Resource
+/// Name) of the resource to be protected, either an application load balancer or Amazon
+/// API Gateway stage. The ARN should be in one of the following formats: For an
+/// Application Load Balancer:
+/// `arn:aws:elasticloadbalancing:region:account-id:loadbalancer/app/load-balancer-name/load-balancer-id`
+/// For an Amazon API Gateway stage:
+/// `arn:aws:apigateway:region::/restapis/api-id/stages/stage-name`" — the two kinds the
+/// model's `ResourceType` catalog also names.
+///
+/// The `app` segment of the load-balancer form is what makes the kind an APPLICATION
+/// load balancer, so a `net` (or any other family) load balancer ARN names a resource
+/// this service does not protect and is not associable. As in [`parse_resource_arn`] the
+/// partition and account fields are required to be PRESENT but their values are not
+/// matched: this emulator serves a single account, and the resource an ARN names is
+/// identified by its own segments.
+///
+/// Shared by every operation whose `ResourceArn` names a PROTECTED resource rather than
+/// a WAF resource (`AssociateWebACL`, `DisassociateWebACL`, `GetWebACLForResource`), so
+/// one rule decides which ARNs those calls accept.
+pub fn associable_resource_type(arn: &str) -> Option<&'static str> {
+    // The resource field is the REMAINDER of the ARN: a stage's resource field carries
+    // slashes, and splitting at a fixed field count keeps any later colon with the
+    // resource instead of ending the parse.
+    let mut fields = arn.splitn(6, ':');
+    let prefix = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    if prefix != "arn" || partition.is_empty() || !region_is_well_formed(region) {
+        return None;
+    }
+    let mut segments = resource.split('/');
+    match service {
+        // `loadbalancer/app/<load-balancer-name>/<load-balancer-id>`.
+        "elasticloadbalancing" => {
+            let kind = segments.next()?;
+            let family = segments.next()?;
+            let name = segments.next()?;
+            let id = segments.next()?;
+            (kind == "loadbalancer"
+                && family == "app"
+                && !name.is_empty()
+                && !id.is_empty()
+                && segments.next().is_none())
+            .then_some(RESOURCE_TYPE_APPLICATION_LOAD_BALANCER)
+        }
+        // `/restapis/<api-id>/stages/<stage-name>`, whose documented form begins with
+        // the slash that leaves the first segment empty.
+        "apigateway" => {
+            let leading = segments.next()?;
+            let restapis = segments.next()?;
+            let api_id = segments.next()?;
+            let stages = segments.next()?;
+            let stage_name = segments.next()?;
+            (leading.is_empty()
+                && restapis == "restapis"
+                && !api_id.is_empty()
+                && stages == "stages"
+                && !stage_name.is_empty()
+                && segments.next().is_none())
+            .then_some(RESOURCE_TYPE_API_GATEWAY)
+        }
+        _ => None,
+    }
+}
+
 /// The most `XssMatchSet`s this emulator stores for the account before
 /// `CreateXssMatchSet` answers its modelled `WAFLimitsExceededException`.
 ///
@@ -878,6 +956,27 @@ impl SizeConstraintSetEntry {
     }
 }
 
+/// The most resources one web ACL protects in this emulator.
+///
+/// The model states no quota and the protected resources are not records this service
+/// holds — a `ResourceArn` is text the caller brings — so without this bound a caller
+/// could grow one web ACL's association set without limit. It is CHOSEN, not cited, and
+/// bounds only how many resources one web ACL may protect, never how an association
+/// behaves.
+pub const MAX_ASSOCIATED_RESOURCES: usize = 50;
+
+/// Why a web ACL cannot be associated with a resource, as
+/// [`ComAmazonawsWafregionalAwswafRegional20161128State::associate_resource`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociateRefusal {
+    /// This service holds no `WebACL` under that id: the modelled
+    /// `WAFNonexistentItemException`.
+    NoSuchWebACL,
+    /// The web ACL already protects [`MAX_ASSOCIATED_RESOURCES`] resources, so this one
+    /// cannot be added to it.
+    TooManyResources,
+}
+
 /// One stored `WebACL`.
 #[derive(Debug, Clone)]
 pub struct WebACLEntry {
@@ -903,10 +1002,18 @@ pub struct WebACLEntry {
     /// `WebACLArn`, minted once at create time so every later read reports the same
     /// ARN rather than one rebuilt from the reading request's region.
     pub web_acl_arn: String,
+    /// The ARNs of the resources this web ACL protects, as `AssociateWebACL` wrote them
+    /// and `DisassociateWebACL` removes them. The association lives HERE, on the web
+    /// ACL's own record, so `GetWebACLForResource` and `ListResourcesForWebACL` read the
+    /// one copy the write wrote; a resource is protected by at most one web ACL, which
+    /// [`ComAmazonawsWafregionalAwswafRegional20161128State::associate_resource`]
+    /// maintains. At most [`MAX_ASSOCIATED_RESOURCES`] entries, so one record's
+    /// association state is bounded.
+    pub associated_resources: BTreeSet<String>,
 }
 
 impl WebACLEntry {
-    /// A new web ACL record, holding no rules.
+    /// A new web ACL record, holding no rules and protecting no resource.
     pub fn new(
         web_acl_id: String,
         name: String,
@@ -923,6 +1030,16 @@ impl WebACLEntry {
             rules: Vec::new(),
             tags,
             web_acl_arn,
+            associated_resources: BTreeSet::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `WebACLSummary` shape
+    /// `GetWebACLForResource` carries: the stored record's own id and name.
+    pub fn summary(&self) -> WebACLSummary {
+        WebACLSummary {
+            web_acl_id: self.web_acl_id.clone(),
+            name: self.name.clone(),
         }
     }
 
@@ -1624,6 +1741,62 @@ impl ComAmazonawsWafregionalAwswafRegional20161128State {
     /// `None` when this service held none).
     pub fn remove_ip_set(&mut self, ip_set_id: &str) -> Option<IPSetEntry> {
         self.ip_sets.remove(ip_set_id)
+    }
+
+    /// The web ACL protecting the resource `resource_arn` names, or `None` when no
+    /// stored web ACL protects it.
+    ///
+    /// A resource is protected by AT MOST ONE web ACL — [`Self::associate_resource`] is
+    /// what keeps that true — so this answers the one record holding that ARN.
+    pub fn web_acl_for_resource(&self, resource_arn: &str) -> Option<&WebACLEntry> {
+        self.web_acls
+            .values()
+            .find(|entry| entry.associated_resources.contains(resource_arn))
+    }
+
+    /// Protect the resource `resource_arn` with the web ACL `web_acl_id`.
+    ///
+    /// Associating a resource REPLACES whatever association it had: a resource is
+    /// protected by at most one web ACL, so the ARN is removed from every other record
+    /// before it is added to this one. Repeating the same association changes nothing,
+    /// so a caller may retry it.
+    pub fn associate_resource(
+        &mut self,
+        web_acl_id: &str,
+        resource_arn: &str,
+    ) -> Result<(), AssociateRefusal> {
+        // Every record OTHER than the target loses the ARN first, so no two web ACLs ever
+        // hold one resource. The target is the one record that keeps what it has, which is
+        // also what makes repeating an association a no-op.
+        let Some(target) = self.web_acls.get(web_acl_id) else {
+            return Err(AssociateRefusal::NoSuchWebACL);
+        };
+        if !target.associated_resources.contains(resource_arn)
+            && target.associated_resources.len() >= MAX_ASSOCIATED_RESOURCES
+        {
+            return Err(AssociateRefusal::TooManyResources);
+        }
+        for (id, entry) in &mut self.web_acls {
+            if id == web_acl_id {
+                entry.associated_resources.insert(resource_arn.to_string());
+            } else {
+                entry.associated_resources.remove(resource_arn);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop protecting the resource `resource_arn` names, answering the id of the web
+    /// ACL that protected it (and `None` when none did, so the resource is already
+    /// unprotected).
+    pub fn disassociate_resource(&mut self, resource_arn: &str) -> Option<String> {
+        let web_acl_id = self
+            .web_acl_for_resource(resource_arn)
+            .map(|entry| entry.web_acl_id.clone())?;
+        if let Some(entry) = self.web_acls.get_mut(&web_acl_id) {
+            entry.associated_resources.remove(resource_arn);
+        }
+        Some(web_acl_id)
     }
 
     /// The tag set of the resource `arn` names, or `None` when this store holds no

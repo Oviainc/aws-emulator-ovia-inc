@@ -168,10 +168,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// so it is enforced here rather than by a per-member constraint, and a STRICT one, so a
     /// window whose bounds are equal is refused rather than reported over: the period the
     /// projection includes its bounds in is therefore always a non-degenerate one. An
-    /// `Entity` map that identifies no entity is refused too
-    /// ([`crate::state::entity_identity_refusal_at`], the rule every other entity read
-    /// applies to the same member, named here after the member this request carries). The
-    /// reported range is the requested one, as the other time-ranged reads report it.
+    /// `Entity` map that designates no kind of object is refused too
+    /// ([`crate::state::entity_type_refusal_at`], named here after the member this request
+    /// carries). That is the TYPE half of the rule only: this member's doc lists the same
+    /// attributes per `Type` but carries none of the "must specify" sentence the reads whose
+    /// `KeyAttributes` identifies one entity carry, so no minimum identity is required here.
+    /// The reported range is the requested one, as the other time-ranged reads report it.
     ///
     /// The projection itself is derived in `crate::state`
     /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::entity_change_events`]),
@@ -188,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refused(message));
         }
         if let Some(message) =
-            crate::state::entity_identity_refusal_at(crate::state::ENTITY_MEMBER_PATH, &input.entity)
+            crate::state::entity_type_refusal_at(crate::state::ENTITY_MEMBER_PATH, &input.entity)
         {
             return Err(refused(message));
         }

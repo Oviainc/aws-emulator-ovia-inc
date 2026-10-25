@@ -1035,78 +1035,145 @@ const NAME_ATTRIBUTE: &str = "Name";
 /// location where this object is hosted" (same member doc as [`NAME_ATTRIBUTE`]).
 const ENVIRONMENT_ATTRIBUTE: &str = "Environment";
 
-/// The entity types `Type` designates, in sorted order.
+/// The `Attributes` entry that says what KIND of resource an object is: "`ResourceType`
+/// specifies the type of the resource" (same member doc as [`NAME_ATTRIBUTE`]).
+const RESOURCE_TYPE_ATTRIBUTE: &str = "ResourceType";
+
+/// The `Attributes` entry that picks out WHICH resource of that kind: "`Identifier`
+/// identifies the resource objects of this resource" (same member doc as
+/// [`NAME_ATTRIBUTE`]).
+const IDENTIFIER_ATTRIBUTE: &str = "Identifier";
+
+/// The entity types whose identity NAMES the object: `Name` "is used only if the value of
+/// the `Type` field is `Service`, `RemoteService`, or `AWS::Service`"
+/// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
+const NAMED_ENTITY_TYPES: [&str; 3] = [SERVICE_ENTITY_TYPE, "RemoteService", "AWS::Service"];
+
+/// The entity types whose identity picks out a RESOURCE: `ResourceType` and `Identifier` are
+/// used "only when the value of the `Type` field is `Resource` or `AWS::Resource`" (same
+/// member doc as [`NAMED_ENTITY_TYPES`]).
+const RESOURCE_ENTITY_TYPES: [&str; 2] = ["Resource", "AWS::Resource"];
+
+/// The entity types `Type` designates, in sorted order: the two groups above together, so
+/// the set of types and the attributes each type makes applicable cannot disagree.
 ///
 /// The `KeyAttributes` doc names them as the values the rest of the map is interpreted
-/// against: `Name` "is used only if the value of the `Type` field is `Service`,
-/// `RemoteService`, or `AWS::Service`", and `ResourceType`/`Identifier` "only when the value
-/// of the `Type` field is `Resource` or `AWS::Resource`"
-/// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")` — the same
-/// text on `ListServiceOperationsInput`, `ListServiceDependenciesInput` and
+/// against ([`NAMED_ENTITY_TYPES`], [`RESOURCE_ENTITY_TYPES`]; the same text on
+/// `ListServiceOperationsInput`, `ListServiceDependenciesInput` and
 /// `ListServiceDependentsInput`). A value outside this set designates no kind of object, so
 /// none of the other attributes has a meaning.
 pub const ENTITY_TYPES: [&str; 5] = [
-    "AWS::Resource",
-    "AWS::Service",
-    "RemoteService",
-    "Resource",
-    "Service",
+    RESOURCE_ENTITY_TYPES[1], // AWS::Resource
+    NAMED_ENTITY_TYPES[2],    // AWS::Service
+    NAMED_ENTITY_TYPES[1],    // RemoteService
+    RESOURCE_ENTITY_TYPES[0], // Resource
+    NAMED_ENTITY_TYPES[0],    // Service
 ];
+
+/// The attributes BESIDE `Type` that an identity of `entity_type` is read by: the ones the
+/// member's own per-`Type` list makes applicable to it.
+///
+/// A service is named and placed (`Name` and `Environment`); a resource is picked out by
+/// what kind of resource it is and which one (`ResourceType` and `Identifier`), for which
+/// `Name` has no meaning — which is why the pair depends on the `Type`. The resource pair is
+/// the identity the member doc writes out for a resource: `{ "Type": "AWS::Resource",
+/// "ResourceType": "AWS::DynamoDB::Table", "Identifier": "Customers" }`
+/// (`smithy_query(query="doc", shape="ListEntityEventsInput", member="Entity")`), beside the
+/// service identity the same doc writes as `{ "Type": "Service", "Name": "visits-service",
+/// "Environment": "petclinic-test" }`.
+fn identifying_attributes(entity_type: &str) -> [&'static str; 2] {
+    if RESOURCE_ENTITY_TYPES.contains(&entity_type) {
+        [RESOURCE_TYPE_ATTRIBUTE, IDENTIFIER_ATTRIBUTE]
+    } else {
+        [NAME_ATTRIBUTE, ENVIRONMENT_ATTRIBUTE]
+    }
+}
 
 /// The refusal a key-attribute map that is supposed to IDENTIFY an entity earns, or `None`
 /// when it identifies one.
 ///
-/// The identity rule the member documents is that the map designates the kind of object it
-/// names: "You must specify at least the `Type`, `Name`, and `Environment` attributes", with
-/// `Type` designating "the type of object this is" and the other attributes applicable only
-/// for particular `Type` values ([`ENTITY_TYPES`]). So a map with no `Type`, or with a
-/// `Type` outside the documented set, names no entity at all and is refused with the
-/// modelled `ValidationException` rather than answered with the caller's own map echoed back
-/// as a discovered entity.
+/// The map must first designate the KIND of object it names, with `Type` "designating the
+/// type of object this is" and carrying one of the documented values ([`ENTITY_TYPES`]): a
+/// map with no `Type`, or with a `Type` outside that set, names no entity at all and is
+/// refused with the modelled `ValidationException` rather than answered with the caller's own
+/// map echoed back as a discovered entity.
 ///
-/// Only `Type` is required here, because the doc's own per-`Type` list makes `Name`
-/// applicable to three of the five types and `Identifier`/`ResourceType` to the other two:
-/// which further attributes identify the object FOLLOWS from `Type`, so `Type` is the one
-/// entry an identity cannot be read without, and a caller may name as few of the rest as
-/// pins the entity down ([`attributes_contain`]).
+/// It must then carry the MINIMUM IDENTITY the member documents — "You must specify at least
+/// the `Type`, `Name`, and `Environment` attributes" — read against the member's own
+/// per-`Type` list: the attributes that `Type` makes applicable
+/// ([`identifying_attributes`]) are the ones saying WHICH object of that kind the read is
+/// about, so a map missing any of them pins down no single entity, however many of the
+/// others it carries.
 ///
 /// Shared so the reads that take this member as the entity to report on — `GetService`,
-/// `ListServiceOperations`, `ListServiceDependencies`, `ListServiceDependents` and
-/// `ListEntityEvents` (whose `Entity` is "the entity for which to retrieve change events")
-/// — cannot disagree about which identities are serviceable. The member is NOT the same rule
+/// `ListServiceOperations`, `ListServiceDependencies` and `ListServiceDependents` — cannot
+/// disagree about which identities are serviceable. The member is NOT the same rule
 /// everywhere it appears: `ListServiceLevelObjectives` takes an OPTIONAL filter whose doc
-/// drops the "must specify" sentence, and an SLO's own `KeyAttributes` records the object
-/// the SLO relates to, so neither is an entity lookup.
+/// drops the "must specify" sentence, an SLO's own `KeyAttributes` records the object the SLO
+/// relates to, and `ListEntityEvents` takes the entity to report on under a member whose doc
+/// carries no "must specify" sentence either — so none of them is subject to the minimum,
+/// and `ListEntityEvents` reads its entity by the type rule alone
+/// ([`entity_type_refusal_at`]). A caller may still name as few attributes BEYOND the minimum
+/// as pins the entity down ([`attributes_contain`]).
 pub fn entity_identity_refusal(key_attributes: &HashMap<String, String>) -> Option<String> {
-    entity_identity_refusal_at(KEY_ATTRIBUTES_MEMBER_PATH, key_attributes)
+    let entity_type = match entity_type_clause(KEY_ATTRIBUTES_MEMBER_PATH, key_attributes) {
+        Err(clause) => return Some(validation_envelope(&[clause])),
+        Ok(entity_type) => entity_type,
+    };
+    let clauses: Vec<String> = identifying_attributes(entity_type)
+        .into_iter()
+        .filter(|attribute| !key_attributes.contains_key(*attribute))
+        .map(|attribute| {
+            constraint_clause(
+                KEY_ATTRIBUTES_MEMBER_PATH,
+                &format!("Member must contain the entity identity attribute '{attribute}'"),
+            )
+        })
+        .collect();
+    (!clauses.is_empty()).then(|| validation_envelope(&clauses))
 }
 
-/// [`entity_identity_refusal`], for an operation that takes the entity to report on under a
-/// DIFFERENTLY NAMED member: `ListEntityEvents` takes it as `Entity`
-/// ([`ENTITY_MEMBER_PATH`]).
+/// The refusal a map that must designate the KIND of object it names earns, or `None` when it
+/// does — the type half of [`entity_identity_refusal`] on its own, for an operation whose
+/// member documents no minimum identity: `ListEntityEvents` takes the entity to report on as
+/// `Entity` ([`ENTITY_MEMBER_PATH`]), whose doc lists the same attributes per `Type` without
+/// the "must specify" sentence.
 ///
-/// The rule is the member's, not the name's, so it is one function; the NAME is a parameter
-/// because a refusal states the member the request carries, and naming a member the request
-/// never sent would leave a client with nothing to fix.
-pub fn entity_identity_refusal_at(
+/// The NAME is a parameter because a refusal states the member the request carries, and
+/// naming a member the request never sent would leave a client with nothing to fix.
+pub fn entity_type_refusal_at(
     member_path: &str,
     attributes: &HashMap<String, String>,
 ) -> Option<String> {
-    let clause = match attributes.get(TYPE_ATTRIBUTE) {
-        None => constraint_clause(
+    entity_type_clause(member_path, attributes)
+        .err()
+        .map(|clause| validation_envelope(&[clause]))
+}
+
+/// The entity type `attributes` designates, or the clause a map that designates none earns.
+///
+/// The ONE place the `Type` entry is read, so every operation that reads an entity by this
+/// map agrees on which values designate a kind of object.
+fn entity_type_clause<'attributes>(
+    member_path: &str,
+    attributes: &'attributes HashMap<String, String>,
+) -> Result<&'attributes str, String> {
+    match attributes.get(TYPE_ATTRIBUTE) {
+        None => Err(constraint_clause(
             member_path,
             &format!("Member must contain the entity type attribute '{TYPE_ATTRIBUTE}'"),
-        ),
-        Some(entity_type) if !ENTITY_TYPES.contains(&entity_type.as_str()) => constraint_clause(
-            &format!("{member_path}.{TYPE_ATTRIBUTE}"),
-            &format!(
-                "Member must satisfy enum value set: [{}]",
-                ENTITY_TYPES.join(", ")
-            ),
-        ),
-        Some(_) => return None,
-    };
-    Some(validation_envelope(&[clause]))
+        )),
+        Some(entity_type) if !ENTITY_TYPES.contains(&entity_type.as_str()) => {
+            Err(constraint_clause(
+                &format!("{member_path}.{TYPE_ATTRIBUTE}"),
+                &format!(
+                    "Member must satisfy enum value set: [{}]",
+                    ENTITY_TYPES.join(", ")
+                ),
+            ))
+        }
+        Some(entity_type) => Ok(entity_type.as_str()),
+    }
 }
 
 /// The member path a refusal of the entity-identity map names: the member in the lowerCamel
@@ -1486,8 +1553,8 @@ const NEAR_END_DIMENSIONS: [(&str, &str); 2] = [
 /// [`NEAR_END_DIMENSIONS`], for the far end of a call.
 const FAR_END_DIMENSIONS: [(&str, &str); 3] = [
     (NAME_ATTRIBUTE, "RemoteService"),
-    ("ResourceType", "RemoteResourceType"),
-    ("Identifier", "RemoteResourceIdentifier"),
+    (RESOURCE_TYPE_ATTRIBUTE, "RemoteResourceType"),
+    (IDENTIFIER_ATTRIBUTE, "RemoteResourceIdentifier"),
 ];
 
 /// The dimension carrying the operation of the entity the metrics were collected for.

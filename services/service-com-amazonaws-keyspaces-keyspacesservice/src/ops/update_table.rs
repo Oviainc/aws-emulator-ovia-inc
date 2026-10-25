@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTable
-//! IMPLEMENTED: applies ONE setting change — or a set of added columns — to a table in
+//! IMPLEMENTED: applies ONE setting change — or a set of added columns, each declaring a
+//! type this keyspace can resolve — to a table in
 //! [`crate::state`], leaves it `UPDATING` until the clock owes it `ACTIVE` again, and
 //! answers with the table's ARN. This is the ONLY file to touch for `UpdateTable`.
 //!
@@ -340,6 +341,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // KEYSPACE that holds the replication group.
         let replica_regions: Option<Vec<String>> =
             keyspace.table_replica_regions().map(<[String]>::to_vec);
+        // The user-defined types an added column's type may refer to: the ones this
+        // keyspace holds in status ACTIVE. Taken before the table is borrowed mutably,
+        // since it is the KEYSPACE that holds the types a type expression resolves
+        // against, and bounded by `MAX_TYPES_PER_KEYSPACE` names.
+        let usable_type_names = keyspace.usable_type_names();
         let Some(table) = keyspace.tables.get_mut(&input.table_name) else {
             return Err(UpdateTableErrorModeled::ResourceNotFoundException(
                 crate::state::table_not_found(&region, &input.keyspace_name, &input.table_name),
@@ -465,6 +471,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "addColumns names column '{}', which the table's schema already declares",
                             column.name
                         )));
+                    }
+                    // A column added to an existing table declares a type under the same
+                    // rule a created one does: every identifier in it that names neither
+                    // a CQL native type nor a type constructor must name a user-defined
+                    // type of THIS keyspace in status ACTIVE, and any other reference is
+                    // a type "that doesn't exist. The resource might not be specified
+                    // correctly, or its status might not be ACTIVE" — refused here, so no
+                    // schema ever holds a column of a type the service could not have
+                    // created.
+                    if let Some(referenced) = crate::state::unresolvable_type_reference(
+                        &column.r#type,
+                        &usable_type_names,
+                    ) {
+                        return Err(UpdateTableErrorModeled::ResourceNotFoundException(
+                            crate::state::type_not_found(
+                                &region,
+                                &input.keyspace_name,
+                                &referenced,
+                            ),
+                        )
+                        .into());
                     }
                 }
                 Some(added)

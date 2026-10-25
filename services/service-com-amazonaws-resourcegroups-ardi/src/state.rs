@@ -17,13 +17,20 @@
 //! [`ComAmazonawsResourcegroupsArdiState::tag_sync_tasks`], keyed by the task's own
 //! ARN — the identifier `GetTagSyncTask` and `CancelTagSyncTask` address a task by —
 //! so `StartTagSyncTask` and every reader of a task read one record.
+//!
+//! The account's optional-feature settings live beside both in
+//! [`ComAmazonawsResourcegroupsArdiState::account_settings`], which
+//! `UpdateAccountSettings` writes and `GetAccountSettings` reports, keyed by region
+//! for the same reason the groups are: the endpoint a setting was written through is
+//! the endpoint that reports it.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier, GroupingStatusesItem,
-    ListGroupResourcesItem, ResourceIdentifier, ResourceQuery, ResourceStatus, TagSyncTaskItem,
+    AccountSettings, Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier,
+    GroupingStatusesItem, ListGroupResourcesItem, ResourceIdentifier, ResourceQuery,
+    ResourceStatus, TagSyncTaskItem, GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES,
     QUERY_TYPE_VALUES,
 };
 
@@ -37,6 +44,13 @@ pub struct ComAmazonawsResourcegroupsArdiState {
     /// Every persisted tag-sync task, keyed by `TagSyncTaskRecord::task_arn`.
     /// Ordered, so a listing of tasks and its continuation token are stable.
     pub tag_sync_tasks: BTreeMap<String, TagSyncTaskRecord>,
+    /// The optional-feature settings written for this account, keyed by region,
+    /// for the same reason [`GroupKey`] carries one: this service is REGIONAL, so
+    /// a setting written through one region's endpoint is the setting that
+    /// region's endpoint reports, and another region keeps the default until it is
+    /// written itself. A region with no entry has never been written and reports
+    /// [`AccountSettingsRecord::default`].
+    pub account_settings: BTreeMap<String, AccountSettingsRecord>,
 }
 
 /// Where one resource group lives: the region whose endpoint created it, and the
@@ -147,6 +161,50 @@ impl ComAmazonawsResourcegroupsArdiState {
             .range(GroupKey::first_in(region)..)
             .take_while(move |(key, _)| key.region == region)
             .map(|(_, record)| record)
+    }
+
+    /// The optional-feature settings `region` reports at `now`.
+    ///
+    /// For a REPORTING caller: the only thing it writes is the status transition
+    /// the clock already made due ([`AccountSettingsRecord::settle_due`]), which
+    /// was owed at this instant whether or not anybody called. A region nothing
+    /// has ever been written for reports [`AccountSettingsRecord::default`]
+    /// WITHOUT storing a record, so reading never creates one.
+    pub fn account_settings_at(&mut self, region: &str, now: SystemTime) -> AccountSettingsRecord {
+        match self.account_settings.get_mut(region) {
+            Some(record) => {
+                record.settle_due(now);
+                record.clone()
+            }
+            None => AccountSettingsRecord::default(),
+        }
+    }
+
+    /// The settings record of `region`, for a caller that is about to WRITE it:
+    /// the record is created from the default when that region has none, and the
+    /// transition the clock already owes is materialised first, so a write never
+    /// discards a status that had already fallen due.
+    ///
+    /// `Err` carries the message the refusal reports when storing settings for a
+    /// region this store holds none for would push it past
+    /// [`MAX_ACCOUNT_SETTINGS_REGIONS`]; a region it already holds is always
+    /// writable, so the bound never blocks changing a setting that exists.
+    pub fn account_settings_mut(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<&mut AccountSettingsRecord, String> {
+        if !self.account_settings.contains_key(region)
+            && self.account_settings.len() >= MAX_ACCOUNT_SETTINGS_REGIONS
+        {
+            return Err(format!(
+                "this emulator holds account settings for at most \
+                 {MAX_ACCOUNT_SETTINGS_REGIONS} regions",
+            ));
+        }
+        let record = self.account_settings.entry(region.to_string()).or_default();
+        record.settle_due(now);
+        Ok(record)
     }
 }
 
@@ -914,6 +972,159 @@ impl MemberRecord {
                 .map(|name| ResourceStatus {
                     name: Some(name.clone()),
                 }),
+        }
+    }
+}
+
+/// The most regions this emulator holds account settings for at once.
+///
+/// NOT an AWS quota: a region is not a resource a caller creates. This is the
+/// emulator's bound on in-memory fixture state, so a client looping on
+/// `UpdateAccountSettings` with a different region in its credential scope every
+/// time is refused rather than growing the store without end. Reaching it is a
+/// `BadRequestException`, and a region the store already holds stays writable.
+pub const MAX_ACCOUNT_SETTINGS_REGIONS: usize = 100;
+
+/// The modelled `GroupLifecycleEventsStatus` of a feature that is on, and the
+/// `GroupLifecycleEventsDesiredStatus` a caller asks for to turn it on.
+///
+/// This and the two below are the three values this service WRITES, so each is a
+/// name for one member of the generated value lists
+/// ([`GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES`] and
+/// `GROUP_LIFECYCLE_EVENTS_STATUS_VALUES`) rather than a second statement of what
+/// those lists admit — which is why validation reads the list and not these.
+pub const LIFECYCLE_EVENTS_ACTIVE: &str = "ACTIVE";
+
+/// The modelled status and desired status of a feature that is off — and the
+/// status of an account nothing has been written for, since the feature is one
+/// `UpdateAccountSettings` "turns on or turns off", so it is off until a caller
+/// asks for it.
+pub const LIFECYCLE_EVENTS_INACTIVE: &str = "INACTIVE";
+
+/// The modelled status of a feature whose switch has been accepted and is not in
+/// effect yet. The model documents the switch as asynchronous: a caller "can call
+/// the GetAccountSettings operation to check for completion by looking for
+/// GroupLifecycleEventsStatus to change to ACTIVE".
+pub const LIFECYCLE_EVENTS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// How long after an accepted switch the requested status is owed.
+///
+/// The model documents that the switch is asynchronous but no duration for it, so
+/// this span is the emulator's own choice: long enough that a caller reading
+/// immediately after the write still observes `IN_PROGRESS`, short enough that a
+/// caller polling for completion does not wait. It is stored as a due INSTANT on
+/// the record and nothing ever sleeps on it.
+pub const LIFECYCLE_EVENTS_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The request member `UpdateAccountSettings` carries the desired status in, as a
+/// refusal names it.
+pub const DESIRED_STATUS_MEMBER: &str = "GroupLifecycleEventsDesiredStatus";
+
+/// `Ok(())` when `desired` is a status a caller may ask for, else the message the
+/// refusal reports — which names the member and the values the model admits, so a
+/// caller can fix the request from the message alone.
+///
+/// The admitted set is the model's own
+/// ([`GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES`], generated from
+/// `GroupLifecycleEventsDesiredStatus`), never a second hand-written copy of it.
+pub fn check_desired_status(desired: &str) -> Result<(), String> {
+    if GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES.contains(&desired) {
+        return Ok(());
+    }
+    Err(format!(
+        "{DESIRED_STATUS_MEMBER} is not valid: it is one of {}",
+        GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES.join(", "),
+    ))
+}
+
+/// A status change that the clock already owes at [`PendingLifecycleStatus::due_at`],
+/// whether or not anybody calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLifecycleStatus {
+    /// The status that is in effect from `due_at` on.
+    pub status: String,
+    /// The instant the switch finishes. Public so a test can hold or advance the
+    /// emulator's clock without sleeping for the span.
+    pub due_at: SystemTime,
+}
+
+/// The Resource Groups optional-feature settings of one region of this account:
+/// what a caller last asked for, what is in effect, and the switch the clock still
+/// owes between the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSettingsRecord {
+    /// The modelled `GroupLifecycleEventsDesiredStatus`: the status a caller last
+    /// asked for, in effect from the moment it was asked for.
+    pub desired_status: String,
+    /// The modelled `GroupLifecycleEventsStatus`: the status actually in effect —
+    /// [`LIFECYCLE_EVENTS_IN_PROGRESS`] while a requested switch has not finished.
+    pub status: String,
+    /// The modelled `GroupLifecycleEventsStatusMessage`, "the text of any error
+    /// message occurs during an attempt to turn group lifecycle events on or
+    /// off". No switch this emulator accepts fails, so nothing writes it and it is
+    /// reported absent.
+    pub status_message: Option<String>,
+    /// The switch the clock owes, or `None` when the status in effect is already
+    /// the one asked for.
+    pub pending: Option<PendingLifecycleStatus>,
+}
+
+impl Default for AccountSettingsRecord {
+    /// The settings of a region nothing has been written for: an optional feature
+    /// a caller has never asked for is off, and both the desired and the effective
+    /// status report that.
+    fn default() -> Self {
+        Self {
+            desired_status: LIFECYCLE_EVENTS_INACTIVE.to_string(),
+            status: LIFECYCLE_EVENTS_INACTIVE.to_string(),
+            status_message: None,
+            pending: None,
+        }
+    }
+}
+
+impl AccountSettingsRecord {
+    /// Record that `desired` was asked for at `now`.
+    ///
+    /// The desired status becomes `desired` at once; the status in effect becomes
+    /// [`LIFECYCLE_EVENTS_IN_PROGRESS`] and `desired` falls due
+    /// [`LIFECYCLE_EVENTS_SETTLE_DELAY`] later, so a caller reading straight after
+    /// the write still sees the switch in flight. A second request supersedes a
+    /// switch still in flight, which is what makes the LAST request the one that
+    /// decides the outcome.
+    pub fn request(&mut self, desired: &str, now: SystemTime) {
+        self.desired_status = desired.to_string();
+        self.status = LIFECYCLE_EVENTS_IN_PROGRESS.to_string();
+        // Nothing has failed, so there is no error text to report.
+        self.status_message = None;
+        self.pending = Some(PendingLifecycleStatus {
+            status: desired.to_string(),
+            due_at: now + LIFECYCLE_EVENTS_SETTLE_DELAY,
+        });
+    }
+
+    /// Materialise the switch the clock already made due at `now`.
+    ///
+    /// It was owed at this instant whether or not anybody called, so any caller —
+    /// a reporting one included — may settle it; a switch not yet due is left
+    /// alone, and a record with nothing in flight is unchanged.
+    pub fn settle_due(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if pending.due_at > now {
+            return;
+        }
+        self.status = pending.status.clone();
+        self.pending = None;
+    }
+
+    /// The modelled `AccountSettings` structure for this record.
+    pub fn to_account_settings(&self) -> AccountSettings {
+        AccountSettings {
+            group_lifecycle_events_desired_status: Some(self.desired_status.clone()),
+            group_lifecycle_events_status: Some(self.status.clone()),
+            group_lifecycle_events_status_message: self.status_message.clone(),
         }
     }
 }

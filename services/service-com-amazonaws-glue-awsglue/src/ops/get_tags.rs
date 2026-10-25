@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the tags of the resource `ResourceArn` names, read from THAT resource's own
+//! record in [`crate::state::ComAmazonawsGlueAwsglueState`] — the tag set its create
+//! recorded and every later tag write updated — so the tags a create carried are the
+//! tags this read reports. The ARN is resolved through
+//! [`crate::state::parse_tagged_resource`] plus
+//! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags`], the one resolution
+//! every tag read in this emulator goes through.
+//!
+//! An ARN that names no taggable Glue resource at all earns the modelled client-input
+//! refusal; one of a known kind this store holds no resource for earns the modelled
+//! `EntityNotFoundException`, as does one naming another Region's or another account's
+//! estate.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +148,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTagsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // A `ResourceArn` this service tags NO resource of is a bad parameter, not a
+        // miss: the modelled constraint admits any Glue ARN, so the resource type it
+        // carries is what is checked here.
+        let Some(resource) = crate::state::parse_tagged_resource(&input.resource_arn) else {
+            return Err(GetTagsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(crate::state::invalid_resource_arn_message(
+                    &input.resource_arn,
+                )),
+                from_federation_source: None,
+            })
+            .into());
+        };
+        let not_found = || {
+            GetTagsErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &resource,
+                    &input.resource_arn,
+                )),
+                from_federation_source: None,
+            })
+        };
+
+        // A Glue resource belongs to the Region its ARN names, and this endpoint serves
+        // exactly one, so an ARN of another Region names a resource this endpoint holds
+        // nothing for rather than the same-named local one.
+        if resource.region != crate::state::request_region(ctx.parts()) {
+            return Err(not_found().into());
+        }
+
+        let store = state.lock();
+        let Some(tags) = store.resource_tags(&resource) else {
+            return Err(not_found().into());
+        };
+        // Definite, and EMPTY for a resource carrying no tag: the answer to "which tags
+        // does this resource have" is the empty map, not an absent member.
+        Ok(GetTagsOutput {
+            tags: Some(tags.clone()),
+        })
     }
 }
