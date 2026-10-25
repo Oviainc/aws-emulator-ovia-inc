@@ -318,31 +318,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
 
-        // A re-sent request resolves to the certificate it already created. An entry
-        // whose certificate has since been deleted is stale, so it is not reused: a
-        // minted ARN must always have a record behind it.
+        // A re-sent request resolves to the certificate it already created. The pass
+        // above has already dropped every entry that stands for nothing — a token that
+        // timed out, and one whose certificate has since been deleted — so an entry
+        // found here has a record behind it.
         if let Some(existing) = idempotency
             .as_ref()
             .and_then(|key| store.idempotency.get(key))
-            .filter(|arn| store.certificates.contains_key(*arn))
-            .cloned()
+            .map(|recorded| recorded.certificate_arn.clone())
         {
             return Ok(RequestCertificateOutput {
                 certificate_arn: Some(existing),
             });
         }
 
+        // The cap on the WHOLE store, checked first because it is the one bound nothing
+        // in the request can partition: the Region below comes off the caller's own
+        // credential scope, so the per-Region quota alone would let a caller that varies
+        // the Region string grow the store without limit. The token index is checked
+        // with it, so neither can pass the cap.
+        let stored = store.certificates.len();
+        let tokens = store.idempotency.len();
+        if stored >= crate::state::CERTIFICATE_STORE_LIMIT
+            || tokens >= crate::state::CERTIFICATE_STORE_LIMIT
+        {
+            // Name whichever count reached the cap, so the refusal says what is full.
+            let (full, held) = if stored >= crate::state::CERTIFICATE_STORE_LIMIT {
+                ("ACM certificates", stored)
+            } else {
+                ("certificate idempotency tokens", tokens)
+            };
+            return Err(RequestCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator already holds {held} {full}, the most it stores ({})",
+                        crate::state::CERTIFICATE_STORE_LIMIT
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The per-account certificate quota: refused BEFORE the record is inserted, so
-        // the store cannot grow past it however many times the call is repeated. (The
-        // idempotency index is bounded with it: an entry is only ever written beside a
-        // new certificate and `remove_certificate` drops every entry pointing at a
-        // deleted one, so it never holds more entries than there are certificates.)
-        if store.certificates.len() >= CERTIFICATE_LIMIT {
+        // the store cannot grow past it however many times the call is repeated.
+        if store.certificates.len() >= crate::state::CERTIFICATE_LIMIT {
             let held = store.certificates.len();
             return Err(RequestCertificateErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
-                        "this account already holds {held} ACM certificates, the quota of {CERTIFICATE_LIMIT} for this Region"
+                        "this account already holds {held} ACM certificates, the quota of {} for this Region",
+                        crate::state::CERTIFICATE_LIMIT
                     )),
                 },
             )
@@ -421,6 +446,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             revocation_reason: None,
             created_at: now,
             issued_at: None,
+            // A requested certificate was not imported, and carries no serial until a
+            // certificate authority has signed one for it.
+            imported_at: None,
+            serial: None,
             not_before: None,
             not_after: None,
             tags,
@@ -428,7 +457,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.certificates.insert(arn.clone(), certificate);
         if let Some(key) = idempotency {
-            store.idempotency.insert(key, arn.clone());
+            store.idempotency.insert(
+                key,
+                crate::state::CertificateIdempotency {
+                    certificate_arn: arn.clone(),
+                    recorded_at: now,
+                },
+            );
         }
 
         Ok(RequestCertificateOutput {
@@ -480,12 +515,6 @@ fn validation_outcome(
 /// itself: "The maximum number of domain names that you can add to an ACM
 /// certificate is 100" (`RequestCertificateRequest$SubjectAlternativeNames` doc).
 const DOMAIN_NAME_LIMIT: usize = 100;
-
-/// The number of ACM certificates one account may hold in a Region, from the ACM
-/// service quota "ACM certificates" (default 2,500 per Region). It bounds the store
-/// against a caller that repeats `RequestCertificate`, and past it ACM answers the
-/// quota error this operation already models.
-const CERTIFICATE_LIMIT: usize = 2_500;
 
 /// `DomainValidationOptions` as a `domain name -> validation domain` lookup.
 ///

@@ -255,6 +255,12 @@ pub const ISSUED_EXTENDED_KEY_USAGES: &[&str] = &[
 /// `AMAZON_ISSUED`" (`CertificateDetail$Type` doc).
 pub const TYPE_AMAZON_ISSUED: &str = "AMAZON_ISSUED";
 
+/// `CertificateType` of a certificate a client brought into ACM itself:
+/// `ImportCertificate` "imports a certificate into Certificate Manager (ACM)"
+/// (`ImportCertificate` doc), and `ImportedAt` "exists only when the certificate type
+/// is IMPORTED" (`CertificateDetail$ImportedAt` doc).
+pub const TYPE_IMPORTED: &str = "IMPORTED";
+
 /// `RenewalEligibility`: "only exported private certificates can be renewed with the
 /// RenewCertificate command" (`CertificateDetail$RenewalEligibility` doc), so a
 /// public certificate ACM issues is not eligible.
@@ -263,6 +269,12 @@ pub const RENEWAL_INELIGIBLE: &str = "INELIGIBLE";
 /// `CertificateKeyPairOrigin` of a certificate whose key pair ACM generated, which
 /// is every certificate `RequestCertificate` creates.
 pub const KEY_PAIR_ORIGIN_AWS_MANAGED: &str = "AWS_MANAGED";
+
+/// `CertificateKeyPairOrigin` of a certificate whose key pair the CLIENT generated,
+/// which is every certificate `ImportCertificate` stores: the request carries the
+/// private key "that matches the public key in the certificate"
+/// (`ImportCertificateRequest$PrivateKey` doc).
+pub const KEY_PAIR_ORIGIN_CUSTOMER_PROVIDED: &str = "CUSTOMER_PROVIDED";
 
 /// `CertificateExport` when `Options.Export` is absent: export is opt-in
 /// (`CertificateOptions$Export` doc).
@@ -683,6 +695,16 @@ pub struct Certificate {
     pub revocation_reason: Option<String>,
     pub created_at: SystemTime,
     pub issued_at: Option<SystemTime>,
+    /// When the certificate was IMPORTED into ACM, which "exists only when the
+    /// certificate type is IMPORTED" (`CertificateDetail$ImportedAt` doc) — so this is
+    /// `Some` exactly for a record whose type is [`TYPE_IMPORTED`], and is re-stamped
+    /// by a reimport that replaces the certificate stored under the same ARN.
+    pub imported_at: Option<SystemTime>,
+    /// "The serial number of the certificate" (`CertificateDetail$Serial` doc), which
+    /// the certificate authority that signed it assigned. `None` for a record this
+    /// emulator holds no signed certificate for — it signs none itself — and `Some` for
+    /// an imported one, read out of the X.509 body the import carried.
+    pub serial: Option<String>,
     pub not_before: Option<SystemTime>,
     pub not_after: Option<SystemTime>,
     /// Tag key -> value, as `ListTagsForCertificate` reports them.
@@ -690,6 +712,14 @@ pub struct Certificate {
 }
 
 impl Certificate {
+    /// Whether this record is a certificate a client imported, which is what decides
+    /// the two instants that exist only for one kind of certificate: `ImportedAt`
+    /// "exists only when the certificate type is IMPORTED" and `IssuedAt` "only when
+    /// the certificate type is AMAZON_ISSUED" (`CertificateDetail` docs).
+    pub fn is_imported(&self) -> bool {
+        self.cert_type == TYPE_IMPORTED
+    }
+
     /// Apply everything the clock already owes this certificate at `now`: the initial
     /// domain-validation email, then the validation outcome.
     ///
@@ -1080,16 +1110,51 @@ pub struct AcmeEndpointIdempotency {
     pub acme_endpoint_arn: String,
 }
 
+/// What one `RequestCertificate` idempotency token has already created, and when the
+/// index recorded it.
+///
+/// The instant is what lets the index SHRINK again: a token ACM no longer recognises —
+/// one older than [`IDEMPOTENCY_TOKEN_TTL`] — stands for nothing, so
+/// [`ComAmazonawsAcmCertificatemanagerState::expire_certificate_idempotency_tokens`]
+/// drops it and the index cannot accumulate one entry per token a caller ever sent.
+#[derive(Debug, Clone)]
+pub struct CertificateIdempotency {
+    /// The ARN the first call answered with.
+    pub certificate_arn: String,
+    /// When the index recorded this token; it times out [`IDEMPOTENCY_TOKEN_TTL`]
+    /// later, the window `RequestCertificateRequest$IdempotencyToken` publishes ("if
+    /// you call RequestCertificate multiple times with the same idempotency token
+    /// within one hour").
+    pub recorded_at: SystemTime,
+}
+
+impl CertificateIdempotency {
+    /// Whether this token is still live at `now`.
+    pub fn token_is_live(&self, now: SystemTime) -> bool {
+        now.duration_since(self.recorded_at)
+            .is_ok_and(|elapsed| elapsed < IDEMPOTENCY_TOKEN_TTL)
+            // A record stamped in the future (a clock that stepped back) has not timed
+            // out either.
+            || self.recorded_at > now
+    }
+}
+
 /// Per-service state for com-amazonaws-acm-certificatemanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAcmCertificatemanagerState {
     /// Certificate ARN -> record. A `BTreeMap`, so an unsorted `ListCertificates`
     /// page and its `NextToken` walk one deterministic order.
     pub certificates: BTreeMap<String, Certificate>,
-    /// Idempotency key (token plus a fingerprint of the request parameters) ->
-    /// certificate ARN, so re-sending one `RequestCertificate` returns the
+    /// Idempotency key (token plus a fingerprint of the request parameters) -> what
+    /// that token created, so re-sending one `RequestCertificate` returns the
     /// certificate it already created instead of making another.
-    pub idempotency: HashMap<String, String>,
+    ///
+    /// BOUNDED three ways: an entry is only ever written beside a new certificate,
+    /// [`Self::remove_certificate`] drops the entries pointing at a deleted one,
+    /// [`Self::expire_certificate_idempotency_tokens`] drops the ones that have timed
+    /// out, and [`CERTIFICATE_STORE_LIMIT`] caps what the index may hold whatever the
+    /// request says.
+    pub idempotency: HashMap<String, CertificateIdempotency>,
     /// ACME endpoint ARN -> record. A `BTreeMap`, so an unsorted `ListAcmeEndpoints`
     /// page and its `NextToken` walk one deterministic order.
     pub acme_endpoints: BTreeMap<String, AcmeEndpointRecord>,
@@ -1137,12 +1202,30 @@ impl ComAmazonawsAcmCertificatemanagerState {
             .retain(|_, request| request.token_is_live(now));
     }
 
+    /// Drop every `RequestCertificate` idempotency entry that stands for nothing at
+    /// `now`: one whose token has timed out ([`IDEMPOTENCY_TOKEN_TTL`]), and one whose
+    /// certificate is gone.
+    ///
+    /// The index therefore holds at most one entry per LIVE token, rather than one per
+    /// token any caller ever sent.
+    pub fn expire_certificate_idempotency_tokens(&mut self, now: SystemTime) {
+        let certificates = &self.certificates;
+        self.idempotency.retain(|_, recorded| {
+            recorded.token_is_live(now) && certificates.contains_key(&recorded.certificate_arn)
+        });
+    }
+
     /// Apply every validation outcome the clock already owes at `now`.
     ///
     /// Call it FIRST in every handler that locks the store, so each operation sees the
     /// state a caller would see after any other. One pass touches at most as many
-    /// records as the account may hold certificates and ACME endpoints, and each is one
-    /// instant comparison.
+    /// records as this store may hold ([`CERTIFICATE_STORE_LIMIT`],
+    /// [`ACME_ENDPOINT_STORE_LIMIT`], [`ACME_DOMAIN_VALIDATION_STORE_LIMIT`]), and each
+    /// is one instant comparison.
+    ///
+    /// The timed-out idempotency entries go with them: a token ACM would no longer
+    /// recognise is one the clock has already retired, so the pass that materialises
+    /// what the clock owes drops those too.
     pub fn materialize_due(&mut self, now: SystemTime) {
         for certificate in self.certificates.values_mut() {
             certificate.materialize_due(now);
@@ -1153,6 +1236,7 @@ impl ComAmazonawsAcmCertificatemanagerState {
         for validation in self.acme_domain_validations.values_mut() {
             validation.materialize_due(now);
         }
+        self.expire_certificate_idempotency_tokens(now);
     }
 
     /// The stored ACME endpoint the id `endpoint_id` names in `region`, or `None` when
@@ -1291,7 +1375,8 @@ impl ComAmazonawsAcmCertificatemanagerState {
     /// record behind it.
     pub fn remove_certificate(&mut self, arn: &str) -> Option<Certificate> {
         let removed = self.certificates.remove(arn)?;
-        self.idempotency.retain(|_, stored| stored != arn);
+        self.idempotency
+            .retain(|_, recorded| recorded.certificate_arn != arn);
         Some(removed)
     }
 }
@@ -2085,6 +2170,28 @@ pub const RESERVED_TAG_PREFIX: &str = "aws:";
 /// `ListTagsForCertificate` report the stored map through that same list.
 pub const TAG_LIMIT: usize = 50;
 
+/// The number of ACM certificates one account may hold in a Region, from the ACM
+/// service quota "ACM certificates" (default 2,500 per Region). It bounds the store
+/// against a caller that repeats a certificate-creating call, and past it ACM answers
+/// the quota error those operations model (`LimitExceededException`: "An ACM quota has
+/// been exceeded").
+pub const CERTIFICATE_LIMIT: usize = 2_500;
+
+/// The most certificate records \u2014 and the most idempotency entries \u2014 this emulator
+/// stores, across every Region.
+///
+/// Not an AWS quota: [`CERTIFICATE_LIMIT`] is ACM's own per-Region one, and the Region
+/// of a request is read off the caller's SigV4 credential scope ([`request_region`]),
+/// so a per-Region bound is a bound the CALLER can partition by signing each request
+/// for another Region string. This cap is keyed on nothing in the request, so it bounds
+/// [`ComAmazonawsAcmCertificatemanagerState::certificates`] and
+/// [`ComAmazonawsAcmCertificatemanagerState::idempotency`] \u2014 and with them the
+/// per-request [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] pass over
+/// those records \u2014 however the request varies. `RequestCertificate` and
+/// `ImportCertificate` check it before inserting and answer their modelled quota error
+/// past it, exactly as [`ACME_ENDPOINT_STORE_LIMIT`] is checked for ACME endpoints.
+pub const CERTIFICATE_STORE_LIMIT: usize = 5_000;
+
 /// The request's tags as the key -> value map the certificate record stores, or the
 /// message explaining why a tag was refused.
 ///
@@ -2345,8 +2452,15 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         managed_by: cert.managed_by.clone(),
         domain_validation_options: (!cert.domain_validations.is_empty())
             .then(|| cert.domain_validations.iter().map(domain_validation).collect()),
-        created_at: Some(to_date_time(cert.created_at)),
+        // "The time at which the certificate was requested"
+        // (`CertificateDetail$CreatedAt` doc): an imported certificate was never
+        // requested, so it reports the instant it was imported instead.
+        created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
         issued_at: cert.issued_at.map(to_date_time),
+        imported_at: cert.imported_at.map(to_date_time),
+        // The serial the signing authority assigned, which only a record holding a
+        // signed certificate carries.
+        serial: cert.serial.clone(),
         status: Some(cert.status.clone()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
@@ -2426,13 +2540,15 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         renewal_eligibility: Some(cert.renewal_eligibility.clone()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
-        created_at: Some(to_date_time(cert.created_at)),
+        // As on `CertificateDetail`: `CreatedAt` is when the certificate was
+        // REQUESTED, and an imported one carries its import instant instead.
+        created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
         issued_at: cert.issued_at.map(to_date_time),
+        imported_at: cert.imported_at.map(to_date_time),
         // Present only for a revoked certificate, as on `CertificateDetail`.
         revoked_at: cert.revoked_at.map(to_date_time),
         managed_by: cert.managed_by.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
-        ..CertificateSummary::default()
     }
 }
 
@@ -2571,16 +2687,18 @@ pub fn acme_account_summary(account: &AcmeAccountRecord) -> AcmeAccountSummary {
 /// Members that belong to something this service never does stay absent, and are the
 /// members the search filters correspondingly keep nothing on:
 ///
-/// * `X509Attributes.Issuer` is the issuing CA's distinguished NAME, and
-///   `X509Attributes.SerialNumber` the serial that CA assigns when it signs; this
-///   emulator signs no X.509 certificate, so it holds neither. (The detail's own
-///   `Issuer` member is a plain CA name, which [`issuer_name`] does report.)
-/// * `AcmCertificateMetadata.ImportedAt` dates an import, `RenewalStatus` belongs to
-///   a renewal ACM has started, and the ACME members to a certificate obtained
-///   through an ACME endpoint; no stored record carries any of them. `RevokedAt` is
-///   reported, and is absent exactly when the record carries no revocation, which
-///   "exists only when the certificate status is REVOKED"
-///   (`CertificateDetail$RevokedAt` doc).
+/// * `X509Attributes.Issuer` is the issuing CA's distinguished NAME, which no stored
+///   record holds — the detail's own `Issuer` member is a plain CA name, which
+///   [`issuer_name`] does report. `SerialNumber` is the serial the signing authority
+///   assigned, reported for a record that carries one (an imported certificate's own
+///   X.509 serial) and absent for one this emulator never signed.
+/// * `AcmCertificateMetadata.RenewalStatus` belongs to a renewal ACM has started and
+///   the ACME members to a certificate obtained through an ACME endpoint; no stored
+///   record carries any of them. `ImportedAt` is reported for an imported certificate,
+///   `RevokedAt` for a revoked one, and each is absent exactly when the record carries
+///   nothing for it, which "exists only when the certificate status is REVOKED"
+///   (`CertificateDetail$RevokedAt` doc) and "only when the certificate type is
+///   IMPORTED" (`$ImportedAt` doc) demand.
 pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult {
     CertificateSearchResult {
         certificate_arn: Some(cert.arn.clone()),
@@ -2613,14 +2731,16 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
                 .then(|| cert.extended_key_usages.clone()),
             not_before: cert.not_before.map(to_date_time),
             not_after: cert.not_after.map(to_date_time),
+            serial_number: cert.serial.clone(),
             ..X509Attributes::default()
         }),
         certificate_metadata: Some(CertificateMetadata::AcmCertificateMetadata(
             AcmCertificateMetadata {
-                created_at: Some(to_date_time(cert.created_at)),
+                created_at: (!cert.is_imported()).then(|| to_date_time(cert.created_at)),
                 exported: Some(cert.exported),
                 in_use: Some(!cert.in_use_by.is_empty()),
                 issued_at: cert.issued_at.map(to_date_time),
+                imported_at: cert.imported_at.map(to_date_time),
                 // The revocation instant, which exists only beside the `REVOKED`
                 // status the same record carries.
                 revoked_at: cert.revoked_at.map(to_date_time),
