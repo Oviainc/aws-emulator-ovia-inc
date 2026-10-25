@@ -92,7 +92,10 @@ fn request_ids(body: &str) -> Vec<&str> {
 
 /// One zone-addressed operation: its name, its HTTP method, the URI it addresses a
 /// zone id at, and the body it sends.
-type ZoneOperation = (&'static str, &'static str, fn(&str) -> String, fn() -> String);
+///
+/// `pub(crate)` so a sibling suite tabulating zone-addressed operations names the
+/// same row shape rather than growing a second one.
+pub(crate) type ZoneOperation = (&'static str, &'static str, fn(&str) -> String, fn() -> String);
 
 /// One failure to drive: how to ask for it, and what it must be refused with.
 struct Failure {
