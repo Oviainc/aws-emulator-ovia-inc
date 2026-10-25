@@ -164,13 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_arn = %input.resource_arn,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: an ARN minted in another Region names no resource here, so a
+        // cross-Region ARN is a resource this Region does not hold.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let state = state.lock();
+        let state = state.region(&region);
 
         let invalid = |message: String| {
             ListTagsForResourceErrorModeled::ValidationException(ValidationException {

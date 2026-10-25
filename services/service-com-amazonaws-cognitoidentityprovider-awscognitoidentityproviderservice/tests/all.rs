@@ -47,6 +47,8 @@ mod initiate_auth;
 mod list_devices;
 #[path = "all/list_groups.rs"]
 mod list_groups;
+#[path = "all/list_identity_providers.rs"]
+mod list_identity_providers;
 #[path = "all/list_user_pools.rs"]
 mod list_user_pools;
 #[path = "all/list_users_in_group.rs"]

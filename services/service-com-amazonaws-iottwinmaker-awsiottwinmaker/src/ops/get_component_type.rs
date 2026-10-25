@@ -199,13 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             component_type_id = %input.component_type_id,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a component type created through another Region's endpoint is not
+        // in it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetComponentTypeErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
             return Err(GetComponentTypeErrorModeled::ResourceNotFoundException(

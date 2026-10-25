@@ -169,7 +169,7 @@ pub(crate) async fn accept(router: &MultiServiceRouter, request: Value) -> Answe
     call(router, "AcceptAgreementRequest", request).await
 }
 
-async fn describe(router: &MultiServiceRouter, agreement_id: &str) -> Answer {
+pub(crate) async fn describe(router: &MultiServiceRouter, agreement_id: &str) -> Answer {
     call(
         router,
         "DescribeAgreement",
@@ -182,7 +182,7 @@ async fn terms(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "GetAgreementTerms", request).await
 }
 
-async fn search(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn search(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "SearchAgreements", request).await
 }
 
@@ -242,7 +242,11 @@ pub(crate) fn upfront_term(id: &str, selector: &str, dimensions: &[(&str, i32)])
 }
 
 /// A requested term carrying the acceptor's auto-renewal choice.
-fn renewal_term(id: &str, enable_auto_renew: bool) -> Value {
+///
+/// `pub(crate)` because the `agreement_end_dates` suite accepts the same choice
+/// to check what an agreement does at its end date rather than spelling a second
+/// copy of the request shape.
+pub(crate) fn renewal_term(id: &str, enable_auto_renew: bool) -> Value {
     json!({
         "id": id,
         "configuration": {
@@ -878,26 +882,31 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
     // The third element is `EstimatedCharges$agreementValue` where the model
     // states it outright — the documented `0` for terms that commit nothing —
     // and `None` where the value is whatever the quote priced the terms at,
-    // which the describe is checked against either way.
+    // which the describe is checked against either way. The fourth is whether
+    // the terms commit the agreement for a duration, so that it has an end date
+    // at all; what that date IS is pinned in `tests/all/agreement_end_dates.rs`.
     let cases = vec![
         (
             "a legal term only, so nothing is committed",
             vec![term("eula.v1")],
             Some("0"),
+            false,
         ),
         (
             "a prepaid purchase, whose value the rate card prices",
             vec![upfront_term("cfg", "P12M", &[("Users", 2)])],
             None,
+            true,
         ),
         (
             "metered pricing plus the acceptor's renewal choice",
             vec![term("UsageBasedPricingTerm"), renewal_term("renew", true)],
             Some("0"),
+            false,
         ),
     ];
 
-    for (case, requested, agreement_value) in cases {
+    for (case, requested, agreement_value, end_dated) in cases {
         let router = emulator();
         let created = create(&router, new_request("ap-offer42", requested)).await;
         let request_id = created.str_at("/agreementRequestId");
@@ -969,14 +978,17 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
             "case {case:?}: an agreement with no future start date starts when accepted, \
              got {body:?}"
         );
-        assert!(
-            body["endTime"].is_null(),
-            "case {case:?}: endTime is null for an agreement with no end date, got {body:?}"
+        assert_eq!(
+            body["endTime"].is_number(),
+            end_dated,
+            "case {case:?}: expected an endTime only for terms that commit a duration \
+             (end_dated={end_dated}), got {body:?}"
         );
-        assert!(
-            body["endTimeBehavior"].is_null(),
-            "case {case:?}: endTimeBehavior is absent for an agreement with no end date, \
-             got {body:?}"
+        assert_eq!(
+            body["endTimeBehavior"].is_object(),
+            end_dated,
+            "case {case:?}: endTimeBehavior is present exactly for an active agreement with \
+             an end date (end_dated={end_dated}), got {body:?}"
         );
         assert_eq!(
             described.body["estimatedCharges"]["agreementValue"],

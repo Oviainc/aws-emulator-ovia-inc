@@ -321,6 +321,20 @@ pub const FILTERABLE_COMPLIANCE_TYPES: [&str; 3] = [
     COMPLIANCE_TYPE_NOT_APPLICABLE,
 ];
 
+/// Every `ComplianceType` an AGGREGATE compliance read holds for a Config rule, and
+/// therefore the only values a `ConfigRuleComplianceFilters` may name
+/// (`ConfigRuleComplianceFilters$ComplianceType`: "Config supports only COMPLIANT and
+/// NON_COMPLIANT. Config does not support the NOT_APPLICABLE and the
+/// INSUFFICIENT_DATA values").
+///
+/// It is one constant for both because they are the same set: a rule whose evaluation
+/// results place it in neither of these has no compliance result for an aggregate read
+/// to report (`DescribeAggregateComplianceByConfigRules`: "Does not display rules that
+/// do not have compliance results"), which is also why no filter may name such a
+/// value.
+pub const AGGREGATE_RULE_COMPLIANCE_TYPES: [&str; 2] =
+    [COMPLIANCE_TYPE_COMPLIANT, COMPLIANCE_TYPE_NON_COMPLIANT];
+
 /// How many evaluation results one page carries when the request asks for no size of
 /// its own (`GetComplianceDetailsByConfigRuleRequest$Limit`: "The maximum number of
 /// evaluation results returned on each page. The default is 10. ... If you specify 0,

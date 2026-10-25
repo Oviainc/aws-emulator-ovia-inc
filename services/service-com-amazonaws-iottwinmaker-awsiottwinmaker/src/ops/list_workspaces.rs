@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaces
-//! Reports the workspaces of the account — "Retrieves information about
+//! Reports the workspaces of the account in the Region this request is signed
+//! for — "Retrieves information about
 //! workspaces in the current account" — in `workspaceId` order, a page at a
 //! time, each row built from the STORED workspace record the create persisted.
+//! A workspace created through another Region's endpoint is not one of them:
+//! this service is regional, so each Region has its own set of workspaces.
 //!
 //! `maxResults` caps the page: its documented default is 25 and its documented
 //! minimum 1, so an omitted value serves 25 rows and an explicit zero is
@@ -158,13 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every call is recorded, successful or refused: the real service logs
         // control-plane access, and a page served is a read of tenant state.
         ::tracing::info!(operation = "ListWorkspaces", "serving a request");
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a workspace created through another Region's endpoint is not in
+        // it, so it is not reported here.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListWorkspacesErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let state = state.lock();
+        let state = state.region(&region);
 
         let invalid = |message: String| {
             ListWorkspacesErrorModeled::ValidationException(ValidationException {
@@ -249,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// elsewhere — by another listing of this service, or by hand — is recognisably
 /// not one of ours. The token itself is the shape every paginated operation of
 /// this service mints ([`crate::state::encode_page_token`]); this listing is
-/// account-wide, so unlike `ListEntities`' it is scoped to no parent resource.
+/// Region-wide, so unlike `ListEntities`' it is scoped to no parent resource.
 const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:workspaces:1:";
 
 /// The opaque `nextToken` for the page of workspaces starting at `workspace_id`.

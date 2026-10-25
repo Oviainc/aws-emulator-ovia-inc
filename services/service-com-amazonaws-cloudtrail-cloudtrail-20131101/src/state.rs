@@ -3044,6 +3044,29 @@ impl PolicyResourceRejection {
     }
 }
 
+/// The refusal text for `ResourcePolicyNotFoundException`: a resource that exists
+/// and carries no resource-based policy.
+///
+/// One sentence for every operation that looks a policy up — the read that reports
+/// one and the delete that detaches one — so the two cannot word the same miss
+/// differently. Built from the request: it names the resource the ARN resolved to.
+pub fn resource_policy_not_found_message(resource_arn: &str) -> String {
+    format!("No resource policy is attached to {resource_arn}")
+}
+
+/// The refusal text for `ConflictException`: a resource CloudTrail has not finished
+/// loading, which no resource-policy WRITE can change.
+///
+/// From the model doc for the error — "the specified resource is not ready for an
+/// operation … If this exception occurs, wait a few minutes, and then try the
+/// operation again" — and shared by every resource-policy write for that reason.
+pub fn policy_resource_not_ready_message(resource_arn: &str) -> String {
+    format!(
+        "Resource {resource_arn} is not ready for this operation; wait a few minutes and \
+         then try the operation again"
+    )
+}
+
 /// The resource a resource-policy operation addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyResource {
@@ -3078,10 +3101,11 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
             ))
         })?;
         if !parsed.kind.takes_resource_policy() {
+            // The refusal names the resource type the ARN carried, in the sentence
+            // the service answers an unsupported type with — built from the request,
+            // so a caller sees which type it addressed.
             return Err(PolicyResourceRejection::TypeNotSupported(format!(
-                "Resource type '{}' does not support resource-based policies: a CloudTrail \
-                 resource-based policy attaches to an event data store, a dashboard or a \
-                 channel",
+                "Resource policies are not supported for the resource: {}.",
                 parsed.kind.resource_type()
             )));
         }

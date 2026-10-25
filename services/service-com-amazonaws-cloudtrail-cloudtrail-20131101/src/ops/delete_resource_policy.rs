@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Detaches the resource-based policy from one CloudTrail resource, dropping it from
+//! the shared resource-policy registry (`crate::state`) where `PutResourcePolicy`
+//! stored it and `GetResourcePolicy` reads it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@idempotent` in the modelled sense that one resource carries one resource-based
+//! policy: the resource survives the detach, so a later put attaches a new one, while
+//! a resource with nothing attached has no policy to delete.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +160,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        // A resource ARN carries its own Region, so this operation reads no Region
+        // off the request.
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "DeleteResourcePolicy needs the CloudTrail resource-policy registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The ARN names the resource the policy is attached TO; the three ways it
+        // can fail to name a stored resource are the rule every resource-policy
+        // operation shares.
+        let resource = store
+            .resolve_policy_resource(&input.resource_arn, now)
+            .map_err(resource_rejection)?;
+
+        // Detaching a policy WRITES to the resource, so a resource CloudTrail has not
+        // finished loading is refused the way every resource-policy write refuses it.
+        if !resource.ready {
+            return Err(
+                DeleteResourcePolicyErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::policy_resource_not_ready_message(
+                        &resource.arn,
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The policy is dropped from the registry, so a later read reports that the
+        // resource carries none and a later put attaches a new one. A resource with
+        // nothing attached is the one case `ResourcePolicyNotFoundException`
+        // (HTTP 404) is modelled for.
+        if store.resource_policies.remove(&resource.arn).is_none() {
+            return Err(
+                DeleteResourcePolicyErrorModeled::ResourcePolicyNotFoundException(
+                    ResourcePolicyNotFoundException {
+                        message: Some(crate::state::resource_policy_not_found_message(
+                            &resource.arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The modelled output carries no members: the detach is reported by the 200
+        // alone.
+        Ok(DeleteResourcePolicyOutput {})
+    }
+}
+
+/// Answer a rejected `ResourceArn` with the modelled error its case names.
+///
+/// Stated per operation because the error enum is per operation: this names the
+/// variants `DeleteResourcePolicy`'s own model declares, which is what
+/// `#[operation_error]` makes explicit.
+fn resource_rejection(
+    rejection: crate::state::PolicyResourceRejection,
+) -> DeleteResourcePolicyErrorModeled {
+    let message = Some(rejection.message().to_string());
+    match rejection {
+        crate::state::PolicyResourceRejection::ArnNotValid(_) => {
+            DeleteResourcePolicyErrorModeled::ResourceARNNotValidException(
+                ResourceARNNotValidException { message },
+            )
+        }
+        crate::state::PolicyResourceRejection::TypeNotSupported(_) => {
+            DeleteResourcePolicyErrorModeled::ResourceTypeNotSupportedException(
+                ResourceTypeNotSupportedException { message },
+            )
+        }
+        crate::state::PolicyResourceRejection::ResourceNotFound(_) => {
+            DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException { message },
+            )
+        }
     }
 }
