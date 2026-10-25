@@ -132,6 +132,8 @@ mod fast_launch_images;
 // What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.
 #[path = "all/fast_snapshot_restores.rs"]
 mod fast_snapshot_restores;
+#[path = "all/fleet_instances.rs"]
+mod fleet_instances;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]
