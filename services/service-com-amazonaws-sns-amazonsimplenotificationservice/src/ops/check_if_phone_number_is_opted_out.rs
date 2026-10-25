@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckIfPhoneNumberIsOptedOut
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckIfPhoneNumberIsOptedOut`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckIfPhoneNumberIsOptedOut::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +69,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -114,6 +106,17 @@ impl From<CheckIfPhoneNumberIsOptedOutErrorModeled> for CheckIfPhoneNumberIsOpte
     }
 }
 
+/// The modelled refusal of a request parameter that does not comply with its
+/// constraints — this operation's only client error for bad input.
+fn invalid_parameter(message: String) -> CheckIfPhoneNumberIsOptedOutError {
+    CheckIfPhoneNumberIsOptedOutErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `CheckIfPhoneNumberIsOptedOut` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,23 +148,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CHECK_IF_PHONE_NUMBER_IS_OPTED_OUT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report whether `phoneNumber` has opted out of receiving SMS messages from this
+    /// account: `true` while this account holds an uncleared opt-out for the number,
+    /// `false` otherwise — which is every number no opt-out was ever recorded for and
+    /// every number `OptInPhoneNumber` opted back in.
+    ///
+    /// A REPORT: it reads the record and writes nothing, so two reads of one number
+    /// answer the same thing. The number still has to be one, in E.164 format, which
+    /// is argument validation and so judged before the store is consulted.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckIfPhoneNumberIsOptedOut` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckIfPhoneNumberIsOptedOutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckIfPhoneNumberIsOptedOut"))
+        if let Some(message) = state::phone_number_refusal(&input.phone_number) {
+            return Err(invalid_parameter(message));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(
+                CheckIfPhoneNumberIsOptedOutErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the SNS store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let store = store.lock();
+        let is_opted_out = store
+            .phone_numbers
+            .get(&input.phone_number)
+            .is_some_and(state::PhoneNumberRecord::is_opted_out);
+
+        Ok(CheckIfPhoneNumberIsOptedOutOutput { is_opted_out })
     }
 }
