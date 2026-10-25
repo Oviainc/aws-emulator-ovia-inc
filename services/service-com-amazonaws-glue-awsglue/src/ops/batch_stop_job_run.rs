@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchStopJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchStopJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchStopJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits a stop for each named run of one stored job definition, reporting the outcome
+//! PER RUN: a run of that job that has not finished yet is moved into
+//! [`crate::state::JOB_RUN_STATE_STOPPING`] and reported in `SuccessfulSubmissions`, with
+//! [`crate::state::JOB_RUN_STATE_STOPPED`] owed it one span later
+//! ([`crate::state::JOB_RUN_SETTLES_AFTER`]) — so a caller polling `GetJobRun` straight
+//! after this call still sees the run stopping. A run this operation cannot stop — one
+//! the named job does not hold, or one that has already finished — is reported in
+//! `Errors` with its own `ErrorDetail`, so a per-run problem never fails the batch.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchStopJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchStopJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchStopJobRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error, the same way `StartJobRun` reports it.
+            return Err(BatchStopJobRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `JobName` is `@required` with `length 1..255` and `JobRunIds` is `@required`
+        // with `length 1..25`, so an absent, empty or over-long one is refused at the
+        // boundary: reaching here, the only question is which of the named runs this job
+        // holds and which of those can still be stopped.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let mut submissions: Vec<BatchStopJobRunSuccessfulSubmission> = Vec::new();
+        let mut errors: Vec<BatchStopJobRunError2> = Vec::new();
+
+        match store.jobs.get_mut(&input.job_name) {
+            Some(job) => {
+                // Everything the clock already owed this job's runs is materialised
+                // first, so a run the clock has already finished is seen as finished and
+                // takes no stop.
+                job.settle_due_runs(now);
+                for run_id in &input.job_run_ids {
+                    let Some(run) = job.run_mut(run_id) else {
+                        errors.push(stop_error(
+                            &input.job_name,
+                            run_id,
+                            ENTITY_NOT_FOUND_CODE,
+                            format!(
+                                "Job run {run_id} not found for job {}",
+                                input.job_name
+                            ),
+                        ));
+                        continue;
+                    };
+                    if run.submit_stop(now) {
+                        submissions.push(BatchStopJobRunSuccessfulSubmission {
+                            job_name: Some(input.job_name.clone()),
+                            job_run_id: Some(run_id.clone()),
+                        });
+                    } else {
+                        let settled_state = run.state.clone();
+                        errors.push(stop_error(
+                            &input.job_name,
+                            run_id,
+                            INVALID_INPUT_CODE,
+                            format!(
+                                "Job run {run_id} has already finished in state \
+                                 {settled_state} and cannot be stopped"
+                            ),
+                        ));
+                    }
+                }
+            }
+            // A job this account does not hold holds none of the named runs either, so
+            // every entry of the request fails the same way. The miss is reported per
+            // run rather than as the whole call failing, because this operation models
+            // no entity-not-found error of its own and `Errors` is where the runs it
+            // could not stop are reported.
+            None => {
+                for run_id in &input.job_run_ids {
+                    errors.push(stop_error(
+                        &input.job_name,
+                        run_id,
+                        ENTITY_NOT_FOUND_CODE,
+                        format!("Job {} not found", input.job_name),
+                    ));
+                }
+            }
+        }
+
+        ::tracing::info!(
+            operation = "BatchStopJobRun",
+            job = %input.job_name,
+            submitted = submissions.len(),
+            failed = errors.len(),
+            "submitted stops for Glue job runs"
+        );
+
+        // Both lists are reported whether or not either is empty: an empty `Errors` is
+        // the positive statement that a stop was submitted for every run named, which is
+        // what a client checks before treating the batch as accepted.
+        Ok(BatchStopJobRunOutput {
+            successful_submissions: Some(submissions),
+            errors: Some(errors),
+        })
+    }
+}
+
+/// The per-run `ErrorCode` for a run the named job does not hold: the Glue error class
+/// for "A specified entity does not exist", named by its own shape exactly as
+/// `BatchDeleteTable`'s per-table miss names it.
+const ENTITY_NOT_FOUND_CODE: &str = "EntityNotFoundException";
+
+/// The per-run `ErrorCode` for a run that cannot be stopped because it has already
+/// finished: this operation's own modelled client error class, "The input provided was
+/// not valid", named by its shape the same way.
+const INVALID_INPUT_CODE: &str = "InvalidInputException";
+
+/// One `Errors` entry: the run the request named, and the detail of why no stop was
+/// submitted for it. The wording of these per-run messages is not recorded anywhere, so
+/// what they state is the reference the request gave and the reason it failed.
+fn stop_error(
+    job_name: &str,
+    job_run_id: &str,
+    error_code: &str,
+    error_message: String,
+) -> BatchStopJobRunError2 {
+    BatchStopJobRunError2 {
+        job_name: Some(job_name.to_string()),
+        job_run_id: Some(job_run_id.to_string()),
+        error_detail: Some(crate::state::catalog_error_detail(
+            error_code,
+            error_message,
+        )),
     }
 }
