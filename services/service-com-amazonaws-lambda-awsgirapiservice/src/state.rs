@@ -1352,6 +1352,20 @@ pub fn alias_name_message(name: &str) -> String {
     pattern_violation_message("name", name, ALIAS_NAME_PATTERN)
 }
 
+/// The message an operation addressing an alias refuses with when the function holds no
+/// alias of that name: `ResourceNotFoundException`'s own sentence, naming the alias by
+/// the fully-qualified ARN the request asked about.
+///
+/// `alias_arn` is the function's unqualified ARN qualified by the alias name
+/// ([`FunctionRecord::versioned_arn`]), so the whole sentence is built from the request:
+/// the caller recovers the ARN it asked for by stripping the fixed prefix, which is how
+/// every Lambda resource-shaped refusal states the resource it could not find (compare
+/// the `Function not found: <arn>` [`resolve_function`] builds).
+#[must_use]
+pub fn alias_not_found_message(alias_arn: &str) -> String {
+    format!("Cannot find alias arn: {alias_arn}")
+}
+
 /// One alias of a function: "a function identifier that you can update to invoke a
 /// different version", as `CreateAlias` documents it.
 ///
