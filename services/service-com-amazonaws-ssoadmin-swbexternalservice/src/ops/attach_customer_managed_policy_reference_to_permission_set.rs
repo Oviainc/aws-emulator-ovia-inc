@@ -5,8 +5,10 @@
 //! Adds the customer managed policy reference a request names to the SET of references a
 //! stored permission set carries. A reference's identity is its (`Name`, `Path`) pair,
 //! with `Path` materialised to its documented default `/` when the request names none, so
-//! attaching the same pair twice attaches it once, and the same name under another path is
-//! another reference. `ListCustomerManagedPolicyReferencesInPermissionSet` reads back
+//! a permission set holds a given pair at most once, the same name under another path is
+//! another reference, and an attach of a pair the set already holds is a conflict with the
+//! write that attached it — refused, with the stored set left as it was.
+//! `ListCustomerManagedPolicyReferencesInPermissionSet` reads back
 //! exactly the set this wrote, and
 //! `DetachCustomerManagedPolicyReferenceFromPermissionSet` removes one entry of it.
 //!
@@ -232,12 +234,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         let identity = reference.identity();
-        // The emulator's own per-permission-set ceiling, asked only of a reference that
-        // would ADD an entry: re-attaching one the set already holds grows nothing, so it
-        // cannot cross a ceiling the set is already at.
-        if !record.customer_managed_policies.contains_key(&identity)
-            && record.customer_managed_policies.len()
-                >= crate::state::MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET
+        // An ATTACH, not a PUT: the model marks this operation NOT `@idempotent` and
+        // declares `ConflictException` for "a conflict with a previous successful write".
+        // The (`Name`, `Path`) pair is the attachment's identity, so a request naming one
+        // the set already holds is that conflict — refused, and the stored set is left as
+        // it was rather than reporting success for a write that would add nothing.
+        if record.customer_managed_policies.contains_key(&identity) {
+            return Err(
+                AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::customer_managed_policy_already_attached_message(
+                                &permission_set_arn,
+                                &reference.name,
+                                &reference.path,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The emulator's own per-permission-set ceiling, asked of every reference that
+        // reaches it: a duplicate was already refused above, so each one here would ADD an
+        // entry.
+        if record.customer_managed_policies.len()
+            >= crate::state::MAX_CUSTOMER_MANAGED_POLICIES_PER_PERMISSION_SET
         {
             return Err(
                 AttachCustomerManagedPolicyReferenceToPermissionSetErrorModeled::ServiceQuotaExceededException(
@@ -250,8 +272,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // A SET keyed by the reference's identity: attaching the same (Name, Path) pair
-        // twice attaches it once.
+        // A SET keyed by the reference's identity, which the refusal above makes a fresh
+        // key: the stored set holds one entry per distinct (`Name`, `Path`) pair.
         record.customer_managed_policies.insert(identity, reference);
 
         // The modeled response carries no members: the stored set is observed through

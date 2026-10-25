@@ -7,7 +7,8 @@
 //!
 //! THE RULE under test: a permission set carries a SET of AWS managed policy ARNs, each
 //! identified by its `ManagedPolicyArn`; `AttachManagedPolicyToPermissionSet` adds one
-//! entry to that set (so attaching the same ARN twice attaches it once),
+//! entry to that set and refuses an ARN the set already carries with `ConflictException`
+//! (the duplicate-attach rule itself is `policy_attach_conflict.rs`),
 //! `DetachManagedPolicyFromPermissionSet` removes exactly the entry whose ARN the request
 //! names and answers `ResourceNotFoundException` for an ARN the permission set does not
 //! carry, and `ListManagedPoliciesInPermissionSet` reports exactly the entries that are
@@ -305,17 +306,32 @@ async fn an_attach_stores_the_policy_and_the_list_answers_from_it() {
 }
 
 #[tokio::test]
-async fn attaching_the_same_policy_twice_attaches_it_once() {
+async fn a_second_attach_of_a_policy_the_set_already_carries_is_refused() {
     let (router, instance_arn) = organization_router();
     for (index, case) in policy_cases().into_iter().enumerate() {
         let permission_set_arn =
             create_permission_set(&router, &instance_arn, &format!("Twice{index}")).await;
-        for attempt in 1..=3 {
+        let (status, body) = attach(&router, &instance_arn, &permission_set_arn, &case.arn).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the first attach expected 200, got {status} {body}",
+            case.label
+        );
+        // Every later attach of the same ARN is a conflict with the write that attached
+        // it, whatever form the ARN takes.
+        for attempt in 2..=3 {
             let (status, body) =
                 attach(&router, &instance_arn, &permission_set_arn, &case.arn).await;
             assert_eq!(
-                status, 200,
-                "case {:?}: attach #{attempt} expected 200, got {status} {body}",
+                status, 400,
+                "case {:?}: attach #{attempt} of an attached ARN expected 400, got {status} \
+                 {body}",
+                case.label
+            );
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {:?}: attach #{attempt} expected ConflictException, got {body}",
                 case.label
             );
         }
@@ -323,7 +339,7 @@ async fn attaching_the_same_policy_twice_attaches_it_once() {
         assert_eq!(
             found,
             vec![(case.name.clone(), case.arn.clone())],
-            "case {:?}: three attaches of one ARN attach it once, got {found:?}",
+            "case {:?}: the refused attaches leave the one entry stored, got {found:?}",
             case.label
         );
     }
@@ -729,7 +745,8 @@ async fn a_caller_cannot_attach_past_the_per_permission_set_ceiling() {
         "ServiceQuotaExceededException",
         "an attach past the ceiling expected ServiceQuotaExceededException, got {body}"
     );
-    // Re-attaching one the set already holds adds nothing, so it is still accepted.
+    // Re-attaching one the set already holds is the DUPLICATE refusal, not the ceiling
+    // one: the request would add nothing, so it never reaches the ceiling.
     let (status, body) = attach(
         &router,
         &instance_arn,
@@ -738,8 +755,13 @@ async fn a_caller_cannot_attach_past_the_per_permission_set_ceiling() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "a re-attach at the ceiling expected 200, got {status} {body}"
+        status, 400,
+        "a re-attach at the ceiling expected 400, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ConflictException",
+        "a re-attach at the ceiling expected ConflictException, got {body}"
     );
     let found = attached_set(&router, &instance_arn, &permission_set_arn).await;
     assert_eq!(
