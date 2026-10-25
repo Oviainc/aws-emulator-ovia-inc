@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableOrganizationAdminAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableOrganizationAdminAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableOrganizationAdminAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Designates one account as the GuardDuty delegated administrator the Region the
+//! request was signed for serves, and persists that designation. A Region holds at
+//! most one, so designating the account it already holds changes nothing and
+//! designating another is refused until the current one is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +131,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableOrganizationAdminAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableOrganizationAdminAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableOrganizationAdminAccount"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                EnableOrganizationAdminAccountErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `AdminAccountId` is "the Amazon Web Services account ID for the
+        // organization account to be enabled as a GuardDuty delegated
+        // administrator" (`smithy_query(operation="EnableOrganizationAdminAccount")`)
+        // but targets a plain `String`, so the boundary validator accepts any
+        // value: one that cannot be an account id at all is the parameter failure,
+        // refused before anything is looked up.
+        if !crate::state::is_account_id(&input.admin_account_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ADMIN_ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // A removal the clock already owes is materialised first, so a designation
+        // made after a previous administrator's removal fell due is not refused by
+        // a record that should no longer be there.
+        state.settle_organization_admin_accounts();
+
+        if let Some(current) = state.organization_admin_account_in(&region) {
+            // Designating the account the Region already holds is the same
+            // designation: it answers success and changes nothing, so a retried
+            // call is not a second designation.
+            if current.admin_account_id == input.admin_account_id
+                && current.disable_due_millis.is_none()
+            {
+                return Ok(EnableOrganizationAdminAccountOutput {});
+            }
+            // Anything else would be a SECOND administrator for one organization,
+            // which a read reporting at most one cannot describe.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ORGANIZATION_ADMIN_ALREADY_DESIGNATED_MESSAGE,
+            ));
+        }
+
+        if state.organization_admin_regions_exhausted(&region) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ORGANIZATION_ADMIN_REGION_LIMIT_MESSAGE,
+            ));
+        }
+
+        state.designate_organization_admin_account(&region, &input.admin_account_id);
+
+        // The response models no members (`smithy_query(operation="EnableOrganizationAdminAccount")`):
+        // `ListOrganizationAdminAccounts` is what reports the designation back.
+        Ok(EnableOrganizationAdminAccountOutput {})
     }
 }
