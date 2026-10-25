@@ -74,6 +74,9 @@ mod refusal_constructions;
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 

@@ -604,9 +604,11 @@ async fn an_approved_removal_proposal_deletes_the_member_and_its_resources() {
             read.body
         );
 
-        // The member named by the removal, and the node it owned, are gone exactly when
-        // the action was carried out.
-        let expected_lookup = if *present { 404 } else { 200 };
+        // The member named by the removal, and the node it owned, begin deleting exactly
+        // when the action was carried out: "DELETING - … the member is being deleted as the
+        // result of an APPROVED PROPOSAL to remove the member" (`Member$Status`), so the
+        // records stay readable and report the stage of the removal.
+        let expected_member_status = if *present { "DELETING" } else { "AVAILABLE" };
         let member = call(
             &router,
             "GET",
@@ -615,9 +617,11 @@ async fn an_approved_removal_proposal_deletes_the_member_and_its_resources() {
         )
         .await;
         assert_eq!(
-            member.status, expected_lookup,
-            "case {case}: expected GetMember {expected_lookup} for {other}, got {} {:?}",
-            member.status, member.body
+            (member.status, member.text(&["Member", "Status"]).as_str()),
+            (200, expected_member_status),
+            "case {case}: expected GetMember 200 {expected_member_status} for {other}, got {} {:?}",
+            member.status,
+            member.body
         );
         let node = call(
             &router,
@@ -626,13 +630,30 @@ async fn an_approved_removal_proposal_deletes_the_member_and_its_resources() {
             None,
         )
         .await;
+        let node_status = node.text(&["Node", "Status"]);
         assert_eq!(
-            node.status, expected_lookup,
-            "case {case}: expected GetNode {expected_lookup} for the removed member's node, got \
-             {} {:?}",
-            node.status,
-            node.body
+            node.status, 200,
+            "case {case}: expected GetNode 200 for the removed member's node, got {} {:?}",
+            node.status, node.body
         );
+        if *present {
+            assert_eq!(
+                node_status, "DELETING",
+                "case {case}: expected the removed member's node DELETING, got {node_status:?} \
+                 {:?}",
+                node.body
+            );
+        } else {
+            // The action was not carried out, so nothing started deleting this node: it is
+            // either still `CREATING` or has settled to `AVAILABLE`, the two statuses its
+            // create puts it through.
+            assert!(
+                node_status == "CREATING" || node_status == "AVAILABLE",
+                "case {case}: expected the node to be CREATING or AVAILABLE, got \
+                 {node_status:?} {:?}",
+                node.body
+            );
+        }
 
         // The founding member that made the proposal is untouched either way.
         let founding = call(

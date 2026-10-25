@@ -155,6 +155,17 @@ async fn get_function(router: &MultiServiceRouter, reference: &str) -> Answer {
     json_call(router, "GET", &uri, &serde_json::Value::Null).await
 }
 
+/// `GetFunction` on a function reference at one qualifier, which is the read of ONE
+/// identity of it.
+async fn get_function_at(
+    router: &MultiServiceRouter,
+    reference: &str,
+    qualifier: &str,
+) -> Answer {
+    let uri = format!("/2015-03-31/functions/{reference}?Qualifier={qualifier}");
+    json_call(router, "GET", &uri, &serde_json::Value::Null).await
+}
+
 /// The base64 SHA-256 of `bytes` — the independent computation of what `CodeSha256`
 /// must report, so the test never reads the value it is checking out of the response.
 fn expected_code_sha256(bytes: &[u8]) -> String {
@@ -543,11 +554,38 @@ async fn create_function_persists_what_it_reports() {
             "RevisionId",
             "LastModified",
         ] {
+            // `RevisionId` belongs to one IDENTITY, so it is asserted below rather than
+            // here for a create that published a version: that call answered with THAT
+            // version's revision, and this read is of the unpublished version.
+            if member == "RevisionId" && case.version != "$LATEST" {
+                continue;
+            }
             assert_eq!(
                 configuration[member], created[member],
                 "case {}: GetFunction reported a different {member} ({:?}) than \
                  CreateFunction stored ({:?})",
                 case.name, configuration[member], created[member]
+            );
+        }
+        // A create that published a version answered with the VERSION's revision: the
+        // qualified read of that version reports the same one, and the unqualified read
+        // of the unpublished version reports its own.
+        if case.version != "$LATEST" {
+            let qualified = get_function_at(&router, case.name, case.version).await;
+            assert_eq!(
+                qualified.json()["Configuration"]["RevisionId"], created["RevisionId"],
+                "case {}: expected version {} to report the revision CreateFunction \
+                 answered ({:?}), got {:?}",
+                case.name,
+                case.version,
+                created["RevisionId"],
+                qualified.json()["Configuration"]["RevisionId"]
+            );
+            assert_ne!(
+                configuration["RevisionId"], created["RevisionId"],
+                "case {}: expected the unpublished version to carry a revision of its \
+                 own, got the published version's {:?}",
+                case.name, configuration["RevisionId"]
             );
         }
         // GetFunction with no qualifier reports the unpublished version, whatever
@@ -583,10 +621,14 @@ async fn create_function_persists_what_it_reports() {
                 code["RepositoryType"]
             );
             let location = code["Location"].as_str().unwrap_or_default();
+            // The location belongs to the identity READ, so the revision in it is the one
+            // this read reports — which for a create that published a version is the
+            // unpublished version's rather than that version's.
+            let read_revision = configuration["RevisionId"].as_str().unwrap_or_default();
             assert!(
-                location.contains(case.name) && location.contains(&revision),
-                "case {}: expected a Location naming the function and its revision, \
-                 got {location:?}",
+                location.contains(case.name) && location.contains(read_revision),
+                "case {}: expected a Location naming the function and its revision \
+                 {read_revision:?}, got {location:?}",
                 case.name
             );
         }

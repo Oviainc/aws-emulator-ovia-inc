@@ -397,6 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             status: crate::state::STATUS_CREATING.to_string(),
             available_at: now + crate::state::TRANSITION_SPAN,
+            // Nothing is deleting this node: the instant `DELETED` falls due is set when
+            // a delete — of the node or of the member that owns it — starts its removal.
+            deleted_at: None,
             creation_date: now,
             tags: crate::state::map_in(input.tags),
             arn: crate::state::node_arn(&region, &node_id),

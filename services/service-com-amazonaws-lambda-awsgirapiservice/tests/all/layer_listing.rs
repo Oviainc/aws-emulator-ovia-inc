@@ -240,7 +240,9 @@ struct ListCase {
     name: &'static str,
     /// One `PublishLayerVersion` body per version, oldest first.
     versions: Vec<Value>,
-    /// The `LatestMatchingVersion.Description` the listing must report.
+    /// The `LatestMatchingVersion.Description` the listing must report. `None` for a
+    /// version published without one: a listing entry reports only what the version
+    /// carries, while the version's own read defaults the member to the empty string.
     description: Option<Value>,
     /// The `LatestMatchingVersion.LicenseInfo` the listing must report.
     license_info: Option<Value>,

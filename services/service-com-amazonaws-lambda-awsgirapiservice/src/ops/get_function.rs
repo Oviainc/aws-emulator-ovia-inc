@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetFunctionOutput {
             configuration: Some(record.configuration(&version, &config)),
-            code: Some(record.code_location()),
+            code: Some(record.code_location(&version)),
             // Tags are function-level rather than version-level, so every qualifier
             // reports the same ones; an untagged function reports none at all.
             tags: (!record.tags.is_empty()).then(|| {
@@ -212,7 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             tags_error: None,
-            concurrency: record.concurrency(),
+            // "Concurrency settings apply to the function as a whole, including all
+            // published versions and the unpublished version", so reserved concurrency
+            // is a property of the UNQUALIFIED function: a read addressed to a qualified
+            // identity (a published version, an alias or `$LATEST` named explicitly)
+            // reports no `Concurrency` block at all, because that identity carries no
+            // limit of its own. The qualifier may come from either the name or the
+            // `Qualifier` parameter, so both are read — see
+            // [`crate::state::named_qualifier`].
+            concurrency: match crate::state::named_qualifier(
+                &input.function_name,
+                input.qualifier.as_deref(),
+            ) {
+                Some(_) => None,
+                None => record.concurrency(),
+            },
         })
     }
 }

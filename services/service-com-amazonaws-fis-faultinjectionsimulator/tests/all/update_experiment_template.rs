@@ -22,6 +22,13 @@
 //! `ValidationException`, 402 `ServiceQuotaExceededException`) and the stored template is
 //! left untouched — including the bounds the `aws:fis:wait` action's `duration` publishes,
 //! asserted at each bound and one past it.
+//!
+//! One nested structure is not a replacement when the request carries it EMPTY: a
+//! `logConfiguration` with none of its members set names no configuration, so it removes
+//! the one the template carried. [`an_empty_log_configuration_removes_a_templates_logging`]
+//! asserts that over the destinations such a configuration can name, over a template that
+//! carries none, and one member past the empty form (a schema version with no
+//! destination, which names a configuration and is judged as one).
 
 use std::time::Duration;
 
@@ -446,6 +453,13 @@ fn update_cases() -> Vec<(&'static str, Value, Value)> {
             }),
         ),
         (
+            "log configuration removed by an empty configuration",
+            json!({ "logConfiguration": {} }),
+            // No operation deletes a log configuration, so an empty one is the removal:
+            // the member is gone from the template the update reports.
+            json!({ "logConfiguration": null }),
+        ),
+        (
             "report configuration replaced",
             json!({
                 "experimentReportConfiguration": {
@@ -660,6 +674,14 @@ fn refusal_cases() -> Vec<(&'static str, Value, u16, &'static str)> {
         (
             "a new action with no actionId to take",
             json!({ "actions": { "fresh": { "parameters": { "duration": "PT1M" } } } }),
+            400,
+            "ValidationException",
+        ),
+        (
+            // One member past the empty form: this names a configuration, so it REPLACES
+            // the stored one — and a log configuration has to name somewhere to log.
+            "a log configuration naming a schema version but no destination",
+            json!({ "logConfiguration": { "logSchemaVersion": 1 } }),
             400,
             "ValidationException",
         ),
@@ -879,6 +901,188 @@ async fn an_update_moves_only_the_template_it_names() {
             "case {case:?}: an update must not reach into an experiment already started; \
              {member} is now {:?}",
             read_back[member]
+        );
+    }
+}
+
+/// The log configurations an empty `logConfiguration` is asserted to remove: `(case, the
+/// configuration the template is created with)`. The rows differ along everything that
+/// half of the rule generalises over — which destinations the stored configuration names
+/// (CloudWatch Logs, Amazon S3, both), which schema version it carries, and whether the
+/// template carries a configuration at all, for which the removal has nothing to remove.
+fn log_removal_cases() -> Vec<(&'static str, Option<Value>)> {
+    vec![
+        (
+            "a CloudWatch Logs destination",
+            Some(json!({
+                "logSchemaVersion": BASELINE_LOG_SCHEMA_VERSION,
+                "cloudWatchLogsConfiguration": {
+                    "logGroupArn": "arn:aws:logs:us-east-1:000000000000:log-group:/fis/off:*"
+                }
+            })),
+        ),
+        (
+            "an S3 destination with a prefix",
+            Some(json!({
+                "logSchemaVersion": BASELINE_LOG_SCHEMA_VERSION,
+                "s3Configuration": { "bucketName": "fis-logs-off", "prefix": "stored" }
+            })),
+        ),
+        (
+            "both destinations at schema version 1",
+            Some(json!({
+                "logSchemaVersion": 1,
+                "cloudWatchLogsConfiguration": {
+                    "logGroupArn": "arn:aws:logs:us-east-1:000000000000:log-group:/fis/both:*"
+                },
+                "s3Configuration": { "bucketName": "fis-logs-both" }
+            })),
+        ),
+        ("no stored log configuration at all", None),
+    ]
+}
+
+/// The create body for a template carrying `logs`, or none when `logs` is `None`.
+fn template_logging(label: &str, logs: Option<&Value>) -> Value {
+    let mut body = json!({
+        "clientToken": token(&format!("logs-{}", label.replace(' ', "-"))),
+        "description": format!("update suite: {label}"),
+        "roleArn": ROLE_ARN,
+        "stopConditions": [{ "source": "none" }],
+        "actions": {
+            "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } }
+        }
+    });
+    if let Some(logs) = logs {
+        body["logConfiguration"] = logs.clone();
+    }
+    body
+}
+
+/// A `logConfiguration` carrying NONE of its members names no configuration, so it REMOVES
+/// the one the template carried: the update answers a template without that member, every
+/// later read reports it gone, an experiment started afterwards carries none, and a second
+/// such update has nothing left to remove. A configuration can be given back afterwards,
+/// and then has to carry its own schema version — there is no stored one left to take.
+#[tokio::test]
+async fn an_empty_log_configuration_removes_a_templates_logging() {
+    let router = emulator();
+
+    for (case, stored) in log_removal_cases() {
+        let (id, before) = create_from(&router, case, template_logging(case, stored.as_ref())).await;
+        assert_eq!(
+            before.get("logConfiguration").cloned(),
+            stored,
+            "case {case:?}: the created template must carry the configuration the create \
+             named, got {:?}",
+            before.get("logConfiguration")
+        );
+
+        let answer = update_template(&router, &id, json!({ "logConfiguration": {} })).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200 for an empty logConfiguration, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let after = answer.member("experimentTemplate").clone();
+        assert_eq!(
+            after.get("logConfiguration"),
+            None,
+            "case {case:?}: expected no logConfiguration member at all, got {:?}",
+            after.get("logConfiguration")
+        );
+        // Nothing but the logging (and the update instant) moved.
+        assert_partial_update(case, &before, &after, &json!({ "logConfiguration": null }));
+
+        let fetched = read_template(&router, case, &id).await;
+        assert_eq!(
+            fetched, after,
+            "case {case:?}: GetExperimentTemplate must report the template the removal \
+             stored, got {fetched:?}"
+        );
+
+        // Removing again has nothing to remove, and is not a refusal either.
+        let again = update_template(&router, &id, json!({ "logConfiguration": {} })).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: expected HTTP 200 for a second empty logConfiguration, got {} \
+             with {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            again.member("experimentTemplate").get("logConfiguration"),
+            None,
+            "case {case:?}: the template must still carry no logConfiguration, got {:?}",
+            again.body
+        );
+
+        // An experiment started from the template now carries no log configuration: it
+        // takes the one the template holds, and the template holds none.
+        let started = start_experiment(
+            &router,
+            json!({
+                "clientToken": token(&format!("logs-off-{}", case.replace(' ', "-"))),
+                "experimentTemplateId": id
+            }),
+        )
+        .await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: expected HTTP 200 from StartExperiment, got {} with {:?}",
+            started.status, started.body
+        );
+        assert_eq!(
+            started.member("experiment").get("logConfiguration"),
+            None,
+            "case {case:?}: an experiment started after the removal must carry no \
+             logConfiguration, got {:?}",
+            started.member("experiment").get("logConfiguration")
+        );
+
+        // The removal left no schema version behind, so giving logging back needs one.
+        let refused = update_template(
+            &router,
+            &id,
+            json!({ "logConfiguration": { "s3Configuration": { "bucketName": "fis-relog" } } }),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for a new log configuration with no schema \
+             version, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {:?}",
+            refused.body
+        );
+
+        let relogged = json!({
+            "logSchemaVersion": BASELINE_LOG_SCHEMA_VERSION,
+            "s3Configuration": { "bucketName": "fis-relog", "prefix": "again" }
+        });
+        let readded =
+            update_template(&router, &id, json!({ "logConfiguration": relogged.clone() })).await;
+        assert_eq!(
+            readded.status, 200,
+            "case {case:?}: expected HTTP 200 once the new configuration carries a schema \
+             version, got {} with {:?}",
+            readded.status, readded.body
+        );
+        assert_eq!(
+            readded.member("experimentTemplate")["logConfiguration"],
+            relogged,
+            "case {case:?}: expected the log configuration the request named, got {:?}",
+            readded.body
+        );
+        let refetched = read_template(&router, case, &id).await;
+        assert_eq!(
+            refetched["logConfiguration"], relogged,
+            "case {case:?}: GetExperimentTemplate must report the configuration given back, \
+             got {:?}",
+            refetched["logConfiguration"]
         );
     }
 }

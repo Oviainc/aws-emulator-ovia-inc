@@ -171,16 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Same documented minimum as on the create path: `InstanceCount`'s
         // "default and minimal value is 4". Refused before the store is locked,
-        // so a rejected update leaves the record exactly as it was.
+        // so a rejected update leaves the record exactly as it was, and with the
+        // same service error code the create path reports for this fault.
         if let Some(requested) = input.instance_count {
             if requested < crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT {
                 return Err(UpdateOutpostResolverErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "InstanceCount must be at least {}, got {requested}",
-                            crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT
-                        )),
-                    },
+                    crate::state::outpost_resolver_instance_count_below_minimum(),
                 )
                 .into());
             }

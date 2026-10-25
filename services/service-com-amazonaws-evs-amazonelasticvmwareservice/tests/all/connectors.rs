@@ -8,7 +8,8 @@
 //!   `ListEnvironmentConnectors` reports exactly that record, whatever the connector
 //!   type, the form or the length of the appliance FQDN, and whether the secret is
 //!   given as an ARN or as a name ("The ARN or name of the Amazon Web Services Secrets
-//!   Manager secret", `secretIdentifier` doc).
+//!   Manager secret", `secretIdentifier` doc) — a name being reported as the ARN it
+//!   resolves to, which `tests/all/connector_secret_arn.rs` owns.
 //! * A new connector is `CREATING` and the clock owes it `ACTIVE`: "A connector allows
 //!   the Amazon EVS control plane to interface with VCF appliances using a fully
 //!   qualified domain name" (`CreateEnvironmentConnector` doc) — a connection to
@@ -42,7 +43,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::environment_lifecycle::{
-    call, call_in_region, create_settled, emulator, error_type, Emulator,
+    call, call_in_region, create_settled, emulator, error_type, secret_arn_of, Emulator,
 };
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated
@@ -57,7 +58,10 @@ const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 /// A secret given as a full Secrets Manager ARN, one form `secretIdentifier` accepts.
 const SECRET_ARN: &str = "arn:aws:secretsmanager:us-west-2:000000000000:secret:evs/vcf-AbCd12";
 
-/// A secret given as a bare name, the other form it accepts.
+/// A secret given as a bare name, the other form it accepts. The ARN reported for it is
+/// the ARN of that name (`environment_lifecycle::secret_arn_of`), because `secretArn` is
+/// "The Amazon Resource Name (ARN) of" the secret — the rule
+/// `tests/all/connector_secret_arn.rs` owns.
 const SECRET_NAME: &str = "evs/vcf-appliance-credentials";
 
 /// An FQDN at the modelled `ApplianceFqdn` maximum of 253 characters: three 63-byte
@@ -236,6 +240,10 @@ async fn a_connector_is_created_and_read_back_by_list() {
             SECRET_ARN.to_string(),
         ),
         (
+            // The ARN reported for a name this long is longer than the 2048 characters
+            // `SecretIdentifier` bounds, which no real secret reaches: Secrets Manager
+            // bounds a secret NAME at 512 characters, so no AWS rule covers this input
+            // and the ARN of the name is reported uniformly.
             "a secret name at the modelled 2048-character maximum",
             "VCENTER",
             "vcenter.evs.example.com".to_string(),
@@ -271,9 +279,10 @@ async fn a_connector_is_created_and_read_back_by_list() {
             ("environmentId", json!(environment)),
             ("type", json!(connector_type)),
             ("applianceFqdn", json!(appliance_fqdn)),
-            // `secretArn` carries the `SecretIdentifier` the request supplied: a name
-            // is reported as a name, because no Secrets Manager secret is resolved.
-            ("secretArn", json!(secret_identifier)),
+            // `secretArn` reports the ARN of the secret the request named, whichever
+            // form it used: "The Amazon Resource Name (ARN) of the Amazon Web Services
+            // Secrets Manager secret".
+            ("secretArn", json!(secret_arn_of(&secret_identifier))),
             // The connection is still being established.
             ("state", json!("CREATING")),
             // No check has run: this emulator contacts no appliance, so the
@@ -308,7 +317,12 @@ async fn a_connector_is_created_and_read_back_by_list() {
         assert_member(case, &settled, "state", &json!("ACTIVE"));
         assert_member(case, &settled, "createdAt", &created["createdAt"]);
         assert_member(case, &settled, "applianceFqdn", &json!(appliance_fqdn));
-        assert_member(case, &settled, "secretArn", &json!(secret_identifier));
+        assert_member(
+            case,
+            &settled,
+            "secretArn",
+            &json!(secret_arn_of(&secret_identifier)),
+        );
     }
 }
 
@@ -468,12 +482,12 @@ async fn an_update_reconfigures_exactly_the_member_it_names() {
 
         // The member named carries the new value; the other one holds; the identity of
         // the connector is untouched.
-        let (changed, held) = if member == "applianceFqdn" {
-            ("applianceFqdn", "secretArn")
+        let (changed, held, expected_new) = if member == "applianceFqdn" {
+            ("applianceFqdn", "secretArn", new_value.clone())
         } else {
-            ("secretArn", "applianceFqdn")
+            ("secretArn", "applianceFqdn", secret_arn_of(&new_value))
         };
-        assert_member(case, &updated, changed, &json!(new_value));
+        assert_member(case, &updated, changed, &json!(expected_new));
         assert_member(case, &updated, held, &before[held]);
         assert_member(case, &updated, "connectorId", &json!(connector_id));
         assert_member(case, &updated, "environmentId", &json!(environment));
@@ -500,7 +514,7 @@ async fn an_update_reconfigures_exactly_the_member_it_names() {
         std::thread::sleep(PAST_THE_TRANSITION);
         let settled = only_connector(&router, case, &environment).await;
         assert_member(case, &settled, "state", &json!("ACTIVE"));
-        assert_member(case, &settled, changed, &json!(new_value));
+        assert_member(case, &settled, changed, &json!(expected_new));
         assert_member(case, &settled, held, &before[held]);
     }
 }

@@ -39,10 +39,37 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The download plane
+//!
+//! `GetFunction` hands out `Code$Location`, "A presigned URL that you can use to download
+//! the deployment package", and `GetLayerVersion` hands out `Content$Location`, "A link to
+//! the layer archive in Amazon S3"; a URL this service announces is a promise that a
+//! caller can follow it. Both are addressed to the per-region download hosts this service
+//! publishes (`crate::state::is_download_host`), under
+//! `crate::state::DOWNLOAD_PATH_PREFIX`, which name no modelled operation. Two seams
+//! carry them, the same pair any emulated data plane uses:
+//!
+//! - [`Service::can_handle`] also claims a request addressed to those published hosts,
+//!   whose first label names no service, so the router does not answer `UnknownService`
+//!   for a URL this service handed out;
+//! - [`Service::override_operation`] serves it, through [`Downloads`], which the router
+//!   reaches BEFORE authentication — which is what lets a presigned URL be followed
+//!   without a signature, as a presigned URL is.
+//!
+//! What it serves is the bytes the store HOLDS for the object the URL names: the
+//! deployment package of the function revision the location was reported for (a published
+//! version froze its own, so its location keeps serving those after the unpublished
+//! version's code is replaced), or one layer version's archive. A download is a pure
+//! READ: it answers the same bytes twice and changes nothing a later caller sees. A URL
+//! whose object this emulator holds no bytes for — an S3-sourced package it does not
+//! resolve — is a `404`, because nothing may be served that was not stored.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -142,6 +169,10 @@ fn claims_shared_tagging_path(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the download URLs `GetFunction` and `GetLayerVersion` announce, from the
+    /// SAME shared engine the generated entry threads into every operation — not a
+    /// second copy of the store.
+    downloads: Downloads<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -150,8 +181,168 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            downloads: Downloads { engine },
         }
+    }
+}
+
+/// Serves a deployment package or a layer archive from the bytes [`crate::state`] holds.
+///
+/// This is the data plane behind the URLs `GetFunction` and `GetLayerVersion` announce.
+/// It is NOT a modelled operation — AWS serves those objects from a presigned S3 URL, and
+/// this emulator serves them from the host it published in that URL, because a URL it
+/// announces has to resolve. It only READS.
+struct Downloads<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for Downloads<Eng> {
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r smithy_server_runtime::OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // An object is READ, so `GET` carries it and `HEAD` reports its metadata
+            // without the bytes; anything else is refused as the method it is.
+            if !matches!(req.method(), "GET" | "HEAD") {
+                return download_error(405, "MethodNotAllowed", METHOD_NOT_ALLOWED_MESSAGE);
+            }
+            let Some(target) = request_target(req) else {
+                return download_error(404, "NoSuchKey", NO_SUCH_KEY_MESSAGE);
+            };
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return download_error(
+                    500,
+                    "ServiceException",
+                    "Lambda state is not reachable on this engine",
+                );
+            };
+            let store = state.lock();
+            let held = match &target {
+                crate::state::DownloadTarget::FunctionPackage { name, revision_id } => store
+                    .functions
+                    .get(name)
+                    .and_then(|function| function.package_at_revision(revision_id))
+                    .and_then(crate::state::held_package_bytes),
+                crate::state::DownloadTarget::LayerArchive { name, version } => store
+                    .layers
+                    .get(name)
+                    .and_then(|layer| layer.versions.get(version))
+                    .and_then(|held| held.archive.zip_bytes.as_deref()),
+            };
+            // A URL whose object this store no longer holds — a deleted function or layer
+            // version, a revision that has been replaced — names no object, and so does
+            // one whose bytes were never held here at all.
+            let Some(bytes) = held else {
+                return download_error(404, "NoSuchKey", NO_SUCH_KEY_MESSAGE);
+            };
+            download_response(bytes, req.method() == "GET")
+        })
+    }
+
+    /// Served UNSIGNED. A download URL is handed to a caller to fetch directly, so the
+    /// fetch carries no SigV4 `Authorization` header. The modelled operations are
+    /// unaffected — the router reads their schemes from the model, which this answer
+    /// cannot weaken.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+}
+
+/// What this service's download message says for an object it does not hold.
+const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+
+/// What it says for a method a download does not answer.
+const METHOD_NOT_ALLOWED_MESSAGE: &str = "The specified method is not allowed against this resource.";
+
+/// The object a request to a download host names, or `None` when it names none.
+///
+/// The host comes from the request, because it is what says WHICH of the two published
+/// stores the path addresses; both are read by `crate::state`, so the URL this service
+/// mints and the request it serves cannot disagree about either. The path is taken by
+/// `service_common`'s one reader of a request URI, so this plane and every other service's
+/// claim read a URI the same way.
+fn request_target(req: &RtRequest) -> Option<crate::state::DownloadTarget> {
+    crate::state::parse_download_target(
+        &request_authority(req)?,
+        service_common::request_path(req.uri()),
+    )
+}
+
+/// Whether the request is addressed to one of the download hosts this service publishes.
+///
+/// The HOST is what makes a request this plane's, rather than the path: a path that host
+/// publishes no object at is answered by the plane as the object it does not hold, not by
+/// the router as an unrouted request.
+fn names_download_host(req: &RtRequest) -> bool {
+    request_authority(req).is_some_and(|host| crate::state::is_download_host(&host))
+}
+
+/// The authority a request is addressed to: its `Host` header, or the URI authority when
+/// the request carries one instead.
+fn request_authority(req: &RtRequest) -> Option<String> {
+    req.headers()
+        .get("host")
+        .map(str::to_string)
+        .or_else(|| {
+            req.uri()
+                .parse::<::http::Uri>()
+                .ok()
+                .and_then(|uri| uri.authority().map(|authority| authority.as_str().to_string()))
+        })
+}
+
+/// Serve one stored object: its own bytes, under its own length.
+///
+/// `with_body` is false for a `HEAD`, which reports the object's metadata without its
+/// bytes.
+fn download_response(bytes: &[u8], with_body: bool) -> RtResponse {
+    let body = if with_body {
+        SdkBody::from(bytes.to_vec())
+    } else {
+        SdkBody::empty()
+    };
+    let mut response = RtResponse::new(download_status(200), body);
+    // A deployment package and a layer archive are both .zip archives, which is what the
+    // store holds for them.
+    response
+        .headers_mut()
+        .insert("content-type", "application/zip");
+    response
+        .headers_mut()
+        .insert("content-length", bytes.len().to_string());
+    response
+}
+
+/// One refusal of a download request, in this service's own JSON error envelope: the
+/// path is not a modelled operation, so there is no modelled error to render.
+fn download_error(code: u16, error_code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "__type": error_code, "message": message }).to_string();
+    let mut response = RtResponse::new(download_status(code), SdkBody::from(body));
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", error_code.to_string());
+    response
+}
+
+/// A status this plane answers with. Every call site passes a constant, so the conversion
+/// cannot fail.
+fn download_status(code: u16) -> StatusCode {
+    StatusCode::try_from(code).expect("the download plane's statuses are valid constants")
+}
+
+/// The `Host` header of a buffered request, or the URI authority when the request is
+/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
+        Some(host) => Some(host),
+        None => parts.uri.authority().map(http::uri::Authority::as_str),
     }
 }
 
@@ -188,6 +379,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             crate::ROUTE_PATH_SEGMENTS,
             None,
         ) && claims_shared_tagging_path(parts)
+            // And a request addressed to one of the DOWNLOAD hosts this service publishes
+            // its presigned URLs under, whose first label names no service at all:
+            // without this the router answers `UnknownService` for a URL this service
+            // handed out. See the module docs.
+            || request_host(parts).is_some_and(crate::state::is_download_host)
     }
 
     fn override_operation(
@@ -198,7 +394,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // The download plane is the one such request: a fetch of a URL this service
+        // announced names no modelled operation at all, so there is no routing key to
+        // resolve for it (see the module docs). Every method addressed to a published
+        // download host reaches the plane, which decides the method itself: a read is
+        // served and anything else is refused as a method, rather than falling through to
+        // the router's answer for an unrouted request.
+        if names_download_host(req) {
+            return Some(&self.downloads as &dyn ErasedOperation);
+        }
         None
     }
 

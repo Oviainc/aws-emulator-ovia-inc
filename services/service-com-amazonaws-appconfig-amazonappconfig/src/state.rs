@@ -1043,6 +1043,24 @@ impl ConfigurationProfile {
     pub fn latest_version_number(&self) -> i32 {
         self.next_version_number - 1
     }
+
+    /// The hosted configuration version `identifier` names, by version number or by
+    /// version label.
+    ///
+    /// `StartDeployment`'s `ConfigurationVersion` is "the configuration version to
+    /// deploy. If deploying an AppConfig hosted configuration version, you can specify
+    /// either the version number or version label", so both spellings resolve to the
+    /// same stored version. Shared by the deployment that records a version and by the
+    /// data plane that serves its content, so one spelling cannot resolve two ways.
+    pub fn resolve_hosted_version(
+        &self,
+        identifier: &str,
+    ) -> Option<&HostedConfigurationVersion> {
+        self.hosted_versions.values().find(|version| {
+            version.version_number.to_string() == identifier
+                || version.version_label.as_deref() == Some(identifier)
+        })
+    }
 }
 
 /// One row of AppConfig's AWS-authored extension catalogue: an extension AppConfig
