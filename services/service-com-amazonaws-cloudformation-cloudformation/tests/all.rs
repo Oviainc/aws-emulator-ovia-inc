@@ -39,6 +39,8 @@ mod ecs_elbv2_stack_outputs;
 mod error_envelope;
 #[path = "all/extension_registry.rs"]
 mod extension_registry;
+#[path = "all/failed_create_rollback.rs"]
+mod failed_create_rollback;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
 #[path = "all/iam_capability_gate.rs"]
@@ -55,6 +57,8 @@ mod provisioned_resources;
 mod published_type_schema;
 #[path = "all/rds_stack_resources.rs"]
 mod rds_stack_resources;
+#[path = "all/regional_stack_namespace.rs"]
+mod regional_stack_namespace;
 #[path = "all/s3vectors_resource_types.rs"]
 mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]

@@ -141,7 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // "If you specified the name of a change set to delete, specify the stack name ...
         // associated with it": only an ARN names a change set on its own.
         crate::state::require_stack_for_change_set_name(
@@ -157,6 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.settle(now);
 
@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model declares no not-found error here, and the request asks for a state the
         // store is already in.
         let Some(change_set) = store
-            .resolve_change_set(&input.change_set_name, input.stack_name.as_deref())
+            .resolve_change_set(&region, &input.change_set_name, input.stack_name.as_deref())
         else {
             return Ok(DeleteChangeSetOutput {});
         };

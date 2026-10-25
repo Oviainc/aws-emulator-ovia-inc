@@ -121,6 +121,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The SQS fan-out of a publish is defined ONCE, by `Publish`: a batched publish delivers the
+// same envelope to the same subscriptions.
+use super::publish::{deliver_to_queues, queue_deliveries, DeliveryBudget, QueueDelivery};
 use crate::state::{self, MessageRequest, PublishedMessage};
 
 /// "Publishes up to 10 messages to the specified topic in a single batch. … If you
@@ -254,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation first: a destination that is not an SNS topic ARN at all
         // is bad input, not a topic that does not exist.
@@ -330,109 +333,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut store = store.lock();
+        // The store's lock is held for the publish only, and released before the queues
+        // subscribed to the topic are delivered to: a delivery is an in-process call into
+        // another service, which must not run under this store's lock.
+        let (successful, failed, deliveries) = {
+            let mut store = store.lock();
 
-        let Some(topic) = store.topics.get(&input.topic_arn).cloned() else {
-            return Err(PublishBatchErrorModeled::NotFoundException(NotFoundException {
-                message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
-            })
-            .into());
-        };
-
-        // The batch's own ceiling: the combined size of every message in it, against
-        // the ceiling the topic sets for one message.
-        let ceiling = state::max_message_size(&topic);
-        let combined: usize = entries.iter().map(entry_bytes).sum();
-        if combined > ceiling {
-            return Err(PublishBatchErrorModeled::BatchRequestTooLongException(
-                BatchRequestTooLongException {
-                    message: Some(format!(
-                        "The length of all the batch messages put together is more than the \
-                         limit: {combined} bytes exceeds the topic's limit of {ceiling} bytes."
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // SNS "delivers the message to each endpoint that is subscribed to the topic"
-        // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
-        // it receives nothing. The recipients are the same for every entry of the
-        // batch, so they are resolved once.
-        let recipients: Vec<String> = store
-            .subscriptions_of(&topic.arn)
-            .into_iter()
-            .filter(|sub| !sub.pending_confirmation)
-            .map(|sub| sub.arn.clone())
-            .collect();
-
-        // "The result of publishing each message is reported individually in the
-        // response. Because the batch request can result in a combination of successful
-        // and unsuccessful actions, you should check for batch errors even when the call
-        // returns an HTTP status code of 200" (the `PublishBatch` doc): an entry that
-        // breaks a per-message rule fails on its own, and the rest are still published.
-        //
-        // The entries are walked in request order, which is the order "multiple messages
-        // within a single batch are published in" for a FIFO topic.
-        let mut successful: Vec<PublishBatchResultEntry> = Vec::with_capacity(entries.len());
-        let mut failed: Vec<BatchResultErrorEntry> = Vec::new();
-        for entry in entries {
-            let judgement = {
-                let request = MessageRequest {
-                    message: &entry.message,
-                    subject: entry.subject.as_deref(),
-                    message_structure: entry.message_structure.as_deref(),
-                    message_group_id: entry.message_group_id.as_deref(),
-                    message_deduplication_id: entry.message_deduplication_id.as_deref(),
-                };
-                match state::message_refusal(request) {
-                    Some(reason) => Err(reason),
-                    None => state::topic_message_refusal(&topic, request),
-                }
-            };
-            let message_deduplication_id = match judgement {
-                Ok(deduplication_id) => deduplication_id,
-                Err(reason) => {
-                    failed.push(BatchResultErrorEntry {
-                        id: entry.id,
-                        code: INVALID_PARAMETER_CODE.to_string(),
-                        message: Some(reason),
-                        // "Specifies whether the error happened due to the caller of the
-                        // batch API action" — a per-message rule is the caller's to
-                        // satisfy.
-                        sender_fault: true,
-                    });
-                    continue;
-                }
+            let Some(topic) = store.topics.get(&input.topic_arn).cloned() else {
+                return Err(PublishBatchErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                })
+                .into());
             };
 
-            // Only a FIFO topic is sequenced: "This parameter applies only to FIFO
-            // (first-in-first-out) topics" (`PublishBatchResultEntry$SequenceNumber`
-            // doc).
-            let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
-            let message_id = store.next_unique_id();
-            let published = PublishedMessage {
-                message_id: message_id.clone(),
-                topic_arn: topic.arn.clone(),
-                message: entry.message,
-                subject: entry.subject,
-                message_structure: entry.message_structure,
-                message_attributes: entry.message_attributes.unwrap_or_default(),
-                message_group_id: entry.message_group_id,
-                message_deduplication_id,
-                sequence_number: sequence_number.clone(),
-                published_at: std::time::SystemTime::now(),
-            };
-            for recipient in &recipients {
-                store.record_delivery(recipient, published.clone());
+            // The batch's own ceiling: the combined size of every message in it, against
+            // the ceiling the topic sets for one message.
+            let ceiling = state::max_message_size(&topic);
+            let combined: usize = entries.iter().map(entry_bytes).sum();
+            if combined > ceiling {
+                return Err(PublishBatchErrorModeled::BatchRequestTooLongException(
+                    BatchRequestTooLongException {
+                        message: Some(format!(
+                            "The length of all the batch messages put together is more than \
+                             the limit: {combined} bytes exceeds the topic's limit of \
+                             {ceiling} bytes."
+                        )),
+                    },
+                )
+                .into());
             }
 
-            successful.push(PublishBatchResultEntry {
-                id: Some(entry.id),
-                message_id: Some(message_id),
-                sequence_number,
-            });
-        }
+            // SNS "delivers the message to each endpoint that is subscribed to the topic"
+            // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
+            // it receives nothing. The recipients are the same for every entry of the
+            // batch, so they are resolved once.
+            let recipients: Vec<state::SubscriptionRecord> = store
+                .subscriptions_of(&topic.arn)
+                .into_iter()
+                .filter(|sub| !sub.pending_confirmation)
+                .cloned()
+                .collect();
+
+            // "The result of publishing each message is reported individually in the
+            // response. Because the batch request can result in a combination of successful
+            // and unsuccessful actions, you should check for batch errors even when the call
+            // returns an HTTP status code of 200" (the `PublishBatch` doc): an entry that
+            // breaks a per-message rule fails on its own, and the rest are still published.
+            //
+            // The entries are walked in request order, which is the order "multiple messages
+            // within a single batch are published in" for a FIFO topic.
+            let mut successful: Vec<PublishBatchResultEntry> =
+                Vec::with_capacity(entries.len());
+            let mut failed: Vec<BatchResultErrorEntry> = Vec::new();
+            let mut deliveries: Vec<QueueDelivery> = Vec::new();
+            // ONE delivery budget for the whole batch, so the (entries x subscriptions x body
+            // bytes) product one request can fan out to is capped rather than each factor on
+            // its own.
+            let mut budget = DeliveryBudget::new();
+            for entry in entries {
+                let judgement = {
+                    let request = MessageRequest {
+                        message: &entry.message,
+                        subject: entry.subject.as_deref(),
+                        message_structure: entry.message_structure.as_deref(),
+                        message_group_id: entry.message_group_id.as_deref(),
+                        message_deduplication_id: entry.message_deduplication_id.as_deref(),
+                    };
+                    match state::message_refusal(request) {
+                        Some(reason) => Err(reason),
+                        None => state::topic_message_refusal(&topic, request),
+                    }
+                };
+                let message_deduplication_id = match judgement {
+                    Ok(deduplication_id) => deduplication_id,
+                    Err(reason) => {
+                        failed.push(BatchResultErrorEntry {
+                            id: entry.id,
+                            code: INVALID_PARAMETER_CODE.to_string(),
+                            message: Some(reason),
+                            // "Specifies whether the error happened due to the caller of the
+                            // batch API action" — a per-message rule is the caller's to
+                            // satisfy.
+                            sender_fault: true,
+                        });
+                        continue;
+                    }
+                };
+
+                // Only a FIFO topic is sequenced: "This parameter applies only to FIFO
+                // (first-in-first-out) topics" (`PublishBatchResultEntry$SequenceNumber`
+                // doc).
+                let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
+                let message_id = store.next_unique_id();
+                let published = PublishedMessage {
+                    message_id: message_id.clone(),
+                    topic_arn: topic.arn.clone(),
+                    message: entry.message,
+                    subject: entry.subject,
+                    message_structure: entry.message_structure,
+                    message_attributes: entry.message_attributes.unwrap_or_default(),
+                    message_group_id: entry.message_group_id,
+                    message_deduplication_id,
+                    sequence_number: sequence_number.clone(),
+                    published_at: std::time::SystemTime::now(),
+                };
+                // The deliveries this entry owes to the SQS queues subscribed to the topic,
+                // built through `Publish`'s one definition of the envelope, within the
+                // batch's shared budget, and performed below with the lock released.
+                deliveries.extend(queue_deliveries(&recipients, &published, &mut budget));
+                for recipient in &recipients {
+                    store.record_delivery(&recipient.arn, published.clone());
+                }
+
+                successful.push(PublishBatchResultEntry {
+                    id: Some(entry.id),
+                    message_id: Some(message_id),
+                    sequence_number,
+                });
+            }
+            (successful, failed, deliveries)
+        };
+        deliver_to_queues(ctx, &deliveries).await;
 
         Ok(PublishBatchOutput {
             successful: Some(successful),
