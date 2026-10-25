@@ -17,9 +17,12 @@
 //! beyond its default one ([`crate::state::reported_list`]): for a monolingual voice
 //! the key is absent, not an empty array.
 //!
-//! A page carries at most [`VOICE_PAGE_SIZE`] voices and the `NextToken` encodes both
-//! the position reached and the query it was reached under, so a token minted for one
-//! filter cannot silently resume a different one.
+//! The response carries the WHOLE filtered catalog: the model declares no pagination
+//! for this operation (`ListSpeechSynthesisTasks` is the only operation here that
+//! carries a pagination config), so the listing is never truncated and no `NextToken`
+//! is minted. The modelled `NextToken` input is therefore a token this service never
+//! issues, and a non-empty one is `InvalidNextTokenException` (400) rather than a
+//! partial list.
 //!
 //! ## Shape of an operation
 //!
@@ -142,60 +145,6 @@ impl From<DescribeVoicesErrorModeled> for DescribeVoicesError {
     }
 }
 
-/// How many voices one `DescribeVoices` page carries.
-///
-/// CHOSEN: Amazon Polly documents `NextToken` on this operation but no page size.
-pub const VOICE_PAGE_SIZE: usize = 50;
-
-/// The field separator inside a page cursor. An ASCII unit separator, so it cannot
-/// occur in an `Engine` or `LanguageCode` value.
-const CURSOR_SEPARATOR: char = '\u{1f}';
-
-/// Encode the cursor a `NextToken` carries: the position reached AND the query it was
-/// reached under.
-///
-/// The filter travels in the token because a position alone is meaningless across
-/// queries — an index into the en-US voices is a different voice from the same index
-/// into the whole catalog. [`decode_voice_cursor`] refuses a token whose filter does
-/// not match the request, so resuming with different parameters is an error rather
-/// than a silently wrong page.
-fn encode_voice_cursor(
-    start: usize,
-    engine: Option<&str>,
-    language: Option<&str>,
-    include_additional: bool,
-) -> String {
-    crate::state::encode_page_token(&format!(
-        "{start}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{include_additional}",
-        engine.unwrap_or_default(),
-        language.unwrap_or_default(),
-    ))
-}
-
-/// The position a `NextToken` resumes at, or `None` if this service did not mint the
-/// token or it was minted for a different query.
-fn decode_voice_cursor(
-    token: &str,
-    engine: Option<&str>,
-    language: Option<&str>,
-    include_additional: bool,
-) -> Option<usize> {
-    let cursor = crate::state::decode_page_token(token)?;
-    let mut fields = cursor.split(CURSOR_SEPARATOR);
-    let start = fields.next()?.parse::<usize>().ok()?;
-    let minted_for = (fields.next()?, fields.next()?, fields.next()?);
-    if fields.next().is_some() {
-        return None;
-    }
-    let include = include_additional.to_string();
-    let asked_for = (
-        engine.unwrap_or_default(),
-        language.unwrap_or_default(),
-        include.as_str(),
-    );
-    (minted_for == asked_for).then_some(start)
-}
-
 /// The `DescribeVoices` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -232,23 +181,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The cursor carries the position AND the query it was reached under, so a
-        // token minted for one filter cannot resume a different one, and a token this
-        // service did not mint is refused before any state is read.
-        let start = match input.next_token.as_deref() {
-            Some(token) => decode_voice_cursor(
-                token,
-                input.engine.as_deref(),
-                input.language_code.as_deref(),
-                input.include_additional_language_codes,
+        // This operation is not paginated, so the service mints no continuation token
+        // for it: a non-empty `NextToken` is one it could not have issued, and is
+        // refused before any state is read rather than answered with a partial list.
+        // An empty token (the model admits length 0) names no position, so it reads as
+        // no token at all.
+        if input
+            .next_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty())
+        {
+            return Err(DescribeVoicesErrorModeled::InvalidNextTokenException(
+                crate::service::errors::invalid_next_token(),
             )
-            .ok_or_else(|| {
-                DescribeVoicesErrorModeled::InvalidNextTokenException(
-                    crate::service::errors::invalid_next_token(),
-                )
-            })?,
-            None => 0,
-        };
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeVoicesErrorModeled::ServiceFailureException(
@@ -257,10 +204,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        // One past the page is enough to know whether a further page exists, so the
-        // whole filtered catalog is never materialised — the same shape as
-        // `ListLexicons`, which peeks one entry past its page.
-        let mut window: Vec<Voice> = guard
+        // Every voice the query keeps, in catalog order: the listing is not paged, so
+        // the response is the whole filtered catalog.
+        let voices: Vec<Voice> = guard
             .voices
             .iter()
             .filter(|voice| {
@@ -274,8 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     voice.speaks(language, input.include_additional_language_codes)
                 })
             })
-            .skip(start)
-            .take(VOICE_PAGE_SIZE.saturating_add(1))
             .map(|voice| Voice {
                 id: Some(voice.id.to_string()),
                 name: Some(voice.name.to_string()),
@@ -292,20 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let has_further_page = window.len() > VOICE_PAGE_SIZE;
-        window.truncate(VOICE_PAGE_SIZE);
-        let next_token = has_further_page.then(|| {
-            encode_voice_cursor(
-                start.saturating_add(window.len()),
-                input.engine.as_deref(),
-                input.language_code.as_deref(),
-                input.include_additional_language_codes,
-            )
-        });
-
         Ok(DescribeVoicesOutput {
-            voices: Some(window),
-            next_token,
+            voices: Some(voices),
+            // The response carries the whole filtered catalog, so it is never truncated
+            // and no continuation token is owed.
+            next_token: None,
         })
     }
 }
