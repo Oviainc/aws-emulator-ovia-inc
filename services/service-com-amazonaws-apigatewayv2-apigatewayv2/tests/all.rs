@@ -67,8 +67,12 @@ mod portal_product_lifecycle;
 mod portal_product_update;
 #[path = "all/portal_publication.rs"]
 mod portal_publication;
+#[path = "all/portal_update.rs"]
+mod portal_update;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]
 mod product_rest_endpoint_page_lifecycle;
+#[path = "all/product_rest_endpoint_page_update.rs"]
+mod product_rest_endpoint_page_update;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
 #[path = "all/quick_create_servable_set.rs"]

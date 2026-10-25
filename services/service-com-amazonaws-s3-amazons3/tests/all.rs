@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bucket_abac.rs"]
 mod bucket_abac;
+#[path = "all/bucket_accelerate_configuration.rs"]
+mod bucket_accelerate_configuration;
 #[path = "all/bucket_acl.rs"]
 mod bucket_acl;
 #[path = "all/bucket_cors.rs"]

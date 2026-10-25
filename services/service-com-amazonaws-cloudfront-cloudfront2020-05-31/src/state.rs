@@ -79,6 +79,7 @@ use crate::ops::types::{
     SessionStickinessConfig, Signer, StreamingDistribution, StreamingDistributionConfig,
     StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
     TrafficConfig, TrustedKeyGroups, TrustedSigners, ValidationTokenDetail, ViewerCertificate,
+    WebAclCustomization,
 };
 
 /// The CloudFront FUNCTION slice of this store: the function record, its two stages,
@@ -290,10 +291,17 @@ pub const MAX_DISTRIBUTION_TENANTS: usize = 10_000;
 /// nothing here runs.
 pub const DOMAIN_STATUS_ACTIVE: &str = "active";
 
+/// The `CustomizationActionType` a distribution tenant's web ACL customization carries when
+/// a web ACL of its own is associated with it: "you can specify `override` to specify a
+/// separate WAF web ACL for the distribution tenant". The other value the enum admits
+/// (`disable`) is the one that takes the tenant out of its distribution's protections
+/// without naming a web ACL, which is a customization a caller states rather than one an
+/// association produces.
+pub const CUSTOMIZATION_ACTION_OVERRIDE: &str = "override";
+
 /// `DnsConfiguration$Status` for a domain that "is correctly configured and points to the
 /// correct routing endpoint of the connection group".
 pub const DNS_CONFIGURATION_VALID: &str = "valid-configuration";
-
 /// `DnsConfiguration$Status` for a domain where "there is either a missing DNS record or
 /// the DNS record exists but it's using an incorrect routing endpoint": the status for a
 /// verification that was MADE and disagreed — a DNS record that resolves the domain to
@@ -3644,6 +3652,48 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Set or clear the WAF web ACL customization of the distribution tenant `id` names,
+    /// and report the record as it now stands.
+    ///
+    /// `Customizations$WebAcl` is "the WAF web ACL" a tenant overrides or disables, and it
+    /// is the ONE member a web ACL association of a tenant writes: `Some` stores the
+    /// customization, `None` takes it off the record, and a customization set that is then
+    /// empty is dropped altogether rather than reported as an element describing nothing.
+    /// The tenant's other customizations are carried over untouched, because the
+    /// association says nothing about them.
+    ///
+    /// The write versions the tenant exactly as any other change to its configuration
+    /// does — `LastModifiedTime` becomes `now`, a fresh version token is minted so the
+    /// token the caller matched on no longer satisfies an `If-Match`, and the tenant goes
+    /// back to [`STATUS_IN_PROGRESS`] with a new propagation deadline, since the new
+    /// configuration has to reach the edge locations before it is deployed again.
+    ///
+    /// `None` when the store holds no such tenant, checked BEFORE the mint so a version
+    /// token is never spent on a tenant that is not there.
+    pub fn apply_tenant_web_acl(
+        &mut self,
+        id: &str,
+        web_acl: Option<WebAclCustomization>,
+        now: SystemTime,
+    ) -> Option<&StoredDistributionTenant> {
+        if !self.distribution_tenants.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let tenant = self.distribution_tenants.get_mut(id)?;
+        let mut customizations = tenant.customizations.take().unwrap_or_default();
+        customizations.web_acl = web_acl;
+        tenant.customizations = (customizations.web_acl.is_some()
+            || customizations.certificate.is_some()
+            || customizations.geo_restrictions.is_some())
+        .then_some(customizations);
+        tenant.last_modified_time = now;
+        tenant.etag = etag;
+        tenant.status = STATUS_IN_PROGRESS.to_string();
+        tenant.deployed_due = now + PROPAGATION_DELAY;
+        Some(tenant)
+    }
+
     /// Replace the configuration of the cache policy `id` names, and report the record as
     /// it now stands.
     ///
@@ -6414,6 +6464,42 @@ pub fn cache_policy_in_use() -> crate::ops::types::CachePolicyInUse {
 pub const CACHE_POLICY_IN_USE_MESSAGE: &str =
     "The specified cache policy is currently associated with a cache behavior. Please \
      disassociate the policy before deleting.";
+
+/// The modelled `IllegalDelete` (HTTP 400) for a delete whose target is a policy AWS
+/// published rather than one this account created.
+///
+/// A published policy is READ-ONLY to the account that reads it — nothing a caller does
+/// creates, changes or removes one — so a delete of one is refused for what the REQUEST
+/// asked for rather than answered "does not exist": the resource is there, and a caller
+/// told it is missing would try to create it. The sentence states that condition and names
+/// nothing from the request, so every refusal of it reads the same.
+pub fn illegal_delete_managed_policy() -> crate::ops::types::IllegalDelete {
+    crate::ops::types::IllegalDelete {
+        message: Some(ILLEGAL_DELETE_MANAGED_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `IllegalDelete`'s message, in the form CloudFront answers a delete of a policy AWS owns
+/// with: delete is not allowed for it.
+pub const ILLEGAL_DELETE_MANAGED_POLICY_MESSAGE: &str =
+    "The request failed because delete is not allowed for this policy.";
+
+/// The modelled `IllegalUpdate` (HTTP 400) for an update whose target is a policy AWS
+/// published rather than one this account created.
+///
+/// The SAME rule [`illegal_delete_managed_policy`] states, over the other mutation a policy
+/// takes: a published policy is read-only to this account, so the update is refused for
+/// what the request asked for and the policy keeps the configuration AWS gave it. The
+/// sentence is that one worded for this mutation.
+pub fn illegal_update_managed_policy() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(ILLEGAL_UPDATE_MANAGED_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `IllegalUpdate`'s message for a policy AWS owns: update is not allowed for it.
+pub const ILLEGAL_UPDATE_MANAGED_POLICY_MESSAGE: &str =
+    "The request failed because update is not allowed for this policy.";
 
 /// The modelled `CachePolicyAlreadyExists` (HTTP 409) for a policy name that is already
 /// taken — "A cache policy with this name already exists. You must provide a unique name.

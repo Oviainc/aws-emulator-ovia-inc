@@ -11,8 +11,10 @@
 //! operations resolve it, through [`crate::state::parse_resource_arn`] and then the
 //! one shared resolver [`crate::state::ComAmazonawsDsqlDsqlState::resource_tags_mut`]:
 //! an ARN that names no Aurora DSQL resource at all is a bad request (400
-//! `ValidationException`), and a well-formed one naming nothing this store holds
-//! answers the modelled 404. EVERY tagged resource of this service resolves —  a
+//! `ValidationException`), and a well-formed one naming nothing this store holds —
+//! including one scoped to another region, account or partition than the endpoint the
+//! request reached — answers the modelled 404. EVERY tagged resource of this service
+//! resolves —  a
 //! cluster (`cluster/{cluster}`) and a stream of it
 //! (`cluster/{cluster}/stream/{stream}`) — each to its OWN tag map, exactly as in
 //! `ListTagsForResource` and `UntagResource`, so a tag write and a tag read never
@@ -186,9 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The ARN carries the resource, so this operation reads nothing from the
-        // request's credential scope.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_server_error());
         };
@@ -225,9 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UntagResource`: it walks every tagged resource of this service — a cluster,
         // and a stream of a cluster addressed by its nested ARN
         // `cluster/{cluster}/stream/{stream}` (`crate::state::stream_arn`) — to that
-        // resource's own tag map. A well-formed ARN naming nothing this store holds
-        // answers the modelled 404, whichever of the two it names.
-        let Some(held) = state.resource_tags_mut(&resource) else {
+        // resource's own tag map, within the scope the request reached. A well-formed
+        // ARN naming nothing this store holds answers the modelled 404, whichever of
+        // the two it names — and an ARN of another region, account or partition names
+        // a resource this endpoint neither reads nor writes, so it is absent here too.
+        let Some(held) = state.resource_tags_mut(&resource, &crate::state::request_region(ctx))
+        else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     &input.resource_arn,

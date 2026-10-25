@@ -18,6 +18,9 @@
 //!   the summary the listing reports and the question roll-ups of the template and its
 //!   lens review all move with it — by either spelling of the lens (`LensAlias` is
 //!   "either the lens alias … or the lens ARN");
+//! * every member a request can write here is optional, so a request that supplies NONE of
+//!   them asks for no change: it answers nothing and leaves the question as it stands,
+//!   while a member it DOES supply is a write however empty the value it carries;
 //! * a `TemplateArn` nothing is stored under, a lens the template does not apply and a
 //!   `QuestionId` that lens does not ask are each a modelled 404; a `ChoiceId` the
 //!   question does not offer and a value outside a modelled enum's value set are each a
@@ -434,13 +437,14 @@ async fn selected_choices_replace_the_choices_in_place() {
     }
 }
 
-/// An update is a WRITE whatever it carries: a request that supplies none of the answer's
-/// members still answers the question, so a previously `UNANSWERED` question becomes
-/// `ANSWERED` with the state a newly answered question has — every choice the question
-/// offers recorded `UNSELECTED`, nothing selected, the question applying and no reason or
-/// notes. The rows are questions of two pillars whose choice catalogs differ in size.
+/// A request that supplies one member answers the question even when that member carries
+/// no value — `SelectedChoices` naming no choice records the state a newly answered
+/// question has: every choice the question offers `UNSELECTED`, nothing selected, the
+/// question applying and no reason or notes. A request that supplies NO member asks for no
+/// change and answers nothing, so the question is still `UNANSWERED` afterwards. The rows
+/// are questions of two pillars whose choice catalogs differ in size.
 #[tokio::test]
-async fn an_update_that_carries_no_member_still_answers_the_question() {
+async fn an_empty_member_answers_the_question_and_no_member_answers_nothing() {
     let client = Client::new();
     let template_arn = template(&client, "empty-update-template", &[FRAMEWORK_LENS]).await;
 
@@ -451,13 +455,43 @@ async fn an_update_that_carries_no_member_still_answers_the_question() {
         let (question_id, _) = question;
         let offered = offered_choices(&client, &template_arn, question).await;
 
-        let written = answer_of(
+        // Every member this operation writes is optional, so a request carrying none of
+        // them records nothing: the question is answered by the request that answers it.
+        let untouched = answer_of(
             &client
                 .update_review_template_answer(
                     &template_arn,
                     FRAMEWORK_LENS,
                     question_id,
                     json!({}),
+                )
+                .await,
+            &template_arn,
+            FRAMEWORK_LENS,
+            question_id,
+        );
+        assert_eq!(
+            member(&untouched, "AnswerStatus"),
+            Some(UNANSWERED),
+            "case {question_id:?}: an update that supplies no member answers nothing, got \
+             {untouched:?}"
+        );
+        assert_eq!(
+            summary_of(&client, &template_arn, question)
+                .await
+                .get("AnswerStatus")
+                .and_then(Value::as_str),
+            Some(UNANSWERED),
+            "case {question_id:?}: the listing must report the question unanswered too"
+        );
+
+        let written = answer_of(
+            &client
+                .update_review_template_answer(
+                    &template_arn,
+                    FRAMEWORK_LENS,
+                    question_id,
+                    json!({ "SelectedChoices": [] }),
                 )
                 .await,
             &template_arn,

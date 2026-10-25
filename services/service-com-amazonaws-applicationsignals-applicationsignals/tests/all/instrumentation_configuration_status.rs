@@ -19,7 +19,8 @@
 //!   fall in the requested window (else the last hour), most recent first, a page at a time;
 //! * a status read of an identity that names no stored configuration is the modelled
 //!   `ResourceNotFoundException` (404), and a read never changes what a later caller sees;
-//! * a configuration's history goes when the configuration goes.
+//! * a configuration's history goes when the configuration goes — whether it was deleted or
+//!   its `ExpiresAt` fell due, the one write this read materialises.
 //!
 //! The rows of each table differ along what the rules generalise over: the whole modelled
 //! `InstrumentationConfigurationStatus` and `InstrumentationErrorCause` catalogues, both
@@ -1270,4 +1271,172 @@ async fn a_history_is_bounded_and_keeps_its_newest_events() {
             body["Events"]
         );
     }
+}
+
+/// A configuration whose `ExpiresAt` the clock has reached is no longer served to clients, so
+/// neither is its status history: the read reports the configuration as not found and the
+/// stored history is gone with it, while a configuration of the type that does not expire
+/// keeps serving its own events.
+///
+/// Both `InstrumentationType` values are rows, since the type is what decides whether a
+/// configuration expires at all. The documented floor on a BREAKPOINT lifetime is 5 minutes,
+/// which outlasts any test, so the passage of time is staged on the store the handlers share
+/// through `put_instrumentation_configuration` — the very method the create path calls.
+#[tokio::test]
+async fn a_lapsed_configuration_serves_no_status_history() {
+    let service = "checkout";
+    let environment = "eks:cluster-prod/namespace";
+    let now = now_seconds();
+    let (router, engine) = router_with_engine();
+
+    // One configuration of each type, at locations of their own so the two records are
+    // addressed under different location hashes.
+    let expiring_hash = create_configuration(
+        &router,
+        &create_request(service, environment, BREAKPOINT, "src/Cart.java"),
+    )
+    .await;
+    let permanent_hash = create_configuration(
+        &router,
+        &create_request(service, environment, PROBE, "src/Pricing.java"),
+    )
+    .await;
+
+    let reported_at = now - 30.0;
+    let (code, body) = report(
+        &router,
+        &json!({
+            "Service": service,
+            "Environment": environment,
+            "Configurations": [
+                report_entry(BREAKPOINT, &expiring_hash, "ACTIVE", reported_at, None),
+                report_entry(PROBE, &permanent_hash, "ACTIVE", reported_at, None),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "expected the setup report to succeed, got {code} with {body}"
+    );
+
+    // Both configurations serve that event while both are still live.
+    for (label, kind, hash) in [
+        (
+            "a BREAKPOINT configuration, which expires",
+            BREAKPOINT,
+            &expiring_hash,
+        ),
+        (
+            "a PROBE configuration, which does not expire",
+            PROBE,
+            &permanent_hash,
+        ),
+    ] {
+        let (code, body) = get_status(
+            &router,
+            &status_request(
+                service,
+                environment,
+                kind,
+                json!({ "LocationHash": hash }),
+                &Query::default(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            code, 200,
+            "case {label:?}: expected HTTP 200 before any lapse, got {code} with {body}"
+        );
+        assert_eq!(
+            event_times(&body),
+            vec![reported_at],
+            "case {label:?}: expected the reported event, got {:?}",
+            body["Events"]
+        );
+    }
+
+    // Stage what the clock will do to the type that expires: the same record, with an expiry
+    // it has already passed.
+    let scope = InstrumentationScope::new(BREAKPOINT, service, environment);
+    let key = instrumentation_key(SNAPSHOT, &expiring_hash);
+    let lapsed_at = DateTime::from_secs_f64(now - 1.0);
+    {
+        let state = engine.state::<ComAmazonawsApplicationsignalsApplicationsignalsState>();
+        let mut store = state.lock();
+        let mut record = store
+            .instrumentation_configuration(&scope, &key)
+            .expect("the create stored the configuration under its identity")
+            .clone();
+        record.expires_at = Some(lapsed_at);
+        store.put_instrumentation_configuration(scope.clone(), record, lapsed_at);
+    }
+
+    let (code, error) = get_status(
+        &router,
+        &status_request(
+            service,
+            environment,
+            BREAKPOINT,
+            json!({ "LocationHash": &expiring_hash }),
+            &Query::default(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        code, 404,
+        "expected a read of a lapsed configuration to be 404, got {code} with {error}"
+    );
+    assert_eq!(
+        error["__type"].as_str(),
+        Some("ResourceNotFoundException"),
+        "expected a ResourceNotFoundException, got {error}"
+    );
+    assert_eq!(
+        error["ResourceType"].as_str(),
+        Some("InstrumentationConfiguration"),
+        "expected the configuration type name, got {error}"
+    );
+
+    // The lapse was materialised rather than merely hidden, and the history went with the
+    // configuration it belonged to.
+    {
+        let state = engine.state::<ComAmazonawsApplicationsignalsApplicationsignalsState>();
+        let store = state.lock();
+        assert!(
+            store.instrumentation_configuration(&scope, &key).is_none(),
+            "expected the lapsed configuration to be dropped from the store"
+        );
+        let held = store
+            .instrumentation_status_history(&scope, &key)
+            .map(|history| history.len());
+        assert!(
+            held.is_none(),
+            "expected the lapsed configuration's status history to be dropped, holding {held:?}"
+        );
+    }
+
+    // The configuration that does not expire is untouched by another one's lapse.
+    let (code, body) = get_status(
+        &router,
+        &status_request(
+            service,
+            environment,
+            PROBE,
+            json!({ "LocationHash": &permanent_hash }),
+            &Query::default(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "expected a configuration that does not expire to keep serving its events, \
+         got {code} with {body}"
+    );
+    assert_eq!(
+        event_times(&body),
+        vec![reported_at],
+        "expected the reported event to still be served, got {:?}",
+        body["Events"]
+    );
 }

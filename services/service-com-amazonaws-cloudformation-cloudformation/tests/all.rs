@@ -73,6 +73,8 @@ mod publisher_registration;
 mod rds_stack_resources;
 #[path = "all/regional_stack_namespace.rs"]
 mod regional_stack_namespace;
+#[path = "all/resource_signals.rs"]
+mod resource_signals;
 #[path = "all/s3vectors_resource_types.rs"]
 mod s3vectors_resource_types;
 #[path = "all/resolved_properties.rs"]

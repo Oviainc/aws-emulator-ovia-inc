@@ -217,6 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An edge is one dataflow of a contact, so each edge this update carries is
+        // type-checked the way the create's are: an update cannot leave a profile holding
+        // a graph a create would have refused (see `state::dataflow_edge_fault`).
+        for edge in input.dataflow_edges.iter().flatten() {
+            if let Some(refusal) = guard.dataflow_edge_fault(edge) {
+                return Err(
+                    UpdateMissionProfileErrorModeled::InvalidParameterException(refusal).into(),
+                );
+            }
+        }
+
         let stored = guard
             .mission_profiles
             .get_mut(&input.mission_profile_id)

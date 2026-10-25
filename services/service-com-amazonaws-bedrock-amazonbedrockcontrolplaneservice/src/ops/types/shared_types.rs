@@ -291,7 +291,15 @@ pub struct AutomatedReasoningPolicyScenario {
     pub rule_ids: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#AutomatedReasoningPolicyTestCase")]
+/// `AutomatedReasoningPolicyTestCase`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="AutomatedReasoningPolicyTestCase")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct AutomatedReasoningPolicyTestCase {
     pub test_case_id: String,
@@ -302,6 +310,49 @@ pub struct AutomatedReasoningPolicyTestCase {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub confidence_threshold: Option<f64>,
 }
+
+bedrock_schema_and_codec!(
+    AutomatedReasoningPolicyTestCase,
+    AUTOMATED_REASONING_POLICY_TEST_CASE_SCHEMA,
+    "com.amazonaws.bedrock#AutomatedReasoningPolicyTestCase",
+    "com.amazonaws.bedrock",
+    "AutomatedReasoningPolicyTestCase",
+    (M_TEST_CASE_ID, test_case_id, "testCaseId", 0, req, string),
+    (
+        M_GUARD_CONTENT,
+        guard_content,
+        "guardContent",
+        1,
+        req,
+        string
+    ),
+    (
+        M_QUERY_CONTENT,
+        query_content,
+        "queryContent",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_EXPECTED_AGGREGATED_FINDINGS_RESULT,
+        expected_aggregated_findings_result,
+        "expectedAggregatedFindingsResult",
+        3,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+    (
+        M_CONFIDENCE_THRESHOLD,
+        confidence_threshold,
+        "confidenceThreshold",
+        6,
+        opt,
+        double
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrock#AutomatedReasoningPolicyTestResult")]
 #[derive(Debug, Clone)]

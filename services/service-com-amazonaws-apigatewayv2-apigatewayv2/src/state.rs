@@ -2427,11 +2427,16 @@ pub struct ProductRestEndpointPage {
     /// creating request addressed: an ARN names the Region its resource was created in,
     /// so it cannot be rebuilt per read from whatever Region a later caller signs for.
     pub product_rest_endpoint_page_arn: String,
+    /// The Region the creating request addressed, kept beside the ARN that names it: a
+    /// later WRITE that re-resolves this page's display content derives the identified
+    /// endpoint's invoke URL in the page's OWN Region, rather than in whatever Region the
+    /// writing caller happened to sign for.
+    pub region: String,
     /// The REST endpoint this page documents, as the request identified it.
     pub rest_endpoint_identifier: wire::RestEndpointIdentifier,
-    /// The display content this page reports, resolved ONCE by
-    /// [`resolve_endpoint_display_content`] rather than per read, so the endpoint it
-    /// names does not follow the Region a later reader signs for.
+    /// The display content this page reports, resolved by
+    /// [`resolve_endpoint_display_content`] at every WRITE rather than per read, so the
+    /// endpoint it names does not follow the Region a later reader signs for.
     pub display_content: wire::EndpointDisplayContentResponse,
     /// "The timestamp when the product REST endpoint page was last modified" — the
     /// creation instant until something rewrites the record.
@@ -2446,7 +2451,8 @@ pub struct ProductRestEndpointPage {
     pub available_at: Instant,
 }
 
-/// The members `CreateProductRestEndpointPage` and `GetProductRestEndpointPage` each
+/// The members `CreateProductRestEndpointPage`, `GetProductRestEndpointPage` and
+/// `UpdateProductRestEndpointPage` each
 /// report for one page — the Get response carries the create's members plus
 /// `RawDisplayContent` — so [`ProductRestEndpointPage::to_wire`] projects the record
 /// ONCE and every reader serializes that projection rather than assembling its own.
@@ -2911,7 +2917,8 @@ pub fn portal_domain_hosted_zone_id(region: &str) -> String {
     format!("Z{mixed}")
 }
 
-/// Resolve a portal's requested domain configuration into the one the readers report.
+/// Resolve a portal's requested domain configuration into the one the readers report,
+/// generating the default domain of a portal with this id in this Region.
 ///
 /// The request names either a domain the account owns together with its ACM certificate
 /// (`AcmManaged`) or API Gateway's default domain (`None`); either way the response
@@ -2920,6 +2927,27 @@ pub fn portal_domain_hosted_zone_id(region: &str) -> String {
 pub fn resolve_portal_endpoint_configuration(
     portal_id: &str,
     region: &str,
+    requested: &wire::EndpointConfigurationRequest,
+) -> wire::EndpointConfigurationResponse {
+    portal_endpoint_configuration(
+        portal_default_domain_name(portal_id, region),
+        portal_domain_hosted_zone_id(region),
+        requested,
+    )
+}
+
+/// Resolve a requested domain configuration onto a default domain the service has
+/// ALREADY generated for the portal.
+///
+/// Which domain the account brought is the request's to say, while the default domain
+/// name and its hosted zone id are generated from the portal's id and the Region the
+/// portal lives in — so a later write to a portal's domain configuration carries those
+/// two over rather than rebuilding them from whatever Region the writing request was
+/// signed for. [`resolve_portal_endpoint_configuration`] is this with the pair generated
+/// for a given id and Region.
+pub fn portal_endpoint_configuration(
+    portal_default_domain_name: String,
+    portal_domain_hosted_zone_id: String,
     requested: &wire::EndpointConfigurationRequest,
 ) -> wire::EndpointConfigurationResponse {
     wire::EndpointConfigurationResponse {
@@ -2931,8 +2959,8 @@ pub fn resolve_portal_endpoint_configuration(
             .acm_managed
             .as_ref()
             .map(|managed| managed.domain_name.clone()),
-        portal_default_domain_name: portal_default_domain_name(portal_id, region),
-        portal_domain_hosted_zone_id: portal_domain_hosted_zone_id(region),
+        portal_default_domain_name,
+        portal_domain_hosted_zone_id,
     }
 }
 

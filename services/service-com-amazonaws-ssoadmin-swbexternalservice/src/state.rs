@@ -26,8 +26,9 @@ use crate::ops::types::{
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
-    PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
-    ResourceServerScopeDetails, ScopeDetails, Tag, TrustedTokenIssuerConfiguration,
+    PermissionSet, PermissionSetProvisioningStatus, PermissionsBoundary, PortalOptions,
+    RegionMetadata, ResourceServerConfig, ResourceServerScopeDetails, ScopeDetails, Tag,
+    TrustedTokenIssuerConfiguration,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -312,6 +313,20 @@ pub fn assignment_operation_not_found_message(request_id: &str) -> String {
     format!("Could not find the status of an assignment operation with request id {request_id}.")
 }
 
+/// The refusal a `RequestId` this instance tracks no permission-set PROVISIONING under
+/// earns, as the message of the modelled `ResourceNotFoundException`.
+///
+/// Built from the request, exactly as [`assignment_operation_not_found_message`] is: it
+/// names the request id that resolved to nothing. A separate helper because the two are
+/// separate histories — a provisioning request id is not an assignment operation's, and
+/// neither answers a read of the other.
+pub fn permission_set_provisioning_not_found_message(request_id: &str) -> String {
+    format!(
+        "Could not find the status of a permission set provisioning with request id \
+         {request_id}."
+    )
+}
+
 /// `ApplicationStatus::ENABLED` (the enum is `ENABLED | DISABLED`) — the status an
 /// application carries when the create that made it named none.
 ///
@@ -476,6 +491,22 @@ pub fn provisioning_status_unknown_message(provisioning_status: &str) -> String 
     )
 }
 
+/// `ProvisionTargetType::AWS_ACCOUNT` — the one of the model's two provisioning targets
+/// (`ALL_PROVISIONED_ACCOUNTS | AWS_ACCOUNT`) that names ONE Amazon Web Services account,
+/// which is the account `ProvisionPermissionSet$TargetId` carries. The other names every
+/// account the permission set is already provisioned into, so it carries no account.
+pub const PROVISION_TARGET_TYPE_AWS_ACCOUNT: &str = "AWS_ACCOUNT";
+
+/// The refusal a provisioning that targets ONE account without naming it earns, as the
+/// message of the modelled `ValidationException`.
+///
+/// BUILT from the request: it names the member the request left out and the target type
+/// that requires it ("TargetID is an Amazon Web Services account identifier"), so the
+/// caller can fix the request from this text alone.
+pub fn target_id_required_message(target_type: &str) -> String {
+    format!("TargetId is required when TargetType is {target_type}")
+}
+
 /// `StatusValues::IN_PROGRESS` — the NON-TERMINAL status an assignment operation carries
 /// from the call that starts it until the instant its completion falls due (see
 /// [`ASSIGNMENT_OPERATION_SPAN`]).
@@ -495,6 +526,21 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// wait it out. It is held as the instant the completion falls due and the status is
 /// DERIVED from it ([`AssignmentOperationRecord::status`]); nothing sleeps for it.
 pub const ASSIGNMENT_OPERATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after the call that STARTS a permission-set provisioning that provisioning
+/// falls due: the instant its status leaves `IN_PROGRESS` for `SUCCEEDED` and the copy it
+/// carries reaches the accounts it targets.
+///
+/// Provisioning a permission set is asynchronous — `ProvisionPermissionSet` answers with a
+/// status object whose `StatusValues` carries the non-terminal `IN_PROGRESS`, and
+/// `DescribePermissionSetProvisioningStatus` exists to "retrieve the current status of the
+/// provisioning workflow" — and AWS publishes no duration for that workflow, so this span
+/// is the emulator's OWN choice, on the same footing as [`ASSIGNMENT_OPERATION_SPAN`]:
+/// never zero, so a caller that polls straight after the call still observes the in-flight
+/// status, and short enough that a test can wait it out. It is held as the instant the
+/// completion falls due and the status is DERIVED from it
+/// ([`PermissionSetProvisioningRecord::status`]); nothing sleeps for it.
+pub const PERMISSION_SET_PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 
 /// The page size a paginated read uses when the caller sends no `MaxResults`, and the
 /// ceiling it clamps a caller's value to: the model's `MaxResults` shape is
@@ -2044,6 +2090,85 @@ impl AssignmentOperationRecord {
     }
 }
 
+/// One PROVISIONING of a permission set into the accounts a `ProvisionPermissionSet` call
+/// targeted, tracked by the `RequestId` that call answered with.
+///
+/// `Status` is DERIVED from [`succeeded_due`](Self::succeeded_due) rather than stored,
+/// exactly as an [`AssignmentOperationRecord`]'s is, so a read never has to write to move
+/// the status on. The COPY the provisioning carries — [`revision`](Self::revision), the
+/// permission set's definition as it stood when the call was accepted — reaches the
+/// accounts in [`accounts`](Self::accounts) at that SAME instant, applied by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::materialize_due`], so an account's copy
+/// changes when the workflow completes rather than when it was asked for.
+#[derive(Debug, Clone)]
+pub struct PermissionSetProvisioningRecord {
+    pub request_id: String,
+    /// The instance the provisioning ran under. A status record belongs to one instance,
+    /// like an assignment operation's, so a `RequestId` minted under another instance is
+    /// as absent as one that was never minted.
+    pub instance_arn: String,
+    pub permission_set_arn: String,
+    /// The account the call named as its target, when it named ONE
+    /// (`ProvisionTargetType::AWS_ACCOUNT`) — what the status object reports as its
+    /// `AccountId`. A provisioning of every account that already holds the permission set
+    /// (`ALL_PROVISIONED_ACCOUNTS`) names no single account, so it carries none.
+    pub account_id: Option<String>,
+    /// Every account this provisioning copies the permission set into, FIXED when the
+    /// call was accepted: the one account an `AWS_ACCOUNT` target names, or the accounts
+    /// holding a copy at that instant for an `ALL_PROVISIONED_ACCOUNTS` one. An account
+    /// that started holding the permission set after the call is not part of the work
+    /// this call accepted.
+    pub accounts: BTreeSet<String>,
+    /// The permission set's definition revision
+    /// ([`PermissionSetRecord::definition_revision`]) as it stood when the call was
+    /// accepted: the definition this provisioning copies, so a change made to the
+    /// permission set while the workflow is in flight is not the one that lands.
+    pub revision: String,
+    pub failure_reason: Option<String>,
+    pub created_date: DateTime,
+    /// When this provisioning stops being `IN_PROGRESS` and becomes `SUCCEEDED`:
+    /// [`PERMISSION_SET_PROVISIONING_SPAN`] after the call that started it was accepted.
+    pub succeeded_due: SystemTime,
+    /// Whether the copy has already reached the target accounts. Set when the clock makes
+    /// the provisioning due and the copy is applied, so the copy lands exactly once
+    /// however often the store is swept.
+    pub applied: bool,
+}
+
+impl PermissionSetProvisioningRecord {
+    /// `StatusValues` as of `now`: the non-terminal `IN_PROGRESS` until the provisioning's
+    /// completion is due, `SUCCEEDED` after.
+    ///
+    /// The enum's third value, `FAILED`, is never reported: nothing here fails a
+    /// provisioning, which is also why [`Self::failure_reason`] stays absent.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.succeeded_due {
+            STATUS_IN_PROGRESS
+        } else {
+            STATUS_SUCCEEDED
+        }
+    }
+
+    /// Whether the clock has made this provisioning's completion due.
+    pub fn completion_due(&self, now: SystemTime) -> bool {
+        now >= self.succeeded_due
+    }
+
+    /// This record as the modeled `PermissionSetProvisioningStatus` shape, as of `now` —
+    /// what both `ProvisionPermissionSet` and `DescribePermissionSetProvisioningStatus`
+    /// report, so a describe cannot disagree with the call that minted the request id.
+    pub fn to_shape(&self, now: SystemTime) -> PermissionSetProvisioningStatus {
+        PermissionSetProvisioningStatus {
+            status: Some(self.status(now).to_string()),
+            request_id: Some(self.request_id.clone()),
+            account_id: self.account_id.clone(),
+            permission_set_arn: Some(self.permission_set_arn.clone()),
+            failure_reason: self.failure_reason.clone(),
+            created_date: Some(self.created_date),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-ssoadmin-swbexternalservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSsoadminSwbexternalserviceState {
@@ -2091,6 +2216,18 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// is evicted beyond that (see [`Self::record_assignment_deletion`]) rather than a
     /// delete being refused for history nobody can grow.
     pub assignment_deletions: Vec<AssignmentOperationRecord>,
+    /// Permission-set PROVISIONING statuses, newest last — the history
+    /// `DescribePermissionSetProvisioningStatus` reads by `RequestId`, and the record of
+    /// the copy each provisioning owes its target accounts until the clock makes it due
+    /// (see [`Self::materialize_due`]).
+    ///
+    /// Separate from [`Self::assignment_operations`] because the two are read by different
+    /// operations: a `RequestId` a provisioning carries is not an assignment operation's
+    /// and must not answer a describe of one. A `Vec` in insertion order, so the history
+    /// is chronological; it holds at most [`MAX_RECORDS_PER_STORE`] records and the oldest
+    /// is evicted beyond that (see [`Self::record_permission_set_provisioning`]) rather
+    /// than a provisioning being refused for history nobody can grow.
+    pub permission_set_provisionings: Vec<PermissionSetProvisioningRecord>,
     /// Whether the account's IAM Identity Center ENABLEMENT has been decided already.
     ///
     /// The emulator's account gets its instance from the first request that needs one: a
@@ -2194,6 +2331,121 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         for instance in self.instances.values_mut() {
             instance.materialize_due(now);
         }
+        self.materialize_due_provisionings(now);
+    }
+
+    /// Apply every permission-set provisioning whose completion the clock has made due:
+    /// the copy it carries reaches its target accounts at that instant, whether or not
+    /// anybody called.
+    ///
+    /// Each provisioning lands exactly once — the record is marked applied — so a later
+    /// sweep neither re-copies a definition the permission set has since moved past nor
+    /// undoes a provisioning that followed it.
+    fn materialize_due_provisionings(&mut self, now: SystemTime) {
+        let due: Vec<usize> = self
+            .permission_set_provisionings
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| !record.applied && record.completion_due(now))
+            .map(|(index, _)| index)
+            .collect();
+        for index in due {
+            self.apply_provisioning(index);
+        }
+    }
+
+    /// Copy the definition one stored provisioning carries into the accounts it targeted,
+    /// by recording that revision as the one each of those accounts now holds. A
+    /// provisioning that has already landed is left alone, so it lands exactly once
+    /// however often the store is swept: re-copying it would undo a provisioning that
+    /// followed it.
+    ///
+    /// An account holds a permission set through the assignments granted on it, and the
+    /// revision recorded on those rows is what every reader compares against the
+    /// permission set's current definition, so this provisioning updates exactly those
+    /// rows. A target account that holds no assignment of this permission set has no copy
+    /// to refresh, so there is nothing to write for it.
+    fn apply_provisioning(&mut self, index: usize) {
+        let Some(record) = self.permission_set_provisionings.get_mut(index) else {
+            return;
+        };
+        if record.applied {
+            return;
+        }
+        record.applied = true;
+        let instance_arn = record.instance_arn.clone();
+        let permission_set_arn = record.permission_set_arn.clone();
+        let revision = record.revision.clone();
+        let accounts = record.accounts.clone();
+        for row in &mut self.account_assignments {
+            if row.instance_arn != instance_arn || row.permission_set_arn != permission_set_arn {
+                continue;
+            }
+            if !accounts.contains(&row.account_id) {
+                continue;
+            }
+            row.provisioned_revision = revision.clone();
+        }
+    }
+
+    /// Store the status of one permission-set provisioning, evicting the OLDEST records
+    /// while the history is over [`MAX_RECORDS_PER_STORE`].
+    ///
+    /// Like [`Self::record_assignment_deletion`], this store evicts rather than refusing:
+    /// AWS accepts a provisioning of a permission set that exists, so the emulator's
+    /// memory ceiling is kept by dropping the oldest status instead of refusing the call.
+    /// An evicted record's copy lands only if the clock had ALREADY made it due at `now`:
+    /// eviction is the memory ceiling and not a second clock, so it never delivers a copy
+    /// ahead of the instant the provisioning that owes it reported.
+    pub fn record_permission_set_provisioning(
+        &mut self,
+        record: PermissionSetProvisioningRecord,
+        now: SystemTime,
+    ) {
+        self.permission_set_provisionings.push(record);
+        let excess = self
+            .permission_set_provisionings
+            .len()
+            .saturating_sub(MAX_RECORDS_PER_STORE);
+        for index in 0..excess {
+            if self
+                .permission_set_provisionings
+                .get(index)
+                .is_some_and(|record| record.completion_due(now))
+            {
+                self.apply_provisioning(index);
+            }
+        }
+        self.permission_set_provisionings.drain(..excess);
+    }
+
+    /// The status record of the permission-set provisioning `request_id` names, WITHIN
+    /// `instance_arn`.
+    ///
+    /// Scoped to the instance exactly as [`Self::assignment_operation`] is, and absent
+    /// once the permission set it reports on has gone: a status exists to report the
+    /// provisioning of one permission set, so an id whose permission set no reader can
+    /// see is as absent as one that was never minted.
+    pub fn permission_set_provisioning(
+        &self,
+        instance_arn: &str,
+        request_id: &str,
+    ) -> Option<&PermissionSetProvisioningRecord> {
+        self.permission_set_provisionings
+            .iter()
+            .find(|record| record.instance_arn == instance_arn && record.request_id == request_id)
+            .filter(|record| {
+                self.permission_set(instance_arn, &record.permission_set_arn)
+                    .is_some()
+            })
+    }
+
+    /// Whether any stored permission-set provisioning already carries `request_id`, so a
+    /// freshly minted one is never reused for a second provisioning.
+    pub fn permission_set_provisioning_request_id_taken(&self, request_id: &str) -> bool {
+        self.permission_set_provisionings
+            .iter()
+            .any(|record| record.request_id == request_id)
     }
 
     /// Drop the instance `instance_arn` names and everything held INSIDE it.
@@ -2216,6 +2468,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.assignment_operations
             .retain(|_, record| record.instance_arn != instance_arn);
         self.assignment_deletions
+            .retain(|record| record.instance_arn != instance_arn);
+        self.permission_set_provisionings
             .retain(|record| record.instance_arn != instance_arn);
         let orphaned_applications: Vec<String> = self
             .applications
@@ -2496,7 +2750,8 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// what granting an account assignment on that account does — however many principals
     /// were assigned through it, so an account appears at most once. The copy in place is
     /// the one the LAST provisioning put there, so a provisioning that followed a change
-    /// to the permission set brings the account back up to date.
+    /// to the permission set brings the account back up to date, whether that provisioning
+    /// was a grant or a `ProvisionPermissionSet` call.
     ///
     /// The status is COMPUTED, by comparing the revision each provisioning recorded
     /// ([`AccountAssignmentRecord::provisioned_revision`]) against the permission set's

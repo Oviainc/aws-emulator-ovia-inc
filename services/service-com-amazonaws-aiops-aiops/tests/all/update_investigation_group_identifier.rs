@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `UpdateInvestigationGroup` ADDRESSED BY THE GROUP'S NAME.
+//! End-to-end HTTP tests for `UpdateInvestigationGroup` ADDRESSED BY THE GROUP'S ARN.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: an update addressed by either form the operation's `identifier`
-//! admits reaches the SAME stored record, so for every member the operation accepts the
-//! name form applies the change exactly as the ARN form does, leaves every member the
-//! request omitted alone, and records the change on `lastModifiedBy`/`lastModifiedAt`.
-//! The member's own documentation is
-//! `smithy_query(query="doc",shape="com.amazonaws.aiops#UpdateInvestigationGroupRequest",member="identifier")`:
-//! "Specify either the name or the ARN of the investigation group that you want to
-//! modify."; the modelled pattern
-//! (`smithy_query(query="shape",shape="InvestigationGroupIdentifier")`) spells the
-//! alternation out as
-//! `^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`.
+//! The rule under test: an update addresses its group through the group's ARN, so for
+//! every member the operation accepts the change reaches the stored record, every member
+//! the request omitted is left alone and the change is recorded on
+//! `lastModifiedBy`/`lastModifiedAt`; the same update addressed by a bare label — the
+//! group's own name included — resolves no group and is answered with the modelled
+//! `ResourceNotFoundException` (404) without touching the record. The modelled pattern
+//! (`smithy_query(query="shape",shape="InvestigationGroupIdentifier")`) admits the bare
+//! label beside the ARN
+//! (`^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`), which is
+//! a well-formedness rule and not an address.
 //!
 //! Rows span the MEMBER SET the operation accepts
 //! (`smithy_query(query="operation",operation="UpdateInvestigationGroup")`:
@@ -24,9 +23,8 @@
 //! `chatbotNotificationChannel`, `isCloudTrailEventHistoryEnabled`,
 //! `crossAccountConfigurations`) and so differ along the member's type — boolean,
 //! string, structure, list, map, list of structures — and along how many members one
-//! request carries: one, all of them, and none. Each row is applied twice over twin
-//! groups, once through the name and once through the ARN, and the two resulting
-//! records are compared.
+//! request carries: one, all of them, and none. Each row is applied through the ARN and
+//! then attempted again through the name.
 
 use std::sync::Arc;
 
@@ -49,10 +47,10 @@ const REGIONS: &[&str] = &["us-west-2", "us-east-1", "eu-central-1", "ap-southea
 /// and asserted separately.
 const MUTATION_STAMPS: &[&str] = &["lastModifiedAt", "lastModifiedBy"];
 
-/// Members that differ between two groups by construction — the ARN names the Region
-/// and the id, and the two twins are created at whatever instant the clock reads — so
-/// they are dropped before the two records are compared.
-const PER_RESOURCE_MEMBERS: &[&str] = &["arn", "createdAt", "lastModifiedAt"];
+/// The error code this service's resource operations report an unresolvable identifier
+/// with (`smithy_query(query="shape",shape="ResourceNotFoundException")`: `@httpError
+/// 404`).
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The Region row `n` signs for; past [`REGIONS`] a synthetic name inside what a SigV4
 /// credential scope admits (`[a-zA-Z0-9-]`).
@@ -218,14 +216,16 @@ async fn update_ok(
     );
 }
 
-/// A group document without the members two distinct resources differ in by
-/// construction, so what remains is the configuration alone.
-fn configuration(group: &Map<String, Value>) -> Map<String, Value> {
-    group
-        .iter()
-        .filter(|(member, _)| !PER_RESOURCE_MEMBERS.contains(&member.as_str()))
-        .map(|(member, value)| (member.clone(), value.clone()))
-        .collect()
+/// The modelled error shape a failed call reported.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
+        // An error `__type` may be namespaced (`com.amazonaws.aiops#Foo`).
+        .rsplit('#')
+        .next()
+        .unwrap_or("<no __type>")
+        .to_string()
 }
 
 /// The `lastModifiedAt` stamp a group reports.
@@ -332,39 +332,51 @@ fn update_cases() -> Vec<UpdateCase> {
     ]
 }
 
-/// An update addressed by the group's NAME applies the change to the stored record —
-/// for every member the operation accepts — exactly as the same update addressed by the
-/// group's ARN does, and leaves the members it omitted alone.
+/// An update addressed by the group's ARN applies the change to the stored record — for
+/// every member the operation accepts — and leaves the members it omitted alone, while
+/// the same update addressed by the group's NAME resolves no group and changes nothing.
 #[tokio::test]
-async fn an_update_addressed_by_name_applies_every_member_as_the_arn_form_does() {
+async fn an_update_addressed_by_the_arn_applies_every_member() {
     for (index, UpdateCase {
         case,
         patch,
         expected,
     }) in update_cases().into_iter().enumerate()
     {
-        // Twin groups, one per Region (an account holds one group per Region): the row
-        // is applied to one through its name and to the other through its ARN.
+        // One group per row, in its own Region (an account holds one group per Region).
         let router = emulator();
-        let named_region = region(2 * index);
-        let arn_region = region(2 * index + 1);
+        let home = region(index);
         let name = "patched-investigation-group";
-        let named_arn = create_ok(&router, &named_region, name).await;
-        let arn_arn = create_ok(&router, &arn_region, name).await;
+        let arn = create_ok(&router, &home, name).await;
 
-        let before = get_ok(&router, &named_region, name, case).await;
+        let before = get_ok(&router, &home, &arn, case).await;
 
-        update_ok(&router, &named_region, name, &patch, case).await;
-        update_ok(&router, &arn_region, &arn_arn, &patch, case).await;
-
-        // The record the name addressed is the one the ARN reads back.
-        let after = get_ok(&router, &named_region, name, case).await;
-        let after_via_arn = get_ok(&router, &named_region, &named_arn, case).await;
+        // The same request addressed by the group's own name addresses no group, so it
+        // is refused and the record below is the one the ARN form produced alone.
+        let (status, refused) = call_in(
+            &router,
+            &home,
+            "PATCH",
+            &format!("/investigationGroups/{}", encode(name)),
+            Some(&patch),
+        )
+        .await;
         assert_eq!(
-            after, after_via_arn,
-            "case {case:?}: both identifier forms address one record, \
-             via the name {after:?} vs via the ARN {after_via_arn:?}"
+            (status, error_code(&refused).as_str()),
+            (404, RESOURCE_NOT_FOUND),
+            "case {case:?}: an update addressed by the name must be refused, \
+             got {status} / {refused:?}"
         );
+        let untouched = get_ok(&router, &home, &arn, case).await;
+        assert_eq!(
+            untouched, before,
+            "case {case:?}: the refused update must leave the record as it was, \
+             expected {before:?}, got {untouched:?}"
+        );
+
+        update_ok(&router, &home, &arn, &patch, case).await;
+
+        let after = get_ok(&router, &home, &arn, case).await;
 
         // Every member the request carried now reads back as the request asked.
         for (member, want) in &expected {
@@ -431,30 +443,21 @@ async fn an_update_addressed_by_name_applies_every_member_as_the_arn_form_does()
             before.get("createdBy"),
             "case {case:?}: lastModifiedBy must name the calling principal, got {after:?}"
         );
-
-        // And the two forms produced the same configuration on their own records.
-        let via_arn = get_ok(&router, &arn_region, &arn_arn, case).await;
-        assert_eq!(
-            configuration(&after),
-            configuration(&via_arn),
-            "case {case:?}: the name form and the ARN form must apply the same change, \
-             via the name {after:?} vs via the ARN {via_arn:?}"
-        );
     }
 }
 
-/// Repeated updates addressed by the name each reach the same record: a boolean member
+/// Repeated updates addressed by the ARN each reach the same record: a boolean member
 /// round-trips through both of its values, and every read reports the value the last
-/// update set.
+/// update set, while a read or an update through the name reports the group absent.
 #[tokio::test]
-async fn repeated_updates_addressed_by_name_each_reach_the_stored_record() {
+async fn repeated_updates_addressed_by_the_arn_each_reach_the_stored_record() {
     let router = emulator();
     let home = region(0);
     let name = "toggled-investigation-group";
     let arn = create_ok(&router, &home, name).await;
 
     // The created default, then the two values the member can take, set alternately.
-    let created = get_ok(&router, &home, name, "the created group").await;
+    let created = get_ok(&router, &home, &arn, "the created group").await;
     assert_eq!(
         created.get("isCloudTrailEventHistoryEnabled"),
         Some(&json!(true)),
@@ -467,20 +470,32 @@ async fn repeated_updates_addressed_by_name_each_reach_the_stored_record() {
         update_ok(
             &router,
             &home,
-            name,
+            &arn,
             &json!({ "isCloudTrailEventHistoryEnabled": want }),
             &case,
         )
         .await;
-        for (via, identifier) in [("the name", name), ("the ARN", arn.as_str())] {
-            let group = get_ok(&router, &home, identifier, &case).await;
-            assert_eq!(
-                group.get("isCloudTrailEventHistoryEnabled"),
-                Some(&json!(want)),
-                "case {case:?}: read via {via} must report {want}, got {group:?}"
-            );
-        }
-        let group = get_ok(&router, &home, name, &case).await;
+        let group = get_ok(&router, &home, &arn, &case).await;
+        assert_eq!(
+            group.get("isCloudTrailEventHistoryEnabled"),
+            Some(&json!(want)),
+            "case {case:?}: a read through the ARN must report {want}, got {group:?}"
+        );
+        let (status, refused) = call_in(
+            &router,
+            &home,
+            "GET",
+            &format!("/investigationGroups/{}", encode(name)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (404, RESOURCE_NOT_FOUND),
+            "case {case:?}: a read through the name must report the group absent, \
+             got {status} / {refused:?}"
+        );
+        let group = get_ok(&router, &home, &arn, &case).await;
         let now = last_modified_at(&group, &case);
         assert!(
             now > previous,

@@ -3239,6 +3239,19 @@ pub struct Bucket {
     /// while the bucket has no versioning state — the state a bucket is created in, and
     /// what makes `GetBucketVersioning` report no `Status` until a put sets one.
     pub versioning: Option<BucketVersioning>,
+    /// The Transfer Acceleration state the last `PutBucketAccelerateConfiguration` set on
+    /// the bucket, or `None` while the bucket has none.
+    ///
+    /// `None` is NOT a third state and NOT a stored default: "A bucket has no Transfer
+    /// Acceleration state if a state has never been set on the bucket", and a read of such
+    /// a bucket "does not return a state value" for it
+    /// (`GetBucketAccelerateConfiguration`'s own documentation) — the same distinction
+    /// [`Self::versioning`] keeps between "never set" and "set to one of the published
+    /// values". The API publishes no delete for the subresource, so a bucket leaves this
+    /// state only by a put and never goes back to it.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    accelerate: Option<String>,
     /// The `Payer` the last `PutBucketRequestPayment` set on the bucket, or `None` while
     /// its request payment configuration has never been set.
     ///
@@ -3529,6 +3542,24 @@ impl Bucket {
         self.versioning
             .as_ref()
             .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
+    }
+
+    /// The bucket's Transfer Acceleration state — a `BucketAccelerateStatus` value — or
+    /// `None` while no state has ever been set on it, which is what makes a read report no
+    /// state value at all rather than a default. See [`Self::accelerate`].
+    pub fn accelerate_status(&self) -> Option<&str> {
+        self.accelerate.as_deref()
+    }
+
+    /// Set the bucket's Transfer Acceleration state from the `AccelerateConfiguration` a
+    /// `PutBucketAccelerateConfiguration` request carried.
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Bucket::set_versioning`] replaces
+    /// the versioning state: `AccelerateConfiguration` is the "Container for setting the
+    /// transfer acceleration state" the request carries as its whole payload, so the state
+    /// the bucket is in afterwards is the one it names.
+    pub fn set_accelerate_status(&mut self, status: &str) {
+        self.accelerate = Some(status.to_string());
     }
 
     /// Who pays for downloads from the bucket: the `Payer` its request payment

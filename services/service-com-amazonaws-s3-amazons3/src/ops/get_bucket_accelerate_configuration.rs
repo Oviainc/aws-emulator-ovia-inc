@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketAccelerateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketAccelerateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketAccelerateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Transfer Acceleration state of a bucket, as the last
+//! `PutBucketAccelerateConfiguration` set it: `Enabled`, `Suspended`, or no state value at
+//! all for a bucket no put has ever set one on. A bucket this emulator does not hold is
+//! `NoSuchBucket` (404). Read-only — nothing about the bucket changes here.
 //!
 //! ## Shape of an operation
 //!
@@ -106,9 +102,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `GetBucketAccelerateConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketAccelerateConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketAccelerateConfiguration")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketAccelerateConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketAccelerateConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -162,18 +171,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketAccelerateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketAccelerateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketAccelerateConfiguration"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — this request's `ExpectedBucketOwner`, judged the way every other
+        // bucket-scoped operation judges it (`GetBucketVersioning`, `GetBucketAbac`): this
+        // emulator serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // Read-only: the guard is taken, the bucket's Transfer Acceleration state is
+        // copied out, and nothing is written — including for a bucket no put has set a
+        // state on, which carries none to derive a default from.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketAccelerateConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        Ok(GetBucketAccelerateConfigurationOutput {
+            // "A GET accelerate request does not return a state value for a bucket that
+            // has no transfer acceleration state. A bucket has no Transfer Acceleration
+            // state if a state has never been set on the bucket" (this operation's own
+            // documentation) — so an unset subresource is reported as ABSENT rather than
+            // as either published value.
+            status: bucket.accelerate_status().map(str::to_string),
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`GetBucketAccelerateConfigurationOutput$RequestCharged`) —
+            // Requester Pays is not emulated, so nobody was charged and nothing is
+            // reported, the way every other handler in this crate answers it.
+            request_charged: None,
+        })
     }
 }

@@ -16,6 +16,10 @@
 //!
 //! In order, because each step needs the one before it to have held:
 //!
+//! 0. a `SearchJobIdentifier` that is not a well-formed identifier of this service —
+//!    `ValidationException` (400) from [`crate::state::check_job_identifier`], judged
+//!    before any store lookup, because a string that cannot be an identifier names no
+//!    resource rather than a missing one;
 //! 1. a `SearchJobIdentifier` that names no job — `ResourceNotFoundException` (404);
 //! 2. a search job whose results have not settled (any status outside
 //!    [`crate::state::EXPORTABLE_SEARCH_JOB_STATES`]) — `ValidationException` (400)
@@ -202,6 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The identifier's SYNTAX is judged before anything is looked up or minted: a
+        // string that cannot be an identifier of this service is invalid input, not a
+        // missing resource.
+        crate::state::check_job_identifier(&input.search_job_identifier)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let now = SystemTime::now();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(store_unavailable());

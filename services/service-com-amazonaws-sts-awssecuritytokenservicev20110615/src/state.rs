@@ -5,9 +5,9 @@
 //! STS is a credential vendor: every operation either mints a session (`AssumeRole`,
 //! `GetSessionToken`, `GetFederationToken`) or reports on one (`GetCallerIdentity`,
 //! `GetAccessKeyInfo`). This module holds the registries those operations share —
-//! the sessions keyed by the access key id each was minted under, plus the role id
-//! STS keeps stable per role ARN — and the pure rules the handlers apply to them, so
-//! a handler file contains only its own operation's decisions.
+//! the sessions keyed by the access key id each was minted under, plus the reading of
+//! the role records the IAM store in the same engine holds — and the pure rules the
+//! handlers apply to them, so a handler file contains only its own operation's decisions.
 //!
 //! Beside the sessions it keeps the encoded authorization messages the account has
 //! issued: STS is also the service that decodes the opaque blob an authorization
@@ -256,9 +256,10 @@ impl MintError {
 /// Per-service state for com-amazonaws-sts-awssecuritytokenservicev20110615. A handler reaches it through [`service_state`].
 ///
 /// One store, bounded by [`MAX_SESSIONS`]: the sessions this service minted. There is
-/// deliberately no second map for role ids — a role id is a pure function of the role
-/// ARN ([`role_id`]), so remembering one would add a request-driven store without
-/// making anything more stable.
+/// deliberately no map for role ids — a role's id belongs to the role, so it is read
+/// from the IAM store in the same engine ([`resolve_role`]), the service that holds the
+/// role; remembering one here would add a request-driven store without making anything
+/// more stable.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsStsAwssecuritytokenservicev20110615State {
     /// Every session this service minted and has not pruned, keyed by its access key

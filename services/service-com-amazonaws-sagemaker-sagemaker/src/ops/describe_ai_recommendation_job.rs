@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAIRecommendationJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAIRecommendationJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAIRecommendationJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replays the AI recommendation job `CreateAIRecommendationJob` stored under this
+//! `AIRecommendationJobName` — its ARN, the members the create carried, its status and
+//! its timestamps. A name nothing created is refused with the modelled
+//! `ResourceNotFound`; this is the ONLY file to touch for this operation.
+//!
+//! A REPORTING operation: the one write it makes is the move out of `InProgress` the
+//! CLOCK already owed ([`crate::state::AIRecommendationJob::settle_status`]), which was
+//! due at the stored instant whether or not anybody read the job — so a read never
+//! changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +178,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAIRecommendationJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAIRecommendationJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAIRecommendationJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store
+            .ai_recommendation_jobs
+            .get_mut(&input.ai_recommendation_job_name)
+        else {
+            // A name nothing created names no job, so the read is refused with the
+            // not-found failure this operation models. The ARN that refusal names is the
+            // one this name WOULD carry, minted from the Region the request signed for,
+            // because there is no stored record to read one from.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                crate::state::AI_RECOMMENDATION_JOB_KIND,
+                &input.ai_recommendation_job_name,
+            );
+            return Err(DescribeAIRecommendationJobErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::ai_recommendation_job_not_found(&arn)),
+                },
+            )
+            .into());
+        };
+
+        // The only write a reporting call makes: the move out of `InProgress` the clock
+        // already owed. It was due at the stored instant whether or not anybody described
+        // the job, so a waiter terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeAIRecommendationJobOutput {
+            ai_recommendation_job_name: job.name.clone(),
+            ai_recommendation_job_arn: job.arn.clone(),
+            ai_recommendation_job_status: job.status.clone(),
+            failure_reason: job.failure_reason.clone(),
+            model_source: job.model_source.clone(),
+            // Reported as an `AIRecommendationOutputResult`: the stored destinations, and
+            // nothing else. Its `S3OutputLocation` is required here while the create's is
+            // optional, and `S3Uri`'s modelled pattern admits no empty value — so
+            // `CreateAIRecommendationJob` refuses a request that names none (this emulator
+            // mints no default bucket) and every stored job therefore carries one. The
+            // `unwrap_or_default` arm is that unreachable case, never a bucket invented
+            // for a caller that named none.
+            output_config: AIRecommendationOutputResult {
+                s3_output_location: job
+                    .output_config
+                    .s3_output_location
+                    .clone()
+                    .unwrap_or_default(),
+                model_package_group_identifier: job
+                    .output_config
+                    .model_package_group_identifier
+                    .clone(),
+                mlflow_config: job.output_config.mlflow_config.clone(),
+            },
+            inference_specification: job.inference_specification.clone(),
+            ai_workload_config_identifier: job.workload_config_identifier.clone(),
+            // The EFFECTIVE value the create stored, so a job created without the member
+            // reports the documented default it would have run under.
+            optimize_model: Some(job.optimize_model),
+            // Required on the create and optional on the read, so a stored job always
+            // reports the targets it was created with.
+            performance_target: Some(job.performance_target.clone()),
+            // Nothing analysed the model (see
+            // `crate::state::NO_RECOMMENDATION_RUNTIME_REASON`), so there is no
+            // recommendation to report: the member stays ABSENT rather than reporting an
+            // empty list a caller cannot tell from "no recommendations yet".
+            recommendations: None,
+            role_arn: job.role_arn.clone(),
+            compute_spec: job.compute_spec.clone(),
+            adapter_source: job.adapter_source.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            // Nothing ran the analysis, so there is no instant its run started at.
+            start_time: None,
+            end_time: job.end_time.map(crate::state::timestamp),
+            // `Tags` is optional in the modelled output, so a job created without any
+            // reports the member absent rather than an empty list.
+            tags: (!job.tags.is_empty()).then(|| job.tags.clone()),
+        };
+        let job_arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }
+
