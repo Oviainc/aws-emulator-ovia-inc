@@ -9,9 +9,10 @@
 //!
 //! * a tag key lies outside the reserved namespace: a key beginning with the prefix AWS
 //!   reserves for its own tags is refused with the modelled `ValidationException`
-//!   (HTTP 400) and nothing is stored, while a key that merely contains that prefix
-//!   further along, or carries it in another case, is a key of the caller's own
-//!   namespace and is stored like any other (a tag key is case-sensitive);
+//!   (HTTP 400) and nothing is stored, whatever letter case the prefix arrives in, while
+//!   a key that merely contains that prefix further along is a key of the caller's own
+//!   namespace and is stored like any other (the letter cases of the prefix are spanned
+//!   in `reserved_tag_namespace`);
 //! * a request asks a resource to carry no more tags than a resource may hold
 //!   ([`MAX_TAGS_PER_RESOURCE`]) — accepted at the cap, refused past it;
 //! * a tag key is within the `@length` bounds `TagMap`'s key models (1..128,
@@ -25,7 +26,8 @@
 //! (`GetFeed` / `GetDictionary`).
 
 use crate::harness::{
-    call, pair, router, tag_object, tagged_create_body, tags_of, tags_path, TAGGABLE_KINDS,
+    call, list_member, list_path, pair, router, tag_object, tagged_create_body, tags_of, tags_path,
+    TAGGABLE_KINDS,
 };
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
@@ -101,10 +103,13 @@ fn tag_cases() -> Vec<TagCase> {
             ))),
         },
         TagCase {
-            label: "the reserved prefix in upper case: a tag key is case-sensitive",
-            tags: vec![pair(&reserved.to_uppercase(), "mine")],
-            admitted: true,
-            message: None,
+            label: "the reserved prefix in upper case: the namespace is claimed in any case",
+            tags: vec![pair(&format!("{}cloudformation:stack-name", reserved.to_uppercase()), "mine")],
+            admitted: false,
+            message: Some(reserved_tag_key_message(&format!(
+                "{}cloudformation:stack-name",
+                reserved.to_uppercase()
+            ))),
         },
         TagCase {
             label: "the reserved prefix further along the key, not at its start",
@@ -169,24 +174,6 @@ fn tag_cases() -> Vec<TagCase> {
             )),
         },
     ]
-}
-
-/// The path the collection of `kind` is listed under (`ListFeeds` / `ListDictionaries`).
-fn list_path(kind: &str) -> &'static str {
-    match kind {
-        "feed" => "/v1/feeds",
-        "dictionary" => "/v1/dictionaries",
-        other => panic!("no such resource kind: {other}"),
-    }
-}
-
-/// The member a list response reports its page under.
-fn list_member(kind: &str) -> &'static str {
-    match kind {
-        "feed" => "feeds",
-        "dictionary" => "dictionaries",
-        other => panic!("no such resource kind: {other}"),
-    }
 }
 
 /// How many resources of `kind` the store holds under `name`.
