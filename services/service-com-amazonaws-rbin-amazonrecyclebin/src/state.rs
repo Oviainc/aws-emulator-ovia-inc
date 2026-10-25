@@ -224,6 +224,12 @@ impl Rule {
         }
     }
 
+    /// Whether the rule's own resource selection makes it one Recycle Bin cannot lock,
+    /// as [`unlockable_rule`] decides.
+    pub fn unlockable(&self) -> Option<UnlockableRule> {
+        unlockable_rule(&self.resource_tags, &self.exclude_resource_tags)
+    }
+
     /// Assign `tags` to the rule, as [`upsert_tags`] defines assigning.
     pub fn apply_tags(&mut self, tags: Vec<Tag>) {
         upsert_tags(&mut self.tags, tags);
@@ -454,6 +460,99 @@ impl BlockingCondition {
             Self::RuleWithExclusionTags => "a Region-level rule with exclusion tags",
         }
     }
+}
+
+/// Why a retention rule's resource selection makes it one Recycle Bin cannot hold a
+/// lock on.
+///
+/// "You can't lock tag-level retention rules, or Region-level retention rules that have
+/// exclusion tags" (smithy_query(query="doc", shape="LockRule")): a rule carrying
+/// resource tags is tag-level, and one carrying exclusion tags is a Region-level rule
+/// with exclusions. The invariant lives HERE, in one place, because every door a lock
+/// can arrive through is held to it — `LockRule`, which refuses the rule the request
+/// addressed, and `CreateRule`, which refuses a request that would mint the same
+/// combination — so the two cannot disagree about which rules a lock can hold on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockableRule {
+    /// The rule selects resources by resource tags, which makes it tag-level.
+    TagLevel,
+    /// The rule is Region-level and carries exclusion tags.
+    ExclusionTags,
+}
+
+impl UnlockableRule {
+    /// The blocking condition a 409 names when the rule a lock request ADDRESSED is one
+    /// of these.
+    pub fn blocking_condition(self) -> BlockingCondition {
+        match self {
+            Self::TagLevel => BlockingCondition::TagLevelRule,
+            Self::ExclusionTags => BlockingCondition::RuleWithExclusionTags,
+        }
+    }
+
+    /// The requirement the lock configuration failed, for the validation clause a 400
+    /// names when the request would CREATE one of these. A tag-level rule's sentence is
+    /// the one [`TAG_LEVEL_MEMBER_REQUIREMENT`] states for every member that cannot be
+    /// specified for such a rule.
+    fn lock_configuration_requirement(self) -> &'static str {
+        match self {
+            Self::TagLevel => TAG_LEVEL_MEMBER_REQUIREMENT,
+            Self::ExclusionTags => {
+                "Member must not be specified for a retention rule with exclusion tags"
+            }
+        }
+    }
+}
+
+/// Whether a rule that retains what `resource_tags` select, less what
+/// `exclude_resource_tags` exclude, is one Recycle Bin cannot lock — and why.
+///
+/// `None` only for a Region-level rule with no exclusion tags, the one kind a lock can
+/// hold on.
+pub fn unlockable_rule(
+    resource_tags: &[ResourceTag],
+    exclude_resource_tags: &[ResourceTag],
+) -> Option<UnlockableRule> {
+    if !resource_tags.is_empty() {
+        Some(UnlockableRule::TagLevel)
+    } else if !exclude_resource_tags.is_empty() {
+        Some(UnlockableRule::ExclusionTags)
+    } else {
+        None
+    }
+}
+
+/// The member path a refused `LockConfiguration` is named by, as a validation clause
+/// spells a member: the modelled member name, lower camel case.
+pub const LOCK_CONFIGURATION_MEMBER: &str = "lockConfiguration";
+
+/// The member path a refused `ExcludeResourceTags` is named by.
+pub const EXCLUDE_RESOURCE_TAGS_MEMBER: &str = "excludeResourceTags";
+
+/// The requirement ANY member fails by being specified for a tag-level retention rule —
+/// a rule that selects what it retains by resource tags. Two members fail it, for
+/// reasons the service states separately, so the sentence is written once here and both
+/// name it: `ExcludeResourceTags` ("[Region-level retention rules only] ... You can't
+/// specify exclusion tags for tag-level retention rules") through
+/// [`EXCLUDE_RESOURCE_TAGS_REQUIREMENT`], and `LockConfiguration` ("You can't lock
+/// tag-level retention rules") through [`UnlockableRule::lock_configuration_requirement`].
+const TAG_LEVEL_MEMBER_REQUIREMENT: &str =
+    "Member must not be specified for a tag-level retention rule";
+
+/// The requirement an `ExcludeResourceTags` fails on a tag-level rule: the two members
+/// select resources in ways that cannot hold together.
+pub const EXCLUDE_RESOURCE_TAGS_REQUIREMENT: &str = TAG_LEVEL_MEMBER_REQUIREMENT;
+
+/// The modelled 400 for a request asking to lock a rule Recycle Bin cannot lock.
+///
+/// The lock configuration is the member that cannot hold: the rule itself is one the
+/// service creates happily without a lock, so the request is refused for asking to lock
+/// it rather than for the way it selects resources.
+pub fn lock_configuration_not_allowed(blocker: UnlockableRule) -> ValidationException {
+    member_validation_failed(
+        LOCK_CONFIGURATION_MEMBER,
+        blocker.lock_configuration_requirement(),
+    )
 }
 
 /// The modelled 409 for a lock, modify or delete the rule's own state forbids.

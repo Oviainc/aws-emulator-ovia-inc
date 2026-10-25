@@ -224,7 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; the emulator then cannot create
@@ -236,25 +235,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Where the bucket lives, from the request's own location constraint. Note this
         // is NOT the Region the request was signed for: the constraint is what the model
         // documents as deciding the bucket's Region, and an absent one means us-east-1.
-        let region = crate::state::bucket_region(
-            input
-                .create_bucket_configuration
-                .as_ref()
-                .and_then(|configuration| configuration.location_constraint.as_deref()),
-        );
+        let constraint = input
+            .create_bucket_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.location_constraint.as_deref());
+
+        // A create that names NO constraint can only mean the one Region the unspecified
+        // constraint stands for: "If you don't specify a Region, the bucket is created in
+        // the US East (N. Virginia) Region (us-east-1) by default"
+        // (`CreateBucketConfiguration$LocationConstraint`). An endpoint for any other
+        // Region cannot serve that request — it would create the bucket somewhere the
+        // caller did not ask for — so S3 refuses it rather than choosing for the caller.
+        // The endpoint is the Region the request was signed for.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if constraint.is_none() && endpoint_region != crate::state::DEFAULT_BUCKET_REGION {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ILLEGAL_LOCATION_CONSTRAINT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::UNSPECIFIED_LOCATION_CONSTRAINT_MESSAGE,
+            ));
+        }
+
+        let region = crate::state::bucket_region(constraint);
+
+        // "By default, `ObjectOwnership` is set to `BucketOwnerEnforced` and ACLs are
+        // disabled" (`smithy_query(query="shape",shape="ObjectOwnership")`): the setting
+        // the bucket comes into being with is the one the header names, or that default.
+        let ownership = input
+            .object_ownership
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_OBJECT_OWNERSHIP);
+
+        // The ACL the request names, if any, and the refusal naming one earns when the
+        // bucket's Object Ownership setting disables ACLs — both decided BEFORE the bucket
+        // is recorded, so a refused create leaves nothing behind.
+        //
+        // The refusal is the one `PutBucketOwnershipControls` answers the same combination
+        // with, judged by the same rule: a bucket may not hold BOTH the setting that
+        // disables ACLs and an ACL that grants access beyond the bucket owner. The owner's
+        // own `FULL_CONTROL` is not such a grant — it is the ACL every bucket carries, and
+        // the one a read of an ACL-disabled bucket still reports — so a create naming the
+        // `private` canned ACL beside the enforced setting is served.
+        let grants = requested_grants(&input, &region)?;
+        if ownership == crate::state::BUCKET_OWNER_ENFORCED
+            && grants
+                .as_deref()
+                .is_some_and(|grants| grants != crate::state::default_acl_grants())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::INVALID_BUCKET_ACL_WITH_OBJECT_OWNERSHIP_MESSAGE,
+            ));
+        }
 
         let mut store = state.lock();
         match store.create_bucket(&input.bucket, &region) {
-            crate::state::BucketCreation::Created => Ok(CreateBucketOutput {
-                location: Some(location_of(
-                    &input.bucket,
-                    &region,
-                    input.bucket_namespace.as_deref(),
-                )),
-                // Directory buckets only, per the member's documentation; a general
-                // purpose bucket reports none.
-                bucket_arn: None,
-            }),
+            crate::state::BucketCreation::Created => {
+                // Everything the request settled about the new bucket is applied here,
+                // under the same lock that recorded it, so no reader can see the bucket
+                // before its Object Ownership setting and its ACL are in place.
+                if let Some(bucket) = store.bucket_mut(&input.bucket) {
+                    bucket.set_object_ownership(ownership);
+                    // The `OwnershipControls` subresource is associated with the bucket as
+                    // it comes into being, carrying the setting the bucket was created
+                    // with: a bucket has an Object Ownership setting from the moment it
+                    // exists, so `GetBucketOwnershipControls` reports it rather than
+                    // "there are none" — the not-found a read answers only once
+                    // `DeleteBucketOwnershipControls` has withdrawn them.
+                    bucket.set_ownership_controls(vec![ownership.to_string()]);
+                    if let Some(grants) = grants {
+                        bucket.set_acl_grants(grants);
+                    }
+                }
+                Ok(CreateBucketOutput {
+                    location: Some(location_of(
+                        &input.bucket,
+                        &region,
+                        input.bucket_namespace.as_deref(),
+                    )),
+                    // Directory buckets only, per the member's documentation; a general
+                    // purpose bucket reports none.
+                    bucket_arn: None,
+                })
+            }
             crate::state::BucketCreation::NameTaken => {
                 // Every caller of this emulator is the one emulated account
                 // (`engine::emulator_account_id()`), so a taken name is always a bucket
@@ -304,6 +368,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `BucketNamespace` value whose buckets live in the caller's account regional
 /// namespace rather than the shared global one (one of that enum's two values).
 const ACCOUNT_REGIONAL_NAMESPACE: &str = "account-regional";
+
+/// The ACL this create names, or `None` when it names none at all.
+///
+/// `CreateBucket` offers the same two header forms `PutBucketAcl` does and no body form:
+/// "Specify a canned ACL with the x-amz-acl request header" or "specify access permissions
+/// explicitly with the x-amz-grant-read, x-amz-grant-write, x-amz-grant-read-acp,
+/// x-amz-grant-write-acp, and x-amz-grant-full-control headers" (this operation's own
+/// documentation). The canned ACL is expanded and the explicit grants parsed through the
+/// SAME seams `PutBucketAcl` uses, so one ACL means the same thing however it was set, and
+/// the result is judged against the same published rules before the bucket is recorded.
+fn requested_grants(
+    input: &CreateBucketInput,
+    region: &str,
+) -> Result<Option<Vec<crate::state::AclGrant>>, CreateBucketError> {
+    // The five explicit-grant headers, each with the ONE `Permission` it stands for, in
+    // the model's own member order (`smithy_query(query="operation",
+    // operation="CreateBucket")`: GrantFullControl, GrantRead, GrantReadACP, GrantWrite,
+    // GrantWriteACP).
+    let grant_headers: [(&str, Option<&str>, &str); 5] = [
+        (
+            "x-amz-grant-full-control",
+            input.grant_full_control.as_deref(),
+            crate::state::PERMISSION_FULL_CONTROL,
+        ),
+        (
+            "x-amz-grant-read",
+            input.grant_read.as_deref(),
+            crate::state::PERMISSION_READ,
+        ),
+        (
+            "x-amz-grant-read-acp",
+            input.grant_read_acp.as_deref(),
+            crate::state::PERMISSION_READ_ACP,
+        ),
+        (
+            "x-amz-grant-write",
+            input.grant_write.as_deref(),
+            crate::state::PERMISSION_WRITE,
+        ),
+        (
+            "x-amz-grant-write-acp",
+            input.grant_write_acp.as_deref(),
+            crate::state::PERMISSION_WRITE_ACP,
+        ),
+    ];
+
+    let mut grants: Vec<crate::state::AclGrant> = Vec::new();
+    if let Some(canned) = input.acl.as_deref() {
+        // `ACL` targets the `BucketCannedACL` enum, so a value outside it is refused at
+        // the boundary before this handler runs; the refusal below is what keeps that true
+        // if the expansion table and the enum ever part.
+        let Some(expanded) = crate::state::canned_acl_grants(canned) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                format!("x-amz-acl names the canned ACL {canned:?}, which S3 does not publish"),
+            ));
+        };
+        grants.extend(expanded);
+    }
+    for (header, value, permission) in grant_headers {
+        let Some(value) = value else { continue };
+        match crate::state::acl_grants_from_header(value, permission) {
+            Ok(parsed) => grants.extend(parsed),
+            Err(pair) => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "{header} names the grantee {pair:?}, which is not a type=value \
+                         pair whose type is id, uri or emailAddress"
+                    ),
+                ))
+            }
+        }
+    }
+    if grants.is_empty() {
+        return Ok(None);
+    }
+    crate::state::validate_acl_grants(&grants, region).map_err(|rejection| {
+        crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::MALFORMED_ACL_CODE,
+            crate::state::INVALID_ARGUMENT_STATUS,
+            rejection.to_string(),
+        )
+    })?;
+    Ok(Some(grants))
+}
 
 /// The `Location` a created bucket reports.
 ///

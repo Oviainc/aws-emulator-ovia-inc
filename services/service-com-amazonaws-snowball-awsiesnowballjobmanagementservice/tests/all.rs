@@ -47,6 +47,8 @@ mod job_unlock_code;
 mod job_updates;
 #[path = "all/long_term_pricing.rs"]
 mod long_term_pricing;
+#[path = "all/long_term_pricing_listing.rs"]
+mod long_term_pricing_listing;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 #[path = "all/return_shipping_label_reports.rs"]

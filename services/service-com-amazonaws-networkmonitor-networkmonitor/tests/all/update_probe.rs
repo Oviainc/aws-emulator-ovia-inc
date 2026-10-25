@@ -99,7 +99,11 @@ fn member_of(body: &Value, member: &str) -> Value {
     body.get(member).cloned().unwrap_or(Value::Null)
 }
 
-fn timestamp(body: &Value, member: &str) -> f64 {
+/// The epoch-seconds a response reports for one timestamp member. Shared,
+/// because what a record reports for `createdAt` / `modifiedAt` is asserted by
+/// more than one suite (`probe_teardown` reads the same two members for the
+/// delete path) and one reading of them keeps those suites from drifting.
+pub(crate) fn timestamp(body: &Value, member: &str) -> f64 {
     body.get(member)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("a probe record must report {member}, got {body:?}"))

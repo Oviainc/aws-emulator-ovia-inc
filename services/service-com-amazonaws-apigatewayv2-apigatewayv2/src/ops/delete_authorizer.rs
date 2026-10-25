@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the [`crate::state::Authorizer`] record its api holds under the
+//! requested `AuthorizerId`, unless a route of that api still names it. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A route of the same api references an authorizer through its `AuthorizerId`, so the
+//! delete is refused while any such route exists and nothing is removed.
 //!
 //! ## Shape of an operation
 //!
@@ -62,6 +59,11 @@
 //!   See the message field for more information.
 //! * `TooManyRequestsException` (HTTP 429) — A limit has been exceeded. See the accompanying
 //!   error message for details.
+//! * `ConflictException` (HTTP 409) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for "the requested operation would cause a conflict with
+//!   the current state of a service resource associated with the request", which is what a
+//!   route still naming the authorizer is. This operation's own modelled `errors` list
+//!   omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -101,9 +103,17 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteAuthorizerOutput {
 // here — hence the `DeleteAuthorizerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.apigatewayv2#DeleteAuthorizer")]
+// `ConflictException` — a shape this SERVICE models, and one `CreateAuthorizer` on the
+// very same resource lists — is widened in through `extra_errors`: an authorizer a route
+// still names cannot be removed, and that refusal is a conflict with the current state of
+// the api's resources, not a missing resource (404) or a rate limit (429).
+#[smithy_macros::operation_error(
+    "com.amazonaws.apigatewayv2#DeleteAuthorizer",
+    extra_errors = ["ConflictException"]
+)]
 #[derive(Debug)]
 pub enum DeleteAuthorizerErrorModeled {
+    ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
 }
@@ -159,18 +169,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAuthorizer"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteAuthorizer",
+            ));
+        };
+        let mut store = state.lock();
+
+        // An authorizer is a CHILD of an api: it is addressed through the api that owns
+        // it, so an api that does not exist holds no authorizer to remove.
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_identifier_message(
+                "API",
+                &input.api_id,
+            )));
+        };
+
+        // An authorizer is addressed by the api that owns it AND its own id, so an id
+        // that names an authorizer of ANOTHER api is not found here either — the same
+        // addressing `GetAuthorizer` reports on.
+        let Some(authorizer) = api.authorizers.get(&input.authorizer_id) else {
+            return Err(not_found(
+                crate::state::INVALID_AUTHORIZER_IDENTIFIER_MESSAGE.to_string(),
+            ));
+        };
+        // The refusal below names the authorizer the way its caller configured it, so the
+        // name is read off the record before the reference scan borrows the api again.
+        let name = authorizer.name.clone();
+
+        // A route of this api holds the reference, through its `AuthorizerId`. Removing
+        // the authorizer would leave those routes handing their authorization decision
+        // to nothing, so the delete is refused while any of them exists and the store is
+        // left exactly as it was: the caller unwires or deletes the routes first. The
+        // sentence API Gateway refuses with names the authorizer and ONE referencing
+        // route ("... is referenced in route: <RouteKey>"), so the first in the store's
+        // stable order is the one named: a route key identifies the route within its api,
+        // which is what the caller changes.
+        let dependent = api
+            .route_keys_using_authorizer(&input.authorizer_id)
+            .into_iter()
+            .next();
+        if let Some(dependent) = dependent {
+            return Err(DeleteAuthorizerErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Cannot delete authorizer '{name}', is referenced in route: {dependent}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The api OWNS its authorizers, so removing the entry is the whole delete: a
+        // later GetAuthorizer finds nothing, and a second DeleteAuthorizer of the same
+        // id answers 404 rather than removing anything again.
+        api.authorizers.remove(&input.authorizer_id);
+
+        Ok(DeleteAuthorizerOutput)
     }
+}
+
+/// This operation's "the resource specified in the request was not found" refusal: the
+/// modelled `NotFoundException`, carrying the sentence API Gateway answers for the
+/// identifier that resolved to nothing.
+fn not_found(message: String) -> DeleteAuthorizerError {
+    DeleteAuthorizerErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

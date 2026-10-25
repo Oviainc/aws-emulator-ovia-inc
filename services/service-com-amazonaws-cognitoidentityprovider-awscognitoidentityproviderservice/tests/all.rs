@@ -53,6 +53,8 @@ mod list_identity_providers;
 mod list_user_pools;
 #[path = "all/list_users_in_group.rs"]
 mod list_users_in_group;
+#[path = "all/resend_confirmation_code.rs"]
+mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]
 mod resource_server_lifecycle;
 #[path = "all/self_service_sign_up.rs"]

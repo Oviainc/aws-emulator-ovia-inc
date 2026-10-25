@@ -161,16 +161,10 @@ const NEEDLE: &str = "ET";
 impl Listing {
     /// This listing's create request for a record named `name`.
     ///
-    /// Reuses the family table rather than writing a second set of create requests;
-    /// only the Call Analytics JOB family is absent from it (that family has no ARN
-    /// resource type, so the tagging suite holds no row for it).
+    /// Reuses the family table rather than writing a second set of create requests: it
+    /// holds a row for every family this service stores records of, each family's ARN
+    /// resource type included.
     fn create_request(&self, name: &str) -> Value {
-        if self.create == "StartCallAnalyticsJob" {
-            return json!({
-                "CallAnalyticsJobName": name,
-                "Media": {"MediaFileUri": "s3://example-media/call.flac"}
-            });
-        }
         families()
             .into_iter()
             .find(|family| family.create == self.create)

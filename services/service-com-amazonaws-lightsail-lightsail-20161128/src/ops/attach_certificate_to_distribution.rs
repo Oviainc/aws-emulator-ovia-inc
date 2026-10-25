@@ -201,23 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The certificate is read first, so the one mutable handle the
             // attachment needs is taken once and there is no second lookup of
             // the distribution to keep correct.
-            let certificate = store.certificate(&certificate_name).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::resource_does_not_exist(
-                    crate::state::RESOURCE_TYPE_CERTIFICATE,
-                    &certificate_name,
-                )
-            })?;
-            // A certificate the certificate authority has not issued yet secures
-            // nothing, so there is no HTTPS traffic the distribution could accept
-            // with it.
-            if !certificate.is_issued() {
-                return Err(operation_failure(format!(
-                    "The certificate {certificate_name} is {}: only certificates with a \
-                     status of {} can be attached to a distribution.",
-                    certificate.status,
-                    crate::state::CERTIFICATE_STATUS_ISSUED
-                )));
-            }
+            // A certificate this account does not hold, and one the certificate
+            // authority has not issued yet (which secures nothing, so there is no
+            // HTTPS traffic the distribution could accept with it), are both
+            // refused by the store's one owner of that rule — the same rule
+            // `CreateDistribution` applies to the certificate its request names.
+            let certificate = store
+                .attachable_certificate(&certificate_name)
+                .map_err(|refusal| certificate_refusal(&certificate_name, refusal))?;
             // The domains the attachment publishes on the distribution: "After
             // the certificate is attached, your distribution accepts HTTPS
             // traffic for all of the domains that are associated with the
@@ -283,6 +274,25 @@ fn invalid(message: String) -> AttachCertificateToDistributionError {
         ..Default::default()
     })
     .into()
+}
+
+/// This operation's rendering of a certificate the store says no distribution
+/// may serve HTTPS traffic with: a name this account holds no certificate under
+/// is the `DoesNotExist` envelope, and a certificate that is not issued yet is
+/// the modelled `OperationFailureException` carrying the store's message.
+fn certificate_refusal(
+    certificate_name: &str,
+    refusal: crate::state::CertificateNotAttachable,
+) -> AttachCertificateToDistributionError {
+    match refusal {
+        crate::state::CertificateNotAttachable::DoesNotExist => {
+            crate::scaffolded::Scaffolded::resource_does_not_exist(
+                crate::state::RESOURCE_TYPE_CERTIFICATE,
+                certificate_name,
+            )
+        }
+        crate::state::CertificateNotAttachable::NotIssued(message) => operation_failure(message),
+    }
 }
 
 /// Lightsail's refusal of a well-formed request its resources' state does not

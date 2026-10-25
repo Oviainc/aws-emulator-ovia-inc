@@ -351,8 +351,24 @@ impl Emulator {
     }
 
     /// Create [`BUCKET`] and upload one import file to it.
+    ///
+    /// The create names its `LocationConstraint`: a create that names none can only mean
+    /// us-east-1, the Region the unspecified constraint stands for, so S3 refuses one sent
+    /// to any other Region's endpoint and this harness signs for [`REGION`].
     async fn upload(&self, key: &str, body: &str) {
-        let created = self.s3("PUT", &format!("/{BUCKET}"), b"").await;
+        let created = self
+            .s3(
+                "PUT",
+                &format!("/{BUCKET}"),
+                format!(
+                    "<CreateBucketConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LocationConstraint>{REGION}</LocationConstraint>\
+                     </CreateBucketConfiguration>"
+                )
+                .as_bytes(),
+            )
+            .await;
         assert!(
             created == 200 || created == 409,
             "CreateBucket {BUCKET}: expected 200 or 409, got {created}"

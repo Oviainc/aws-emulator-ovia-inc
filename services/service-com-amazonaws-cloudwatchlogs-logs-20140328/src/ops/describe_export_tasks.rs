@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExportTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExportTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the stored export tasks, filtered by the `taskId` or the
+//! `statusCode` the request names and served one page at a time. This is the ONLY file
+//! to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeExportTasks::handle`] with real behaviour and
@@ -121,6 +121,49 @@ pub struct DescribeExportTasks<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeExportTasks";
+
+/// Where the next page resumes: the `taskId` of the last task returned, plus the filters of
+/// the enumeration it belongs to. A continuation that changes a filter is refused, because
+/// the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    task_id: Option<String>,
+    status_code: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "taskId": self.task_id,
+            "statusCode": self.status_code,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let string = |name: &str| {
+            value
+                .get(name)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            task_id: string("taskId"),
+            status_code: string("statusCode"),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 impl<Eng> DescribeExportTasks<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -147,18 +190,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExportTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExportTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExportTasks"))
+        // `ctx` carries only request metadata; this operation reports on stored tasks and
+        // needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeExportTasksError::from(
+                DescribeExportTasksErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeExportTasksError::from(
+                DescribeExportTasksErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // An export runs asynchronously, so the status this call reports is the one the clock
+        // has already made due — materialised before the read, never moved on because of it.
+        store.materialize_due_export_transitions(crate::state::now_ms());
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.task_id != input.task_id || cursor.status_code != input.status_code {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeExportTasks request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it (by `taskId`), of the tasks that
+        // satisfy EVERY filter the request named: "Specifying a task ID filters the results to
+        // one or zero export tasks" and "Specifying a status code filters the results to zero
+        // or more export tasks" — so neither filter is a missing resource, each is a narrower
+        // page. `statusCode` targets the modelled `ExportTaskStatusCode` enum, so the boundary
+        // validator has already refused a status outside it.
+        let matching: Vec<&crate::state::ExportTaskRecord> = store
+            .export_tasks
+            .values()
+            .filter(|task| {
+                input
+                    .task_id
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == task.task_id)
+            })
+            .filter(|task| {
+                input
+                    .status_code
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == task.status_code)
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|task| task.task_id <= cursor.after),
+            None => 0,
+        };
+        // "The maximum number of items returned. If you don't specify a value, the default is
+        // up to 50 items." `limit` is modelled `range 1..50`, so the boundary validator has
+        // already refused a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // "The token for the next set of items to return": there is a next set only while
+        // tasks remain beyond this page.
+        let next_token = page.last().filter(|_| last < matching.len()).map(|task| {
+            Cursor {
+                task_id: input.task_id.clone(),
+                status_code: input.status_code.clone(),
+                after: task.task_id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeExportTasksOutput {
+            export_tasks: Some(
+                page.iter()
+                    .map(|task| task.reported())
+                    .collect::<Vec<ExportTask>>(),
+            ),
+            next_token,
+        })
     }
 }

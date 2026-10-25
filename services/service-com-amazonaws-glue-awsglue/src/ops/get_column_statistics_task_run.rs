@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetColumnStatisticsTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetColumnStatisticsTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetColumnStatisticsTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the column statistics task run `StartColumnStatisticsTaskRun` recorded under
+//! this `ColumnStatisticsTaskRunId`, which is the whole address of a run: no catalog,
+//! database or table member narrows it.
+//!
+//! A read, with the one write a reporting operation may make: the status the CLOCK
+//! already owed every stored run is materialised first
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_column_statistics_task_runs`]),
+//! so what this reports is the status the clock had already reached and not a status
+//! moved on because somebody polled.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +142,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetColumnStatisticsTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetColumnStatisticsTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetColumnStatisticsTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                GetColumnStatisticsTaskRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the statuses the clock had already made due.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // `ColumnStatisticsTaskRunId` is `@required` with `length 1..255`, so an absent
+        // or over-long one is refused at the boundary: reaching here, the only question
+        // is whether this account holds a run under that id.
+        let Some(run) = store.column_statistics_task_run(&input.column_statistics_task_run_id)
+        else {
+            return Err(
+                GetColumnStatisticsTaskRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::column_statistics_task_run_not_found(
+                                &input.column_statistics_task_run_id,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetColumnStatisticsTaskRunOutput {
+            column_statistics_task_run: Some(run.to_column_statistics_task_run()),
+        })
     }
 }

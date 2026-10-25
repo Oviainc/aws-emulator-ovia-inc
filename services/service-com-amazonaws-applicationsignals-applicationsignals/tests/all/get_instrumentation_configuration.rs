@@ -493,8 +493,12 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
         "LineNumber": 142
     });
 
-    // One BREAKPOINT configuration, which expires, and one PROBE configuration at the same
-    // location, which does not.
+    // One BREAKPOINT configuration, which expires, and one PROBE configuration elsewhere in
+    // the same service and environment, which does not. The PROBE sits at ANOTHER location
+    // because one location holds one configuration whatever its instrumentation type
+    // (`CreateInstrumentationConfiguration` conflicts "for the same service, environment,
+    // signal type, and location"), and it carries a tag of its own so the expiry pass is
+    // seen not to disturb the surviving record's tags.
     let breakpoint_request = json!({
         "Service": service,
         "Environment": environment,
@@ -506,7 +510,8 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
     });
     let mut probe_request = breakpoint_request.clone();
     probe_request["InstrumentationType"] = json!(PROBE);
-    probe_request["Tags"] = json!([]);
+    probe_request["Location"]["CodeLocation"]["LineNumber"] = json!(204);
+    probe_request["Tags"] = json!([{ "Key": "owner", "Value": "probe" }]);
 
     let (status, created) = create(&router, &breakpoint_request).await;
     assert_eq!(
@@ -523,8 +528,12 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let permanent_hash = permanent["LocationHash"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let temporary = get_request(&breakpoint_request, json!({ "LocationHash": hash.clone() }));
-    let permanent_request = get_request(&probe_request, json!({ "LocationHash": hash.clone() }));
+    let permanent_request = get_request(&probe_request, json!({ "LocationHash": permanent_hash }));
 
     let (status, fetched) = get(&router, &temporary).await;
     assert_eq!(
@@ -558,7 +567,9 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
         "expected a ResourceNotFoundException for an expired configuration, got {error}"
     );
 
-    // The record is gone from the store rather than merely hidden, and so are its tags.
+    // The record is gone from the store rather than merely hidden, and so are its tags —
+    // while the surviving configuration keeps its own, because one ARN names one record and
+    // a tag set is addressed by that ARN.
     {
         let state = engine.state::<ComAmazonawsApplicationsignalsApplicationsignalsState>();
         let store = state.lock();
@@ -566,15 +577,22 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
             store.instrumentation_configuration(&scope, &key).is_none(),
             "expected the lapsed configuration to be dropped from the store"
         );
+        let lapsed_arn = created["ARN"].as_str().unwrap_or_default();
         assert!(
-            store.tags.is_empty(),
-            "expected the lapsed configuration's tags to be dropped, {} remain",
-            store.tags.len()
+            !store.tags.contains_key(lapsed_arn),
+            "expected the lapsed configuration's tags to be dropped, got {:?}",
+            store.tags.get(lapsed_arn)
+        );
+        let surviving_arn = permanent["ARN"].as_str().unwrap_or_default();
+        let surviving = store.tags.get(surviving_arn);
+        assert!(
+            surviving.is_some_and(|tags| tags.get("owner").map(String::as_str) == Some("probe")),
+            "expected the surviving configuration to keep its own tags, got {surviving:?}"
         );
     }
 
-    // The PROBE configuration at the same location "persists until explicitly deleted", so
-    // the expiry pass left it alone and the get still reports it.
+    // The PROBE configuration "persists until explicitly deleted", so the expiry pass left
+    // it alone and the get still reports it.
     let (status, still_there) = get(&router, &permanent_request).await;
     assert_eq!(
         status, 200,

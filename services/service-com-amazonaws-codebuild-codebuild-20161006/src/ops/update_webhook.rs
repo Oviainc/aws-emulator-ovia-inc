@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebhook
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebhook`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Rewrites the webhook kept against a build project in [`crate::state`]: this is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebhook::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What an update changes, and what it leaves alone
+//!
+//! The input models every member of `Webhook` a caller may change (the branch filter,
+//! the filter groups, the build type and the pull-request build policy) and carries no
+//! sentinel for "leave this one as it is", and CodeBuild offers no other call for
+//! dropping a webhook's filters. So the request IS the webhook's configuration
+//! afterwards: a configuration member the request omits is cleared. The members the
+//! input does not model (the payload URL, `manualCreation`, the scope configuration and
+//! the status) identify the webhook that was created and are left exactly as they were,
+//! and the secret changes only when `rotateSecret` asks for it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +166,239 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebhook` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebhookErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebhook"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateWebhook (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
+        let project_arn = crate::state::project_arn(&region, &input.project_name);
+
+        // Checked before anything is read or written: the constraint is on the request
+        // alone, and the model cannot express it. The rule holds wherever a webhook's
+        // filter groups are set, so it lives in `crate::state`.
+        if let Some(message) =
+            crate::state::webhook_filter_groups_violation(input.filter_groups.as_deref())
+        {
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                &project_arn,
+                invalid_input(message),
+            ));
+        }
+
+        // READ PASS: the project's source type is what the requested build type is
+        // judged against, and a project with no webhook has no configuration to
+        // rewrite. The pass takes a copy of both and judges nothing while the lock is
+        // held; the write pass below re-asserts them under one critical section of its
+        // own.
+        let found = {
+            let guard = state.lock();
+            guard.projects.get(&input.project_name).map(|stored| {
+                (
+                    stored.project.webhook.is_some(),
+                    stored
+                        .project
+                        .source
+                        .as_ref()
+                        .map(|source| source.r#type.clone())
+                        .unwrap_or_default(),
+                )
+            })
+        };
+        let Some((has_webhook, source_type)) = found else {
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                project_not_found(&project_arn),
+            ));
+        };
+        if !has_webhook {
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                webhook_not_found(&project_arn),
+            ));
+        }
+
+        if let Some(message) = crate::state::webhook_build_type_violation(
+            &source_type,
+            input.build_type.as_deref(),
+            &project_arn,
+        ) {
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                &project_arn,
+                invalid_input(message),
+            ));
+        }
+
+        // A rotation mints a NEW secret the way the creating call minted the first one:
+        // through the emulator's credential store, never built here. A Bitbucket
+        // webhook carries no secret, which is why AWS documents `rotateSecret` as
+        // ignored for it. A store that minted nothing leaves the operation to refuse
+        // rather than report a secret it made up: what could not be settled is the
+        // repository provider's side of the webhook, which is what
+        // `OAuthProviderException` says.
+        let rotated_secret = if input.rotate_secret
+            && source_type != crate::state::SECRETLESS_WEBHOOK_SOURCE_TYPE
+        {
+            let Some(secret) = crate::state::mint_webhook_secret(ctx.credential_store()) else {
+                return Err(UpdateWebhookErrorModeled::OAuthProviderException(
+                    OAuthProviderException {
+                        message: Some(format!(
+                            "No webhook secret could be created for project: {project_arn}"
+                        )),
+                    },
+                )
+                .into());
+            };
+            Some(secret)
+        } else {
+            None
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw, so a
+        // project — or a webhook — removed while this request was resolving cannot be
+        // written back.
+        let mut guard = state.lock();
+        let Some(stored) = guard.projects.get_mut(&input.project_name) else {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                project_not_found(&project_arn),
+            ));
+        };
+        let Some(webhook) = stored.project.webhook.as_mut() else {
+            drop(guard);
+            return Err(refuse(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                &project_arn,
+                webhook_not_found(&project_arn),
+            ));
+        };
+
+        apply_update(webhook, input);
+        if let Some(secret) = rotated_secret.clone() {
+            webhook.secret = Some(secret);
+            // `lastModifiedSecret` reports "the last time a repository's secret token
+            // was modified", so only a rotation moves it.
+            webhook.last_modified_secret = Some(crate::state::datetime(now));
+        }
+        let mut reported = webhook.clone();
+
+        // The webhook is part of the project's settings, which is what
+        // `Project$lastModified` reports. The service clock is millisecond-resolution,
+        // so the stamp is the later of now and one millisecond past the stored stamp:
+        // strictly increasing per project, and never ahead of the clock.
+        let last_modified_millis = now.max(stored.last_modified_millis + 1);
+        stored.last_modified_millis = last_modified_millis;
+        stored.project.last_modified = Some(crate::state::datetime(last_modified_millis));
+
+        // The secret is reported by the call that MINTED it and by no other: the
+        // creating call, or an update that rotated it. An update that did not rotate
+        // reports the rest of the webhook without it, and the stored secret goes on
+        // signing the provider's payloads.
+        reported.secret = rotated_secret;
+        drop(guard);
+
+        // The project's settings changed, so the write leaves the same metadata-only
+        // record every other change to a project does — with the lock already released,
+        // so a log consumer never waits on this request's critical section.
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ProjectUpdated,
+            Some(&project_arn),
+        );
+
+        Ok(UpdateWebhookOutput {
+            webhook: Some(reported),
+        })
     }
 }
+
+/// Audit one refusal and hand it back, so a refused update leaves the same record the
+/// successful write does. The lock is never held here: every caller has dropped it.
+fn refuse(
+    operation: &str,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    outcome: crate::state::AuditOutcome,
+    project_arn: &str,
+    error: UpdateWebhookError,
+) -> UpdateWebhookError {
+    crate::state::audit(operation, ctx.parts(), outcome, Some(project_arn));
+    error
+}
+
+/// Apply one `UpdateWebhook` request's configuration to the stored webhook.
+///
+/// The request is the webhook's configuration afterwards (see the module docs), so each
+/// configuration member is REPLACED by what the request carries — cleared when it
+/// carries none. The input is DESTRUCTURED rather than read member by member, so a
+/// member the model gains later fails to compile here instead of being silently
+/// dropped.
+fn apply_update(webhook: &mut Webhook, input: UpdateWebhookInput) {
+    let UpdateWebhookInput {
+        // The webhook is identified by the project it belongs to.
+        project_name: _,
+        branch_filter,
+        // Settled before this by the caller: rotating needs the credential store.
+        rotate_secret: _,
+        filter_groups,
+        build_type,
+        pull_request_build_policy,
+    } = input;
+    webhook.branch_filter = branch_filter;
+    webhook.filter_groups = filter_groups;
+    webhook.build_type = build_type;
+    webhook.pull_request_build_policy = pull_request_build_policy;
+}
+
+/// The modelled refusal of a request this operation cannot serve as sent.
+fn invalid_input(message: String) -> UpdateWebhookError {
+    UpdateWebhookErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// No project of that name is held, so there is no webhook to update. The wording is
+/// the one every operation of this service uses for a missing project.
+fn project_not_found(project_arn: &str) -> UpdateWebhookError {
+    UpdateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Project cannot be found: {project_arn}")),
+    })
+    .into()
+}
+
+/// The project is held but carries no webhook, so the resource this call names does not
+/// exist: AWS models that as `ResourceNotFoundException`, "the specified Amazon Web
+/// Services resource cannot be found".
+fn webhook_not_found(project_arn: &str) -> UpdateWebhookError {
+    UpdateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!(
+            "A webhook does not exist for CodeBuild project: {project_arn}"
+        )),
+    })
+    .into()
+}
+

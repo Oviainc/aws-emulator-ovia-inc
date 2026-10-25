@@ -385,6 +385,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read-only: the guard is taken, the object's metadata is copied out, and
         // nothing is written — a later caller sees exactly what this one saw.
         let store = state.lock();
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version: `InvalidArgument` with
+        // HTTP 400, which leaves `NoSuchVersion` for a well-formed id the bucket holds no
+        // version for.
+        if input
+            .version_id
+            .as_deref()
+            .is_some_and(|version_id| !crate::state::version_id_is_well_formed(version_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                crate::state::INVALID_VERSION_ID_MESSAGE,
+            ));
+        }
         // "To retrieve a specific version, you must be the bucket owner and you must use
         // the versionId subresource" (`GetObject`, which `HeadObject` shares its read with
         // — "a HEAD request has the same options as a GET operation on an object"): with

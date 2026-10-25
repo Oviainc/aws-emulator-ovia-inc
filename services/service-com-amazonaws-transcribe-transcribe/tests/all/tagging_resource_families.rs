@@ -72,7 +72,8 @@ pub(crate) struct Family {
 /// implements. `TagList` is accepted by each of these creates
 /// (`smithy_query(query="operation", operation="StartTranscriptionJob,CreateVocabulary,\
 /// CreateMedicalVocabulary,CreateVocabularyFilter,CreateLanguageModel,\
-/// CreateCallAnalyticsCategory,StartMedicalScribeJob,StartMedicalTranscriptionJob")`), so
+/// CreateCallAnalyticsCategory,StartMedicalScribeJob,StartMedicalTranscriptionJob,\
+/// StartCallAnalyticsJob")`), so
 /// each family's records carry a tag set the three tagging operations own.
 pub(crate) fn families() -> Vec<Family> {
     vec![
@@ -206,6 +207,26 @@ pub(crate) fn families() -> Vec<Family> {
                 operation: "GetMedicalScribeJob",
                 name_member: "MedicalScribeJobName",
                 record: "MedicalScribeJob",
+            }),
+        },
+        Family {
+            case: "Call Analytics job",
+            // The published `<type>/${JobName}` segment of this family's ARN
+            // (`arn:${Partition}:transcribe:${Region}:${Account}:analytics-job/${JobName}`),
+            // the same hyphenation family as the Call Analytics CATEGORY type above.
+            resource_type: "analytics-job",
+            create: "StartCallAnalyticsJob",
+            base_request: |name| {
+                json!({
+                    "CallAnalyticsJobName": name,
+                    "Media": {"MediaFileUri": "s3://example-media/call.wav"},
+                    "DataAccessRoleArn": ROLE_ARN
+                })
+            },
+            reader: Some(Reader {
+                operation: "GetCallAnalyticsJob",
+                name_member: "CallAnalyticsJobName",
+                record: "CallAnalyticsJob",
             }),
         },
     ]

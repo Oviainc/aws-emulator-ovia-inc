@@ -1301,11 +1301,21 @@ pub fn provision(
 /// could deploy) leaves the resources it holds in declaration order rather than dropping
 /// them.
 fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
+    creation_order_of(template, &dependency_map(template))
+}
+
+/// [`creation_order`] over a dependency relation that has ALREADY been built.
+///
+/// The relation is the expensive half — one scan of every resource's declaration — so a
+/// caller that needs both the order and the relation itself ([`waits_on_each`]) builds it
+/// once and passes it here rather than having it built a second time. `needs` is in
+/// DECLARATION order, one entry per `template.resources`, which is what
+/// [`dependency_map`] answers.
+fn creation_order_of<'a>(
+    template: &'a Template,
+    needs: &[BTreeSet<String>],
+) -> Vec<&'a DeclaredResource> {
     let declared: Vec<&DeclaredResource> = template.resources.iter().collect();
-    let needs: Vec<BTreeSet<String>> = declared
-        .iter()
-        .map(|resource| dependencies_of(resource, template))
-        .collect();
     let mut emitted: BTreeSet<String> = BTreeSet::new();
     let mut ordered: Vec<&DeclaredResource> = Vec::with_capacity(declared.len());
     let mut taken = vec![false; declared.len()];
@@ -1317,9 +1327,9 @@ fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
             if taken[index] {
                 continue;
             }
-            if needs[index]
-                .iter()
-                .any(|needed| !emitted.contains(needed.as_str()))
+            if needs
+                .get(index)
+                .is_some_and(|needed| needed.iter().any(|name| !emitted.contains(name.as_str())))
             {
                 continue;
             }
@@ -1339,6 +1349,16 @@ fn creation_order(template: &Template) -> Vec<&DeclaredResource> {
         }
     }
     ordered
+}
+
+/// The dependency relation of a whole template, built ONCE: one entry per resource, in
+/// declaration order, carrying the logical ids that resource depends on.
+fn dependency_map(template: &Template) -> Vec<BTreeSet<String>> {
+    template
+        .resources
+        .iter()
+        .map(|resource| dependencies_of(resource, template))
+        .collect()
 }
 
 /// The logical ids of the resources of the same template that `resource` depends on:
@@ -1378,6 +1398,65 @@ fn dependencies_of(resource: &DeclaredResource, template: &Template) -> BTreeSet
                 .any(|declared| &declared.logical_id == name)
         })
         .collect()
+}
+
+/// Which of `roots` each resource of the template WAITS ON: for every resource that
+/// depends on one of those ids, directly or through another resource, the ids it waits on.
+/// A resource that waits on none is absent from the answer, and a root is never reported
+/// as waiting on itself.
+///
+/// The relation walked is the one [`creation_order`] walks — `DependsOn` plus the implicit
+/// dependency a `Ref`, an `Fn::GetAtt` or an `Fn::Sub` variable creates — so a resource
+/// waits on a root exactly when CloudFormation would not create it before that root
+/// exists. This is what a stack operation gated on a wait condition has NOT started
+/// ([`crate::state::wait_conditions`]).
+///
+/// ONE pass over the template, whatever `roots` holds: the dependency relation is built
+/// once ([`dependency_map`]), and each resource is visited once in CREATION order — which
+/// puts it after everything it depends on — taking the union of what those wait on plus
+/// any root among them. The work is charged to the deployment's [`Budget`], like every
+/// other evaluation over a caller-supplied body, and a template that exhausts it is
+/// answered with what the pass had reached: fewer resources reported as waiting, never
+/// unbounded work.
+pub fn waits_on_each(
+    template: &Template,
+    roots: &BTreeSet<String>,
+    budget: &mut Budget,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut waiting: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if roots.is_empty() {
+        return waiting;
+    }
+    let needs = dependency_map(template);
+    let by_logical_id: BTreeMap<&str, &BTreeSet<String>> = template
+        .resources
+        .iter()
+        .zip(&needs)
+        .map(|(resource, needed)| (resource.logical_id.as_str(), needed))
+        .collect();
+    for resource in creation_order_of(template, &needs) {
+        let Some(dependencies) = by_logical_id.get(resource.logical_id.as_str()) else {
+            continue;
+        };
+        // Charged per dependency examined, which is what this pass costs.
+        if budget.spend(1 + dependencies.len()).is_none() {
+            break;
+        }
+        let mut waits: BTreeSet<String> = BTreeSet::new();
+        for dependency in dependencies.iter() {
+            if roots.contains(dependency) {
+                waits.insert(dependency.clone());
+            }
+            if let Some(inherited) = waiting.get(dependency) {
+                waits.extend(inherited.iter().cloned());
+            }
+        }
+        waits.remove(&resource.logical_id);
+        if !waits.is_empty() {
+            waiting.insert(resource.logical_id.clone(), waits);
+        }
+    }
+    waiting
 }
 
 /// The names the intrinsic functions inside one template value refer to, split by HOW each

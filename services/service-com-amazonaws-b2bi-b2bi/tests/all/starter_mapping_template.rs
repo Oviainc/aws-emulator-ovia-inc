@@ -26,7 +26,7 @@ use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
 // The wire harness this test target shares: one b2bi service on one shared engine, a
 // signed awsJson1_0 call, and the `__type` of an error body.
 use crate::edi_parsing::{given_object, X12_850 as X12_850_SAMPLE, BUCKET};
-use crate::onboarding_loop::{b2bi_router, call, error_code, s3};
+use crate::onboarding_loop::{b2bi_router, call, error_code, s3, SIGNING_REGION};
 
 /// The request body for one starter template.
 fn request(mapping_type: &str, transaction_set: &str, version: &str) -> Value {
@@ -674,8 +674,20 @@ async fn a_sample_edi_file_that_cannot_be_read_is_refused_as_not_found() {
     let router = b2bi_router();
 
     // One bucket really exists, so the rows separate "this bucket holds no such object"
-    // from "there is no such bucket".
-    let (status, _) = s3(&router, "PUT", "/edi-samples", b"").await;
+    // from "there is no such bucket". The create names its `LocationConstraint`, which a
+    // create sent to a regional endpoint must.
+    let (status, _) = s3(
+        &router,
+        "PUT",
+        "/edi-samples",
+        format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{SIGNING_REGION}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        )
+        .as_bytes(),
+    )
+    .await;
     assert_eq!(status, 200, "the sample bucket must be created, got {status}");
 
     // (case, the outputSampleLocation, the expected status and error code)

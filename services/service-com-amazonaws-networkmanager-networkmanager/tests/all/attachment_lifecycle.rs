@@ -26,7 +26,7 @@ use crate::resource_tagging::{list_tags, tag, tags_uri};
 
 /// The id prefix and ARN resource type of an attachment: the model's own
 /// `^attachment-([0-9a-f]{8,17})$` (`smithy_query shape=AttachmentId`).
-const ATTACHMENT: &str = "attachment";
+pub(crate) const ATTACHMENT: &str = "attachment";
 
 /// How many attachments one core network may hold: the bound
 /// `state::MAX_ATTACHMENTS_PER_CORE_NETWORK` fixes, which is what keeps a repeated create
