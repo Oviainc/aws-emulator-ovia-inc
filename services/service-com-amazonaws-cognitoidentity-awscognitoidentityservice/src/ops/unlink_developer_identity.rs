@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnlinkDeveloperIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnlinkDeveloperIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnlinkDeveloperIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! FORGETS one developer-identity mapping of a stored pool: the `(developer provider,
+//! developer user identifier)` login the pool had indexed against the named identity is
+//! dropped, so the identifier resolves nothing and "will be considered [a] new
+//! [identity] next time [it is] seen". The identity record itself survives, losing the
+//! developer provider only once no identifier of it is left; an identity reached through
+//! no login at all is what makes it inaccessible.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +171,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnlinkDeveloperIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnlinkDeveloperIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnlinkDeveloperIdentity"))
+        // This operation reads and writes the identity store only; `ctx` carries nothing it
+        // needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the identity-pool store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The mapping this call forgets belongs to a pool, so the pool has to be one this
+        // service holds.
+        let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "IdentityPool '{}' not found.",
+                            input.identity_pool_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let developer_provider = pool.developer_provider_name.clone();
+
+        // The identity named is what this call unlinks the identifier FROM: it has to be
+        // one this service holds, and one of THIS pool's — an identity belongs to the pool
+        // that minted it and never moves, so a request reaching an identity of another pool
+        // is refused as one the caller may not reach here.
+        let Some(identity) = store.identities.get(&input.identity_id) else {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                    },
+                )
+                .into(),
+            );
+        };
+        if identity.identity_pool_id != input.identity_pool_id {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(format!(
+                            "Access to Identity '{}' is forbidden.",
+                            input.identity_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A developer identity is a login of the pool keyed by the pool's own
+        // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
+        // users" — whose value is the developer user identifier. A request naming any other
+        // provider therefore names a mapping this pool cannot hold, exactly as one naming an
+        // identifier that was never registered does, so both are the same absent mapping —
+        // and an absent mapping is refused as access this caller does not have, not as a
+        // resource reported missing: resolving a developer user identifier is an
+        // authorization question, so nothing is disclosed about what the pool holds for one.
+        let registered_to = developer_provider
+            .as_deref()
+            .filter(|provider| *provider == input.developer_provider_name.as_str())
+            .and_then(|provider| {
+                store
+                    .linked_identity(
+                        &input.identity_pool_id,
+                        provider,
+                        &input.developer_user_identifier,
+                    )
+                    .cloned()
+            });
+        let Some(registered_to) = registered_to else {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(
+                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A mapping held against a DIFFERENT identity belongs to that other account, so it
+        // is not one this call may forget — "a user tries to use a login which is already
+        // linked to another account". The identity it does belong to is not named back: the
+        // caller asked about one that does not hold it.
+        if registered_to != input.identity_id {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(format!(
+                            "The developer user identifier '{}' is already linked to another \
+                             identity.",
+                            input.developer_user_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The mapping goes: the identifier resolves nothing in this pool from here on, which
+        // is what makes it a new identity the next time it is seen.
+        let provider = input.developer_provider_name.clone();
+        store.unlink_login(
+            &input.identity_pool_id,
+            &provider,
+            &input.developer_user_identifier,
+        );
+
+        // The identity keeps the developer provider only while it still has an identifier
+        // registered under it: "Cognito supports the association of multiple developer user
+        // identifiers with an identity ID", so one going is not the provider going. The
+        // identity is never deleted — removing its developer user identifier along with its
+        // federated logins leaves it reachable through nothing, which is what "the Cognito
+        // identity becomes inaccessible" is.
+        let identifiers_left = store
+            .logins_of_identity(&input.identity_pool_id, &provider, &input.identity_id)
+            .len();
+        if let Some(identity) = store.identities.get_mut(&input.identity_id) {
+            if identifiers_left == 0 {
+                identity.logins.retain(|linked| *linked != provider);
+            }
+            // The mapping this call removed is a change to the identity, recorded with the
+            // instant it happened.
+            identity.last_modified_date = now;
+        }
+
+        Ok(UnlinkDeveloperIdentityOutput)
     }
 }

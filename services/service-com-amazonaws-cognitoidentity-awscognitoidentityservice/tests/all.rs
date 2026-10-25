@@ -31,6 +31,8 @@ mod principal_tag_attribute_map;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unlink_developer_identity.rs"]
+mod unlink_developer_identity;
 #[path = "all/unlink_identity.rs"]
 mod unlink_identity;
 #[path = "all/untag_resource.rs"]

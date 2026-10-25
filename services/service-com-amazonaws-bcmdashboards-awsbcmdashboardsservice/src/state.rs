@@ -345,18 +345,55 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     pub scheduled_report_executions: BTreeMap<(String, String), ScheduledReportExecution>,
 }
 
+/// The ARN namespace this service's ARNs carry, as the model's `aws.api#service`
+/// trait declares it (`arnNamespace: bcm-dashboards`).
+const ARN_NAMESPACE: &str = "bcm-dashboards";
+
+/// The ARN resource-type segment of a dashboard ARN, as `DashboardArn`'s pattern
+/// declares it.
+const DASHBOARD_RESOURCE_TYPE: &str = "dashboard";
+
+/// The ARN resource-type segment of a scheduled-report ARN, as `ScheduledReportArn`'s
+/// pattern declares it.
+const SCHEDULED_REPORT_RESOURCE_TYPE: &str = "scheduled-report";
+
+/// Advance `counter` and render its new value as a resource id: 32 lowercase hex
+/// characters, which satisfies both the `[-a-z0-9]+` resource segment the ARN patterns
+/// admit and `WidgetId`'s stricter `^[0-9a-f]{32}$`.
+///
+/// The counter is monotonic, so no two ids this store mints for one resource type are
+/// equal — including an id minted after the resource holding the previous one was
+/// deleted. `wrapping_add` keeps the bump panic-free in a debug build; a `u64` counter
+/// cannot be driven to its ceiling by API calls.
+fn next_resource_id(counter: &mut u64) -> String {
+    *counter = counter.wrapping_add(1);
+    format!("{:032x}", *counter)
+}
+
+/// Mint a fresh, unique ARN for one resource type: the next id from `counter` under
+/// `resource_type`, with the emulator's canonical account id supplied by
+/// `engine::emulator_arn`.
+///
+/// `bcm-dashboards` ARNs carry no region (the model's ARN patterns have an empty region
+/// segment), so the region passed is empty. Every resource type this store mints an ARN
+/// for goes through here, so the id width, the region and the account all stay the same
+/// shape across types.
+fn mint_arn(counter: &mut u64, resource_type: &str) -> String {
+    let resource_id = next_resource_id(counter);
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        "",
+        &format!("{resource_type}/{resource_id}"),
+    )
+}
+
 impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
-    /// Mint a fresh, unique dashboard ARN.
-    ///
-    /// The resource id is 32 lowercase hex characters, which satisfies the
-    /// `DashboardArn` pattern's `[-a-z0-9]+` resource segment; the account segment
-    /// comes from the emulator's canonical account id via `engine::emulator_arn`.
-    /// `bcm-dashboards` ARNs carry no region (the model's pattern has an empty
-    /// region segment), so the region passed is empty.
+    /// Mint a fresh, unique dashboard ARN, as [`mint_arn`] mints every resource ARN
+    /// this store hands out: a 32-hex-character resource id under the `dashboard`
+    /// resource type, which satisfies the `DashboardArn` pattern's `[-a-z0-9]+`
+    /// resource segment.
     pub fn mint_dashboard_arn(&mut self) -> String {
-        self.next_dashboard_seq = self.next_dashboard_seq.wrapping_add(1);
-        let resource_id = format!("{:032x}", self.next_dashboard_seq);
-        ::engine::emulator_arn("bcm-dashboards", "", &format!("dashboard/{resource_id}"))
+        mint_arn(&mut self.next_dashboard_seq, DASHBOARD_RESOURCE_TYPE)
     }
 
     /// The ARN the dashboard named `name` is stored under, or `None` when no stored
@@ -422,24 +459,19 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
             .map(|dashboard| dashboard.resource_policy.as_deref().unwrap_or_default())
     }
 
-    /// Mint a fresh widget id: 32 lowercase hex characters, as `WidgetId`'s
-    /// `^[0-9a-f]{32}$` pattern requires.
+    /// Mint a fresh widget id: the same [`next_resource_id`] rendering the ARN minters
+    /// use, which is what `WidgetId`'s `^[0-9a-f]{32}$` pattern requires.
     pub fn mint_widget_id(&mut self) -> String {
-        self.next_widget_seq = self.next_widget_seq.wrapping_add(1);
-        format!("{:032x}", self.next_widget_seq)
+        next_resource_id(&mut self.next_widget_seq)
     }
 
-    /// Mint a fresh, unique scheduled-report ARN, the same way dashboard ARNs are
-    /// minted: 32 lowercase hex characters for the resource id (which satisfies
-    /// `ScheduledReportArn`'s `[-a-z0-9]+` resource segment), the emulator's
-    /// canonical account id, and the empty region the model's pattern requires.
+    /// Mint a fresh, unique scheduled-report ARN through the same [`mint_arn`] the
+    /// dashboard minter uses, under the `scheduled-report` resource type — whose
+    /// `ScheduledReportArn` pattern admits the same `[-a-z0-9]+` resource segment.
     pub fn mint_scheduled_report_arn(&mut self) -> String {
-        self.next_scheduled_report_seq = self.next_scheduled_report_seq.wrapping_add(1);
-        let resource_id = format!("{:032x}", self.next_scheduled_report_seq);
-        ::engine::emulator_arn(
-            "bcm-dashboards",
-            "",
-            &format!("scheduled-report/{resource_id}"),
+        mint_arn(
+            &mut self.next_scheduled_report_seq,
+            SCHEDULED_REPORT_RESOURCE_TYPE,
         )
     }
 
