@@ -943,10 +943,15 @@ async fn create_node_persists_its_configuration() {
     }
 }
 
-/// `DeleteNode` removes the node from every read: `GetNode` answers 404, `ListNodes` no
-/// longer reports it, and deleting an id no node holds is a 404 too.
+/// `DeleteNode` STARTS the node's removal: the node stays readable and reports `DELETING`,
+/// `ListNodes` keeps reporting it (and its status filter selects on the stored value), and
+/// a repeated delete starts no second deletion.
+///
+/// The staged statuses and the clock that settles them are
+/// [`crate::node_deletion_lifecycle`]'s subject; what this row table spans is the position
+/// the deleted node sits at in the stored ordering a page cursor keys on.
 #[tokio::test]
-async fn delete_node_removes_it_from_every_read() {
+async fn delete_node_starts_the_deletion_and_keeps_the_node_readable() {
     let router = new_router();
     let (network_id, member_id) = available_network(&router, "delete-1", "delete-net").await;
 
@@ -968,8 +973,12 @@ async fn delete_node_removes_it_from_every_read() {
 
     // Rows: the first, the middle and the last node of the stored ordering, so the
     // deletion is exercised at every position a page cursor can sit on.
+    let mut deleted: Vec<String> = Vec::new();
+    let mut surviving = node_ids.clone();
     for (case, index) in [("middle", 1_usize), ("first", 0), ("last", 0)] {
-        let doomed = node_ids.remove(index);
+        let doomed = surviving.remove(index);
+        deleted.push(doomed.clone());
+        deleted.sort();
         let answer = call(
             &router,
             "DELETE",
@@ -991,15 +1000,15 @@ async fn delete_node_removes_it_from_every_read() {
         )
         .await;
         assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected GetNode 404 ResourceNotFoundException after the delete, \
-             got {} {:?}",
+            (answer.status, answer.text(&["Node", "Status"]).as_str()),
+            (200, "DELETING"),
+            "case {case}: expected GetNode 200 DELETING right after the delete, got {} {:?}",
             answer.status,
             answer.body
         );
 
-        // Deleting it a second time finds nothing to delete.
+        // Deleting it a second time starts no second deletion: the status and the due
+        // instant the first delete set are left exactly as they were.
         let answer = call(
             &router,
             "DELETE",
@@ -1008,32 +1017,54 @@ async fn delete_node_removes_it_from_every_read() {
         )
         .await;
         assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected a repeated DeleteNode to be a 404, got {} {:?}",
+            answer.status, 200,
+            "case {case}: expected a repeated DeleteNode 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let answer = call(
+            &router,
+            "GET",
+            &format!("/networks/{network_id}/nodes/{doomed}?memberId={member_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.text(&["Node", "Status"]).as_str()),
+            (200, "DELETING"),
+            "case {case}: expected the node to stay DELETING after a repeated delete, got \
+             {} {:?}",
             answer.status,
             answer.body
         );
 
-        let answer = call(
-            &router,
-            "GET",
-            &format!("/networks/{network_id}/nodes?memberId={member_id}"),
-            None,
-        )
-        .await;
-        let listed: Vec<String> = answer.body["Nodes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|node| node["Id"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(
-            listed, node_ids,
-            "case {case}: expected ListNodes to report only the surviving nodes, got {:?}",
-            answer.body
-        );
+        // The unfiltered listing reports every node the network holds, deleting ones
+        // included, and each status filter selects on the stored value.
+        for (query, expected) in [
+            ("", node_ids.clone()),
+            ("&status=AVAILABLE", surviving.clone()),
+            ("&status=DELETING", deleted.clone()),
+            ("&status=DELETED", Vec::new()),
+        ] {
+            let answer = call(
+                &router,
+                "GET",
+                &format!("/networks/{network_id}/nodes?memberId={member_id}{query}"),
+                None,
+            )
+            .await;
+            let listed: Vec<String> = answer.body["Nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|node| node["Id"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                listed, expected,
+                "case {case} ListNodes{query:?}: expected {expected:?}, got {:?}",
+                answer.body
+            );
+        }
     }
 }
 
