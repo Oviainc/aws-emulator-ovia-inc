@@ -144,14 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
         // This operation models no not-found error, so a job run that is not stored
-        // under this virtual cluster is refused as an invalid request rather than
-        // answered with a silent success.
-        let Some(record) = state.job_run(&input.virtual_cluster_id, &input.id) else {
+        // under this virtual cluster in this region is refused as an invalid request
+        // rather than answered with a silent success.
+        let Some(record) = state.job_run(&region, &input.virtual_cluster_id, &input.id) else {
             return Err(CancelJobRunErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -179,6 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if current_state != crate::state::JOB_CANCEL_PENDING {
             state.move_job_run(
+                &region,
                 &input.id,
                 crate::state::JOB_CANCEL_PENDING,
                 crate::state::JOB_CANCELLED,

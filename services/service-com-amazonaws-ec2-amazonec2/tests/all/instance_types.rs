@@ -1071,8 +1071,7 @@ async fn an_undocumented_filter_is_refused() {
 /// The per-type figures AWS publishes as hardware data — the processor's clock speed, the
 /// EBS-optimized performance table, the Gigabit network-performance string, the network
 /// CARD count (AWS names its multi-card types individually, so the name does not yield
-/// it), bandwidth weightings, in-transit encryption and reboot migration — are reported
-/// absent rather
+/// it), bandwidth weightings and reboot migration — are reported absent rather
 /// than invented, and EC2's rule for a filter on an attribute a resource does not carry
 /// is that it matches no value. So each of these documented filters is accepted and
 /// answers an empty set, which is what pins the choice: the filter is not refused (it is
@@ -1080,7 +1079,7 @@ async fn an_undocumented_filter_is_refused() {
 #[tokio::test]
 async fn a_filter_on_a_member_reported_absent_selects_nothing() {
     let (router, _engine) = super::ec2_query::emulator();
-    let cases: [(&str, &str, &str); 7] = [
+    let cases: [(&str, &str, &str); 6] = [
         ("the clock speed", "processor-info.sustained-clock-speed-in-ghz", "2.5"),
         ("the network performance", "network-info.network-performance", "25 Gigabit"),
         ("the network card count", "network-info.maximum-network-cards", "1"),
@@ -1090,11 +1089,6 @@ async fn a_filter_on_a_member_reported_absent_selects_nothing() {
             "3600",
         ),
         ("bandwidth weightings", "network-info.bandwidth-weightings", "default"),
-        (
-            "in-transit encryption",
-            "network-info.encryption-in-transit-supported",
-            "true",
-        ),
         ("reboot migration", "reboot-migration-support", "supported"),
     ];
 
@@ -1111,6 +1105,57 @@ async fn a_filter_on_a_member_reported_absent_selects_nothing() {
              got {} types",
             items.len()
         );
+    }
+}
+
+/// `EncryptionInTransitSupported` is reported for every type and is the SAME fact
+/// `GetVpcResourcesBlockingEncryptionEnforcement` reports a VPC's instances against, and
+/// the filter on it selects exactly the types that carry it.
+///
+/// The rows differ along what the rule generalises over: a type of a generation from which
+/// every Nitro type encrypts, two of the earlier families AWS names one by one, a Nitro
+/// type of an earlier generation, a type that runs on the Xen hypervisor, and a family
+/// whose digits are a memory size rather than a generation — the high-memory `U-*` family,
+/// which that same list names ("Encryption in transit", Amazon EC2 User Guide).
+#[tokio::test]
+async fn in_transit_encryption_is_reported_and_filterable() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let cases: [(&str, &str, bool); 8] = [
+        ("a 6th-generation type", "m6i.large", true),
+        ("a 7th-generation type", "c7a.2xlarge", true),
+        ("a named earlier family", "c5n.large", true),
+        ("a named earlier AMD family", "c5a.large", true),
+        ("a named earlier dense-storage family", "d3.xlarge", true),
+        ("a Nitro type of the 5th generation", "m5.large", false),
+        ("a Xen type", "t2.micro", false),
+        ("a high-memory family carrying no generation", "u-6tb1.metal", true),
+    ];
+
+    for (case, instance_type, encrypts) in cases {
+        let item = describe_one(&router, case, instance_type).await;
+        assert_eq!(
+            member(case, &item, "encryptionInTransitSupported"),
+            encrypts.to_string(),
+            "case {case:?}: {instance_type} encrypts in transit: {encrypts}, got {item:?}"
+        );
+
+        // The filter reads the same member, so a type is selected by exactly the value it
+        // reports and by no other.
+        for value in [true, false] {
+            let mut params = filters(&[(
+                "network-info.encryption-in-transit-supported",
+                &[value.to_string().as_str()],
+            )]);
+            params.extend(named(instance_type));
+            let (status, body) = describe(&router, "us-east-1", &params).await;
+            assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+            assert_eq!(
+                type_items(&body).len(),
+                usize::from(value == encrypts),
+                "case {case:?}: filtering {instance_type} on {value} selects it only when it \
+                 reports {value}, got {body}"
+            );
+        }
     }
 }
 

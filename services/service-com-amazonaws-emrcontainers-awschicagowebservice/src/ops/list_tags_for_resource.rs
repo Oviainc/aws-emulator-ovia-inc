@@ -148,9 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into()
         })?;
-        // Nothing about this read depends on request metadata: the ARN the operation
-        // reports on is a modelled member, not a header.
-        let _ = ctx;
+        // The one value this read takes from the request metadata is the region it is
+        // signed for, which is where the ARN is resolved; the ARN the operation reports on
+        // is a modelled member, not a header.
+        let region = crate::state::request_region(ctx);
 
         // `resourceArn`'s length and pattern are refused at the boundary BEFORE this
         // handler runs. What is left to judge about the ARN is whether its resource path
@@ -174,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the record this call reads is the settled one. Nothing else here writes.
         state.settle();
 
-        let Some(tags) = state.resource_tags(&resource, &input.resource_arn) else {
+        let Some(tags) = state.resource_tags(&region, &resource, &input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Resource {} was not found", input.resource_arn)),

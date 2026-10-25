@@ -168,22 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Defence in depth for a caller that builds the input directly: `Pillar` is an
         // enum, so the boundary walk in `crate::service` already refuses a value outside
         // its published set with this same 400 before the handler runs. It is kept so a
-        // goal is never STORED naming a pillar the enum does not publish.
-        if let Some(unknown) = input
-            .pillars
-            .iter()
-            .find(|pillar| !PILLAR_VALUES.contains(&pillar.as_str()))
-        {
-            return Err(CreateAgentGoalErrorModeled::ValidationException(
-                crate::state::member_constraint_exception(
-                    crate::state::PILLARS_MEMBER,
-                    &format!(
-                        "Member must satisfy enum value set: [{}], got {unknown}",
-                        PILLAR_VALUES.join(", ")
-                    ),
-                ),
-            )
-            .into());
+        // goal is never STORED naming a pillar the enum does not publish, and the refusal
+        // is built in `crate::state` so every operation that stores a pillar list words it
+        // identically.
+        if let Some(exception) = crate::state::unpublished_pillar_exception(&input.pillars) {
+            return Err(CreateAgentGoalErrorModeled::ValidationException(exception).into());
         }
 
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({

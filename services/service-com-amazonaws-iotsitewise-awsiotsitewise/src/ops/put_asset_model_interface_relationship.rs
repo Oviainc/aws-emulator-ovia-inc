@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAssetModelInterfaceRelationship
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAssetModelInterfaceRelationship`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAssetModelInterfaceRelationship::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation applies an interface asset model to an asset model
+//! in the shared engine store (`crate::state`); this is the ONLY file to touch for
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +173,351 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAssetModelInterfaceRelationship` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAssetModelInterfaceRelationshipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAssetModelInterfaceRelationship"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAssetModelInterfaceRelationshipError::Modeled(
+                PutAssetModelInterfaceRelationshipErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, exactly as `CreateAssetModel` and `UpdateAssetModel`
+        // leave it. Applying the same interface twice is idempotent in the store
+        // anyway — the relationship is keyed by the two models — so no answer is
+        // fabricated for a retry.
+        let mut store = state.lock();
+
+        // Both members are `CustomID` labels: a raw UUID or the `externalId:` form.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        let interface_asset_model_id = store
+            .resolve_asset_model_id(&input.interface_asset_model_id)
+            .ok_or_else(|| model_not_found(&input.interface_asset_model_id))?;
+
+        // An interface is applied to ANOTHER model: one model cannot stand on both
+        // sides of the relationship, since every property would then map to itself.
+        if asset_model_id == interface_asset_model_id {
+            return Err(invalid_request(format!(
+                "The asset model {asset_model_id} cannot implement itself as an interface."
+            )));
+        }
+
+        // Only a model of the INTERFACE type can be applied as one: that is what
+        // the `AssetModelType` value means.
+        let interface = store
+            .asset_models
+            .get(&interface_asset_model_id)
+            .ok_or_else(|| model_not_found(&input.interface_asset_model_id))?;
+        if interface.model_type != crate::state::MODEL_TYPE_INTERFACE {
+            return Err(invalid_request(format!(
+                "The asset model {interface_asset_model_id} is of type {} and so cannot be \
+                 applied as an interface; only an asset model of type {} can.",
+                interface.model_type,
+                crate::state::MODEL_TYPE_INTERFACE
+            )));
+        }
+        // Cloned so the writes below are not borrowing the two models.
+        let interface_record = interface.clone();
+        let applied_to = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?
+            .clone();
+        // What an earlier application of this same interface to this same model
+        // resolved to, if there was one: re-applying keeps those pairings rather
+        // than resolving a second, different answer for the same two models.
+        let applied_before = store
+            .interface_relationship(&asset_model_id, &interface_asset_model_id)
+            .cloned();
+
+        // The overrides are resolved FIRST, against both models' stored property
+        // lists: each entry addresses one property of the interface and one of the
+        // model it is applied to, in either `CustomID` form.
+        let configuration = &input.property_mapping_configuration;
+        let mut overrides: Vec<(String, String)> = Vec::new();
+        for entry in configuration.overrides.as_deref().unwrap_or(&[]) {
+            let interface_property_id = interface_record
+                .resolve_property_id(&entry.interface_asset_model_property_id)
+                .ok_or_else(|| {
+                    property_not_found(
+                        &input.interface_asset_model_id,
+                        &entry.interface_asset_model_property_id,
+                    )
+                })?;
+            let asset_model_property_id = applied_to
+                .resolve_property_id(&entry.asset_model_property_id)
+                .ok_or_else(|| {
+                    property_not_found(&input.asset_model_id, &entry.asset_model_property_id)
+                })?;
+            // One interface property maps to ONE property: a second entry for it
+            // would silently win over the first.
+            if overrides
+                .iter()
+                .any(|(mapped, _)| *mapped == interface_property_id)
+            {
+                return Err(invalid_request(format!(
+                    "The request overrides the mapping of the interface property \
+                     {interface_property_id} more than once."
+                )));
+            }
+            overrides.push((interface_property_id, asset_model_property_id));
+        }
+
+        // Every property the interface declares has to end up mapped, in the
+        // interface's own property order so the stored mapping does not depend on
+        // the order the overrides arrived in. Per property: an override names its
+        // counterpart outright; `matchByPropertyName` pairs it with the property of
+        // the same name, the only identity two models share; the mapping an EARLIER
+        // application of this same interface resolved to stands, so re-applying is
+        // idempotent whatever the configuration; and `createMissingProperty`
+        // creates the property on the model the interface is applied to, where that
+        // model declares no property of that name. A property none of the four
+        // resolves is a request that cannot be served, not a partial application.
+        // Two interface properties never share one target: the mapping is one to
+        // one in both directions.
+        let mut property_mappings: Vec<PropertyMapping> =
+            Vec::with_capacity(interface_record.properties.len());
+        let mut created: Vec<AssetModelProperty> = Vec::new();
+        for property in &interface_record.properties {
+            let Some(interface_asset_model_property_id) =
+                property.id.clone().filter(|id| !id.is_empty())
+            else {
+                // A stored property without an id is unaddressable, so it can be
+                // half of no mapping — the same filter the asset-side
+                // materialisation applies.
+                continue;
+            };
+            let overridden = overrides
+                .iter()
+                .find(|(mapped, _)| *mapped == interface_asset_model_property_id)
+                .map(|(_, target)| target.clone());
+            let matched_by_name = configuration
+                .match_by_property_name
+                .then(|| applied_to.property_id_named(&property.name))
+                .flatten();
+            // What the previous application of THIS relationship mapped the
+            // property to, while the model still declares that property.
+            let mapped_before = applied_before
+                .as_ref()
+                .and_then(|record| {
+                    record.property_mappings.iter().find(|mapping| {
+                        mapping.interface_asset_model_property_id
+                            == interface_asset_model_property_id
+                    })
+                })
+                .map(|mapping| mapping.asset_model_property_id.clone())
+                .filter(|id| {
+                    applied_to
+                        .properties
+                        .iter()
+                        .any(|held| held.id.as_deref() == Some(id.as_str()))
+                });
+            let asset_model_property_id = match overridden.or(matched_by_name).or(mapped_before) {
+                Some(id) => id,
+                None => {
+                    if !configuration.create_missing_property {
+                        return Err(invalid_request(format!(
+                            "The interface asset model property {} ({}) maps to no property of \
+                             the asset model {}: supply an override for it, ask for matching by \
+                             property name, or ask for the missing property to be created.",
+                            property.name,
+                            interface_asset_model_property_id,
+                            input.asset_model_id
+                        )));
+                    }
+                    // Creating the property is only open where the model does not
+                    // already declare one of that NAME: two properties of one name
+                    // on a model make every later match by name ambiguous — this
+                    // application's own re-application included — so the request is
+                    // refused rather than served into that state. Reached only with
+                    // matching by name NOT asked for, since a name the model holds
+                    // would otherwise have matched above. The check is on the NAME
+                    // alone, so a stored property carrying no id still blocks the
+                    // duplicate it would become.
+                    if applied_to
+                        .properties
+                        .iter()
+                        .chain(created.iter())
+                        .any(|held| held.name == property.name)
+                    {
+                        return Err(invalid_request(format!(
+                            "The asset model {} already declares a property named {}, so the \
+                             interface asset model property {} cannot be created on it: ask for \
+                             matching by property name, or supply an override for it.",
+                            input.asset_model_id,
+                            property.name,
+                            interface_asset_model_property_id
+                        )));
+                    }
+                    // The created property is the interface's own definition: its
+                    // name, data type, unit and property type, under an id of its
+                    // own. The external id is NOT copied — an external id is unique
+                    // within the account, so it stays with the interface's property
+                    // — and the path is derived by the reads that report it.
+                    let id = crate::state::new_id();
+                    created.push(AssetModelProperty {
+                        id: Some(id.clone()),
+                        external_id: None,
+                        name: property.name.clone(),
+                        data_type: property.data_type.clone(),
+                        data_type_spec: property.data_type_spec.clone(),
+                        unit: property.unit.clone(),
+                        r#type: property.r#type.clone(),
+                        path: None,
+                    });
+                    id
+                }
+            };
+            // One property of the applied-to model answers for ONE property of the
+            // interface: two interface properties sharing a target would make the
+            // mapping ambiguous in the other direction.
+            if property_mappings
+                .iter()
+                .any(|mapping| mapping.asset_model_property_id == asset_model_property_id)
+            {
+                return Err(invalid_request(format!(
+                    "The property {} of the asset model {} is already mapped to another property \
+                     of the interface asset model, so the interface property {} cannot map to it \
+                     as well.",
+                    asset_model_property_id, input.asset_model_id, interface_asset_model_property_id
+                )));
+            }
+            property_mappings.push(PropertyMapping {
+                asset_model_property_id,
+                interface_asset_model_property_id,
+            });
+        }
+
+        // A hierarchy is mapped by the one identity two models share, its name:
+        // the modelled configuration governs PROPERTIES only ("how properties are
+        // matched and created"), so nothing here creates a hierarchy, and an
+        // interface hierarchy the applied-to model does not declare is reported by
+        // no mapping rather than by an invented one.
+        let hierarchy_mappings: Vec<HierarchyMapping> = interface_record
+            .hierarchies
+            .iter()
+            .filter_map(|hierarchy| {
+                let interface_asset_model_hierarchy_id =
+                    hierarchy.id.clone().filter(|id| !id.is_empty())?;
+                let asset_model_hierarchy_id = applied_to.hierarchy_id_named(&hierarchy.name)?;
+                Some(HierarchyMapping {
+                    asset_model_hierarchy_id,
+                    interface_asset_model_hierarchy_id,
+                })
+            })
+            .collect();
+
+        // The published per-model property quota still holds for the properties
+        // this application would add.
+        if applied_to.properties.len() + created.len()
+            > crate::state::MAX_PROPERTIES_PER_ASSET_MODEL
+        {
+            return Err(limit_exceeded(format!(
+                "An asset model carries at most {} properties.",
+                crate::state::MAX_PROPERTIES_PER_ASSET_MODEL
+            )));
+        }
+        let key = crate::state::interface_relationship_key(
+            &asset_model_id,
+            &interface_asset_model_id,
+        );
+        if !store.interface_relationships.contains_key(&key)
+            && store.interface_relationships.len() >= crate::state::MAX_INTERFACE_RELATIONSHIPS
+        {
+            return Err(limit_exceeded(format!(
+                "This emulator holds at most {} interface relationships.",
+                crate::state::MAX_INTERFACE_RELATIONSHIPS
+            )));
+        }
+
+        // Nothing can be refused from here on, so the writes land together.
+        let record = store
+            .asset_models
+            .get_mut(&asset_model_id)
+            .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        record.properties.extend(created);
+        // Applying an interface changes the model's definition, so it carries a new
+        // version and reports UPDATING until the transition this call owes falls due.
+        record.begin_update(now);
+        let output = PutAssetModelInterfaceRelationshipOutput {
+            asset_model_id: record.id.clone(),
+            interface_asset_model_id: interface_asset_model_id.clone(),
+            asset_model_arn: record.arn.clone(),
+            asset_model_status: record.status(now),
+        };
+
+        store.interface_relationships.insert(
+            key,
+            crate::state::InterfaceRelationshipRecord {
+                asset_model_id: asset_model_id.clone(),
+                interface_asset_model_id,
+                property_mappings,
+                hierarchy_mappings,
+            },
+        );
+        // Every asset created from the model inherits its property and hierarchy
+        // definitions, so the properties this application created are materialised
+        // on them the way any other change to the definition is.
+        store.propagate_asset_model_definitions(&asset_model_id, now);
+
+        Ok(output)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset-model label that
+/// resolved to nothing.
+fn model_not_found(label: &str) -> PutAssetModelInterfaceRelationshipError {
+    PutAssetModelInterfaceRelationshipError::Modeled(
+        PutAssetModelInterfaceRelationshipErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_ASSET_MODEL,
+                    label,
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a property label that names no
+/// property of the asset model the request addressed it to. Both identifiers are
+/// echoed as the request sent them.
+fn property_not_found(
+    model_label: &str,
+    property_label: &str,
+) -> PutAssetModelInterfaceRelationshipError {
+    PutAssetModelInterfaceRelationshipError::Modeled(
+        PutAssetModelInterfaceRelationshipErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: format!(
+                    "The asset model {model_label} has no property {property_label}."
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> PutAssetModelInterfaceRelationshipError {
+    PutAssetModelInterfaceRelationshipError::Modeled(
+        PutAssetModelInterfaceRelationshipErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> PutAssetModelInterfaceRelationshipError {
+    PutAssetModelInterfaceRelationshipError::Modeled(
+        PutAssetModelInterfaceRelationshipErrorModeled::LimitExceededException(
+            LimitExceededException { message },
+        ),
+    )
 }

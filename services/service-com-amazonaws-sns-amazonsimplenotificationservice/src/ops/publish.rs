@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Exactly one destination: "If you don't specify a value for the TopicArn
         // parameter, you must specify a value for the PhoneNumber or TargetArn
@@ -329,55 +329,454 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut store = store.lock();
-
-        let Some(topic) = store.topics.get(&destination).cloned() else {
-            return Err(PublishErrorModeled::NotFoundException(NotFoundException {
-                message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
-            })
-            .into());
+        // The store's lock is held for the publish only, and released before the queues
+        // subscribed to the topic are delivered to: a delivery is an in-process call into
+        // another service, which must not run under this store's lock.
+        let (output, deliveries) = {
+            let mut store = store.lock();
+            publish_into_store(&mut store, input, &destination)?
         };
+        deliver_to_queues(ctx, &deliveries).await;
+        Ok(output)
+    }
+}
 
-        // The rules that need the topic as well as the message: its size ceiling and
-        // the FIFO ordering parameters, which also decide the stored deduplication id.
-        let message_deduplication_id = match state::topic_message_refusal(&topic, request) {
-            Ok(deduplication_id) => deduplication_id,
-            Err(reason) => return Err(invalid_parameter(reason)),
-        };
-        // Only a FIFO topic is sequenced: "This response element applies only to FIFO
-        // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc).
-        let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
+/// Record the publish in the store, and report the deliveries it owes to the SQS queues
+/// subscribed to the topic.
+///
+/// The whole store-touching half of the operation, so the one place that holds the store's
+/// lock is the caller's block.
+fn publish_into_store(
+    store: &mut crate::state::ComAmazonawsSnsAmazonsimplenotificationserviceState,
+    input: PublishInput,
+    destination: &str,
+) -> Result<(PublishOutput, Vec<QueueDelivery>), PublishError> {
+    let Some(topic) = store.topics.get(destination).cloned() else {
+        return Err(PublishErrorModeled::NotFoundException(NotFoundException {
+            message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+        })
+        .into());
+    };
 
-        let message_id = store.next_unique_id();
-        let published = PublishedMessage {
-            message_id: message_id.clone(),
-            topic_arn: topic.arn.clone(),
-            message: input.message,
-            subject: input.subject,
-            message_structure: input.message_structure,
-            message_attributes: input.message_attributes.unwrap_or_default(),
-            message_group_id: input.message_group_id,
-            message_deduplication_id,
-            sequence_number: sequence_number.clone(),
-            published_at: std::time::SystemTime::now(),
-        };
+    // The rules that need the topic as well as the message: its size ceiling and
+    // the FIFO ordering parameters, which also decide the stored deduplication id.
+    let request = MessageRequest {
+        message: &input.message,
+        subject: input.subject.as_deref(),
+        message_structure: input.message_structure.as_deref(),
+        message_group_id: input.message_group_id.as_deref(),
+        message_deduplication_id: input.message_deduplication_id.as_deref(),
+    };
+    let message_deduplication_id = match state::topic_message_refusal(&topic, request) {
+        Ok(deduplication_id) => deduplication_id,
+        Err(reason) => return Err(invalid_parameter(reason)),
+    };
+    // Only a FIFO topic is sequenced: "This response element applies only to FIFO
+    // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc).
+    let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
 
-        // SNS "delivers the message to each endpoint that is subscribed to the topic"
-        // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
-        // it receives nothing.
-        let recipients: Vec<String> = store
-            .subscriptions_of(&topic.arn)
-            .into_iter()
-            .filter(|sub| !sub.pending_confirmation)
-            .map(|sub| sub.arn.clone())
-            .collect();
-        for recipient in recipients {
-            store.record_delivery(&recipient, published.clone());
-        }
+    let message_id = store.next_unique_id();
+    let published = PublishedMessage {
+        message_id: message_id.clone(),
+        topic_arn: topic.arn.clone(),
+        message: input.message,
+        subject: input.subject,
+        message_structure: input.message_structure,
+        message_attributes: input.message_attributes.unwrap_or_default(),
+        message_group_id: input.message_group_id,
+        message_deduplication_id,
+        sequence_number: sequence_number.clone(),
+        published_at: std::time::SystemTime::now(),
+    };
 
-        Ok(PublishOutput {
+    // SNS "delivers the message to each endpoint that is subscribed to the topic"
+    // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
+    // it receives nothing.
+    let subscriptions: Vec<state::SubscriptionRecord> = store
+        .subscriptions_of(&topic.arn)
+        .into_iter()
+        .filter(|sub| !sub.pending_confirmation)
+        .cloned()
+        .collect();
+    let deliveries = queue_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
+    for subscription in &subscriptions {
+        store.record_delivery(&subscription.arn, published.clone());
+    }
+
+    Ok((
+        PublishOutput {
             message_id: Some(message_id),
             sequence_number,
+        },
+        deliveries,
+    ))
+}
+
+/// The ARN namespace of Amazon SQS, whose queues are the subscription endpoint kind this
+/// operation delivers to.
+pub(crate) const SQS_ARN_NAMESPACE: &str = "sqs";
+
+/// The subscription protocol whose endpoint is an SQS queue: "sqs – delivery of JSON-encoded
+/// message to an Amazon SQS queue" (`SubscribeInput$Protocol`).
+pub(crate) const SQS_PROTOCOL: &str = "sqs";
+
+/// One message this publish owes to one SQS queue subscribed to the topic.
+///
+/// "Delivers a message to the specified topic […] When a messageId is returned, the message
+/// has been saved and Amazon SNS will attempt to deliver it shortly." (`Publish`) — the
+/// delivery is not part of the answer, so it is carried out of the store as this record and
+/// performed with the store's lock released.
+///
+/// The body is SHARED, not copied per subscription: every subscriber of one published message
+/// receives the same bytes (the envelope carries nothing subscription-specific), so one
+/// publish holds ONE body however many queues are subscribed.
+#[derive(Debug, Clone)]
+pub struct QueueDelivery {
+    /// The subscription that owes the delivery, for the log when it cannot be made.
+    subscription_arn: String,
+    /// The url of the queue the subscription's endpoint ARN names.
+    queue_url: String,
+    /// The Region the queue is in: the one its own ARN names.
+    region: String,
+    /// The body the queue receives, shared with every other delivery of this message.
+    body: ::std::sync::Arc<str>,
+    /// The message attributes the queue receives, set only on a RAW delivery: without the
+    /// notification envelope that carries them, they are the only place they survive.
+    attributes: Vec<(String, MessageAttributeValue)>,
+}
+
+/// How many deliveries ONE publishing request may make, across every message it publishes
+/// and every subscription of the topic.
+///
+/// The request's OWN bound, not a limit AWS publishes. Each factor of the fan-out is bounded
+/// on its own — at most 10 entries per `PublishBatch` and
+/// [`crate::state::MAX_RECORDS_PER_STORE`] subscriptions per store — but their PRODUCT is
+/// not, so one request could otherwise dispatch 10,000 in-process calls. It is set far above
+/// any realistic topic fan-out (a handful of subscribers), and a request that exhausts it
+/// stops delivering and says so in the log rather than silently dispatching more.
+const MAX_DELIVERIES_PER_REQUEST: usize = 100;
+
+/// How many delivered bytes ONE publishing request may hand to the subscribed queues.
+///
+/// A second bound on the same fan-out, because a delivery count alone does not bound the
+/// work: one message may be just under the topic's `MaximumMessageSize` (up to 1 MiB), so a
+/// count-only cap would admit a hundred megabytes of message bodies from one request.
+const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
+
+/// What one publishing request has left to spend on delivering to subscribed queues.
+///
+/// ONE budget for the whole request, spent across every message and every subscription: that
+/// is what caps the (messages x subscriptions x body bytes) PRODUCT rather than each factor
+/// on its own.
+#[derive(Debug)]
+pub(crate) struct DeliveryBudget {
+    deliveries: usize,
+    bytes: usize,
+}
+
+impl DeliveryBudget {
+    /// A fresh budget: [`MAX_DELIVERIES_PER_REQUEST`] deliveries and
+    /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes.
+    pub(crate) fn new() -> Self {
+        Self {
+            deliveries: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Charge one delivery of `bytes`: `false` when it would pass either bound, in which case
+    /// nothing is charged and nothing must be delivered.
+    fn charge(&mut self, bytes: usize) -> bool {
+        let deliveries = self.deliveries + 1;
+        let total = self.bytes.saturating_add(bytes);
+        if deliveries > MAX_DELIVERIES_PER_REQUEST || total > MAX_DELIVERED_BYTES_PER_REQUEST {
+            return false;
+        }
+        self.deliveries = deliveries;
+        self.bytes = total;
+        true
+    }
+}
+
+/// The deliveries `published` owes to the SQS queues among `subscriptions`, within what
+/// `budget` has left.
+///
+/// The body is rendered ONCE here — the enveloped form and the raw form at most once each —
+/// and shared by every delivery, so a fan-out does not re-serialize the message per
+/// subscriber. `pub(crate)` with [`deliver_to_queues`]: `PublishBatch` publishes the same
+/// messages to the same subscriptions, so it goes through this one definition of the envelope
+/// and the fan-out rather than a second copy, and shares one budget across its entries.
+pub(crate) fn queue_deliveries(
+    subscriptions: &[state::SubscriptionRecord],
+    published: &PublishedMessage,
+    budget: &mut DeliveryBudget,
+) -> Vec<QueueDelivery> {
+    let mut enveloped: Option<::std::sync::Arc<str>> = None;
+    let mut raw_body: Option<::std::sync::Arc<str>> = None;
+    let mut deliveries: Vec<QueueDelivery> = Vec::new();
+    for subscription in subscriptions {
+        let Some(target) = QueueTarget::of(subscription) else {
+            continue;
+        };
+        let body = if target.raw {
+            raw_body
+                .get_or_insert_with(|| ::std::sync::Arc::from(published.message.as_str()))
+                .clone()
+        } else {
+            enveloped
+                .get_or_insert_with(|| ::std::sync::Arc::from(notification_envelope(published)))
+                .clone()
+        };
+        if !budget.charge(body.len()) {
+            ::tracing::warn!(
+                subscription = %subscription.arn,
+                deliveries = MAX_DELIVERIES_PER_REQUEST,
+                bytes = MAX_DELIVERED_BYTES_PER_REQUEST,
+                "this request reached the emulator's delivery budget; the remaining \
+                 subscriptions of the topic are not delivered to"
+            );
+            return deliveries;
+        }
+        deliveries.push(QueueDelivery {
+            subscription_arn: subscription.arn.clone(),
+            queue_url: target.queue_url,
+            region: target.region,
+            body,
+            attributes: if target.raw {
+                published
+                    .message_attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    deliveries
+}
+
+/// Where one subscription's deliveries go, and in which form.
+struct QueueTarget {
+    /// The url of the queue the subscription's endpoint ARN names.
+    queue_url: String,
+    /// The Region the queue is in: the one its own ARN names.
+    region: String,
+    /// Whether the subscription asked for RAW delivery.
+    raw: bool,
+}
+
+impl QueueTarget {
+    /// The queue `subscription` addresses, or `None` when it is not one this operation
+    /// delivers to.
+    fn of(subscription: &state::SubscriptionRecord) -> Option<Self> {
+        if subscription.protocol != SQS_PROTOCOL {
+            // Every other protocol (`http`, `lambda`, `email`, `firehose`, …) needs its own
+            // delivery path, which is not implemented here. The message is still RECORDED
+            // against the subscription, so nothing claims a delivery that did not happen.
+            return None;
+        }
+        let endpoint = subscription.endpoint.as_deref()?;
+        let arn = ::service_common::arn::parse(endpoint)?;
+        if arn.vendor != SQS_ARN_NAMESPACE || arn.resource.contains([':', '/']) {
+            // A queue's ARN names the queue directly: a resource field carrying a type
+            // separator addresses no queue.
+            return None;
+        }
+        let region = ::service_common::arn::region_of(endpoint, SQS_ARN_NAMESPACE)?;
+        if subscription
+            .attributes
+            .contains_key(state::FILTER_POLICY_ATTRIBUTE)
+        {
+            // A filter policy decides WHICH messages the subscription receives, and applying
+            // one is not implemented here. A subscriber that asked to be filtered must not be
+            // handed every message instead — that would deliver what it filtered out — so the
+            // delivery does not happen and says so.
+            ::tracing::warn!(
+                subscription = %subscription.arn,
+                "a subscription carrying a FilterPolicy is not delivered to: message \
+                 filtering is not implemented in this emulator"
+            );
+            return None;
+        }
+        Some(Self {
+            queue_url: format!(
+                "https://sqs.{region}.amazonaws.com/{}/{}",
+                arn.account, arn.resource
+            ),
+            region: region.to_string(),
+            // "RawMessageDelivery – When set to true, enables raw message delivery to Amazon
+            // SQS […] endpoints. This eliminates the need for the endpoints to process JSON
+            // formatting, which is otherwise created for Amazon SNS metadata."
+            raw: subscription
+                .attributes
+                .get(state::RAW_MESSAGE_DELIVERY_ATTRIBUTE)
+                .is_some_and(|value| value == state::RAW_MESSAGE_DELIVERY_ENABLED),
         })
     }
+}
+
+/// Deliver each queued message to the queue its subscription names.
+///
+/// A queue is reached the way any emulated service reaches another: through the in-process
+/// callback ([`smithy_server_runtime::OperationContext::callback`]), so this crate names no
+/// other service crate. The delivery's outcome is not part of this operation's answer, so a
+/// queue that cannot be reached is logged and changes nothing about what the caller is told.
+pub(crate) async fn deliver_to_queues(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    deliveries: &[QueueDelivery],
+) {
+    let mut client: Option<(String, ::aws_sdk_sqs::Client)> = None;
+    for delivery in deliveries {
+        let client = match client.as_ref() {
+            // One client per Region: every queue of one Region is reached through the same
+            // endpoint, and a publish rarely fans out across Regions.
+            Some((region, client)) if *region == delivery.region => client,
+            _ => {
+                let fresh = sqs_client(ctx, &delivery.region);
+                &client.insert((delivery.region.clone(), fresh)).1
+            }
+        };
+        let mut request = client
+            .send_message()
+            .queue_url(&delivery.queue_url)
+            .message_body(&*delivery.body);
+        for (name, value) in &delivery.attributes {
+            let mut attribute =
+                ::aws_sdk_sqs::types::MessageAttributeValue::builder().data_type(&value.data_type);
+            if let Some(string) = value.string_value.as_deref() {
+                attribute = attribute.string_value(string);
+            }
+            if let Some(binary) = value.binary_value.as_ref() {
+                attribute =
+                    attribute.binary_value(::aws_smithy_types::Blob::new(binary.clone()));
+            }
+            match attribute.build() {
+                Ok(attribute) => request = request.message_attributes(name, attribute),
+                Err(error) => ::tracing::warn!(
+                    subscription = %delivery.subscription_arn,
+                    attribute = %name,
+                    error = %error,
+                    "a message attribute could not be carried to the subscribed queue"
+                ),
+            }
+        }
+        if let Err(error) = request.send().await {
+            ::tracing::warn!(
+                subscription = %delivery.subscription_arn,
+                queue = %delivery.queue_url,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a subscribed queue could not be delivered to"
+            );
+        }
+    }
+}
+
+/// An SQS client over the in-process callback into this same emulator.
+fn sqs_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_sqs::Client {
+    let config = ::aws_sdk_sqs::Config::builder()
+        .behavior_version(::aws_sdk_sqs::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_sqs::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://sqs.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client is
+        // not given. The same goes for caching the identity: the credentials are handed over
+        // directly.
+        .retry_config(::aws_sdk_sqs::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_sqs::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_sqs::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_sqs::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_sqs::Client::from_conf(config)
+}
+
+/// The JSON notification SNS wraps a message in for a subscriber that has not asked for raw
+/// delivery: "This eliminates the need for the endpoints to process JSON formatting, which is
+/// otherwise created for Amazon SNS metadata."
+/// (`GetSubscriptionAttributesResponse$Attributes`, `RawMessageDelivery`).
+///
+/// The envelope carries the metadata the message was published with — its type, id, topic,
+/// subject, body, attributes and the instant it was published — and nothing that depends on
+/// WHICH subscription receives it, so one publish renders it once for every subscriber. It
+/// carries NO signature members (`Signature`, `SigningCertURL`): nothing signs a message in
+/// this emulator, and a member that looked like a signature would be one a subscriber could
+/// not verify.
+fn notification_envelope(published: &PublishedMessage) -> String {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert(
+        "Type".to_string(),
+        serde_json::Value::from("Notification"),
+    );
+    envelope.insert(
+        "MessageId".to_string(),
+        serde_json::Value::from(published.message_id.as_str()),
+    );
+    envelope.insert(
+        "TopicArn".to_string(),
+        serde_json::Value::from(published.topic_arn.as_str()),
+    );
+    if let Some(subject) = published.subject.as_deref() {
+        envelope.insert("Subject".to_string(), serde_json::Value::from(subject));
+    }
+    envelope.insert(
+        "Message".to_string(),
+        serde_json::Value::from(published.message.as_str()),
+    );
+    if let Some(timestamp) = rfc3339(published.published_at) {
+        envelope.insert("Timestamp".to_string(), serde_json::Value::from(timestamp));
+    }
+    if let Some(sequence_number) = published.sequence_number.as_deref() {
+        envelope.insert(
+            "SequenceNumber".to_string(),
+            serde_json::Value::from(sequence_number),
+        );
+    }
+    if !published.message_attributes.is_empty() {
+        // "MessageAttributes": {"<name>": {"Type": "<data type>", "Value": "<value>"}} — the
+        // form the envelope carries a published attribute in. A binary value is carried as the
+        // base64 text the wire form of `BinaryValue` already is.
+        let mut attributes: Vec<(&String, &MessageAttributeValue)> =
+            published.message_attributes.iter().collect();
+        attributes.sort_by(|left, right| left.0.cmp(right.0));
+        let rendered: serde_json::Map<String, serde_json::Value> = attributes
+            .into_iter()
+            .map(|(name, value)| {
+                let mut attribute = serde_json::Map::new();
+                attribute.insert(
+                    "Type".to_string(),
+                    serde_json::Value::from(value.data_type.as_str()),
+                );
+                let text = value.string_value.clone().or_else(|| {
+                    value
+                        .binary_value
+                        .as_ref()
+                        .map(::aws_smithy_types::base64::encode)
+                });
+                if let Some(text) = text {
+                    attribute.insert("Value".to_string(), serde_json::Value::from(text));
+                }
+                (name.clone(), serde_json::Value::Object(attribute))
+            })
+            .collect();
+        envelope.insert(
+            "MessageAttributes".to_string(),
+            serde_json::Value::Object(rendered),
+        );
+    }
+    serde_json::Value::Object(envelope).to_string()
+}
+
+/// `at` as the RFC 3339 instant the envelope reports, or `None` for an instant the timestamp
+/// type cannot render.
+fn rfc3339(at: std::time::SystemTime) -> Option<String> {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }

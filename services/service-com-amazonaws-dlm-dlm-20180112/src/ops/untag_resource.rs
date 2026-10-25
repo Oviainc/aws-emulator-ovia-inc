@@ -129,7 +129,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -140,14 +139,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The ARN resolves among the policies of the region this request was
+        // signed for, so an ARN naming another region names no policy here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(policy_id) = store.policy_id_for_arn(&input.resource_arn) else {
+        let Some(policy_id) = store.policy_id_for_arn(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found_by_arn(&input.resource_arn),
             )
             .into());
         };
-        let Some(policy) = store.policies.get_mut(&policy_id) else {
+        let Some(policy) = store.policy_mut(&region, &policy_id) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found_by_arn(&input.resource_arn),
             )

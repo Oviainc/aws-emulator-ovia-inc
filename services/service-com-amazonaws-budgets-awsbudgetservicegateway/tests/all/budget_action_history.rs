@@ -42,11 +42,16 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// An `ExecutionRoleArn` satisfying `RoleArn`'s modelled `@pattern` and `@length(32, 618)`
-/// (`smithy_query(query="shape",shape="RoleArn")`).
-const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/budget-action-role";
+/// (`smithy_query(query="shape",shape="RoleArn")`), in the account the action lives in:
+/// "roles and actions must be in the same account" (`Action$ExecutionRoleArn`).
+fn execution_role(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:role/budget-action-role")
+}
 
-/// A second role, for the update table's row that replaces the role.
-const OTHER_EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/budget-action-role-two";
+/// A second role of the same account, for the update table's row that replaces the role.
+fn other_execution_role(account_id: &str) -> String {
+    format!("arn:aws:iam::{account_id}:role/budget-action-role-two")
+}
 
 /// `NotificationThreshold`'s published `@range` — "range 0..15000000000000" from
 /// `smithy_query(query="shape",shape="NotificationThreshold")`.
@@ -172,7 +177,7 @@ impl Row {
             "ActionType": self.action_type,
             "ActionThreshold": self.threshold(),
             "Definition": definition_for(self.action_type),
-            "ExecutionRoleArn": EXECUTION_ROLE,
+            "ExecutionRoleArn": execution_role(account_id),
             "ApprovalModel": self.approval_model,
             "Subscribers": subscribers(self.subscriber_count),
         })
@@ -181,7 +186,7 @@ impl Row {
     /// The `Action` a read must report for this row once created: every member the
     /// caller supplied, plus the two the SERVICE owns (the minted `ActionId` and the
     /// `Status` a new action starts in).
-    fn expected_action(&self, budget_name: &str, action_id: &str) -> Value {
+    fn expected_action(&self, account_id: &str, budget_name: &str, action_id: &str) -> Value {
         json!({
             "ActionId": action_id,
             "BudgetName": budget_name,
@@ -189,7 +194,7 @@ impl Row {
             "ActionType": self.action_type,
             "ActionThreshold": self.threshold(),
             "Definition": definition_for(self.action_type),
-            "ExecutionRoleArn": EXECUTION_ROLE,
+            "ExecutionRoleArn": execution_role(account_id),
             "ApprovalModel": self.approval_model,
             "Status": ACTION_STATUS_STANDBY,
             "Subscribers": subscribers(self.subscriber_count),
@@ -411,7 +416,7 @@ async fn creating_an_action_records_one_create_action_event() {
         create_budget(&router, &account_id, &budget_name).await;
         let action_id = create_action(&router, &account_id, &budget_name, &row).await;
 
-        let expected = row.expected_action(&budget_name, &action_id);
+        let expected = row.expected_action(&account_id, &budget_name, &action_id);
         let read_back = describe_action(&router, &account_id, &budget_name, &action_id, &row.case)
             .await;
         assert!(
@@ -485,7 +490,7 @@ async fn each_update_appends_one_update_action_event() {
     let budget_name = "update-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let action_id = create_action(&router, &account_id, &budget_name, row).await;
-    let created = row.expected_action(&budget_name, &action_id);
+    let created = row.expected_action(&account_id, &budget_name, &action_id);
 
     // One row per member `UpdateBudgetAction` accepts; `ActionId`, `BudgetName`,
     // `ActionType` and the service-owned `Status` are not among them.
@@ -502,7 +507,7 @@ async fn each_update_appends_one_update_action_event() {
         ("Subscribers", json!({"Subscribers": subscribers(3)})),
         (
             "ExecutionRoleArn",
-            json!({"ExecutionRoleArn": OTHER_EXECUTION_ROLE}),
+            json!({"ExecutionRoleArn": other_execution_role(&account_id)}),
         ),
         (
             "Definition",

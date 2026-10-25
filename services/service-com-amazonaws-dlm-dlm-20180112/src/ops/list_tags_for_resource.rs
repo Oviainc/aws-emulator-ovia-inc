@@ -132,7 +132,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -144,11 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A pure read: exactly the tags the create, an update or `TagResource`
-        // stored on the policy this ARN names.
+        // stored on the policy this ARN names, among the policies of the region
+        // this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let policy = store
-            .policy_id_for_arn(&input.resource_arn)
-            .and_then(|policy_id| store.policies.get(&policy_id));
+            .policy_id_for_arn(&region, &input.resource_arn)
+            .and_then(|policy_id| store.policy(&region, &policy_id));
         let Some(policy) = policy else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::policy_not_found_by_arn(&input.resource_arn),

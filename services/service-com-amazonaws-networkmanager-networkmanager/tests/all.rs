@@ -21,6 +21,8 @@ mod attachment_lifecycle;
 mod attachment_routing_policy_associations;
 #[path = "all/connect_peer_association_lifecycle.rs"]
 mod connect_peer_association_lifecycle;
+#[path = "all/connect_peer_delete.rs"]
+mod connect_peer_delete;
 #[path = "all/connect_peer_lifecycle.rs"]
 mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]
@@ -41,6 +43,8 @@ mod delete_attachment;
 mod delete_connection;
 #[path = "all/delete_dependency_refusal.rs"]
 mod delete_dependency_refusal;
+#[path = "all/delete_device.rs"]
+mod delete_device;
 #[path = "all/device_lifecycle.rs"]
 mod device_lifecycle;
 #[path = "all/direct_connect_gateway_attachment_lifecycle.rs"]

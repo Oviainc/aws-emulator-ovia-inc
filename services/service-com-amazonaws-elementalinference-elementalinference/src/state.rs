@@ -7,9 +7,9 @@
 //! record below is the single copy every one of those handlers reads and writes, so
 //! the shapes the handlers hand back are all built from it. A feed's resource-based
 //! policy is part of that record ([`Feed::policy`]) rather than a store of its own:
-//! `PutFeedPolicy` attaches or replaces it and `GetFeedPolicy` reports it, so the
-//! document a client reads back is the one the last put stored, and a feed that leaves
-//! the store takes its policy with it.
+//! `PutFeedPolicy` attaches or replaces it, `GetFeedPolicy` reports it and
+//! `DeleteFeedPolicy` detaches it, so the document a client reads back is the one the
+//! last put stored, and a feed that leaves the store takes its policy with it.
 //!
 //! A deletion that has COMPLETED is reported rather than erased: both delete operations
 //! are `@idempotent` and their responses carry the resource's status, `DELETED` being
@@ -638,8 +638,9 @@ pub struct Feed {
     /// feed carries no policy.
     ///
     /// A feed holds AT MOST ONE policy: `PutFeedPolicy` "attaches or replaces" it, so
-    /// a second put overwrites this member rather than adding beside it, and
-    /// `GetFeedPolicy` reports exactly the document the last put stored. It lives on
+    /// a second put overwrites this member rather than adding beside it,
+    /// `GetFeedPolicy` reports exactly the document the last put stored and
+    /// `DeleteFeedPolicy` clears it. It lives on
     /// the feed record, so a policy is reachable only for as long as the feed it is
     /// attached to is, and the feed's removal takes its policy with it — there is no
     /// second map that could outlive the resource or disagree with it.

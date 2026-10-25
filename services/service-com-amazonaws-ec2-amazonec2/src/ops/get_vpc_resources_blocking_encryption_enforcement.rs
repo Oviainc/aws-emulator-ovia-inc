@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVpcResourcesBlockingEncryptionEnforcement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVpcResourcesBlockingEncryptionEnforcement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVpcResourcesBlockingEncryptionEnforcement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources of ONE VPC out of [`crate::state`] whose traffic VPC Encryption
+//! Control cannot encrypt, which is what stands between that VPC and encryption
+//! enforcement. A reporting operation only — it writes nothing beyond the transitions the
+//! clock already owed.
+//!
+//! The report is paged in resource-id order through this service's own opaque cursor
+//! ([`crate::state::encode_scoped_page_token`]), and its LAST token names the end of the
+//! report ([`END_OF_REPORT_CURSOR`]) rather than being left out, which is what EC2's
+//! recorded answer does; the request that follows that token is where the walk ends.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +145,306 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVpcResourcesBlockingEncryptionEnforcement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVpcResourcesBlockingEncryptionEnforcementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVpcResourcesBlockingEncryptionEnforcement"))
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`GetVpcResourcesBlockingEncryptionEnforcementRequest$DryRun`). Every caller of
+        // this emulator is permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`GetVpcResourcesBlockingEncryptionEnforcementRequest$NextToken`) — anything else
+        // is refused rather than read as an id, and it is refused before any other member
+        // is looked at, so whether a bogus token is caught never depends on the rest of the
+        // request. The cursor inside the token carries the VPC it was minted for
+        // ([`crate::state::decode_scoped_page_token`]), so a token presented back against a
+        // DIFFERENT VPC is refused rather than resuming inside a report it never
+        // described.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_scoped_page_token(token, &input.vpc_id)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let mut store = state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call the
+        // describes make. An instance `TerminateInstances` answered as `shutting-down` is
+        // `terminated` once its due instant has passed, whether or not anybody called, and
+        // a terminated instance is no longer a resource of the VPC, so applying it here
+        // changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the VPC to check for resources blocking encryption enforcement"
+        // (`GetVpcResourcesBlockingEncryptionEnforcementRequest$VpcId`, required): a VPC the
+        // account does not have is an error, not an empty report — the same refusal every
+        // operation of this crate that resolves a `VpcId` answers.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(crate::state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // A token naming the end of the report ([`END_OF_REPORT_CURSOR`]) is where a walk
+        // stops: everything the report held was reported before that token was minted, so
+        // the request continuing it answers no resource and no token at all.
+        if start_at.as_deref() == Some(END_OF_REPORT_CURSOR) {
+            return Ok(GetVpcResourcesBlockingEncryptionEnforcementOutput {
+                non_compliant_resources: Some(Vec::new()),
+                next_token: None,
+            });
+        }
+
+        let mut blocking = blocking_resources(&store, &input.vpc_id);
+
+        // Page in resource-id order, which the cursor below names a position in: the ids
+        // come out of several stores, so the order is established here rather than
+        // inherited from the container any one of them happens to be.
+        blocking.sort_by(|left, right| left.id.cmp(&right.id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => blocking
+                .partition_point(|resource| resource.id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = blocking.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request"
+        // (`GetVpcResourcesBlockingEncryptionEnforcementRequest$MaxResults`). A request that
+        // names none gets the largest page the model publishes, so the `NextToken` path
+        // below behaves the same whether or not a page size was asked for. The model's
+        // `range 5..1000` has already refused anything outside it, so the only value that
+        // cannot convert is one the boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "The token to include in another request to get the next page of items. This
+        // value is null when there are no more items to return"
+        // (`GetVpcResourcesBlockingEncryptionEnforcementResult$NextToken`): a token names
+        // the resource the next page starts at. The recorded wire answer of a report with
+        // nothing more to return carries a token too, so the end of the report is named by
+        // one as well ([`END_OF_REPORT_CURSOR`]) and the null arrives one request later,
+        // when that token is followed — which is where the walk ends, rather than at a
+        // page that repeats itself.
+        let next_token = Some(crate::state::encode_scoped_page_token(
+            &input.vpc_id,
+            page.get(limit)
+                .and_then(|resource| resource.id.as_deref())
+                .unwrap_or(END_OF_REPORT_CURSOR),
+        ));
+
+        Ok(GetVpcResourcesBlockingEncryptionEnforcementOutput {
+            non_compliant_resources: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model
+/// publishes (`GetVpcResourcesBlockingEncryptionEnforcementMaxResults`, `range 5..1000`),
+/// which is also the most EC2 returns in one page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The cursor the LAST token of a report names: the end of the report itself, rather than
+/// a resource the next page starts at.
+///
+/// EC2's recorded answer to this operation carries a `nextToken` even for a report that
+/// holds nothing more — the recorded response of a VPC whose `nonCompliantResourceSet` is
+/// EMPTY states a `nextToken` beside it — so this operation mints one there as well, and
+/// the null the member documents ("This value is null when there are no more items to
+/// return") arrives one request later, when that token is followed. Do not "simplify" this
+/// to omitting the token on the last page: that is the recorded behaviour this operation is
+/// held to, and the walk still ends, because the request continuing this cursor reports
+/// nothing and no token at all.
+///
+/// The cursor inside it cannot collide with a resource id, because every id this service
+/// mints carries a `<prefix>-<hex>` shape. The token itself stays opaque — it travels inside
+/// [`crate::state::encode_scoped_page_token`], checksum and all, exactly like a cursor
+/// naming a resource — so a caller reads it as what it is: the token that ends the walk.
+const END_OF_REPORT_CURSOR: &str = "end-of-report";
+
+/// The `ResourceType` of an EC2 instance, the word a report of one names it by: the
+/// modelled `ResourceType` enum's `instance` member
+/// (`smithy_query(query="shape",shape="ResourceType")`).
+///
+/// The attachment kind this report also names has its spelling in
+/// [`crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT`], where the refusals that
+/// quote it already keep it, and is used from there rather than spelled again here.
+const RESOURCE_TYPE_INSTANCE: &str = "instance";
+
+/// How a report words the gateway of an attachment whose record names none: the
+/// description has to name the thing that cannot encrypt, and a gateway with no id is
+/// exactly an unknown one.
+const UNNAMED_TRANSIT_GATEWAY: &str = "unknown transit gateway";
+
+/// The `TransitGatewayAttachmentState` members in which an attachment carries no traffic
+/// between the VPC and the gateway, and never will again: the refusal of the attachment
+/// request (`rejecting`, `rejected`), its removal (`deleting`, `deleted`) and its failure
+/// (`failing`, `failed`).
+///
+/// The rule is "the attachment is not, and will not become, live"; every other member of
+/// that enum (`initiating`, `initiatingRequest`, `pendingAcceptance`, `rollingBack`,
+/// `pending`, `available`, `modifying`) is a state an attachment carries traffic in or is
+/// on its way to doing so from, so a report names it. Listed from the modelled enum
+/// (`smithy_query(query="shape",shape="TransitGatewayAttachmentState")`) rather than from
+/// the states this crate's writers happen to mint, so an attachment delete landing later
+/// cannot start reporting attachments that are gone.
+const ATTACHMENT_STATES_CARRYING_NO_TRAFFIC: [&str; 6] = [
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTING,
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_REJECTED,
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING,
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED,
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILING,
+    crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILED,
+];
+
+/// The `EncryptionStateValue` a transit gateway that supports VPC Encryption Control is
+/// in: `enabled`. The other members of that enum (`enabling`, `disabling`, `disabled`) are
+/// states in which the gateway does not yet, or no longer, carry encrypted traffic.
+const ENCRYPTION_STATE_ENABLED: &str = "enabled";
+
+/// Every resource of the VPC `vpc_id` the store holds whose traffic VPC Encryption Control
+/// cannot encrypt — "a resource that is not compliant with VPC encryption requirements"
+/// (`VpcEncryptionNonCompliantResource`), which is what blocks encryption enforcement for
+/// that VPC.
+///
+/// Two kinds of resource the store holds can be one, and each answers for itself out of a
+/// MODELLED fact rather than out of a list of ids:
+///
+/// * an instance of the VPC whose instance type does not automatically encrypt in-transit
+///   traffic (`NetworkInfo$EncryptionInTransitSupported`, which
+///   [`crate::state::instance_type_encrypts_in_transit`] answers);
+/// * a VPC attachment of the VPC to a transit gateway that does not support VPC Encryption
+///   Control (`TransitGatewayOptions$EncryptionSupport`, "describes the encryption support
+///   status for a transit gateway").
+///
+/// Neither is EXCLUDABLE: `VpcEncryptionControlExclusions` — the exclusions a VPC
+/// Encryption Control configuration can carry — has a member for internet gateway,
+/// egress-only internet gateway, NAT gateway, virtual private gateway, VPC peering, Lambda,
+/// VPC Lattice and Elastic File System traffic, and none for an instance or a transit
+/// gateway attachment, so enforcement cannot be reached by excluding one. The resource
+/// kinds that member list DOES name are the ones to add here as this crate starts storing
+/// them: every operation that creates one (`CreateNatGateway`, `CreateInternetGateway`,
+/// `CreateVpcPeeringConnection`, `CreateVpnGateway`, …) is still a scaffold stub with its
+/// own open issue, so the store can hold none of them today.
+///
+/// Each reported `Description` — "a description of the non-compliant resource"
+/// (`VpcEncryptionNonCompliantResource$Description`) — is this emulator's OWN wording,
+/// built from the fact that made the resource non-compliant. AWS's recorded text for it is
+/// not known, so a later recording that words it differently is not a regression: what the
+/// rule requires is that the description name the thing that cannot encrypt, which is what
+/// this crate's tests assert.
+fn blocking_resources(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    vpc_id: &str,
+) -> Vec<VpcEncryptionNonCompliantResource> {
+    let mut found: Vec<VpcEncryptionNonCompliantResource> = Vec::new();
+
+    for instance in store.instances.values() {
+        // A terminated instance is not a resource of the VPC any more — the line
+        // `DeleteVpc` draws when it asks what still depends on a VPC
+        // (`ComAmazonawsEc2Amazonec2State::vpc_dependencies`) — so it blocks nothing.
+        if instance.state == crate::state::InstanceStateName::Terminated {
+            continue;
+        }
+        // Whose instances the report covers is the store's own answer
+        // (`ComAmazonawsEc2Amazonec2State::instance_is_in_vpc`), the same one `DeleteVpc`
+        // asks when it decides what still depends on a VPC, so the two cannot disagree
+        // about which VPC holds an instance.
+        if !store.instance_is_in_vpc(instance, vpc_id) {
+            continue;
+        }
+        if crate::state::instance_type_encrypts_in_transit(&instance.instance_type) {
+            continue;
+        }
+        found.push(VpcEncryptionNonCompliantResource {
+            id: Some(instance.instance_id.clone()),
+            r#type: Some(RESOURCE_TYPE_INSTANCE.to_string()),
+            description: Some(format!(
+                "The instance type {} does not support encryption in transit.",
+                instance.instance_type
+            )),
+            is_excludable: Some(false),
+        });
+    }
+
+    for record in store.transit_gateway_attachments.values() {
+        let crate::state::TransitGatewayAttachmentView::Vpc(attachment) = &record.view else {
+            continue;
+        };
+        if attachment.vpc_id.as_deref() != Some(vpc_id) {
+            continue;
+        }
+        // An attachment carries traffic between the VPC and the gateway only while it is
+        // live, so one in a state it will never carry traffic in again blocks nothing
+        // ([`ATTACHMENT_STATES_CARRYING_NO_TRAFFIC`]).
+        if attachment
+            .state
+            .as_deref()
+            .is_some_and(|state| ATTACHMENT_STATES_CARRYING_NO_TRAFFIC.contains(&state))
+        {
+            continue;
+        }
+        // The id is what the report NAMES the resource by and what a page cursor resumes
+        // at, so a record without one is not reportable. Unreachable while every
+        // attachment is minted by `insert_transit_gateway_attachment`, which stamps the id
+        // it minted onto the view.
+        let Some(attachment_id) = attachment.transit_gateway_attachment_id.as_deref() else {
+            continue;
+        };
+        let transit_gateway_id = attachment.transit_gateway_id.as_deref().unwrap_or_default();
+        if transit_gateway_supports_encryption(store, transit_gateway_id) {
+            continue;
+        }
+        // The description names the thing that cannot encrypt, so an attachment whose
+        // record names no gateway at all says that rather than leaving a gap where the id
+        // would be ([`UNNAMED_TRANSIT_GATEWAY`]). Unreachable while every attachment is
+        // minted by `insert_transit_gateway_attachment`, which stamps the gateway it was
+        // asked for onto the view.
+        let gateway = if transit_gateway_id.is_empty() {
+            UNNAMED_TRANSIT_GATEWAY.to_string()
+        } else {
+            format!("transit gateway {transit_gateway_id}")
+        };
+        found.push(VpcEncryptionNonCompliantResource {
+            id: Some(attachment_id.to_string()),
+            r#type: Some(crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT.to_string()),
+            description: Some(format!(
+                "The {gateway} does not support VPC Encryption Control."
+            )),
+            is_excludable: Some(false),
+        });
+    }
+
+    found
+}
+
+/// Whether the transit gateway `transit_gateway_id` supports VPC Encryption Control: its
+/// options report an `EncryptionSupport` whose state is [`ENCRYPTION_STATE_ENABLED`].
+///
+/// A gateway the store does not hold supports nothing — there is no encryption state to
+/// read — so an attachment to it blocks enforcement just as an attachment to a gateway
+/// that reports no encryption support does.
+fn transit_gateway_supports_encryption(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    transit_gateway_id: &str,
+) -> bool {
+    store
+        .transit_gateways
+        .get(transit_gateway_id)
+        .and_then(|transit_gateway| transit_gateway.options.as_ref())
+        .and_then(|options| options.encryption_support.as_ref())
+        .and_then(|support| support.encryption_state.as_deref())
+        == Some(ENCRYPTION_STATE_ENABLED)
 }

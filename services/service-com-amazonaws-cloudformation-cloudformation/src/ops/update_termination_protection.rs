@@ -132,7 +132,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack whose flag could be set,
             // and nothing was written.
@@ -151,8 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.stack_name,
             ))
         };
+        let region = crate::state::request_region(ctx.parts());
         let stack = store
-            .resolve_mut(&input.stack_name)
+            .resolve_mut(&region, &input.stack_name)
             .filter(|stack| stack.is_live())
             .ok_or_else(not_found)?;
         // The mutation this call exists for: "Updates termination protection for the

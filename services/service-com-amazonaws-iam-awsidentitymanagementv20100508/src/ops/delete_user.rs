@@ -206,6 +206,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // An attached managed policy is a dependent too: this operation's own
+        // documentation lists "Attached managed policies (DetachUserPolicy)" among
+        // the items to remove before deleting a user, so a user that still carries
+        // one is refused rather than having the attachment dropped behind the
+        // caller's back. `AttachUserPolicy` is what fills that map.
+        let has_attached_policies = store
+            .user_attached_policies
+            .get(&key)
+            .is_some_and(|attached| !attached.is_empty());
+        if has_attached_policies {
+            return Err(DeleteUserErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must detach all policies first.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
         // An access key is a dependent too, refused the same way rather than
         // cascade-deleted: `CreateAccessKey` is what fills that map.
         if store.access_keys_held_by(&key) > 0 {
@@ -237,6 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.users.remove(&key);
         // The user held no policies, so this only drops an empty leftover entry.
         store.user_inline_policies.remove(&key);
+        store.user_attached_policies.remove(&key);
         Ok(DeleteUserOutput)
     }
 }

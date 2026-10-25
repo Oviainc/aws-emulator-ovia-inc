@@ -173,7 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.settle(now);
 
-            let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+            let region = crate::state::request_region(ctx.parts());
+            let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_does_not_exist(&input.stack_name),
                 )

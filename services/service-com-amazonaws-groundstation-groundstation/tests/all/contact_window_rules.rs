@@ -196,13 +196,21 @@ fn assert_refused(reply: &Reply, case: &str, parameter: &str) {
 }
 
 /// Every `contactId` `ListContacts` reports over `window`, in whatever order it answered.
+///
+/// The status list names every status a stored contact of this suite can hold — a
+/// reservation being scheduled or scheduled, one released, and each stage of a pass the
+/// clock has already carried a contact into — so the answer is "which contacts the store
+/// holds over this window" whatever the clock has made of them by the time it is asked.
 async fn listed_contacts(router: &MultiServiceRouter, window: (i64, i64)) -> Vec<String> {
     let reply = send(
         router,
         "POST",
         "/contacts",
         Some(json!({
-            "statusList": ["SCHEDULING", "SCHEDULED", "CANCELLED"],
+            "statusList": [
+                "SCHEDULING", "SCHEDULED", "CANCELLED",
+                "PREPASS", "PASS", "POSTPASS", "COMPLETED",
+            ],
             "startTime": window.0,
             "endTime": window.1,
             "maxResults": 100,

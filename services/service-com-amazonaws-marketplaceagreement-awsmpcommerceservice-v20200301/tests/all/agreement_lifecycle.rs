@@ -270,6 +270,63 @@ pub(crate) async fn agreement_over(
     accepted.str_at("/agreementId")
 }
 
+/// The quantity of the one prepaid dimension [`invoiced_agreement`] buys, large
+/// enough that every adjustment these suites submit stays inside what the
+/// invoice it bills has open to adjustment.
+const INVOICED_QUANTITY: i32 = 100;
+
+/// Create and accept one agreement whose terms carry a prepaid charge, so the
+/// acceptance issues an invoice, answering the agreement's id and that invoice's
+/// id.
+///
+/// `pub(crate)` because every suite that submits a billing adjustment needs an
+/// invoice of a real agreement to adjust, and they share this one harness.
+pub(crate) async fn invoiced_agreement(
+    router: &MultiServiceRouter,
+    proposal: &str,
+) -> (String, String) {
+    let agreement = agreement_over(
+        router,
+        proposal,
+        vec![upfront_term(
+            "term.invoiced@1",
+            "P12M",
+            &[("Users", INVOICED_QUANTITY)],
+        )],
+    )
+    .await;
+    let invoices = invoices_of(router, &agreement).await;
+    let invoice = invoices.first().cloned().unwrap_or_else(|| {
+        panic!("accepting a quote with a prepaid charge must issue an invoice, got {invoices:?}")
+    });
+    (agreement, invoice)
+}
+
+/// The ids of the invoices `agreement` has been issued, in the order
+/// `ListAgreementInvoiceLineItems` groups them.
+pub(crate) async fn invoices_of(router: &MultiServiceRouter, agreement: &str) -> Vec<String> {
+    let answer = call(
+        router,
+        "ListAgreementInvoiceLineItems",
+        json!({"agreementId": agreement, "groupBy": "INVOICE_ID"}),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "listing the invoices of {agreement} must succeed, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["agreementInvoiceLineItemGroupSummaries"]
+        .as_array()
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|group| group["invoiceId"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The ids of the charges a created quote minted, in the order
 /// `ChargeSummary$expectedCharges` reports them — the charges of the agreement
 /// accepting that quote creates, and so the only ids a purchase order of that

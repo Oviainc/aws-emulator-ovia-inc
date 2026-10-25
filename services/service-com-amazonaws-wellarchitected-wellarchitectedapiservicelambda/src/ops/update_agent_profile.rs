@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: merges the members the request carries into the stored agent profile —
+//! an absent member is left untouched, never nulled — records the modification
+//! (`lastModifiedBy`, `lastModifiedAt`) and answers the profile as it now stands, with
+//! the members the SERVICE owns (`arn`, `name`, `createdBy`, `createdAt`) and the ones it
+//! DERIVES from the stored profile (`eligibleForScheduledGeneration`,
+//! `eligibleForArchitectureGeneration`, `fieldErrors`). A later `GetAgentProfile` of that
+//! ARN reports the same profile. An ARN that names no stored profile is a
+//! `ResourceNotFoundException` (404) carrying the ARN as sent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `clientToken` makes the update idempotent: the same token with the same parameters
+//! against the same profile applies nothing a second time — it answers the profile as it
+//! stands and records no second modification — so a retry costs the profile nothing. The
+//! answer is read from the store rather than cached, so an intervening update of the same
+//! profile is reported as well. This operation models no `ConflictException`, so a token
+//! the ledger remembers for OTHER parameters is not a replay — that request is applied as
+//! the update it is.
 //!
 //! ## Shape of an operation
 //!
@@ -187,20 +194,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `Pillar` is an
+        // enum, so the boundary walk in `crate::service` already refuses a value outside
+        // its published set with this same 400 before the handler runs. It is kept so an
+        // update can never leave a profile STORED naming a pillar the enum does not
+        // publish, and the refusal is built in `crate::state` so every operation that
+        // stores a pillar list words it identically.
+        if let Some(exception) =
+            crate::state::unpublished_pillar_exception(input.pillars.as_deref().unwrap_or_default())
+        {
+            return Err(UpdateAgentProfileErrorModeled::ValidationException(exception).into());
+        }
+
+        // What this request would apply, hashed: a retry carrying the same `clientToken`
+        // fingerprints alike exactly when it asks for the same change to the same
+        // profile. An ABSENT member leaves the stored value alone, so it has to
+        // fingerprint differently from one sent explicitly — an absent member renders as
+        // `null` where a sent value renders as itself.
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "profileArn": &input.profile_arn,
+            "aggregationConfiguration": input
+                .aggregation_configuration
+                .as_ref()
+                .map(|configurations| {
+                    configurations
+                        .iter()
+                        .map(|configuration| {
+                            serde_json::json!({
+                                "accessRoleArn": &configuration.access_role_arn,
+                                "accountId": &configuration.account_id,
+                                "regions": &configuration.regions,
+                            })
+                        })
+                        .collect::<Vec<serde_json::Value>>()
+                }),
+            "businessOverview": &input.business_overview,
+            "deletionProtection": input.deletion_protection,
+            "description": &input.description,
+            "displayName": &input.display_name,
+            "executionRoleArn": &input.execution_role_arn,
+            "pillars": &input.pillars,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the token is remembered WITH the profile and the
+        // parameters it was spent on, so only a retry of that same request is a replay,
+        // and a replay applies nothing — it answers the profile as the store holds it,
+        // which is also what reports an intervening update of the same profile. The token
+        // is OPTIONAL, so a request that carries none is never a replay.
+        let replay = match input.client_token.as_deref() {
+            Some(client_token) => store
+                .update_agent_profile_tokens
+                .get(client_token)
+                .is_some_and(|remembered| {
+                    remembered.profile_arn == input.profile_arn
+                        && remembered.fingerprint == fingerprint
+                }),
+            None => false,
+        };
+
+        // The ARN is the profile's identity, so one that satisfies the modelled
+        // `AgentProfileArn` pattern (the boundary walk refuses one that does not) but
+        // names no stored profile is this lookup's 404 — including a profile that has
+        // since been deleted, whose remembered tokens went with it.
+        let record = store
+            .agent_profiles
+            .get_mut(&input.profile_arn)
+            .ok_or_else(|| {
+                UpdateAgentProfileErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_profile_not_found(&input.profile_arn),
+                )
+            })?;
+
+        if !replay {
+            // Only the members the request carries are applied; every `None` leaves the
+            // stored value alone. `name`, `arn`, `createdBy` and `createdAt` are not
+            // modelled on this request at all, so they cannot change.
+            if let Some(display_name) = input.display_name {
+                record.display_name = Some(display_name);
+            }
+            if let Some(description) = input.description {
+                record.description = Some(description);
+            }
+            if let Some(business_overview) = input.business_overview {
+                record.business_overview = Some(business_overview);
+            }
+            if let Some(pillars) = input.pillars {
+                record.pillars = pillars;
+            }
+            if let Some(deletion_protection) = input.deletion_protection {
+                record.deletion_protection = deletion_protection;
+            }
+            if let Some(execution_role_arn) = input.execution_role_arn {
+                record.execution_role_arn = execution_role_arn;
+            }
+            if let Some(aggregation_configuration) = input.aggregation_configuration {
+                record.aggregation_configuration = aggregation_configuration;
+            }
+            // "The identifier of the user or system that last modified this profile":
+            // every request this emulator serves is attributed to its one account, as the
+            // create attributes `createdBy`, and the instant is the clock's — never a
+            // value read off the request.
+            record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+            record.last_modified_at = Some(std::time::SystemTime::now());
+        }
+
+        let output = profile_output(record);
+
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.update_agent_profile_tokens.remember(
+                client_token,
+                crate::state::UpdateAgentProfileToken {
+                    profile_arn: input.profile_arn,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(output)
+    }
+}
+
+/// The stored profile as THIS operation answers it.
+///
+/// `CreateAgentProfile`, `GetAgentProfile` and `ListAgentProfiles` answer the same members
+/// from the same record through their own shapes — the model declares
+/// `UpdateAgentProfileResponse` as its own structure — so this is one more projection of
+/// the one stored record, with the reporting members (`eligibleFor…`, `fieldErrors`,
+/// `tags`) DERIVED from it rather than held twice.
+fn profile_output(record: &crate::state::AgentProfileRecord) -> UpdateAgentProfileOutput {
+    UpdateAgentProfileOutput {
+        name: record.name.clone(),
+        display_name: record.display_name.clone(),
+        description: record.description.clone(),
+        business_overview: record.business_overview.clone(),
+        pillars: record.pillars.clone(),
+        deletion_protection: record.deletion_protection,
+        execution_role_arn: record.execution_role_arn.clone(),
+        aggregation_configuration: record.aggregation_configuration.clone(),
+        arn: record.arn.clone(),
+        eligible_for_scheduled_generation: Some(record.eligible_for_generation()),
+        eligible_for_architecture_generation: Some(record.eligible_for_generation()),
+        field_errors: record.field_errors(),
+        tags: record.tag_list(),
+        created_by: record.created_by.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+        last_modified_by: record.last_modified_by.clone(),
+        last_modified_at: record
+            .last_modified_at
+            .map(::aws_smithy_types::DateTime::from),
     }
 }

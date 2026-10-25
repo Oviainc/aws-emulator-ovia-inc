@@ -49,6 +49,11 @@
 //! together with the instant each one's non-terminal `modelStatus` is owed its move to
 //! `Active`.
 //!
+//! And it holds the custom model deployments `ops/create_custom_model_deployment.rs`
+//! mints, `ops/get_custom_model_deployment.rs` reads back and
+//! `ops/list_custom_model_deployments.rs` reports, together with the instant each
+//! deployment's non-terminal `status` is owed its move to `Active`.
+//!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
 //! reads back, so the form one request submits is the form the next request gets.
@@ -79,8 +84,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CustomModelDataSource, CustomModelSummary, EndpointConfig, EvaluationConfig,
-    EvaluationInferenceConfig, EvaluationOutputDataConfig,
+    CustomModelDataSource, CustomModelDeploymentSummary, CustomModelSummary, EndpointConfig,
+    EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
     GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
@@ -449,6 +454,49 @@ pub fn commitment_term(commitment_duration: &str) -> Option<Duration> {
         _ => None,
     }
 }
+
+/// `CustomModelDeploymentStatus` — the deployment is still being brought up by the create
+/// call.
+///
+/// The enum is `[Creating, Active, Failed]`
+/// (`smithy_query(query="shape",shape="CustomModelDeploymentStatus")`), which is also what
+/// `crate::ops::types::CUSTOM_MODEL_DEPLOYMENT_STATUS_VALUES` carries.
+pub const CUSTOM_MODEL_DEPLOYMENT_STATUS_CREATING: &str = "Creating";
+
+/// `CustomModelDeploymentStatus` once the deployment serves on-demand inference — the
+/// terminal status the non-terminal one above is owed its move to. See
+/// [`CUSTOM_MODEL_DEPLOYMENT_STATUS_CREATING`] for the value list.
+///
+/// `Failed` names a deployment that could not be brought up; nothing implemented here
+/// makes an accepted deployment fail, so it is never minted.
+pub const CUSTOM_MODEL_DEPLOYMENT_STATUS_ACTIVE: &str = "Active";
+
+/// How long after `CreateCustomModelDeployment` a deployment's non-terminal `status` is
+/// owed its move to [`CUSTOM_MODEL_DEPLOYMENT_STATUS_ACTIVE`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for bringing a custom model
+/// deployment up, so this is the emulator's span. It is non-zero, so a caller that reads
+/// the deployment straight after creating it still observes the `Creating` status the real
+/// service reports; and it is materialised from the stored due instant on the next call
+/// that touches the record rather than waited on, so no handler sleeps.
+pub const CUSTOM_MODEL_DEPLOYMENT_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The most custom model deployments this account may hold at once, across every region,
+/// past which a create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota, and account-wide because what it
+/// bounds is the STORE: without a server-side cap a caller could grow this part of it with
+/// nothing but fresh deployment names, in one region or in many.
+pub const MAX_CUSTOM_MODEL_DEPLOYMENTS_PER_ACCOUNT: usize = 100;
+
+// The base-model segment a `CustomModelArn` carries for a model that was IMPORTED rather
+// than customized from a base model is `CUSTOM_MODEL_IMPORTED_BASE`, which the custom
+// model family below already states: `CustomModelArn` spells the segment
+// `custom-model/(imported|<base model id>)/<id>`
+// (`smithy_query(query="operation",operation="CreateCustomModelDeployment")`), so that one
+// literal is the alternative to a base model id and names no foundation model for the
+// published catalog to carry — a deployment create reads it from there rather than
+// declaring a second spelling of the same token.
 
 /// `ModelStatus` — a custom model that is still being validated and registered by the
 /// call that created it.
@@ -1008,6 +1056,63 @@ impl ProvisionedModelThroughputRecord {
     }
 }
 
+/// One custom model deployment: the on-demand inference deployment
+/// `CreateCustomModelDeployment` mints over a custom model and
+/// `GetCustomModelDeployment` reads back.
+#[derive(Debug, Clone)]
+pub struct CustomModelDeploymentRecord {
+    /// `customModelDeploymentArn` — the ARN this deployment is addressed by, and the key
+    /// it is stored under ([`custom_model_deployment_arn`]).
+    pub arn: String,
+    /// `modelDeploymentName` — the name the create request gave it, unique within the
+    /// account and region, and the OTHER spelling of a
+    /// `CustomModelDeploymentIdentifier`.
+    pub name: String,
+    /// The region the create request addressed: a deployment belongs to one region, as the
+    /// name's uniqueness does.
+    pub region: String,
+    /// `modelArn` — the custom model this deployment serves, as the create request carried
+    /// it.
+    pub model_arn: String,
+    /// `description` — the create request's description, absent when it carried none.
+    pub description: Option<String>,
+    /// `tags` — the tags the create request attached.
+    ///
+    /// The ONE copy of this deployment's tags: the list the create filled is the list
+    /// `ops/tag_resource.rs` rewrites and `ops/list_tags_for_resource.rs` reports, reached
+    /// through [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::tagged_resource`].
+    pub tags: Vec<Tag>,
+    /// `status` — a [`CustomModelDeploymentStatus`](CUSTOM_MODEL_DEPLOYMENT_STATUS_CREATING).
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to
+    /// [`CUSTOM_MODEL_DEPLOYMENT_STATUS_ACTIVE`], or `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`MarketplaceModelEndpointRecord::in_service_due_at`] is one.
+    pub active_due_at: Option<SystemTime>,
+    /// `createdAt` — when the create call accepted this deployment.
+    pub created_at: SystemTime,
+    /// `lastUpdatedAt` — when the deployment last changed, and `None` while nothing has
+    /// changed it since it was created (the member is optional in the model).
+    pub last_updated_at: Option<SystemTime>,
+}
+
+impl CustomModelDeploymentRecord {
+    /// Materialise the move to [`CUSTOM_MODEL_DEPLOYMENT_STATUS_ACTIVE`] the clock has
+    /// already made due at `now`.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at the due
+    /// instant even if nobody had called, which is why that instant — not `now` — is the
+    /// one the record reports as its last update.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.active_due_at.filter(|due| now >= *due) {
+            self.status = CUSTOM_MODEL_DEPLOYMENT_STATUS_ACTIVE;
+            self.active_due_at = None;
+            self.last_updated_at = Some(due);
+        }
+    }
+}
+
 /// One stored custom model: the identity `CreateCustomModel` minted, the data source and
 /// key that request carried, the base model it reports, and the status a read reports.
 ///
@@ -1186,6 +1291,13 @@ pub struct EnforcedGuardrailConfiguration {
 ///   enforces, and `custom_model_create_tokens` holds at most one entry per stored custom
 ///   model for the same reason `create_tokens` does.
 ///
+/// * `custom_model_deployments` and `custom_model_deployment_names` hold one entry per
+///   live custom model deployment, capped at
+///   [`MAX_CUSTOM_MODEL_DEPLOYMENTS_PER_ACCOUNT`] by the quota
+///   `CreateCustomModelDeployment` enforces, and
+///   `custom_model_deployment_create_tokens` holds at most one entry per live deployment
+///   for the same reason `create_tokens` does.
+///
 /// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
 ///   written: no operation here creates or deletes a foundation model.
 ///
@@ -1319,6 +1431,19 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Provisioned Throughput ids this store has minted; the uniqueness half of
     /// a minted id.
     pub minted_provisioned_models: u64,
+    /// Every stored custom model deployment, keyed by its `customModelDeploymentArn`.
+    pub custom_model_deployments: HashMap<String, CustomModelDeploymentRecord>,
+    /// `(region, modelDeploymentName)` -> `customModelDeploymentArn`, because the name is
+    /// the other spelling of a `CustomModelDeploymentIdentifier` and is unique within an
+    /// account and region.
+    pub custom_model_deployment_names: HashMap<(String, String), String>,
+    /// `CreateCustomModelDeployment` idempotency: `(region, clientRequestToken)` -> the
+    /// `customModelDeploymentArn` that token minted. Scoped to that one operation, and to
+    /// the region the request addressed, the way the Provisioned Throughput index is.
+    pub custom_model_deployment_create_tokens: HashMap<(String, String), String>,
+    /// How many custom model deployment ids this store has minted; the uniqueness half of
+    /// a minted id.
+    pub minted_custom_model_deployments: u64,
     /// Every stored custom model, keyed by its `CustomModelArn` — one of the two
     /// spellings a `ModelIdentifier` carries.
     pub custom_models: HashMap<String, CustomModelRecord>,
@@ -1709,9 +1834,8 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// itself carries, so neither spelling reaches another region's resource.
     ///
     /// The families this service holds no record of (a custom model, an inference profile,
-    /// an automated reasoning policy, a model invocation job, an async invoke, a custom
-    /// model deployment) resolve to `None`: nothing creates one yet, so this account holds
-    /// no such resource to tag.
+    /// an automated reasoning policy, a model invocation job, an async invoke) resolve to
+    /// `None`: nothing creates one yet, so this account holds no such resource to tag.
     pub fn tagged_resource(
         &mut self,
         resource_arn: &str,
@@ -1761,6 +1885,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 record.arn.clone(),
             ));
         }
+        if resource_arn.contains(&format!(":{CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE}/")) {
+            let record = self.custom_model_deployment(resource_arn, region, now)?;
+            return Some(TaggedResource::CustomModelDeployment(record.arn.clone()));
+        }
         if !resource_arn.starts_with("arn:") {
             // A bare resource NAME, which `TaggableResourcesArn` admits beside an ARN: it
             // names at most one resource of a family whose own identifier admits a name,
@@ -1775,6 +1903,9 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 return Some(TaggedResource::ProvisionedModelThroughput(
                     record.arn.clone(),
                 ));
+            }
+            if let Some(record) = self.custom_model_deployment(resource_arn, region, now) {
+                return Some(TaggedResource::CustomModelDeployment(record.arn.clone()));
             }
         }
         None
@@ -1802,6 +1933,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             TaggedResource::EvaluationJob(arn) => self.evaluation_jobs.get(arn).map(|job| &job.tags),
             TaggedResource::ProvisionedModelThroughput(arn) => self
                 .provisioned_model_throughputs
+                .get(arn)
+                .map(|record| &record.tags),
+            TaggedResource::CustomModelDeployment(arn) => self
+                .custom_model_deployments
                 .get(arn)
                 .map(|record| &record.tags),
         }
@@ -1832,6 +1967,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             }
             TaggedResource::ProvisionedModelThroughput(arn) => self
                 .provisioned_model_throughputs
+                .get_mut(arn)
+                .map(|record| &mut record.tags),
+            TaggedResource::CustomModelDeployment(arn) => self
+                .custom_model_deployments
                 .get_mut(arn)
                 .map(|record| &mut record.tags),
         }
@@ -1945,6 +2084,8 @@ pub enum TaggedResource {
     EvaluationJob(String),
     /// A Provisioned Throughput, by its `ProvisionedModelArn`.
     ProvisionedModelThroughput(String),
+    /// A custom model deployment, by its `CustomModelDeploymentArn`.
+    CustomModelDeployment(String),
 }
 
 /// The region field of an ARN (`arn:<partition>:<service>:<region>:<account>:<resource>`),
@@ -1975,6 +2116,98 @@ pub fn apply_tags(held: &mut Vec<Tag>, applied: Vec<Tag>) {
         }
     }
 }
+
+impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
+    /// Mint a fresh custom model deployment id: the resource half of a
+    /// `custom-model-deployment/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons;
+    /// `CustomModelDeploymentArn` admits exactly `[a-z0-9]{12}` there, which is what two
+    /// [`ID_HALF_WIDTH`] base-36 halves spell.
+    pub fn mint_custom_model_deployment_id(&mut self, now: SystemTime) -> String {
+        self.minted_custom_model_deployments += 1;
+        minted_id(self.minted_custom_model_deployments, now)
+    }
+
+    /// The `customModelDeploymentArn` a `CustomModelDeploymentIdentifier` names, within the
+    /// region the request addresses: the identifier itself when it is the ARN of a
+    /// deployment stored for `region`, otherwise the ARN the deployment of that NAME in
+    /// `region` carries.
+    ///
+    /// The identifier's pattern is that ARN OR a bare `ModelDeploymentName`
+    /// (`smithy_query(query="operation",operation="GetCustomModelDeployment")`), so both
+    /// spellings address the same deployment — and BOTH are scoped to the region, because a
+    /// deployment belongs to the account-region it was created in: an AWS endpoint serves
+    /// one region, so a deployment of another one is not a resource this request can
+    /// address, whichever spelling names it.
+    #[must_use]
+    pub fn custom_model_deployment_arn_of(
+        &self,
+        identifier: &str,
+        region: &str,
+    ) -> Option<String> {
+        if let Some(record) = self.custom_model_deployments.get(identifier) {
+            return (record.region == region).then(|| record.arn.clone());
+        }
+        self.custom_model_deployment_names
+            .get(&(region.to_string(), identifier.to_string()))
+            .cloned()
+    }
+
+    /// The custom model deployment a `CustomModelDeploymentIdentifier` names, with any
+    /// status transition the clock has made due at `now` materialised first — so every
+    /// caller reads the status the deployment holds at `now`, whichever operation asked.
+    pub fn custom_model_deployment(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut CustomModelDeploymentRecord> {
+        let arn = self.custom_model_deployment_arn_of(identifier, region)?;
+        let record = self.custom_model_deployments.get_mut(&arn)?;
+        record.settle(now);
+        Some(record)
+    }
+
+    /// Materialise every custom model deployment status transition the clock has made due
+    /// at `now`, so a LISTING reports — and filters on — the status each record holds at
+    /// `now` exactly as a read of that one deployment would.
+    pub fn settle_custom_model_deployments(&mut self, now: SystemTime) {
+        for record in self.custom_model_deployments.values_mut() {
+            record.settle(now);
+        }
+    }
+}
+
+/// The ARN of a custom model deployment in `region`:
+/// `arn:aws:bedrock:<region>:<account>:custom-model-deployment/<id>`, as
+/// `CustomModelDeploymentArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:custom-model-deployment/[a-z0-9]{12}$`)
+/// spells it.
+#[must_use]
+pub fn custom_model_deployment_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        "bedrock",
+        region,
+        &format!("{CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// The ARN resource type a custom model deployment is named by.
+pub const CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE: &str = "custom-model-deployment";
+
+/// What this service answers as its `ValidationException` message for a
+/// `CustomModelDeploymentIdentifier` that is not the ARN of a deployment and resolves to
+/// none.
+///
+/// RECORDED behaviour, not a modelled rule: the corpus `simparity-behavioral-ga-prod-v1`
+/// records Amazon Bedrock answering 400 `ValidationException` with exactly this sentence
+/// for a bare deployment name this account holds no deployment under. A CONSTANT,
+/// interpolating no part of the request: it reports that the identifier is not usable, and
+/// nothing about which name was asked for, so the message cannot be used to probe the
+/// store.
+pub const CUSTOM_MODEL_DEPLOYMENT_IDENTIFIER_INVALID: &str =
+    "The provided custom model deployment identifier is invalid.";
 
 /// A minted resource id: `^[a-z0-9]+$`, the store's mint `ordinal` then the sub-second
 /// part of `now`, each in [`ID_HALF_WIDTH`] base-36 digits.
@@ -2181,6 +2414,29 @@ pub fn provisioned_model_summary(
         commitment_expiration_time: record.commitment_expiration_time.map(date_time),
         creation_time: date_time(record.created_at),
         last_modified_time: date_time(record.last_modified_at),
+    }
+}
+
+/// The `CustomModelDeploymentSummary` a listing reports for a stored custom model
+/// deployment.
+///
+/// Lives here rather than in `ops/list_custom_model_deployments.rs` because every member it
+/// carries is also a member `GetCustomModelDeployment` reports, and the two must agree
+/// about them: a listed summary is the same record the read of that one deployment finds.
+#[must_use]
+pub fn custom_model_deployment_summary(
+    record: &CustomModelDeploymentRecord,
+) -> CustomModelDeploymentSummary {
+    CustomModelDeploymentSummary {
+        custom_model_deployment_arn: record.arn.clone(),
+        custom_model_deployment_name: record.name.clone(),
+        model_arn: record.model_arn.clone(),
+        created_at: date_time(record.created_at),
+        status: record.status.to_string(),
+        last_updated_at: record.last_updated_at.map(date_time),
+        // `failureMessage` is reported "if the deployment status is FAILED". Nothing here
+        // makes an accepted deployment fail, so there is none to report.
+        failure_message: None,
     }
 }
 
@@ -3115,6 +3371,27 @@ impl FoundationModelCatalog {
     #[must_use]
     pub fn model(&self, model_id: &str) -> Option<&FoundationModel> {
         self.0.get(model_id)
+    }
+
+    /// The model a QUALIFIED base model id names: a `modelId` the catalog carries, or one
+    /// of its ids followed by the `:`-separated version qualifiers AWS appends when it
+    /// writes a base model id into a resource ARN (`…:0:8k`).
+    ///
+    /// Those qualifiers are part of the id a `CustomModelArn` embeds — its pattern admits
+    /// `([:][a-z0-9-]{1,63}){0,2}` after the model id
+    /// (`smithy_query(query="operation",operation="CreateCustomModelDeployment")`) — and
+    /// they name a variant of the SAME published model, so the qualified id resolves to
+    /// the catalog row its unqualified prefix names. Matching is at a `:` boundary only,
+    /// so one model id is never read as a prefix of another.
+    #[must_use]
+    pub fn qualified_model(&self, qualified_model_id: &str) -> Option<&FoundationModel> {
+        let mut candidate = qualified_model_id;
+        loop {
+            if let Some(model) = self.model(candidate) {
+                return Some(model);
+            }
+            candidate = candidate.rsplit_once(':')?.0;
+        }
     }
 }
 

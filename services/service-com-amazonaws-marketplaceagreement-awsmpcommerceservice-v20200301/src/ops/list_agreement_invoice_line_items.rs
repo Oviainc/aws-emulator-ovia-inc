@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgreementInvoiceLineItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgreementInvoiceLineItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the invoices of one agreement, grouped the way `groupBy` asks for —
+//! one group per invoice — and filtered by the invoice, type, billing period and
+//! issue-date members the call carries. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgreementInvoiceLineItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An invoice is issued by the acceptance that bills a charge of the agreement
+//! ([`crate::state::Invoice`]); this operation only reports them, so it writes
+//! nothing. Each group states what the invoice billed and how much of it is
+//! still open to adjustment, which is the ceiling
+//! `BatchCreateBillingAdjustmentRequest` holds an entry to.
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ListAgreementInvoiceLineItems::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! `agreementId` has to name an agreement this store holds: this operation
+//! models `ResourceNotFoundException`, so an id naming none is answered with it
+//! rather than with an empty page.
 //!
 //! ## Reaching this service's state
 //!
@@ -168,18 +166,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgreementInvoiceLineItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgreementInvoiceLineItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgreementInvoiceLineItems"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAgreementInvoiceLineItemsErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let issued_after = input.after_issued_time.map(|bound| bound.as_secs_f64());
+        let issued_before = input.before_issued_time.map(|bound| bound.as_secs_f64());
+        // The token resumes THIS listing: one minted for a different agreement
+        // or a different set of filters would index into a different sequence.
+        let scope = crate::state::invoice_line_item_scope(
+            &input.agreement_id,
+            &input.group_by,
+            input.invoice_id.as_deref(),
+            input.invoice_type.as_deref(),
+            input.invoice_billing_period.as_ref(),
+            issued_after,
+            issued_before,
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        ListAgreementInvoiceLineItemsErrorModeled::ValidationException(
+                            crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // "The unique identifier of the agreement": the invoices reported are
+        // the invoices OF that agreement, so an id naming none is a reference to
+        // a resource that does not exist — the modelled not-found this operation
+        // declares, at the status this service answers every lookup that found
+        // nothing with.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            return Err(crate::state::not_found(
+                ListAgreementInvoiceLineItemsErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        let mut matched: Vec<&crate::state::Invoice> = store
+            .invoices_of(&input.agreement_id)
+            .into_iter()
+            .filter(|invoice| {
+                // Every filter the input carries is an AND over the stored
+                // invoice's own value, so the documented combinations select.
+                input
+                    .invoice_id
+                    .as_deref()
+                    .is_none_or(|id| id == invoice.id)
+                    && input
+                        .invoice_type
+                        .as_deref()
+                        .is_none_or(|kind| kind == invoice.invoice_type)
+                    && input.invoice_billing_period.as_ref().is_none_or(|period| {
+                        invoice.billing_period().is_some_and(|issued| {
+                            issued.month == period.month && issued.year == period.year
+                        })
+                    })
+                    // "issued after"/"issued before" the instant named, so an
+                    // invoice issued AT the bound is on neither side of it.
+                    && issued_after.is_none_or(|bound| {
+                        crate::state::epoch_secs(invoice.issued_at) > bound
+                    })
+                    && issued_before.is_none_or(|bound| {
+                        crate::state::epoch_secs(invoice.issued_at) < bound
+                    })
+            })
+            .collect();
+        // Issue order, then id, so the order is total and a page token indexes
+        // into the same sequence on every call.
+        matched.sort_by(|left, right| {
+            left.issued_at
+                .cmp(&right.issued_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // Only the page the caller asked for is projected into groups; the rest
+        // of what the listing selects is never cloned.
+        let Some((page, next_token)) = crate::state::paginate(
+            &matched,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this listing selects, which no
+            // token this operation minted for it ever named.
+            return Err(
+                ListAgreementInvoiceLineItemsErrorModeled::ValidationException(
+                    crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                )
+                .into(),
+            );
+        };
+
+        // `groupBy` admits one value, `INVOICE_ID`, so one group per invoice is
+        // the grouping every accepted call asks for. Each group is read off the
+        // one invoice record — including the amount of it still open to
+        // adjustment — so projecting a page is work bounded by the page size
+        // alone.
+        let groups: Vec<AgreementInvoiceLineItemGroupSummary> =
+            page.iter().map(|invoice| invoice.to_group_summary()).collect();
+        Ok(ListAgreementInvoiceLineItemsOutput {
+            agreement_invoice_line_item_group_summaries: Some(groups),
+            next_token,
+        })
     }
 }

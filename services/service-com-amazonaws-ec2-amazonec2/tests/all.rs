@@ -145,6 +145,8 @@ mod fpga_image_tasks_and_volume_io;
 mod get_password_data;
 #[path = "all/host_reservation_offerings.rs"]
 mod host_reservation_offerings;
+#[path = "all/image_references.rs"]
+mod image_references;
 #[path = "all/image_usage_reports.rs"]
 mod image_usage_reports;
 #[path = "all/images.rs"]
@@ -275,6 +277,8 @@ mod vpc_endpoints_and_byoip;
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]
 mod vpc_network_lifecycle;
+#[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
+mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
 mod vpn_connection_device_types;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
