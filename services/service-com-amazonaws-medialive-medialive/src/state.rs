@@ -557,10 +557,17 @@ pub mod input_source_type {
     pub const DYNAMIC: &str = "DYNAMIC";
 }
 
+/// The `InputNetworkLocation` value of an input that lives in the AWS Cloud —
+/// "AWS, for an input existing in the AWS Cloud"
+/// (`smithy_query(query="shape", shape="InputNetworkLocation")`, whose other
+/// value is the on-premises one). This is the location whose ingest addresses
+/// are this service's own public ones.
+pub const AWS_INPUT_NETWORK_LOCATION: &str = "AWS";
+
 /// The `InputNetworkLocation` an input that names none gets: the
 /// `InputNetworkLocation` doc says "By default all inputs will continue to be
 /// AWS inputs" (`smithy_query(query="shape", shape="InputNetworkLocation")`).
-pub const DEFAULT_INPUT_NETWORK_LOCATION: &str = "AWS";
+pub const DEFAULT_INPUT_NETWORK_LOCATION: &str = AWS_INPUT_NETWORK_LOCATION;
 
 /// The `InputType` values whose sources can carry a dynamic URL: the
 /// `Input$InputSourceType` doc — "Certain pull input sources can be dynamic,
@@ -651,6 +658,26 @@ fn push_ingest_protocol(input_type: Option<&str>) -> Option<PushIngestProtocol> 
         .iter()
         .find(|(name, _)| *name == input_type)
         .map(|(_, protocol)| *protocol)
+}
+
+/// The `InputType` values whose ingest IS the `Sources` URL list — the PULL
+/// types: `Sources` is "The source URLs for a PULL-type input. Every PULL type
+/// input needs exactly two source URLs for redundancy. Only specify sources for
+/// PULL type Inputs" (`smithy_query(query="operation", operation="CreateInput")`),
+/// so an input of one of these types has nothing to ingest from until it carries
+/// at least one source URL.
+///
+/// The two file types are the same pair [`DYNAMIC_CAPABLE_INPUT_TYPES`] names,
+/// because what a dynamic URL varies is exactly such a source. Every other
+/// `InputType` ingests through a list of its own (`Destinations` for a pushed-to
+/// type, `MediaConnectFlows`, `InputDevices`, `SdiSources`, the multicast,
+/// receiver-group and SRT settings), so none of them is in this table.
+const PULL_SOURCE_INPUT_TYPES: [&str; 4] = ["URL_PULL", "RTMP_PULL", "MP4_FILE", "TS_FILE"];
+
+/// Whether an input of `input_type` ingests through its `Sources`
+/// ([`PULL_SOURCE_INPUT_TYPES`]).
+fn pulls_from_sources(input_type: Option<&str>) -> bool {
+    input_type.is_some_and(|input_type| PULL_SOURCE_INPUT_TYPES.contains(&input_type))
 }
 
 /// Base of the pool this service's emulated public addresses come from — a push
@@ -2742,6 +2769,81 @@ impl ComAmazonawsMedialiveMedialiveState {
         id.to_string()
     }
 
+    /// The message refusing the configuration `input` carries, or `None` when it
+    /// is one this service can ingest through.
+    ///
+    /// ONE rule for every operation that WRITES an input's configuration
+    /// (`CreateInput`, `UpdateInput`), applied to the record that WOULD be
+    /// stored, so the two cannot accept configurations the other refuses:
+    ///
+    /// * every id the configuration names must resolve to a resource this
+    ///   account holds — an input security group, an SdiSource, a claimed input
+    ///   device. Those resources are what the input ingests through, and each
+    ///   derives the inputs using it from this store
+    ///   ([`Self::inputs_using_security_group`], [`Self::inputs_using_sdi_source`]),
+    ///   so an id nothing minted would leave the input claiming a resource no
+    ///   read of the account can show.
+    /// * an input must carry the ingest list its `Type` ingests through: the
+    ///   whitelist that admits the system pushing to a pushed-to type
+    ///   ([`PUSH_INGEST_PROTOCOLS`]), and the source URLs a pulled-from type
+    ///   pulls ([`PULL_SOURCE_INPUT_TYPES`]).
+    /// * the two cross-member rules the `Vpc` member's own doc states — it
+    ///   "requires setting the roleArn property on Input creation" and is "not
+    ///   compatible with the inputSecurityGroups property".
+    ///
+    /// A VPC input and an on-premises input are the two cases the whitelist does
+    /// NOT admit anything for: the former's ingest addresses "will be created in
+    /// a VPC rather than with public Internet addresses", and the latter lives
+    /// "in a customer network" (`InputNetworkLocation`), so neither is reached
+    /// through an input security group of this account.
+    pub fn input_configuration_error(&self, input: &InputRecord) -> Option<String> {
+        if input.vpc.is_some() {
+            if !input.security_groups.is_empty() {
+                return Some(VPC_WITH_SECURITY_GROUPS_MESSAGE.to_string());
+            }
+            if input.role_arn.as_deref().unwrap_or_default().is_empty() {
+                return Some(VPC_WITHOUT_ROLE_ARN_MESSAGE.to_string());
+            }
+        }
+        for group in &input.security_groups {
+            if self.live_input_security_group(group).is_none() {
+                return Some(unknown_reference_message(
+                    "inputSecurityGroups",
+                    "input security group",
+                    group,
+                ));
+            }
+        }
+        for source in &input.sdi_sources {
+            if self
+                .sdi_sources
+                .get(source)
+                .is_none_or(SdiSourceRecord::is_deleted)
+            {
+                return Some(unknown_reference_message("sdiSources", "SdiSource", source));
+            }
+        }
+        for device in &input.input_devices {
+            let Some(id) = device.id.as_deref().filter(|id| !id.is_empty()) else {
+                return Some(missing_reference_id_message("inputDevices"));
+            };
+            if self.input_device(id).is_none() {
+                return Some(unknown_reference_message("inputDevices", "input device", id));
+            }
+        }
+        let input_type = input.input_type.as_deref().unwrap_or_default();
+        if input.needs_input_whitelist() && input.security_groups.is_empty() {
+            return Some(required_for_input_type_message(
+                "inputSecurityGroups",
+                input_type,
+            ));
+        }
+        if pulls_from_sources(input.input_type.as_deref()) && input.sources.is_empty() {
+            return Some(required_for_input_type_message("sources", input_type));
+        }
+        None
+    }
+
     /// Allocate the system-generated ingest address of every push destination
     /// of `id` that does not hold one yet, so the input reports the endpoint an
     /// upstream system pushes its stream to.
@@ -4210,6 +4312,43 @@ pub fn not_found_message(resource_type: &str, identifier: &str) -> String {
     format!("{resource_type} {identifier} not found")
 }
 
+/// The message a write refused because the configuration it carries references
+/// a resource this account does not hold: the member as the wire spells it, the
+/// kind of resource the entry names, and the id it named.
+///
+/// Composed from the REQUEST, so it names what the caller must change. One
+/// helper for every reference list an input configuration carries
+/// (`InputSecurityGroups`, `SdiSources`, `InputDevices`), so the refusals cannot
+/// be worded three ways.
+pub fn unknown_reference_message(member: &str, resource_type: &str, identifier: &str) -> String {
+    format!("{member} references {resource_type} {identifier}, which this account does not hold")
+}
+
+/// The message a write refused because an entry of a reference list names no id
+/// at all carries: the member as the wire spells it.
+pub fn missing_reference_id_message(member: &str) -> String {
+    format!("every entry of {member} must name the id of a resource this account holds")
+}
+
+/// The message a write refused because the configuration leaves out the ingest
+/// list the requested `InputType` ingests through carries: the member as the
+/// wire spells it and the type that requires it, both out of the request.
+pub fn required_for_input_type_message(member: &str, input_type: &str) -> String {
+    format!("{member} is required for an input of type {input_type}")
+}
+
+/// The message a write refused for a private-VPC input that also attaches input
+/// security groups carries: `Vpc` is "not compatible with the
+/// inputSecurityGroups property". Nothing is interpolated — the incompatibility
+/// is between two members the caller named, not about either one's value.
+pub const VPC_WITH_SECURITY_GROUPS_MESSAGE: &str =
+    "vpc is not compatible with the inputSecurityGroups property";
+
+/// The message a write refused for a private-VPC input with no role carries:
+/// `Vpc` "requires setting the roleArn property on Input creation".
+pub const VPC_WITHOUT_ROLE_ARN_MESSAGE: &str =
+    "vpc requires setting the roleArn property on Input creation";
+
 /// Whether an `Accept` header allows a response of the media type `media_type`.
 ///
 /// One definition for every operation that negotiates a response media type, so
@@ -4528,6 +4667,20 @@ impl InputRecord {
         }
     }
 
+    /// Whether this input is ingested by an upstream system PUSHING to an
+    /// endpoint of this service, which the input security groups attached to it
+    /// are what admit: its `Type` has a push ingest protocol
+    /// ([`PUSH_INGEST_PROTOCOLS`]) and its ingest addresses are this service's
+    /// public ones — neither created inside a customer VPC (`Vpc`, whose
+    /// addresses replace "public Internet addresses" and which is "not
+    /// compatible with the inputSecurityGroups property") nor on premises
+    /// (`InputNetworkLocation`, "On-Prem for an input in a customer network").
+    pub fn needs_input_whitelist(&self) -> bool {
+        push_ingest_protocol(self.input_type.as_deref()).is_some()
+            && self.vpc.is_none()
+            && self.input_network_location == AWS_INPUT_NETWORK_LOCATION
+    }
+
     /// This input's `InputSourceType`: `DYNAMIC` when it is one of the types
     /// whose pull sources may carry a dynamic URL and a source URL carries the
     /// `$urlPath$` variable, otherwise `STATIC` ("By default all input sources
@@ -4551,16 +4704,22 @@ impl InputRecord {
     }
 }
 
-/// Build a new input record from the ids. Every modelled member starts at the
-/// empty value the request then fills in.
+/// Build the record of a new input, with NO identity yet: every modelled member
+/// starts at the empty value the request then fills in, and `id` and `arn` stay
+/// empty until the create stores it.
+///
+/// The identity is assigned where the record is inserted, so a create refused
+/// for a configuration this service cannot ingest through
+/// ([`ComAmazonawsMedialiveMedialiveState::input_configuration_error`]) spends
+/// no input id: the ids a client is handed are the ids of inputs that exist.
 ///
 /// There is no transient state to owe: the real service answers `CreateInput`
 /// with an input that is already `DETACHED`, so this one is usable from the
 /// instant it is stored.
-pub fn new_input(id: String, arn: String) -> InputRecord {
+pub fn new_input() -> InputRecord {
     InputRecord {
-        id,
-        arn,
+        id: String::new(),
+        arn: String::new(),
         name: None,
         input_type: None,
         input_network_location: DEFAULT_INPUT_NETWORK_LOCATION.to_string(),

@@ -56,8 +56,10 @@ const TEMPLATE_GROUP_NOT_EMPTY: &str = "Template group must be empty before dele
 /// its whitelist rules are not all valid IPv4 CIDRs.
 const INVALID_WHITELIST_CIDR: &str = "Every whitelist needs to have a valid IPv4 CIDR.";
 
-/// One `CreateInput`, answering the created input.
+/// One `CreateInput`, answering the created input — with the resources its
+/// configuration names put in the account first (`crate::support`).
 async fn create_input(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+    let body = crate::support::resolved_input_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/inputs", Some(body)).await;
     assert_eq!(
         status, 201,

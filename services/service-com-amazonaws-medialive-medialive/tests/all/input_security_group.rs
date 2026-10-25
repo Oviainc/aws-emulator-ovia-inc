@@ -22,6 +22,17 @@ fn wait_for_the_clock() {
     std::thread::sleep(TRANSIENT_STATE_SPAN + Duration::from_millis(200));
 }
 
+/// The source URLs a PULL-type input ingests through — `Sources` is "The source
+/// URLs for a PULL-type input", so an input of such a type carries them, and
+/// `CreateInput` refuses one that carries none. This suite is about the security
+/// GROUP, so every pull input it creates takes this same redundant pair.
+fn pull_sources() -> Value {
+    json!([
+        { "url": "https://example.com/a.m3u8" },
+        { "url": "https://example.com/b.m3u8" },
+    ])
+}
+
 /// `CreateInputSecurityGroup`, asserting the 201 the recorded wire response
 /// carries and returning the `SecurityGroup` it reports.
 ///
@@ -387,6 +398,7 @@ async fn a_group_is_in_use_exactly_while_a_resource_references_it() {
         Some(json!({
             "name": "uses-the-other-group",
             "type": "URL_PULL",
+            "sources": pull_sources(),
             "inputSecurityGroups": [untouched_id.clone()],
         })),
     )
@@ -860,7 +872,8 @@ async fn an_update_refuses_an_id_no_group_has() {
         &router,
         "POST",
         "/prod/inputs",
-        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL" })),
+        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL",
+                      "sources": pull_sources() })),
     )
     .await;
     assert_eq!(
@@ -934,6 +947,7 @@ async fn an_update_keeps_reporting_what_uses_the_group() {
         Some(json!({
             "name": "uses-the-group",
             "type": "URL_PULL",
+            "sources": pull_sources(),
             "inputSecurityGroups": [group_id.clone()],
         })),
     )
@@ -1071,7 +1085,7 @@ async fn a_resource_create_answers_the_status_the_wire_carries() {
         (
             "input",
             "/prod/inputs",
-            json!({ "name": "created", "type": "URL_PULL" }),
+            json!({ "name": "created", "type": "URL_PULL", "sources": pull_sources() }),
             201,
             "the model's declared code",
         ),
@@ -1185,6 +1199,7 @@ async fn a_deleted_group_reaches_the_terminal_deleted_state() {
                     Some(json!({
                         "name": "uses-the-group",
                         "type": "URL_PULL",
+                        "sources": pull_sources(),
                         "inputSecurityGroups": [id.clone()],
                     })),
                 )
@@ -1336,7 +1351,8 @@ async fn deleting_an_id_no_group_has_is_not_found() {
         &router,
         "POST",
         "/prod/inputs",
-        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL" })),
+        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL",
+                      "sources": pull_sources() })),
     )
     .await;
     assert_eq!(
