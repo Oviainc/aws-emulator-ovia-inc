@@ -316,10 +316,14 @@ async fn an_undeclared_enum_value_is_refused_on_every_other_enum_member() {
 
 /// EVERY value each enumeration declares is accepted on the same path, so the refusal
 /// above is scoped to values the catalog really does not hold.
+///
+/// A FRESH emulator per member, because what one member's rows leave behind is not part of
+/// the next member's case: a `StartRecommendationReportGeneration` row puts a report
+/// generation task in flight, and `PutPortfolioPreferences` refuses a save made while a
+/// task of the account is still running (`preferences_conflict.rs`), which has nothing to
+/// do with the enum value under test here.
 #[tokio::test]
 async fn every_value_these_enumerations_declare_is_accepted() {
-    let router = router_with_one_server();
-
     for EnumMember {
         member,
         uri,
@@ -327,6 +331,7 @@ async fn every_value_these_enumerations_declare_is_accepted() {
         declared,
     } in enum_members()
     {
+        let router = router_with_one_server();
         for value in declared {
             let answer = call(&router, "POST", uri, Some(request(value))).await;
             assert_eq!(
@@ -341,10 +346,11 @@ async fn every_value_these_enumerations_declare_is_accepted() {
 /// A member the request leaves out is not refused: an enumeration constrains the values a
 /// member may carry, not whether it is carried at all — including an empty list, which
 /// carries no entry whose member could be outside a catalog.
+///
+/// One emulator per row, for the same reason the table above takes one per member: a row
+/// that starts a task must not decide the next row's answer.
 #[tokio::test]
 async fn an_absent_enum_targeting_member_is_not_refused() {
-    let router = router_with_one_server();
-
     let absent: Vec<(&str, &str, Value)> = vec![
         ("ListServers with no enum member", "/list-servers", json!({})),
         (
@@ -385,6 +391,7 @@ async fn an_absent_enum_targeting_member_is_not_refused() {
     ];
 
     for (case, uri, request) in absent {
+        let router = router_with_one_server();
         let answer = call(&router, "POST", uri, Some(request)).await;
         assert_eq!(
             answer.status, 200,

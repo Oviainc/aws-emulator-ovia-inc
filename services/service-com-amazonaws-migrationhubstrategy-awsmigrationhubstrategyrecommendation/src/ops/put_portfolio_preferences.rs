@@ -14,6 +14,13 @@
 //! 400 `ValidationException`, rather than stored and reported back as a preference the
 //! service does not have.
 //!
+//! The preferences are the account-wide inputs the service's recommendations are computed
+//! from, so a save is refused with the modelled 409 `ConflictException` for as long as any
+//! task of the account has not reached a terminal status
+//! ([`crate::state::ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::ongoing_task`]),
+//! and the stored record is left exactly as it was. The gate is decided from the STORE,
+//! never from what the request carries.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -79,7 +86,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{invalid_request_body, PortfolioPreferences};
+use crate::state::{invalid_request_body, ongoing_task_conflict, PortfolioPreferences};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -262,9 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every refusal is decided from the request alone, before the store is written:
-        // a request this service cannot accept must leave the saved preferences exactly
-        // as they were.
+        // What the request itself carries is judged first, before the store is read at
+        // all: a request this service cannot accept is refused for the value it carries
+        // whatever the account is doing, and leaves the saved preferences exactly as they
+        // were.
         check_enum(input.application_mode.as_deref(), APPLICATION_MODE_VALUES)?;
         if let Some(preferences) = input.application_preferences.as_ref() {
             check_application_preferences(preferences)?;
@@ -273,10 +281,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             check_database_preferences(preferences)?;
         }
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // These preferences are the inputs the service's recommendations are computed
+        // from, so they cannot be replaced underneath work that consumes them: while any
+        // task of this account is still running the save is refused with the modelled
+        // conflict and the stored record is left exactly as it was, and the caller waits
+        // for the task to finish. The condition comes from the store — is a task still
+        // owed its terminal status? — so it does not depend on what this request carries.
+        if let Some(ongoing) = store.ongoing_task(now) {
+            return Err(PutPortfolioPreferencesErrorModeled::ConflictException(
+                ongoing_task_conflict(&ongoing),
+            )
+            .into());
+        }
+
         // The save: the record becomes exactly what this request carries, so a member it
         // leaves out is not set afterwards. `GetPortfolioPreferences` reads this same
         // record — there is one copy of it in the store.
-        state.lock().portfolio_preferences = Some(PortfolioPreferences {
+        store.portfolio_preferences = Some(PortfolioPreferences {
             prioritize_business_goals: input.prioritize_business_goals,
             application_preferences: input.application_preferences,
             database_preferences: input.database_preferences,

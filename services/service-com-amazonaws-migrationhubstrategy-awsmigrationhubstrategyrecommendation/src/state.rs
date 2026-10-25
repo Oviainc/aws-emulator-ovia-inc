@@ -52,7 +52,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationComponentStrategy,
     ApplicationPreferences,
-    AssessmentTarget, AssociatedApplication, DataCollectionDetails, DatabaseConfigDetail,
+    AssessmentTarget, AssociatedApplication, ConflictException, DataCollectionDetails, DatabaseConfigDetail,
     DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
@@ -1245,6 +1245,49 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
         i32::try_from(covered).unwrap_or(i32::MAX)
     }
 
+    /// The task of this account that has not reached a terminal status at `now`, if there
+    /// is one.
+    ///
+    /// Every stored record gets the terminal status the clock already owed it first
+    /// ([`Self::settle_all`]) — owed at this same instant even if nobody had called — so a
+    /// task whose span has passed is not reported as ongoing. The three kinds of task this
+    /// service runs are looked at in the order they appear in the import-then-assess loop,
+    /// and the first one still running is the answer: what a caller has to wait for is that
+    /// there is one, not which of them it is.
+    pub fn ongoing_task(&mut self, now: SystemTime) -> Option<OngoingTask> {
+        self.settle_all(now);
+        let importing = self
+            .import_tasks
+            .values()
+            .find(|task| !task.is_complete())
+            .map(|task| OngoingTask {
+                kind: IMPORT_FILE_TASK,
+                id: task.id.clone(),
+                status: task.status.clone(),
+            });
+        let assessing = || {
+            self.assessments
+                .values()
+                .find(|assessment| !assessment.is_terminal())
+                .map(|assessment| OngoingTask {
+                    kind: ASSESSMENT,
+                    id: assessment.id.clone(),
+                    status: assessment.status.clone(),
+                })
+        };
+        let reporting = || {
+            self.recommendation_reports
+                .values()
+                .find(|report| report.is_in_progress())
+                .map(|report| OngoingTask {
+                    kind: RECOMMENDATION_REPORT_GENERATION_TASK,
+                    id: report.id.clone(),
+                    status: report.status.clone(),
+                })
+        };
+        importing.or_else(assessing).or_else(reporting)
+    }
+
     /// Materialise every completion the clock owes, for a caller about to read across
     /// all of the records.
     pub fn settle_all(&mut self, now: SystemTime) {
@@ -1329,6 +1372,49 @@ impl ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState 
             .fold(0i32, |total, task| {
                 total.saturating_add(task.number_of_records_success)
             })
+    }
+}
+
+/// A task of this account that has not reached a terminal status yet, as
+/// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::ongoing_task`]
+/// reports it.
+///
+/// Carries what a refusal caused by the task tells the caller: which task of the account
+/// is still running, and the non-terminal status it holds.
+#[derive(Debug, Clone)]
+pub struct OngoingTask {
+    /// What kind of task it is, in this service's own words — one of [`IMPORT_FILE_TASK`],
+    /// [`ASSESSMENT`] and [`RECOMMENDATION_REPORT_GENERATION_TASK`].
+    pub kind: &'static str,
+    /// The id the start call minted for it.
+    pub id: String,
+    /// The non-terminal status it carries.
+    pub status: String,
+}
+
+/// How this service names an import file task when a refusal reports one as ongoing.
+pub const IMPORT_FILE_TASK: &str = "import file task";
+
+/// How it names an assessment.
+pub const ASSESSMENT: &str = "assessment";
+
+/// How it names a recommendation report generation task.
+pub const RECOMMENDATION_REPORT_GENERATION_TASK: &str = "recommendation report generation task";
+
+/// The `ConflictException` (HTTP 409) this service answers a write of the account-wide
+/// inputs its recommendations are computed from while `ongoing` is still running.
+///
+/// The model documents the error as "Exception to indicate that there is an ongoing task
+/// when a new task is created. Return when once the existing tasks are complete", so the
+/// message reports exactly that: which task of the account is still running, the status it
+/// holds, and that the write succeeds once the task completes. It carries nothing from the
+/// request — the condition is one of the STORE, not of what the caller sent.
+pub fn ongoing_task_conflict(ongoing: &OngoingTask) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "The {} {} is {}. Retry once the ongoing task is complete.",
+            ongoing.kind, ongoing.id, ongoing.status
+        ),
     }
 }
 

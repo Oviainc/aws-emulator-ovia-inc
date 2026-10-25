@@ -47,6 +47,9 @@ mod import_status_report;
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 
+#[path = "all/preferences_conflict.rs"]
+mod preferences_conflict;
+
 #[path = "all/recommendation_report.rs"]
 mod recommendation_report;
 
