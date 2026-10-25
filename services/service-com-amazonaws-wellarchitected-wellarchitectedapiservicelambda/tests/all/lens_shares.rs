@@ -235,7 +235,11 @@ pub(crate) fn stored_shares(client: &Client, alias: &str) -> Vec<StoredShare> {
 /// doing the sharing and this emulator attributes every request to its one account. The
 /// seed records exactly what `CreateLensShare` records (rule 1 asserts that), and the READ
 /// under test still crosses the HTTP boundary.
-fn record_lens_share(client: &Client, alias: &str, shared_with: &str) -> (String, String) {
+pub(crate) fn record_lens_share(
+    client: &Client,
+    alias: &str,
+    shared_with: &str,
+) -> (String, String) {
     let state_handle = client.store();
     let mut store = state_handle.lock();
     let (lens_id, lens_arn, shared_by) = store

@@ -164,6 +164,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
+        // `MaxResults` is the page size the caller asks for: "Value range is 1 to 1000."
+        // A value outside that range is refused rather than quietly replaced with a page
+        // size the caller did not ask for — a parameter value this listing does not take,
+        // which is what `InvalidParameterValue` reports.
+        if let Some(requested) = input.max_results {
+            if let Some(why) = crate::state::max_results_refusal(
+                "MaxResults",
+                crate::state::LIST_QUEUES_MAX_RESULTS_RANGE,
+                requested,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+            }
+        }
+
         let prefix = input.queue_name_prefix.unwrap_or_default();
         // `queues` is name-ordered, so a page boundary means the same thing on the
         // next call.
@@ -182,16 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match token.parse() {
                 Ok(start) if start <= names.len() => start,
                 _ => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "NextToken {token:?} was not issued by this listing."
-                    )))
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        format!("Value {token} for parameter NextToken is invalid. Reason: it was not issued by this listing."),
+                    ))
                 }
             },
         };
         let page_size = input
             .max_results
+            // Inside the range checked above, so the conversion holds.
             .and_then(|max| usize::try_from(max).ok())
-            .filter(|max| *max > 0)
             // A request that names no page size still cannot make one answer grow with
             // the stored queue count; the caller walks the rest with `NextToken`.
             .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
