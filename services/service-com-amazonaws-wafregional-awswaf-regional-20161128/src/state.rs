@@ -376,13 +376,7 @@ pub fn page<'records, Record>(
     limit: i32,
     next_marker: Option<&str>,
 ) -> (Vec<&'records Record>, Option<String>) {
-    // `Limit`'s `@range` of 0..100 is enforced at the boundary, so a larger value
-    // cannot arrive; it is bounded here anyway.
-    let page_size = match usize::try_from(limit) {
-        Ok(0) => MAX_PAGE_SIZE,
-        Ok(limit) => limit.min(MAX_PAGE_SIZE),
-        Err(_) => MAX_PAGE_SIZE,
-    };
+    let page_size = page_size(limit);
     // Borrowed bounds, so resuming copies no id.
     let start = match next_marker {
         Some(marker) => ::std::ops::Bound::Included(marker),
@@ -396,6 +390,48 @@ pub fn page<'records, Record>(
         .collect();
     let next_marker = remaining.next().map(|(id, _)| id.clone());
     (page, next_marker)
+}
+
+/// How many records one page of a paginated read carries, for a request asking for
+/// `limit` of them.
+///
+/// `Limit`'s `@range` of 0..100 is enforced at the boundary, so a larger value cannot
+/// arrive; it is bounded here anyway. 0 — the model's declared default — asks for the
+/// service's own page size, [`MAX_PAGE_SIZE`]. Shared by every paginated read, whether
+/// it walks a map keyed by resource id ([`page`]) or a list a record holds
+/// ([`page_activated_rules`]).
+fn page_size(limit: i32) -> usize {
+    match usize::try_from(limit) {
+        Ok(0) => MAX_PAGE_SIZE,
+        Ok(limit) => limit.min(MAX_PAGE_SIZE),
+        Err(_) => MAX_PAGE_SIZE,
+    }
+}
+
+/// One page of the `ActivatedRule`s a record holds, in the order the record keeps them,
+/// plus the `NextMarker` that resumes the walk — or `None` when `next_marker` names no
+/// activation in the list.
+///
+/// The pagination rule of [`page`], over a list held by one record rather than a map of
+/// records: `Limit` bounds the page, the marker names the `RuleId` the page resumes at,
+/// and the returned marker is the `RuleId` of the first activation AFTER the page, so it
+/// is present exactly when one remains. An activation's `RuleId` identifies it within
+/// the record that holds it, which is what makes it a usable marker.
+pub fn page_activated_rules(
+    rules: &[ActivatedRule],
+    limit: i32,
+    next_marker: Option<&str>,
+) -> Option<(Vec<ActivatedRule>, Option<String>)> {
+    let start = match next_marker {
+        None => 0,
+        Some(marker) => rules
+            .iter()
+            .position(|activated| activated.rule_id == marker)?,
+    };
+    let mut remaining = rules[start..].iter();
+    let page: Vec<ActivatedRule> = remaining.by_ref().take(page_size(limit)).cloned().collect();
+    let next_marker = remaining.next().map(|activated| activated.rule_id.clone());
+    Some((page, next_marker))
 }
 
 /// AWS WAF Classic answers each refusal class with ONE fixed sentence that carries no
@@ -1426,12 +1462,37 @@ impl SqlInjectionMatchSetEntry {
     }
 }
 
+/// The `WafRuleType` of a `Rule`, which is the only kind a rule group holds and the
+/// type an `ActivatedRule` naming none carries.
+///
+/// Source: `ActivatedRule.Type`'s own documentation — "The rule type, either `REGULAR`,
+/// as defined by `Rule`, `RATE_BASED`, as defined by `RateBasedRule`, or `GROUP`, as
+/// defined by `RuleGroup`. The default is REGULAR." — one of the model's
+/// `WAF_RULE_TYPE_VALUES`.
+pub const WAF_RULE_TYPE_REGULAR: &str = "REGULAR";
+
+/// The most `ActivatedRule`s one `RuleGroup` holds.
+///
+/// Source: `UpdateRuleGroup`'s own documentation — "You can only insert REGULAR rules
+/// into a rule group. You can have a maximum of ten rules per rule group."
+pub const MAX_RULE_GROUP_RULES: usize = 10;
+
+/// The most updates one `UpdateRuleGroup` request may carry, so the work one request
+/// asks for is bounded by the resource's own quota rather than by the caller.
+///
+/// Twice [`MAX_RULE_GROUP_RULES`], for the same reason as
+/// [`MAX_RULE_UPDATES_PER_REQUEST`]: one request can at most empty a rule group and then
+/// fill it again, since a delete must name a rule the group holds and an insert one it
+/// does not.
+pub const MAX_RULE_GROUP_UPDATES_PER_REQUEST: usize = 2 * MAX_RULE_GROUP_RULES;
+
 /// One stored `RuleGroup`.
 ///
-/// A rule group's activated rules are not held here: `CreateRuleGroup` documents that
-/// it creates "An empty RuleGroup" and that "You use UpdateRuleGroup to add rules to
-/// the rule group", and the modelled `RuleGroup` shape carries only the id, the name
-/// and the metric name.
+/// The modelled `RuleGroup` shape carries only the id, the name and the metric name, so
+/// the activated rules this record holds are reported by
+/// `ListActivatedRulesInRuleGroup` rather than by `GetRuleGroup`. A rule group
+/// `CreateRuleGroup` just made holds none: "An empty RuleGroup […] You use
+/// UpdateRuleGroup to add rules to the rule group."
 #[derive(Debug, Clone)]
 pub struct RuleGroupEntry {
     pub rule_group_id: String,
@@ -1439,6 +1500,11 @@ pub struct RuleGroupEntry {
     /// The metric name, fixed at creation: "You can't change the name of the metric
     /// after you create the RuleGroup."
     pub metric_name: String,
+    /// The rules activated in this rule group, in priority order — "Rules with a lower
+    /// value for `Priority` are evaluated before `Rules` with a higher value" — as
+    /// `UpdateRuleGroup` wrote them. At most [`MAX_RULE_GROUP_RULES`] entries, so one
+    /// record's activation state is bounded.
+    pub rules: Vec<ActivatedRule>,
     /// The tags the create request carried, keyed by `Key` as `RuleEntry::tags` is, so
     /// a key repeated in one request keeps the last value given for it. The tagging
     /// operations (`ListTagsForResource`, `TagResource`, `UntagResource`) read and write
@@ -1463,9 +1529,53 @@ impl RuleGroupEntry {
             rule_group_id,
             name,
             metric_name,
+            rules: Vec::new(),
             tags: BTreeMap::new(),
             permission_policy: None,
         }
+    }
+
+    /// Whether this rule group activates the rule `rule_id` names.
+    ///
+    /// An activation is identified by its `RuleId`: "If you want to replace one `Rule`
+    /// with another, you delete the existing one and add the new one."
+    pub fn holds_rule(&self, rule_id: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|activated| activated.rule_id == rule_id)
+    }
+
+    /// Whether an activation this rule group already holds has taken `priority`.
+    ///
+    /// Source: `ActivatedRule.Priority`'s own documentation — "The value must be a
+    /// unique integer. If you add multiple `Rules` […] the values don't need to be
+    /// consecutive."
+    pub fn priority_taken(&self, priority: i32) -> bool {
+        self.rules
+            .iter()
+            .any(|activated| activated.priority == priority)
+    }
+
+    /// Activate `activated` in this rule group, keeping the list in priority order.
+    /// Answers whether the group changed — `false` for a rule it already activates.
+    pub fn insert_rule(&mut self, activated: &ActivatedRule) -> bool {
+        if self.holds_rule(&activated.rule_id) {
+            return false;
+        }
+        self.rules.push(activated.clone());
+        self.rules.sort_by_key(|activated| activated.priority);
+        true
+    }
+
+    /// Remove the activation of the rule `rule_id` names, if this group holds one.
+    /// Answers whether the group changed.
+    pub fn remove_rule(&mut self, rule_id: &str) -> bool {
+        if !self.holds_rule(rule_id) {
+            return false;
+        }
+        self.rules
+            .retain(|activated| activated.rule_id != rule_id);
+        true
     }
 
     /// This record projected onto the modelled `RuleGroup` shape the Create and Get
