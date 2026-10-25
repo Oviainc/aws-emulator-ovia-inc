@@ -23,10 +23,13 @@
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
 //! IPv4 address the account reserves and attaches to an instance), the **CDN
 //! distribution** (a global resource that caches and serves the content of an
-//! origin resource), the peering of a Region's **Lightsail VPC** with the
-//! account's default VPC there, the temporary **container image registry log in**
-//! credentials `CreateContainerServiceRegistryLogin` hands out for the account's
-//! container image registry, the append-only **operation log** every mutating
+//! origin resource) together with the **certificate** (an SSL/TLS certificate
+//! the account requests for a domain, which is attached to a distribution so it
+//! accepts HTTPS traffic for that certificate's domains), the peering of a
+//! Region's **Lightsail VPC** with the account's default VPC there, the
+//! temporary **container image registry log in** credentials
+//! `CreateContainerServiceRegistryLogin` hands out for the account's container
+//! image registry, the append-only **operation log** every mutating
 //! call writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
@@ -60,14 +63,15 @@ use crate::ops::types::{
     AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, Alarm,
     AvailabilityZone, Blueprint, Bucket, BucketAccessLogConfig, BucketBundle, BucketCorsConfig,
     BucketCorsRule, BucketState, Bundle, CacheBehavior, CacheBehaviorPerPath, CacheSettings,
-    Container,
+    Certificate, CertificateSummary, Container,
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContactMethod,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, DestinationInfo,
     DistributionBundle, DistributionCustomErrorResponse,
-    Domain, DomainEntry, ExportSnapshotRecord, ExportSnapshotRecordSourceInfo,
+    Domain, DomainEntry, DomainValidationRecord, ExportSnapshotRecord,
+    ExportSnapshotRecordSourceInfo,
     Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, LightsailDistribution, LoadBalancer,
@@ -651,6 +655,11 @@ pub const OPERATION_TYPE_ALLOCATE_STATIC_IP: &str = "AllocateStaticIp";
 pub const OPERATION_TYPE_PUT_ALARM: &str = "PutAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_ALARM: &str = "DeleteAlarm";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_CERTIFICATE: &str = "CreateCertificate";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
+    "AttachCertificateToDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_CONTACT_METHOD: &str = "CreateContactMethod";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -8606,14 +8615,250 @@ pub const INSTANCE_HEALTH_INITIAL: &str = "initial";
 pub const INSTANCE_HEALTH_REASON_REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
 
 // ---------------------------------------------------------------------------
-// CDN distributions
+// SSL/TLS certificates and CDN distributions
 // ---------------------------------------------------------------------------
+
+/// The `resourceType` a certificate and its operations report, from the modelled
+/// `ResourceType` enum.
+pub const RESOURCE_TYPE_CERTIFICATE: &str = "Certificate";
 
 /// The `resourceType` a content delivery network distribution reports, from the
 /// modelled `ResourceType` enum — the value the
 /// `LightsailDistribution$resourceType` documentation names ("The Lightsail
 /// resource type (`Distribution`)").
 pub const RESOURCE_TYPE_DISTRIBUTION: &str = "Distribution";
+
+/// The resource portion a certificate ARN carries before its id. Mirrors the
+/// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
+/// this resource's own `ResourceType` value.
+pub const CERTIFICATE_ARN_RESOURCE_PREFIX: &str = "Certificate/";
+
+/// The `CertificateStatus` a certificate this account just requested is in, from
+/// the modelled enum: Lightsail has to validate the domain before the
+/// certificate authority issues it.
+pub const CERTIFICATE_STATUS_PENDING_VALIDATION: &str = "PENDING_VALIDATION";
+
+/// The `CertificateStatus` of a validated certificate, from the modelled enum.
+/// `AttachCertificateToDistribution`'s `certificateName` documentation says
+/// "Only certificates with a status of ISSUED can be attached to a
+/// distribution".
+pub const CERTIFICATE_STATUS_ISSUED: &str = "ISSUED";
+
+/// The `CertificateDomainValidationStatus` of a domain whose validation is still
+/// outstanding, from the modelled enum.
+pub const DOMAIN_VALIDATION_STATUS_PENDING: &str = "PENDING_VALIDATION";
+
+/// The `CertificateDomainValidationStatus` of a validated domain, from the
+/// modelled enum.
+pub const DOMAIN_VALIDATION_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// The algorithm a Lightsail certificate's key pair is generated with, as
+/// `Certificate$keyAlgorithm` reports it.
+///
+/// A Lightsail SSL/TLS certificate is an AWS Certificate Manager certificate,
+/// and AWS documents `RSA_2048` as the key algorithm ACM requests a certificate
+/// with unless the caller asks for another — and Lightsail's `CreateCertificate`
+/// takes no key-algorithm parameter, so there is no other to ask for.
+pub const CERTIFICATE_KEY_ALGORITHM: &str = "RSA_2048";
+
+/// The certificate authority that issued the certificate, as
+/// `Certificate$issuerCA` reports it: Amazon's own, because Lightsail requests
+/// the certificate from AWS Certificate Manager rather than from a CA the caller
+/// names.
+pub const CERTIFICATE_ISSUER_CA: &str = "Amazon";
+
+/// How long an issued certificate stays valid: `notAfter` is `notBefore` plus
+/// this span.
+///
+/// A DOCUMENTED duration, not a chosen one: AWS documents that "ACM
+/// certificates are valid for 13 months (395 days)", and a Lightsail
+/// certificate is an ACM certificate.
+pub const CERTIFICATE_VALIDITY_MILLIS: i64 = 395 * 24 * 60 * 60 * 1_000;
+
+/// The most alternate domains one certificate may carry.
+///
+/// A DOCUMENTED limit, not a guard: the modelled
+/// `CreateCertificate$subjectAlternativeNames` documentation says "You can
+/// specify a maximum of nine alternate domains (in addition to the primary
+/// domain name)".
+pub const MAX_SUBJECT_ALTERNATIVE_NAMES: usize = 9;
+
+/// The most SSL/TLS certificates this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_CERTIFICATES: usize = 500;
+
+/// How many certificates one `GetCertificates` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more certificates remain.
+pub const CERTIFICATE_PAGE_SIZE: usize = 10;
+
+/// The ARN of the certificate `id`. A certificate, like the distribution it is
+/// attached to, lives in [`DISTRIBUTION_REGION_NAME`] — "only certificates
+/// created in the us-east-1 Amazon Web Services Region can be attached to
+/// Lightsail distributions" — so that is the Region its ARN carries.
+pub fn certificate_arn(id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        DISTRIBUTION_REGION_NAME,
+        &format!("{CERTIFICATE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The serial number of the certificate minted as `id`, as
+/// `Certificate$serialNumber` reports it.
+///
+/// An X.509 serial number is printed as colon-separated hex byte pairs, and this
+/// one is built from the certificate's own minted id — so it identifies that one
+/// certificate and is the same on every later read. An odd trailing digit is
+/// dropped, so every group is a whole byte; a minted uuid carries 32 hex digits,
+/// which the assertion below pins.
+pub fn certificate_serial_number(id: &str) -> String {
+    let mut digits: Vec<char> = id.chars().filter(char::is_ascii_hexdigit).collect();
+    debug_assert!(
+        digits.len() >= 2,
+        "a certificate id carries at least one hex byte, got {id:?}"
+    );
+    digits.truncate(digits.len() - digits.len() % 2);
+    digits
+        .chunks(2)
+        .map(|pair| pair.iter().collect::<String>())
+        .collect::<Vec<String>>()
+        .join(":")
+}
+
+/// One stored SSL/TLS certificate: the request the caller made, the members the
+/// service assigned, and the validation state it is in.
+#[derive(Debug, Clone)]
+pub struct StoredCertificate {
+    /// The certificate name the request named, kept verbatim — it is this
+    /// record's store key and the name every certificate operation addresses it
+    /// by.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    /// Where the certificate lives — always [`DISTRIBUTION_REGION_NAME`], for
+    /// the reason that constant gives.
+    ///
+    /// Kept on the record rather than re-derived: the modelled `Certificate`
+    /// carries no location member, but every operation that LOGS about this
+    /// certificate has to locate its entry where the resource is, and this is
+    /// where that location comes from.
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The domain the certificate is for, kept as the request asked.
+    pub domain_name: String,
+    /// The alternate domains and subdomains the certificate also covers, kept in
+    /// the order the request named them.
+    pub subject_alternative_names: Vec<String>,
+    pub serial_number: String,
+    /// The current `CertificateStatus`.
+    pub status: &'static str,
+    /// The status the clock owes this certificate, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The instant the certificate authority issues this certificate — the same
+    /// instant the clock owes it [`CERTIFICATE_STATUS_ISSUED`] — which is what
+    /// `issuedAt`, `notBefore` and `notAfter` are reported from once it is
+    /// issued.
+    pub issued_at_ms: i64,
+}
+
+impl StoredCertificate {
+    /// Whether the certificate authority has issued this certificate.
+    pub fn is_issued(&self) -> bool {
+        self.status == CERTIFICATE_STATUS_ISSUED
+    }
+
+    /// Every domain this certificate covers — the domain it is for, then each
+    /// alternate domain the request named that is not already in the list.
+    ///
+    /// This is what a distribution the certificate is attached to reports as its
+    /// `alternativeDomainNames`: "After the certificate is attached, your
+    /// distribution accepts HTTPS traffic for all of the domains that are
+    /// associated with the certificate."
+    pub fn domain_names(&self) -> Vec<String> {
+        let mut names = vec![self.domain_name.clone()];
+        for alternative in &self.subject_alternative_names {
+            if !names.iter().any(|name| name == alternative) {
+                names.push(alternative.clone());
+            }
+        }
+        names
+    }
+
+    /// This record as the modelled `CertificateSummary`.
+    ///
+    /// `in_use_resource_count` is how many resources the certificate is attached
+    /// to, which only the whole store knows — see
+    /// [`ComAmazonawsLightsailLightsail20161128State::certificate_in_use_resource_count`].
+    ///
+    /// `include_details` is `GetCertificates`'s own
+    /// `includeCertificateDetails`: without it "the response will include only
+    /// the certificate Amazon Resource Name (ARN), certificate name, domain name,
+    /// and tags".
+    pub fn view(&self, in_use_resource_count: i32, include_details: bool) -> CertificateSummary {
+        CertificateSummary {
+            certificate_arn: Some(self.arn.clone()),
+            certificate_name: Some(self.name.clone()),
+            domain_name: Some(self.domain_name.clone()),
+            certificate_detail: include_details.then(|| self.detail(in_use_resource_count)),
+            tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// This record as the modelled `Certificate`, the full detail of the
+    /// certificate.
+    pub fn detail(&self, in_use_resource_count: i32) -> Certificate {
+        let issued = self.is_issued();
+        Certificate {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            domain_name: Some(self.domain_name.clone()),
+            status: Some(self.status.to_string()),
+            serial_number: Some(self.serial_number.clone()),
+            subject_alternative_names: Some(self.subject_alternative_names.clone()),
+            // One record per domain the certificate covers. This emulator owns
+            // no DNS zone to publish a validation CNAME in, so a record carries
+            // the domain it is about and the state its validation is in rather
+            // than a `resourceRecord` nobody could create.
+            domain_validation_records: Some(
+                self.domain_names()
+                    .into_iter()
+                    .map(|domain_name| DomainValidationRecord {
+                        domain_name: Some(domain_name),
+                        validation_status: Some(
+                            if issued {
+                                DOMAIN_VALIDATION_STATUS_SUCCESS
+                            } else {
+                                DOMAIN_VALIDATION_STATUS_PENDING
+                            }
+                            .to_string(),
+                        ),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            in_use_resource_count,
+            key_algorithm: Some(CERTIFICATE_KEY_ALGORITHM.to_string()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            // Nothing was issued while the certificate was still being
+            // validated, so none of the issuance members is reported until it
+            // is: a certificate has no issuer, no validity window and no issue
+            // date before the certificate authority gives it one.
+            issued_at: issued.then(|| timestamp(self.issued_at_ms)),
+            issuer_ca: issued.then(|| CERTIFICATE_ISSUER_CA.to_string()),
+            not_before: issued.then(|| timestamp(self.issued_at_ms)),
+            not_after: issued
+                .then(|| timestamp(self.issued_at_ms.saturating_add(CERTIFICATE_VALIDITY_MILLIS))),
+            tags: Some(self.tags.clone()),
+            support_code: Some(self.support_code.clone()),
+            ..Default::default()
+        }
+    }
+}
 
 /// The resource portion a distribution ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
@@ -8880,10 +9125,10 @@ pub struct StoredDistribution {
     /// moved yet can be.
     pub able_to_update_bundle: bool,
     /// The SSL/TLS certificate attached to the distribution, if the request
-    /// named one.
+    /// named one or `AttachCertificateToDistribution` attached one.
     pub certificate_name: Option<String>,
     /// The alternate domain names of the distribution, which come from the
-    /// domains of an attached certificate: a distribution this call created has
+    /// domains of an attached certificate: a distribution with none attached has
     /// none of its own.
     pub alternative_domain_names: Vec<String>,
     /// The origin the distribution pulls content from: what the request asked
@@ -9214,6 +9459,13 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// made from. A `BTreeMap` so `GetDistributions` walks a stable, total order
     /// and a page token can name the next distribution.
     pub distributions: BTreeMap<String, StoredDistribution>,
+    /// Every SSL/TLS certificate, keyed by its certificate name — the identifier
+    /// every certificate operation takes. NOT keyed by region, for the same
+    /// reason a distribution is not: a Lightsail certificate is addressed from
+    /// the one Region its API is served in (see [`DISTRIBUTION_REGION_NAME`]). A
+    /// `BTreeMap` so `GetCertificates` walks a stable, total order and a page
+    /// token can name the next certificate.
+    pub certificates: BTreeMap<String, StoredCertificate>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -9937,6 +10189,55 @@ impl ComAmazonawsLightsailLightsail20161128State {
         );
     }
 
+    /// The certificate `name` names, for a reporting operation.
+    pub fn certificate(&self, name: &str) -> Option<&StoredCertificate> {
+        self.certificates.get(name)
+    }
+
+    /// Store a newly requested certificate.
+    pub fn insert_certificate(&mut self, certificate: StoredCertificate) {
+        self.certificates
+            .insert(certificate.name.clone(), certificate);
+    }
+
+    /// How many resources of this account the certificate `name` is attached to,
+    /// which is what `Certificate$inUseResourceCount` reports.
+    ///
+    /// Counted from the records that hold the attachment rather than from a
+    /// counter, so the number cannot drift from the distributions that actually
+    /// name the certificate. The walk is bounded by [`MAX_DISTRIBUTIONS`].
+    pub fn certificate_in_use_resource_count(&self, name: &str) -> i32 {
+        let count = self
+            .distributions
+            .values()
+            .filter(|distribution| distribution.certificate_name.as_deref() == Some(name))
+            .count();
+        i32::try_from(count).unwrap_or(i32::MAX)
+    }
+
+    /// The certificate `name` names as the modelled `CertificateSummary`, with
+    /// the resources it is attached to counted.
+    ///
+    /// The one way a reporting operation renders a certificate: the attachment
+    /// lives on the DISTRIBUTION record, so assembling the view needs the whole
+    /// store, not just the certificate.
+    pub fn certificate_view(&self, name: &str, include_details: bool) -> Option<CertificateSummary> {
+        let certificate = self.certificates.get(name)?;
+        Some(certificate.view(
+            self.certificate_in_use_resource_count(name),
+            include_details,
+        ))
+    }
+
+    /// The distribution `name` names, for an operation the spec says mutates it
+    /// — attaching a certificate to it, or releasing the one it holds.
+    ///
+    /// `name` is this record's store key, so it must not be reassigned through
+    /// this handle; no operation in this slice renames a distribution.
+    pub fn distribution_mut(&mut self, name: &str) -> Option<&mut StoredDistribution> {
+        self.distributions.get_mut(name)
+    }
+
     /// A token of `len` characters drawn from `alphabet`, for the purpose
     /// `label` names.
     ///
@@ -10293,6 +10594,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// relational database, one of its snapshots, or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
+    /// a certificate reaches the validation status it was owed,
     /// a Region's Lightsail VPC peering walks into the phase it was owed
     /// (established, or gone), a CDN distribution settles into the status it was
     /// owed, an operation whose work is done settles into `Succeeded`, and a set
@@ -10309,7 +10611,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`MAX_CONTAINER_SERVICES`],
     /// [`MAX_RELATIONAL_DATABASES`],
     /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`],
-    /// [`MAX_DISTRIBUTIONS`] and
+    /// [`MAX_CERTIFICATES`], [`MAX_DISTRIBUTIONS`] and
     /// [`MAX_OPERATION_HISTORY`] — and, for the peering walk, by the modelled
     /// `RegionName` enum [`vpc_peerings`](Self::vpc_peerings) is keyed by — and a
     /// record drops out of the work as soon as it has nothing outstanding.
@@ -10501,6 +10803,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 distribution.status = due.state;
                 distribution.due = None;
+            }
+        }
+        for certificate in self.certificates.values_mut() {
+            let Some(due) = certificate.due else { continue };
+            if due.at_ms <= now_ms {
+                certificate.status = due.state;
+                certificate.due = None;
             }
         }
         for operation in &mut self.operations {
