@@ -51,6 +51,8 @@ mod disk_block_storage;
 mod disk_delete;
 #[path = "all/disk_detach.rs"]
 mod disk_detach;
+#[path = "all/disk_listing.rs"]
+mod disk_listing;
 #[path = "all/disk_restore_from_snapshot.rs"]
 mod disk_restore_from_snapshot;
 #[path = "all/disk_restore_snapshot_completeness.rs"]
