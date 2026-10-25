@@ -447,6 +447,78 @@ impl DataSource {
 }
 
 // ---------------------------------------------------------------------------
+// Indexes
+//
+// An index is a sub-resource of a domain, the way a data source is:
+// `CreateIndex` mints one and `GetIndex` reports it, both from the ONE [`Index`]
+// record below, so the schema a create persisted is the schema a read answers
+// with.
+// ---------------------------------------------------------------------------
+
+/// `IndexStatus`'s `CREATED` value — the status `CreateIndex` reports for the index
+/// it minted. `IndexStatus` declares exactly `CREATED | UPDATED | DELETED`
+/// ([`crate::ops::types::INDEX_STATUS_VALUES`]): a value per index call, so what the
+/// member carries is which call was served, not a lifecycle state the resource moves
+/// through.
+pub const INDEX_STATUS_CREATED: &str = "CREATED";
+
+/// How many indexes one domain may hold before a create is refused.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — the model
+/// publishes none — and it is what stops a caller looping with fresh index names
+/// from growing this process's state without end.
+pub const INDEX_QUOTA: usize = 100;
+
+/// The characters `IndexName`'s pattern forbids ANYWHERE in the name, from its
+/// trailing character class `[^ ,:"+/*\\|?#><A-Z]` (the upper-case letters that
+/// class also excludes are tested as a range rather than listed here).
+const INDEX_NAME_FORBIDDEN: &str = " ,:\"+/*\\|?#><";
+
+/// The characters that class forbids only as the FIRST character, from
+/// `IndexName`'s leading class `[^_ ,:"+/*\\|?#><A-Z-]`: an index name may carry an
+/// underscore or a hyphen, just not lead with one.
+const INDEX_NAME_FORBIDDEN_FIRST: [char; 2] = ['_', '-'];
+
+/// Whether `value` is an `IndexName`: pattern
+/// `^(?!\.\.?$)[^_ ,:"+/*\\|?#><A-Z-][^ ,:"+/*\\|?#><A-Z]*$` with
+/// `@length(min: 1, max: 255)`.
+///
+/// The request boundary enforces the length bound but not this pattern — its
+/// negative lookahead is not a construct the boundary's regex engine compiles — so
+/// an operation that takes an `IndexName` checks the shape itself rather than
+/// storing a name no index could have. The same reasoning as [`is_guid`] and
+/// [`is_arn`], and a SHAPE test only: whether the name resolves to a stored index is
+/// the lookup's job.
+pub fn is_index_name(value: &str) -> bool {
+    // The lookahead: `.` and `..` are the two names the pattern refuses outright
+    // (they are the relative path segments of the index's own on-disk directory).
+    if value == "." || value == ".." {
+        return false;
+    }
+    let forbidden =
+        |ch: char| INDEX_NAME_FORBIDDEN.contains(ch) || ch.is_ascii_uppercase();
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        // The length bound already refuses the empty name; a handler that is handed
+        // one anyway refuses it here rather than storing it.
+        return false;
+    };
+    !forbidden(first) && !INDEX_NAME_FORBIDDEN_FIRST.contains(&first) && !characters.any(forbidden)
+}
+
+/// One OpenSearch index of a domain, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct Index {
+    /// `IndexName`. Unique within the domain, so the name IS the key the domain's
+    /// map holds it under.
+    pub index_name: String,
+    /// The `IndexSchema` document the call that minted this index carried, stored
+    /// VERBATIM as the modelled document rather than as a parsed mirror of it:
+    /// `GetIndex` answers with "the JSON schema of the index", which is this.
+    pub schema: ::aws_smithy_types::Document,
+}
+
+// ---------------------------------------------------------------------------
 // Cross-cluster connections
 // ---------------------------------------------------------------------------
 
@@ -1102,6 +1174,11 @@ pub struct Domain {
     /// domain, so the name IS the key. Iterating a `BTreeMap` is order-stable, which
     /// is what lets `ListDataSources` report the same order twice.
     pub data_sources: BTreeMap<String, DataSource>,
+    /// This domain's OpenSearch indexes, keyed by their `IndexName` — unique per
+    /// domain, so the name IS the key. `CreateIndex` mints one and `GetIndex`
+    /// reports it, from THIS one record, and deleting the domain releases every
+    /// index on it. Bounded by [`INDEX_QUOTA`].
+    pub indexes: BTreeMap<String, Index>,
     /// The packages of this account that are associated with this domain, keyed by
     /// their `PackageID` — a domain holds at most ONE association per package, so
     /// the package's id IS the key. `AssociatePackages` makes one and
@@ -3370,6 +3447,59 @@ pub fn data_source_absent(name: &str) -> ValidationException {
 pub fn data_source_exists(name: &str) -> ValidationException {
     ValidationException {
         message: Some(format!("DataSource with name {name} already exists.")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a name that names no index of a
+/// domain the store DOES hold.
+///
+/// An index is a resource of its own — `CreateIndex` models
+/// `ResourceAlreadyExistsException` for one the domain already has — so a read of
+/// one that does not exist is the modelled missing-resource refusal, naming both
+/// the domain and the index so a caller tells it apart from [`domain_not_found`].
+pub fn index_not_found(domain_name: &str, index_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Index {index_name} doesn't exist in domain {domain_name}."
+        )),
+    }
+}
+
+/// The `ResourceAlreadyExistsException` payload for a create naming an index the
+/// domain already holds — the mirror of [`index_not_found`], so one refusal reads
+/// like the other.
+pub fn index_exists(domain_name: &str, index_name: &str) -> ResourceAlreadyExistsException {
+    ResourceAlreadyExistsException {
+        message: Some(format!(
+            "Index {index_name} already exists in domain {domain_name}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a member that must be an `IndexName` and
+/// is not ([`is_index_name`]). It names the member and the value, so the caller can
+/// fix the request from the refusal alone — the same shape as [`malformed_guid`].
+pub fn malformed_index_name(member: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} must not be '.' or '..', must not begin with '_' or '-', and must carry \
+             no upper-case letter, whitespace or any of ,:\"+/*\\|?#>< : {value}"
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an `IndexSchema` that is not a JSON
+/// object.
+///
+/// `IndexSchema` is a document "defining index mappings, settings, and semantic
+/// enrichment configuration" — a set of named sections — so a document that carries
+/// a scalar or an array instead is a malformed request rather than a schema with no
+/// sections.
+pub fn malformed_index_schema(member: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} must be a JSON object of index schema sections."
+        )),
     }
 }
 

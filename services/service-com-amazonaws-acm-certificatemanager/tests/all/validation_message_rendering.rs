@@ -7,18 +7,22 @@
 //! request a trace happened to record:
 //!
 //! 1. ACM states every member-constraint failure as
-//!    `Value of the input at '<member path>' failed to satisfy constraint:
-//!    <modelled requirement>`, joined into the AWS envelope
-//!    (`N validation error(s) detected: `), naming the input POSITION and the
-//!    requirement and never the value that was submitted there (an ABSENT member,
-//!    having no submitted value, keeps the `Value null at '<path>'` subject); a
-//!    `@pattern` requirement reports the expression without the model's `^` / `$`
-//!    anchoring, and a failure of a collection's ELEMENT is reported against the
-//!    collection member with the element's requirement nested.
+//!    `<subject> failed to satisfy constraint: <modelled requirement>`, joined into
+//!    the AWS envelope (`N validation error(s) detected: `). The subject names the
+//!    input POSITION that failed and the value submitted there
+//!    (`Value '<value>' at '<member path>'`), EXCEPT at a position whose value ACM
+//!    withholds — a resource identifier (`…Arn`), a request token (`…Token`), and a
+//!    value the validating walk holds no submitted text for (a collection's element
+//!    count, a value past its echo cap) — which read
+//!    `Value of the input at '<member path>'`; an ABSENT member, having no submitted
+//!    value at all, reads `Value null at '<path>'`. A `@pattern` requirement reports
+//!    the expression without the model's `^` / `$` anchoring, and a failure of a
+//!    collection's ELEMENT is reported against the collection member with the
+//!    element's requirement nested.
 //!    The table spans the constraint kinds (`@required`, `@length` on a string and
 //!    on a list, `@range`, `@pattern`, `@enum`), the member depth (a top-level
-//!    member, a collection element, and a member of a collection element), several
-//!    operations, and the one- and many-clause envelopes.
+//!    member, a collection element, and a member of a collection element), both
+//!    subjects, several operations, and the one- and many-clause envelopes.
 //! 2. `ListCertificates` refuses a request that names exactly one of
 //!    `SortBy` / `SortOrder` with the sentence for that paired-parameter rule.
 //! 3. `RequestCertificate` refuses a `DomainValidationOptions` entry naming a domain
@@ -35,9 +39,30 @@ use serde_json::{json, Value};
 
 use crate::certificate_lifecycle::{call, describe, error_code, router, ACCOUNT, REGION};
 
-/// How ACM names the subject of a constraint clause: the input position, never the
-/// submitted value.
-const SUBJECT: &str = "Value of the input at";
+/// How ACM names the subject of a constraint clause at a position whose value it
+/// WITHHOLDS: the input position, never the submitted value.
+const WITHHOLDING_SUBJECT: &str = "Value of the input at";
+
+/// Which of the two subjects a row's clauses open with.
+#[derive(Clone, Copy)]
+enum Subject<'a> {
+    /// The value as submitted, which is what every position states but the few ACM
+    /// withholds.
+    Echoed(&'a str),
+    /// The withholding form, for a resource identifier, a request token, or a value
+    /// the validating walk holds no submitted text for.
+    Withheld,
+}
+
+impl Subject<'_> {
+    /// The subject as it is rendered in front of a clause about `path`.
+    fn rendered(self, path: &str) -> String {
+        match self {
+            Subject::Echoed(value) => format!("Value '{value}' at '{path}'"),
+            Subject::Withheld => format!("{WITHHOLDING_SUBJECT} '{path}'"),
+        }
+    }
+}
 
 /// The `@pattern` of `com.amazonaws.acm#Arn`, as the model spells it
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#Arn")`), anchors included.
@@ -100,12 +125,14 @@ const CERTIFICATE_STATUS_VALUES: &[&str] = &[
 ];
 
 /// One constraint-rendering row: what it exercises, the operation to call, the
-/// request body, the `(member path, requirement)` clauses the answer must state in
-/// order, and the caller-supplied strings that must NOT appear in it.
+/// request body, the subject its clauses open with, the `(member path, requirement)`
+/// clauses the answer must state in order, and the caller-supplied strings that must
+/// NOT appear in it.
 struct Case<'a> {
     what: &'a str,
     operation: &'a str,
     body: Value,
+    subject: Subject<'a>,
     clauses: Vec<(&'a str, String)>,
     withheld: Vec<&'a str>,
 }
@@ -140,11 +167,14 @@ fn unanchored(modelled: &str) -> &str {
 
 /// The full message the clauses must compose into: the AWS envelope over one clause
 /// per violation, in order.
-fn envelope(clauses: &[(&str, String)]) -> String {
+fn envelope(subject: Subject<'_>, clauses: &[(&str, String)]) -> String {
     let rendered: Vec<String> = clauses
         .iter()
         .map(|(path, requirement)| {
-            format!("{SUBJECT} '{path}' failed to satisfy constraint: {requirement}")
+            format!(
+                "{} failed to satisfy constraint: {requirement}",
+                subject.rendered(path)
+            )
         })
         .collect();
     match rendered.len() {
@@ -165,6 +195,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "a malformed resourceArn on a read operation",
             operation: "ListTagsForResource",
             body: json!({ "ResourceArn": "not-a-valid-arn-at-all" }),
+            subject: Subject::Withheld,
             clauses: vec![("resourceArn", pattern_requirement(ARN_PATTERN))],
             withheld: vec!["not-a-valid-arn-at-all"],
         },
@@ -172,6 +203,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "the same malformed resourceArn on a write operation",
             operation: "UntagResource",
             body: json!({ "ResourceArn": "not-a-valid-arn-at-all", "TagKeys": ["Env"] }),
+            subject: Subject::Withheld,
             clauses: vec![("resourceArn", pattern_requirement(ARN_PATTERN))],
             withheld: vec!["not-a-valid-arn-at-all"],
         },
@@ -179,6 +211,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "a resourceArn that is both too short and malformed",
             operation: "UntagResource",
             body: json!({ "ResourceArn": "arn:aws:acm:x", "TagKeys": ["Env"] }),
+            subject: Subject::Withheld,
             clauses: vec![
                 (
                     "resourceArn",
@@ -196,6 +229,7 @@ fn cases() -> Vec<Case<'static>> {
                 "ValidationMethod": "DNS",
                 "CertificateAuthorityArn": "not-a-valid-certificate-authority-arn-at-all",
             }),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "certificateAuthorityArn",
                 pattern_requirement(PCA_ARN_PATTERN),
@@ -206,6 +240,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "an idempotencyToken over the maximum length AND outside its pattern",
             operation: "PutAccountConfiguration",
             body: json!({ "IdempotencyToken": "edcf2492-b054-4720-b528-4e3096c39531" }),
+            subject: Subject::Withheld,
             clauses: vec![
                 (
                     "idempotencyToken",
@@ -222,6 +257,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "an idempotencyToken under the minimum length AND outside its pattern",
             operation: "PutAccountConfiguration",
             body: json!({ "IdempotencyToken": "" }),
+            subject: Subject::Withheld,
             clauses: vec![
                 (
                     "idempotencyToken",
@@ -238,6 +274,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "an idempotencyToken of a legal length but outside its pattern",
             operation: "PutAccountConfiguration",
             body: json!({ "IdempotencyToken": "token-with-dashes" }),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "idempotencyToken",
                 pattern_requirement(IDEMPOTENCY_TOKEN_PATTERN),
@@ -248,6 +285,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "an integer member below its @range minimum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 0 }),
+            subject: Subject::Echoed("0"),
             clauses: vec![(
                 "maxItems",
                 "Member must have value greater than or equal to 1".to_string(),
@@ -258,6 +296,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "an integer member above its @range maximum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 1001 }),
+            subject: Subject::Echoed("1001"),
             clauses: vec![(
                 "maxItems",
                 "Member must have value less than or equal to 1000".to_string(),
@@ -268,6 +307,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "a list member below its @length minimum (entry count)",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": [] }),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "tagKeys",
                 "Member must have length greater than or equal to 1".to_string(),
@@ -278,6 +318,7 @@ fn cases() -> Vec<Case<'static>> {
             what: "a list member above its @length maximum (entry count)",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": many_keys }),
+            subject: Subject::Withheld,
             clauses: vec![(
                 "tagKeys",
                 "Member must have length less than or equal to 50".to_string(),
@@ -291,13 +332,15 @@ fn cases() -> Vec<Case<'static>> {
                 "CertificateArn": arn,
                 "Tags": [{ "Key": "{not-a-legal-key}", "Value": "ok" }],
             }),
+            subject: Subject::Echoed("{not-a-legal-key}"),
             clauses: vec![("tags.1.member.key", pattern_requirement(TAG_KEY_PATTERN))],
-            withheld: vec!["{not-a-legal-key}"],
+            withheld: vec![],
         },
         Case {
             what: "a list ELEMENT outside its enum value set",
             operation: "ListCertificates",
             body: json!({ "CertificateStatuses": ["NOT_A_STATUS"] }),
+            subject: Subject::Echoed("NOT_A_STATUS"),
             clauses: vec![(
                 "certificateStatuses",
                 nested(&format!(
@@ -305,12 +348,13 @@ fn cases() -> Vec<Case<'static>> {
                     CERTIFICATE_STATUSES.join(", ")
                 )),
             )],
-            withheld: vec!["NOT_A_STATUS"],
+            withheld: vec![],
         },
         Case {
             what: "a list ELEMENT below the element's @length minimum",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": [""] }),
+            subject: Subject::Echoed(""),
             clauses: vec![(
                 "tagKeys",
                 nested("Member must have length greater than or equal to 1"),
@@ -321,11 +365,12 @@ fn cases() -> Vec<Case<'static>> {
             what: "a list ELEMENT outside the element's @pattern",
             operation: "UntagResource",
             body: json!({ "ResourceArn": arn, "TagKeys": ["{not-a-legal-key}"] }),
+            subject: Subject::Echoed("{not-a-legal-key}"),
             clauses: vec![(
                 "tagKeys",
                 nested(&pattern_requirement(TAG_KEY_PATTERN)),
             )],
-            withheld: vec!["{not-a-legal-key}"],
+            withheld: vec![],
         },
         // The same rule at the OTHER seam: a value sitting directly on a UNION
         // member, which the framework's validating walk does not descend into, so
@@ -338,6 +383,7 @@ fn cases() -> Vec<Case<'static>> {
                     "Filter": { "AcmCertificateMetadataFilter": { "Status": "NOT_A_STATUS" } },
                 },
             }),
+            subject: Subject::Echoed("NOT_A_STATUS"),
             clauses: vec![(
                 "FilterStatement.Filter.AcmCertificateMetadataFilter.Status",
                 format!(
@@ -345,7 +391,7 @@ fn cases() -> Vec<Case<'static>> {
                     CERTIFICATE_STATUS_VALUES.join(", ")
                 ),
             )],
-            withheld: vec!["NOT_A_STATUS"],
+            withheld: vec![],
         },
     ]
 }
@@ -395,11 +441,11 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
              constraint: Member must not be null",
         ),
         // A collection ELEMENT's failure, reported against the collection member
-        // with the element's requirement nested.
+        // with the element's requirement nested, and the element's own value stated.
         (
             "ListCertificates",
             json!({ "CertificateStatuses": ["NOT_A_STATUS"] }),
-            "1 validation error detected: Value of the input at 'certificateStatuses' failed to \
+            "1 validation error detected: Value 'NOT_A_STATUS' at 'certificateStatuses' failed to \
              satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value \
              set: [PENDING_VALIDATION, ISSUED, INACTIVE, EXPIRED, VALIDATION_TIMED_OUT, REVOKED, \
              FAILED]]",
@@ -421,9 +467,9 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
 }
 
 /// RULE: ACM states every member-constraint failure against the input POSITION that
-/// failed and the requirement the model declares there — one clause per violation in
-/// the AWS envelope, with the submitted value withheld and a `@pattern` reported
-/// without the model's anchors.
+/// failed, the requirement the model declares there and the value submitted there — one
+/// clause per violation in the AWS envelope, with the value withheld only at the
+/// positions ACM withholds it at and a `@pattern` reported without the model's anchors.
 #[tokio::test]
 async fn every_constraint_failure_is_stated_against_the_input_position() {
     let router = router();
@@ -433,6 +479,7 @@ async fn every_constraint_failure_is_stated_against_the_input_position() {
             what,
             operation,
             body,
+            subject,
             clauses,
             withheld,
         } = case;
@@ -449,7 +496,7 @@ async fn every_constraint_failure_is_stated_against_the_input_position() {
         let stated = message(&answer);
         assert_eq!(
             stated,
-            envelope(&clauses),
+            envelope(subject, &clauses),
             "case {what:?} ({operation}): expected the ACM constraint envelope, got {stated:?}"
         );
         for value in withheld {

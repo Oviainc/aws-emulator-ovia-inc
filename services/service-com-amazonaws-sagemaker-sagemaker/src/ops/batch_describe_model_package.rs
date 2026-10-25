@@ -178,7 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(package) = found else {
                 errors.insert(
                     requested.clone(),
-                    item_error(format!("Could not find model package \"{requested}\".")),
+                    item_error(crate::state::could_not_find(
+                        crate::state::MODEL_PACKAGE_KIND_LABEL,
+                        requested,
+                    )),
                 );
                 continue;
             };

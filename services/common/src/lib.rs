@@ -135,7 +135,9 @@
 //! bind the IDENTICAL route the modelled shape of the path label decides. The route is
 //! the finest discriminator a REST model publishes, it names no service, and it is read
 //! through the service's OWN protocol (`routing_key`), so the claim and the later
-//! operation lookup cannot disagree.
+//! operation lookup cannot disagree. The six services that sign as `chime` are the other
+//! instance of that shape, and their shared signing name is not even their endpoint
+//! prefix, so they are told apart by [`chime_family`] instead.
 //!
 //! The four `lambda`-signing services are the other instance of that shape: the Lambda
 //! control plane, Lambda Core, Lambda Web and Lambda MicroVMs each bind their own dated

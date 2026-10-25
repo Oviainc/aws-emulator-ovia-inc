@@ -19,6 +19,8 @@ mod env_endpoint_not_found_wording;
 mod env_endpoint_payload;
 #[path = "all/environment_business_rules.rs"]
 mod environment_business_rules;
+#[path = "all/environment_endpoint_management_lifecycle.rs"]
+mod environment_endpoint_management_lifecycle;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
 #[path = "all/environment_region_scoping.rs"]
@@ -31,5 +33,7 @@ mod environment_unit_count_ranges;
 mod environment_update_status_sequence;
 #[path = "all/rejection_contract.rs"]
 mod rejection_contract;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

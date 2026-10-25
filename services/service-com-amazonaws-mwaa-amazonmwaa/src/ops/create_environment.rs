@@ -4,8 +4,9 @@
 //!
 //! Mints an environment record in this service's store and answers with the ARN it
 //! stored, so a later `GetEnvironment` / `ListEnvironments` / `ListTagsForResource`
-//! cannot disagree with what this call returned. The environment starts `CREATING` and
-//! the clock owes it `AVAILABLE` one `crate::state::TRANSITION_SPAN` later.
+//! cannot disagree with what this call returned. Which lifecycle the new environment
+//! starts in is decided by who manages its VPC endpoints: see
+//! `crate::state::create_lifecycle`.
 //!
 //! ## Shape of an operation
 //!
@@ -385,6 +386,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         spec.validate().map_err(validation)?;
 
+        // The tags in the reserved namespace are AWS's own to apply, so a create may not
+        // seed one either: refused before the environment is recorded, so nothing is
+        // provisioned for a request AWS would not accept.
+        if let Some(reserved) = crate::state::first_reserved_tag_key(
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys())
+                .map(String::as_str),
+        ) {
+            return Err(validation(crate::state::reserved_tag_key_message(
+                "Tags", reserved,
+            )));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let mut store = state.lock();
         store.settle(now);
@@ -417,6 +433,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let name = input.name.clone();
         let arn = crate::state::environment_arn(&region, &name);
+        let (status, pending) = crate::state::create_lifecycle(&spec.endpoint_management, now);
         store.insert(crate::state::EnvironmentRecord {
             webserver_url: crate::state::webserver_url(&region, &arn),
             service_role_arn: crate::state::service_role_arn(),
@@ -430,14 +447,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: name.clone(),
             arn,
             region: region.clone(),
-            // A new environment is not ready yet: the clock owes it AVAILABLE.
-            status: crate::state::STATUS_CREATING.to_string(),
-            pending: [crate::state::PendingTransition {
-                to: crate::state::STATUS_AVAILABLE.to_string(),
-                last_update_status: None,
-                due_at: now + crate::state::TRANSITION_SPAN,
-            }]
-            .into(),
+            // A new environment is not ready yet, and which non-terminal status it waits
+            // in depends on whether MWAA creates the VPC endpoints it needs or the caller
+            // does: the environment is only provisioned on by itself in the first case.
+            status,
+            pending,
             created_at: now,
             spec,
             last_update: None,

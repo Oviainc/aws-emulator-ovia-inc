@@ -158,11 +158,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // inventing a second one here.
 #[smithy_macros::operation_error(
     "com.amazonaws.eks#CreateCapability",
-    extra_errors = ["ResourceNotFoundException"]
+    extra_errors = ["ResourceNotFoundException", "ClientException"]
 )]
 #[derive(Debug)]
 pub enum CreateCapabilityErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
@@ -337,16 +338,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The lock is taken for the resolution alone and released again, because the IAM
         // call below is an `await` and this store's guard is not held across one.
-        let cluster_exists = {
+        let cluster_connected = {
             let mut guard = store.lock();
             guard.materialize_due_transitions(now);
             guard
                 .clusters
-                .contains_key(&(region.clone(), input.cluster_name.clone()))
+                .get(&(region.clone(), input.cluster_name.clone()))
+                .map(|cluster| cluster.is_connected())
         };
-        if !cluster_exists {
+        let Some(cluster_connected) = cluster_connected else {
             return Err(CreateCapabilityErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&input.cluster_name),
+            )
+            .into());
+        };
+        // A managed capability is software Amazon EKS installs and runs in the cluster's
+        // control plane, and a cluster `RegisterCluster` connected has none of that
+        // plane: this operation does not apply to it. The gate is a fact about the
+        // CLUSTER, so it is answered as soon as the cluster is resolved — before the role
+        // the body names is resolved and before the cluster's status is judged.
+        if cluster_connected {
+            return Err(CreateCapabilityErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
             )
             .into());
         }

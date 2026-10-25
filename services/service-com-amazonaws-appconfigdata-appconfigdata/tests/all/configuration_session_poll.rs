@@ -2,32 +2,39 @@
 
 //! The AppConfigData configuration-polling loop, end to end over HTTP.
 //!
-//! Every test drives real requests through the `MultiServiceRouter` this crate's
-//! service is mounted in, so routing, deserialization, the handler, and the
-//! restJson1 header/payload bindings are all exercised. The only thing written
-//! directly into state is the DEPLOYED CONFIGURATION: AppConfigData has no operation
-//! that deploys one (that is AppConfig's control plane, whose operations are still
-//! scaffolds), so a deployment is seeded through the service's own state the way a
-//! future deployment hook would write it.
+//! Every test drives real requests through a `MultiServiceRouter` that mounts BOTH
+//! AppConfigData and the AppConfig control plane over one shared engine, because the
+//! data plane has nothing of its own to serve: the applications, environments,
+//! configuration profiles, hosted configuration versions and deployments a session
+//! resolves against are created here through AppConfig's own operations, exactly as a
+//! client would create them, and the poll then reads them back. Nothing is written
+//! into either store by hand except where a test has to move the CLOCK on (a token's
+//! expiry, a deployment's start), which no operation exposes.
 //!
 //! The rules under test, none of which is specific to one payload or one identifier:
 //!
-//! * a session is persisted under the opaque token it returns, and that token
-//!   resolves back to the session on a later request;
-//! * a poll returns the configuration deployed for the session's triple, with its
-//!   content type and version label, only when that configuration's version differs
-//!   from the version the session was last served; otherwise the payload is empty;
-//!   every poll returns a fresh single-use token and a non-zero poll interval;
+//! * a session is started only for a triple the AppConfig control plane actually
+//!   holds; an unresolvable level is `ResourceNotFoundException` (404) naming the
+//!   modelled `ResourceType` and the request member that named it;
+//! * each identifier is "the ID or the name" of its level, so a session resolves
+//!   either spelling;
+//! * a poll returns the content of the configuration version the environment's
+//!   in-force deployment deployed, with that version's content type and label, only
+//!   when it differs from the version the session was last served; otherwise the
+//!   payload is empty. Every poll returns a fresh single-use token and a non-zero poll
+//!   interval;
 //! * a token that resolves to no session, or that has been used or has expired, is
-//!   refused with `BadRequestException` (400) naming the modelled problem;
-//! * a session whose triple has no deployed configuration is refused with
-//!   `ResourceNotFoundException` (404);
-//! * input outside a modelled constraint is refused with `BadRequestException` (400).
+//!   refused with `BadRequestException` (400) whose `Details.InvalidParameters` is
+//!   keyed by the offending input MEMBER and names the modelled problem;
+//! * an absent `@required` input member is `BadRequestException` (400) whose `Message`
+//!   is the validation envelope naming that member and the constraint it failed —
+//!   never a 501, and never a 400 with no message.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use service_com_amazonaws_appconfig_amazonappconfig::state::ComAmazonawsAppconfigAmazonappconfigState;
 use service_com_amazonaws_appconfigdata_appconfigdata::state::{
     ComAmazonawsAppconfigdataAppconfigdataState, DEFAULT_POLL_INTERVAL_IN_SECONDS, MAX_SESSIONS,
 };
@@ -35,8 +42,9 @@ use service_com_amazonaws_appconfigdata_appconfigdata::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` header whose credential scope names the `appconfig`
-/// signing name — the one AppConfigData signs with, per the model's `aws.auth#sigv4`
-/// trait. Request authentication is switched off below, so only the scope matters.
+/// signing name — the one both AppConfigData and the AppConfig control plane sign
+/// with, per each model's `aws.auth#sigv4` trait. Request authentication is switched
+/// off below, so only the scope matters.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/appconfig/aws4_request, \
      SignedHeaders=host, Signature=0123456789abcdef";
@@ -44,7 +52,27 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The AppConfigData endpoint host an SDK client addresses.
 const ENDPOINT_HOST: &str = "appconfigdata.us-east-1.amazonaws.com";
 
-/// One emulator: the shared engine plus a router with this service mounted.
+/// The predefined deployment strategy that reaches every target at once
+/// (`state::PREDEFINED_DEPLOYMENT_STRATEGIES`), so a deployment's rollout has begun
+/// the instant `StartDeployment` answers.
+const ALL_AT_ONCE: &str = "AppConfig.AllAtOnce";
+
+/// The `LocationUri` that selects AppConfig's own hosted configuration store.
+const HOSTED: &str = "hosted";
+
+/// One AppConfig hierarchy, as its control plane minted it.
+#[derive(Debug, Clone)]
+struct Hierarchy {
+    application_id: String,
+    application_name: String,
+    environment_id: String,
+    environment_name: String,
+    profile_id: String,
+    profile_name: String,
+}
+
+/// One emulator: the shared engine plus a router with the data plane and the control
+/// plane mounted.
 struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
@@ -56,41 +84,240 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_appconfig_amazonappconfig::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
         Self { engine, router }
     }
 
-    /// This service's store, as the handlers reach it.
+    /// This service's session store, as the handlers reach it.
     fn state(&self) -> engine::ServiceState<ComAmazonawsAppconfigdataAppconfigdataState> {
         self.engine
             .state::<ComAmazonawsAppconfigdataAppconfigdataState>()
     }
 
-    async fn start_configuration_session(&self, body: &str) -> Reply {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://{ENDPOINT_HOST}/configurationsessions"))
+    /// The AppConfig control plane's store, for the one thing no operation exposes:
+    /// moving a deployment's start instant into the past.
+    fn control_plane(&self) -> engine::ServiceState<ComAmazonawsAppconfigAmazonappconfigState> {
+        self.engine
+            .state::<ComAmazonawsAppconfigAmazonappconfigState>()
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Reply {
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{ENDPOINT_HOST}{path}"))
             .header("host", ENDPOINT_HOST)
             .header("authorization", AUTHORIZATION)
-            .header("content-type", "application/json")
-            .body(Bytes::copy_from_slice(body.as_bytes()))
-            .expect("the StartConfigurationSession request is well formed");
+            .header("content-type", content_type);
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(body).expect("the request is well formed");
         Reply::of(self.router.dispatch(request).await)
+    }
+
+    async fn post_json(&self, path: &str, body: &str) -> Reply {
+        self.send(
+            "POST",
+            path,
+            "application/json",
+            &[],
+            Bytes::copy_from_slice(body.as_bytes()),
+        )
+        .await
+    }
+
+    async fn start_configuration_session(&self, body: &str) -> Reply {
+        self.post_json("/configurationsessions", body).await
+    }
+
+    /// `GET /configuration` with whatever query string is given — `None` for a request
+    /// that carries no `configuration_token` parameter at all.
+    async fn get_configuration(&self, query: Option<&str>) -> Reply {
+        let path = match query {
+            Some(query) => format!("/configuration?{query}"),
+            None => "/configuration".to_string(),
+        };
+        self.send("GET", &path, "application/json", &[], Bytes::new())
+            .await
     }
 
     async fn get_latest_configuration(&self, token: &str) -> Reply {
-        let request = http::Request::builder()
-            .method("GET")
-            .uri(format!(
-                "https://{ENDPOINT_HOST}/configuration?configuration_token={token}"
-            ))
-            .header("host", ENDPOINT_HOST)
-            .header("authorization", AUTHORIZATION)
-            .body(Bytes::new())
-            .expect("the GetLatestConfiguration request is well formed");
-        Reply::of(self.router.dispatch(request).await)
+        self.get_configuration(Some(&format!("configuration_token={token}")))
+            .await
     }
 
-    /// Start a session and return its initial token.
+    /// Create an application, an environment and a hosted configuration profile
+    /// through AppConfig's own operations, and answer the ids and names it minted.
+    async fn create_hierarchy(
+        &self,
+        application: &str,
+        environment: &str,
+        profile: &str,
+    ) -> Hierarchy {
+        let created = self
+            .post_json("/applications", &format!(r#"{{"Name":"{application}"}}"#))
+            .await;
+        assert_eq!(
+            created.status,
+            201,
+            "CreateApplication({application}): expected 201, got {} body {}",
+            created.status,
+            created.text()
+        );
+        let application_id = created.string("Id");
+
+        let created = self
+            .post_json(
+                &format!("/applications/{application_id}/environments"),
+                &format!(r#"{{"Name":"{environment}"}}"#),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            201,
+            "CreateEnvironment({environment}): expected 201, got {} body {}",
+            created.status,
+            created.text()
+        );
+        let environment_id = created.string("Id");
+
+        let profile_id = self.create_profile(&application_id, profile).await;
+
+        Hierarchy {
+            application_id,
+            application_name: application.to_string(),
+            environment_id,
+            environment_name: environment.to_string(),
+            profile_id,
+            profile_name: profile.to_string(),
+        }
+    }
+
+    /// One more hosted configuration profile under an existing application.
+    async fn create_profile(&self, application_id: &str, profile: &str) -> String {
+        let created = self
+            .post_json(
+                &format!("/applications/{application_id}/configurationprofiles"),
+                &format!(r#"{{"Name":"{profile}","LocationUri":"{HOSTED}"}}"#),
+            )
+            .await;
+        assert_eq!(
+            created.status,
+            201,
+            "CreateConfigurationProfile({profile}): expected 201, got {} body {}",
+            created.status,
+            created.text()
+        );
+        created.string("Id")
+    }
+
+    /// Write a hosted configuration version and deploy it, as a client sets a
+    /// configuration up: the version number AppConfig minted is what the deployment
+    /// names.
+    async fn deploy(
+        &self,
+        hierarchy: &Hierarchy,
+        profile_id: &str,
+        content: &[u8],
+        content_type: &str,
+        version_label: Option<&str>,
+    ) {
+        let application_id = &hierarchy.application_id;
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(label) = version_label {
+            headers.push(("VersionLabel", label));
+        }
+        let written = self
+            .send(
+                "POST",
+                &format!(
+                    "/applications/{application_id}/configurationprofiles/{profile_id}\
+                     /hostedconfigurationversions"
+                ),
+                content_type,
+                &headers,
+                Bytes::copy_from_slice(content),
+            )
+            .await;
+        assert_eq!(
+            written.status,
+            201,
+            "CreateHostedConfigurationVersion: expected 201, got {} body {}",
+            written.status,
+            written.text()
+        );
+        let version = written
+            .header("version-number")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no Version-Number header; headers {:?}",
+                    written.headers
+                )
+            })
+            .to_string();
+
+        // Only one deployment may be in flight in an environment, so any earlier one
+        // is first allowed to finish — see `settle_deployments`.
+        self.settle_deployments(hierarchy);
+        let environment_id = &hierarchy.environment_id;
+        let started = self
+            .post_json(
+                &format!(
+                    "/applications/{application_id}/environments/{environment_id}/deployments"
+                ),
+                &format!(
+                    r#"{{"DeploymentStrategyId":"{ALL_AT_ONCE}",
+                          "ConfigurationProfileId":"{profile_id}",
+                          "ConfigurationVersion":"{version}"}}"#
+                ),
+            )
+            .await;
+        assert_eq!(
+            started.status,
+            201,
+            "StartDeployment(version {version}): expected 201, got {} body {}",
+            started.status,
+            started.text()
+        );
+    }
+
+    /// Move every deployment in the hierarchy's environment far enough into the past
+    /// that its rollout window and final bake time have both elapsed.
+    ///
+    /// The transition is the CLOCK's — AppConfig completes a deployment once its
+    /// strategy's durations have passed, whether or not anybody reads it — so a test
+    /// that needs a finished deployment moves the start instant rather than sleeping
+    /// for the strategy's bake time.
+    fn settle_deployments(&self, hierarchy: &Hierarchy) {
+        let state = self.control_plane();
+        let mut store = state.lock();
+        let Some(environment) = store
+            .applications
+            .get_mut(&hierarchy.application_id)
+            .and_then(|application| {
+                application.environments.get_mut(&hierarchy.environment_id)
+            })
+        else {
+            return;
+        };
+        for deployment in environment.deployments.values_mut() {
+            deployment.started_at -= Duration::from_secs(24 * 60 * 60);
+        }
+        environment.materialize(SystemTime::now());
+    }
+
+    /// Start a session over a triple, named however the caller spells it.
     async fn session_token(&self, application: &str, environment: &str, profile: &str) -> String {
         let reply = self
             .start_configuration_session(&format!(
@@ -152,11 +379,16 @@ impl Reply {
             .unwrap_or_else(|e| panic!("response body is not JSON ({e}): {}", self.text()))
     }
 
-    fn initial_token(&self) -> String {
-        self.json()["InitialConfigurationToken"]
+    /// One top-level string member of a JSON response body.
+    fn string(&self, member: &str) -> String {
+        self.json()[member]
             .as_str()
-            .unwrap_or_else(|| panic!("no InitialConfigurationToken in {}", self.text()))
+            .unwrap_or_else(|| panic!("no {member} in {}", self.text()))
             .to_string()
+    }
+
+    fn initial_token(&self) -> String {
+        self.string("InitialConfigurationToken")
     }
 
     fn next_token(&self) -> String {
@@ -172,17 +404,15 @@ impl Reply {
 
     /// The error code a restJson1 error response carries.
     fn error_code(&self) -> String {
-        self.json()["__type"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no __type in {}", self.text()))
-            .to_string()
+        self.string("__type")
     }
 
-    /// `Details.InvalidParameters.configuration_token.Problem`, as the modelled
-    /// `BadRequestException` carries it.
+    /// `Details.InvalidParameters.ConfigurationToken.Problem`, as the modelled
+    /// `BadRequestException` carries it: the map is keyed by the Smithy input member
+    /// name, which is how a client finds the parameter it got wrong.
     fn token_problem(&self) -> String {
         let body = self.json();
-        body["Details"]["InvalidParameters"]["configuration_token"]["Problem"]
+        body["Details"]["InvalidParameters"]["ConfigurationToken"]["Problem"]
             .as_str()
             .unwrap_or_else(|| panic!("no token problem in {}", self.text()))
             .to_string()
@@ -213,9 +443,9 @@ const CONTENT_CASES: &[ContentCase] = &[
         name: "json document",
         content_type: "application/json",
         first: br#"{"feature":"on"}"#,
-        first_label: Some("v1"),
+        first_label: Some("v-one"),
         second: br#"{"feature":"off"}"#,
-        second_label: Some("v2"),
+        second_label: Some("v-two"),
     },
     ContentCase {
         name: "yaml document",
@@ -241,41 +471,41 @@ const CONTENT_CASES: &[ContentCase] = &[
         second: &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
         second_label: Some("binary-2"),
     },
-    ContentCase {
-        name: "empty deployed content",
-        content_type: "application/json",
-        first: b"",
-        first_label: Some("empty-1"),
-        second: br#"{"now":"not empty"}"#,
-        second_label: Some("empty-2"),
-    },
 ];
 
-/// The whole polling loop, for every content class: first poll serves the deployed
-/// configuration, the next poll serves an empty payload because nothing changed, and
-/// a poll after a change serves the new content and label. Every poll rotates the
-/// token.
+/// The whole polling loop, for every content class: the first poll serves the version
+/// the environment's deployment deployed, the next poll serves an empty payload
+/// because nothing changed, and a poll after a new deployment serves the new content
+/// and label. Every poll rotates the token.
 #[tokio::test]
 async fn a_poll_returns_content_only_when_the_deployed_version_changed() {
     for case in CONTENT_CASES {
         let name = case.name;
         let emulator = Emulator::new();
+        let hierarchy = emulator
+            .create_hierarchy("MyApp", "Prod", "MyProfile")
+            .await;
         let token = emulator
-            .session_token("MyApp", "Prod", "MyProfile")
+            .session_token(
+                &hierarchy.application_name,
+                &hierarchy.environment_name,
+                &hierarchy.profile_name,
+            )
             .await;
         assert!(
             is_modelled_token(&token),
             "case {name}: the initial token must satisfy the modelled token pattern, got {token:?}"
         );
 
-        emulator.state().lock().deploy_configuration(
-            "MyApp",
-            "Prod",
-            "MyProfile",
-            case.first,
-            case.content_type,
-            case.first_label,
-        );
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                case.first,
+                case.content_type,
+                case.first_label,
+            )
+            .await;
 
         // FIRST POLL — the session has been served nothing yet, so the deployed
         // content comes back with its content type and version label.
@@ -351,15 +581,16 @@ async fn a_poll_returns_content_only_when_the_deployed_version_changed() {
             "case {name}: the second poll must rotate the token too, got {third_token:?}"
         );
 
-        // THIRD POLL — after a change, the new content and its label come back.
-        emulator.state().lock().deploy_configuration(
-            "MyApp",
-            "Prod",
-            "MyProfile",
-            case.second,
-            case.content_type,
-            case.second_label,
-        );
+        // THIRD POLL — after a new version is deployed, it and its label come back.
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                case.second,
+                case.content_type,
+                case.second_label,
+            )
+            .await;
         let third = emulator.get_latest_configuration(&third_token).await;
         assert_eq!(
             third.status,
@@ -400,46 +631,252 @@ async fn a_poll_returns_content_only_when_the_deployed_version_changed() {
     }
 }
 
-/// Redeploying identical bytes is not a change, so a session that already holds them
-/// is not made to download them again — the version is compared, not the call count.
+/// How a triple may be spelled: each identifier is documented as "the ID or the name"
+/// of its level, so every mixture of the two resolves to the same session.
 #[tokio::test]
-async fn redeploying_identical_content_is_not_a_change() {
-    let emulator = Emulator::new();
-    let token = emulator.session_token("MyApp", "Prod", "MyProfile").await;
-    for _ in 0..3 {
-        emulator.state().lock().deploy_configuration(
-            "MyApp",
-            "Prod",
-            "MyProfile",
-            b"{\"feature\":\"on\"}".to_vec(),
-            "application/json",
-            Some("v1"),
+async fn a_session_resolves_each_identifier_by_id_or_by_name() {
+    let spellings: &[(&str, [bool; 3])] = &[
+        ("all three by name", [false, false, false]),
+        ("all three by id", [true, true, true]),
+        ("application by id, the rest by name", [true, false, false]),
+        ("profile by id, the rest by name", [false, false, true]),
+        ("environment by id, the rest by name", [false, true, false]),
+    ];
+
+    for (name, by_id) in spellings {
+        let emulator = Emulator::new();
+        let hierarchy = emulator
+            .create_hierarchy("MyApp", "Prod", "MyProfile")
+            .await;
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                b"served",
+                "text/plain",
+                Some("spelling"),
+            )
+            .await;
+        let pick = |use_id: bool, id: &str, resource_name: &str| {
+            if use_id {
+                id.to_string()
+            } else {
+                resource_name.to_string()
+            }
+        };
+        let token = emulator
+            .session_token(
+                &pick(by_id[0], &hierarchy.application_id, &hierarchy.application_name),
+                &pick(by_id[1], &hierarchy.environment_id, &hierarchy.environment_name),
+                &pick(by_id[2], &hierarchy.profile_id, &hierarchy.profile_name),
+            )
+            .await;
+        let reply = emulator.get_latest_configuration(&token).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {name}: expected 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.body.as_ref(),
+            b"served",
+            "case {name}: expected the deployed content, got {:?}",
+            reply.text()
         );
     }
-    let first = emulator.get_latest_configuration(&token).await;
-    assert_eq!(
-        first.body.as_ref(),
-        b"{\"feature\":\"on\"}",
-        "the first poll must serve the deployed content, got {:?}",
-        first.text()
-    );
+}
 
-    emulator.state().lock().deploy_configuration(
-        "MyApp",
-        "Prod",
-        "MyProfile",
-        b"{\"feature\":\"on\"}".to_vec(),
-        "application/json",
-        Some("v1"),
-    );
-    let second = emulator
-        .get_latest_configuration(&first.next_token())
+/// Which level of the hierarchy a session named that the control plane does not hold.
+struct MissingCase {
+    name: &'static str,
+    /// Each identifier as the request spells it; `None` means "the one that exists".
+    application: Option<&'static str>,
+    environment: Option<&'static str>,
+    profile: Option<&'static str>,
+    /// The modelled `ResourceType` value and the request member `ReferencedBy` is
+    /// keyed by. The `ResourceType` values are the five the model's `ResourceType`
+    /// enum declares (Application, ConfigurationProfile, Deployment, Environment,
+    /// Configuration), listed in `src/ops/types/shared_types.rs` as
+    /// `RESOURCE_TYPE_VALUES`.
+    resource_type: &'static str,
+    referenced_by: &'static str,
+}
+
+const MISSING_CASES: &[MissingCase] = &[
+    MissingCase {
+        name: "unknown application",
+        application: Some("zzzzzzz"),
+        environment: None,
+        profile: None,
+        resource_type: "Application",
+        referenced_by: "ApplicationIdentifier",
+    },
+    MissingCase {
+        name: "unknown environment",
+        application: None,
+        environment: Some("Beta"),
+        profile: None,
+        resource_type: "Environment",
+        referenced_by: "EnvironmentIdentifier",
+    },
+    MissingCase {
+        name: "unknown configuration profile",
+        application: None,
+        environment: None,
+        profile: Some("OtherProfile"),
+        resource_type: "ConfigurationProfile",
+        referenced_by: "ConfigurationProfileIdentifier",
+    },
+    MissingCase {
+        name: "nothing in common",
+        application: Some("a"),
+        environment: Some("b"),
+        profile: Some("c"),
+        // Resolved outermost first, so the application is the level reported.
+        resource_type: "Application",
+        referenced_by: "ApplicationIdentifier",
+    },
+    MissingCase {
+        name: "maximum-length identifiers",
+        application: Some(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        environment: None,
+        profile: None,
+        resource_type: "Application",
+        referenced_by: "ApplicationIdentifier",
+    },
+];
+
+/// `StartConfigurationSession` resolves its three identifiers against the control
+/// plane before it mints anything: a level that does not exist is refused with the
+/// modelled `ResourceNotFoundException`, naming the level and the request member that
+/// named it — never a 201 with a token for a hierarchy that is not there.
+#[tokio::test]
+async fn a_session_for_a_resource_the_control_plane_lacks_is_not_found() {
+    for case in MISSING_CASES {
+        let name = case.name;
+        let emulator = Emulator::new();
+        let hierarchy = emulator
+            .create_hierarchy("MyApp", "Prod", "MyProfile")
+            .await;
+        let application = case.application.unwrap_or(&hierarchy.application_name);
+        let environment = case.environment.unwrap_or(&hierarchy.environment_name);
+        let profile = case.profile.unwrap_or(&hierarchy.profile_name);
+
+        let reply = emulator
+            .start_configuration_session(&format!(
+                r#"{{"ApplicationIdentifier":"{application}",
+                      "EnvironmentIdentifier":"{environment}",
+                      "ConfigurationProfileIdentifier":"{profile}"}}"#
+            ))
+            .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {name}: expected 404, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "ResourceNotFoundException",
+            "case {name}: expected ResourceNotFoundException, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.header("x-amzn-errortype"),
+            Some("ResourceNotFoundException"),
+            "case {name}: expected the error type header, got {:?}",
+            reply.header("x-amzn-errortype")
+        );
+        assert_eq!(
+            reply.json()["ResourceType"].as_str(),
+            Some(case.resource_type),
+            "case {name}: expected ResourceType {}, got {}",
+            case.resource_type,
+            reply.text()
+        );
+        assert_eq!(
+            reply.json()["ReferencedBy"][case.referenced_by].as_str(),
+            Some(match case.referenced_by {
+                "ApplicationIdentifier" => application,
+                "EnvironmentIdentifier" => environment,
+                _ => profile,
+            }),
+            "case {name}: expected ReferencedBy to name the request member, got {}",
+            reply.text()
+        );
+        assert!(
+            reply.json()["Message"]
+                .as_str()
+                .is_some_and(|message| message == format!("{} not found", case.resource_type)),
+            "case {name}: expected a Message naming the level that is missing, got {}",
+            reply.text()
+        );
+    }
+}
+
+/// A poll serves its OWN configuration profile's deployment: a deployment of another
+/// profile in the same environment is not what this session polls, so there is nothing
+/// to serve and the refusal is the modelled `ResourceNotFoundException`.
+#[tokio::test]
+async fn a_poll_with_nothing_deployed_for_its_profile_is_not_found() {
+    let emulator = Emulator::new();
+    let hierarchy = emulator
+        .create_hierarchy("MyApp", "Prod", "MyProfile")
         .await;
-    assert!(
-        second.body.is_empty(),
-        "redeploying identical content must not re-serve it, got {:?}",
-        second.text()
-    );
+    let other_profile = emulator
+        .create_profile(&hierarchy.application_id, "OtherProfile")
+        .await;
+    emulator
+        .deploy(
+            &hierarchy,
+            &hierarchy.profile_id,
+            b"only for MyProfile",
+            "text/plain",
+            None,
+        )
+        .await;
+
+    let cases: &[(&str, &str)] = &[
+        ("a profile nothing was deployed for", "OtherProfile"),
+        ("the same profile named by id", &other_profile),
+    ];
+    for (name, profile) in cases {
+        let token = emulator
+            .session_token(
+                &hierarchy.application_name,
+                &hierarchy.environment_name,
+                profile,
+            )
+            .await;
+        let reply = emulator.get_latest_configuration(&token).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {name}: expected 404, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "ResourceNotFoundException",
+            "case {name}: expected ResourceNotFoundException, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.json()["ResourceType"].as_str(),
+            Some("Configuration"),
+            "case {name}: expected the Configuration resource type, got {}",
+            reply.text()
+        );
+        assert!(
+            reply.json()["ReferencedBy"].is_null(),
+            "case {name}: a poll names no resource parameter of its own, so ReferencedBy \
+             must be absent, got {}",
+            reply.text()
+        );
+    }
 }
 
 /// How a token is made unusable before the poll that uses it.
@@ -453,7 +890,8 @@ enum TokenState {
 }
 
 /// A token resolves to exactly one session and is good for exactly one call: anything
-/// else is `BadRequestException` (400) naming the modelled problem.
+/// else is `BadRequestException` (400) naming the modelled problem, under the input
+/// member the client got wrong.
 #[tokio::test]
 async fn an_unusable_token_is_refused_with_the_modelled_problem() {
     // `Corrupted` / `Expired` are two of the three modelled
@@ -483,19 +921,23 @@ async fn an_unusable_token_is_refused_with_the_modelled_problem() {
 
     for (name, state, expected_problem) in cases {
         let emulator = Emulator::new();
-        emulator.state().lock().deploy_configuration(
-            "MyApp",
-            "Prod",
-            "MyProfile",
-            b"{}".to_vec(),
-            "application/json",
-            None,
-        );
+        let hierarchy = emulator
+            .create_hierarchy("MyApp", "Prod", "MyProfile")
+            .await;
+        emulator
+            .deploy(&hierarchy, &hierarchy.profile_id, b"{}", "application/json", None)
+            .await;
 
         let token = match state {
             TokenState::NeverMinted(token) => token.to_string(),
             TokenState::AlreadyUsed => {
-                let token = emulator.session_token("MyApp", "Prod", "MyProfile").await;
+                let token = emulator
+                    .session_token(
+                        &hierarchy.application_name,
+                        &hierarchy.environment_name,
+                        &hierarchy.profile_name,
+                    )
+                    .await;
                 let used = emulator.get_latest_configuration(&token).await;
                 assert_eq!(
                     used.status, 200,
@@ -506,7 +948,13 @@ async fn an_unusable_token_is_refused_with_the_modelled_problem() {
                 token
             }
             TokenState::Expired => {
-                let token = emulator.session_token("MyApp", "Prod", "MyProfile").await;
+                let token = emulator
+                    .session_token(
+                        &hierarchy.application_name,
+                        &hierarchy.environment_name,
+                        &hierarchy.profile_name,
+                    )
+                    .await;
                 let state = emulator.state();
                 let mut guard = state.lock();
                 let session = guard
@@ -533,64 +981,27 @@ async fn an_unusable_token_is_refused_with_the_modelled_problem() {
             reply.text()
         );
         assert_eq!(
+            reply.json()["Reason"].as_str(),
+            Some("InvalidParameters"),
+            "case {name}: expected the modelled Reason, got {}",
+            reply.text()
+        );
+        assert_eq!(
             reply.token_problem(),
             expected_problem,
             "case {name}: expected problem {expected_problem}, got {}",
             reply.text()
         );
-    }
-}
-
-/// A session whose triple has no deployed configuration is a 404 — the lookup is by
-/// the session's own triple, not "is anything deployed".
-#[tokio::test]
-async fn a_session_with_no_deployed_configuration_is_not_found() {
-    let deployed = ("MyApp", "Prod", "MyProfile");
-    let cases = [
-        ("unknown application", ("OtherApp", "Prod", "MyProfile")),
-        ("unknown environment", ("MyApp", "Beta", "MyProfile")),
-        ("unknown configuration profile", ("MyApp", "Prod", "OtherProfile")),
-        ("nothing in common", ("a", "b", "c")),
-        (
-            "maximum-length identifiers",
-            (
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            ),
-        ),
-    ];
-
-    for (name, (application, environment, profile)) in cases {
-        let emulator = Emulator::new();
-        emulator.state().lock().deploy_configuration(
-            deployed.0,
-            deployed.1,
-            deployed.2,
-            b"{\"feature\":\"on\"}".to_vec(),
-            "application/json",
-            Some("v1"),
-        );
-        let token = emulator
-            .session_token(application, environment, profile)
-            .await;
-        let reply = emulator.get_latest_configuration(&token).await;
+        // The message is the service's own terse sentence for that problem; the
+        // problem above is where a client branches.
+        let expected_message = match expected_problem {
+            "Corrupted" => "Token not valid",
+            _ => "Token expired",
+        };
         assert_eq!(
-            reply.status, 404,
-            "case {name}: expected 404, got {} body {}",
-            reply.status,
-            reply.text()
-        );
-        assert_eq!(
-            reply.error_code(),
-            "ResourceNotFoundException",
-            "case {name}: expected ResourceNotFoundException, got {}",
-            reply.text()
-        );
-        assert_eq!(
-            reply.json()["ResourceType"].as_str(),
-            Some("Configuration"),
-            "case {name}: expected the Configuration resource type, got {}",
+            reply.json()["Message"].as_str(),
+            Some(expected_message),
+            "case {name}: expected the service's message for {expected_problem}, got {}",
             reply.text()
         );
     }
@@ -614,6 +1025,7 @@ async fn the_requested_minimum_poll_interval_is_held_to_its_modelled_range() {
 
     for (name, requested, expected_status) in cases {
         let emulator = Emulator::new();
+        emulator.create_hierarchy("MyApp", "Prod", "MyProfile").await;
         let interval = requested
             .map(|seconds| format!(r#","RequiredMinimumPollIntervalInSeconds":{seconds}"#))
             .unwrap_or_default();
@@ -646,41 +1058,141 @@ async fn the_requested_minimum_poll_interval_is_held_to_its_modelled_range() {
     }
 }
 
-/// A required identifier that is absent, or outside its modelled 1..128 length, is
-/// refused with `BadRequestException` (400) — never a 200 and never a 501.
+/// An absent `@required` input member, wherever the model binds it.
+struct AbsentMemberCase {
+    name: &'static str,
+    /// The `StartConfigurationSession` body to send, or `None` for the one route whose
+    /// required member is bound to the query string.
+    body: Option<&'static str>,
+    /// The whole `Message` the refusal must carry.
+    message: &'static str,
+}
+
+const ABSENT_MEMBER_CASES: &[AbsentMemberCase] = &[
+    AbsentMemberCase {
+        name: "no ApplicationIdentifier",
+        body: Some(
+            r#"{"EnvironmentIdentifier":"Prod","ConfigurationProfileIdentifier":"MyProfile"}"#,
+        ),
+        message: "1 validation error detected: Value null at 'applicationIdentifier' failed \
+                  to satisfy constraint: Member must not be null",
+    },
+    AbsentMemberCase {
+        name: "no EnvironmentIdentifier",
+        body: Some(
+            r#"{"ApplicationIdentifier":"MyApp","ConfigurationProfileIdentifier":"MyProfile"}"#,
+        ),
+        message: "1 validation error detected: Value null at 'environmentIdentifier' failed \
+                  to satisfy constraint: Member must not be null",
+    },
+    AbsentMemberCase {
+        name: "no ConfigurationProfileIdentifier",
+        body: Some(r#"{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"Prod"}"#),
+        message: "1 validation error detected: Value null at 'configurationProfileIdentifier' \
+                  failed to satisfy constraint: Member must not be null",
+    },
+    AbsentMemberCase {
+        name: "no configuration_token query parameter",
+        body: None,
+        // The one member bound to the query string, which earns AppConfigData's own
+        // sentence rather than the body-member validation envelope.
+        message: "ConfigurationToken must be provided. Use the StartConfigurationSession \
+                  API to obtain an InitialConfigurationToken",
+    },
+];
+
+/// A `@required` input member the request omits is refused with the operation's own
+/// modelled `BadRequestException` (400), carrying a `Message` that says which member
+/// was missing — including the one member a route binds to the query string, which
+/// must not fall through to a 501.
 #[tokio::test]
-async fn a_malformed_start_request_is_refused_with_bad_request() {
+async fn an_absent_required_member_is_refused_with_the_modelled_bad_request() {
+    for case in ABSENT_MEMBER_CASES {
+        let name = case.name;
+        let emulator = Emulator::new();
+        emulator.create_hierarchy("MyApp", "Prod", "MyProfile").await;
+        let reply = match case.body {
+            Some(body) => emulator.start_configuration_session(body).await,
+            None => emulator.get_configuration(None).await,
+        };
+        assert_eq!(
+            reply.status, 400,
+            "case {name}: expected 400, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "BadRequestException",
+            "case {name}: expected BadRequestException, got {}",
+            reply.text()
+        );
+        assert_eq!(
+            reply.header("x-amzn-errortype"),
+            Some("BadRequestException"),
+            "case {name}: expected the error type header, got {:?}",
+            reply.header("x-amzn-errortype")
+        );
+        assert_eq!(
+            reply.json()["Message"].as_str(),
+            Some(case.message),
+            "case {name}: expected Message {:?}, got {}",
+            case.message,
+            reply.text()
+        );
+    }
+}
+
+/// A value outside a modelled constraint is refused in the same modelled shape, with
+/// the envelope naming the member and the bound it failed: the refusal class is one
+/// class, whether the member was absent or merely out of range.
+#[tokio::test]
+async fn a_value_outside_a_modelled_constraint_is_refused_with_the_modelled_bad_request() {
     let over_long = "i".repeat(129);
-    let cases: &[(&str, String)] = &[
-        (
-            "no ApplicationIdentifier",
-            r#"{"EnvironmentIdentifier":"Prod","ConfigurationProfileIdentifier":"MyProfile"}"#
-                .to_string(),
-        ),
-        (
-            "no EnvironmentIdentifier",
-            r#"{"ApplicationIdentifier":"MyApp","ConfigurationProfileIdentifier":"MyProfile"}"#
-                .to_string(),
-        ),
-        (
-            "no ConfigurationProfileIdentifier",
-            r#"{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"Prod"}"#.to_string(),
-        ),
+    // `Identifier` is modelled `@length 1..128` and `OptionalPollSeconds`
+    // `@range 15..86400`, as `StartConfigurationSession`'s input members are listed in
+    // the crate root's OPERATIONS.md.
+    let cases: &[(&str, String, &str)] = &[
         (
             "empty ApplicationIdentifier",
-            r#"{"ApplicationIdentifier":"","EnvironmentIdentifier":"Prod","ConfigurationProfileIdentifier":"MyProfile"}"#
+            r#"{"ApplicationIdentifier":"","EnvironmentIdentifier":"Prod",
+                "ConfigurationProfileIdentifier":"MyProfile"}"#
                 .to_string(),
+            "Value '' at 'applicationIdentifier' failed to satisfy constraint: Member must \
+             have length greater than or equal to 1",
         ),
         (
             "over-long EnvironmentIdentifier",
             format!(
-                r#"{{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"{over_long}","ConfigurationProfileIdentifier":"MyProfile"}}"#
+                r#"{{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"{over_long}",
+                    "ConfigurationProfileIdentifier":"MyProfile"}}"#
             ),
+            "at 'environmentIdentifier' failed to satisfy constraint: Member must have \
+             length less than or equal to 128",
+        ),
+        (
+            "poll interval one below the modelled minimum",
+            r#"{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"Prod",
+                "ConfigurationProfileIdentifier":"MyProfile",
+                "RequiredMinimumPollIntervalInSeconds":14}"#
+                .to_string(),
+            "Value '14' at 'requiredMinimumPollIntervalInSeconds' failed to satisfy \
+             constraint: Member must have value greater than or equal to 15",
+        ),
+        (
+            "poll interval one above the modelled maximum",
+            r#"{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"Prod",
+                "ConfigurationProfileIdentifier":"MyProfile",
+                "RequiredMinimumPollIntervalInSeconds":86401}"#
+                .to_string(),
+            "Value '86401' at 'requiredMinimumPollIntervalInSeconds' failed to satisfy \
+             constraint: Member must have value less than or equal to 86400",
         ),
     ];
 
-    for (name, body) in cases {
+    for (name, body, expected_clause) in cases {
         let emulator = Emulator::new();
+        emulator.create_hierarchy("MyApp", "Prod", "MyProfile").await;
         let reply = emulator.start_configuration_session(body).await;
         assert_eq!(
             reply.status, 400,
@@ -693,6 +1205,12 @@ async fn a_malformed_start_request_is_refused_with_bad_request() {
             "BadRequestException",
             "case {name}: expected BadRequestException, got {}",
             reply.text()
+        );
+        let message = reply.json()["Message"].as_str().unwrap_or("").to_string();
+        assert!(
+            message.starts_with("1 validation error detected: ")
+                && message.contains(expected_clause),
+            "case {name}: expected a Message containing {expected_clause:?}, got {message:?}"
         );
     }
 }
@@ -711,14 +1229,18 @@ async fn a_sessions_minimum_poll_interval_is_reported_and_enforced() {
 
     for (name, requested, expected_interval, immediate_repoll_allowed) in cases {
         let emulator = Emulator::new();
-        emulator.state().lock().deploy_configuration(
-            "MyApp",
-            "Prod",
-            "MyProfile",
-            b"{\"feature\":\"on\"}".to_vec(),
-            "application/json",
-            Some("v1"),
-        );
+        let hierarchy = emulator
+            .create_hierarchy("MyApp", "Prod", "MyProfile")
+            .await;
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                br#"{"feature":"on"}"#,
+                "application/json",
+                Some("v-one"),
+            )
+            .await;
         let interval = requested
             .map(|seconds| format!(r#","RequiredMinimumPollIntervalInSeconds":{seconds}"#))
             .unwrap_or_default();
@@ -774,6 +1296,12 @@ async fn a_sessions_minimum_poll_interval_is_reported_and_enforced() {
                 "case {name}: expected PollIntervalNotSatisfied, got {}",
                 immediate.text()
             );
+            assert_eq!(
+                immediate.json()["Message"].as_str(),
+                Some("Request too early"),
+                "case {name}: expected the service's too-early message, got {}",
+                immediate.text()
+            );
             let state = emulator.state();
             let session = state.lock().session(&next).cloned();
             assert_eq!(
@@ -791,7 +1319,7 @@ async fn a_sessions_minimum_poll_interval_is_reported_and_enforced() {
 #[tokio::test]
 async fn tokens_are_opaque_and_unique() {
     let cases = [
-        ("short identifiers", ("a", "b", "c")),
+        ("short identifiers", ("ap", "en", "pr")),
         ("ordinary identifiers", ("MyApp", "Prod", "MyProfile")),
         (
             "identifiers that look like ids",
@@ -800,9 +1328,12 @@ async fn tokens_are_opaque_and_unique() {
         (
             "maximum-length identifiers",
             (
-                &"a".repeat(128)[..],
-                &"b".repeat(128)[..],
-                &"c".repeat(128)[..],
+                // `Name` is modelled `len 1..64` on the control plane, so the longest
+                // name a session can be started over is the longest one AppConfig will
+                // create.
+                &"a".repeat(64)[..],
+                &"b".repeat(64)[..],
+                &"c".repeat(64)[..],
             ),
         ),
     ];
@@ -810,6 +1341,18 @@ async fn tokens_are_opaque_and_unique() {
     let emulator = Emulator::new();
     let mut seen: Vec<String> = Vec::new();
     for (name, (application, environment, profile)) in cases {
+        let hierarchy = emulator
+            .create_hierarchy(application, environment, profile)
+            .await;
+        emulator
+            .deploy(
+                &hierarchy,
+                &hierarchy.profile_id,
+                b"content",
+                "text/plain",
+                None,
+            )
+            .await;
         let first = emulator
             .session_token(application, environment, profile)
             .await;
@@ -844,14 +1387,6 @@ async fn tokens_are_opaque_and_unique() {
             seen.push(token.clone());
         }
         // And both resolve to their OWN session: each is usable exactly once.
-        emulator.state().lock().deploy_configuration(
-            application,
-            environment,
-            profile,
-            b"content".to_vec(),
-            "text/plain",
-            None,
-        );
         for token in [&first, &second] {
             let reply = emulator.get_latest_configuration(token).await;
             assert_eq!(

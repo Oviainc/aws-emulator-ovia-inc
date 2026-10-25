@@ -76,7 +76,7 @@ use crate::ops::types::{
     AddonNamespaceConfigResponse, AssociatedAccessPolicy, BadRequestException, Cancellation,
     Capability,
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
-    Certificate, Cluster, ClusterVersionInformation, ComputeConfigResponse,
+    Certificate, ClientException, Cluster, ClusterVersionInformation, ComputeConfigResponse,
     ConnectorConfigResponse,
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
@@ -712,6 +712,39 @@ pub fn resource_not_found() -> ResourceNotFoundException {
 pub fn child_resource_not_found(message: String) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(message),
+        ..Default::default()
+    }
+}
+
+/// The sentence every Amazon EKS-managed-plane operation refuses a cluster this
+/// service does not manage with.
+///
+/// A cluster `RegisterCluster` connected is an external Kubernetes cluster: it has no
+/// Amazon EKS control plane and none of the resources Amazon EKS manages inside one
+/// (add-ons, node groups, Fargate profiles, access entries, identity-provider
+/// configurations, pod identity associations, capabilities, certificate authorities,
+/// control-plane updates, cluster insights). The refusal is PERMANENT — it is what
+/// tells a client the cluster is externally managed and to stop — so it is one fixed
+/// sentence, naming nothing from the request.
+pub const CONNECTED_CLUSTER_REFUSAL_MESSAGE: &str =
+    "This operation is not supported for connected clusters";
+
+/// The `ClientException` payload every EKS-managed-plane operation answers for a
+/// cluster [`ClusterRecord::is_connected`] reports.
+///
+/// `ClientException` is "usually caused by a client action... using an action or
+/// resource on behalf of an IAM principal that doesn't have permissions to use the
+/// action or resource or specifying an identifier that is not valid" — the modelled
+/// class for "this action does not apply to the resource you named", which is exactly
+/// what a connected cluster is for these operations. It is deliberately NOT
+/// `InvalidRequestException` ("the request is invalid given the STATE of the
+/// cluster"), which a client or waiter reads as transient and retries.
+///
+/// Shared here so no two operations can word or classify the gate differently.
+pub fn connected_cluster_refusal(cluster_name: &str) -> ClientException {
+    ClientException {
+        cluster_name: Some(cluster_name.to_string()),
+        message: Some(CONNECTED_CLUSTER_REFUSAL_MESSAGE.to_string()),
         ..Default::default()
     }
 }
@@ -3685,6 +3718,12 @@ pub const ACCESS_ENTRIES_LISTING: &str = "access-entries";
 /// The scope `ListAssociatedAccessPolicies`'s tokens carry, over one access
 /// entry's associated policy ARNs. See [`CLUSTERS_LISTING`].
 pub const ASSOCIATED_ACCESS_POLICIES_LISTING: &str = "associated-access-policies";
+/// The scope `ListAddons`'s tokens carry, over one cluster's add-on names. See
+/// [`CLUSTERS_LISTING`].
+pub const ADDONS_LISTING: &str = "addons";
+/// The scope `ListNodegroups`'s tokens carry, over one cluster's node group
+/// names. See [`CLUSTERS_LISTING`].
+pub const NODEGROUPS_LISTING: &str = "node-groups";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///

@@ -203,10 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(package) = store.model_packages.get_mut(&key) else {
             // The message quotes the ARN the caller passed, not one this emulator
             // synthesized.
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Could not find model package \"{}\".",
-                input.model_package_arn
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                    &input.model_package_arn,
+                ),
+            ));
         };
 
         // `ModelApprovalStatus` "does not apply to unversioned models"

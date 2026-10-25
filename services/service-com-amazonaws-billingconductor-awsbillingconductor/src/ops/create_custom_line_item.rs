@@ -352,11 +352,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             presentation_service: input
                 .presentation_details
                 .map(|presentation| presentation.service),
-            inclusive_start_billing_period: period_range
-                .as_ref()
-                .map(|range| range.inclusive_start_billing_period.clone()),
-            exclusive_end_billing_period: period_range
-                .and_then(|range| range.exclusive_end_billing_period),
+            // The billing periods the item applies in: the range the create named, or
+            // the one fully open stretch when it named none, which applies to every
+            // billing period.
+            spans: vec![crate::state::BillingPeriodSpan::new(
+                period_range
+                    .as_ref()
+                    .map(|range| range.inclusive_start_billing_period.clone()),
+                period_range.and_then(|range| range.exclusive_end_billing_period),
+            )],
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             associated_resources,
             creation_time_millis: now,

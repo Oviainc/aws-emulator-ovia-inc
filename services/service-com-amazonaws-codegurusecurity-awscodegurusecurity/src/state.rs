@@ -15,9 +15,14 @@
 //!
 //! * [`UPLOAD_ARTIFACT_QUOTA`] caps `upload_artifacts`, and an artifact also expires
 //!   [`UPLOAD_ARTIFACT_TTL_MILLIS`] after it was minted ([`Store::expire_due_artifacts`]).
-//! * [`UPLOAD_CONTENT_MAX_BYTES`] caps the resource uploaded to one minted target and
-//!   [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`] the bytes every target holds together, both
-//!   enforced in [`Store::receive_upload`], which is the only writer of uploaded bytes.
+//! * an upload to a minted target is ACCEPTED whatever the size of a code archive, and
+//!   the bound sits on the RETAINED side instead: [`Store::receive_upload`], the only
+//!   writer of uploaded bytes, records the archive's length and a digest of all of its
+//!   bytes and keeps at most [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`] of its content, so what
+//!   every target holds together cannot exceed that times [`UPLOAD_ARTIFACT_QUOTA`]. One
+//!   upload is bounded too, by what this process can hold at once
+//!   ([`UPLOAD_ACCEPTED_MAX_BYTES`], read off the declared length before the body is
+//!   touched), which is far above any archive a scan is run on.
 //! * [`SCAN_QUOTA`] caps `scans`, and [`RUNS_PER_SCAN_QUOTA`] caps the runs of one scan,
 //!   so the (scans x runs) product is bounded.
 //! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in every writer of the
@@ -289,17 +294,57 @@ pub const SCAN_RESOURCE_NOT_UPLOADED_MESSAGE: &str =
 /// a URL THIS service handed out back to this service (see `crate::service`).
 pub const UPLOAD_HOST_LABEL: &str = "codeguru-security-upload";
 
-/// The most bytes one minted upload target retains.
+/// How much of one uploaded archive's content this emulator keeps a copy of.
 ///
-/// A STORE BOUND chosen by this emulator, not a published AWS limit: it is what stops one
-/// upload growing the emulator's heap without end. A larger archive is refused rather
-/// than truncated, so a target never holds a resource that is not what was uploaded.
-pub const UPLOAD_CONTENT_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// A RETENTION bound chosen by this emulator, and NOT a limit on the archive a caller may
+/// upload: an upload is accepted and accounted for in full (its length and a digest over
+/// every byte that arrived), and this is only how much of its content is kept alongside
+/// that accounting. Nothing this service answers reads the archive back — the one question
+/// a handler asks of it is whether the artifact holds a resource at all — so a bounded
+/// prefix keeps the store bounded without refusing an upload the published target promises
+/// to accept.
+pub const UPLOAD_RETAINED_PREFIX_MAX_BYTES: usize = 64 * 1024;
 
-/// The most bytes every minted upload target together retains; see
-/// [`UPLOAD_CONTENT_MAX_BYTES`], which bounds one of them. Also a chosen store bound:
-/// [`UPLOAD_ARTIFACT_QUOTA`] alone would admit the quota times one archive.
-pub const UPLOAD_CONTENT_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// The largest object a single `PUT` can upload, in bytes: a published upload target is a
+/// pre-signed S3 URL, and S3 accepts at most 5 GB (5 x 2^30 bytes) in one `PUT`, offering
+/// multipart upload above that. The published size bound of this plane, rather than a
+/// bound of this emulator's choosing; see [`exceeds_single_put_maximum`].
+pub const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Whether an upload of `byte_count` bytes is larger than one `PUT` to a pre-signed S3
+/// URL accepts ([`S3_SINGLE_PUT_MAX_BYTES`]). Exactly the maximum is accepted; only past
+/// it is too large.
+pub fn exceeds_single_put_maximum(byte_count: u64) -> bool {
+    byte_count > S3_SINGLE_PUT_MAX_BYTES
+}
+
+/// The most bytes this emulator takes in ONE upload to a published target.
+///
+/// CHOSEN, not a published AWS limit, and a bound on this PROCESS rather than on the
+/// archive a scan may be run on: the server holds a request body in memory in full before
+/// any handler sees it, so an upload this emulator would have to materialise in one piece
+/// has to be bounded for the process to survive it. It is therefore set far above the
+/// whole zipped source trees CodeGuru Security is run on — a repository archive of tens of
+/// megabytes is accepted, and so is one an order of magnitude larger — and the declared
+/// length is read before the body is touched ([`upload_size_bound_exceeded`]), so reaching
+/// it costs no allocation.
+pub const UPLOAD_ACCEPTED_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The size bound an upload of `byte_count` bytes is past, or `None` when it is within
+/// both — the published maximum of one `PUT` ([`S3_SINGLE_PUT_MAX_BYTES`]) and what this
+/// emulator takes in one upload ([`UPLOAD_ACCEPTED_MAX_BYTES`]).
+///
+/// Answers the bound itself, so the refusal states which one the upload is past. Exactly
+/// a bound is within it; only past it is too large.
+pub fn upload_size_bound_exceeded(byte_count: u64) -> Option<u64> {
+    if exceeds_single_put_maximum(byte_count) {
+        Some(S3_SINGLE_PUT_MAX_BYTES)
+    } else if byte_count > UPLOAD_ACCEPTED_MAX_BYTES {
+        Some(UPLOAD_ACCEPTED_MAX_BYTES)
+    } else {
+        None
+    }
+}
 
 /// A code artifact `CreateUploadUrl` minted an upload target for, and `CreateScan`
 /// resolves its `resourceId` against.
@@ -324,16 +369,52 @@ pub struct UploadArtifact {
     pub upload: Option<UploadedResource>,
 }
 
-/// The code resource a caller uploaded to a minted target.
+/// The code resource a caller uploaded to a minted target: the accounting of the archive
+/// that arrived, plus a bounded prefix of its content.
+///
+/// The archive is not kept in full. An upload is accepted whatever its size, and what the
+/// store keeps of it is its length, a digest over every byte that arrived and at most
+/// [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`] of its leading content — enough to identify the
+/// resource a run was started on, and bounded whatever was uploaded.
 #[derive(Debug, Clone)]
 pub struct UploadedResource {
-    /// The uploaded bytes, exactly as they arrived. Bounded by
-    /// [`UPLOAD_CONTENT_MAX_BYTES`].
-    pub bytes: Vec<u8>,
+    /// How many bytes arrived, counted over the whole archive.
+    pub byte_count: u64,
+    /// Lowercase hex SHA-256 over every byte that arrived, so the resource a target holds
+    /// is identified by its whole content and not only by what is retained of it.
+    pub content_sha256: String,
+    /// The archive's leading bytes, exactly as they arrived, truncated to
+    /// [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`] — the whole archive when it is no longer than
+    /// that.
+    pub retained_prefix: Vec<u8>,
     /// The media type the upload declared, when it declared one.
     pub content_type: Option<String>,
     /// Epoch milliseconds at which the upload was received.
     pub received_at_millis: i64,
+}
+
+impl UploadedResource {
+    /// Account for the archive `bytes` that arrived at a minted target: its length, its
+    /// digest and the prefix of it this store retains.
+    ///
+    /// Takes the bytes by reference and copies only the retained prefix, so receiving an
+    /// archive costs one pass over the buffered body rather than a second copy of it.
+    /// The digest and the hex rendering are both done by maintained crates this crate
+    /// already depends on.
+    pub fn received(bytes: &[u8], content_type: Option<String>, received_at_millis: i64) -> Self {
+        use ::sha2::Digest;
+
+        let mut hasher = ::sha2::Sha256::new();
+        hasher.update(bytes);
+        let retained = bytes.len().min(UPLOAD_RETAINED_PREFIX_MAX_BYTES);
+        Self {
+            byte_count: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            content_sha256: ::hex::encode(hasher.finalize()),
+            retained_prefix: bytes[..retained].to_vec(),
+            content_type,
+            received_at_millis,
+        }
+    }
 }
 
 /// One run (one revision) of a scan.
@@ -482,9 +563,10 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// scan name as well as the token, so a token reused for a different scan can never
     /// answer for the other scan's run.
     pub idempotency: HashMap<(String, String), String>,
-    /// How many bytes the uploaded resources of `upload_artifacts` hold in total, kept in
-    /// step with every write and release so the ceiling
-    /// [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`] can be enforced without walking the store.
+    /// How many bytes of uploaded content the resources of `upload_artifacts` retain in
+    /// total, kept in step with every write and release so the figure is available
+    /// without walking the store. Bounded by [`UPLOAD_ARTIFACT_QUOTA`] times
+    /// [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`], whatever sizes were uploaded.
     pub upload_bytes_held: usize,
     /// The account's configuration record, absent until the account is onboarded to
     /// CodeGuru Security ([`Self::onboard_account`]). The SINGLE copy of the
@@ -565,14 +647,16 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         }
     }
 
-    /// Take the bytes a released artifact held out of the retained total.
+    /// Take the bytes a released artifact retained out of the retained total.
     fn release_upload_bytes(&mut self, released: &UploadArtifact) {
         if let Some(upload) = &released.upload {
-            self.upload_bytes_held = self.upload_bytes_held.saturating_sub(upload.bytes.len());
+            self.upload_bytes_held = self
+                .upload_bytes_held
+                .saturating_sub(upload.retained_prefix.len());
         }
     }
 
-    /// Receive one upload to a minted target: store `bytes` as the code resource of the
+    /// Receive one upload to a minted target: hold `received` as the code resource of the
     /// artifact `target` names.
     ///
     /// The whole judgement lives here, so the data plane that serves the target and any
@@ -581,20 +665,23 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// * every part of the published URL must agree with the recorded artifact — an
     ///   artifact this store no longer holds (its lifetime ended), or a path that crosses
     ///   one artifact's id with another scan's name or another account, names no target;
-    /// * an archive past [`UPLOAD_CONTENT_MAX_BYTES`], or one that would push the retained
-    ///   total past [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`], is refused rather than truncated;
+    /// * the archive is accepted whatever its size — what is held of it is the accounting
+    ///   [`UploadedResource::received`] already computed, so a large upload is stored
+    ///   rather than refused;
     /// * a target holds ONE resource, so a second upload to the same target replaces the
     ///   first — which is what makes an interrupted upload retryable.
+    ///
+    /// Takes the accounting already computed, so the per-upload work that is proportional
+    /// to the archive (the digest, the retained copy) happens OUTSIDE this lock and only
+    /// the store's own bookkeeping runs inside it, whatever was uploaded.
     pub fn receive_upload(
         &mut self,
         target: &UploadTarget,
-        bytes: Vec<u8>,
-        content_type: Option<String>,
-        now_millis: i64,
+        received: UploadedResource,
     ) -> UploadOutcome {
         // The targets whose lifetime the clock has already ended are released first, so an
         // expired target is not written to.
-        self.expire_due_artifacts(now_millis);
+        self.expire_due_artifacts(received.received_at_millis);
         let held = self
             .upload_artifacts
             .get(&target.code_artifact_id)
@@ -603,26 +690,19 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         let Some(artifact) = held else {
             return UploadOutcome::NoSuchTarget;
         };
-        if bytes.len() > UPLOAD_CONTENT_MAX_BYTES {
-            return UploadOutcome::TooLarge;
-        }
-        let already = artifact.upload.as_ref().map_or(0, |held| held.bytes.len());
-        let would_hold = self
-            .upload_bytes_held
-            .saturating_sub(already)
-            .saturating_add(bytes.len());
-        if would_hold > UPLOAD_CONTENT_TOTAL_MAX_BYTES {
-            return UploadOutcome::StoreFull;
-        }
+        let already = artifact
+            .upload
+            .as_ref()
+            .map_or(0, |held| held.retained_prefix.len());
+        let retains = received.retained_prefix.len();
         let Some(artifact) = self.upload_artifacts.get_mut(&target.code_artifact_id) else {
             return UploadOutcome::NoSuchTarget;
         };
-        artifact.upload = Some(UploadedResource {
-            bytes,
-            content_type,
-            received_at_millis: now_millis,
-        });
-        self.upload_bytes_held = would_hold;
+        artifact.upload = Some(received);
+        self.upload_bytes_held = self
+            .upload_bytes_held
+            .saturating_sub(already)
+            .saturating_add(retains);
         UploadOutcome::Stored
     }
 
@@ -934,11 +1014,6 @@ pub enum UploadOutcome {
     Stored,
     /// The target names no code artifact of this account, or no longer does.
     NoSuchTarget,
-    /// The archive is larger than one target retains ([`UPLOAD_CONTENT_MAX_BYTES`]).
-    TooLarge,
-    /// Storing the archive would push the retained total past
-    /// [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`].
-    StoreFull,
 }
 
 /// The region a published URL's host names: the request's own when it has a Region's

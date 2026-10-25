@@ -74,9 +74,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eks-awswesleyfrontend.j
 // here — hence the `DescribePodIdentityAssociationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eks#DescribePodIdentityAssociation")]
+//
+// `ClientException` is widened in through `extra_errors`: this SERVICE models that
+// shape and many of its operations declare it, but this one does not list it — and it
+// is the class every operation of the Amazon EKS-managed plane refuses a cluster this
+// service does not manage with ([`crate::state::connected_cluster_refusal`]).
+#[smithy_macros::operation_error(
+    "com.amazonaws.eks#DescribePodIdentityAssociation",
+    extra_errors = ["ClientException"]
+)]
 #[derive(Debug)]
 pub enum DescribePodIdentityAssociationErrorModeled {
+    ClientException(ClientException),
     InvalidParameterException(InvalidParameterException),
     InvalidRequestException(InvalidRequestException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -193,13 +202,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cluster name identifies a cluster only within one Region, and an
         // association only exists inside its cluster, so the absent cluster is
         // reported before the association is looked for.
-        if !guard
+        let Some(cluster) = guard
             .clusters
-            .contains_key(&(region.clone(), input.cluster_name.clone()))
-        {
+            .get(&(region.clone(), input.cluster_name.clone()))
+        else {
             return Err(not_found(crate::state::cluster_not_found(
                 &input.cluster_name,
             )));
+        };
+        // EKS Pod Identity hands credentials to Pods through the Amazon EKS-managed
+        // plane, which a cluster `RegisterCluster` connected has none of: this operation
+        // does not apply to it. The gate is a fact about the CLUSTER, so it precedes
+        // resolving the association id.
+        if cluster.is_connected() {
+            return Err(DescribePodIdentityAssociationErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.cluster_name),
+            )
+            .into());
         }
 
         let key = (region, input.cluster_name.clone(), input.association_id.clone());

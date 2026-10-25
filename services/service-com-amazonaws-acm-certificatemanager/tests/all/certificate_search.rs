@@ -1020,9 +1020,10 @@ async fn an_unsatisfiable_request_is_refused() {
 }
 
 /// RULE: a refusal says what was wrong with the request — the member the offending
-/// value sat on and the requirement it failed — so the caller can fix the request
-/// from the message alone, WITHOUT echoing the value back (the service's constraint
-/// wording withholds it; see `crate::validation_message_rendering`).
+/// value sat on, the requirement it failed, and the value submitted there — so the
+/// caller can fix the request from the message alone (the service's constraint wording
+/// withholds the value only at the positions it withholds; see
+/// `crate::validation_message_rendering`).
 #[tokio::test]
 async fn a_refusal_names_the_member_and_its_requirement() {
     let router = router();
@@ -1037,8 +1038,11 @@ async fn a_refusal_names_the_member_and_its_requirement() {
             vec![
                 "FilterStatement.Filter.AcmCertificateMetadataFilter.Status",
                 "PENDING_VALIDATION",
+                // The value as submitted: a plain enum member is not one of the
+                // positions ACM withholds.
+                "Value 'NOT_A_STATUS' at",
             ],
-            vec!["NOT_A_STATUS"],
+            vec![],
         ),
         (
             "a ComparisonOperator outside its enum, refused by the boundary validator",
@@ -1046,8 +1050,9 @@ async fn a_refusal_names_the_member_and_its_requirement() {
             vec![
                 "filterStatement.filter.x509AttributeFilter.subject.commonName.comparisonOperator",
                 "CONTAINS, EQUALS",
+                "Value 'STARTS_WITH' at",
             ],
-            vec!["STARTS_WITH"],
+            vec![],
         ),
         (
             "a range bounding nothing",

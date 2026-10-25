@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrainingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrainingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the training job `CreateTrainingJob` stored in `crate::state` —
+//! the round-trip reader for that create — materialising the move out of `InProgress` the
+//! clock already owes it, and refuses a name the account holds no job under with a 400
+//! `ValidationException`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrainingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing ran the job's algorithm image (see `create_training_job.rs`), so the members
+//! that would report a run's own measurements — its start instant, its training and
+//! billable time, its final metrics, its secondary-status transitions and its rule
+//! evaluations — are absent rather than filled with values nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -293,18 +293,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrainingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrainingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrainingJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store.training_jobs.get_mut(&input.training_job_name) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a job that
+            // exists. Recorded AWS classifies this as a 400 `ValidationException` rather
+            // than as the modelled `ResourceNotFound`, and words it with the fixed
+            // sentence the training-job readers answer.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::REQUESTED_RESOURCE_NOT_FOUND,
+            ));
+        };
+        // The one write this reporting operation makes: the move out of `InProgress` the
+        // clock already owed. It was due at the stored instant whether or not anybody
+        // described the job, so a waiter terminates and no read changes what a later
+        // caller sees.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let request = job.request.clone();
+        let output = DescribeTrainingJobOutput {
+            training_job_name: job.name.clone(),
+            training_job_arn: job.arn.clone(),
+            // The three ARNs of the resource that OWNS a training job SageMaker created on
+            // a caller's behalf. `CreateTrainingJob` is the only producer of a job here,
+            // so every stored job is caller-created; the tuning-job ARN is reported from
+            // the record for the day one is.
+            tuning_job_arn: job.tuning_job_arn.clone(),
+            labeling_job_arn: None,
+            auto_ml_job_arn: None,
+            model_artifacts: ModelArtifacts {
+                // The location a run WOULD write its artifacts to, derived from the
+                // output location the request named — not a claim that an object is there.
+                // Nothing started the image, which is what `FailureReason` says once the
+                // clock has settled the job.
+                s3_model_artifacts: job.model_artifacts_path(),
+            },
+            training_job_status: job.status.clone(),
+            // Required, and every stored job carries one; a record seeded without one
+            // reads as a job whose work has not begun.
+            secondary_status: job
+                .secondary_status
+                .clone()
+                .unwrap_or_else(|| crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string()),
+            failure_reason: job.failure_reason.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+            training_end_time: job.training_end_time.map(crate::state::timestamp),
+            // Nothing started the algorithm image, so there is no instant the run began
+            // at, no time it spent, no metric it emitted and no transition it passed
+            // through. See `crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`, which is
+            // the `FailureReason` above once the clock has settled the job.
+            training_start_time: None,
+            training_time_in_seconds: None,
+            billable_time_in_seconds: None,
+            billable_token_count: None,
+            secondary_status_transitions: None,
+            final_metric_data_list: None,
+            // A debugger or profiler rule is evaluated against a running job; none ran.
+            debug_rule_evaluation_statuses: None,
+            profiler_rule_evaluation_statuses: None,
+            profiling_status: None,
+            mlflow_details: None,
+            progress_info: None,
+            // Written by a run that produced a model package; nothing ran.
+            output_model_package_arn: None,
+            warm_pool_status: job.warm_pool_status.clone(),
+            // Everything below is what the accepted request carried, replayed from the
+            // stored record rather than reconstructed.
+            hyper_parameters: request.hyper_parameters,
+            algorithm_specification: request.algorithm_specification,
+            role_arn: Some(request.role_arn),
+            input_data_config: request.input_data_config,
+            output_data_config: Some(request.output_data_config),
+            resource_config: request.resource_config,
+            vpc_config: request.vpc_config,
+            stopping_condition: request.stopping_condition.unwrap_or_default(),
+            enable_network_isolation: request.enable_network_isolation,
+            enable_inter_container_traffic_encryption: request
+                .enable_inter_container_traffic_encryption,
+            enable_managed_spot_training: request.enable_managed_spot_training,
+            checkpoint_config: request.checkpoint_config,
+            debug_hook_config: request.debug_hook_config,
+            experiment_config: request.experiment_config,
+            debug_rule_configurations: request.debug_rule_configurations,
+            tensor_board_output_config: request.tensor_board_output_config,
+            profiler_config: request.profiler_config,
+            profiler_rule_configurations: request.profiler_rule_configurations,
+            environment: request.environment,
+            retry_strategy: request.retry_strategy,
+            remote_debug_config: request.remote_debug_config,
+            infra_check_config: request.infra_check_config,
+            serverless_job_config: request.serverless_job_config,
+            mlflow_config: request.mlflow_config,
+            model_package_config: request.model_package_config,
+        };
+        let job_arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }

@@ -42,11 +42,11 @@ use crate::stack_lifecycle::{
 };
 
 /// Wait past the instant a generation's conclusion becomes due.
-async fn wait_for_the_generation() {
+pub(crate) async fn wait_for_the_generation() {
     tokio::time::sleep(generated::GENERATION_DELAY + Duration::from_millis(250)).await;
 }
 
-async fn create_generated_template(
+pub(crate) async fn create_generated_template(
     router: &MultiServiceRouter,
     name: &str,
     extra: &[(String, String)],
@@ -56,7 +56,10 @@ async fn create_generated_template(
     call(router, "CreateGeneratedTemplate", &members).await
 }
 
-async fn describe_generated_template(router: &MultiServiceRouter, name: &str) -> (u16, String) {
+pub(crate) async fn describe_generated_template(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (u16, String) {
     call(
         router,
         "DescribeGeneratedTemplate",
@@ -66,7 +69,7 @@ async fn describe_generated_template(router: &MultiServiceRouter, name: &str) ->
 }
 
 /// Deploy a template, wait past the instant its create settles, and answer the stack id.
-async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) -> String {
+pub(crate) async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) -> String {
     let (status, body) = create_stack(router, name, template, &[]).await;
     assert_eq!(
         status, 200,
@@ -81,7 +84,7 @@ async fn deploy(router: &MultiServiceRouter, name: &str, template: &str) -> Stri
 /// The `GeneratedTemplateId` of a successful `CreateGeneratedTemplate`, checked to be the
 /// ARN form the model documents:
 /// `arn:${Partition}:cloudformation:${Region}:${Account}:generatedtemplate/${Id}`.
-fn assert_generated_template_id_shape(case: &str, id: &str) {
+pub(crate) fn assert_generated_template_id_shape(case: &str, id: &str) {
     let prefix = format!("arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:generatedtemplate/");
     assert!(
         id.starts_with(&prefix),
@@ -105,15 +108,15 @@ fn assert_generated_template_id_shape(case: &str, id: &str) {
 
 /// One resource a request lists itself: `ResourceDefinition`'s type, logical id and the one
 /// `ResourceIdentifier` pair that identifies it.
-struct ListedResource {
-    resource_type: &'static str,
-    logical_resource_id: &'static str,
-    identifier_key: &'static str,
-    identifier_value: &'static str,
+pub(crate) struct ListedResource {
+    pub(crate) resource_type: &'static str,
+    pub(crate) logical_resource_id: &'static str,
+    pub(crate) identifier_key: &'static str,
+    pub(crate) identifier_value: &'static str,
 }
 
 /// The request members that submit one `Resources` entry, in the awsQuery flattened form.
-fn listed_members(position: usize, listed: &ListedResource) -> Vec<(String, String)> {
+pub(crate) fn listed_members(position: usize, listed: &ListedResource) -> Vec<(String, String)> {
     let index = position + 1;
     vec![
         member(
@@ -372,7 +375,7 @@ async fn a_generation_is_read_back_through_describe_generated_template() {
 }
 
 /// The code of an awsQuery error response.
-fn error_code(case: &str, body: &str) -> String {
+pub(crate) fn error_code(case: &str, body: &str) -> String {
     xml_text(body, "Code")
         .unwrap_or_else(|| panic!("case {case:?}: expected an error <Code>, got {body}"))
 }

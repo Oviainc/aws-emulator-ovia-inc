@@ -22,6 +22,12 @@
 //! the second connector of a type cannot be created, and silently reconfiguring the
 //! first is `UpdateEnvironmentConnector`'s work, not a create's.
 //!
+//! The credential secret is named on input by ARN OR by name (`secretIdentifier`) and
+//! reported through `Connector$secretArn`, so the identifier is resolved to that
+//! secret's ARN before it is stored or compared
+//! ([`crate::state::secret_resources::resolve_secret_arn`]): the record this operation
+//! reports, and every later read of it, carries an ARN.
+//!
 //! The SDDC_MANAGER connector Amazon EVS creates automatically "for environments where
 //! Amazon EVS installs VCF" is deliberately NOT minted by `CreateEnvironment` here:
 //! its appliance FQDN and its credential secret are produced by the VCF installation,
@@ -221,6 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
+        // `secretIdentifier` is "The ARN or name of" the credential secret while the
+        // member it feeds, `Connector$secretArn`, is "The Amazon Resource Name (ARN) of"
+        // it: the identifier is resolved to that secret's ARN before anything compares or
+        // stores it, so one secret has one `secretArn` however the request named it.
+        let secret_arn = crate::state::secret_resources::resolve_secret_arn(
+            &region,
+            &input.secret_identifier,
+        );
         let created_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
@@ -251,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type already connected is either this request again or a conflict.
         if let Some(existing) = crate::state::live_connector_of_type(environment, &input.r#type) {
             if existing.appliance_fqdn == input.appliance_fqdn
-                && existing.secret_arn == input.secret_identifier
+                && existing.secret_arn == secret_arn
             {
                 // `@idempotent`: the same create again reports the stored record and
                 // mints nothing.
@@ -282,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connector_id.clone(),
             &input.r#type,
             &input.appliance_fqdn,
-            &input.secret_identifier,
+            secret_arn,
             created_at_ms,
             pending,
         );

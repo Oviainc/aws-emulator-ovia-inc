@@ -61,6 +61,52 @@ pub const MAX_ENVIRONMENTS: usize = 1_000;
 /// How many tags one environment can carry, from `TagMap`'s own `@length(1, 50)`.
 pub const MAX_TAGS: usize = 50;
 
+/// The tag-key namespace Amazon Web Services keeps for the tags it applies itself.
+///
+/// A tag whose key opens with it belongs to AWS, not to the caller: a caller may neither
+/// create, change nor remove one, so every operation that WRITES this service's tag maps
+/// — `CreateEnvironment`'s `Tags`, `TagResource` and `UntagResource` — refuses a request
+/// that names such a key, in either direction. `TagKey`'s modelled `@pattern`
+/// (`smithy_query(query="shape",shape="TagKey")`:
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) admits the colon, so the boundary validator cannot
+/// express the rule and each writer enforces it through [`is_reserved_tag_key`].
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Compared WITHOUT regard to case, because the namespace is reserved rather than one
+/// spelling of it. It is a PREFIX test: a key that merely contains the prefix later on, or
+/// opens with `aws` and no colon, is an ordinary caller-owned key. `get(..)` rather than
+/// slicing, so a key whose prefix-length byte boundary falls inside a multi-byte character
+/// (which `TagKey`'s pattern admits through `\p{L}`) is simply not reserved instead of
+/// panicking.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The first key of `keys` that [`is_reserved_tag_key`], in the order given, or `None`
+/// when the request names none. The one place the tag writers ask the question, so a key
+/// is judged the same way whichever operation carries it.
+pub fn first_reserved_tag_key<'a, I>(keys: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().find(|key| is_reserved_tag_key(key))
+}
+
+/// Why a request naming the reserved tag key `key` in member `member` is refused: the
+/// message of the `ValidationException` (HTTP 400) the tag writers answer with. It names
+/// the member, the offending key and the constraint, so the caller can fix the request
+/// from the sentence alone.
+pub fn reserved_tag_key_message(member: &str, key: &str) -> String {
+    format!(
+        "{member} names the tag key {key}, which begins with the reserved \
+         {RESERVED_TAG_KEY_PREFIX} prefix: that namespace holds the tags Amazon Web \
+         Services applies itself, and a caller can neither create, edit nor delete one"
+    )
+}
+
 /// How many Apache Airflow variables this emulator holds for ONE environment, and how
 /// many pools.
 ///
@@ -115,6 +161,21 @@ pub const STATUS_CREATING_SNAPSHOT: &str = "CREATING_SNAPSHOT";
 /// `EnvironmentStatus` while an update is in progress — "The request to update the
 /// environment is in progress."
 pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// `EnvironmentStatus` while the create is PAUSED waiting for VPC endpoints the caller
+/// has to create — "The request was successful, but the process to create the environment
+/// is paused until you create the required VPC endpoints in your VPC. After you create the
+/// VPC endpoints, the process resumes." (the `Status` member's own doc).
+///
+/// Nothing in this process creates a VPC endpoint, and the service exposes no operation
+/// that reports one was created, so an environment whose endpoints the CALLER manages
+/// stays here: the only transition the clock owes it is [`STATUS_CREATE_FAILED`], see
+/// [`CUSTOMER_ENDPOINT_GRACE_PERIOD`].
+pub const STATUS_PENDING: &str = "PENDING";
+
+/// `EnvironmentStatus` once the create gave up — "The request to create the environment
+/// failed and the environment was not created." (the `Status` member's own doc).
+pub const STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 
 /// `UpdateStatus` while the update the clock owes has not landed yet.
 pub const UPDATE_STATUS_PENDING: &str = "PENDING";
@@ -195,6 +256,21 @@ pub const DEFAULT_WEBSERVER_ACCESS_MODE: &str = "PUBLIC_ONLY";
 /// create, and manage, the VPC endpoints in your VPC." — so MWAA manages them unless the
 /// caller asks to.
 pub const DEFAULT_ENDPOINT_MANAGEMENT: &str = "SERVICE";
+
+/// The `EndpointManagement` mode in which the CALLER owns the environment's VPC endpoints:
+/// "If set to CUSTOMER, you must create, and manage, the VPC endpoints in your VPC." — so
+/// the create cannot finish by itself, see [`create_lifecycle`].
+pub const ENDPOINT_MANAGEMENT_CUSTOMER: &str = "CUSTOMER";
+
+/// How long a create whose endpoints the caller manages waits for those endpoints before
+/// it fails.
+///
+/// A DOCUMENTED duration, so it keeps its documented value rather than a span of this
+/// emulator's choosing: `EndpointManagement`'s own doc — "In a shared VPC deployment, the
+/// environment will remain in PENDING status until you create the VPC endpoints. If you do
+/// not take action to create the endpoints within 72 hours, the status will change to
+/// CREATE_FAILED."
+pub const CUSTOMER_ENDPOINT_GRACE_PERIOD: Duration = Duration::from_secs(72 * 60 * 60);
 
 /// The Apache Airflow log level a log type carries when nothing configured it.
 ///
@@ -592,6 +668,49 @@ pub fn update_not_allowed_message(name: &str, status: &str) -> String {
         "Environment {name} is in status {status}. An environment can only be updated \
          while its status is {STATUS_AVAILABLE}."
     )
+}
+
+/// The status a NEW environment starts in, and the status changes the clock owes it — one
+/// decision, made from who manages the environment's VPC endpoints, so every create
+/// follows the lifecycle its own endpoint-management mode implies.
+///
+/// MWAA creates the endpoints an environment needs itself unless the caller asked to own
+/// them ([`DEFAULT_ENDPOINT_MANAGEMENT`] / [`ENDPOINT_MANAGEMENT_CUSTOMER`]), and that
+/// choice is what decides whether the create can finish on its own:
+///
+/// * service-managed — nothing is waited for, so the create is in progress
+///   ([`STATUS_CREATING`]) and the clock owes it [`STATUS_AVAILABLE`] one
+///   [`TRANSITION_SPAN`] later.
+/// * caller-managed — the create is paused until the caller's VPC endpoints exist
+///   ([`STATUS_PENDING`]), and no operation of this service reports that they do, so the
+///   environment stays paused; the one change the clock owes it is
+///   [`STATUS_CREATE_FAILED`], once [`CUSTOMER_ENDPOINT_GRACE_PERIOD`] has passed without
+///   them.
+pub fn create_lifecycle(
+    endpoint_management: &str,
+    now: SystemTime,
+) -> (String, VecDeque<PendingTransition>) {
+    if endpoint_management == ENDPOINT_MANAGEMENT_CUSTOMER {
+        (
+            STATUS_PENDING.to_string(),
+            [PendingTransition {
+                to: STATUS_CREATE_FAILED.to_string(),
+                last_update_status: None,
+                due_at: now + CUSTOMER_ENDPOINT_GRACE_PERIOD,
+            }]
+            .into(),
+        )
+    } else {
+        (
+            STATUS_CREATING.to_string(),
+            [PendingTransition {
+                to: STATUS_AVAILABLE.to_string(),
+                last_update_status: None,
+                due_at: now + TRANSITION_SPAN,
+            }]
+            .into(),
+        )
+    }
 }
 
 /// A status change the clock owes an environment: where it lands, and when.

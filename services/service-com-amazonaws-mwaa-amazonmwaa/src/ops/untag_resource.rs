@@ -6,6 +6,10 @@
 //! `tagKeys` query parameter names from the SAME tag map `GetEnvironment` and
 //! `ListTagsForResource` read.
 //!
+//! A key in the namespace [`crate::state::RESERVED_TAG_KEY_PREFIX`] reserves is not the
+//! caller's to remove any more than it is the caller's to create, so a request naming one
+//! is refused with `ValidationException` (HTTP 400) and nothing is removed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -141,6 +145,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An environment lives in the Region it was created in, so an ARN is resolved in
         // the Region this request was signed for and nowhere else.
         let region = crate::state::request_region(ctx);
+
+        // A tag AWS applies itself is AWS's own: a caller can no more delete one than
+        // create it. Judged on the request alone, so it is refused ahead of the ARN lookup
+        // and before any tag map is touched.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::reserved_tag_key_message("tagKeys", reserved)),
+            })
+            .into());
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagResourceErrorModeled::InternalServerException(InternalServerException {

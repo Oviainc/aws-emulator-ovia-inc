@@ -15,6 +15,13 @@
 //! that account holds; a well-formed ARN of this account naming no stored record is
 //! refused with HTTP 404 `NotFoundException`.
 //!
+//! Every key the request names is checked before anything is removed, and one AWS does
+//! not let a request name is refused with the modelled `ValidationException` (400): AWS reserves the `aws:` tag-key
+//! prefix ("you can't edit or delete tag names or values with this prefix") and accepts
+//! no empty or over-long key, so a key a write could not have created is not a key a
+//! removal may name either — the same check `TagResource` and `CreateTask` apply
+//! ([`crate::state::tag_key_violation`]).
+//!
 //! `BadRequestException` and `NotFoundException` are the codes the behavioural corpus
 //! recorded for this service's tagging APIs, and its model declares neither on any
 //! operation (its own 404 shape, `ResourceNotFoundException`, is what the device and
@@ -237,6 +244,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TAGGING_NOT_FOUND_MESSAGE,
             ));
         };
+
+        // A key AWS does not let a request NAME is refused here as well as on the write
+        // path: the reserved-prefix rule is worded "you can't edit or delete tag names
+        // or values with this prefix", and an empty or over-long key is no more
+        // addressable for a removal than for a write. `TagKeys` carries no model
+        // constraint, so the AWS-wide key rules are enforced in the handler, through the
+        // same check `TagResource` and `CreateTask` use
+        // ([`crate::state::tag_key_violation`]). The WHOLE list is checked before
+        // anything is removed, so a refused call leaves the record as it was.
+        if let Some(violation) = input
+            .tag_keys
+            .iter()
+            .find_map(|key| crate::state::tag_key_violation(crate::state::TAG_KEYS_INPUT_MEMBER, key))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::tag_validation_message(&violation),
+            })
+            .into());
+        }
+
         for key in &input.tag_keys {
             tags.remove(key);
         }

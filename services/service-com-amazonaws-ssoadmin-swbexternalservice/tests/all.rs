@@ -29,6 +29,8 @@ mod application_access_scope_limits;
 mod application_access_scopes;
 #[path = "all/application_assignment_configuration.rs"]
 mod application_assignment_configuration;
+#[path = "all/application_assignment_delete.rs"]
+mod application_assignment_delete;
 #[path = "all/application_assignments.rs"]
 mod application_assignments;
 #[path = "all/application_authentication_methods.rs"]
@@ -83,6 +85,8 @@ mod managed_policies;
 mod managed_policies_in_permission_set;
 #[path = "all/permission_set_update.rs"]
 mod permission_set_update;
+#[path = "all/permission_sets_provisioned_to_account.rs"]
+mod permission_sets_provisioned_to_account;
 #[path = "all/permissions_boundary.rs"]
 mod permissions_boundary;
 #[path = "all/permissions_boundary_delete.rs"]

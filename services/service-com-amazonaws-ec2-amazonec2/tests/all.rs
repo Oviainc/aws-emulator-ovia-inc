@@ -220,6 +220,13 @@ mod public_ipv4_pools;
 // What `DeleteQueuedReservedInstances` deletes and what it reports per id.
 #[path = "all/queued_reserved_instances.rs"]
 mod queued_reserved_instances;
+// What `DescribeTransitGatewayMulticastDomains` reports out of the domain store, and how the
+// id list, the documented filters and the page size narrow it. Declared HERE rather than in
+// sorted position, for the reason this file's header note and the relocations at its head and
+// tail record: a suite's own sorted neighbourhood is where concurrent ec2 landings insert
+// their two lines, and the `transit_gateway_*` cluster is the busiest of them.
+#[path = "all/transit_gateway_multicast_domains.rs"]
+mod transit_gateway_multicast_domains;
 #[path = "all/regions.rs"]
 mod regions;
 #[path = "all/resource_specific_error_codes.rs"]
@@ -326,6 +333,11 @@ mod store_ceilings;
 // of this file — and this one lost repeated serialized squash merges to exactly that.
 #[path = "all/traffic_mirror_filters.rs"]
 mod traffic_mirror_filters;
+// What `CancelExportTask` cancels, what it refuses and what it leaves alone. Declared LAST
+// rather than in sorted position, for the reason the header records: a suite's own sorted
+// neighbourhood is where every new ec2 suite inserts its lines.
+#[path = "all/export_task_cancellation.rs"]
+mod export_task_cancellation;
 // Declared LAST for the same reason as the two suites above: the sorted region of this file
 // is where every new ec2 suite inserts its lines, and a landing that loses the squash merge
 // has to redo it.

@@ -89,7 +89,7 @@ pub const CLASSIC_API_VERSION: &str = "2012-06-01";
 /// `services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10`:
 /// `version: 2015-12-01`. An envelope naming it is served out of that model through
 /// [`V2FrontDoor`].
-pub const V2_API_VERSION: &str = "2015-12-01";
+pub const V2_API_VERSION: &str = elbv2::service::shared_endpoint::API_VERSION;
 
 /// The awsQuery error code AWS answers an action/version pair it cannot resolve with.
 /// Reserved for exactly that: an action the service does not have at the version asked

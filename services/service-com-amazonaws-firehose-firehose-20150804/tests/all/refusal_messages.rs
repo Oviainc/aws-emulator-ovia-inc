@@ -14,7 +14,9 @@
 //!    name states name and account, a lookup that found nothing states the account and
 //!    not the name it was given, a delete the state blocks states name, account and
 //!    state, and two destination configurations that exclude each other are refused with
-//!    one sentence over the members supplied.
+//!    one sentence over the members supplied;
+//! 4. a put to a stream that is not accepting data states the stream the request named
+//!    and the account the put was scoped to, and not the state the stream is in.
 //!
 //! Every request goes through the real router, so what is asserted is the body a client
 //! reads. The harness (`Emulator`, `s3_configuration`, …) is the lifecycle suite's.
@@ -22,7 +24,7 @@
 use serde_json::{json, Value};
 
 use super::delivery_stream_lifecycle::{
-    error_code, s3_configuration, Emulator, BUCKET_ARN, ROLE_ARN,
+    error_code, s3_configuration, Emulator, BUCKET_ARN, PAST_THE_TRANSITION, ROLE_ARN,
 };
 // `error_message` lives beside `error_code` in the lifecycle suite, so every suite in this
 // test crate reads a refusal the same way rather than carrying its own copy. It is
@@ -605,6 +607,75 @@ async fn a_lookup_that_resolved_nothing_names_the_account_and_never_the_probed_n
                  got {message:?}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_put_to_a_stream_that_is_not_active_names_the_stream_and_the_account() {
+    let emulator = Emulator::new();
+    let account = engine::emulator_account_id();
+
+    // A create answers with the stream in `CREATING`, and "attempts to send data to a
+    // delivery stream that is not in the ACTIVE state cause an exception". The sentence
+    // is built from the request's own stream name and the account the put was scoped to,
+    // whichever put operation raised it and whichever non-`ACTIVE` state the stream is in.
+    //
+    // (case, operation, request for a name)
+    struct Put {
+        case: &'static str,
+        operation: &'static str,
+        /// Builds the request that puts to a stream of that name.
+        request: fn(&str) -> Value,
+    }
+
+    let puts = vec![
+        Put {
+            case: "put a record",
+            operation: "PutRecord",
+            request: |name| json!({ "DeliveryStreamName": name, "Record": { "Data": "eA==" } }),
+        },
+        Put {
+            case: "put a batch",
+            operation: "PutRecordBatch",
+            request: |name| json!({ "DeliveryStreamName": name, "Records": [{ "Data": "eA==" }] }),
+        },
+    ];
+
+    // The names differ in every way a stream name can — including one that, with the
+    // per-operation suffix, is exactly the modelled 64-character maximum; the template
+    // does not.
+    for name in ["creating-put", "creating.put.2", &"c".repeat(49)] {
+        for put in &puts {
+            let (case, operation) = (put.case, put.operation);
+            let stream = format!("{name}-{operation}");
+            emulator.create_stream(&stream, None).await;
+            let (status, refused) = emulator.call(operation, (put.request)(&stream)).await;
+            assert_eq!(status, 400, "case {case:?} of {stream:?}: got {refused:?}");
+            assert_eq!(
+                error_code(&refused),
+                "ResourceNotFoundException",
+                "case {case:?} of {stream:?}: got {refused:?}"
+            );
+            let message = error_message(&refused);
+            let expected = format!("Firehose {stream} is not active in {account} account.");
+            assert_eq!(
+                message, expected,
+                "case {case:?} of {stream:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    // The same stream takes data once the creation span has passed, so the refusal was
+    // the state and not the name.
+    tokio::time::sleep(PAST_THE_TRANSITION).await;
+    for put in &puts {
+        let (case, operation) = (put.case, put.operation);
+        let stream = format!("creating-put-{operation}");
+        let (status, accepted) = emulator.call(operation, (put.request)(&stream)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} of {stream:?}: an ACTIVE stream takes data, got {accepted:?}"
+        );
     }
 }
 

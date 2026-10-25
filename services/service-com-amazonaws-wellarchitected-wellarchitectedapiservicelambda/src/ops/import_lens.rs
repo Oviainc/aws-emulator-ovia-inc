@@ -251,21 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?;
                 // A resource holds at most `TagMap`'s own maximum of tags, so an update
                 // that would push the lens past it is refused rather than growing the
-                // stored map without bound. Checked BEFORE anything is written, so a
-                // refused request changes nothing.
-                let merged_tags = record
-                    .tags
-                    .keys()
-                    .chain(tags.keys())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len();
-                if merged_tags > crate::state::MAX_TAGS_PER_RESOURCE {
+                // stored map without bound. Counted and worded by the shared helpers
+                // beside `MAX_TAGS_PER_RESOURCE`, so this and `TagResource`'s tag write
+                // cannot drift. Checked BEFORE anything is written, so a refused request
+                // changes nothing.
+                if crate::state::merged_tag_count(&record.tags, &tags)
+                    > crate::state::MAX_TAGS_PER_RESOURCE
+                {
                     return Err(field_validation(
-                        "Tags",
-                        &format!(
-                            "Member must not raise the lens's tag count above {}",
-                            crate::state::MAX_TAGS_PER_RESOURCE
-                        ),
+                        crate::state::TAGS_MEMBER,
+                        &crate::state::tag_ceiling_constraint("the lens"),
                     ));
                 }
                 // An import that already landed becomes the lens's draft content before

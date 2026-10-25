@@ -40,6 +40,13 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! This service's model carries no client-input error at all, and the code Elastic Load
+//! Balancing answers a value outside a rule its model cannot express with is
+//! `ValidationError` — the same code the framework renders on the query protocols for a
+//! value outside a MODELLED bound. So beside `validation` there is
+//! [`Scaffolded::validation_error`], which answers under that code; reach for it rather
+//! than inventing a second code for one logical failure.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -359,10 +366,11 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason: neither synthetic shape carries an `awsQueryError` trait.
             Self::ValidationException(_) => None,
-            // Same reason again: `<Code>ValidationError</Code>` comes from
-            // [`OperationError::shape_name`] above, not from a modelled trait.
+            // Same reason again: the `<Code>ValidationError</Code>` the envelope renders
+            // comes from [`OperationError::shape_name`] above, not from a modelled trait,
+            // and it IS the code AWS answers with — so there is nothing to override.
             Self::ValidationError(_) => None,
         }
     }

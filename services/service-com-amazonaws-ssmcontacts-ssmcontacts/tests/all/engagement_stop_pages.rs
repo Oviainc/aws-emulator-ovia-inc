@@ -135,7 +135,7 @@ async fn stop_time(emulator: &Emulator, engagement_arn: &str, case: &str) -> f64
 ///
 /// Written to the store directly because no modelled call moves a page's send instant — the
 /// plan's own schedule does, and a suite cannot wait minutes for it.
-fn set_sent_time(emulator: &Emulator, page_arn: &str, at: SystemTime) {
+pub(crate) fn set_sent_time(emulator: &Emulator, page_arn: &str, at: SystemTime) {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     let mut state = state.lock();
     let page = state
@@ -146,7 +146,7 @@ fn set_sent_time(emulator: &Emulator, page_arn: &str, at: SystemTime) {
 }
 
 /// `offset_secs` from now, which a negative value puts in the past.
-fn from_now(offset_secs: i64) -> SystemTime {
+pub(crate) fn from_now(offset_secs: i64) -> SystemTime {
     let now = SystemTime::now();
     let delta = Duration::from_secs(offset_secs.unsigned_abs());
     if offset_secs.is_negative() {

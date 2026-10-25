@@ -31,6 +31,10 @@ pub mod authorization;
 /// resources an Amazon EVS request names.
 pub mod ec2_resources;
 
+/// The ARN of the Amazon Web Services Secrets Manager secret an Amazon EVS request
+/// named, which it may name by ARN or by name.
+pub mod secret_resources;
+
 /// The `EnvironmentState` / `VlanState` values this service moves a resource through.
 /// Both enums carry the same five values (`smithy_query(query="shape",
 /// shape="EnvironmentState,VlanState")`).
@@ -544,13 +548,14 @@ pub struct StoredConnector {
     pub connector_type: String,
     /// The FQDN of the VCF appliance the connector connects to.
     pub appliance_fqdn: String,
-    /// The Secrets Manager secret holding the appliance credentials, EXACTLY as the
-    /// request supplied it.
+    /// The ARN of the Secrets Manager secret holding the appliance credentials.
     ///
-    /// `secretIdentifier` accepts "The ARN or name of the Amazon Web Services Secrets
-    /// Manager secret" and `secretArn` carries that same `SecretIdentifier` shape, so
-    /// a name is reported as a name: this emulator runs no Secrets Manager and cannot
-    /// resolve a name to the ARN of a secret it does not hold.
+    /// A request names that secret by ARN OR by name (`secretIdentifier`, "The ARN or
+    /// name of the Amazon Web Services Secrets Manager secret"), while the member this
+    /// field is reported through is `Connector$secretArn`, "The Amazon Resource Name
+    /// (ARN) of" it — so the identifier is resolved to an ARN before it is stored
+    /// ([`secret_resources::resolve_secret_arn`]) and a connector read hands the caller
+    /// an ARN whichever form the request used.
     pub secret_arn: String,
     /// The `ConnectorState` the connector is in.
     pub state: String,
@@ -572,11 +577,14 @@ pub struct StoredConnector {
 impl StoredConnector {
     /// A new connector, as `CreateEnvironmentConnector` mints one: `CREATING` until
     /// the move to `ACTIVE` the clock owes it comes due.
+    ///
+    /// `secret_arn` is the RESOLVED ARN of the credential secret
+    /// ([`secret_resources::resolve_secret_arn`]), never the raw `secretIdentifier`.
     pub fn creating(
         connector_id: String,
         connector_type: &str,
         appliance_fqdn: &str,
-        secret_identifier: &str,
+        secret_arn: String,
         created_at_ms: i64,
         pending: PendingConnectorState,
     ) -> Self {
@@ -584,7 +592,7 @@ impl StoredConnector {
             connector_id,
             connector_type: connector_type.to_string(),
             appliance_fqdn: appliance_fqdn.to_string(),
-            secret_arn: secret_identifier.to_string(),
+            secret_arn,
             state: CONNECTOR_CREATING.to_string(),
             state_details: None,
             checks: Vec::new(),

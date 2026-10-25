@@ -275,12 +275,10 @@ async fn get_function_configuration_reports_the_stored_configuration() {
             }),
             runtime: Some("python3.12"),
             package_type: "Zip",
-            // ABSENT, as `tests/all/function_configuration.rs` pins it for the operation
-            // that owns this member. The recorded AWS response carries an EMPTY
-            // description here instead, which is the `$.Description` cause this issue
-            // leaves open for `CreateFunction`'s own follow-up rather than contradicting
-            // the existing assertion from a second suite.
-            description: None,
+            // EMPTY, not absent: `Description` is a member of every
+            // `FunctionConfiguration` AWS reports, so a function created without one
+            // reports it as the empty string.
+            description: Some(""),
             log_format: "Text",
             log_group: "/aws/lambda/defaults".to_string(),
             snap_start_apply_on: "None",
@@ -328,7 +326,7 @@ async fn get_function_configuration_reports_the_stored_configuration() {
             }),
             runtime: None,
             package_type: "Image",
-            description: None,
+            description: Some(""),
             log_format: "Text",
             log_group: "/aws/lambda/from-image".to_string(),
             snap_start_apply_on: "None",

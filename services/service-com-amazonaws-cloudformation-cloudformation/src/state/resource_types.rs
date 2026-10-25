@@ -437,6 +437,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::EFS::FileSystem",
     "AWS::EFS::MountTarget",
     // Amazon EKS
+    "AWS::EKS::AccessEntry",
     "AWS::EKS::Addon",
     "AWS::EKS::Cluster",
     "AWS::EKS::FargateProfile",

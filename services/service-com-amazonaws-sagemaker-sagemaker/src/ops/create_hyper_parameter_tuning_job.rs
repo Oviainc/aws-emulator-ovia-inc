@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHyperParameterTuningJob
-//! IMPLEMENTED: refuses a request whose requested capacity is past a published
-//! per-tuning-job quota with the modelled `ResourceLimitExceeded`, a request that breaks
+//! IMPLEMENTED: refuses a request whose requested capacity is past one of the account's
+//! published quotas on the training jobs a tuning job runs with the modelled
+//! `ResourceLimitExceeded`, a request that breaks
 //! a cross-member rule the model cannot express with a 400 `ValidationException`, and a
 //! name another tuning job already holds with the modelled `ResourceInUse`; otherwise it
 //! stores the job in `crate::state` as `InProgress` together with the instant the clock
@@ -226,59 +227,127 @@ fn searched_hyperparameters(ranges: &ParameterRanges) -> usize {
             .map_or(0, Vec::len)
 }
 
-/// Why one `ParameterRanges`' bounds are not searchable, if they are not.
+/// Which constraint a hyperparameter range breaks, of the rules the model's own
+/// constraints cannot express.
 ///
 /// `MinValue`/`MaxValue` are modelled as free strings (`pattern .*`), so the type the
 /// range declares and the ordering of its two bounds are rules the service enforces
 /// itself: an integer range carries integers, a continuous range carries finite
 /// floating-point values, and in both the minimum may not exceed the maximum.
-fn parameter_range_bounds_refusal(ranges: &ParameterRanges) -> Option<String> {
-    for range in ranges.integer_parameter_ranges.iter().flatten() {
-        let (Ok(min), Ok(max)) = (
-            range.min_value.trim().parse::<i64>(),
-            range.max_value.trim().parse::<i64>(),
-        ) else {
-            return Some(format!(
-                "The integer parameter range for hyperparameter \"{}\" must carry integer \
-                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
-                range.name, range.min_value, range.max_value
-            ));
-        };
-        if min > max {
-            return Some(format!(
-                "The integer parameter range for hyperparameter \"{}\" has MinValue {min}, \
-                 which is greater than its MaxValue {max}.",
-                range.name
-            ));
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RangeViolation {
+    IntegerBoundsReversed,
+    IntegerBoundsNotIntegers,
+    ContinuousBoundsReversed,
+    ContinuousBoundsNotNumbers,
+    ContinuousBoundsNotFinite,
+}
+
+impl RangeViolation {
+    /// What the refusal states after naming the offending ranges: the constraint the
+    /// range kind requires, then the value to send instead.
+    ///
+    /// The sentence names the MEMBERS and the requirement, never a parsed number: the
+    /// values the caller sent are its own, and re-rendering them (`1.0` read back as `1`)
+    /// would report something it did not write.
+    fn constraint(self) -> &'static str {
+        match self {
+            Self::IntegerBoundsReversed => {
+                "For integer parameter ranges, the value of MinValue must be smaller than \
+                 the value of MaxValue. Specify a value for MinValue that is smaller than \
+                 the value of MaxValue."
+            }
+            Self::IntegerBoundsNotIntegers => {
+                "For integer parameter ranges, the values of MinValue and MaxValue must be \
+                 integers. Specify integer MinValue and MaxValue values."
+            }
+            Self::ContinuousBoundsReversed => {
+                "For continuous parameter ranges, the value of MinValue must be smaller \
+                 than the value of MaxValue. Specify a value for MinValue that is smaller \
+                 than the value of MaxValue."
+            }
+            Self::ContinuousBoundsNotNumbers => {
+                "For continuous parameter ranges, the values of MinValue and MaxValue must \
+                 be numbers. Specify numeric MinValue and MaxValue values."
+            }
+            Self::ContinuousBoundsNotFinite => {
+                "For continuous parameter ranges, the values of MinValue and MaxValue must \
+                 be finite numbers. Specify finite MinValue and MaxValue values."
+            }
         }
     }
-    for range in ranges.continuous_parameter_ranges.iter().flatten() {
-        let (Ok(min), Ok(max)) = (
-            range.min_value.trim().parse::<f64>(),
-            range.max_value.trim().parse::<f64>(),
-        ) else {
-            return Some(format!(
-                "The continuous parameter range for hyperparameter \"{}\" must carry numeric \
-                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
-                range.name, range.min_value, range.max_value
-            ));
-        };
-        if !min.is_finite() || !max.is_finite() {
-            return Some(format!(
-                "The continuous parameter range for hyperparameter \"{}\" must carry finite \
-                 MinValue and MaxValue values, but carries \"{}\" and \"{}\".",
-                range.name, range.min_value, range.max_value
-            ));
+}
+
+/// Every range of `ranges` whose bounds are not searchable: the constraint it breaks and
+/// the hyperparameter it names, in the order the request lists them.
+fn range_violations(ranges: &[&ParameterRanges]) -> Vec<(RangeViolation, String)> {
+    let mut violations = Vec::new();
+    for range in ranges {
+        for integer in range.integer_parameter_ranges.iter().flatten() {
+            let (Ok(min), Ok(max)) = (
+                integer.min_value.trim().parse::<i64>(),
+                integer.max_value.trim().parse::<i64>(),
+            ) else {
+                violations.push((
+                    RangeViolation::IntegerBoundsNotIntegers,
+                    integer.name.clone(),
+                ));
+                continue;
+            };
+            if min > max {
+                violations.push((RangeViolation::IntegerBoundsReversed, integer.name.clone()));
+            }
         }
-        if min > max {
-            return Some(format!(
-                "The continuous parameter range for hyperparameter \"{}\" has MinValue {min}, \
-                 which is greater than its MaxValue {max}.",
-                range.name
-            ));
+        for continuous in range.continuous_parameter_ranges.iter().flatten() {
+            let (Ok(min), Ok(max)) = (
+                continuous.min_value.trim().parse::<f64>(),
+                continuous.max_value.trim().parse::<f64>(),
+            ) else {
+                violations.push((
+                    RangeViolation::ContinuousBoundsNotNumbers,
+                    continuous.name.clone(),
+                ));
+                continue;
+            };
+            if !min.is_finite() || !max.is_finite() {
+                violations.push((
+                    RangeViolation::ContinuousBoundsNotFinite,
+                    continuous.name.clone(),
+                ));
+                continue;
+            }
+            if min > max {
+                violations.push((
+                    RangeViolation::ContinuousBoundsReversed,
+                    continuous.name.clone(),
+                ));
+            }
         }
     }
-    None
+    violations
+}
+
+/// Why the hyperparameter ranges this request searches over are not valid, if they are
+/// not — the 400 `ValidationException`'s message.
+///
+/// The refusal is built from the REQUEST: it names every range that breaks the first
+/// constraint broken, as a bracketed comma-separated list of the hyperparameter names the
+/// request gave them, and then states that constraint. So a client extracts the offending
+/// hyperparameters from the list it sent rather than parsing prose, and a request with
+/// several bad ranges is answered once with all of them instead of one per round trip.
+fn parameter_ranges_refusal(ranges: &[&ParameterRanges]) -> Option<String> {
+    let violations = range_violations(ranges);
+    let (broken, _) = *violations.first()?;
+    let names: Vec<&str> = violations
+        .iter()
+        .filter(|(violation, _)| *violation == broken)
+        .map(|(_, name)| name.as_str())
+        .collect();
+    Some(format!(
+        "The hyperparameter ranges [{}] are not valid. {}",
+        names.join(","),
+        broken.constraint()
+    ))
 }
 
 /// Why this request is not a tuning job the service can start, if it is not — every rule
@@ -308,10 +377,8 @@ fn validation_refusal(input: &CreateHyperParameterTuningJobInput) -> Option<Stri
     }
 
     let ranges = parameter_ranges(input);
-    for range in &ranges {
-        if let Some(message) = parameter_range_bounds_refusal(range) {
-            return Some(message);
-        }
+    if let Some(message) = parameter_ranges_refusal(&ranges) {
+        return Some(message);
     }
 
     // The bound is on the hyperparameters ONE training job definition searches: the
@@ -451,32 +518,41 @@ fn validation_refusal(input: &CreateHyperParameterTuningJobInput) -> Option<Stri
     None
 }
 
-/// Why the capacity this request asks for is past a published per-tuning-job quota, if
-/// it is — the modelled `ResourceLimitExceeded`'s message.
-fn limit_refusal(limits: &ResourceLimits) -> Option<String> {
+/// Why the capacity this request asks for is past an account-level quota, if it is — the
+/// modelled `ResourceLimitExceeded`'s message.
+///
+/// The quotas are the ACCOUNT's published quotas on the training jobs a tuning job runs,
+/// and they are evaluated with the parallel one FIRST: a request is classified against
+/// the dimension SageMaker weighs first, so a request that is legal for one dimension and
+/// illegal for the other is answered about the one that actually blocks it.
+///
+/// `in_use` is what the account is using of those quotas now — see
+/// `crate::state::ComAmazonawsSagemakerSagemakerState::parallel_training_jobs_in_use`,
+/// which is where it is counted — because the message states the utilisation beside the
+/// limit, not just the member of the request that exceeded it.
+fn limit_refusal(limits: &ResourceLimits, in_use: usize) -> Option<String> {
     let quotas = [
         (
-            "MaxNumberOfTrainingJobs",
-            "Maximum number of training jobs per hyperparameter tuning job",
-            limits.max_number_of_training_jobs.unwrap_or(0),
-            crate::state::MAX_TRAINING_JOBS_PER_TUNING_JOB,
-        ),
-        (
-            "MaxParallelTrainingJobs",
-            "Maximum number of parallel training jobs per hyperparameter tuning job",
+            crate::state::PARALLEL_TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME,
             limits.max_parallel_training_jobs,
             crate::state::MAX_PARALLEL_TRAINING_JOBS_PER_TUNING_JOB,
+        ),
+        (
+            crate::state::TRAINING_JOBS_PER_TUNING_JOB_QUOTA_NAME,
+            limits.max_number_of_training_jobs.unwrap_or(0),
+            crate::state::MAX_TRAINING_JOBS_PER_TUNING_JOB,
         ),
     ];
     quotas
         .into_iter()
-        .find(|(_, _, requested, quota)| requested > quota)
-        .map(|(member, quota_name, requested, quota)| {
-            // The quota is per tuning job, so there is no account utilisation to state:
-            // what the limit is, and what this request asked for, is the whole story.
-            format!(
-                "The service limit '{quota_name}' is {quota}, and {member} requested \
-                 {requested}."
+        .find(|(_, requested, quota)| requested > quota)
+        .map(|(quota_name, requested, quota)| {
+            crate::state::account_quota_exceeded(
+                quota_name,
+                crate::state::TRAINING_JOBS_UNIT,
+                i64::from(quota),
+                in_use as i64,
+                i64::from(requested),
             )
         })
 }
@@ -501,11 +577,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
-        // The capacity the request asks for, against the account's published limits.
-        // This comes first: a request for more training jobs than the account may run is
-        // a limit failure whatever else is wrong with its numbers.
-        if let Some(message) = limit_refusal(&input.hyper_parameter_tuning_job_config.resource_limits)
-        {
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(
+            &region,
+            "hyper-parameter-tuning-job",
+            &input.hyper_parameter_tuning_job_name,
+        );
+
+        let mut store = state.lock();
+        // The capacity the request asks for, against the account's published quotas on the
+        // training jobs a tuning job runs. This comes first: a request for more training
+        // jobs than the account may run is a limit failure whatever else is wrong with its
+        // numbers. The store is read for the utilisation the refusal states.
+        if let Some(message) = limit_refusal(
+            &input.hyper_parameter_tuning_job_config.resource_limits,
+            store.parallel_training_jobs_in_use(),
+        ) {
             return Err(CreateHyperParameterTuningJobErrorModeled::ResourceLimitExceeded(
                 ResourceLimitExceeded {
                     message: Some(message),
@@ -519,14 +606,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        let region = crate::state::request_region(ctx);
-        let arn = crate::state::resource_arn(
-            &region,
-            "hyper-parameter-tuning-job",
-            &input.hyper_parameter_tuning_job_name,
-        );
-
-        let mut store = state.lock();
         // The name identifies the job, so a second create under a name already taken is
         // the modelled `ResourceInUse` rather than a second record. Checked before the
         // store bound: a collision adds no record, so it cannot be a limit failure. The
@@ -545,7 +624,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // The store is bounded, so a caller varying the job name cannot grow it without
-        // end. `ResourceLimitExceeded` is the limit failure this operation models.
+        // end. `ResourceLimitExceeded` is the limit failure this operation models. That
+        // bound is the emulator's OWN (`crate::state::MODEL_QUOTA`) rather than one of the
+        // published quotas the capacity check above evaluates, so it is stated in its own
+        // words rather than as a quota Service Quotas could raise.
         if !store.tuning_jobs_below_quota() {
             return Err(CreateHyperParameterTuningJobErrorModeled::ResourceLimitExceeded(
                 ResourceLimitExceeded {
@@ -577,10 +659,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tuning_jobs
                 .contains_key(&crate::state::entity_key(name))
             {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Could not find the parent hyperparameter tuning job \"{name}\" named by \
-                     WarmStartConfig."
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::tuning_job_not_found(name),
+                ));
             }
         }
 

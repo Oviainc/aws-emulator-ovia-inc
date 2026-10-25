@@ -128,6 +128,65 @@ pub const MAX_PROPERTIES_RETURNED: usize = 800;
 /// `TooManyTagsException` (HTTP 400) that operation models.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The tag-key prefix Amazon Web Services reserves for the tags it applies
+/// itself.
+///
+/// AWS's tagging rules reserve this prefix across every tagging API: a caller
+/// may neither create nor edit nor delete a tag whose key begins with it, so a
+/// request naming one is refused and nothing it asked for is applied. The
+/// reservation is of the NAMESPACE rather than of one spelling of it, so the
+/// prefix is matched however it is cased (see [`is_reserved_tag_key`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// Only the prefix is reserved, so a key that merely CONTAINS it further along,
+/// or one that starts with the letters without the colon, is an ordinary
+/// caller-owned key. A key too short to carry the prefix cannot be in the
+/// namespace, and neither can one whose first bytes are the middle of a
+/// multi-byte character — `str::get` answers `None` for both.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The requirement `keys` fails when any of them lies in the namespace
+/// [`RESERVED_TAG_KEY_PREFIX`] reserves, as the message of the refusal that
+/// earns, or `None` when every key is the caller's own to write.
+///
+/// `member` is the member of the request that carries the keys (`tags`,
+/// `tagKeys`), so the message is built from the request: it names the member at
+/// fault, the keys that failed and the requirement they failed, the same
+/// construction as this service's other validation messages. The offending keys
+/// are reported in key order, so the refusal does not depend on the iteration
+/// order of the map the request was deserialized into.
+///
+/// Decided on the keys ALONE, so every writer of a tag set — the tagging
+/// operations and every create that takes a `tags` map — refuses the whole
+/// request before touching the store: a request mixing a legal key with a
+/// reserved one applies neither.
+pub fn reserved_tag_keys_violation<'a, I>(member: &str, keys: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut reserved: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return None;
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+    Some(format!(
+        "{member} names the tag {} {} in the {RESERVED_TAG_KEY_PREFIX} namespace, which is \
+         reserved for the tags Amazon Web Services applies itself: such a key cannot be \
+         created, changed or removed by a caller.",
+        if reserved.len() == 1 { "key" } else { "keys" },
+        reserved.join(", "),
+    ))
+}
+
 /// The most workspaces this emulator holds, the most entities one workspace
 /// holds, and the most component types one workspace holds, before
 /// `CreateWorkspace` / `CreateEntity` / `CreateComponentType` answer the

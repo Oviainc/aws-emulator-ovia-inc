@@ -235,6 +235,26 @@ pub enum ObjectTagWrite {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::replace_object_retention`] did, so the caller
+/// answers each outcome without re-deriving it — and cannot record a retention without
+/// having gone through the byte budgets a stored object's members count against, per
+/// bucket AND service-wide. The shape [`ObjectTagWrite`] has, for the same reason: a
+/// retention is one more string kept beside an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectRetentionWrite {
+    /// The addressed object version's retention is now the one that was handed in (or
+    /// none, when the call removed it).
+    Applied,
+    /// The bucket exists but holds no such object version; nothing was written.
+    NoSuchObject,
+    /// Keeping the retention would take the bucket past [`MAX_OBJECT_BYTES_PER_BUCKET`]
+    /// retained bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Keeping the retention would take the whole store past [`MAX_OBJECT_BYTES_TOTAL`]
+    /// retained bytes; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
+}
+
 /// How many in-progress multipart uploads one bucket in this emulator keeps.
 ///
 /// NOT a fidelity claim: S3 publishes no limit on concurrent multipart uploads of a
@@ -3100,10 +3120,18 @@ fn midnight_after_days(from: SystemTime, days: i32) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(midnight).ok()?))
 }
 
-/// `date` as an instant. A lifecycle `Date` is a midnight UTC, so this is the midnight it
-/// names.
-fn instant_of(date: &::aws_smithy_types::DateTime) -> Option<SystemTime> {
-    Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(date.secs()).ok()?))
+/// The instant `date` names, or `None` when it is outside the range a [`SystemTime`] on
+/// this platform can hold.
+///
+/// The ONE place a modelled timestamp becomes an instant the store keeps, whichever member
+/// carried it: the midnight UTC a lifecycle `Date` names, and the end of the period an
+/// object version's retention runs to ([`ObjectRetention::retain_until`]), so the value
+/// `GetObjectRetention` reports back is the one the write recorded.
+/// `::aws_smithy_types::DateTime::from(SystemTime)` is the other direction, and both are
+/// the crate's own conversions — nothing here re-derives epoch arithmetic, which is also
+/// what lets a date BEFORE the epoch through rather than refusing it.
+pub fn instant_of(date: &::aws_smithy_types::DateTime) -> Option<SystemTime> {
+    SystemTime::try_from(*date).ok()
 }
 
 /// Whether `tags` carries `tag`'s key with `tag`'s value — "this tag must exist in the
@@ -3965,6 +3993,21 @@ impl Bucket {
         self.stored_version(key, version_id)?.as_object()
     }
 
+    /// The object version a request ADDRESSES: the one `version_id` names, or the key's
+    /// current object when the request names no version.
+    ///
+    /// One place, so every operation that acts on "this object, optionally this version of
+    /// it" resolves the address the same way — "the version ID for the object that you want
+    /// to apply this Object Retention configuration to"
+    /// (`PutObjectRetentionRequest$VersionId`), and with none the current version, which is
+    /// what a reader naming no `versionId` answers with.
+    pub fn addressed_object(&self, key: &str, version_id: Option<&str>) -> Option<&Object> {
+        match version_id {
+            None => self.object(key),
+            Some(version_id) => self.object_version(key, version_id),
+        }
+    }
+
     /// Every version of `key` the bucket holds, NEWEST FIRST: the current one followed by
     /// the noncurrent ones, delete markers among them.
     ///
@@ -4115,6 +4158,26 @@ impl Bucket {
     /// reaching an object this way directly would bypass them.
     fn object_mut(&mut self, key: &str) -> Option<&mut Object> {
         self.versions.get_mut(key)?.first_mut()?.as_object_mut()
+    }
+
+    /// The object version a request addresses, for writing one of its subresources: the
+    /// one `version_id` names, or the key's current object when it names none — the
+    /// mutable twin of [`Self::addressed_object`].
+    ///
+    /// PRIVATE, and reached only through
+    /// [`ComAmazonawsS3Amazons3State::replace_object_retention`], for the reason
+    /// [`Self::object_mut`] is private: that is the one place that sees the byte budgets a
+    /// subresource write also has to stay inside.
+    fn addressed_object_mut(&mut self, key: &str, version_id: Option<&str>) -> Option<&mut Object> {
+        match version_id {
+            None => self.object_mut(key),
+            Some(version_id) => self
+                .versions
+                .get_mut(key)?
+                .iter_mut()
+                .find(|held| held.named_by(version_id))?
+                .as_object_mut(),
+        }
     }
 
     /// Store `object` at `key` as the key's current version, reporting what that did.
@@ -4450,6 +4513,16 @@ pub struct Object {
     /// cannot use PutObject to only update a single piece of metadata for an existing
     /// object."
     pub encryption: ObjectEncryption,
+    /// The Object Lock retention in force on this stored version — see
+    /// [`ObjectRetention`] — or `None` while no retention is associated with it, which is
+    /// the state a write leaves a version in.
+    ///
+    /// Unlike every member above it, this one is set AFTER the write: a retention is
+    /// "placed" on an object by `PutObjectRetention` ("Places an Object Retention
+    /// configuration on an object"), through
+    /// [`ComAmazonawsS3Amazons3State::replace_object_retention`], which is the one place
+    /// that sees the byte budgets it has to stay inside.
+    pub retention: Option<ObjectRetention>,
 }
 
 /// The server-side encryption in force on one stored object: the configuration the write
@@ -4544,6 +4617,68 @@ impl ObjectEncryption {
     }
 }
 
+/// The `ObjectLockRetentionMode` value whose retention bars a weakening write unless the
+/// caller asks to bypass it — one of that enum's two values
+/// (`smithy_query(query="shape",shape="ObjectLockRetentionMode")`, which
+/// [`crate::ops::types::OBJECT_LOCK_RETENTION_MODE_VALUES`] carries).
+pub const GOVERNANCE_RETENTION_MODE: &str = "GOVERNANCE";
+
+/// The other `ObjectLockRetentionMode` value: the one whose retention nothing may weaken
+/// while it is in force, bypass asked for or not.
+pub const COMPLIANCE_RETENTION_MODE: &str = "COMPLIANCE";
+
+/// The Object Lock RETENTION in force on one stored object version: the configuration
+/// `PutObjectRetention` last placed on it, which `GetObjectRetention` reports back.
+///
+/// The members are `ObjectLockRetention`'s own
+/// (`smithy_query(query="shape",shape="ObjectLockRetention")`): the `Mode` the version is
+/// locked in and the `RetainUntilDate` that lock runs to. Both together or neither — "the
+/// container element for the Object Retention configuration"
+/// (`PutObjectRetentionRequest$Retention`) describes one period in one mode, so a version
+/// either carries a retention or carries none, which is why this lives behind an
+/// `Option` on [`Object`].
+///
+/// What it records is a retention SETTING, not an enforcement engine: the instant the
+/// period runs to is kept so every reader answers the same date, and
+/// [`Self::in_force_at`] is what a write that would weaken it is judged against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRetention {
+    /// An `ObjectLockRetentionMode` value — [`GOVERNANCE_RETENTION_MODE`] or
+    /// [`COMPLIANCE_RETENTION_MODE`].
+    pub mode: String,
+    /// When the retention period runs to: `ObjectLockRetention$RetainUntilDate`, "the date
+    /// on which this Object Lock Retention will expire".
+    pub retain_until: SystemTime,
+}
+
+impl ObjectRetention {
+    /// Whether the period is still running at `instant`, which is what makes the retention
+    /// a restriction on a later write rather than a record of one that has run out: a
+    /// retention "will expire" at its `RetainUntilDate`
+    /// (`ObjectLockRetention$RetainUntilDate`), so the instant it names is the first one it
+    /// no longer covers.
+    pub fn in_force_at(&self, instant: SystemTime) -> bool {
+        instant < self.retain_until
+    }
+
+    /// Whether this retention protects LESS than `other` does — the comparison a
+    /// `PutObjectRetention` over an existing retention is judged by: a period that ends
+    /// earlier (shortening it) or a mode that can itself be lifted where the one in force
+    /// cannot (`GOVERNANCE` placed over `COMPLIANCE`).
+    pub fn weakens(&self, other: &Self) -> bool {
+        self.retain_until < other.retain_until
+            || (other.mode == COMPLIANCE_RETENTION_MODE && self.mode != COMPLIANCE_RETENTION_MODE)
+    }
+
+    /// How many bytes this record retains — the caller-supplied string it holds, which the
+    /// per-bucket and service-wide budgets must count like every other string kept beside
+    /// an object ([`ObjectEncryption::retained_bytes`] counts its own the same way).
+    pub fn retained_bytes(&self) -> usize {
+        self.mode.len()
+    }
+}
+
+
 impl Object {
     /// How many bytes this stored object retains: its payload AND every string kept
     /// beside it (its entity tag, storage class, the response headers it carries, its
@@ -4561,6 +4696,10 @@ impl Object {
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
             + self.encryption.retained_bytes()
+            + self
+                .retention
+                .as_ref()
+                .map_or(0, ObjectRetention::retained_bytes)
             + [
                 &self.content_type,
                 &self.cache_control,
@@ -5180,6 +5319,76 @@ impl ComAmazonawsS3Amazons3State {
             })
     }
 
+    /// Replace the Object Lock retention of the object version `version_id` names in
+    /// `bucket` — the key's current object when it names none — with `retention`, or take
+    /// the retention away when that is `None`. Reports what the write did, or `None` when
+    /// this emulator holds no such bucket (so a retention write refuses a name that is not
+    /// a bucket instead of creating one).
+    ///
+    /// A REPLACEMENT of the whole subresource, the way [`Self::replace_object_tags`]
+    /// replaces a tag set: `Retention` is "the container element for the Object Retention
+    /// configuration" (`PutObjectRetentionRequest$Retention`), so what the version carries
+    /// afterwards is exactly what this call carried and nothing of the configuration
+    /// before it.
+    ///
+    /// This decides NOTHING about whether the write is ALLOWED: whether a retention in
+    /// force bars it, and whether the caller asked to bypass a governance one, is the
+    /// handler's judgement over [`ObjectRetention::in_force_at`] and
+    /// [`ObjectRetention::weakens`] — this is the storage seam those answers end at.
+    ///
+    /// It is the ONLY way an object's retention is recorded, because it is the only place
+    /// that can see BOTH the per-bucket byte budget and the service-wide one: a retention
+    /// is retained with the object ([`Object::retained_bytes`]) and is not bounded by
+    /// anything [`Self::put_object`] checked. Nothing is written unless the answer is
+    /// [`ObjectRetentionWrite::Applied`].
+    pub fn replace_object_retention(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        retention: Option<ObjectRetention>,
+    ) -> Option<ObjectRetentionWrite> {
+        let held = self.buckets.get(bucket)?;
+        let Some(object) = held.addressed_object(key, version_id) else {
+            return Some(ObjectRetentionWrite::NoSuchObject);
+        };
+
+        // What the bucket and the whole store would retain with this retention in place of
+        // the version's current one: everything they retain now, less the bytes the record
+        // being replaced holds, plus the bytes of the replacement.
+        let released = object
+            .retention
+            .as_ref()
+            .map_or(0, ObjectRetention::retained_bytes);
+        let taken = retention
+            .as_ref()
+            .map_or(0, ObjectRetention::retained_bytes);
+        let would_hold = held.retained_bytes().saturating_sub(released) + taken;
+        if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(ObjectRetentionWrite::ByteBudgetReached { would_hold });
+        }
+        let total_would_hold = self
+            .buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(released)
+            + taken;
+        if total_would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(ObjectRetentionWrite::TotalByteBudgetReached {
+                would_hold: total_would_hold,
+            });
+        }
+
+        self.buckets
+            .get_mut(bucket)
+            .and_then(|held| held.addressed_object_mut(key, version_id))
+            .map(|object| {
+                object.retention = retention;
+                ObjectRetentionWrite::Applied
+            })
+    }
+
     /// Record a bucket named `name` in `region`, reporting what happened.
     ///
     /// Nothing is written unless the answer is [`BucketCreation::Created`]: a taken name
@@ -5469,6 +5678,29 @@ pub const DEFAULT_BUCKET_KEY_ENABLED: bool = false;
 /// `aws:kms` or `aws:kms:dsse`." Both are values of the `ServerSideEncryption` enum, so a
 /// rule naming a key beside any other algorithm is one S3 refuses rather than records.
 pub const KMS_SSE_ALGORITHMS: [&str; 2] = ["aws:kms", "aws:kms:dsse"];
+
+/// The code a read of an object version's RETENTION answers with when no retention is
+/// associated with that version, with HTTP 404.
+///
+/// The subresource-not-there case, answered the way [`NO_SUCH_WEBSITE_CONFIGURATION_CODE`]
+/// answers it for a bucket's website configuration: `GetObjectRetention` reports the
+/// `Retention` container as its WHOLE @httpPayload
+/// (`smithy_query(query="operation",operation="GetObjectRetention")`), so a 200 has no way
+/// to report "there is none". The code is named for the subresource the request addressed,
+/// as every row of that family is.
+pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE: &str = "NoSuchObjectLockConfiguration";
+/// See [`NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`].
+pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_MESSAGE: &str =
+    "The specified object does not have an ObjectLock configuration";
+
+/// The `<Message>` S3 sends beside the 403 `AccessDenied` of a call an Object Lock
+/// retention bars: "Access Denied because object protected by object lock."
+///
+/// A fixed sentence for that one condition — it names neither the object, the mode nor the
+/// date, so nothing in it is derived from the request — which is why it lives here beside
+/// the other code/message pairs rather than being built in the handler.
+pub const OBJECT_LOCK_ACCESS_DENIED_MESSAGE: &str =
+    "Access Denied because object protected by object lock.";
 
 /// The code S3 answers a request whose value is not valid for the parameter carrying it:
 /// "InvalidArgument - Invalid Argument", HTTP 400 (Amazon S3 "Error responses", list of
@@ -5927,6 +6159,8 @@ mod tests {
             encryption: ObjectEncryption::default(),
             // The store mints the id; an object handed to `put_object` carries none.
             version_id: None,
+            // A write places no retention; `replace_object_retention` is what does.
+            retention: None,
         }
     }
 
