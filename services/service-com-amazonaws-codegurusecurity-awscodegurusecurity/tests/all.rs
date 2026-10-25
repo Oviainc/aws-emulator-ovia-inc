@@ -33,5 +33,7 @@ mod scan_completion;
 mod scan_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/upload_size.rs"]
+mod upload_size;
 #[path = "all/upload_target.rs"]
 mod upload_target;
