@@ -49,6 +49,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+// The two shapes a core network change event is reported through, imported on their own
+// so this slice's shape list below stays exactly as the rest of the service shares it.
+use crate::ops::types::{CoreNetworkChangeEvent, CoreNetworkChangeEventValues};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
     ConnectAttachment, ConnectAttachmentOptions,
@@ -825,6 +828,56 @@ pub const CHANGE_SET_EXECUTING: &str = "EXECUTING";
 /// See [`CHANGE_SET_PENDING_GENERATION`].
 pub const CHANGE_SET_EXECUTION_SUCCEEDED: &str = "EXECUTION_SUCCEEDED";
 
+/// The members of `ChangeStatus` one change of a stored policy version's change set
+/// reports (`smithy_query shape=ChangeStatus`: NOT_STARTED, IN_PROGRESS, COMPLETE, FAILED
+/// — mirrored in `ops::types::CHANGE_STATUS_VALUES`).
+///
+/// A change waits in [`CHANGE_STATUS_NOT_STARTED`] while its version's change set has not
+/// been executed, reads [`CHANGE_STATUS_IN_PROGRESS`] while that execution is under way
+/// and [`CHANGE_STATUS_COMPLETE`] once it has succeeded — the same clock the version's own
+/// `ChangeSetState` follows ([`CoreNetworkPolicyRecord::change_set_state_at`]). `FAILED` is
+/// unreachable here because a document that does not pass [`validate_policy_document`] is
+/// refused synchronously and never stored, so no stored change set can fail.
+pub const CHANGE_STATUS_NOT_STARTED: &str = "NOT_STARTED";
+/// See [`CHANGE_STATUS_NOT_STARTED`].
+pub const CHANGE_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`CHANGE_STATUS_NOT_STARTED`].
+pub const CHANGE_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The members of `ChangeAction` one change reports (`smithy_query shape=ChangeAction`:
+/// ADD, MODIFY, REMOVE — mirrored in `ops::types::CHANGE_ACTION_VALUES`): what the change
+/// does to the object it names, which follows from which of the two compared policies
+/// configures that object ([`policy_changes`]).
+pub const CHANGE_ACTION_ADD: &str = "ADD";
+/// See [`CHANGE_ACTION_ADD`].
+pub const CHANGE_ACTION_MODIFY: &str = "MODIFY";
+/// See [`CHANGE_ACTION_ADD`].
+pub const CHANGE_ACTION_REMOVE: &str = "REMOVE";
+
+/// The members of `ChangeType` the difference between two policy documents produces
+/// (`smithy_query shape=ChangeType`, mirrored in `ops::types::CHANGE_TYPE_VALUES`): the
+/// kinds of object a policy document configures and [`policy_topology`] therefore derives
+/// — an edge, a segment at one edge location, a network function group at one edge
+/// location, and the `attachment-policies` block as a whole.
+///
+/// The members this list leaves out are the ones no difference between two STORED documents
+/// can be seen in here. `ATTACHMENT_MAPPING`, the two attachment-route kinds and the
+/// routing-policy kinds describe objects that are not part of a document at all. The
+/// remaining configuration kinds (`CORE_NETWORK_CONFIGURATION`, `SEGMENTS_CONFIGURATION`,
+/// `SEGMENT_ACTIONS_CONFIGURATION`) name blocks a document does carry, but the derived
+/// topology keeps only what the operations of this slice act on — an edge's location, ASN
+/// and inside CIDR blocks, and a segment's or group's name and edge locations — so two
+/// documents differing ONLY in a part of those blocks the topology does not model (segment
+/// actions, a segment's other attributes) are not yet reported as a change.
+pub const CHANGE_TYPE_CORE_NETWORK_EDGE: &str = "CORE_NETWORK_EDGE";
+/// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
+pub const CHANGE_TYPE_CORE_NETWORK_SEGMENT: &str = "CORE_NETWORK_SEGMENT";
+/// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
+pub const CHANGE_TYPE_NETWORK_FUNCTION_GROUP: &str = "NETWORK_FUNCTION_GROUP";
+/// See [`CHANGE_TYPE_CORE_NETWORK_EDGE`].
+pub const CHANGE_TYPE_ATTACHMENT_POLICIES_CONFIGURATION: &str =
+    "ATTACHMENT_POLICIES_CONFIGURATION";
+
 /// How this service names ONE policy version of a core network in the required
 /// `ResourceId` of a modelled refusal: `<CoreNetworkId>/<PolicyVersionId>`.
 ///
@@ -1092,24 +1145,70 @@ pub struct CoreNetworkPolicyRecord {
     /// The `ClientToken` of the `PutCoreNetworkPolicy` that minted this version, kept so a
     /// retry of that request answers this version instead of minting a second one.
     pub client_token: Option<String>,
-    /// Whether this version's change set has been executed, which is what puts its
-    /// document in force. The version a create carries is executed by the create itself
-    /// ("A subsequent change set is created showing the differences between the LIVE
-    /// policy and the submitted policy", `smithy_query query="doc"
-    /// shape="PutCoreNetworkPolicy"` — a put only PREPARES one).
-    pub executed: bool,
+    /// The instant the execution of this version's change set began — which is what puts
+    /// its document in force — and `None` for a version whose change set has not been
+    /// executed. The version a create carries is executed by the create itself ("A
+    /// subsequent change set is created showing the differences between the LIVE policy and
+    /// the submitted policy", `smithy_query query="doc" shape="PutCoreNetworkPolicy"` — a
+    /// put only PREPARES one).
+    pub executed_at: Option<SystemTime>,
+    /// The changes this version's change set carries: the difference between the policy
+    /// that was in force when this version was stored and this version's own document
+    /// ([`policy_changes`]).
+    ///
+    /// Computed ONCE, where the version is stored, because that is when the change set is
+    /// generated — "a subsequent change set is created showing the differences between the
+    /// LIVE policy and the submitted policy" (`smithy_query query="doc"
+    /// shape="PutCoreNetworkPolicy"`) — so a later put that moves the LIVE policy does not
+    /// rewrite the change set of a version already stored, and a read of these changes
+    /// never re-parses a document. The list is bounded by the caps
+    /// [`validate_policy_document`] puts on the two documents compared, and a version is
+    /// itself bounded by [`MAX_POLICY_VERSIONS_PER_CORE_NETWORK`].
+    pub changes: Vec<PolicyChange>,
 }
 
 impl CoreNetworkPolicyRecord {
+    /// Whether this version's change set has been executed, which is what puts its
+    /// document in force.
+    pub fn executed(&self) -> bool {
+        self.executed_at.is_some()
+    }
+
     /// This version's `ChangeSetState` as of `now` — a function of the clock, so reading a
     /// version never writes. See [`CHANGE_SET_PENDING_GENERATION`].
     pub fn change_set_state_at(&self, now: SystemTime) -> &'static str {
-        match (self.executed, now >= self.settled_at) {
+        match (self.executed(), now >= self.settled_at) {
             (false, false) => CHANGE_SET_PENDING_GENERATION,
             (false, true) => CHANGE_SET_READY_TO_EXECUTE,
             (true, false) => CHANGE_SET_EXECUTING,
             (true, true) => CHANGE_SET_EXECUTION_SUCCEEDED,
         }
+    }
+
+    /// The change events of this version's change set as of `now`, each keyed by its
+    /// `IdentifierPath` — in that key's order, which is the order
+    /// [`policy_changes`] records the changes in.
+    ///
+    /// One event per change the change set carries, reporting the status that change's
+    /// execution is in as of `now` and the instant it last entered that status: the version
+    /// was stored (nothing executed yet), the execution began, or the execution succeeded.
+    /// Both are functions of stored instants and the clock, so reading them writes nothing
+    /// and two reads of an execution that has settled report the same events.
+    pub fn change_events_at(&self, now: SystemTime) -> Vec<(String, CoreNetworkChangeEvent)> {
+        let (status, event_time) = match self.executed_at {
+            Some(_) if now >= self.settled_at => (CHANGE_STATUS_COMPLETE, self.settled_at),
+            Some(started_at) => (CHANGE_STATUS_IN_PROGRESS, started_at),
+            None => (CHANGE_STATUS_NOT_STARTED, self.created_at),
+        };
+        self.changes
+            .iter()
+            .map(|change| {
+                (
+                    change.identifier_path(),
+                    change.to_change_event(status, event_time),
+                )
+            })
+            .collect()
     }
 
     /// The modelled `CoreNetworkPolicy` for this version, as of `now`, carrying the
@@ -1381,7 +1480,7 @@ impl CoreNetworkRecord {
     pub fn created_policy_document(&self) -> Option<&str> {
         self.policy_versions
             .get(&FIRST_POLICY_VERSION)
-            .filter(|version| version.executed)
+            .filter(|version| version.executed())
             .map(|version| version.document.as_str())
     }
 
@@ -1434,6 +1533,16 @@ impl CoreNetworkRecord {
     ) -> CoreNetworkPolicy {
         let version_id = self.policy_version_counter.saturating_add(1);
         self.policy_version_counter = version_id;
+        // The change set generated with the version: the difference between the document in
+        // force right now and the one being stored. The base is the LIVE version's own
+        // document rather than `self.topology`, which the caller may already have set to
+        // the topology of the document being stored.
+        let in_force = self
+            .live_policy_version
+            .and_then(|live| self.policy_versions.get(&live))
+            .map(|live| policy_topology(&live.document))
+            .unwrap_or_default();
+        let changes = policy_changes(&in_force, &policy_topology(&document));
         let record = CoreNetworkPolicyRecord {
             core_network_id: self.id.clone(),
             version_id,
@@ -1442,7 +1551,8 @@ impl CoreNetworkRecord {
             settled_at: now + SETTLE_DELAY,
             document,
             client_token,
-            executed,
+            executed_at: executed.then_some(now),
+            changes,
         };
         let alias = if executed {
             POLICY_ALIAS_LIVE
@@ -5199,7 +5309,11 @@ pub struct NamedGroup {
 
 /// One `attachment-policies[]` rule of a core network policy document: which attachments
 /// the rule claims, and what it then does with one.
-#[derive(Debug, Clone)]
+///
+/// Compared for equality where two policy documents are diffed ([`policy_changes`]): the
+/// `attachment-policies` block of one document differs from the other's exactly when their
+/// rule lists do.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentPolicyRule {
     /// The rule's `rule-number`, which orders it against the others and is what an
     /// attachment reports as `Attachment$AttachmentPolicyRuleNumber` (an `Integer`,
@@ -5222,7 +5336,7 @@ pub struct AttachmentPolicyRule {
 }
 
 /// How an attachment-policy rule's action names the segment the attachment joins.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentAssociation {
     /// `association-method: constant` — the one name the action's `segment` carries.
     Constant(String),
@@ -5234,7 +5348,7 @@ pub enum SegmentAssociation {
 /// One `conditions[]` entry of an attachment-policy rule, kept as the document spells it:
 /// the property compared ([`CONDITION_ANY`] and friends), the `operator`
 /// ([`OPERATOR_EQUALS`] and friends) and the `key` / `value` the comparison uses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentCondition {
     pub condition_type: String,
     pub operator: Option<String>,
@@ -5365,6 +5479,21 @@ impl PolicyTopology {
             .collect()
     }
 
+    /// The (edge location, name) pairs the entries `groups` are placed at: an entry
+    /// restricting itself to no edge location is placed at every edge location this core
+    /// network has, which is the expansion [`Self::to_segments`] makes too.
+    fn placements(&self, groups: &[NamedGroup]) -> BTreeSet<(String, String)> {
+        let everywhere = self.everywhere();
+        let mut placed = BTreeSet::new();
+        for group in groups {
+            let locations = group.edge_locations.as_deref().unwrap_or(&everywhere);
+            for location in locations {
+                placed.insert((location.clone(), group.name.clone()));
+            }
+        }
+        placed
+    }
+
     /// Whether this core network configures an edge in `location`.
     ///
     /// An attachment joins a resource to one of the core network's EDGES, so a create
@@ -5460,6 +5589,190 @@ impl PolicyTopology {
             })
             .collect()
     }
+}
+
+/// One change of a policy version's change set: what the difference between two policy
+/// documents does to ONE object either of them configures.
+///
+/// Kept in this compact form rather than as a modelled shape because the SAME change is
+/// reported two ways — as a `CoreNetworkChange` of the change set and as a
+/// `CoreNetworkChangeEvent` of its execution — and because a change event's status and
+/// timestamp are functions of the clock, not of the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyChange {
+    /// What kind of object changed: one of the [`CHANGE_TYPE_CORE_NETWORK_EDGE`] family.
+    pub change_type: &'static str,
+    /// What the change does to it: one of the [`CHANGE_ACTION_ADD`] family.
+    pub action: &'static str,
+    /// The edge location the changed object sits at, for a kind that sits at one.
+    pub edge_location: Option<String>,
+    /// The changed segment's or network function group's name, for a kind that has one.
+    pub name: Option<String>,
+}
+
+impl PolicyChange {
+    /// This change's `IdentifierPath`: the type, then the edge location and the name where
+    /// the kind carries them — "the `IdentifierPath` for a core network segment change
+    /// might be `CORE_NETWORK_SEGMENT/us-east-1/devsegment`" (`smithy_query shape=
+    /// CoreNetworkChangeEvent member=IdentifierPath`).
+    ///
+    /// It "uniquely identifies the path for a change within the changeset" (same doc), so
+    /// it is also the key one page of a listing resumes after.
+    pub fn identifier_path(&self) -> String {
+        let mut path = self.change_type.to_string();
+        for segment in [self.edge_location.as_deref(), self.name.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            path.push('/');
+            path.push_str(segment);
+        }
+        path
+    }
+
+    /// The modelled `CoreNetworkChangeEvent` for this change, in `status` as of
+    /// `event_time`.
+    pub fn to_change_event(
+        &self,
+        status: &str,
+        event_time: SystemTime,
+    ) -> CoreNetworkChangeEvent {
+        // `Values` describes the changed object, so a change to an object none of its
+        // members names (the `attachment-policies` block as a whole) carries none rather
+        // than an empty structure.
+        let values = (self.edge_location.is_some() || self.name.is_some()).then(|| {
+            CoreNetworkChangeEventValues {
+                edge_location: self.edge_location.clone(),
+                segment_name: (self.change_type == CHANGE_TYPE_CORE_NETWORK_SEGMENT)
+                    .then(|| self.name.clone())
+                    .flatten(),
+                network_function_group_name: (self.change_type
+                    == CHANGE_TYPE_NETWORK_FUNCTION_GROUP)
+                    .then(|| self.name.clone())
+                    .flatten(),
+                // The remaining members describe objects no policy document configures —
+                // a peer edge, an attachment, a route's CIDR, a routing policy
+                // association — so a change derived from two documents fills none.
+                peer_edge_location: None,
+                routing_policy_direction: None,
+                attachment_id: None,
+                cidr: None,
+                routing_policy_association_details: None,
+            }
+        });
+        CoreNetworkChangeEvent {
+            r#type: Some(self.change_type.to_string()),
+            action: Some(self.action.to_string()),
+            identifier_path: Some(self.identifier_path()),
+            event_time: Some(epoch_seconds(event_time)),
+            status: Some(status.to_string()),
+            values,
+        }
+    }
+}
+
+/// The changes a change set carries: the difference between the policy `in_force` and the
+/// `submitted` one, one entry per object the two configure differently, ordered by
+/// [`PolicyChange::identifier_path`].
+///
+/// An object only the submitted policy configures is [`CHANGE_ACTION_ADD`]ed, one only the
+/// policy in force configures is [`CHANGE_ACTION_REMOVE`]d, and one both configure
+/// differently is [`CHANGE_ACTION_MODIFY`]ed; an object both configure the same way is no
+/// change at all and produces no entry, so two identical documents differ in nothing. The
+/// objects compared are the ones a document configures and [`policy_topology`] therefore
+/// derives: each edge of `core-network-configuration` (its ASN and inside CIDR blocks are
+/// what a modification is), each named `segments` entry at each edge location it is present
+/// in, the same for each `network-function-groups` entry, and the `attachment-policies`
+/// block as a whole, which configures no object of its own.
+///
+/// Both lists are bounded by the caps [`validate_policy_document`] enforces before a
+/// document is stored, so the comparison and its result are bounded too.
+pub fn policy_changes(in_force: &PolicyTopology, submitted: &PolicyTopology) -> Vec<PolicyChange> {
+    let mut changes: Vec<PolicyChange> = Vec::new();
+
+    let edges_before = edges_by_location(in_force);
+    let edges_after = edges_by_location(submitted);
+    for location in edges_before.keys().chain(edges_after.keys()).collect::<BTreeSet<_>>() {
+        let action = match (edges_before.get(location), edges_after.get(location)) {
+            (None, Some(_)) => CHANGE_ACTION_ADD,
+            (Some(_), None) => CHANGE_ACTION_REMOVE,
+            (Some(before), Some(after)) if !same_edge(before, after) => CHANGE_ACTION_MODIFY,
+            _ => continue,
+        };
+        changes.push(PolicyChange {
+            change_type: CHANGE_TYPE_CORE_NETWORK_EDGE,
+            action,
+            edge_location: Some((*location).to_string()),
+            name: None,
+        });
+    }
+
+    for (change_type, before, after) in [
+        (
+            CHANGE_TYPE_CORE_NETWORK_SEGMENT,
+            in_force.placements(&in_force.segments),
+            submitted.placements(&submitted.segments),
+        ),
+        (
+            CHANGE_TYPE_NETWORK_FUNCTION_GROUP,
+            in_force.placements(&in_force.network_function_groups),
+            submitted.placements(&submitted.network_function_groups),
+        ),
+    ] {
+        // A placement carries nothing beyond the pair that identifies it, so one both
+        // policies make is never a MODIFY: it is the same object, unchanged.
+        for (placements, action) in [
+            (after.difference(&before), CHANGE_ACTION_ADD),
+            (before.difference(&after), CHANGE_ACTION_REMOVE),
+        ] {
+            for (location, name) in placements {
+                changes.push(PolicyChange {
+                    change_type,
+                    action,
+                    edge_location: Some(location.clone()),
+                    name: Some(name.clone()),
+                });
+            }
+        }
+    }
+
+    if in_force.attachment_policies != submitted.attachment_policies {
+        changes.push(PolicyChange {
+            change_type: CHANGE_TYPE_ATTACHMENT_POLICIES_CONFIGURATION,
+            action: match (
+                in_force.attachment_policies.is_empty(),
+                submitted.attachment_policies.is_empty(),
+            ) {
+                (true, false) => CHANGE_ACTION_ADD,
+                (false, true) => CHANGE_ACTION_REMOVE,
+                _ => CHANGE_ACTION_MODIFY,
+            },
+            edge_location: None,
+            name: None,
+        });
+    }
+
+    changes.sort_by_cached_key(PolicyChange::identifier_path);
+    changes
+}
+
+/// The edges a topology configures, by edge location. An entry the document spells without
+/// a location names no edge and is already absent from the topology.
+fn edges_by_location(topology: &PolicyTopology) -> BTreeMap<&str, &CoreNetworkEdge> {
+    topology
+        .edges
+        .iter()
+        .filter_map(|edge| edge.edge_location.as_deref().map(|location| (location, edge)))
+        .collect()
+}
+
+/// Whether two edges of the same location are configured the same way: an edge carries its
+/// ASN and its inside CIDR blocks, so a difference in either is what makes the change a
+/// modification rather than no change.
+fn same_edge(left: &CoreNetworkEdge, right: &CoreNetworkEdge) -> bool {
+    left.asn == right.asn
+        && left.inside_cidr_blocks.as_deref().unwrap_or_default()
+            == right.inside_cidr_blocks.as_deref().unwrap_or_default()
 }
 
 /// Derive the reported topology of a core network from its policy document.

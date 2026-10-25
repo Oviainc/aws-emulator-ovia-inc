@@ -3,7 +3,9 @@
 //! @op ModifyVolume
 //! IMPLEMENTED: applies the target configuration the request names to the STORED volume
 //! and records the modification it started in [`crate::state`], answering with that
-//! stored record. This is the ONLY file to touch for this operation.
+//! stored record. A target IOPS rate outside the range the target volume type supports is
+//! NORMALIZED into that range rather than refused. This is the ONLY file to touch for this
+//! operation.
 //!
 //! What the clock owes a modification it accepted — its `modifying` -> `optimizing` ->
 //! `completed` moves — is derived on read from the stored due instants, so a reporting
@@ -310,13 +312,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     None => DEFAULT_GP3_IOPS,
                 };
-                if iops < iops_min || iops > iops_max {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{iops}' for iops. \
-                         A {target_type} volume provisions from {iops_min} to {iops_max} IOPS"
-                    )));
-                }
-                Some(iops)
+                // "The TARGET IOPS rate of the volume" (`ModifyVolumeRequest$Iops`): the
+                // member is a plain Integer with no `@range`, the operation models no
+                // error for it, and its documentation only LISTS "the supported values
+                // for each volume type" without stating a rejection — so a target outside
+                // that list is normalized to the nearest value the target type supports
+                // rather than refused, and the value actually provisioned always lies
+                // inside the type's range. A type that provisions no IOPS at all is a
+                // different rule (the branch above): there is no range to normalize into,
+                // and the member "is valid only for gp3, io1, and io2 volumes".
+                Some(iops.clamp(iops_min, iops_max))
             }
         };
 

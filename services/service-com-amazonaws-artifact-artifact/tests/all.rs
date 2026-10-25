@@ -45,6 +45,8 @@ mod pagination_token_opacity;
 mod report_projection;
 #[path = "all/report_workflow.rs"]
 mod report_workflow;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
