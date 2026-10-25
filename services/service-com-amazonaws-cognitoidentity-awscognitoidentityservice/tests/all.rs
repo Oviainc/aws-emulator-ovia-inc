@@ -33,5 +33,7 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/unlink_identity.rs"]
 mod unlink_identity;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/update_identity_pool.rs"]
 mod update_identity_pool;
