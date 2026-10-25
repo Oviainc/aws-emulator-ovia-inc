@@ -20,7 +20,12 @@
 //! before the connector is active again. A request that asks for the value the
 //! connector already carries changes nothing — the operation is `@idempotent`
 //! (`smithy_query(query="operation",operation="UpdateEnvironmentConnector")`), so
-//! repeating it neither restarts the connector nor moves its `modifiedAt`.
+//! repeating it neither restarts the connector nor moves its `modifiedAt`. A secret is
+//! compared and stored as the ARN its identifier RESOLVES to
+//! ([`crate::state::secret_resources::resolve_secret_arn`]), because `secretIdentifier`
+//! is "The new ARN or name of" the secret while `Connector$secretArn` is "The Amazon
+//! Resource Name (ARN) of" it: naming the stored secret in its other form is therefore
+//! no change at all.
 //!
 //! ## Shape of an operation
 //!
@@ -205,6 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
+        // `secretIdentifier` is "The new ARN or name of" the credential secret while the
+        // member it feeds, `Connector$secretArn`, is "The Amazon Resource Name (ARN) of"
+        // it: the identifier is resolved to that secret's ARN before anything compares or
+        // stores it.
+        let requested_secret_arn = input.secret_identifier.as_deref().map(|secret_identifier| {
+            crate::state::secret_resources::resolve_secret_arn(&region, secret_identifier)
+        });
+
         let mut state = state.lock();
         // Reporting only: this materialises the state changes the clock already owed,
         // which were due whether or not anybody called, so the connector is in the
@@ -238,12 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You cannot update both the secret and the FQDN in the same request", and a
         // request naming neither asks for no new metadata: exactly one of the two
         // reconfigures the connector.
-        let requested = match (
-            input.appliance_fqdn.as_deref(),
-            input.secret_identifier.as_deref(),
-        ) {
+        let requested = match (input.appliance_fqdn.as_deref(), requested_secret_arn) {
             (Some(appliance_fqdn), None) => Requested::ApplianceFqdn(appliance_fqdn),
-            (None, Some(secret_identifier)) => Requested::SecretIdentifier(secret_identifier),
+            (None, Some(secret_arn)) => Requested::SecretArn(secret_arn),
             (Some(_), Some(_)) => {
                 return Err(UpdateEnvironmentConnectorErrorModeled::ValidationException(
                     crate::state::request_validation_error(
@@ -273,9 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 connector.appliance_fqdn = appliance_fqdn.to_string();
                 changed
             }
-            Requested::SecretIdentifier(secret_identifier) => {
-                let changed = connector.secret_arn != secret_identifier;
-                connector.secret_arn = secret_identifier.to_string();
+            Requested::SecretArn(secret_arn) => {
+                // "The ARN or name of" the secret on input, "The Amazon Resource Name
+                // (ARN) of" it on output: the new identifier is resolved to that
+                // secret's ARN, so a connector reconfigured by NAME still reports an
+                // ARN, and naming the secret it already carries in the other form is
+                // not a change.
+                let changed = connector.secret_arn != secret_arn;
+                connector.secret_arn = secret_arn;
                 changed
             }
         };
@@ -310,6 +325,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 enum Requested<'a> {
     /// `applianceFqdn`: the new FQDN of the VCF appliance.
     ApplianceFqdn(&'a str),
-    /// `secretIdentifier`: the new ARN or name of the credential secret.
-    SecretIdentifier(&'a str),
+    /// `secretIdentifier`: the new credential secret, as the ARN it was RESOLVED to
+    /// ([`crate::state::secret_resources::resolve_secret_arn`]) rather than the ARN or
+    /// name the request spelled.
+    SecretArn(String),
 }

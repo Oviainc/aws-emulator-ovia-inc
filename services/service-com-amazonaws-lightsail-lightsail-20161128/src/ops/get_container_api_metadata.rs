@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContainerAPIMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContainerAPIMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this service's published container-API metadata: every metadatum
+//! [`crate::state::CONTAINER_API_METADATA_SPECS`] holds, as one entry naming the
+//! metadatum and carrying its value — among them the current version of the
+//! Lightsail Control (lightsailctl) plugin.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContainerAPIMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! That catalog is service-wide published data, not a per-caller record: it is the
+//! same for every caller in every Region, and no operation of this service creates,
+//! changes or retires an entry. So it lives beside this service's other published
+//! tables (instance bundles, blueprint families, container service powers, regions)
+//! in [`crate::state`], and this operation reads no stored resource and writes
+//! nothing — reporting it cannot change what a later caller sees.
+//!
+//! This is the only file to touch for this operation's BEHAVIOUR; the catalog it
+//! reports lives with this service's other published tables in [`crate::state`].
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // The catalog is service-wide published data (see this module's docs), and the
+        // request carries no member at all, so neither the store nor the request
+        // metadata takes part in the answer.
         let _ = (&input, ctx, &self.engine);
-        // Implement `GetContainerAPIMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContainerAPIMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContainerAPIMetadata"))
+
+        Ok(GetContainerAPIMetadataOutput {
+            metadata: Some(crate::state::container_api_metadata()),
+        })
     }
 }

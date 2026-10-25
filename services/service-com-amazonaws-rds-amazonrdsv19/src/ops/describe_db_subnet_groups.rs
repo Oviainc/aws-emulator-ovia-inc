@@ -183,7 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeDBSubnetGroupsError::from(
                             DescribeDBSubnetGroupsErrorModeled::DBSubnetGroupNotFoundFault(
                                 DBSubnetGroupNotFoundFault {
-                                    message: Some(format!("DBSubnetGroup '{name}' not found.")),
+                                    message: Some(
+                                        crate::state::db_subnet_group_not_found_message(&name),
+                                    ),
                                 },
                             ),
                         )

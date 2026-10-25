@@ -57,6 +57,8 @@ mod certificate_validation_state_machine;
 mod email_validation_dispatch;
 #[path = "all/refusal_codes_and_search_projection.rs"]
 mod refusal_codes_and_search_projection;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/resend_validation_email.rs"]
 mod resend_validation_email;
 #[path = "all/resource_tag_input_constraints.rs"]

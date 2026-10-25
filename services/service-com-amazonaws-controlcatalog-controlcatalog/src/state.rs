@@ -35,6 +35,10 @@ mod published_controls;
 /// The domain/objective/common-control ontology the catalog publishes, as data.
 mod published_ontology;
 
+/// Every compliance framework the catalog cross-walks its controls into, named by the
+/// designator a FRAMEWORK control mapping carries for it.
+pub const PUBLISHED_FRAMEWORKS: &[&str] = published_controls::PUBLISHED_FRAMEWORKS;
+
 /// A catalog domain — the top of the catalog hierarchy.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -656,10 +660,12 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     //  * COMMON_CONTROL — the common control the control implements (its row's
     //    `implements`);
     //  * FRAMEWORK — one entry per published compliance-framework item the control
-    //    satisfies (its row's `frameworks`, each naming a published framework and that
-    //    framework's own identifier for the requirement). A control normally satisfies
-    //    items in SEVERAL frameworks at once, so one entry per control is not the
-    //    catalog's shape;
+    //    satisfies (`published_controls::framework_mappings`: the cross-walk of the
+    //    objective it implements, the items naming its own check, and the
+    //    restatements those imply, each naming a published framework by its
+    //    designator and that framework's own identifier for the requirement). A
+    //    control satisfies the same objective in every framework that states it, so
+    //    one or two entries per control is not the catalog's shape;
     //  * RELATED_CONTROL — one entry per control it is published alongside, with how
     //    the two relate (`published_controls::RELATED_CONTROLS`). Relations are
     //    recorded in both directions, because a query filters on one control at a time
@@ -673,12 +679,12 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                 common_control_arn: common_control_arn(seed.implements),
             },
         ));
-        for &(framework_name, item) in seed.frameworks {
+        for (framework_name, item) in published_controls::framework_mappings(seed) {
             mapping_seed.push((
                 arn.clone(),
                 MappingDetails::Framework {
                     name: framework_name.to_string(),
-                    item: item.to_string(),
+                    item,
                 },
             ));
         }

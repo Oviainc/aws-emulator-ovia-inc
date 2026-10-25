@@ -118,8 +118,10 @@ pub const EXECUTION_RESOURCE_TYPE: &str = "execution";
 /// "Do not use the `aws:` prefix in your tag names or values because it is reserved for
 /// Amazon Web Services use. You can't edit or delete tag names or values with this
 /// prefix." (AWS tagging documentation — the rule is service-independent, which is why
-/// the model carries no pattern for it.) [`tag_violation`] enforces it on the tag KEY,
-/// which is the half of the rule the recorded service refuses a request for.
+/// the model carries no pattern for it.) [`tag_key_violation`] enforces it on the tag
+/// KEY, which is the half of the rule the recorded service refuses a request for, and
+/// "you can't edit or delete" covers a removal as much as a write: every operation that
+/// NAMES a tag key goes through that one check.
 pub const RESERVED_TAG_PREFIX: &str = "aws:";
 
 /// How many tags one resource may carry: the AWS-wide tagging quota ("Maximum number of
@@ -984,13 +986,52 @@ pub fn task_arn(task_id: &str, region: &str) -> String {
     )
 }
 
+/// The input member a tagging WRITE reports its tag-key violations under
+/// (`TagResource$tags`, `CreateTask$tags`).
+pub const TAGS_INPUT_MEMBER: &str = "tags";
+
+/// The input member a tag REMOVAL reports its tag-key violations under
+/// (`UntagResource$tagKeys`).
+pub const TAG_KEYS_INPUT_MEMBER: &str = "tagKeys";
+
+/// Why one tag KEY is not a key this service accepts, or `None` when it is.
+///
+/// The rules are the AWS-wide ones on a tag key ([`RESERVED_TAG_PREFIX`],
+/// [`MAX_TAG_KEY_LENGTH`], and a key must not be empty); they hold wherever a request
+/// NAMES a tag key, whether it is writing that tag or removing it, so every operation
+/// that takes a key — [`tag_violation`] for a `TagMap`, `UntagResource` for its
+/// `tagKeys` — refuses the same keys here. `field` is the input member the message
+/// reports the key under, since that is the only part of the sentence that differs
+/// between those operations.
+pub fn tag_key_violation(field: &str, key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some(format!(
+            "Value '' at '{field}' failed to satisfy constraint: A tag key must not be empty"
+        ));
+    }
+    if key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+        return Some(format!(
+            "Value '{key}' at '{field}' failed to satisfy constraint: Tag keys must not \
+             begin with the reserved prefix '{RESERVED_TAG_PREFIX}'"
+        ));
+    }
+    if key.chars().count() > MAX_TAG_KEY_LENGTH {
+        return Some(format!(
+            "Value '{key}' at '{field}' failed to satisfy constraint: Tag keys must have \
+             length less than or equal to {MAX_TAG_KEY_LENGTH}"
+        ));
+    }
+    None
+}
+
 /// Why a tag map cannot be applied to a resource that already carries `existing`, or
 /// `None` when every tag in it is acceptable.
 ///
 /// The rules are the AWS-wide tagging ones ([`RESERVED_TAG_PREFIX`],
 /// [`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`], [`MAX_TAGS`]); the model constrains
-/// `TagMap` with none of them, so they are enforced here. The keys are walked in sorted
-/// order, so one request always gets one answer.
+/// `TagMap` with none of them, so they are enforced here — the key half through
+/// [`tag_key_violation`], which the removal path enforces too. The keys are walked in
+/// sorted order, so one request always gets one answer.
 pub fn tag_violation(
     tags: &HashMap<String, String>,
     existing: &BTreeMap<String, String>,
@@ -1000,23 +1041,8 @@ pub fn tag_violation(
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     for (key, value) in &sorted {
-        if key.is_empty() {
-            return Some(
-                "Value '' at 'tags' failed to satisfy constraint: A tag key must not be empty"
-                    .to_string(),
-            );
-        }
-        if key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX) {
-            return Some(format!(
-                "Value '{key}' at 'tags' failed to satisfy constraint: Tag keys must not \
-                 begin with the reserved prefix '{RESERVED_TAG_PREFIX}'"
-            ));
-        }
-        if key.chars().count() > MAX_TAG_KEY_LENGTH {
-            return Some(format!(
-                "Value '{key}' at 'tags' failed to satisfy constraint: Tag keys must have \
-                 length less than or equal to {MAX_TAG_KEY_LENGTH}"
-            ));
+        if let Some(violation) = tag_key_violation(TAGS_INPUT_MEMBER, key) {
+            return Some(violation);
         }
         if value.chars().count() > MAX_TAG_VALUE_LENGTH {
             return Some(format!(
@@ -1041,13 +1067,13 @@ pub fn tag_violation(
     None
 }
 
-/// The `ValidationException` message a request whose `tags` breaks [`tag_violation`] is
-/// refused with.
+/// The `ValidationException` message a request whose tags break [`tag_violation`] or
+/// whose tag key breaks [`tag_key_violation`] is refused with.
 ///
 /// AWS's validation refusals count the failed constraints and then state each one, so a
 /// single unacceptable tag reads `1 validation error detected: <the violation>`. Every
-/// operation that takes a `TagMap` builds its message here, so the same unacceptable map
-/// is answered the same way whichever one carried it.
+/// operation that names a tag — a whole `TagMap` or just its keys — builds its message
+/// here, so the same unacceptable tag is answered the same way whichever one carried it.
 pub fn tag_validation_message(violation: &str) -> String {
     format!("1 validation error detected: {violation}")
 }

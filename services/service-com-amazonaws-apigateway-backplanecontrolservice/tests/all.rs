@@ -99,6 +99,8 @@ mod sdk_types;
 mod service_claim;
 #[path = "all/stage_collection.rs"]
 mod stage_collection;
+#[path = "all/stage_export.rs"]
+mod stage_export;
 #[path = "all/stage_invoke.rs"]
 mod stage_invoke;
 #[path = "all/stage_lifecycle.rs"]

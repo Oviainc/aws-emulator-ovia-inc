@@ -582,6 +582,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // versioning state: this write carries no id of its own.
             version_id: None,
             encryption: encryption.clone(),
+            // A write places no Object Lock retention: the object-lock headers are refused
+            // above, and a retention is placed on a stored version afterwards, by
+            // `PutObjectRetention`.
+            retention: None,
             body: input.body,
         };
 

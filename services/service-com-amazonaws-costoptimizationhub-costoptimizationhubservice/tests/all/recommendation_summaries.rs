@@ -20,7 +20,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cost_optimization_hub::{
-    call, enrolled_router, error_code, ok, router, ANALYSIS_WAIT,
+    call, enable_member_account_discount_visibility, enrolled_router,
+    enrolled_router_with_discounts_visible, error_code, management_account_router, ok, router,
+    ANALYSIS_WAIT,
 };
 
 /// The `groupBy` values this service groups by, each paired with the
@@ -223,9 +225,13 @@ async fn a_summary_aggregates_the_catalog_along_the_grouping_dimension() {
 /// best recommendation — whatever dimension the view is grouped by, and under
 /// either `savingsEstimationMode`. The catalog holds a resource with two
 /// recommendations, so the de-duped total is strictly below the grouped one.
+///
+/// The discounted mode is reachable only where the organization has made its
+/// member accounts' discounts visible (`preference_gates`), so the account is
+/// the organization's management account with that preference set.
 #[tokio::test]
 async fn the_total_is_deduped_across_recommendation_types() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
 
     // (case, the mode to store first) — the absent preference is the store's
     // initial value, read under the mode the service applies by default
@@ -456,7 +462,7 @@ async fn summary_pagination_resumes_where_the_previous_page_ended() {
 /// which `summary_metrics_and_refusals` owns.
 #[tokio::test]
 async fn the_savings_percentage_metric_is_reported_only_when_requested() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
     set_mode(&router, "AfterDiscounts").await;
 
     // No metric asked for: nothing to report.
@@ -588,11 +594,14 @@ async fn an_unreportable_metric_is_refused() {
 /// groups and a zero total — and the currency the zero is in is still reported.
 #[tokio::test]
 async fn a_summary_reports_only_what_the_caller_may_read() {
-    let router = router();
+    let router = management_account_router();
     let request = json!({"groupBy": "ResourceType", "metrics": ["SavingsPercentage"]});
     // The discounted mode, under which the metric reports a figure at all
     // (`summary_metrics_and_refusals`), so the percentage below follows what is
-    // visible rather than the mode.
+    // visible rather than the mode. The mode needs the organization's
+    // member-account discounts visible, which only its management account can
+    // enable (`preference_gates`).
+    enable_member_account_discount_visibility(&router).await;
     set_mode(&router, "AfterDiscounts").await;
 
     // (the status this step moves the account to — `None` is "never called" —

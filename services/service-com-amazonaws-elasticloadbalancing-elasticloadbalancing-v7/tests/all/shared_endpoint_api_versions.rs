@@ -1,496 +1,332 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! ONE Elastic Load Balancing endpoint, TWO API versions: which model serves an awsQuery
-//! request, and what happens to a pair neither model resolves.
+//! What the `2015-12-01` API of this shared endpoint actually serves: the ELBv2
+//! `ip`-target surface, reached the way a client reaches it.
 //!
-//! Both Elastic Load Balancing models declare `endpointPrefix` / `arnNamespace` /
-//! `aws.auth#sigv4` name `elasticloadbalancing` (`smithy_query(query="service_info")` on
-//! either), differing only in `sdkId` and in the API version they declare — `2012-06-01`
-//! here and `2015-12-01` in
-//! `services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10`. Every
-//! AWS SDK for either API signs that one name, and nothing in a request's headers or URI
-//! tells the two apart, so this front door claims BOTH APIs' traffic and the `Version`
-//! field of the awsQuery envelope is what names the API a request is for.
+//! The two Elastic Load Balancing models share one endpoint name, and the awsQuery
+//! envelope's `Version` names the API a request is for. WHICH model a pair resolves to is
+//! pinned by `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs` (both
+//! services mounted) and what a resolved pair reaches by
+//! [`super::shared_endpoint_api_version_dispatch`]. This suite pins the behaviour the
+//! issue is titled after, at that version on that shared name: an ip-type target group is
+//! created, targets are registered against the rule the model states for them, and what a
+//! later `DescribeTargetHealth` reports is what was stored. Those are the calls an ECS
+//! `awsvpc` task or an ENI-backed target makes, and they were unreachable while every
+//! `2015-12-01` envelope was refused.
 //!
-//! The rule these suites pin, over the whole class rather than one action:
-//!
-//! > On an endpoint two API models share, an awsQuery request resolves the PAIR of its
-//! > `Action` and its `Version`: the model that declares the named version serves the
-//! > action, and a pair no model resolves is refused `400 InvalidAction` naming the action
-//! > and the version it could not be found for.
-//!
-//! So an action declared by both models (ten are) is answered out of the model whose
-//! version the envelope names — in that model's own `@xmlNamespace` document, with that
-//! model's own input and output shapes — an action declared by only one is served when its
-//! own version is named and refused at the other, and a version neither model declares
-//! resolves nothing. Before this, every `2015-12-01` envelope was refused `InvalidAction`,
-//! so no ELBv2 control-plane call could be made at all: `InvalidAction` is reserved for an
-//! action the service does not have.
-//!
-//! The rows run IN ORDER against one router over one engine, so a later row reads what an
-//! earlier one wrote. The ELBv2 model's operations are reached here through THIS service
-//! alone, which is the production path for an ELBv2 SDK client (it signs the shared name);
-//! that the same store answers under the ELBv2 model's own routing key as well is pinned in
-//! `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`, which needs both
-//! services mounted.
+//! The rule under test (`…elasticloadbalancingv2…/src/state/network.rs`, from
+//! `CreateTargetGroupInput$TargetType` and `TargetDescription$AvailabilityZone`): an `ip`
+//! target must be an IP address of the address type the target group carries its targets
+//! in, and where the address falls in that group's VPC decides the Availability Zone it
+//! takes and whether it is accepted at all. This crate mounts no EC2 service, so nothing
+//! is known here about the VPC the group names — and a refusal is never assumed from that
+//! silence: the half of the rule this suite can reach is the one the request alone
+//! decides (the id IS an address, or it is no target), and the registration is otherwise
+//! stored as it was asked for. The halves that need the account's network are tabled with
+//! both services mounted, in `core/router/tests/all/elbv2_network_resolution.rs`.
 
-use crate::wire::{call_at_version, emulator, find, kid_text, param, parse, Element};
+use crate::wire::{call_at_version, emulator, find, param, parse, Element};
 
-/// The API version THIS model declares.
-const CLASSIC_VERSION: &str = "2012-06-01";
-
-/// The API version the ELBv2 model declares.
-const V2_VERSION: &str = "2015-12-01";
-
-/// A version no Elastic Load Balancing model declares.
-const UNKNOWN_VERSION: &str = "2099-01-01";
-
-/// The `@xmlNamespace` of this model's document (`smithy_query(query="service_info")`).
-const CLASSIC_XMLNS: &str = "http://elasticloadbalancing.amazonaws.com/doc/2012-06-01/";
-
-/// The `@xmlNamespace` of the ELBv2 model's document (the same query on that model).
-const V2_XMLNS: &str = "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/";
+/// The API version the ELBv2 model declares, as that crate publishes it for this shared
+/// front door — read rather than restated.
+const V2_VERSION: &str =
+    service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::service::shared_endpoint::API_VERSION;
 
 /// The region every request below is signed for.
 const REGION: &str = "us-west-2";
 
-/// One call on the shared endpoint and what the model that owns its action/version pair
-/// must answer.
-struct Row {
-    case: &'static str,
-    action: &'static str,
-    /// The `Version` the envelope carries, or `None` to send no `Version` field at all.
-    version: Option<&'static str>,
-    params: &'static [(&'static str, &'static str)],
-    expected_status: u16,
-    /// The awsQuery `<Code>` the answer must carry, for a row that pins a refusal.
-    expected_code: Option<&'static str>,
-    /// Substrings the answer must carry — the serving model's envelope, its namespace and
-    /// the shapes only that model declares.
-    expected_body_contains: &'static [&'static str],
+/// A VPC id no EC2 store here holds, which is what leaves the half of the rule the
+/// request alone decides as the only half that applies.
+const VPC_ID: &str = "vpc-0abc1234";
+
+/// What a row expects of one `RegisterTargets` call.
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// Registered, and `DescribeTargetHealth` reports this Availability Zone (`None`:
+    /// none at all, because none was asked for and none can be detected without the
+    /// VPC).
+    Registered(Option<&'static str>),
+    /// Refused as an invalid request VALUE (`400 ValidationError`), with nothing stored
+    /// for the target.
+    Refused,
 }
 
-#[test]
-fn the_version_in_the_envelope_chooses_the_model_that_serves_the_action() {
-    let router = emulator();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("a current-thread runtime");
+/// One registration: the target's id and the `AvailabilityZone` it names, and what the
+/// rule must do with them.
+#[derive(Debug, Clone, Copy)]
+struct Row {
+    case: &'static str,
+    id: &'static str,
+    zone: Option<&'static str>,
+    expected: Expect,
+}
 
-    // The rows differ along both halves of the pair: the version (this model's, the ELBv2
-    // model's, none at all, and one neither declares) and the action (one only this model
-    // declares, two only the ELBv2 model declares, `CreateLoadBalancer` and
-    // `DescribeLoadBalancers`, which BOTH declare with different inputs and outputs, and
-    // one neither declares).
-    let rows: [Row; 14] = [
+#[tokio::test]
+async fn ip_targets_are_registered_through_the_shared_endpoint_by_the_rule() {
+    let router = emulator();
+
+    // An ip-type target group, created through the SHARED signing name at the ELBv2
+    // version — the call the issue reports as `InvalidAction`.
+    let created = call_at_version(
+        &router,
+        REGION,
+        "CreateTargetGroup",
+        Some(V2_VERSION),
+        &[
+            param("Name", "shared-ip-tg"),
+            param("Protocol", "HTTP"),
+            param("Port", "80"),
+            param("TargetType", "ip"),
+            param("VpcId", VPC_ID),
+        ],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case create the ip target group: expected 200, got {} with {}",
+        created.status, created.body
+    );
+    let document = parse(&created.body);
+    let arn = find(&document, "TargetGroupArn")
+        .and_then(Element::text)
+        .unwrap_or_else(|| panic!("no TargetGroupArn in {}", created.body))
+        .to_string();
+    assert_eq!(
+        find(&document, "TargetType").and_then(Element::text),
+        Some("ip"),
+        "case create the ip target group: expected the ip target type, got {}",
+        created.body
+    );
+    // The ARN is the ELBv2 model's own: its `targetgroup/` resource, in the region the
+    // request was signed for, under this emulator's account — so the record was minted by
+    // that model and not by the front door's.
+    assert!(
+        arn.starts_with("arn:aws:elasticloadbalancing:")
+            && arn.contains(REGION)
+            && arn.contains(":targetgroup/shared-ip-tg/"),
+        "case create the ip target group: expected an ELBv2 target-group ARN in {REGION}, \
+         got {arn}"
+    );
+
+    // The rows differ along what the rule generalises over: which range the address is
+    // in, whether it is an address at all, and whether the request names a zone.
+    let rows: [Row; 5] = [
         Row {
-            // The call the issue reports as `InvalidAction`: an action only the ELBv2
-            // model declares, at the ELBv2 version.
-            case: "CreateTargetGroup at the ELBv2 version",
-            action: "CreateTargetGroup",
-            version: Some(V2_VERSION),
-            params: &[
-                ("Name", "shared-door-tg"),
-                ("Protocol", "HTTP"),
-                ("Port", "80"),
-                ("VpcId", "vpc-0abc1234"),
-            ],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                "<CreateTargetGroupResponse",
-                V2_XMLNS,
-                "<TargetGroupName>shared-door-tg</TargetGroupName>",
-                "<VpcId>vpc-0abc1234</VpcId>",
-            ],
+            case: "an RFC 1918 address from the 10/8 range",
+            id: "10.1.2.3",
+            zone: None,
+            expected: Expect::Registered(None),
         },
         Row {
-            // …read back through the ELBv2 model: the front door serves that model's
-            // state, not a fresh one per call.
-            case: "DescribeTargetGroups at the ELBv2 version",
-            action: "DescribeTargetGroups",
-            version: Some(V2_VERSION),
-            params: &[("Names.member.1", "shared-door-tg")],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                "<DescribeTargetGroupsResponse",
-                V2_XMLNS,
-                "<TargetGroupName>shared-door-tg</TargetGroupName>",
-                "<HealthCheckProtocol>HTTP</HealthCheckProtocol>",
-            ],
+            case: "an RFC 1918 address from the 192.168/16 range, with a zone",
+            id: "192.168.5.5",
+            zone: Some("all"),
+            expected: Expect::Registered(Some("all")),
         },
         Row {
-            // An action BOTH models declare, at the ELBv2 version: the ELBv2 input
-            // members (`Name`, `Subnets`) and the ELBv2 `<LoadBalancers>` output.
-            case: "CreateLoadBalancer at the ELBv2 version",
-            action: "CreateLoadBalancer",
-            version: Some(V2_VERSION),
-            params: &[("Name", "shared-door-v2-lb"), ("Subnets.member.1", "subnet-0abc1234")],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                "<CreateLoadBalancerResponse",
-                V2_XMLNS,
-                "<LoadBalancers>",
-                "<LoadBalancerArn>",
-                "<LoadBalancerName>shared-door-v2-lb</LoadBalancerName>",
-            ],
+            case: "an RFC 6598 address",
+            id: "100.64.0.1",
+            zone: None,
+            expected: Expect::Registered(None),
         },
         Row {
-            // The same action at THIS model's version: this model's input members
-            // (`LoadBalancerName`, `Listeners`, `AvailabilityZones`) and its `<DNSName>`
-            // output, in its own namespace.
-            case: "CreateLoadBalancer at the Classic version",
-            action: "CreateLoadBalancer",
-            version: Some(CLASSIC_VERSION),
-            params: &[
-                ("LoadBalancerName", "shared-door-classic-lb"),
-                ("AvailabilityZones.member.1", "us-west-2a"),
-                ("Listeners.member.1.Protocol", "HTTP"),
-                ("Listeners.member.1.LoadBalancerPort", "80"),
-                ("Listeners.member.1.InstancePort", "8080"),
-            ],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                "<CreateLoadBalancerResponse",
-                CLASSIC_XMLNS,
-                "<DNSName>shared-door-classic-lb-",
-            ],
+            // A publicly routable address is one no `ip` target group may carry, but
+            // WHICH addresses this one's VPC admits is a fact about that VPC — and no EC2
+            // is mounted here to report it. Nothing is refused on that silence, so the
+            // registration is stored as it was asked for; the refusal is tabled where the
+            // VPC is known, in `core/router/tests/all/elbv2_network_resolution.rs`.
+            case: "a publicly routable address, with no VPC known to judge it against",
+            id: "54.239.28.85",
+            zone: None,
+            expected: Expect::Registered(None),
         },
         Row {
-            // `DescribeLoadBalancers` is declared by both: at the ELBv2 version it
-            // reports the ELBv2 load balancer, by ARN.
-            case: "DescribeLoadBalancers at the ELBv2 version",
-            action: "DescribeLoadBalancers",
-            version: Some(V2_VERSION),
-            params: &[("Names.member.1", "shared-door-v2-lb")],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                V2_XMLNS,
-                "<LoadBalancerArn>",
-                "<LoadBalancerName>shared-door-v2-lb</LoadBalancerName>",
-            ],
-        },
-        Row {
-            // …and at this model's version it reports this model's load balancer, out of
-            // this model's `<LoadBalancerDescriptions>` shape.
-            case: "DescribeLoadBalancers at the Classic version",
-            action: "DescribeLoadBalancers",
-            version: Some(CLASSIC_VERSION),
-            params: &[("LoadBalancerNames.member.1", "shared-door-classic-lb")],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[
-                CLASSIC_XMLNS,
-                "<LoadBalancerDescriptions>",
-                "<LoadBalancerName>shared-door-classic-lb</LoadBalancerName>",
-            ],
-        },
-        Row {
-            // No `Version` field at all: the caller has stated no API, so the front
-            // door's OWN model serves the action.
-            case: "a Classic action with no Version field",
-            action: "DescribeLoadBalancers",
-            version: None,
-            params: &[],
-            expected_status: 200,
-            expected_code: None,
-            expected_body_contains: &[CLASSIC_XMLNS, "<LoadBalancerDescriptions>"],
-        },
-        Row {
-            // The other half of that rule: with no version stated, an action only the
-            // ELBv2 model declares is not this model's, so the pair resolves to nothing.
-            case: "an ELBv2-only action with no Version field",
-            action: "DescribeTargetGroups",
-            version: None,
-            params: &[("Names.member.1", "shared-door-tg")],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse", "DescribeTargetGroups"],
-        },
-        Row {
-            // An action only THIS model declares, asked for at the ELBv2 version: that
-            // API does not have it, so the pair is refused rather than served out of this
-            // model's shapes.
-            case: "a Classic-only action at the ELBv2 version",
-            action: "ConfigureHealthCheck",
-            version: Some(V2_VERSION),
-            params: &[
-                ("LoadBalancerName", "shared-door-classic-lb"),
-                ("HealthCheck.Target", "HTTP:8080/health"),
-                ("HealthCheck.Interval", "10"),
-                ("HealthCheck.Timeout", "5"),
-                ("HealthCheck.UnhealthyThreshold", "2"),
-                ("HealthCheck.HealthyThreshold", "3"),
-            ],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse", "ConfigureHealthCheck", V2_VERSION],
-        },
-        Row {
-            // …and the mirror image: an ELBv2-only action at this model's version.
-            case: "an ELBv2-only action at the Classic version",
-            action: "CreateTargetGroup",
-            version: Some(CLASSIC_VERSION),
-            params: &[
-                ("Name", "shared-door-wrong-version"),
-                ("Protocol", "HTTP"),
-                ("Port", "80"),
-                ("VpcId", "vpc-0abc1234"),
-            ],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse", "CreateTargetGroup", CLASSIC_VERSION],
-        },
-        Row {
-            // A version no Elastic Load Balancing model declares, for an action both
-            // declare: nothing resolves it.
-            case: "an action both models declare, at a version neither does",
-            action: "DescribeLoadBalancers",
-            version: Some(UNKNOWN_VERSION),
-            params: &[],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse", "DescribeLoadBalancers", UNKNOWN_VERSION],
-        },
-        Row {
-            case: "an ELBv2 action at a version neither model declares",
-            action: "DescribeTargetGroups",
-            version: Some(UNKNOWN_VERSION),
-            params: &[("Names.member.1", "shared-door-tg")],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse", "DescribeTargetGroups", UNKNOWN_VERSION],
-        },
-        Row {
-            // An action NEITHER model declares, at the ELBv2 version: `InvalidAction` is
-            // what that is for.
-            case: "an action neither model declares, at the ELBv2 version",
-            action: "DescribeTargetGardens",
-            version: Some(V2_VERSION),
-            params: &[],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse"],
-        },
-        Row {
-            case: "an action neither model declares, at the Classic version",
-            action: "DescribeTargetGardens",
-            version: Some(CLASSIC_VERSION),
-            params: &[],
-            expected_status: 400,
-            expected_code: Some("InvalidAction"),
-            expected_body_contains: &["<ErrorResponse"],
+            // What this request names is decided by the request alone: a target of an
+            // `ip` group IS an address, so an instance id is no target of it whatever any
+            // other service holds.
+            case: "an instance id, which is not an address at all",
+            id: "i-1111111111111111",
+            zone: None,
+            expected: Expect::Refused,
         },
     ];
 
     for row in rows {
-        let params: Vec<(String, String)> = row
-            .params
-            .iter()
-            .map(|(name, value)| param(name, value))
-            .collect();
-        let answer = runtime.block_on(call_at_version(
+        let case = row.case;
+        let mut params = vec![param("TargetGroupArn", &arn), param("Targets.member.1.Id", row.id)];
+        if let Some(zone) = row.zone {
+            params.push(param("Targets.member.1.AvailabilityZone", zone));
+        }
+        let registered =
+            call_at_version(&router, REGION, "RegisterTargets", Some(V2_VERSION), &params).await;
+        let health = call_at_version(
             &router,
             REGION,
-            row.action,
-            row.version,
-            &params,
-        ));
-        let case = row.case;
-        let (status, body) = (answer.status, answer.body.clone());
-        // Whatever the answer is, it is an awsQuery envelope — XML a query-protocol
-        // client can parse — and never a router-level refusal in a JSON document.
-        assert!(
-            body.trim_start().starts_with('<') && !body.contains("__type"),
-            "case {case:?}: an awsQuery client must get XML, got {status} with {body}"
-        );
-        assert_eq!(
-            status, row.expected_status,
-            "case {case:?}: expected HTTP {}, got {status} with {body}",
-            row.expected_status
-        );
-        if let Some(expected) = row.expected_code {
-            let actual = answer.error_code();
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: expected the error code {expected}, got {actual:?} in \
-                 {status} with {body}"
-            );
-        }
-        for expected in row.expected_body_contains {
-            assert!(
-                body.contains(expected),
-                "case {case:?}: expected {expected:?} in the serving model's answer, got \
-                 {status} with {body}"
-            );
+            "DescribeTargetHealth",
+            Some(V2_VERSION),
+            &[
+                param("TargetGroupArn", &arn),
+                param("Targets.member.1.Id", row.id),
+            ],
+        )
+        .await;
+        let reported = parse(&health.body);
+        match row.expected {
+            Expect::Registered(expected_zone) => {
+                assert_eq!(
+                    registered.status, 200,
+                    "case {case:?}: expected 200, got {} with {}",
+                    registered.status, registered.body
+                );
+                assert_eq!(
+                    find(&reported, "Reason").and_then(Element::text),
+                    Some("Target.NotInUse"),
+                    "case {case:?}: a target of a group no listener forwards to is reported \
+                     not in use, got {}",
+                    health.body
+                );
+                assert_eq!(
+                    find(&reported, "AvailabilityZone").and_then(Element::text),
+                    expected_zone,
+                    "case {case:?}: expected the stored Availability Zone \
+                     {expected_zone:?}, got {}",
+                    health.body
+                );
+            }
+            Expect::Refused => {
+                assert_eq!(
+                    (registered.status, registered.error_code().as_str()),
+                    (400, "ValidationError"),
+                    "case {case:?}: expected 400 ValidationError, got {} with {}",
+                    registered.status,
+                    registered.body
+                );
+                assert_eq!(
+                    find(&reported, "Reason").and_then(Element::text),
+                    Some("Target.NotRegistered"),
+                    "case {case:?}: a refused target must not be registered, got {}",
+                    health.body
+                );
+            }
         }
     }
 }
 
-/// The ELBv2 target-group calls the issue's checks drive, end to end on the shared
-/// endpoint: a create, the documented idempotent replay of it, the read back, and the
-/// modelled refusal of a conflicting replay.
+/// The version half of the routing key has a DEFAULT, and it is this front door's own
+/// API: an envelope that names no `Version` has stated nothing to disagree with, so it is
+/// served out of the Classic model (`src/service/api_version.rs`'s `serving_model`), while
+/// one naming the ELBv2 version is served out of that model.
 ///
-/// Every row is an ELBv2 operation reached at `Version=2015-12-01` through the service
-/// that claims the shared signing name, which is the production path for an SDK ELBv2
-/// client — and each answer is that model's own, so the pair resolving is not enough: the
-/// state it reports has to be the ELBv2 store's.
-#[test]
-fn elbv2_target_groups_created_through_the_shared_endpoint_round_trip() {
+/// Asserted on `DescribeLoadBalancers`, an action BOTH models declare with different
+/// outputs, so the answer can only come from the serving model — and on the `@xmlNamespace`
+/// each model declares for its own document, which is that model's signature on the wire.
+/// The positive no-`Version` row is the one `core/router`'s suite does not carry: it pins
+/// only that a no-`Version` envelope cannot reach an ELBv2-ONLY action.
+#[tokio::test]
+async fn the_api_version_an_envelope_names_decides_which_model_answers() {
     let router = emulator();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("a current-thread runtime");
 
-    // (case, the target group's name, its port) — the create is replayed and read back
-    // for each, so the suite does not rest on one name or one port.
-    let groups: [(&str, &str, &str); 3] = [
-        ("an HTTP target group on the default port", "round-trip-tg-80", "80"),
-        ("a second group, differing only in port", "round-trip-tg-8080", "8080"),
-        ("a group at the top of the modelled port range", "round-trip-tg-max", "65535"),
+    // The rows differ along the one field that decides: the `Version` the envelope names,
+    // absent or the ELBv2 one, and the namespace of the document each must be answered in.
+    let rows: [(&str, Option<&str>, &str); 2] = [
+        (
+            "no Version field at all, served out of this front door's own API",
+            None,
+            "http://elasticloadbalancing.amazonaws.com/doc/2012-06-01/",
+        ),
+        (
+            "the ELBv2 version, served out of that model",
+            Some(V2_VERSION),
+            "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/",
+        ),
     ];
 
-    for (case, name, port) in groups {
-        let settings = [
-            param("Name", name),
-            param("Protocol", "HTTP"),
-            param("Port", port),
-            param("VpcId", "vpc-0abc1234"),
-        ];
-
-        let created = runtime.block_on(call_at_version(
-            &router,
-            REGION,
-            "CreateTargetGroup",
-            Some(V2_VERSION),
-            &settings,
-        ));
+    for (case, version, namespace) in rows {
+        let answered =
+            call_at_version(&router, REGION, "DescribeLoadBalancers", version, &[]).await;
         assert_eq!(
-            created.status, 200,
-            "case {case:?}: CreateTargetGroup must succeed, got {} with {}",
-            created.status, created.body
+            (answered.status, answered.error_code().as_str()),
+            (200, ""),
+            "case {case:?}: an action both models declare must be served, got {} with {}",
+            answered.status,
+            answered.body
         );
-        let arn = target_group_arn(&created.body)
-            .unwrap_or_else(|| panic!("case {case:?}: no TargetGroupArn in {}", created.body));
         assert!(
-            arn.starts_with("arn:aws:elasticloadbalancing:")
-                && arn.contains(REGION)
-                && arn.contains(&format!("targetgroup/{name}/")),
-            "case {case:?}: expected an ELBv2 target-group ARN in {REGION} for {name}, got \
-             {arn:?}"
+            answered.body.contains(namespace),
+            "case {case:?}: expected the answer in {namespace}, got {}",
+            answered.body
         );
+    }
+}
 
-        // "This operation is idempotent … If you attempt to create multiple target groups
-        // with the same settings, each call succeeds."
-        // (`smithy_query(query="doc",shape="CreateTargetGroup")`.)
-        let replayed = runtime.block_on(call_at_version(
-            &router,
-            REGION,
-            "CreateTargetGroup",
-            Some(V2_VERSION),
-            &settings,
-        ));
-        assert_eq!(
-            replayed.status, 200,
-            "case {case:?}: the idempotent replay must succeed, got {} with {}",
-            replayed.status, replayed.body
-        );
-        let replayed_arn = target_group_arn(&replayed.body).unwrap_or_default();
-        assert_eq!(
-            replayed_arn, arn,
-            "case {case:?}: the replay must report the stored target group, expected the \
-             ARN {arn:?}, got {replayed_arn:?} in {}",
-            replayed.body
-        );
+#[tokio::test]
+async fn a_health_check_port_outside_the_modelled_range_is_refused_through_the_shared_endpoint() {
+    let router = emulator();
 
-        // The read back reports what the create persisted, through the ELBv2 model's own
-        // describe.
-        let described = runtime.block_on(call_at_version(
-            &router,
-            REGION,
-            "DescribeTargetGroups",
-            Some(V2_VERSION),
-            &[param("Names.member.1", name)],
-        ));
-        assert_eq!(
-            described.status, 200,
-            "case {case:?}: DescribeTargetGroups must read it back, got {} with {}",
-            described.status, described.body
-        );
-        let doc = parse(&described.body);
-        let group = find(&doc, "member")
-            .unwrap_or_else(|| panic!("case {case:?}: no member in {}", described.body));
-        assert_eq!(
-            kid_text(group, "TargetGroupArn").as_deref(),
-            Some(arn.as_str()),
-            "case {case:?}: expected the stored ARN {arn:?}, got {}",
-            described.body
-        );
-        assert_eq!(
-            kid_text(group, "Port").as_deref(),
-            Some(port),
-            "case {case:?}: expected the stored port {port}, got {}",
-            described.body
-        );
+    // `HealthCheckPort` carries either the symbolic `traffic-port` or a port number, so
+    // the model gives it no `@range` and the handler enforces the one its documentation
+    // states. The rows are the symbolic value, each published bound of the `Port` shape
+    // (1 and 65535) and one past the top.
+    let rows: [(&str, &str, bool); 4] = [
+        ("the symbolic default", "traffic-port", true),
+        ("the lowest port", "1", true),
+        ("the highest port", "65535", true),
+        ("one past the highest port", "65536", false),
+    ];
 
-        // A repeat of the same NAME with different settings is the one refusal the model
-        // declares for it, as its `awsQueryError` code (`smithy_query(query="operation",
-        // operation="CreateTargetGroup")`: `DuplicateTargetGroupName`, HTTP 400).
-        let conflicting = runtime.block_on(call_at_version(
+    for (index, (case, port, accepted)) in rows.into_iter().enumerate() {
+        let name = format!("shared-hc-tg-{index}");
+        let created = call_at_version(
             &router,
             REGION,
             "CreateTargetGroup",
             Some(V2_VERSION),
             &[
-                param("Name", name),
-                param("Protocol", "HTTPS"),
-                param("Port", port),
-                param("VpcId", "vpc-0abc1234"),
+                param("Name", &name),
+                param("Protocol", "HTTP"),
+                param("Port", "80"),
+                param("VpcId", VPC_ID),
+                param("HealthCheckPort", port),
             ],
-        ));
-        assert_eq!(
-            conflicting.status, 400,
-            "case {case:?}: a conflicting replay must be refused with HTTP 400, got {} \
-             with {}",
-            conflicting.status, conflicting.body
-        );
-        let code = conflicting.error_code();
-        assert_eq!(
-            code, "DuplicateTargetGroupName",
-            "case {case:?}: expected the modelled awsQuery code \
-             DuplicateTargetGroupName, got {code:?} in {}",
-            conflicting.body
-        );
+        )
+        .await;
+        if accepted {
+            let document = parse(&created.body);
+            assert_eq!(
+                (
+                    created.status,
+                    find(&document, "HealthCheckPort").and_then(Element::text)
+                ),
+                (200, Some(port)),
+                "case {case:?} ({port}): expected the stored HealthCheckPort, got {} with \
+                 {}",
+                created.status,
+                created.body
+            );
+        } else {
+            assert_eq!(
+                (created.status, created.error_code().as_str()),
+                (400, "ValidationError"),
+                "case {case:?} ({port}): expected 400 ValidationError, got {} with {}",
+                created.status,
+                created.body
+            );
+            // A refused create stores nothing: the name is unknown to the read back.
+            let described = call_at_version(
+                &router,
+                REGION,
+                "DescribeTargetGroups",
+                Some(V2_VERSION),
+                &[param("Names.member.1", &name)],
+            )
+            .await;
+            assert_eq!(
+                (described.status, described.error_code().as_str()),
+                (400, "TargetGroupNotFound"),
+                "case {case:?}: a refused create must store no target group, got {} with {}",
+                described.status,
+                described.body
+            );
+        }
     }
-
-    // Every group above is one target group in the ONE ELBv2 store, listed by a describe
-    // that names none of them.
-    let all = runtime.block_on(call_at_version(
-        &router,
-        REGION,
-        "DescribeTargetGroups",
-        Some(V2_VERSION),
-        &[],
-    ));
-    for (case, name, _) in groups {
-        assert!(
-            all.body
-                .contains(&format!("<TargetGroupName>{name}</TargetGroupName>")),
-            "case {case:?}: expected {name} among every target group, got {} with {}",
-            all.status,
-            all.body
-        );
-    }
-}
-
-/// The `<TargetGroupArn>` of the first target group an answer reports.
-fn target_group_arn(body: &str) -> Option<String> {
-    let doc = parse(body);
-    find(&doc, "TargetGroupArn")
-        .and_then(Element::text)
-        .map(str::to_string)
 }

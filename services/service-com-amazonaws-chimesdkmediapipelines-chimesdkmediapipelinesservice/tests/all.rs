@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/media_capture_pipeline_lifecycle.rs"]
 mod media_capture_pipeline_lifecycle;
+#[path = "all/media_insights_pipeline_configuration_lifecycle.rs"]
+mod media_insights_pipeline_configuration_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

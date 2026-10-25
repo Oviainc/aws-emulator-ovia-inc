@@ -26,10 +26,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::PROTOCOL_VALUES;
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{
-    create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn,
-};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::{Emulator, REGION};
+
+/// The networks the fixture gateway declares, which are the only names a network output of
+/// a bridge placed on it may carry (`GatewayNetwork$Name`).
+const DECLARED_NETWORKS: [&str; 3] = ["net-1", "net-2", "net-3"];
 
 async fn update_output(
     emulator: &Emulator,
@@ -65,15 +67,32 @@ fn network_output(name: &str, ip: &str, port: i64, protocol: &str, ttl: i64) -> 
 /// the flow outputs the service materialises for it. Its source is accordingly the cloud
 /// flow the content comes from. The create is the subject of `bridge_lifecycle`; here it is
 /// only the fixture every update addresses.
-async fn bridge_with(emulator: &Emulator, name: &str, outputs: Vec<Value>) -> (String, Value) {
+/// What every case below addresses: the gateway the bridge is placed on, declaring
+/// [`DECLARED_NETWORKS`], and the cloud flow a cloud-to-ground bridge's content comes from
+/// — both resolvable in the store, because a reference that resolves to nothing is refused
+/// (`bridge_update_references` is the suite that owns THAT rule).
+async fn fixture(emulator: &Emulator, suite: &str) -> (String, String) {
+    let placement_arn =
+        gateway_with_networks(emulator, &format!("gw-{suite}"), &DECLARED_NETWORKS).await;
+    let flow_arn = cloud_flow(emulator, &format!("{suite}-flow")).await;
+    (placement_arn, flow_arn)
+}
+
+async fn bridge_with(
+    emulator: &Emulator,
+    name: &str,
+    placement_arn: &str,
+    flow_arn: &str,
+    outputs: Vec<Value>,
+) -> (String, Value) {
     let (status, code, created) = create_bridge(
         emulator,
         json!({
             "name": name,
-            "placementArn": minted_gateway_arn(1, "gw-update-output"),
+            "placementArn": placement_arn,
             "egressGatewayBridge": { "maxBitrate": 80_000_000 },
             "sources": [{ "flowSource": {
-                "flowArn": minted_flow_arn(2, "flow-update-output"),
+                "flowArn": flow_arn,
                 "name": "flow-src",
             }}],
             "outputs": outputs,
@@ -229,6 +248,7 @@ fn update_cases() -> Vec<UpdateCase> {
 #[tokio::test]
 async fn update_bridge_output_applies_the_settings_it_carries_and_keeps_the_rest() {
     let emulator = Emulator::new();
+    let (placement_arn, flow_arn) = fixture(&emulator, "update-output").await;
 
     for (index, case) in update_cases().into_iter().enumerate() {
         let UpdateCase {
@@ -238,8 +258,14 @@ async fn update_bridge_output_applies_the_settings_it_carries_and_keeps_the_rest
             update,
             expected,
         } = case;
-        let (bridge_arn, created) =
-            bridge_with(&emulator, &format!("bridge-update-output-{index}"), outputs).await;
+        let (bridge_arn, created) = bridge_with(
+            &emulator,
+            &format!("bridge-update-output-{index}"),
+            &placement_arn,
+            &flow_arn,
+            outputs,
+        )
+        .await;
         let created_outputs = created["bridge"]["outputs"]
             .as_array()
             .cloned()
@@ -324,9 +350,12 @@ fn output_name_of(output: &Value) -> String {
 #[tokio::test]
 async fn every_modelled_protocol_can_be_written_onto_a_bridge_network_output() {
     let emulator = Emulator::new();
+    let (placement_arn, flow_arn) = fixture(&emulator, "output-protocols").await;
     let (bridge_arn, _) = bridge_with(
         &emulator,
         "bridge-output-protocols",
+        &placement_arn,
+        &flow_arn,
         vec![network_output("net-out", "10.0.0.5", 5001, "rtp", 64)],
     )
     .await;
@@ -380,9 +409,12 @@ async fn every_modelled_protocol_can_be_written_onto_a_bridge_network_output() {
 #[tokio::test]
 async fn repeating_one_update_bridge_output_request_leaves_the_same_output() {
     let emulator = Emulator::new();
+    let (placement_arn, flow_arn) = fixture(&emulator, "output-idempotent").await;
     let (bridge_arn, _) = bridge_with(
         &emulator,
         "bridge-output-idempotent",
+        &placement_arn,
+        &flow_arn,
         vec![network_output("net-out", "10.0.0.5", 5001, "rtp", 64)],
     )
     .await;
@@ -420,9 +452,12 @@ async fn repeating_one_update_bridge_output_request_leaves_the_same_output() {
 #[tokio::test]
 async fn an_update_bridge_output_request_that_resolves_nothing_is_refused_and_writes_nothing() {
     let emulator = Emulator::new();
+    let (placement_arn, flow_arn) = fixture(&emulator, "output-refusals").await;
     let (bridge_arn, created) = bridge_with(
         &emulator,
         "bridge-output-refusals",
+        &placement_arn,
+        &flow_arn,
         vec![
             network_output("net-out", "10.0.0.5", 5001, "rtp", 64),
             network_output("other-out", "10.0.0.6", 5002, "udp", 32),

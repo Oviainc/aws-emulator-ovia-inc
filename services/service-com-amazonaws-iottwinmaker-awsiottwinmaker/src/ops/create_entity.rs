@@ -7,9 +7,13 @@
 //! terminal `ACTIVE` state, which is the state recorded traffic reads a
 //! just-created entity back in.
 //!
-//! Four refusals this handler owns, each a `ValidationException` (the model
+//! Five refusals this handler owns, each a `ValidationException` (the model
 //! declares no `ResourceNotFoundException` for `CreateEntity`):
 //!
+//! * `tags` names a key in the reserved `aws:` namespace
+//!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased):
+//!   that namespace is Amazon Web Services' own, so the whole request is
+//!   refused and no entity is created;
 //! * the workspace does not exist;
 //! * `parentEntityId` names an entity that does not exist in the workspace;
 //! * a component — top-level or composite — instantiates a component type the
@@ -205,6 +209,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_id = input.entity_id.as_deref().unwrap_or("<generated>"),
             "serving a request"
         );
+        // The reserved tag-key namespace is AWS's own: a create may no more put a
+        // key under it on the new resource than `TagResource` may add one later,
+        // so a request naming one is refused whole and nothing is created.
+        if let Some(message) = crate::state::reserved_tag_keys_violation(
+            "tags",
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys().map(String::as_str)),
+        ) {
+            return Err(CreateEntityErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateEntityErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),

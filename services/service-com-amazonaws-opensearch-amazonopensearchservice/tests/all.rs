@@ -31,6 +31,8 @@ mod domain_health;
 mod domain_lifecycle;
 #[path = "all/domain_nodes.rs"]
 mod domain_nodes;
+#[path = "all/index_registry.rs"]
+mod index_registry;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
 #[path = "all/instance_type_limits.rs"]

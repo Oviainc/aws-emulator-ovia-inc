@@ -121,6 +121,13 @@ pub mod limits {
     /// modelled `ClientException` past this point rather than growing without bound.
     pub const MAX_CONSUMABLE_RESOURCES: usize = 500;
 
+    /// How many `UpdateConsumableResource` client tokens this store remembers at once, so
+    /// an identical repeat of one resolves to the update it already applied
+    /// ([`super::ComAmazonawsBatchAwsbatchv20160810State::consumable_resource_update_for_token`]).
+    /// An EMULATOR bound: the cache is a replay index anyone can fill, so the oldest entry
+    /// is dropped past this point rather than letting the store grow without bound.
+    pub const MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS: usize = 500;
+
     /// Quota shares kept at once. An EMULATOR bound (AWS publishes no quota for this
     /// resource): `CreateQuotaShare` fills the store and anyone can repeat it, so a create
     /// past this answers the modelled `ClientException`. Sized like the other per-Region
@@ -579,6 +586,35 @@ pub const RESOURCE_TYPE_NON_REPLENISHABLE: &str = "NON_REPLENISHABLE";
 pub const CONSUMABLE_RESOURCE_TYPES: [&str; 2] =
     [RESOURCE_TYPE_REPLENISHABLE, RESOURCE_TYPE_NON_REPLENISHABLE];
 
+/// `UpdateConsumableResource$operation` that makes the request's `quantity` the new total,
+/// from the member's own doc: "`SET` Sets the quantity of the resource to the value
+/// specified by the `quantity` parameter."
+pub const UPDATE_OPERATION_SET: &str = "SET";
+
+/// `UpdateConsumableResource$operation` that adds the request's `quantity` to the total,
+/// from the same doc: "`ADD` Increases the quantity of the resource by the value specified
+/// by the `quantity` parameter."
+pub const UPDATE_OPERATION_ADD: &str = "ADD";
+
+/// `UpdateConsumableResource$operation` that takes the request's `quantity` off the total,
+/// from the same doc: "`REMOVE` Reduces the quantity of the resource by the value specified
+/// by the `quantity` parameter."
+pub const UPDATE_OPERATION_REMOVE: &str = "REMOVE";
+
+/// Every `operation` an `UpdateConsumableResource` may name, from that member's doc ("Must
+/// be one of: SET, ADD, REMOVE"). The model types the member as a plain `String`, so the
+/// framework admits anything and the handler applies this list — the same arrangement as
+/// [`CONSUMABLE_RESOURCE_TYPES`].
+pub const CONSUMABLE_RESOURCE_UPDATE_OPERATIONS: [&str; 3] =
+    [UPDATE_OPERATION_SET, UPDATE_OPERATION_ADD, UPDATE_OPERATION_REMOVE];
+
+/// How long an `UpdateConsumableResource$clientToken` stays the key of the update it
+/// applied, in milliseconds.
+///
+/// The member's own doc states the duration: "A clientToken is valid for 8 hours." Past it
+/// the token keys nothing, so the same token names a new request.
+pub const CLIENT_TOKEN_VALIDITY_MILLIS: i64 = 8 * 60 * 60 * 1_000;
+
 /// `CEType` value whose compute resources AWS Batch manages.
 pub const CE_TYPE_MANAGED: &str = "MANAGED";
 
@@ -842,6 +878,32 @@ fn container_event_detail(container: &ContainerDetail) -> ::serde_json::Value {
         );
     }
     Value::Object(rendered)
+}
+
+/// A digest of the members ONE request carries, so an identical repeat of a `clientToken`
+/// can be told apart from the same token carrying a different payload — the comparison
+/// every `clientToken` on this service documents ("two requests with identical payloads and
+/// clientTokens ... are considered the same request").
+///
+/// SHA-256 over `parts` (the `sha2` crate, hex-encoded with `hex`, as [`new_uuid`] does),
+/// each separated by a NUL so two members cannot run together into the same bytes. The
+/// caller renders its OWN members, in a fixed order, and orders any map's entries before
+/// rendering them: the digest must depend on what the request says, never on how it
+/// happened to be iterated. One definition, so two operations' token paths cannot drift
+/// apart on the layout.
+pub fn request_members_digest<I>(parts: I) -> String
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_ref().as_bytes());
+        hasher.update([0_u8]);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// A fresh identifier in the shape AWS Batch gives a job id and a compute environment
@@ -1310,6 +1372,30 @@ impl ConsumableResource {
     }
 }
 
+/// One `UpdateConsumableResource` a `clientToken` already applied, kept so an identical
+/// repeat of that request answers what the first one answered and applies nothing further.
+///
+/// The member's doc: "If this parameter is specified and two update requests with
+/// identical payloads and clientTokens are received, these requests are considered the
+/// same request. Both requests will succeed, but the update will only happen once." So the
+/// response the first request computed is what is remembered, not just the fact of it.
+#[derive(Debug, Clone)]
+pub struct ConsumableResourceUpdate {
+    /// A digest of the request that applied this update, so a token repeated with a
+    /// DIFFERENT payload can be told apart from the identical repeat the doc describes.
+    pub request_digest: String,
+    /// The name of the resource the update was applied to — the response's
+    /// `consumableResourceName`.
+    pub consumable_resource_name: String,
+    /// That resource's ARN — the response's `consumableResourceArn`.
+    pub consumable_resource_arn: String,
+    /// The `totalQuantity` the update left the resource at — the response's own member.
+    pub total_quantity: i64,
+    /// When the update was applied, in epoch milliseconds: what
+    /// [`CLIENT_TOKEN_VALIDITY_MILLIS`] is measured from.
+    pub applied_at: i64,
+}
+
 /// Whether a `JobStatus` is one a job never leaves.
 pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, JOB_SUCCEEDED | JOB_FAILED)
@@ -1768,6 +1854,12 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     pub consumable_resources: HashMap<String, ConsumableResource>,
     /// Consumable resource ARN -> name, so `name or ARN` members resolve both ways.
     pub consumable_resources_by_arn: HashMap<String, String>,
+    /// The `UpdateConsumableResource` client tokens this store still remembers, keyed by
+    /// the token, each with the update it applied
+    /// ([`Self::consumable_resource_update_for_token`]). A token is valid for
+    /// [`CLIENT_TOKEN_VALIDITY_MILLIS`] and the index is bounded by
+    /// [`limits::MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS`].
+    consumable_resource_updates: HashMap<String, ConsumableResourceUpdate>,
     /// Quota shares by ARN — the only identifier `DescribeQuotaShare` takes. Bounded by
     /// [`limits::MAX_QUOTA_SHARES`], and a share goes when the job queue it hangs off
     /// does.
@@ -1918,6 +2010,56 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.consumable_resources
             .contains_key(id)
             .then(|| id.to_string())
+    }
+
+    /// The `UpdateConsumableResource` the `clientToken` `token` already applied, while that
+    /// token is still valid at `now` ([`CLIENT_TOKEN_VALIDITY_MILLIS`]).
+    ///
+    /// What makes an identical repeat of an update "the same request" rather than a second
+    /// one: the repeat answers the response this record holds and applies nothing.
+    pub fn consumable_resource_update_for_token(
+        &self,
+        token: &str,
+        now: i64,
+    ) -> Option<&ConsumableResourceUpdate> {
+        self.consumable_resource_updates
+            .get(token)
+            .filter(|update| now.saturating_sub(update.applied_at) < CLIENT_TOKEN_VALIDITY_MILLIS)
+    }
+
+    /// Remember that `token` applied `update`, so an identical repeat of that request
+    /// resolves to it.
+    ///
+    /// Tokens whose validity has run out at `update.applied_at` are forgotten first, and a
+    /// cache still at [`limits::MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS`] after that drops the
+    /// token applied longest ago: the index is a replay cache, so losing its oldest entry
+    /// costs a repeat its shortcut and never changes a stored quantity.
+    pub fn remember_consumable_resource_update(
+        &mut self,
+        token: &str,
+        update: ConsumableResourceUpdate,
+    ) {
+        let now = update.applied_at;
+        self.consumable_resource_updates
+            .retain(|_, kept| now.saturating_sub(kept.applied_at) < CLIENT_TOKEN_VALIDITY_MILLIS);
+        while self.consumable_resource_updates.len()
+            >= limits::MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS
+        {
+            let Some(oldest) = self
+                .consumable_resource_updates
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    (left.applied_at, left_key.as_str())
+                        .cmp(&(right.applied_at, right_key.as_str()))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.consumable_resource_updates.remove(&oldest);
+        }
+        self.consumable_resource_updates
+            .insert(token.to_string(), update);
     }
 
     /// The service environment `name_or_arn` names, resolved by name or by ARN.
