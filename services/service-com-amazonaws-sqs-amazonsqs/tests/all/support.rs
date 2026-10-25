@@ -31,11 +31,22 @@ pub const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/u
 
 /// One emulator holding only this service, over one shared engine.
 pub fn emulator() -> MultiServiceRouter {
+    emulator_over_engine().0
+}
+
+/// The same emulator, with the engine it was built over handed back.
+///
+/// A suite that has to observe — or ADVANCE — a span the clock owes uses this: a
+/// retention period is a documented duration measured in minutes at the shortest, so a
+/// test moves the instants a stored message carries into the past instead of sleeping
+/// for them. Everything a request can observe still goes over the wire through the
+/// router; the engine is only the seam the clock is reached through.
+pub fn emulator_over_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// The account id every generated emulator presents.

@@ -2662,6 +2662,48 @@ pub fn deployment_cannot_be_stopped(
     )
 }
 
+/// The mutation a [`predefined_deployment_strategy_immutable`] refusal was asked for.
+///
+/// The verb is the only part of that refusal that moves with the operation, so the two
+/// mutating deployment-strategy handlers name their own rather than each writing the
+/// sentence out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyMutation {
+    /// `UpdateDeploymentStrategy`.
+    Update,
+    /// `DeleteDeploymentStrategy`.
+    Delete,
+}
+
+impl StrategyMutation {
+    /// The verb AppConfig puts in the refusal's fixed prefix.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// `Message` for a mutation refused because the strategy it addresses is one of
+/// AppConfig's published catalogue entries ([`PREDEFINED_DEPLOYMENT_STRATEGIES`]) rather
+/// than a record this account created.
+///
+/// The sentence is built from the request: the fixed prefix `Cannot <verb> predefined
+/// Deployment Strategy ` — the kind spelled in title case as two words, the verb the
+/// refused mutation's own — followed by the `DeploymentStrategyId` the call submitted, and
+/// no trailing full stop. Nothing of any one request is stored here: the id is echoed from
+/// the call being refused, whichever catalogue entry it names.
+pub fn predefined_deployment_strategy_immutable(
+    mutation: StrategyMutation,
+    deployment_strategy_id: &str,
+) -> String {
+    format!(
+        "Cannot {} predefined Deployment Strategy {deployment_strategy_id}",
+        mutation.verb()
+    )
+}
+
 /// `Message` for a revert refused because the deployment completed too long ago.
 ///
 /// A window-level refusal is a DIFFERENT refusal from [`deployment_cannot_be_stopped`]

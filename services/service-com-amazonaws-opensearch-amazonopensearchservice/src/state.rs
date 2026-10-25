@@ -43,7 +43,7 @@ use crate::ops::types::{
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, Insight, InsightEntity,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, Insight, InsightEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails,
     InvalidPaginationTokenException, JWTOptionsOutput, LimitExceededException, Limits,
@@ -1653,6 +1653,58 @@ impl ScheduledChange {
     }
 }
 
+/// One field of an insight's DETAILED view, as this emulator persists it.
+///
+/// A detail read "returns detailed fields associated with the specified insight, such
+/// as text descriptions and metric data", each field a name, a type out of
+/// `InsightFieldType` (`text` or `metric`) and a value — so this is the ONE copy of a
+/// field, held on the insight it details ([`InsightRecord::details`]) in the order a
+/// detail read reports it.
+///
+/// A field's content is stored once per rendering the service raises it in: [`value`]
+/// is the plain one and [`html_value`] the SAME content with the markup the service
+/// renders it with, for a field that has such a rendering. The request's
+/// `ShowHtmlContent` picks between them ([`InsightDetailField::to_insight_field`]), so
+/// neither is derived from the other at read time.
+///
+/// [`value`]: InsightDetailField::value
+/// [`html_value`]: InsightDetailField::html_value
+#[derive(Debug, Clone)]
+pub struct InsightDetailField {
+    /// `InsightField$Name`: "the name of the insight field".
+    pub name: String,
+    /// `InsightField$Type`, one of `InsightFieldType`'s values: whether this field
+    /// carries a text description or metric data.
+    pub field_type: String,
+    /// `InsightField$Value` with no markup in it — what a caller that did not ask for
+    /// HTML content is answered with.
+    pub value: String,
+    /// The same content as the service renders it WITH markup, for a field that has
+    /// such a rendering; `None` where it has none and the plain value is the whole of
+    /// what there is to report.
+    pub html_value: Option<String>,
+}
+
+impl InsightDetailField {
+    /// This field as `InsightField` — the ONE projection of it, so every operation
+    /// that reports a detail field reports the same values.
+    ///
+    /// `show_html` is the request's `ShowHtmlContent` — "specifies whether to show
+    /// response with HTML content in response or not" — so it selects the marked-up
+    /// rendering where this field has one, and changes nothing where it has none.
+    pub fn to_insight_field(&self, show_html: bool) -> InsightField {
+        let value = match (show_html, self.html_value.as_deref()) {
+            (true, Some(html)) => html.to_string(),
+            _ => self.value.clone(),
+        };
+        InsightField {
+            name: self.name.clone(),
+            r#type: self.field_type.clone(),
+            value,
+        }
+    }
+}
+
 /// One insight, as this emulator persists it.
 ///
 /// An insight is "a notification about a domain event or recommendation that helps
@@ -1689,6 +1741,11 @@ pub struct InsightRecord {
     pub updated_at: SystemTime,
     /// `Insight$IsExperimental`: "indicates whether the insight is experimental".
     pub is_experimental: bool,
+    /// The fields of this insight's DETAILED view, in the order a detail read reports
+    /// them — the text descriptions and metric data a detail read answers with. Held
+    /// on the insight itself, because a detail field details THAT insight and goes
+    /// when it goes; empty for an insight the service has raised no detail for.
+    pub details: Vec<InsightDetailField>,
 }
 
 impl InsightRecord {
@@ -4012,6 +4069,26 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         }
     }
 
+    /// The one insight the entity a request names holds under `insight_id`.
+    ///
+    /// An insight is addressed by its entity and its id together, so this resolves
+    /// the entity exactly as [`Self::insights_of_entity`] does — the same ONE
+    /// decision — and then refuses an id that entity holds no insight under rather
+    /// than reporting an insight some other entity holds, or an empty view of one
+    /// that does not exist.
+    ///
+    /// Reads ONLY.
+    pub fn insight_of_entity(
+        &self,
+        entity: &InsightEntity,
+        insight_id: &str,
+    ) -> Result<&InsightRecord, InsightEntityRefusal> {
+        self.insights_of_entity(entity)?
+            .into_iter()
+            .find(|record| record.insight_id == insight_id)
+            .ok_or_else(|| InsightEntityRefusal::NotFound(insight_not_found(entity, insight_id)))
+    }
+
     /// The tag set of the resource `arn` names, for a caller about to READ it.
     ///
     /// A domain is the taggable resource this store persists an ARN for
@@ -4631,6 +4708,26 @@ pub fn unknown_insight_entity(entity_type: &str) -> ValidationException {
             "Entity type {entity_type} is not supported. Supported values are \
              {INSIGHT_ENTITY_ACCOUNT} and {INSIGHT_ENTITY_DOMAIN_NAME}."
         )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that names no insight of the
+/// entity a request named.
+///
+/// It names the id that could not be resolved and the entity it was looked up in,
+/// both as the request gave them, so a caller tells an id this service never minted
+/// from one naming an insight another entity holds.
+pub fn insight_not_found(entity: &InsightEntity, insight_id: &str) -> ResourceNotFoundException {
+    let held_by = if entity.r#type == INSIGHT_ENTITY_DOMAIN_NAME {
+        format!("domain {}", insight_entity_value(entity).unwrap_or_default())
+    } else {
+        format!(
+            "account {}",
+            insight_entity_value(entity).unwrap_or(::engine::emulator_account_id())
+        )
+    };
+    ResourceNotFoundException {
+        message: Some(format!("Insight {insight_id} not found for {held_by}")),
     }
 }
 

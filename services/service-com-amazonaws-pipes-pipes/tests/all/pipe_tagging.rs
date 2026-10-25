@@ -12,14 +12,18 @@
 //! addressed by that record's ARN — `TagResource` merges keys into it (a new key is
 //! added, a key already present has its value replaced), `UntagResource` removes the
 //! keys it names and nothing else, and `ListTagsForResource` and `DescribePipe` both
-//! report exactly that map. Each test's rows span what the rule generalises over (the
-//! number of tags, the key and value charsets and lengths, which keys a call names,
-//! whether a key is present) rather than one recorded request.
+//! report exactly that map (`ListTagsForResource` always as a map, empty when the pipe
+//! carries no tag; `DescribePipe` as the record member, absent when it carries none).
+//! Each test's rows span what the rule generalises over (the number of tags, the key and
+//! value charsets and lengths, which keys a call names, whether a key is present) rather
+//! than one recorded request.
 //!
-//! The rules a tag KEY's content must satisfy (the published `TagKey`/`TagValue` length
-//! bounds, and the prefix AWS reserves for its own tags) have their own suite in
-//! `tests/all/tag_key_rules.rs`; the helpers below are `pub(crate)` so that suite reaches
-//! this same one request path rather than copying it.
+//! The rules a tag's content must satisfy (the published `TagKey`/`TagValue` length
+//! bounds, the documented tag character set, and the prefix AWS reserves for its own tags)
+//! have their own suite in `tests/all/tag_key_rules.rs`, and how an unresolvable
+//! `resourceArn` is reported has one in `tests/all/tagging_refusals.rs`; the helpers below
+//! are `pub(crate)` so those suites reach this same one request path rather than copying
+//! it.
 
 use std::collections::BTreeMap;
 
@@ -70,7 +74,7 @@ pub(crate) fn encode(value: &str) -> String {
     encoded
 }
 
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Reply {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Reply {
     call(
         router,
         "GET",
@@ -96,7 +100,11 @@ pub(crate) async fn tag(
     .await
 }
 
-async fn untag(router: &MultiServiceRouter, resource_arn: &str, tag_keys: &[&str]) -> Reply {
+pub(crate) async fn untag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tag_keys: &[&str],
+) -> Reply {
     let query = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", encode(key)))
@@ -170,13 +178,21 @@ pub(crate) async fn assert_tags_agree(
         tag_map(listed.member("tags"))
     );
     if expected.is_empty() {
-        // `TagMap` is `@length(min: 1)`, so an untagged pipe reports no map at all
-        // rather than an empty one.
+        // The tagging layer reports the map either way, so an untagged pipe reports an
+        // EMPTY one rather than no member — `TagMap`'s `@length(min: 1)` bounds what a
+        // request may send, not what a report carries.
         assert_eq!(
             listed.member("tags"),
-            &Value::Null,
-            "case {case:?}: an untagged pipe must report no tags member, got {:?}",
+            &json!({}),
+            "case {case:?}: an untagged pipe must report an empty tags map, got {:?}",
             listed.member("tags")
+        );
+        // `DescribePipe` reports the pipe RECORD, whose `Tags` member is absent when the
+        // pipe carries none.
+        assert_eq!(
+            describe(router, name).await.member("Tags"),
+            &Value::Null,
+            "case {case:?}: an untagged pipe's record must carry no Tags member"
         );
     }
 
@@ -211,8 +227,11 @@ async fn list_tags_for_resource_reports_the_tags_create_pipe_stored() {
         // `TagValue` is `@length(min: 0)`: an empty value is a value, not an absence.
         ("empty-value", Some(json!({"env": ""}))),
         (
+            // Multi-byte LETTERS, which the documented tag character set admits and
+            // which must round-trip byte-identically; what it does NOT admit has its
+            // own table in `tag_key_rules`.
             "unicode-key-and-value",
-            Some(json!({"équipe": "日本語 🚀", "ключ": "значение"})),
+            Some(json!({"équipe": "日本語 製造", "ключ": "значение"})),
         ),
         (
             "key-and-value-at-their-length-bounds",
@@ -277,8 +296,8 @@ async fn tag_resource_merges_into_the_tags_the_pipe_already_carries() {
         (
             "unicode-value-round-trips",
             Some(json!({"env": "prod"})),
-            json!({"名前": "パイプ 🚀", "env": "pród"}),
-            json!({"名前": "パイプ 🚀", "env": "pród"}),
+            json!({"名前": "パイプ 製造", "env": "pród"}),
+            json!({"名前": "パイプ 製造", "env": "pród"}),
         ),
         (
             "every-tag-tagmap-allows-in-one-call",

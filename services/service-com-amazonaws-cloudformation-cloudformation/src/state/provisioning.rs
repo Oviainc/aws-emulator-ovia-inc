@@ -446,8 +446,12 @@ pub struct Materialised {
 /// `stack` is the stack the resources belong to: every resource this CREATES is created
 /// carrying the tags CloudFormation gives it ([`StackProvenance::tags_for`]), so the
 /// owning service's own tag read on the handle the stack publishes answers with the stack's
-/// tags and the `aws:cloudformation:*` ones. A resource the deployment carries forward keeps
-/// the tags it was created with: nothing is re-tagged for a resource nothing changed about.
+/// tags and the `aws:cloudformation:*` ones. A resource the deployment carries FORWARD is
+/// brought back into step with that same set
+/// ([`super::provisioner::Provisioner::retag`]), since a deployment can state the stack's
+/// tags differently with no resource's declaration changing at all; nothing is called about
+/// a resource whose tags already agree with it, and a resource whose configuration change
+/// the owning service refused is not re-tagged either.
 ///
 /// Every resource the walk ACTS ON is recorded as a pair of transitions
 /// ([`Materialised::transitions`]) — the one that opens it and the one that ends it — which
@@ -510,15 +514,12 @@ pub async fn reconcile(
                 match applied {
                     // The owning service applied it, so the configuration in force is the
                     // DECLARED one — which is what the stack records, and what a later
-                    // deployment and drift detection compare against.
+                    // deployment and drift detection compare against. The transition that
+                    // ENDS the resource is pushed after the tags are in step too, below, so
+                    // `UPDATE_COMPLETE` means both halves of the change landed.
                     Ok(Some(updated)) => {
                         resource.attributes.extend(updated.attributes);
-                        resource.properties = declared_properties;
-                        outcome.transitions.push(ResourceTransition::finished(
-                            &resource,
-                            super::resource_status::UPDATE_COMPLETE,
-                            None,
-                        ));
+                        resource.properties = declared_properties.clone();
                     }
                     Ok(None) => {
                         let unsupported = format!(
@@ -554,6 +555,58 @@ pub async fn reconcile(
                         outcome.resources.push(resource);
                         break;
                     }
+                }
+            }
+            // The tags CloudFormation gives the resource are brought back into step AFTER
+            // the configuration change, whether or not the declaration changed: a stack
+            // operation's `Tags` are propagated to the resources in the stack, and a
+            // deployment can state them differently with no resource's declaration changing
+            // at all — while a configuration change the owning service REFUSED has already
+            // left the loop, so a refused deployment does not re-tag what it could not
+            // change. Only a type with a re-tagging arm has anything asked of its service
+            // ([`super::provisioner::Provisioner::retag`]), and that arm is idempotent, so a
+            // resource whose tags already agree with the set has nothing called about it.
+            let retagged = match provisioner_for(&resource.resource_type) {
+                Some(provisioner) => {
+                    let tags = stack.tags_for(&resource.logical_id);
+                    provisioner
+                        .retag(ctx, region, &resource, &declared_properties, &tags)
+                        .await
+                }
+                None => Ok(()),
+            };
+            match retagged {
+                // Both halves of the change landed, which is what ends a resource this
+                // deployment acted on.
+                Ok(()) => {
+                    if changed {
+                        outcome.transitions.push(ResourceTransition::finished(
+                            &resource,
+                            super::resource_status::UPDATE_COMPLETE,
+                            None,
+                        ));
+                    }
+                }
+                Err(refusal) => {
+                    if !changed {
+                        // A tag-only change opens the resource's transition pair here: the
+                        // configuration half never asked anything of the owning service.
+                        outcome.transitions.push(ResourceTransition::starting(
+                            &resource,
+                            super::resource_status::UPDATE_IN_PROGRESS,
+                        ));
+                    }
+                    outcome.failure = Some(format!(
+                        "The following resource(s) failed to update: [{}]. {refusal}",
+                        resource.logical_id
+                    ));
+                    outcome.transitions.push(ResourceTransition::finished(
+                        &resource,
+                        super::resource_status::UPDATE_FAILED,
+                        Some(handler_failure_reason(&refusal)),
+                    ));
+                    outcome.resources.push(resource);
+                    break;
                 }
             }
             outcome.resources.push(resource);

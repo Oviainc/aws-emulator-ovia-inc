@@ -2110,6 +2110,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon CloudWatch `PutMetricAlarm.AlarmName`: `AlarmName`,
         // `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
         "AWS::CloudWatch::Alarm" => rules(255, Characters::AsGenerated),
+        // Amazon CloudWatch `PutDashboard.DashboardName`: "The maximum length is 255, and
+        // valid characters are A-Z, a-z, 0-9, \"-\", and \"_\""
+        // (`PutDashboardInput$DashboardName`) — the CloudWatch model carries no `@length` for
+        // it, and a generated name is already inside that character set but may be longer
+        // than the bound.
+        CLOUDWATCH_DASHBOARD => rules(255, Characters::AsGenerated),
         // AWS Secrets Manager `CreateSecret.Name`: `NameType`,
         // `@length(min: 1, max: 512)` (Secrets Manager's own Smithy model).
         "AWS::SecretsManager::Secret" => rules(512, Characters::AsGenerated),
@@ -3708,6 +3714,10 @@ pub const SAGEMAKER_MODEL_PACKAGE_GROUP: &str = "AWS::SageMaker::ModelPackageGro
 /// `cloudFormationName: CloudWatch`). This is the type `super::provisioning` creates in
 /// CloudWatch itself, through that service's own `PutMetricStream`.
 pub const CLOUDWATCH_METRIC_STREAM: &str = "AWS::CloudWatch::MetricStream";
+
+/// An Amazon CloudWatch dashboard's resource type. This is the type `super::provisioning`
+/// creates in CloudWatch itself, through that service's own `PutDashboard`.
+pub const CLOUDWATCH_DASHBOARD: &str = "AWS::CloudWatch::Dashboard";
 
 /// The same for an Amazon SNS topic: the SNS model carries
 /// `awsService.cloudFormationName: SNS`.

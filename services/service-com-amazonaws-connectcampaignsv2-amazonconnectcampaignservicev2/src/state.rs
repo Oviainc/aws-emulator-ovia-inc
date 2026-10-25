@@ -731,6 +731,48 @@ impl StoredCampaign {
             .collect()
     }
 
+    /// Remove the channel-subtype config block this campaign holds for the channel
+    /// `channel_subtype` names.
+    ///
+    /// `channel_subtype` is a `ChannelSubtype` value — the catalog
+    /// `CHANNEL_SUBTYPE_VALUES` in [`crate::ops::types`], which the caller refuses a
+    /// value outside of before reaching here, so a value naming no channel removes
+    /// nothing.
+    ///
+    /// Only the named channel's block goes: every other channel keeps the block it
+    /// was configured with, so [`Self::channel_subtypes`] still reports those. A
+    /// config left holding no channel at all holds nothing, so the record carries no
+    /// `channelSubtypeConfig` rather than an empty one — the member is optional on
+    /// both `Campaign` and `CampaignSummary`'s projection. A campaign that held no
+    /// block for the named channel, and one carrying no channel subtype config at
+    /// all, are left exactly as they were, which is what makes the operation
+    /// idempotent, as the model declares.
+    pub fn clear_channel_subtype_config(&mut self, channel_subtype: &str) {
+        let Some(config) = self.channel_subtype_config.as_mut() else {
+            return;
+        };
+        let removed = match channel_subtype {
+            "EMAIL" => config.email.take().is_some(),
+            "SMS" => config.sms.take().is_some(),
+            "TELEPHONY" => config.telephony.take().is_some(),
+            "WHATSAPP" => config.whats_app.take().is_some(),
+            // A catalog value with no block on `ChannelSubtypeConfig` is a channel
+            // this emulator cannot be configured for, so it holds nothing to remove.
+            _ => false,
+        };
+        // Only a removal collapses the config: a call that removed nothing writes
+        // nothing at all, so a campaign carrying a config with no channel in it keeps
+        // that config rather than losing it to a deletion that found nothing.
+        if removed
+            && config.email.is_none()
+            && config.sms.is_none()
+            && config.telephony.is_none()
+            && config.whats_app.is_none()
+        {
+            self.channel_subtype_config = None;
+        }
+    }
+
     /// Remove the communication-time window this campaign holds for the channel
     /// `config_type` names.
     ///

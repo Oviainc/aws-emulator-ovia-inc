@@ -34,6 +34,15 @@
 //!   and that one call is documented "Creates or updates a metric stream" — so it is also
 //!   this type's UPDATE, the one arm here that can apply a changed declaration to a
 //!   resource the stack already has;
+//! * `AWS::CloudWatch::Dashboard`'s three properties are `PutDashboard`'s own members,
+//!   with the dashboard's name the one CloudFormation decides, its `DashboardBody` taken as
+//!   the JSON TEXT the request carries, and its `Tags` the declaration's own tag list beside
+//!   the ones CloudFormation propagates. That one call is documented "Creates a dashboard if
+//!   it does not already exist, or updates an existing dashboard" — so it is this type's
+//!   update as well as its create. Its `Tags` member applies on the CREATE alone, that
+//!   member being documented as ignored when the call updates a dashboard that exists, so a
+//!   later deployment's tag change reaches CloudWatch through that service's own
+//!   `TagResource`/`UntagResource` ([`Provisioner::retag`]);
 //! * `AWS::CodePipeline::Pipeline`'s are the same document with one transformation: they
 //!   are `PipelineDeclaration`'s members spelled with an upper-case initial, so
 //!   [`camel_cased`] lower-cases each key's first letter and the document is the
@@ -215,7 +224,8 @@ use super::provisioning::{
     xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
-    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM,
+    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_DASHBOARD,
+    CLOUDWATCH_METRIC_STREAM,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
@@ -269,6 +279,7 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 pub(super) enum Provisioner {
     FirehoseDeliveryStream,
     CloudWatchMetricStream,
+    CloudWatchDashboard,
     EcrPublicRepository,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
@@ -313,6 +324,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
     match resource_type {
         FIREHOSE_DELIVERY_STREAM => Some(Provisioner::FirehoseDeliveryStream),
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
+        CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
@@ -385,6 +397,9 @@ impl Provisioner {
             }
             Self::CloudWatchMetricStream => {
                 put_metric_stream(ctx, region, resource, propagated).await
+            }
+            Self::CloudWatchDashboard => {
+                put_dashboard(ctx, region, resource, propagated).await
             }
             Self::EmrCluster => run_job_flow(ctx, region, resource, propagated).await,
             Self::EcrPublicRepository => {
@@ -556,6 +571,9 @@ impl Provisioner {
     /// applied rather than as a success that dropped it. `Err` is that service's own
     /// refusal of the change — including a change its API cannot make to an existing
     /// resource, which is the refusal a client would get.
+    ///
+    /// This is the resource's CONFIGURATION alone. The tags CloudFormation gives it travel
+    /// separately, in [`Self::retag`], because they change independently of any declaration.
     pub(super) async fn update(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -579,6 +597,15 @@ impl Provisioner {
                 .await
                 .map(Some)
             }
+            // `PutDashboard` is documented "Creates a dashboard if it does not already
+            // exist, or updates an existing dashboard. If you update a dashboard, the
+            // entire contents are replaced with what you specify here", so the call that
+            // created the dashboard is the call that applies a changed declaration to it.
+            Self::CloudWatchDashboard => {
+                put_dashboard_body(ctx, region, &resource.physical_resource_id, declared)
+                    .await
+                    .map(Some)
+            }
             // `PutRule` is documented "Creates or updates the specified rule", so the call
             // that created the rule is the call that applies a changed declaration to it,
             // with the declared target list reconciled against the one it carries.
@@ -598,6 +625,47 @@ impl Provisioner {
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
             _ => Ok(None),
+        }
+    }
+
+    /// Bring the tags of a resource the stack ALREADY has back into step with the ones
+    /// CloudFormation gives it ([`Self::create`]'s `propagated`), through the owning
+    /// service's own tagging API.
+    ///
+    /// A stack operation's `Tags` are "propagated to the resources that CloudFormation
+    /// creates in the stack", and a deployment that states them differently states them for
+    /// the resources the stack already has as much as for the ones it creates — which is why
+    /// this is asked of every carried-forward resource rather than only of one whose
+    /// declaration changed: a stack's tags change without any resource's declaration
+    /// changing at all.
+    ///
+    /// `Ok(())` for a type with no arm here: nothing is asked of its service, exactly as a
+    /// type with no create arm is left declared-only. Each arm is expected to be
+    /// IDEMPOTENT — it is called on every deployment — so a resource whose tags already
+    /// agree with the set has nothing called about it.
+    ///
+    /// `declared` is the property document this deployment declares for the resource, whose
+    /// own `Tags` are part of the set the resource must end up carrying.
+    pub(super) async fn retag(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        resource: &StoredResource,
+        declared: &Value,
+        propagated: &[(String, String)],
+    ) -> Result<(), Refusal> {
+        let propagated = &self.applicable_tags(propagated);
+        match self {
+            // `PutDashboard`'s `Tags` member cannot carry a change to a dashboard's tags:
+            // that member is documented as ignored when the call updates a dashboard that
+            // exists, so the change reaches CloudWatch through its own tagging calls.
+            Self::CloudWatchDashboard => {
+                retag_dashboard(ctx, region, resource, declared, propagated).await
+            }
+            // Every other type's re-tagging is its own entry here, for the same reason its
+            // create, update and delete are: the tag set is the same for every type, but the
+            // calls that apply it are each service's own.
+            _ => Ok(()),
         }
     }
 
@@ -623,6 +691,9 @@ impl Provisioner {
             }
             Self::CloudWatchMetricStream => {
                 delete_metric_stream(ctx, region, physical_resource_id).await
+            }
+            Self::CloudWatchDashboard => {
+                delete_dashboard(ctx, region, physical_resource_id).await
             }
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
@@ -753,6 +824,9 @@ impl Provisioner {
             }
             Self::CloudWatchMetricStream => {
                 describe_metric_stream(ctx, region, physical_resource_id).await
+            }
+            Self::CloudWatchDashboard => {
+                describe_dashboard(ctx, region, physical_resource_id).await
             }
             Self::EcrPublicRepository => {
                 describe_public_repository(ctx, region, physical_resource_id).await
@@ -1099,6 +1173,230 @@ async fn describe_metric_stream(
     {
         Ok(answer) => Ok(Some(answer)),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon CloudWatch: AWS::CloudWatch::Dashboard
+// ---------------------------------------------------------------------------
+
+/// The code CloudWatch answers for a dashboard it does not hold
+/// (`DashboardNotFoundError`, the 404 `GetDashboard` models: "The specified dashboard does
+/// not exist.").
+const DASHBOARD_NOT_FOUND: &str = "DashboardNotFoundError";
+
+/// Create the dashboard an `AWS::CloudWatch::Dashboard` declares.
+///
+/// The type's properties are `PutDashboard`'s own members, spelled identically:
+/// `DashboardName`, which CloudFormation decides and which is this resource's physical id,
+/// `DashboardBody`, and `Tags`.
+///
+/// The dashboard carries the tags its own declaration asks for plus the ones CloudFormation
+/// gives the resource ([`tags_of`]), as the `[{Key, Value}]` list CloudWatch's own `Tag`
+/// shape spells. Only on the CREATE: "You can use this parameter only when creating a new
+/// dashboard. If you specify Tags when updating an existing dashboard, the tag updates are
+/// ignored." (`PutDashboardInput$Tags`), which is why a later deployment's tag change
+/// travels in [`retag_dashboard`] instead.
+async fn put_dashboard(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        properties.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    put_dashboard_body(
+        ctx,
+        region,
+        &resource.physical_resource_id,
+        &Value::Object(properties),
+    )
+    .await
+}
+
+/// `PutDashboard` with the `DashboardBody` `properties` declares and `name` as the one
+/// member CloudFormation decides — the call behind both this type's create and its update,
+/// so the two cannot send a different request for the same declaration.
+///
+/// The type declares `DashboardBody` as the dashboard document while the request takes the
+/// JSON TEXT of one, so an inline object is rendered and a string passes through — the same
+/// spelling rule a policy document reaches IAM under ([`document_text`]). A declaration
+/// that carries no body sends none, and CloudWatch refuses the call for the required
+/// member it is missing rather than this module inventing an empty dashboard.
+///
+/// The answer's `DashboardValidationMessages` is no return value of the type, and the type
+/// publishes no `Fn::GetAtt` attribute at all ("Ref returns the dashboard name"), so
+/// nothing of the answer is recorded on the resource.
+///
+/// `Tags` is carried through as the caller put it on `properties`: the whole tag set on the
+/// CREATE ([`put_dashboard`]), and the declaration's own list on an update, where CloudWatch
+/// ignores it — an update's tag change travels in [`retag_dashboard`].
+async fn put_dashboard_body(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    properties: &Value,
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    request.insert("DashboardName".to_string(), Value::String(name.to_string()));
+    if let Some(body) = properties.get("DashboardBody").and_then(document_text) {
+        request.insert("DashboardBody".to_string(), Value::String(body));
+    }
+    if let Some(tags) = properties.get("Tags") {
+        request.insert("Tags".to_string(), tags.clone());
+    }
+    call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.PutDashboard"),
+        &Value::Object(request),
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// Bring the tags of the dashboard a resource record names to the ones this deployment gives
+/// it, through CloudWatch's own `TagResource` and `UntagResource`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the resource and is removed, and a key in it with another
+/// value is re-valued ("adds or updates the specified tags", `TagResource`). Where the two
+/// sets already agree nothing is called at all, which is what makes this safe to ask on
+/// every deployment.
+///
+/// The dashboard's own ARN, as CloudWatch reports it, is what its tagging calls address it
+/// by: a dashboard is global, so its ARN carries no Region and is not one this module
+/// reconstructs. A dashboard CloudWatch no longer holds has no tags to reconcile.
+async fn retag_dashboard(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let desired = tags_of(declared, propagated);
+    let Some(arn) = describe_dashboard(ctx, region, &resource.physical_resource_id)
+        .await?
+        .as_ref()
+        .and_then(|dashboard| dashboard.get("DashboardArn"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return Ok(());
+    };
+    let held = declared_tags(
+        // CloudWatch answers its tag read as the same `[{Key, Value}]` list a declaration's
+        // `Tags` property is written as, so one reader serves both sides.
+        &call_json_rpc(
+            ctx,
+            CLOUDWATCH_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{CLOUDWATCH_TARGET_PREFIX}.ListTagsForResource"),
+            &serde_json::json!({ "ResourceARN": &arn }),
+        )
+        .await?,
+    );
+    let added: Vec<(String, String)> = desired
+        .iter()
+        .filter(|(key, value)| {
+            held.iter()
+                .find(|(held_key, _)| held_key == key)
+                .is_none_or(|(_, held_value)| held_value != value)
+        })
+        .cloned()
+        .collect();
+    let removed: Vec<Value> = held
+        .iter()
+        .filter(|(key, _)| !desired.iter().any(|(wanted, _)| wanted == key))
+        .map(|(key, _)| Value::String(key.clone()))
+        .collect();
+    if !added.is_empty() {
+        call_json_rpc(
+            ctx,
+            CLOUDWATCH_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{CLOUDWATCH_TARGET_PREFIX}.TagResource"),
+            &serde_json::json!({
+                "ResourceARN": &arn,
+                "Tags": tags_as_list(&added, UPPER_CASED_TAG),
+            }),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        call_json_rpc(
+            ctx,
+            CLOUDWATCH_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{CLOUDWATCH_TARGET_PREFIX}.UntagResource"),
+            &serde_json::json!({ "ResourceARN": &arn, "TagKeys": Value::Array(removed) }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Delete the dashboard a stack created: "Deletes all dashboards that you specify."
+///
+/// `DeleteDashboards` models no not-found error at all
+/// (`ConflictException`, `InternalServiceFault` and `InvalidParameterValueException` are its
+/// whole error list), unlike `GetDashboard`, so a dashboard CloudWatch no longer holds is
+/// not refused and there is no not-found code to treat as success here.
+async fn delete_dashboard(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "DashboardNames": [physical_resource_id] });
+    call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.DeleteDashboards"),
+        &request,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The dashboard's configuration as CloudWatch reports it, for drift detection: the
+/// `GetDashboard` answer, whose `DashboardName` and `DashboardBody` are the type's own
+/// property names. A dashboard CloudWatch no longer holds (`DashboardNotFoundError`) was
+/// deleted.
+async fn describe_dashboard(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "DashboardName": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        CLOUDWATCH_SIGNING_NAME,
+        region,
+        AWS_JSON_1_0,
+        &format!("{CLOUDWATCH_TARGET_PREFIX}.GetDashboard"),
+        &request,
+    )
+    .await
+    {
+        Ok(answer) => Ok(Some(answer)),
+        // Judged on the error CODE, never on the message, which carries the request's own
+        // dashboard name.
+        Err(refusal) if refusal.code == DASHBOARD_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

@@ -231,12 +231,12 @@ async fn two_different_client_errors_share_the_400_and_differ_by_type() {
         );
     }
 
-    // And the scaffold channel is untouched by the status rule: an operation nobody
-    // has implemented yet is still a 501, not a client error. `DeleteEnvironmentHost`
-    // is one of the operations still carrying the scaffold marker (`grep -rl '^//!
-    // SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`); the request below is one this service's
-    // own validator accepts, so the 501 is the handler's answer and not a refusal before
-    // it.
+    // And the scaffold channel is untouched by the status rule: a 501 means "nobody has
+    // written this operation yet", never a client error. No operation of this service
+    // carries the scaffold marker any more (`grep -rl '^//! SCAFFOLDED, NOT
+    // IMPLEMENTED:' src/ops/` reports nothing), so there is no operation left here to
+    // answer 501: `DeleteEnvironmentHost`, the last one implemented, SERVES the request
+    // below and refuses it as the client error the rule puts on 400.
     let (status, body) = call(
         &router,
         "DeleteEnvironmentHost",
@@ -247,8 +247,13 @@ async fn two_different_client_errors_share_the_400_and_differ_by_type() {
     )
     .await;
     assert_eq!(
-        status, 501,
-        "case a scaffolded operation: expected HTTP 501, got {status} {body}"
+        status, 400,
+        "case no operation is scaffolded: expected HTTP 400, got {status} {body}"
+    );
+    assert!(
+        error_type(&body).contains("ResourceNotFoundException"),
+        "case no operation is scaffolded: expected a ResourceNotFoundException, got {}",
+        error_type(&body)
     );
 }
 

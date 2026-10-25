@@ -29,6 +29,8 @@ mod connection_updates;
 mod crawler_updates;
 #[path = "all/crawlers.rs"]
 mod crawlers;
+#[path = "all/create_partition.rs"]
+mod create_partition;
 #[path = "all/custom_entity_types.rs"]
 mod custom_entity_types;
 #[path = "all/data_catalog.rs"]

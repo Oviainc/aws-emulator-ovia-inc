@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetIpAddressType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetIpAddressType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records the IP address type the request asks for on the ONE stored
+//! distribution, instance or load balancer the request names, re-provisions
+//! whatever follows from it (an instance's own addresses), and answers the
+//! operation-log entry the change appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetIpAddressType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +176,311 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetIpAddressType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetIpAddressTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetIpAddressType"))
+        // `resourceType` and `ipAddressType` target modelled enums and
+        // `resourceName` carries the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: the resource type has to
+        // be one of the kinds this action sets the address type OF, the named
+        // resource has to be one this account holds, a distribution is addressed
+        // only from the Region its API is served in, and a change that moves an
+        // instance's bundle needs the caller's agreement to it. Every one of
+        // those is checked BEFORE the first write, so a refused request records
+        // nothing.
+        let resource_type = input.resource_type;
+        let resource_name = input.resource_name;
+        let ip_address_type = input.ip_address_type;
+        // `acceptBundleUpdate` is optional and carries no modelled default, and
+        // what it accepts is a bundle change, so a request that leaves it out has
+        // accepted none.
+        let accept_bundle_update = input.accept_bundle_update.unwrap_or(false);
+
+        if !SETTABLE_RESOURCE_TYPES.contains(&resource_type.as_str()) {
+            return Err(invalid(format!(
+                "resourceType '{resource_type}' is not a resource type this action sets the \
+                 IP address type of: the resource values are {}",
+                SETTABLE_RESOURCE_TYPES.join(", ")
+            )));
+        }
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE — this operation's own `resourceType` documentation says
+        // "Distribution-related APIs are available only in the N. Virginia
+        // (us-east-1) Amazon Web Services Region" — so when the request names a
+        // distribution, the Region it was signed for decides whether it is served
+        // at all. Asked of the crate's one owner of that rule, before anything is
+        // read or written.
+        if resource_type == crate::state::RESOURCE_TYPE_DISTRIBUTION {
+            if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+                return Err(invalid(message));
+            }
+        }
+        // A load balancer is a REGIONAL resource — its own documentation caps
+        // them "per AWS Region in your account" — so the load balancer a name
+        // addresses is the one in the Region THIS request is signed for. An
+        // instance and a distribution are each addressed by name alone.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let operation = if resource_type == crate::state::RESOURCE_TYPE_INSTANCE {
+                set_instance_ip_address_type(
+                    store,
+                    &resource_name,
+                    &ip_address_type,
+                    accept_bundle_update,
+                    now,
+                )?
+            } else if resource_type == crate::state::RESOURCE_TYPE_LOAD_BALANCER {
+                set_load_balancer_ip_address_type(
+                    store,
+                    &region,
+                    &resource_name,
+                    &ip_address_type,
+                    now,
+                )?
+            } else {
+                set_distribution_ip_address_type(store, &resource_name, &ip_address_type, now)?
+            };
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one sets the address type of the ONE
+            // resource its request names, so it answers a single entry.
+            Ok(SetIpAddressTypeOutput {
+                operations: Some(vec![operation]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The resource types this action sets the IP address type of, from the
+/// `resourceType` member's own documentation: "The resource values are
+/// Distribution, Instance, and LoadBalancer." The modelled `ResourceType` enum
+/// carries every other kind of Lightsail resource too, and none of those has an
+/// IP address type to set.
+const SETTABLE_RESOURCE_TYPES: [&str; 3] = [
+    crate::state::RESOURCE_TYPE_DISTRIBUTION,
+    crate::state::RESOURCE_TYPE_INSTANCE,
+    crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+];
+
+/// Set the instance `name`'s IP address type to `ip_address_type`, answering the
+/// operation-log entry the change appended.
+///
+/// The address type decides which addresses the instance HAS — "the possible
+/// values are ipv4 for IPv4 only, ipv6 for IPv6 only, and dualstack for IPv4 and
+/// IPv6" — so the record's addresses follow it: an address family the new type
+/// takes away is given up, and one it adds is drawn from the same allocator a
+/// create and a start draw from ([`crate::state::ComAmazonawsLightsailLightsail20161128State::fresh_addresses`],
+/// so an address is handed out once in this process). An address of a family the
+/// new type keeps is left exactly where it is: the instance is reachable on it,
+/// and nothing about this change gives it up.
+///
+/// The instance's firewall is NOT rewritten: its rules are what the caller asked
+/// for, kept verbatim, and `OpenInstancePublicPorts`,
+/// `CloseInstancePublicPorts` and `PutInstancePublicPorts` are what change them.
+/// What each rule reports is already derived from the rule itself, so the
+/// firewall reads the same way before and after.
+fn set_instance_ip_address_type(
+    store: &mut crate::state::ComAmazonawsLightsailLightsail20161128State,
+    name: &str,
+    ip_address_type: &str,
+    accept_bundle_update: bool,
+    now: i64,
+) -> Result<Operation, SetIpAddressTypeError> {
+    let instance = store
+        .instance(name)
+        .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_INSTANCE, name))?;
+    let location = instance.location.clone();
+    let current = instance.ip_address_type.clone();
+    let holds_public_ipv4 = instance.public_ip_address.is_some();
+    let holds_ipv6 = !instance.ipv6_addresses.is_empty();
+
+    let wants_ipv4 = crate::state::ip_address_type_has_ipv4(ip_address_type);
+    let wants_ipv6 = crate::state::ip_address_type_has_ipv6(ip_address_type);
+
+    // "Required parameter to accept the instance bundle update when changing to,
+    // and from, IPv6-only. An instance bundle will change when switching from
+    // dual-stack or ipv4, to ipv6. It also changes when switching from ipv6, to
+    // dual-stack or ipv4. You must include this parameter in the command to
+    // update the bundle." Of the modelled address types, IPv6-only is the one
+    // that gives the instance no IPv4 address at all, so the change crosses that
+    // boundary exactly when it takes the instance's IPv4 addressing away or
+    // gives it back.
+    if wants_ipv4 != crate::state::ip_address_type_has_ipv4(&current) && !accept_bundle_update {
+        return Err(invalid(format!(
+            "acceptBundleUpdate must be true to change the ipAddressType of instance \
+             '{name}' from {current} to {ip_address_type}: the instance bundle changes when \
+             switching to, and from, ipv6, and billing for the new bundle begins immediately"
+        )));
+    }
+    // A static IP IS a public IPv4 address the account has reserved and attached
+    // to this instance (the modelled `StaticIp$ipAddress`), so an address type
+    // that gives the instance no public IPv4 address is one the attachment cannot
+    // stand through: the reservation would be attached to an instance that cannot
+    // serve on it. `DetachStaticIp` is what releases it, so the change is refused
+    // rather than silently dropping an address the account holds.
+    if !wants_ipv4 {
+        if let Some(static_ip) = store.attached_static_ip(name) {
+            return Err(operation_failure(format!(
+                "The static IP {} is attached to the instance {name}: a static IP is a \
+                 public IPv4 address, so it must be detached before the instance's IP \
+                 address type is set to {ip_address_type}.",
+                static_ip.name
+            )));
+        }
+    }
+
+    // ONE draw per change, and only when the new address type gives the instance
+    // an address family it does not hold yet — an address it already has is kept,
+    // so nothing is redrawn for a family that is merely retained.
+    let drawn = ((wants_ipv4 && !holds_public_ipv4) || (wants_ipv6 && !holds_ipv6))
+        .then(|| store.fresh_addresses(ip_address_type));
+    let (private_ip_address, public_ip_address, ipv6_addresses) = drawn.unwrap_or_default();
+    let Some(instance) = store.instance_mut(name) else {
+        // Unreachable: the instance was read above under this same lock.
+        return Err(not_found(crate::state::RESOURCE_TYPE_INSTANCE, name));
+    };
+    instance.ip_address_type = ip_address_type.to_string();
+    if wants_ipv4 {
+        if instance.private_ip_address.is_none() {
+            instance.private_ip_address = private_ip_address;
+        }
+        if instance.public_ip_address.is_none() {
+            instance.public_ip_address = public_ip_address;
+        }
+    } else {
+        // An IPv6-only instance holds no IPv4 address, in the Region's VPC or
+        // on the internet, so both are given up.
+        instance.private_ip_address = None;
+        instance.public_ip_address = None;
+    }
+    if wants_ipv6 {
+        if instance.ipv6_addresses.is_empty() {
+            instance.ipv6_addresses = ipv6_addresses;
+        }
+    } else {
+        instance.ipv6_addresses.clear();
+    }
+
+    // The record already reports the new address type, and the entry is left
+    // non-terminal until the clock owes the re-provisioning its terminal status
+    // — the same span every other change to a Lightsail resource is answered
+    // with, so a caller reading straight after this call still sees the work in
+    // flight.
+    Ok(store
+        .start_operation(
+            now,
+            crate::state::OPERATION_TYPE_SET_IP_ADDRESS_TYPE,
+            crate::state::RESOURCE_TYPE_INSTANCE,
+            name,
+            &location,
+            Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+        )
+        .view())
+}
+
+/// Set the IP address type of the load balancer `name` in `region`, answering the
+/// operation-log entry the change appended.
+///
+/// A load balancer's addresses are not members of the record — it is reached
+/// through the `dnsName` it was published under, which does not change — so the
+/// address type is the whole change, and `GetLoadBalancer` reports it from here
+/// on.
+fn set_load_balancer_ip_address_type(
+    store: &mut crate::state::ComAmazonawsLightsailLightsail20161128State,
+    region: &str,
+    name: &str,
+    ip_address_type: &str,
+    now: i64,
+) -> Result<Operation, SetIpAddressTypeError> {
+    let balancer = store
+        .load_balancer_mut(region, name)
+        .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_LOAD_BALANCER, name))?;
+    balancer.ip_address_type = ip_address_type.to_string();
+    let location = balancer.location.clone();
+    Ok(store
+        .start_operation(
+            now,
+            crate::state::OPERATION_TYPE_SET_IP_ADDRESS_TYPE,
+            crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+            name,
+            &location,
+            Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+        )
+        .view())
+}
+
+/// Set the distribution `name`'s IP address type, answering the operation-log
+/// entry the change appended.
+///
+/// Changing which addresses a distribution serves on IS a configuration change,
+/// so the distribution is `InProgress` again until the clock owes it the
+/// deployment — exactly as `AttachCertificateToDistribution` leaves it. This
+/// rollout replaces any the distribution was still owed: a configuration change
+/// starts the deployment again, so the instant it settles is the one THIS change
+/// is owed.
+fn set_distribution_ip_address_type(
+    store: &mut crate::state::ComAmazonawsLightsailLightsail20161128State,
+    name: &str,
+    ip_address_type: &str,
+    now: i64,
+) -> Result<Operation, SetIpAddressTypeError> {
+    let due = crate::state::DueNamedState::after(now, crate::state::DISTRIBUTION_STATUS_DEPLOYED);
+    let distribution = store
+        .distribution_mut(name)
+        .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISTRIBUTION, name))?;
+    distribution.ip_address_type = ip_address_type.to_string();
+    distribution.status = crate::state::DISTRIBUTION_STATUS_IN_PROGRESS;
+    distribution.due = Some(due);
+    let location = distribution.location.clone();
+    Ok(store
+        .start_operation(
+            now,
+            crate::state::OPERATION_TYPE_SET_IP_ADDRESS_TYPE,
+            crate::state::RESOURCE_TYPE_DISTRIBUTION,
+            name,
+            &location,
+            Some(due.at_ms),
+        )
+        .view())
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message names the
+/// member that is wrong and the rule it broke.
+fn invalid(message: String) -> SetIpAddressTypeError {
+    SetIpAddressTypeErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way.
+fn operation_failure(message: String) -> SetIpAddressTypeError {
+    SetIpAddressTypeErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(resource_type: &str, name: &str) -> SetIpAddressTypeError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> SetIpAddressTypeError {
+    SetIpAddressTypeErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

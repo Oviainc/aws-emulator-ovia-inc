@@ -3,7 +3,11 @@
 //! @op UntagResource
 //! IMPLEMENTED: removes the named tag keys from the pipe the `resourceArn` names. A key the
 //! pipe does not carry is a no-op, so a repeated call is idempotent; an ARN no stored pipe
-//! carries is `NotFoundException` (404). This is the ONLY file to touch for this operation.
+//! carries is `NotFoundException` (404) carrying the tagging layer's constant sentence, and
+//! a key outside `TagKey`'s published bound is the `BadRequestException` (400) that layer
+//! answers a broken tag rule with — raised by the boundary validator, which walks a list's
+//! elements, and worded in `crate::service`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,9 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
-                crate::state::pipe_name_in_arn(&input.resource_arn),
-            ))
+            UntagResourceErrorModeled::NotFoundException(crate::state::resource_not_found())
         })?;
 
         // Removing a key the pipe does not carry removes nothing and fails nothing, so the

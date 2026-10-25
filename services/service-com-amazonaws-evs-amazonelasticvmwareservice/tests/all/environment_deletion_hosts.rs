@@ -17,11 +17,12 @@
 //! hosts an environment holds, the `HostState` each one is in, and the way a host stops
 //! occupying the environment (its record reaching `DELETED`, or the record being gone).
 //!
-//! `DeleteEnvironmentHost` — the action the doc names — is still an unimplemented 501
-//! stub (`issues/things-that-do-not-work/20261024T000435Z-evs-deleteenvironmenthost-stub.md`
-//! owns it), so a test cannot remove a host over the wire yet. The host records are
-//! therefore moved through the store this service's own handlers read and write, the
-//! way [`crate::environment_lifecycle::register_network`] seeds the Amazon EC2 store;
+//! `DeleteEnvironmentHost` — the action the doc names — removes a host over the wire,
+//! but only through the `DELETING`/`DELETED` states a deletion goes through
+//! (`tests/all/host_deletion.rs` owns that rule). The other `HostState` values the model
+//! declares are reached by nothing a client can call, so the host records are moved
+//! through the store this service's own handlers read and write, the way
+//! [`crate::environment_lifecycle::register_network`] seeds the Amazon EC2 store;
 //! everything else here is driven as a client drives it.
 
 use std::time::Duration;

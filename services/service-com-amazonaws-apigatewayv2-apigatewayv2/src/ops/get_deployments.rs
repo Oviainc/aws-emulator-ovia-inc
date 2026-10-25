@@ -174,8 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let (page, next_token) =
-            crate::state::page(&api.deployments, input.next_token.as_deref(), max_results);
+        let (page, next_token) = crate::state::page(
+            &api.deployments,
+            &crate::state::page_scope(&["apis", &input.api_id, "deployments"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetDeploymentsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
 
         Ok(GetDeploymentsOutput {
             // The list the api holds, reported whether or not it is empty: an api with

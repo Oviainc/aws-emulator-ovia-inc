@@ -15,6 +15,11 @@
 //! The tables below span that class — histories differing in how many versions they hold,
 //! which position in the history the delete targets, how the document differs between
 //! versions and whether a version carries a description.
+//!
+//! The history helpers below (`core_network_with_policy`, `append_versions`, `get_policy`,
+//! `policy_uri` and the documents they build) are shared with the suite that pins which
+//! version a read addresses (`crate::get_core_network_policy_selection`), so a history is
+//! built in one place.
 
 use serde_json::{json, Value};
 
@@ -45,7 +50,7 @@ fn policy_document(segments: &[&str], locations: &[&str]) -> String {
 
 /// The document the version `version_id` of a test history carries: one segment naming
 /// the version, so a read that answers the wrong version is visible in the document.
-fn document_of_version(version_id: i32) -> String {
+pub(crate) fn document_of_version(version_id: i32) -> String {
     policy_document(
         &[&format!("segment-v{version_id}")],
         &["us-west-2", "eu-west-1"],
@@ -54,13 +59,17 @@ fn document_of_version(version_id: i32) -> String {
 
 /// The policy of a `GetCoreNetworkPolicy` / `PutCoreNetworkPolicy` /
 /// `DeleteCoreNetworkPolicyVersion` response.
-fn policy(body: &Value) -> &Value {
+pub(crate) fn policy(body: &Value) -> &Value {
     &body["CoreNetworkPolicy"]
 }
 
 /// Create a global network and a core network inside it carrying `document`, answering the
 /// minted `CoreNetworkId`.
-async fn core_network_with_policy(emulator: &Emulator, case: &str, document: &str) -> String {
+pub(crate) async fn core_network_with_policy(
+    emulator: &Emulator,
+    case: &str,
+    document: &str,
+) -> String {
     let global_network_id = emulator.create_global_network(case).await;
     let (status, body) = emulator
         .post(
@@ -92,10 +101,22 @@ async fn put_policy(emulator: &Emulator, core_network_id: &str, body: Value) -> 
         .await
 }
 
+/// The URI a read of `core_network_id`'s policy with the query string `query` (empty for
+/// none) is addressed to.
+///
+/// Shared with `crate::get_core_network_policy_selection`, which addresses the same URI for
+/// the rows that assert a refusal, so the route template is spelled in one place.
+pub(crate) fn policy_uri(core_network_id: &str, query: &str) -> String {
+    format!("/core-networks/{core_network_id}/core-network-policy{query}")
+}
+
 /// `GetCoreNetworkPolicy` with the query string `query` (empty for none).
-async fn get_policy(emulator: &Emulator, core_network_id: &str, query: &str) -> (u16, Value) {
-    let uri = format!("/core-networks/{core_network_id}/core-network-policy{query}");
-    emulator.get(&uri).await
+pub(crate) async fn get_policy(
+    emulator: &Emulator,
+    core_network_id: &str,
+    query: &str,
+) -> (u16, Value) {
+    emulator.get(&policy_uri(core_network_id, query)).await
 }
 
 /// `DeleteCoreNetworkPolicyVersion` of `version_id`.
@@ -113,7 +134,7 @@ async fn delete_version(
 
 /// Append `count` versions to `core_network_id`, each with the document and description of
 /// its own version id, answering the version ids in the order they were minted.
-async fn append_versions(
+pub(crate) async fn append_versions(
     emulator: &Emulator,
     case: &str,
     core_network_id: &str,

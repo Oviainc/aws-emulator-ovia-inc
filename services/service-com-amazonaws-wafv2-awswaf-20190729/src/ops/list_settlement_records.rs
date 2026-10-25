@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSettlementRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSettlementRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The individual settlement transactions of ONE scope over ONE time window:
+//! "each record represents a single payment transaction between a client and your
+//! protected resource". The answer is a selection over the scope's monetization
+//! ledger ([`crate::state::SettlementRecordEntry`]) — the transactions that fall
+//! inside the window and satisfy every filter the request applied, ordered by the
+//! field `SortBy` names in the direction `SortOrder` names, cut into pages of at
+//! most `Limit` records.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSettlementRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A transaction is recorded when a rule's `Monetize` action settles a payment for
+//! a request a web ACL evaluated — WAF's DATA plane. This emulator serves the
+//! WAFv2 control plane only, so no operation writes that ledger and a window
+//! reports no transaction, which is the answer AWS gives for a window that settled
+//! none.
+//!
+//! "This operation is only available for CLOUDFRONT scope", so a request naming the
+//! regional namespace is refused as the parameter failure it is, and "the maximum
+//! supported time window is 90 days", so a wider window is refused too.
+//!
+//! The call REPORTS: it reads the ledger and changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +182,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSettlementRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSettlementRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A read: `ctx` carries only request metadata, which this operation does not
+        // need, and nothing here writes to the store.
+        let _ = ctx;
+
+        // The request's own members first, so a bad one is refused whatever the
+        // ledger holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSettlementRecords"))
+        // An enum member's membership is refused at the request boundary, which
+        // words the member's own constraint; these are the handler's own guards, so
+        // a value that ever reaches one unchecked is reported as WAF's
+        // invalid-parameter refusal rather than silently selecting nothing.
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(invalid_parameter(
+                crate::state::FIELD_SCOPE_VALUE,
+                &input.scope,
+                "the scope names the namespace the transactions were settled in, and is \
+                 one of CLOUDFRONT or REGIONAL",
+            ));
+        }
+        // "This operation is only available for CLOUDFRONT scope": the regional
+        // namespace settles no payment, so the scope it names is a value this
+        // operation does not accept, not an empty answer.
+        if input.scope != crate::state::SCOPE_CLOUDFRONT {
+            return Err(invalid_parameter(
+                crate::state::FIELD_SCOPE_VALUE,
+                &input.scope,
+                "settlement records are available only for the CLOUDFRONT scope",
+            ));
+        }
+        if !crate::state::is_known_currency(&input.currency) {
+            return Err(invalid_parameter_without_field(
+                &input.currency,
+                "the currency names the denomination of the amounts in the response",
+            ));
+        }
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SETTLEMENT_SORT_BY);
+        if !SETTLEMENT_SORT_BY_VALUES.contains(&sort_by) {
+            return Err(invalid_parameter_without_field(
+                sort_by,
+                "a settlement listing sorts by one of TIMESTAMP, AMOUNT, NAME or STATUS",
+            ));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SETTLEMENT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(invalid_parameter_without_field(
+                sort_order,
+                "a listing sorts in one of ASC or DESC order",
+            ));
+        }
+        let filters = input.filters.as_deref().unwrap_or_default();
+        crate::state::validate_monetization_filters(filters)
+            .map_err(ListSettlementRecordsErrorModeled::WAFInvalidParameterException)?;
+        let window = crate::state::monetization_window(&input.time_window)
+            .map_err(ListSettlementRecordsErrorModeled::WAFInvalidParameterException)?;
+        // Absent `Limit`, a page holds as many as the model's limit range allows; a
+        // `Limit` outside it is refused rather than clamped — at the boundary, by
+        // the member's own modelled range, and here through the one reading of that
+        // range every paginated operation of this service shares.
+        let page_size = crate::state::page_size(input.limit, "settlement records")
+            .map_err(ListSettlementRecordsErrorModeled::WAFInvalidParameterException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSettlementRecordsErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Every transaction of this scope's ledger that the window contains and the
+        // filters select, carried with its position in the ledger: the position is
+        // what a marker names and what breaks a tie between two transactions the
+        // sort cannot separate, so one query always answers one order and the
+        // descending order is exactly the ascending one reversed.
+        let mut selected: Vec<(usize, &crate::state::SettlementRecordEntry)> = state
+            .settlement_records(&input.scope)
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                window.contains(&crate::state::date_time_millis(&entry.record.timestamp))
+                    && crate::state::monetization_filters_select(entry, filters)
+            })
+            .collect();
+        let descending = sort_order == crate::state::SORT_ORDER_DESC;
+        selected.sort_by(|(left_position, left), (right_position, right)| {
+            let ordering = compare_by(sort_by, &left.record, &right.record)
+                .then_with(|| left_position.cmp(right_position));
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // A `NextMarker` is "the marker from the prior call": the cursor of the last
+        // record of the page before this one, so this page resumes at the record
+        // after it. A marker naming no transaction of this selection names no
+        // position to resume from.
+        if let Some(marker) = input.next_marker.as_deref() {
+            match selected
+                .iter()
+                .position(|(position, _)| cursor(*position) == marker)
+            {
+                Some(index) => {
+                    selected.drain(..=index);
+                }
+                None => selected.clear(),
+            }
+        }
+        // `NextMarker` "indicates that additional results are available", so a page
+        // that ends the selection carries none, which is what ends a paginator's
+        // loop.
+        let truncated = selected.len() > page_size;
+        selected.truncate(page_size);
+        let next_marker = truncated
+            .then(|| selected.last().map(|(position, _)| cursor(*position)))
+            .flatten();
+
+        // `Currency` is "the currency for the amounts in the response", which is the
+        // denomination the request asked for, so every reported record carries it.
+        let settlements = selected
+            .into_iter()
+            .map(|(_, entry)| SettlementRecord {
+                currency: Some(input.currency.clone()),
+                ..entry.record.clone()
+            })
+            .collect();
+
+        Ok(ListSettlementRecordsOutput {
+            settlements: Some(settlements),
+            next_marker,
+        })
     }
+}
+
+/// The modelled `WAFInvalidParameterException` for a parameter the enum
+/// `ParameterExceptionField` names a settings group for, lifted into this
+/// operation's error channel.
+fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> ListSettlementRecordsError {
+    ListSettlementRecordsErrorModeled::WAFInvalidParameterException(
+        crate::state::invalid_parameter_exception(field, parameter, reason),
+    )
+    .into()
+}
+
+/// [`invalid_parameter`] for a parameter that enum names no settings group for.
+fn invalid_parameter_without_field(parameter: &str, reason: &str) -> ListSettlementRecordsError {
+    ListSettlementRecordsErrorModeled::WAFInvalidParameterException(
+        crate::state::invalid_parameter_exception_without_field(parameter, reason),
+    )
+    .into()
+}
+
+/// The cursor naming the transaction at `position` in the scope's ledger: the form
+/// every `NextMarker` of this service takes.
+fn cursor(position: usize) -> String {
+    crate::state::listing_cursor(u64::try_from(position).unwrap_or(u64::MAX))
+}
+
+/// Compare two transactions by the field `sort_by` names, ascending.
+///
+/// `SortBy` is "the field to sort settlement records by: TIMESTAMP, AMOUNT, NAME,
+/// or STATUS" — the settlement instant, the amount that was paid, the name of the
+/// source that paid it and the settlement's status. `Amount` is a string in the
+/// model (`MonetizationAmountValue`), and an amount is a quantity, so it is
+/// compared as the number it spells; a value that spells none compares as zero.
+/// The model ranks no status above another, so statuses compare by their own
+/// value. A record missing the field compares as the empty string, which puts it
+/// at one end of the order rather than in an arbitrary place.
+fn compare_by(
+    sort_by: &str,
+    left: &SettlementRecord,
+    right: &SettlementRecord,
+) -> ::std::cmp::Ordering {
+    match sort_by {
+        "AMOUNT" => amount(left).total_cmp(&amount(right)),
+        "NAME" => left
+            .source_name
+            .as_deref()
+            .unwrap_or_default()
+            .cmp(right.source_name.as_deref().unwrap_or_default()),
+        "STATUS" => left.status.cmp(&right.status),
+        // `TIMESTAMP`, the default: the window is a range over this member, so it
+        // is the one every other sort falls back to.
+        _ => crate::state::date_time_millis(&left.timestamp)
+            .cmp(&crate::state::date_time_millis(&right.timestamp)),
+    }
+}
+
+/// The quantity a record's `Amount` spells. See [`compare_by`].
+fn amount(record: &SettlementRecord) -> f64 {
+    record.amount.trim().parse::<f64>().unwrap_or(0.0)
 }

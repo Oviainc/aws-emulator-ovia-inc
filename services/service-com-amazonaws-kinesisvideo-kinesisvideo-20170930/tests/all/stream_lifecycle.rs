@@ -232,8 +232,9 @@ async fn a_stream_is_created_read_listed_endpointed_and_deleted() {
         .expect("ListStreams returns StreamInfoList");
     assert_eq!(listed, &vec![info.clone()], "ListStreams: {body:?}");
     assert!(
-        body.get("NextToken").is_none(),
-        "the last page carries no NextToken: {body:?}"
+        body.get("NextToken")
+            .is_some_and(serde_json::Value::is_null),
+        "the last page carries the NextToken member as null: {body:?}"
     );
 
     let (status, body) = call(
@@ -804,10 +805,13 @@ async fn list_streams_applies_stream_name_condition_server_side() {
             expected.len().min(1),
             "case {case:?} with MaxResults=1: got {body:?}"
         );
+        // A resume token is minted only while matches remain; on the last page the
+        // member still reaches the wire, as JSON `null`.
         assert_eq!(
-            body.get("NextToken").is_some(),
+            body.get("NextToken")
+                .is_some_and(|token| !token.is_null()),
             expected.len() > 1,
-            "case {case:?}: NextToken is emitted only while matches remain, got {body:?}"
+            "case {case:?}: NextToken carries a token only while matches remain, got {body:?}"
         );
     }
 
