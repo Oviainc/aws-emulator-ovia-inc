@@ -162,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there are no recorded events to read.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -176,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call then reports.
         store.settle(::std::time::SystemTime::now());
 
-        let stack = store.resolve(&input.stack_name).ok_or_else(|| {
+        // A stack name or id names a stack only in the Region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
                 &input.stack_name,
             ))

@@ -19,6 +19,8 @@ mod client_rejections;
 mod client_token_store;
 #[path = "all/custom_detection_rule_association_listing.rs"]
 mod custom_detection_rule_association_listing;
+#[path = "all/custom_detection_rule_org_configuration_listing.rs"]
+mod custom_detection_rule_org_configuration_listing;
 #[path = "all/custom_detection_rule_org_configuration_update.rs"]
 mod custom_detection_rule_org_configuration_update;
 #[path = "all/custom_detection_rules.rs"]

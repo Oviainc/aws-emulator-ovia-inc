@@ -28,8 +28,8 @@
 //! `WAFNonexistentItemException` and `UpdateIPSet` `WAFNonexistentContainerException` for
 //! that id — an update that re-declares an IPSet unchanged keeps the id that service
 //! minted rather than creating a second IPSet, and an IPSet AWS WAF Classic REFUSES to
-//! configure leaves the stack `CREATE_FAILED` naming the resource, with nothing left
-//! behind in that service.
+//! configure rolls the stack back to `ROLLBACK_COMPLETE` with the reason naming the
+//! resource, and nothing left behind in that service.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -768,9 +768,9 @@ async fn an_ip_set_waf_regional_refuses_to_configure_fails_the_stack() {
         let body = create_and_settle(&router, case, stack_name, &template).await;
         assert_eq!(
             opt_element(&body, "StackStatus").as_deref(),
-            Some("CREATE_FAILED"),
-            "case {case:?}: expected the stack to fail rather than publish an IPSet that is \
-             not the one declared, got {body}"
+            Some("ROLLBACK_COMPLETE"),
+            "case {case:?}: expected the failed create to be rolled back rather than \
+             publish an IPSet that is not the one declared, got {body}"
         );
         let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
         assert!(
