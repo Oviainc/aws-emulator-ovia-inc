@@ -1072,13 +1072,25 @@ fn output_states_a_container(output: &Output) -> bool {
         .preset
         .as_deref()
         .is_some_and(|preset| !preset.trim().is_empty());
-    let container = output.container_settings.as_ref().is_some_and(|settings| {
+    preset || container_settings_name_a_container(output.container_settings.as_ref())
+}
+
+/// Whether a `ContainerSettings` names the container its output is written in.
+///
+/// `ContainerSettings$Container` is "Container for this output", and it is the ONE member
+/// of that structure which says what the output is: every other member only configures a
+/// container already named. Absent container settings, and container settings that carry no
+/// `Container`, therefore name no container, and neither does a blank value. The single
+/// test both graphs that carry container settings go through — an output inside a job's
+/// `OutputGroups` and the settings of a preset — so the two cannot disagree about what
+/// names a container.
+fn container_settings_name_a_container(settings: Option<&ContainerSettings>) -> bool {
+    settings.is_some_and(|settings| {
         settings
             .container
             .as_deref()
             .is_some_and(|container| !container.trim().is_empty())
-    });
-    preset || container
+    })
 }
 
 /// What is missing from the settings a submitted job will be run from, or `None` when they
@@ -1167,6 +1179,51 @@ pub fn job_template_settings_problem(
     }
     output_groups_problem(settings.output_groups.as_deref().unwrap_or_default())
         .map(JobTemplateSettingsProblem::Outputs)
+}
+
+/// Why a `PresetSettings` graph is not the encoder settings of an output.
+///
+/// `PresetSettings` is "Settings for preset", and a preset is the encoder-settings graph of
+/// ONE output: `ContainerSettings$Container` ("Container for this output") is what says what
+/// that output is, so a graph that names no container describes no output, exactly as an
+/// output inside a job's `OutputGroups` that states neither container nor preset does
+/// ([`SettingsProblem::NoContainer`]). Its other members — `VideoDescription`,
+/// `AudioDescriptions`, `CaptionDescriptions` — configure the tracks written INTO that
+/// container ("include one instance of VideoDescription per output"), so none of them can
+/// stand in for it. A request stating such a graph is the modelled `BadRequestException`
+/// (400) rather than a stored preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetSettingsProblem {
+    /// The graph names no container, so it describes no output.
+    NoContainer,
+}
+
+impl PresetSettingsProblem {
+    /// The refusal's wording: the settings member that must carry a value and what it
+    /// describes, built from the request's own members as every member-naming refusal in
+    /// this crate is (see [`not_found_message`]).
+    pub fn message(self) -> String {
+        match self {
+            Self::NoContainer => format!(
+                "{} Your settings must specify ContainerSettings.Container: a preset \
+                 states the container the output it describes is written in.",
+                invalid_value_sentence("settings")
+            ),
+        }
+    }
+}
+
+/// What is wrong with the settings graph a request asks this service to SAVE in a preset,
+/// or `None` when the graph describes an output.
+///
+/// Every door into a stored preset takes this test — creating one and updating one — so a
+/// preset cannot be stored, or left, in a state that describes no output.
+pub fn preset_settings_problem(settings: &PresetSettings) -> Option<PresetSettingsProblem> {
+    if container_settings_name_a_container(settings.container_settings.as_ref()) {
+        None
+    } else {
+        Some(PresetSettingsProblem::NoContainer)
+    }
 }
 
 /// The resource-type prefixes a MediaConvert resource ARN can carry.

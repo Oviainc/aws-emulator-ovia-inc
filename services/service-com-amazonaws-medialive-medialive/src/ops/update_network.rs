@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNetwork
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNetwork`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNetwork::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNetwork` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNetworkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNetwork"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // The two CIDR lists are validated BEFORE anything is written, by the
+        // rules `CreateNetwork` holds the same two lists to, so an update cannot
+        // store a pool or a route a create could not — and a refused request
+        // leaves the stored network exactly as it was rather than applying a
+        // prefix of its lists. Each list is validated only when the request
+        // carried it: "Include this parameter only if you want to change …".
+        let ip_pools = input
+            .ip_pools
+            .map(|pools| crate::state::network_ip_pools(pools.into_iter().map(|pool| pool.cidr)))
+            .transpose()
+            .map_err(bad_request)?;
+        let routes = input
+            .routes
+            .map(|routes| {
+                crate::state::network_routes(
+                    routes.into_iter().map(|route| (route.cidr, route.gateway)),
+                )
+            })
+            .transpose()
+            .map_err(bad_request)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only what the clock had already made due — an earlier
+        // create's `CREATING` -> `ACTIVE` step and an accepted delete's
+        // `DELETING` -> `DELETED` one among them — so the resolution below sees
+        // the store a reader would.
+        state.settle(now);
+
+        let changes = crate::state::NetworkChanges {
+            name: input.name,
+            ip_pools,
+            routes,
+        };
+        // The slice checks every refusal BEFORE the first write, so a refused
+        // update leaves the stored network exactly as it was.
+        state
+            .apply_network_changes(&input.network_id, changes, now)
+            .map_err(|refusal| refused(refusal, &input.network_id))?;
+
+        // Read back out of the store, so the response reports what was written
+        // rather than what the request asked for: `Id`, `Arn`, the derived
+        // `AssociatedClusterIds` and the `State` the lifecycle owns are all the
+        // store's, and so is every member this request did not carry.
+        let network = state
+            .network_description(&input.network_id)
+            .ok_or_else(|| unreportable(&input.network_id))?;
+        Ok(crate::state::network_description_output!(
+            UpdateNetworkOutput,
+            network
+        ))
     }
+}
+
+/// Refuse a request whose `IpPools` or `Routes` are not valid, with the
+/// operation's own modelled client error (HTTP 400) — the wording the create
+/// refuses the same list with.
+fn bad_request(message: String) -> UpdateNetworkError {
+    UpdateNetworkErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled error a [`crate::state::NetworkUpdateRefusal`] is answered with.
+///
+/// This operation models NO 404
+/// (`smithy_query(query="operation", operation="UpdateNetwork")`), so a
+/// `NetworkId` the store holds no live network for is a request that cannot be
+/// processed at all: the modelled 400 `BadRequestException`, worded by the shared
+/// helpers every operation of this service uses and carrying the id that was
+/// asked for — the same answer `UpdateCluster`, which models no 404 either, gives
+/// for a `ClusterId` naming nothing. An id whose delete has been accepted is that
+/// same refusal with the message that tells the two apart: the record stays
+/// readable, but it is no longer a network a caller may change. A `Name` another
+/// live network of the account holds is a clash with the stored state, which is
+/// what this operation's `ConflictException` (409) is for, worded exactly as the
+/// other renames of this service word the same clash.
+fn refused(refusal: crate::state::NetworkUpdateRefusal, network_id: &str) -> UpdateNetworkError {
+    use crate::state::NetworkUpdateRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchNetwork => {
+            UpdateNetworkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message("Network", network_id)),
+            })
+        }
+        Refusal::AlreadyDeleted => {
+            UpdateNetworkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::already_deleted_message(&format!(
+                    "Network {network_id}"
+                ))),
+            })
+        }
+        Refusal::NameTaken => UpdateNetworkErrorModeled::ConflictException(ConflictException {
+            message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+        }),
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the network in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateNetworkError {
+    UpdateNetworkErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
+}
+
+/// The network the write above accepted could not be read back out of the store,
+/// which the store's own invariant makes unreachable: the write resolved that id
+/// under the same lock this read holds. A modelled server error of its own rather
+/// than the "no store" one, so the two cannot be mistaken for each other in a log.
+fn unreportable(network_id: &str) -> UpdateNetworkError {
+    UpdateNetworkErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(format!(
+            "Network {network_id} could not be read back after the update"
+        )),
+    })
+    .into()
 }

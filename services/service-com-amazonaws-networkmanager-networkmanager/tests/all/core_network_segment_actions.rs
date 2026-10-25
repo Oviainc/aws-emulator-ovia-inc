@@ -391,19 +391,29 @@ async fn core_network_segment_actions_are_reported_from_the_live_policy() {
 /// the counts of the things such a list may name, so a longer list can only repeat names.
 const MAX_NAMES_PER_ENTRY: usize = 100;
 
+/// How many prefixes one `create-route` entry may declare, and how many destinations it may
+/// name, before the document is refused: the caps `state::MAX_POLICY_ROUTE_PREFIXES` /
+/// `MAX_POLICY_ROUTE_DESTINATIONS` fix, which are what bound the routes one segment holds
+/// and so the listing of its routing information.
+const MAX_ROUTE_PREFIXES_PER_ENTRY: usize = 50;
+/// See [`MAX_ROUTE_PREFIXES_PER_ENTRY`].
+const MAX_ROUTE_DESTINATIONS_PER_ENTRY: usize = 10;
+
 /// `count` segment names, so a `segment-actions` entry can be given a list of a chosen
 /// length.
 fn names(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("name-{index}")).collect()
 }
 
-/// One row of the name-list cap table: how an over-long entry is spelled, and the path a
-/// refusal names.
+/// One row of the name-list cap table: how an over-long entry is spelled, the bound its
+/// list is capped at, and the path a refusal names.
 struct NameListCase {
     /// Names the case in every assertion message.
     name: &'static str,
     /// The `segment-actions` entry carrying `count` names.
     entry: fn(usize) -> Value,
+    /// How many entries that list may carry before the document is refused.
+    bound: usize,
     /// The `Path` the refusal of an over-long list carries.
     path: &'static str,
 }
@@ -423,6 +433,7 @@ async fn a_segment_action_name_list_is_capped_at_its_bound() {
                 })
             },
             path: "$.segment-actions[0].share-with",
+            bound: MAX_NAMES_PER_ENTRY,
         },
         NameListCase {
             name: "share-with except",
@@ -435,6 +446,7 @@ async fn a_segment_action_name_list_is_capped_at_its_bound() {
                 })
             },
             path: "$.segment-actions[0].share-with.except",
+            bound: MAX_NAMES_PER_ENTRY,
         },
         NameListCase {
             name: "via network-function-groups",
@@ -446,11 +458,44 @@ async fn a_segment_action_name_list_is_capped_at_its_bound() {
                 })
             },
             path: "$.segment-actions[0].via.network-function-groups",
+            bound: MAX_NAMES_PER_ENTRY,
+        },
+        NameListCase {
+            name: "create-route destination-cidr-blocks",
+            entry: |count| {
+                json!({
+                    "action": "create-route",
+                    "segment": "alpha",
+                    "destination-cidr-blocks": names(count),
+                    "destinations": ["blackhole"],
+                })
+            },
+            path: "$.segment-actions[0].destination-cidr-blocks",
+            bound: MAX_ROUTE_PREFIXES_PER_ENTRY,
+        },
+        NameListCase {
+            name: "create-route destinations",
+            entry: |count| {
+                json!({
+                    "action": "create-route",
+                    "segment": "alpha",
+                    "destination-cidr-blocks": ["10.0.0.0/16"],
+                    "destinations": names(count),
+                })
+            },
+            path: "$.segment-actions[0].destinations",
+            bound: MAX_ROUTE_DESTINATIONS_PER_ENTRY,
         },
     ];
 
-    for NameListCase { name: case, entry, path } in rows {
-        let at_bound = document(&["alpha"], &["inspection"], json!([entry(MAX_NAMES_PER_ENTRY)]));
+    for NameListCase {
+        name: case,
+        entry,
+        bound,
+        path,
+    } in rows
+    {
+        let at_bound = document(&["alpha"], &["inspection"], json!([entry(bound)]));
         let network_id = emulator.create_global_network(case).await;
         let (status, accepted) = create_core_network(
             &emulator,
@@ -459,14 +504,10 @@ async fn a_segment_action_name_list_is_capped_at_its_bound() {
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: {MAX_NAMES_PER_ENTRY} names is at the bound and accepted, got {status} with {accepted}"
+            "case {case:?}: {bound} entries is at the bound and accepted, got {status} with {accepted}"
         );
 
-        let over = document(
-            &["alpha"],
-            &["inspection"],
-            json!([entry(MAX_NAMES_PER_ENTRY + 1)]),
-        );
+        let over = document(&["alpha"], &["inspection"], json!([entry(bound + 1)]));
         let over_id = emulator.create_global_network("over the bound").await;
         let (status, refused) = create_core_network(
             &emulator,

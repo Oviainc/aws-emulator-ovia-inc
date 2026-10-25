@@ -13,8 +13,10 @@
 //! The tables below span what that rule generalises over: WHICH listing (both of them,
 //! each against its own quota), how many records are stored (none, one, several, both
 //! sides of the quota's upper end, and the quota itself — including the counts a page
-//! boundary would have fallen on), and the length of the stored ids. The recorded
-//! twelve-configuration case is one row.
+//! boundary would have fallen on), the history that left the store at that count
+//! (registrations, deletions and re-registrations, so each count is reached from below
+//! and from above), and the length of the stored ids. The recorded twelve-configuration
+//! case is one row.
 //!
 //! Every assertion goes over the wire through the same router the production emulator
 //! mounts, reusing the harness in [`crate::slack_channel_configurations`], so a reply
@@ -146,6 +148,124 @@ async fn the_workspace_listing_reports_every_registered_workspace_without_a_toke
              {:?}",
             reported_team_ids(&records)
         );
+    }
+}
+
+/// One step of a registry history: what the account is asked to do next, naming a
+/// workspace by its index in [`crate::slack_workspace_configurations::team_ids`].
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Register(usize),
+    Delete(usize),
+}
+
+#[tokio::test]
+async fn the_workspace_listing_reports_the_whole_registry_after_every_change() {
+    use Step::{Delete, Register};
+
+    // The rule is an invariant: whatever the registry holds at this instant is what the
+    // listing reports, whole and with no token. The rows below are histories that take
+    // the registry up to the documented quota and back down again, so the invariant is
+    // asserted at every count in BOTH directions — including the counts a page bounded
+    // below the quota would have split — and after a deletion, a re-registration and a
+    // registration of a workspace the account already holds, which a table that only
+    // ever registers distinct workspaces never reaches.
+    let ids = crate::slack_workspace_configurations::team_ids();
+    let fill: Vec<Step> = (0..ids.len()).map(Register).collect();
+    let drain: Vec<Step> = (0..ids.len()).map(Delete).collect();
+    let histories: [(&str, Vec<Step>); 5] = [
+        ("fills the registry", fill.clone()),
+        (
+            "fills the registry, then empties it",
+            fill.into_iter().chain(drain).collect(),
+        ),
+        (
+            "grows past a deletion",
+            vec![
+                Register(0),
+                Register(1),
+                Register(2),
+                Delete(1),
+                Register(3),
+                Register(4),
+                Delete(0),
+            ],
+        ),
+        (
+            "re-registers what it deleted",
+            vec![Register(2), Register(4), Delete(2), Register(2), Register(0)],
+        ),
+        (
+            // Registering a workspace the account already holds changes nothing, so the
+            // repeated registration leaves the registry — and therefore the listing —
+            // exactly as it was.
+            "registers a workspace it already holds",
+            vec![
+                Register(1),
+                Register(1),
+                Register(3),
+                Register(1),
+                Register(3),
+                Delete(1),
+                Register(3),
+            ],
+        ),
+    ];
+
+    for (label, history) in histories {
+        let emulator = Emulator::new();
+        // The registry this history has built so far, which is what every listing below
+        // must report.
+        let mut registry: Vec<String> = Vec::new();
+
+        for (position, step) in history.iter().enumerate() {
+            let case = format!("{label:?} step {position} {step:?}");
+            match *step {
+                Register(index) => {
+                    let registered = emulator.register_workspace(&ids[index]).await;
+                    assert_eq!(
+                        registered.status, 200,
+                        "case {case}: expected the registration to answer HTTP 200, got {} / {}",
+                        registered.status, registered.body
+                    );
+                    if !registry.contains(&ids[index]) {
+                        registry.push(ids[index].clone());
+                    }
+                }
+                Delete(index) => {
+                    let deleted = emulator.delete_workspace(&ids[index]).await;
+                    assert_eq!(
+                        deleted.status, 200,
+                        "case {case}: expected the deletion to answer HTTP 200, got {} / {}",
+                        deleted.status, deleted.body
+                    );
+                    registry.retain(|team_id| team_id != &ids[index]);
+                }
+            }
+            // The store is keyed by `teamId`, so the listing walks it in that order
+            // whatever order the registrations arrived in.
+            registry.sort();
+
+            let reply = list_workspaces(&emulator, None).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case}: expected HTTP 200, got {} / {}",
+                reply.status, reply.body
+            );
+            assert!(
+                reply.string("nextToken").is_none(),
+                "case {case}: expected no nextToken on a registry the workspace quota \
+                 bounds, got {}",
+                reply.body
+            );
+            let reported_ids = reported_team_ids(&reported(&reply));
+            assert_eq!(
+                reported_ids, registry,
+                "case {case}: expected the whole registry of {} workspaces in the one \
+                 response, got {reported_ids:?}",
+                registry.len()
+            );
+        }
     }
 }
 

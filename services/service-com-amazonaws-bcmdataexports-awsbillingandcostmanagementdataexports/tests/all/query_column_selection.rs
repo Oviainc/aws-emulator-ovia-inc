@@ -51,7 +51,10 @@ const UNPUBLISHED_COLUMN: &str = "not_a_real_column";
 
 /// The `Export` a row submits: a definition that satisfies every modelled constraint, with
 /// the name, the query statement and the table configurations substituted.
-fn export_body(name: &str, statement: &str, table_configurations: Option<Value>) -> Value {
+///
+/// `pub(crate)` so a suite asserting the same rule over another part of the catalog submits
+/// the SAME definition rather than growing a second copy of it.
+pub(crate) fn export_body(name: &str, statement: &str, table_configurations: Option<Value>) -> Value {
     let mut export = cases().remove(0).create_request()["Export"].clone();
     let object = export.as_object_mut().expect("Export is a JSON object");
     object.insert("Name".to_string(), json!(name));
@@ -66,7 +69,7 @@ fn export_body(name: &str, statement: &str, table_configurations: Option<Value>)
 
 /// An export name derived from `label`, inside `Export.Name`'s `@pattern
 /// ^[0-9A-Za-z\-_]+$` and `@length(1, 128)` (smithy_query shape `Export`, member `Name`).
-fn export_name(label: &str) -> String {
+pub(crate) fn export_name(label: &str) -> String {
     label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -158,7 +161,7 @@ fn statements_naming(table: &str, column: &str, anchor: &str) -> Vec<(String, St
 /// Assert `body` is the modelled refusal of a statement naming `column`: HTTP 400,
 /// `ValidationException`, a `Message` built from the request that names the column, the
 /// field-failure reason, and `Export.DataQuery.QueryStatement` as the named field.
-fn assert_column_refused(case: &str, status: u16, body: &Value, column: &str) {
+pub(crate) fn assert_column_refused(case: &str, status: u16, body: &Value, column: &str) {
     assert_eq!(
         (status, error_code(body).as_str()),
         (400, "ValidationException"),

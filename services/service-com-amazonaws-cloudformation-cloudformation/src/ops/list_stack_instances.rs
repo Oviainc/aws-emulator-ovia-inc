@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stack instances the named StackSet carries — one
+//! `StackInstanceSummary` per instance, every member read off the stored instance record —
+//! in the order they entered the StackSet and one bounded page at a time. A `StackSetName`
+//! that resolves to no StackSet of this administrator account and Region is refused with the
+//! modelled `StackSetNotFoundException` rather than answered with an empty list, and
+//! `StackInstanceAccount`, `StackInstanceRegion` and each `Filters` entry narrow the
+//! instances reported, together, to the ones that carry those values.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +90,91 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::StoredStackInstance;
+
+/// WHICH of a StackSet's instances the request selects.
+///
+/// The three narrowing members are independent and apply TOGETHER: "You can filter for stack
+/// instances that are associated with a specific Amazon Web Services account name or Region,
+/// or that have a specific status", so an instance is reported only when it satisfies every
+/// one the request named. A request that names none selects the StackSet's whole set.
+#[derive(Debug, Default)]
+struct Selection {
+    /// `StackInstanceAccount`: "the name of the Amazon Web Services account that you want to
+    /// list stack instances for".
+    account: Option<String>,
+    /// `StackInstanceRegion`: "the name of the Region where you want to list stack
+    /// instances".
+    region: Option<String>,
+    /// `Filters`: up to three `StackInstanceFilter`s (`@length(0..3)`), each a modelled
+    /// filter name with the single value to filter by. A filter that names no `Name` or no
+    /// `Values` narrows nothing: both members are optional in the model and it declares no
+    /// refusal for an incomplete filter, so there is no status to compare against.
+    filters: Vec<(String, String)>,
+}
+
+impl Selection {
+    /// The narrowing the request asks for.
+    fn of(input: &ListStackInstancesInput) -> Self {
+        Self {
+            account: input.stack_instance_account.clone(),
+            region: input.stack_instance_region.clone(),
+            filters: input
+                .filters
+                .iter()
+                .flatten()
+                .filter_map(|filter| match (&filter.name, &filter.values) {
+                    (Some(name), Some(values)) => Some((name.clone(), values.clone())),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this selection covers `instance`.
+    fn selects(&self, instance: &StoredStackInstance) -> bool {
+        self.account
+            .as_ref()
+            .is_none_or(|account| &instance.account == account)
+            && self
+                .region
+                .as_ref()
+                .is_none_or(|region| &instance.region == region)
+            && self
+                .filters
+                .iter()
+                .all(|(name, value)| instance.matches_filter(name, value))
+    }
+}
+
+/// One stored stack instance as the modelled `StackInstanceSummary`.
+///
+/// Every member is read off the instance record, and `StackSetId` off the StackSet that
+/// holds it, so this read and `DescribeStackInstance` cannot disagree about an instance's
+/// account, Region, stack, statuses, drift or last operation. A member the instance does not
+/// carry — the stack of a deployment that has not produced one, a status with no reason, the
+/// organizational unit of a self-managed StackSet, the drift-check instant of an instance no
+/// detection has run against — is absent rather than reported empty.
+fn stack_instance_summary(
+    stack_set_id: &str,
+    stored: &StoredStackInstance,
+) -> StackInstanceSummary {
+    StackInstanceSummary {
+        stack_set_id: Some(stack_set_id.to_string()),
+        region: Some(stored.region.clone()),
+        account: Some(stored.account.clone()),
+        stack_id: stored.stack_id.clone(),
+        status: Some(stored.status.clone()),
+        status_reason: stored.status_reason.clone(),
+        stack_instance_status: Some(StackInstanceComprehensiveStatus {
+            detailed_status: Some(stored.detailed_status.clone()),
+        }),
+        organizational_unit_id: stored.organizational_unit_id.clone(),
+        drift_status: Some(stored.drift_status.clone()),
+        last_drift_check_timestamp: stored.last_drift_check.map(crate::state::timestamp),
+        last_operation_id: Some(stored.last_operation_id.clone()),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,18 +244,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackInstances"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackInstances",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value reads the
+        // same store, and the operation models no error to refuse one with.
+        let selection = Selection::of(&input);
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the clock
+        // had already made due, which was owed whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // The instances are listed for ONE StackSet, named the way every read of a StackSet
+        // names it ("the name or unique ID of the StackSet"), and a `StackSetName` this
+        // administrator account and Region holds no StackSet for is the modelled
+        // `StackSetNotFoundException` ("The specified StackSet doesn't exist"), not an empty
+        // list.
+        let stack_set = store
+            .resolve_stack_set(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                ListStackInstancesErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // That StackSet's instances the selection covers, in the order they entered it, so a
+        // page is a stable window over them. A narrowing that selects none of them is an
+        // EMPTY list: the StackSet exists, and the answer to "its instances in that account,
+        // Region or status" is the ones it holds.
+        let summaries: Vec<StackInstanceSummary> = stack_set
+            .instances
+            .iter()
+            .filter(|instance| selection.selects(instance))
+            .map(|instance| stack_instance_summary(&stack_set.stack_set_id, instance))
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries,
+        // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
+        // asks for, and the token resumes just past that page. The cursor counts into the
+        // SELECTED instances, as every paginated read of this service counts into the
+        // collection it answers, so a caller walking the pages keeps the narrowing it
+        // started with.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackInstanceSummaries,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackInstancesOutput {
+            // Always present, as an empty element for a StackSet with no instance the
+            // request selects: a client reading the list sees the same shape either way.
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }
