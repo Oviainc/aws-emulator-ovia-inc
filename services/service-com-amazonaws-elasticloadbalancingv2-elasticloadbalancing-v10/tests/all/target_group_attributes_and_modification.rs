@@ -824,9 +824,10 @@ async fn a_health_check_that_cannot_hold_together_is_refused() {
     }
 }
 
-/// Turning a health check from TCP into an HTTP one materializes the members that exist
-/// only for an HTTP check, and turning it back drops them — so a read never reports a
-/// path or a matcher for a check that has neither.
+/// Turning a health check from TCP into an HTTP one carries the members that exist only
+/// for an HTTP check — named by the same request, because a modify fills no default for
+/// either — and turning it back drops them, so a read never reports a path or a matcher
+/// for a check that has neither.
 #[tokio::test]
 async fn the_http_only_health_check_members_follow_the_health_check_protocol() {
     let (router, _engine) = emulator();
@@ -844,9 +845,31 @@ async fn the_http_only_health_check_members_follow_the_health_check_protocol() {
         "case a TCP health check: expected no path and no matcher, got {tcp}"
     );
 
+    // The same move with neither member named would leave a layer-7 check with no
+    // destination and no success criterion, so it is refused and stores nothing.
     let mut form = action("ModifyTargetGroup");
     form.push(p("TargetGroupArn", &arn));
     form.push(p("HealthCheckProtocol", "HTTP"));
+    let reply = call(&router, &form).await;
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (400, "ValidationError"),
+        "case becoming an HTTP health check with neither member: expected 400 \
+         ValidationError, got {} body {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        read_target_group(&router, &arn).await,
+        tcp,
+        "case becoming an HTTP health check with neither member: expected nothing stored"
+    );
+
+    let mut form = action("ModifyTargetGroup");
+    form.push(p("TargetGroupArn", &arn));
+    form.push(p("HealthCheckProtocol", "HTTP"));
+    form.push(p("HealthCheckPath", "/up"));
+    form.push(p("Matcher.HttpCode", "200-399"));
     let reply = call(&router, &form).await;
     assert_eq!(
         reply.status, 200,
@@ -859,14 +882,9 @@ async fn the_http_only_health_check_members_follow_the_health_check_protocol() {
             first_text(&http, "HealthCheckPath").as_deref(),
             first_text(&http, "HttpCode").as_deref()
         ),
-        // The documented defaults of an HTTP-semantic health check: the ping path `/`,
-        // and the success codes of the load balancer family the GROUP serves rather than
-        // of the protocol the check speaks — `Matcher$HttpCode`: "For Network Load
-        // Balancers, you can specify values between 200 and 599, with the default value
-        // being 200-399." This group's protocol is TCP, so it is a Network Load
-        // Balancer's.
-        (Some("/"), Some("200-399")),
-        "case becoming an HTTP health check: expected the documented defaults, got {http}"
+        (Some("/up"), Some("200-399")),
+        "case becoming an HTTP health check: expected the members the request named, \
+         got {http}"
     );
 
     let mut form = action("ModifyTargetGroup");

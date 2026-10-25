@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateDistributionTenantWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateDistributionTenantWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateDistributionTenantWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the WAF web ACL customization off ONE stored distribution tenant.
+//!
+//! `Customizations$WebAcl` is "the WAF web ACL" the tenant overrides or disables, so the
+//! disassociation is the removal of that one member from the tenant's record: every later
+//! read reports a tenant with no web ACL customization, and the call versions the tenant
+//! the way any other change to its configuration does. A tenant that carries no web ACL
+//! customization already is left exactly as it is and still answered — removing what is
+//! not there is the same state as removing what is.
+//!
+//! The tenant's current version is a REQUIRED precondition here: a request that states no
+//! `If-Match` at all is refused with `InvalidIfMatchVersion` (HTTP 400), which is what the
+//! recorded service answers it with, rather than treated as stating no precondition.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +78,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,18 +155,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateDistributionTenantWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateDistributionTenantWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call
+        // reads it, so the version this precondition is evaluated against is the one a read
+        // at this instant reports.
+        store.settle(now);
+
+        // The disassociation is a change to ONE stored tenant, so the record has to be
+        // there: `EntityNotFound` is the error this operation models for an entity it
+        // cannot find. `Id` is "the ID of the distribution tenant", so the id is what
+        // resolves it.
+        let Some(current_etag) = store
+            .distribution_tenants
+            .get(&input.id)
+            .map(|tenant| tenant.etag.clone())
+        else {
+            return Err(
+                DisassociateDistributionTenantWebACLErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // The tenant's current version is the precondition this call runs under, and it is
+        // REQUIRED: an absent header is "the `If-Match` version is missing", which is the
+        // same refusal as a value that is no version token at all, while a well-formed
+        // token that is not the stored one is a failed precondition — so a caller never
+        // writes over a tenant it has not read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    DisassociateDistributionTenantWebACLErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    DisassociateDistributionTenantWebACLErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Clearing `Customizations$WebAcl` is the whole of the disassociation: the tenant's
+        // other customizations are untouched, and a tenant that carried none to begin with
+        // reaches the same state, which is what makes a repeated call a no-op rather than a
+        // failure.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateDistributionTenantWebACL"))
+        // The record was read above under this same held lock, so the store still holds it;
+        // the `None` arm answers the modelled not-found rather than panicking if it ever
+        // does not.
+        let Some(tenant) = store.apply_tenant_web_acl(&input.id, None, now) else {
+            return Err(
+                DisassociateDistributionTenantWebACLErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(DisassociateDistributionTenantWebACLOutput {
+            // "The ID of the distribution tenant" — read from the record that was written.
+            id: Some(tenant.id.clone()),
+            // "The current version of the distribution tenant": the token this mutation
+            // just minted, so the version from before it no longer satisfies an `If-Match`.
+            e_tag: Some(tenant.etag.clone()),
+        })
     }
 }

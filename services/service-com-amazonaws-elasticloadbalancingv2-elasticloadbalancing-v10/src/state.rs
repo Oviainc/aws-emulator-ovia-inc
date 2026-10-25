@@ -285,12 +285,45 @@ pub struct MatcherRecord {
 }
 
 impl MatcherRecord {
+    /// Whether this matcher names a return code at all — an HTTP one or a gRPC one.
+    ///
+    /// The model gives `Matcher` two optional members (`HttpCode`, `GrpcCode`), so a
+    /// matcher carrying neither states no success criterion and is no matcher as far as
+    /// a health check is concerned.
+    pub fn names_a_return_code(&self) -> bool {
+        self.http_code.is_some() || self.grpc_code.is_some()
+    }
+
     fn to_shape(&self) -> Matcher {
         Matcher {
             http_code: self.http_code.clone(),
             grpc_code: self.grpc_code.clone(),
         }
     }
+}
+
+/// Whether a layer-7 (HTTP-semantic) health check made of `path` and `matcher` is
+/// complete — it has a destination to request and a return code that counts as success —
+/// and, when it is not, the rule it broke.
+///
+/// Both members are documented as belonging to such a check alone (`HealthCheckPath`:
+/// "[HTTP/HTTPS health checks] The destination for health checks on the targets";
+/// `Matcher`: "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when checking
+/// for a successful response from a target"), and a check that requests nothing, or
+/// accepts no response as success, cannot be evaluated at all. Only a path for the load
+/// balancer to request and a code to compare its answer against make one, so the two are
+/// required TOGETHER of any configuration that is not filling their documented defaults.
+///
+/// The message states the rule rather than the request, because neither member is
+/// identified by a value the caller sent: what is missing is a member, not a bad value.
+pub fn check_layer_7_health_check(
+    path: Option<&str>,
+    matcher: Option<&MatcherRecord>,
+) -> Result<(), String> {
+    if path.is_some() && matcher.is_some_and(MatcherRecord::names_a_return_code) {
+        return Ok(());
+    }
+    Err("Path and return code are required for layer 7 health checks.".to_string())
 }
 
 /// The path an HTTP-semantic health check checks when the request names none, from

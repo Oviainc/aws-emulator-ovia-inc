@@ -68,14 +68,14 @@ pub(crate) const ABSENT_CAPACITY_TASK_ID: &str = "cap-00000000000000000";
 const ORDER_PLACEHOLDER: &str = "oo-1111111111111111a";
 
 /// An `OrderId` of the modelled form that no order of this store carries.
-const ABSENT_ORDER_ID: &str = "oo-00000000000000000";
+pub(crate) const ABSENT_ORDER_ID: &str = "oo-00000000000000000";
 
 /// The two `AssetId`s a row's hardware is recorded under, both of the form the
 /// modelled `AssetIdInput` declares (`^\d{10}$`).
-const INSTALLED: [&str; 2] = ["1234567890", "9876543210"];
+pub(crate) const INSTALLED: [&str; 2] = ["1234567890", "9876543210"];
 
 /// An `AssetId` of that same form that no Outpost of this store holds.
-const ABSENT_ASSET_ID: &str = "9999999999";
+pub(crate) const ABSENT_ASSET_ID: &str = "9999999999";
 
 /// The `AssetId` recorded on the OTHER Outpost of the reference-resolution case, so a
 /// row can name hardware that exists without being hardware of the Outpost in hand.
@@ -84,7 +84,7 @@ const ELSEWHERE_ASSET_ID: &str = "2000000001";
 /// The two members `CreateOrder` marks `@required`, with one line item: the smallest
 /// order this service accepts, which is all a row that only needs an order to EXIST
 /// asks of it. The `CatalogItemId` is of the modelled `SKU` form (`^OR-[A-Z0-9]{7}$`).
-async fn an_order(outposts: &Outposts, outpost_identifier: &str) -> String {
+pub(crate) async fn an_order(outposts: &Outposts, outpost_identifier: &str) -> String {
     let answered = outposts
         .ok(
             "POST",
@@ -105,7 +105,7 @@ async fn an_order(outposts: &Outposts, outpost_identifier: &str) -> String {
 /// fulfilled, so no call in this API creates one: it is recorded through the store,
 /// the same seam [`crate::outpost_assets`] records hardware through, and that module
 /// owns the projection every member of one is asserted against.
-fn install(outposts: &Outposts, outpost_id: &str, asset_ids: &[&str], case: &str) {
+pub(crate) fn install(outposts: &Outposts, outpost_id: &str, asset_ids: &[&str], case: &str) {
     let assets: Vec<AssetInfo> = asset_ids
         .iter()
         .map(|asset_id| asset(asset_id, "rack-1", Some("COMPUTE"), None, None))
@@ -169,12 +169,12 @@ fn is_capacity_task_id(id: &str) -> bool {
 }
 
 /// The capacity-task collection route of an Outpost, by either identifier form.
-fn capacity_route(outpost_identifier: &str) -> String {
+pub(crate) fn capacity_route(outpost_identifier: &str) -> String {
     format!("/outposts/{}/capacity", segment(outpost_identifier))
 }
 
 /// The route of ONE capacity task of an Outpost.
-fn task_route(outpost_identifier: &str, capacity_task_id: &str) -> String {
+pub(crate) fn task_route(outpost_identifier: &str, capacity_task_id: &str) -> String {
     format!(
         "{}/{}",
         capacity_route(outpost_identifier),
@@ -204,7 +204,7 @@ fn stamp(task: &Value, member: &str) -> Option<f64> {
 
 /// One Outpost of a fresh site, so each case starts from an Outpost that has never
 /// run a capacity task. Returns its bare `OutpostId`.
-async fn outpost(outposts: &Outposts, name: &str) -> String {
+pub(crate) async fn outpost(outposts: &Outposts, name: &str) -> String {
     let site = outposts.create_site(&json!({ "Name": format!("{name}-site") })).await;
     let created = outposts
         .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
@@ -213,7 +213,7 @@ async fn outpost(outposts: &Outposts, name: &str) -> String {
 }
 
 /// `StartCapacityTask` on `outpost_identifier`.
-async fn start(outposts: &Outposts, outpost_identifier: &str, request: &Value) -> Reply {
+pub(crate) async fn start(outposts: &Outposts, outpost_identifier: &str, request: &Value) -> Reply {
     outposts
         .call("POST", &capacity_route(outpost_identifier), Some(request))
         .await

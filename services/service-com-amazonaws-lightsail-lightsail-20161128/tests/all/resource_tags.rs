@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `UntagResource` over every kind of Lightsail resource that carries tags,
-//! driven over the wire.
+//! `UntagResource` over the kinds of Lightsail resource that carry tags and are
+//! addressed by their own create and Get — the instance, the block storage disk,
+//! the managed database, the bucket, the load balancer and the contact method —
+//! driven over the wire. The remaining tag-carrying kinds are walked by
+//! `tagged_resource_coverage.rs`, which reuses this suite's helpers rather than
+//! asserting the rule with a second harness.
 //!
 //! Every case here goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: Lightsail_20161128.<Operation>` and an `awsJson1_1` body,
@@ -28,7 +32,7 @@ use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
 
 /// One tag of a request, as `(key, value)` — a value of `None` is a key-only
 /// tag, which the modelled `Tag$value` admits.
-type TagRow = (&'static str, Option<&'static str>);
+pub(crate) type TagRow = (&'static str, Option<&'static str>);
 
 /// The tag set every resource in this suite is created with: two keys with
 /// values, one key-only tag, and a key carrying a hyphen and a digits-only
@@ -43,7 +47,7 @@ const TAGS: &[TagRow] = &[
 /// The Region an unsigned request is served in
 /// (`crate::state::DEFAULT_REGION`), which is the Region every resource this
 /// suite creates without naming one lands in.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// The most tags one Lightsail resource can hold, from the tagging documentation
 /// the modelled `tags` member links to ("You can add up to 50 tags to each
@@ -194,7 +198,7 @@ impl Kind {
 }
 
 /// `tags` as the modelled `TagList` a create request carries.
-fn tag_list(tags: &[TagRow]) -> Value {
+pub(crate) fn tag_list(tags: &[TagRow]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| match value {
@@ -206,7 +210,7 @@ fn tag_list(tags: &[TagRow]) -> Value {
 }
 
 /// The tags `resource` reports, as `(key, value)` pairs in report order.
-fn reported_tags(resource: &Value) -> Vec<(String, Option<String>)> {
+pub(crate) fn reported_tags(resource: &Value) -> Vec<(String, Option<String>)> {
     resource["tags"]
         .as_array()
         .unwrap_or_else(|| panic!("a tagged resource always reports a tag list, got {resource:?}"))
@@ -221,7 +225,7 @@ fn reported_tags(resource: &Value) -> Vec<(String, Option<String>)> {
 }
 
 /// `tags` as the pairs a report must carry.
-fn want_tags(tags: &[TagRow]) -> Vec<(String, Option<String>)> {
+pub(crate) fn want_tags(tags: &[TagRow]) -> Vec<(String, Option<String>)> {
     tags.iter()
         .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
         .collect()
@@ -229,7 +233,12 @@ fn want_tags(tags: &[TagRow]) -> Vec<(String, Option<String>)> {
 
 /// Call `UntagResource` for `name` with `keys` in `region`, requiring success,
 /// and answer the one operation-log entry it reports.
-async fn untag(emulator: &Emulator, region: Option<&str>, name: &str, keys: &[&str]) -> Value {
+pub(crate) async fn untag(
+    emulator: &Emulator,
+    region: Option<&str>,
+    name: &str,
+    keys: &[&str],
+) -> Value {
     let answered = emulator
         .ok_at(
             None,
@@ -256,7 +265,13 @@ async fn untag(emulator: &Emulator, region: Option<&str>, name: &str, keys: &[&s
 /// declares a member for each call that writes this log and none for a change to
 /// a resource's tags, so there is no modelled value to report, and
 /// `Operation$operationType` is an optional member.
-fn assert_entry(case: &str, entry: &Value, name: &str, resource_type: &str, region: &str) {
+pub(crate) fn assert_entry(
+    case: &str,
+    entry: &Value,
+    name: &str,
+    resource_type: &str,
+    region: &str,
+) {
     assert_eq!(
         entry["resourceName"].as_str(),
         Some(name),
