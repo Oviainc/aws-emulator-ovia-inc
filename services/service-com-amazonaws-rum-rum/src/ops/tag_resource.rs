@@ -136,96 +136,19 @@ const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
 // (`crate::state::access_denied`).
 use crate::state::{ACCESS_DENIED_ERROR_CODE, ACCESS_DENIED_STATUS};
 
-/// The most tags one RUM resource holds at once.
-///
-/// From the model: this operation's own documentation states "You can associate as many
-/// as 50 tags with a resource", and `UntagResource$TagKeys` carries the matching
-/// `@length(min: 0, max: 50)`. It is also what bounds the heap one app monitor's tag map
-/// can take: this operation merges keys on every call and `TagMap` itself declares no
-/// length.
-///
-/// The CEILING is documented; the wire code a request past it is refused with is not. No
-/// recorded unit exercises it, so it is answered with this frontend's own
-/// [`BAD_REQUEST_ERROR_CODE`] (the code the recorded units establish for a refused
-/// tagging request) rather than with a code nothing attests to.
-const MAX_TAGS_PER_RESOURCE: usize = 50;
-
-/// The `@pattern` the model declares on `TagKey` — the key shape of `TagMap`, which this
-/// operation's `Tags` targets.
-///
-/// Source: `smithy_query(query="shape", shape="TagKey")`. It is the text a refusal quotes;
-/// the two halves applied below are [`TAG_KEY_RESERVED_PREFIX`] and the character class
-/// [`is_tag_key_character`] tests membership of.
-const TAG_KEY_PATTERN: &str = "^(?!aws:)[a-zA-Z+-=._:/]+$";
-
-/// The prefix [`TAG_KEY_PATTERN`]'s leading `(?!aws:)` excludes: AWS's reserved tag
-/// namespace. Applied as a `starts_with`, which is what a negative lookahead anchored at
-/// the start of the pattern says.
-const TAG_KEY_RESERVED_PREFIX: &str = "aws:";
-
-/// Whether `character` is one the class `[a-zA-Z+-=._:/]` of [`TAG_KEY_PATTERN`] admits.
-///
-/// That class admits the ASCII letters, `_`, and — because `+-=` inside a character class
-/// is the RANGE from `+` (0x2B) to `=` (0x3D) — every character in that range: the
-/// digits, `,`, `-`, `.`, `/`, `:`, `;`, `<` and `=`. The `.`, `:` and `/` the class also
-/// lists explicitly are inside that range too, so the three terms below are the whole
-/// class.
-///
-/// A character class is a MEMBERSHIP test, not a pattern language, so it is written
-/// directly: that keeps the check linear in the key's length by construction (no regex
-/// engine on a path that reads request text) and keeps this operation's manifest out of
-/// the way of the other fixes changing this crate. The class is pinned from the outside
-/// rather than by this reading of it: the suite's `ADMITTED_TAG_KEYS` table has a row per
-/// character class the model admits and `REJECTED_TAG_KEYS` a row per way a key can fall
-/// outside it, both sourced from `smithy_query`.
-fn is_tag_key_character(character: char) -> bool {
-    character.is_ascii_alphabetic() || character == '_' || ('+'..='=').contains(&character)
-}
-
-/// Whether `key` satisfies the modelled `TagKey` `@pattern`: it is outside AWS's reserved
-/// `aws:` namespace AND it is a non-empty run of characters the class admits — which is
-/// exactly what the pattern's lookahead, class and `+` quantifier say between the `^` and
-/// the `$`.
-fn tag_key_matches_pattern(key: &str) -> bool {
-    !key.starts_with(TAG_KEY_RESERVED_PREFIX)
-        && !key.is_empty()
-        && key.chars().all(is_tag_key_character)
-}
-
-/// Why the modelled `TagKey` `@pattern` rejects the key at `path`, worded as the
-/// framework's own validation envelope — or `None` when the key satisfies it.
-///
-/// This check belongs in the handler rather than at the boundary: `TagKey`'s pattern opens
-/// with the negative lookahead `(?!aws:)`, the vendored boundary validator compiles a
-/// `@pattern` with the `regex` crate, which has no look-around, and it treats a pattern it
-/// cannot compile as matching (`pattern_matches` in
-/// `vendor/smithy-schema-server/src/constraints.rs`). So the constraint the model declares
-/// would otherwise never be applied to a tag key at all.
-///
-/// The check IS the pattern: [`tag_key_matches_pattern`] applies both of its halves, so
-/// the clause — which quotes the model's own source text — cannot state a constraint this
-/// function does not apply. `path` is the dotted member path the framework would have
-/// reported for a `TagMap` entry, and the key is echoed into the clause exactly as the
-/// caller sent it, bounded by the 128-character `@length` the boundary already enforced.
-fn tag_key_violation(path: &str, key: &str) -> Option<String> {
-    if tag_key_matches_pattern(key) {
-        return None;
-    }
-    let clause = ::aws_smithy_schema_server::envelope(&[::aws_smithy_schema_server::Violation {
-        path: path.to_string(),
-        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(TAG_KEY_PATTERN.to_string()),
-        value: Some(key.to_string()),
-    }]);
-    // `envelope` answers `None` only for an EMPTY violation list, which the one-element
-    // slice above can never be. Fail closed anyway: a refused key stays refused, with a
-    // clause that states the constraint it failed.
-    Some(clause.unwrap_or_else(|| {
-        format!(
-            "Value '{key}' at '{path}' failed to satisfy constraint: Member must satisfy \
-             regular expression pattern: {TAG_KEY_PATTERN}"
-        )
-    }))
-}
+// The two rules a tag WRITE of this service is subject to, whichever operation carries
+// the map: the constraints `TagMap`'s key shape declares, which the boundary validator
+// leaves unapplied (`crate::state::tag_keys_refusal`), and the documented ceiling on how
+// many tags one resource holds (`crate::state::tag_count_refusal`, over
+// `crate::state::MAX_TAGS_PER_RESOURCE`).
+//
+// Both live in `crate::state` rather than here, because both are properties of the
+// `TagMap` and of the resource it is written to, not of this operation: the sibling
+// `CreateAppMonitor` seeds the SAME map through its own `Tags` member and is subject to the
+// same two rules. What stays this operation's own is only the wire code each refusal is
+// reported under — `BAD_REQUEST_ERROR_CODE` for this frontend, where an app-monitor call
+// answers the modelled `ValidationException`.
+use crate::state::{tag_count_refusal, tag_keys_refusal};
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::tag_resource::TagResourceError`).
@@ -385,13 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut requested: Vec<(String, String)> = input.tags.into_iter().collect();
         requested.sort();
 
-        // `TagKey`'s `@pattern` is the one modelled constraint the boundary validator
-        // cannot apply (it opens with a negative lookahead), so it is applied here,
-        // before anything is written.
-        for (key, _) in &requested {
-            if let Some(message) = tag_key_violation(&format!("tags.{key}.member"), key) {
-                return Err(TagResourceError::BadRequest(ValidationException { message }));
-            }
+        // The constraints `TagMap`'s key shape declares are not applied at the boundary
+        // (the vendored validator never validates a map KEY, and `TagKey`'s `@pattern`
+        // opens with a negative lookahead it could not compile anyway), so they are
+        // applied here, before anything is written.
+        if let Some(message) = tag_keys_refusal(requested.iter().map(|(key, _)| key.as_str())) {
+            return Err(TagResourceError::BadRequest(ValidationException { message }));
         }
 
         // The addressed resource and the policy in force on it, under a SHORT read lock:
@@ -439,14 +361,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .chain(requested.iter().map(|(key, _)| key))
             .collect::<::std::collections::BTreeSet<&String>>()
             .len();
-        if resulting > MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceError::BadRequest(ValidationException {
-                message: format!(
-                    "These tags would leave {} tags on {}, more than the {} tags a resource \
-                     can be associated with.",
-                    resulting, input.resource_arn, MAX_TAGS_PER_RESOURCE
-                ),
-            }));
+        if let Some(message) = tag_count_refusal(resulting, &input.resource_arn) {
+            return Err(TagResourceError::BadRequest(ValidationException { message }));
         }
 
         for (key, value) in requested {
