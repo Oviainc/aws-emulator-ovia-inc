@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{ResourceRef, SyncJob};
+use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
+    ResourceRef, SyncJob, DEFAULT_REGION,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here signs for; it must show up in every minted ARN.
@@ -70,27 +72,52 @@ impl Emulator {
     }
 
     pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Resp {
+        self.call_signed_for(Some(REGION), method, path, body).await
+    }
+
+    /// One dispatched request signed for `region` — or UNSIGNED when `region` is
+    /// `None`, the case the service answers out of its default Region.
+    ///
+    /// The `Authorization` header is what names the Region (the third field of
+    /// its credential scope), so this is the seam a suite about Region scoping
+    /// drives: [`Emulator::call`] is this with the suite-wide [`REGION`].
+    pub(crate) async fn call_signed_for(
+        &self,
+        region: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Resp {
         let payload = match &body {
             Some(value) => {
                 bytes::Bytes::from(serde_json::to_vec(value).expect("serialize the request body"))
             }
             None => bytes::Bytes::new(),
         };
-        let host = format!("api.iottwinmaker.{REGION}.amazonaws.com");
-        let request = http::Request::builder()
+        let host = match region {
+            // A signed request routes by its credential scope, so the suites' host
+            // keeps the service's `api.` endpoint form.
+            Some(region) => format!("api.iottwinmaker.{region}.amazonaws.com"),
+            // An unsigned request carries no scope, so it routes by HOST and is
+            // served out of the service's default Region: it addresses that
+            // Region's own endpoint, which is the endpoint form that routes.
+            None => format!("iottwinmaker.{DEFAULT_REGION}.amazonaws.com"),
+        };
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(format!("https://{host}{path}"))
             .header("host", host)
-            .header("content-type", "application/json")
-            .header(
+            .header("content-type", "application/json");
+        if let Some(region) = region {
+            builder = builder.header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/iottwinmaker/\
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/iottwinmaker/\
                      aws4_request, SignedHeaders=host, Signature=0"
                 ),
-            )
-            .body(payload)
-            .expect("build the request");
+            );
+        }
+        let request = builder.body(payload).expect("build the request");
 
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
@@ -488,6 +515,9 @@ pub(crate) fn seed_sync_job(emulator: &Emulator, workspace_id: &str, sync_source
     let arn = sync_job_arn(workspace_id, sync_source);
     let state = emulator.state();
     let mut state = state.lock();
+    // Seeded into the store of the Region every request from this harness is
+    // signed for, the one the handlers serve those requests out of.
+    let state = state.region_mut(REGION);
     let workspace = state
         .workspaces
         .get_mut(workspace_id)

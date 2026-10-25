@@ -42,6 +42,18 @@ pub(crate) const GATEWAY_READY_INTERVAL: Duration = Duration::from_millis(20);
 /// ["DirectConnectGateway"]), so it is the only `type` a descriptor can report.
 pub(crate) const ATTACH_POINT_TYPE: &str = "DirectConnectGateway";
 
+/// The `directConnectGatewayName` the harness gives the gateway it creates for a suite
+/// that needs an attach point but is not itself about the attach-point listing.
+pub(crate) const HARNESS_GATEWAY_NAME: &str = "ic-harness-attach-point";
+
+/// The `DirectConnectGatewayState` Direct Connect documents as "ready for use", which
+/// is the only state a gateway is an attach point in.
+pub(crate) const GATEWAY_READY_STATE: &str = "available";
+
+/// An email address of the shape an Environment declaring the `email`
+/// `RemoteAccountIdentifierType` asks a create for.
+pub(crate) const PARTNER_EMAIL: &str = "interconnect-partner@example.test";
+
 /// One emulator: a router with this service and Direct Connect mounted over one shared
 /// engine.
 pub(crate) struct Emulator {
@@ -77,8 +89,21 @@ impl Emulator {
         json_version: &str,
         body: Value,
     ) -> (u16, Value) {
+        self.post_in("us-east-1", signing_name, target, json_version, body)
+            .await
+    }
+
+    /// [`Self::post`], signed for `region` rather than for the default one.
+    async fn post_in(
+        &self,
+        region: &str,
+        signing_name: &str,
+        target: &str,
+        json_version: &str,
+        body: Value,
+    ) -> (u16, Value) {
         let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/{signing_name}/aws4_request, \
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{signing_name}/aws4_request, \
              SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
         );
         let request = http::Request::builder()
@@ -107,13 +132,31 @@ impl Emulator {
 
     /// One Interconnect operation (`awsJson1_0`), as a `(status, body)` pair.
     pub(crate) async fn ic(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.post(
+        self.ic_in("us-east-1", operation, body).await
+    }
+
+    /// One Interconnect operation signed for `region`, so a suite's rows can differ in
+    /// the Region the request addresses (which is the Region every ARN it mints
+    /// carries).
+    pub(crate) async fn ic_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
+        self.post_in(
+            region,
             SIGNING_NAME,
             &format!("Interconnect.{operation}"),
             "1.0",
             body,
         )
         .await
+    }
+
+    /// One Interconnect operation signed for `region`, required to succeed.
+    pub(crate) async fn ic_ok_in(&self, region: &str, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.ic_in(region, operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
     }
 
     /// One Interconnect operation, required to succeed.
@@ -197,7 +240,7 @@ impl Emulator {
             let started = Instant::now();
             loop {
                 let state = self.gateway_state(id).await;
-                if state == "available" {
+                if state == GATEWAY_READY_STATE {
                     break;
                 }
                 assert!(
@@ -218,6 +261,50 @@ impl Emulator {
             .as_array()
             .expect("environments is a list")
             .clone()
+    }
+
+    /// One seeded Environment, as `GetEnvironment` reports it — the record that says
+    /// which bandwidths it offers and what identifying information it asks a create for.
+    pub(crate) async fn environment(&self, environment_id: &str) -> Value {
+        let fetched = self
+            .ic_ok("GetEnvironment", json!({ "id": environment_id }))
+            .await;
+        fetched["environment"].clone()
+    }
+
+    /// A Direct Connect gateway of the account that is ready for use, as
+    /// `CreateConnection$attachPoint` names one.
+    ///
+    /// An attach point IS a gateway of the account, so a suite that needs one to attach
+    /// a Connection to takes it from here — the account's first ready gateway, created
+    /// on the first call and reused afterwards — rather than inventing a UUID no
+    /// gateway of the account answers to.
+    pub(crate) async fn attach_point(&self) -> String {
+        if let Some(ready) = self.first_ready_gateway().await {
+            return ready;
+        }
+        self.ready_gateways(&[(HARNESS_GATEWAY_NAME, None)])
+            .await
+            .remove(0)
+    }
+
+    /// The first gateway of the account Direct Connect reports ready for use, in id
+    /// order so the answer does not depend on how the account's gateways are stored —
+    /// or `None` when it holds none.
+    async fn first_ready_gateway(&self) -> Option<String> {
+        let described = self
+            .dx_ok("DescribeDirectConnectGateways", json!({}))
+            .await;
+        let mut ready: Vec<String> = described["directConnectGateways"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|gateway| text(gateway, "directConnectGatewayState") == GATEWAY_READY_STATE)
+            .map(|gateway| text(gateway, "directConnectGatewayId"))
+            .collect();
+        ready.sort();
+        ready.into_iter().next()
     }
 
     /// Every attach point `ListAttachPoints` reports for `environment_id`, walking the
@@ -254,17 +341,19 @@ impl Emulator {
         attach_point: &str,
         description: &str,
     ) -> Value {
+        let mut request = Map::new();
+        request.insert("environmentId".to_string(), json!(environment_id));
+        request.insert("bandwidth".to_string(), json!(bandwidth));
+        request.insert(
+            "attachPoint".to_string(),
+            json!({ "directConnectGateway": attach_point }),
+        );
+        request.insert("description".to_string(), json!(description));
+        if let Some(remote_account) = remote_account_for(&self.environment(environment_id).await) {
+            request.insert("remoteAccount".to_string(), remote_account);
+        }
         let created = self
-            .ic_ok(
-                "CreateConnection",
-                json!({
-                    "environmentId": environment_id,
-                    "bandwidth": bandwidth,
-                    "attachPoint": { "directConnectGateway": attach_point },
-                    "description": description,
-                    "remoteAccount": { "identifier": engine::EMULATOR_ACCOUNT_ID },
-                }),
-            )
+            .ic_ok("CreateConnection", Value::Object(request))
             .await;
         created["connection"].clone()
     }
@@ -295,9 +384,26 @@ pub(crate) async fn placements(emulator: &Emulator) -> Vec<(String, String)> {
     out
 }
 
+/// The `remoteAccount` an Environment asks a `CreateConnection` for: identifying
+/// information of the kind its `remoteIdentifierType` declares ("the type of
+/// identifying information that should be supplied to the `remoteAccount` parameter of
+/// a `CreateConnection` call for this specific Environment"), or nothing at all for an
+/// Environment that declares no type and so asks for none.
+///
+/// The two kinds are the values `RemoteAccountIdentifierType` models: an AWS account
+/// number, and an email address.
+pub(crate) fn remote_account_for(environment: &Value) -> Option<Value> {
+    match environment["remoteIdentifierType"].as_str()? {
+        "account" => Some(json!({ "identifier": engine::EMULATOR_ACCOUNT_ID })),
+        "email" => Some(json!({ "identifier": PARTNER_EMAIL })),
+        _ => None,
+    }
+}
+
 /// Create a connection on `placement` carrying `tags`, and return the stored
-/// `Connection` as `CreateConnection` reported it. `seed` keeps each row's attach
-/// point distinct.
+/// `Connection` as `CreateConnection` reported it. `seed` keeps each row's description
+/// distinct; the attach point is one of the account's own gateways, because an attach
+/// point a Connection is provisioned onto has to be one that exists.
 pub(crate) async fn create_with_tags(
     emulator: &Emulator,
     placement: &(String, String),
@@ -309,9 +415,12 @@ pub(crate) async fn create_with_tags(
     request.insert("bandwidth".to_string(), json!(placement.1));
     request.insert(
         "attachPoint".to_string(),
-        json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-{seed:012}") }),
+        json!({ "directConnectGateway": emulator.attach_point().await }),
     );
     request.insert("description".to_string(), json!(format!("tag case {seed}")));
+    if let Some(remote_account) = remote_account_for(&emulator.environment(&placement.0).await) {
+        request.insert("remoteAccount".to_string(), remote_account);
+    }
     if !tags.is_empty() {
         request.insert("tags".to_string(), json!(tags));
     }

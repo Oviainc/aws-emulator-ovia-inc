@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             bundle_count = input.bundle_names.as_ref().map_or(0, Vec::len),
             "serving a request"
         );
-        let _ = ctx;
+        // The plan is per account and Region, so the Region this request is
+        // signed for picks the store it changes: a plan set here is not the plan
+        // another Region's endpoint reports.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every refusal is decided BEFORE the store is touched, so a refused
         // request leaves the account on the plan it was already on.
@@ -233,6 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let mut state = state.lock();
+        // A plan change is the one other call that gives a Region its first
+        // record, so it answers the Region ceiling too: the Region is the
+        // caller's own credential scope, and without a ceiling a caller could
+        // repeat this call under fresh Region names until the process ran out
+        // of memory. The operation models no quota error, so the refusal goes
+        // out as the limit error it does model.
+        if state.region_ceiling_reached(&region) {
+            return Err(UpdatePricingPlanErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(crate::state::region_ceiling_message()),
+                },
+            )
+            .into());
+        }
+        let state = state.region_mut(&region);
 
         // One count for both reported plans, derived from the stored entities:
         // `billableEntityCount` describes the ACCOUNT, not the plan.
