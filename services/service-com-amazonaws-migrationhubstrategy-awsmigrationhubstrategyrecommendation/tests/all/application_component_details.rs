@@ -208,6 +208,10 @@ fn component(row: usize) -> ApplicationComponentRecord {
         // `application_component_config.rs`, and this detail read reports the service's own
         // recommendation rather than a choice.
         preferred_strategy: None,
+        // The import groups a component came in with are not a member of the detail this
+        // read reports — they are what a list's `groupIdFilter` scopes by
+        // (`application_component_listing.rs`) — so these rows carry none.
+        group_id: Vec::new(),
     }
 }
 
