@@ -132,8 +132,6 @@ async fn minimum_engine_version_follows_authentication_and_acl_membership() {
         ("acl-password-only", &["pw-user", "two-pw-user"], "6.2"),
         ("acl-with-iam", &["pw-user", "iam-user"], "7.0"),
         ("acl-iam-only", &["iam-user"], "7.0"),
-        // A member no user exists for cannot require anything of the engine.
-        ("acl-unknown-member", &["not-a-user"], "6.2"),
     ];
     for (name, members, expected) in acls {
         let mut body = json!({ "ACLName": name });

@@ -490,6 +490,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get_mut(&id)
             .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        // The definition this call supersedes, read before its writes land: it
+        // stays the model's ACTIVE version until the new one settles.
+        let superseded = record.definition();
         record.name = input.asset_model_name.clone();
         record.description = input.asset_model_description.clone();
         if let Some(requested) = external_id {
@@ -504,7 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The model reports UPDATING until the transition this call owes falls due,
         // and the new definition carries a new version — hence a new ETag.
-        record.begin_update(now);
+        record.begin_update(superseded, now);
         let output = UpdateAssetModelOutput {
             asset_model_id: Some(record.id.clone()),
             asset_model_status: record.status(now),

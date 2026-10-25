@@ -13,8 +13,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    AttachedPermissionsBoundary, Group, InstanceProfile, LoginProfile, Policy, PolicyVersion, Role,
-    SAMLPrivateKey, ServiceSpecificCredentialMetadata, Tag, User,
+    AttachedPermissionsBoundary, DelegationRequest, Group, InstanceProfile, LoginProfile, Policy,
+    PolicyVersion, Role, SAMLPrivateKey, ServiceSpecificCredentialMetadata, Tag, User,
 };
 
 pub mod authorization;
@@ -54,6 +54,12 @@ pub const POLICY_USAGE_PERMISSIONS_POLICY: &str = "PermissionsPolicy";
 /// BOUNDARY: "to list only the policies used to set permissions boundaries, set the
 /// value to PermissionsBoundary". See [`POLICY_USAGE_PERMISSIONS_POLICY`].
 pub const POLICY_USAGE_PERMISSIONS_BOUNDARY: &str = "PermissionsBoundary";
+
+/// The ARN resource type of a delegation request: the entity type
+/// `GetHumanReadableSummaryRequest$EntityArn` documents a summary is served for
+/// ("at this time, the only supported entity type is delegation-request"), and the
+/// resource type an ARN naming such a request therefore carries.
+pub const DELEGATION_REQUEST_RESOURCE_TYPE: &str = "delegation-request";
 
 /// The `policyScopeType` value that selects only the managed policies AWS owns: "to
 /// list only Amazon Web Services managed policies, set Scope to AWS"
@@ -898,6 +904,16 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// key is a name the caller chose, so there is no case to fold and no
     /// [`name_key`] to build.
     pub account_properties: BTreeMap<String, String>,
+    /// The persisted delegation requests, keyed by their `DelegationRequestId` — the
+    /// handle every operation on one takes (`GetDelegationRequest$DelegationRequestId`,
+    /// "the unique identifier of the delegation request"), and the last segment of the
+    /// ARN that names one ([`delegation_request_arn`]). `CreateDelegationRequest`
+    /// ("creates an IAM delegation request") is what fills this map.
+    ///
+    /// The identifier is held VERBATIM: `delegationRequestIdType`'s pattern is
+    /// `^[\w-]+$` and the identifier is minted rather than named by a caller, so there
+    /// is no case to fold and no [`name_key`] to build.
+    pub delegation_requests: BTreeMap<String, DelegationRequest>,
     /// Monotonic counter feeding
     /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid).
     pub saml_provider_uuid_seq: u64,
@@ -1150,6 +1166,18 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 self.permissions_boundary_usage_count(arn),
             )
         })
+    }
+
+    /// The delegation request `arn` names, if the account holds it.
+    ///
+    /// Every read of a delegation request addressed by ARN resolves it here, and the
+    /// held request answers only when its OWN ARN is the one asked for — the same
+    /// identity test [`Self::policy_by_arn`] applies to a managed policy — so an ARN
+    /// carrying another account's id names no request THIS account holds.
+    pub fn delegation_request_by_arn(&self, arn: &str) -> Option<&DelegationRequest> {
+        let parsed = parse_delegation_request_arn(arn)?;
+        let held = self.delegation_requests.get(&parsed.delegation_request_id)?;
+        (delegation_request_arn(&parsed.delegation_request_id) == arn).then_some(held)
     }
 
     /// The identity-based policies the IAM identity whose ARN is `arn` carries, or
@@ -1941,6 +1969,55 @@ pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
         path,
         policy_name: policy_name.to_string(),
     })
+}
+
+/// The parts of a delegation request's ARN that an operation taking one reads.
+#[derive(Debug, Clone)]
+pub struct DelegationRequestArn {
+    /// The ARN's account segment: the account that holds the request.
+    pub account: String,
+    /// The request's `DelegationRequestId`: the whole resource body.
+    pub delegation_request_id: String,
+}
+
+/// The parts of `arn` when it is a delegation request's ARN, or `None` when it is
+/// not one — which is what lets an operation taking an ARN of any entity kind tell
+/// the one kind it acts on from every other.
+///
+/// Such an ARN is `arn:<partition>:iam::<account>:delegation-request/<id>`, read
+/// through the same [`iam_arn_parts`] envelope as every other IAM ARN this crate
+/// parses; the identifier is the whole resource body, since
+/// `delegationRequestIdType`'s pattern (`^[\w-]+$`) admits no `/` and so no path.
+/// The account segment comes back with it for the same reason it does for a managed
+/// policy ([`parse_policy_arn`]): it is part of WHICH request the ARN names.
+pub fn parse_delegation_request_arn(arn: &str) -> Option<DelegationRequestArn> {
+    let (account, resource) = iam_arn_parts(arn)?;
+    let delegation_request_id = resource
+        .strip_prefix(DELEGATION_REQUEST_RESOURCE_TYPE)?
+        .strip_prefix('/')?;
+    if delegation_request_id.is_empty() || delegation_request_id.contains('/') {
+        return None;
+    }
+    Some(DelegationRequestArn {
+        account: account.to_string(),
+        delegation_request_id: delegation_request_id.to_string(),
+    })
+}
+
+/// The ARN of a delegation request:
+/// `arn:aws:iam::<account>:delegation-request/<id>`.
+///
+/// Built the same way [`user_arn`] is, from the
+/// [`DELEGATION_REQUEST_RESOURCE_TYPE`] resource type: IAM is a global service, so
+/// the region segment is empty, and a delegation request carries no path — its
+/// identifier is the whole resource body ([`parse_delegation_request_arn`] reads it
+/// back).
+pub fn delegation_request_arn(delegation_request_id: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("{DELEGATION_REQUEST_RESOURCE_TYPE}/{delegation_request_id}"),
+    )
 }
 
 /// The account and resource segments of `arn` when it is an IAM resource's ARN, or

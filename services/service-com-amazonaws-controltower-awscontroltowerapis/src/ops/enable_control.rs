@@ -337,14 +337,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
 
-        // A control is deployed into the regions the landing zone governs; with no
-        // landing zone deployed, the only region this request names is the one it was
-        // signed for.
-        let mut target_regions = store.governed_regions();
-        if target_regions.is_empty() {
-            target_regions.push(region);
-        }
-
         store.enabled_controls.insert(
             arn.clone(),
             crate::state::EnabledControl {
@@ -355,7 +347,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // configuration from no other enabled control.
                 parent_identifier: None,
                 parameters,
-                target_regions,
+                // The regions the control is deployed into are the ones the landing zone
+                // governs, which keeps changing after this call, so they are derived on
+                // every read rather than captured here. All this enablement contributes
+                // is the region it was signed for, the fallback while the account governs
+                // no region at all.
+                enablement_region: region,
                 status: crate::state::EnablementStatus::UnderChange,
                 last_operation_identifier: operation_identifier.clone(),
                 // Drift is not assessable until the configuration is deployed; `settle`

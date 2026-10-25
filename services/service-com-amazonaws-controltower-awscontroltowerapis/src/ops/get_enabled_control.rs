@@ -4,8 +4,8 @@
 //!
 //! Reports one enabled control, read from [`crate::state`] by the ARN `EnableControl`
 //! returned: the same persisted record `ListEnabledControls` summarises, plus the
-//! parameters and target regions the enablement was given. An identifier no enablement
-//! minted is `ResourceNotFoundException` (HTTP 404).
+//! parameters the enablement was given and the regions the landing zone governs now.
+//! An identifier no enablement minted is `ResourceNotFoundException` (HTTP 404).
 //!
 //! Implemented: this operation no longer answers HTTP 501. It is the round-trip reader
 //! for `EnableControl`, so it is implemented alongside it.
@@ -184,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The regions a control is deployed into track the landing zone's current
+        // governance rather than the enabling call, so they are derived here from what is
+        // deployed now.
+        let target_regions = store.target_regions_of(&control);
+
         Ok(GetEnabledControlOutput {
             enabled_control_details: EnabledControlDetails {
                 arn: Some(control.arn),
@@ -206,8 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
                 parent_identifier: control.parent_identifier,
                 target_regions: Some(
-                    control
-                        .target_regions
+                    target_regions
                         .into_iter()
                         .map(|name| Region { name: Some(name) })
                         .collect(),

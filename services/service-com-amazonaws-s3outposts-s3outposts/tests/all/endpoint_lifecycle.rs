@@ -1145,6 +1145,147 @@ async fn customer_owned_ip_without_a_coip_pool_is_refused() {
     }
 }
 
+/// `AccessType` and `CustomerOwnedIpv4Pool` name ONE network path, so a create supplies
+/// the CoIP pool exactly when the access type is the on-premises one: either member
+/// without the other is the modelled 400 that stores nothing, an accepted create reports
+/// back the pair it was given, and no endpoint the listings report ever pairs a pool with
+/// the VPC access type.
+#[tokio::test]
+async fn a_coip_pool_is_supplied_exactly_for_customer_owned_ip_access() {
+    let router = emulator();
+    let outpost_id = owned_outposts(&router).await[0].clone();
+
+    // Three values of `CustomerOwnedIpv4Pool`, whose pattern (from
+    // smithy_query(query="shape", shape="CreateEndpointRequest")) is
+    // `^ipv4pool-coip-([0-9a-f]{17})$`: the low, high and a mixed 17 hex digits.
+    const POOLS: [&str; 3] = [
+        "ipv4pool-coip-00000000000000001",
+        "ipv4pool-coip-fffffffffffffffff",
+        "ipv4pool-coip-0c1d2e3f405162739",
+    ];
+
+    let cases: Vec<(&str, Option<&str>, Option<&str>, u16)> = vec![
+        ("Private with a pool", Some("Private"), Some(POOLS[0]), 400),
+        (
+            "Private with another pool",
+            Some("Private"),
+            Some(POOLS[1]),
+            400,
+        ),
+        (
+            "no AccessType at all (defaults to Private) with a pool",
+            None,
+            Some(POOLS[2]),
+            400,
+        ),
+        (
+            "CustomerOwnedIp with no pool",
+            Some("CustomerOwnedIp"),
+            None,
+            400,
+        ),
+        (
+            "CustomerOwnedIp with its pool",
+            Some("CustomerOwnedIp"),
+            Some(POOLS[1]),
+            200,
+        ),
+        ("Private with no pool", Some("Private"), None, 200),
+        ("no AccessType at all and no pool", None, None, 200),
+    ];
+
+    let mut stored = list_endpoints(&router, "?maxResults=100")
+        .await
+        .endpoints()
+        .len();
+    let mut customer_owned_arn = None;
+    for (index, (case, access_type, pool, expected_status)) in cases.into_iter().enumerate() {
+        let mut request = json!({
+            "OutpostId": outpost_id,
+            "SubnetId": format!("subnet-0000000000000c{index:03x}"),
+            "SecurityGroupId": format!("sg-0000000000000c{index:03x}"),
+        });
+        if let Some(access_type) = access_type {
+            request["AccessType"] = json!(access_type);
+        }
+        if let Some(pool) = pool {
+            request["CustomerOwnedIpv4Pool"] = json!(pool);
+        }
+
+        let answer = create(&router, request).await;
+        assert_eq!(
+            answer.status, expected_status,
+            "case {case:?}: expected {expected_status}, got {} with {:?}",
+            answer.status, answer.body
+        );
+        if expected_status == 400 {
+            assert_eq!(
+                answer.error_code(),
+                "ValidationException",
+                "case {case:?}: a contradictory pair must be the modelled validation failure, got {:?}",
+                answer.body
+            );
+            assert!(
+                answer.message().contains("CustomerOwnedIpv4Pool"),
+                "case {case:?}: the refusal must name the member it is about, got {:?}",
+                answer.message()
+            );
+        } else {
+            stored += 1;
+            let arn = string_at(&answer.body, "EndpointArn");
+            let listed = list_endpoints(&router, "?maxResults=100").await;
+            let endpoint = endpoint_with_arn(&listed, &arn);
+            assert_eq!(
+                endpoint["AccessType"],
+                json!(access_type.unwrap_or("Private")),
+                "case {case:?}: AccessType must be the stored one, got {:?}",
+                endpoint["AccessType"]
+            );
+            assert_eq!(
+                endpoint["CustomerOwnedIpv4Pool"],
+                pool.map_or(Value::Null, |pool| json!(pool)),
+                "case {case:?}: the endpoint must report exactly the pool it was created with, got {:?}",
+                endpoint["CustomerOwnedIpv4Pool"]
+            );
+            if access_type == Some("CustomerOwnedIp") {
+                customer_owned_arn = Some(arn);
+            }
+        }
+
+        let listing = list_endpoints(&router, "?maxResults=100").await;
+        assert_eq!(
+            listing.endpoints().len(),
+            stored,
+            "case {case:?}: a refused create stores nothing and an accepted one stores exactly one"
+        );
+        for endpoint in listing.endpoints() {
+            let reports_pool = !endpoint["CustomerOwnedIpv4Pool"].is_null();
+            assert_eq!(
+                reports_pool,
+                endpoint["AccessType"] == json!("CustomerOwnedIp"),
+                "case {case:?}: a pool is reported exactly for CustomerOwnedIp access, got {endpoint:?}"
+            );
+        }
+    }
+
+    // The same pairing holds in the other listing's projection of the same record.
+    let arn = customer_owned_arn.expect("the CustomerOwnedIp create with its pool was accepted");
+    let shared = list_shared(&router, &format!("?outpostId={outpost_id}&maxResults=100")).await;
+    let endpoint = endpoint_with_arn(&shared, &arn);
+    assert_eq!(
+        endpoint["AccessType"],
+        json!("CustomerOwnedIp"),
+        "ListSharedEndpoints must report the stored AccessType, got {:?}",
+        endpoint["AccessType"]
+    );
+    assert_eq!(
+        endpoint["CustomerOwnedIpv4Pool"],
+        json!(POOLS[1]),
+        "ListSharedEndpoints must report the stored pool, got {:?}",
+        endpoint["CustomerOwnedIpv4Pool"]
+    );
+}
+
 /// `ListSharedEndpoints` reports the endpoints of the Outpost its `OutpostId` names — the
 /// caller's own endpoints on that Outpost included, since `CreateEndpoint` and
 /// `DeleteEndpoint` are its related actions and operate on exactly those — and an Outpost

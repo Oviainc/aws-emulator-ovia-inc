@@ -379,6 +379,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // `Description` is free text this cluster will carry and every describe of it
+        // will report, so its length is bounded before anything is persisted — through
+        // the one rule every write path that takes a description reads.
+        if let Some(message) = crate::state::description_rejection(input.description.as_deref())
+        {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // The request's tag keys are refused before the cluster is created: `Tag$Key`
         // may not be null, and the `aws:` prefix is reserved for AWS.
         if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
@@ -472,6 +484,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // A cluster runs in the subnets of a subnet group that exists:
+        // `SubnetGroupName` names a resource too, so it is resolved against the store
+        // before the ACL as well. This service keeps no subnet groups (every subnet
+        // group write path is still scaffolded, so none can ever have been created), so
+        // no name names one. The refusal is the service's own for this reference — the
+        // modelled COMBINATION fault, stating the rule rather than quoting the name.
+        if input.subnet_group_name.is_some() {
+            return Err(
+                CreateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::SUBNET_GROUP_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
         // The cluster's access control list must already exist: `ACLName` names a
         // resource, so an unknown one is resolved against state, not accepted.
         if !state.acls.contains_key(&acl_name) {
@@ -482,6 +510,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
             .into());
+        }
+        // So must the parameter group the cluster is created with: `ParameterGroupName`
+        // names a resource too (it decides which engine settings the cluster runs
+        // with), so it is resolved against the store exactly as the ACL above is —
+        // otherwise the cluster would be created pointing at a group no describe can
+        // report. `UpdateCluster` resolves a repoint through the same rule.
+        if let Some(parameter_group_name) = parameter_group_name.as_deref() {
+            if !state.parameter_groups.contains_key(parameter_group_name) {
+                return Err(CreateClusterErrorModeled::ParameterGroupNotFoundFault(
+                    ParameterGroupNotFoundFault {
+                        message: Some(crate::state::parameter_group_not_found_message(
+                            parameter_group_name,
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         let cluster = crate::state::StoredCluster {

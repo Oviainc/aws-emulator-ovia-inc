@@ -22,6 +22,12 @@
 //! answer, so an action that cannot be reached is logged and recorded in the alarm's history
 //! as a failed action, and changes nothing about what the caller is told.
 //!
+//! The topic is a resource of another service, so executing the action is a cross-service
+//! request: the target topic's own resource policy is evaluated for the service principal
+//! this service acts as ([`publish_refusal`]) before anything is published, and an explicit
+//! deny of the publish suppresses it — the action is then recorded as failed, with the
+//! authorization failure, and no subscriber of that topic is notified.
+//!
 //! Asynchronous also means NOBODY NEED CALL AGAIN: a client that publishes a datapoint or
 //! writes an alarm looks for the notification on the action's target, not at CloudWatch, so the
 //! transitions the clock makes due after that write are materialised — and the actions they
@@ -39,6 +45,28 @@ use ::serde_json::{Map, Value};
 use crate::ops::types::{AlarmHistoryItem, CompositeAlarm, Dimension, MetricAlarm};
 /// The ARN namespace of Amazon SNS, whose topics are the action kind this module delivers to.
 const SNS_ARN_NAMESPACE: &str = "sns";
+
+/// The service principal this service executes an alarm action as: the identity a target
+/// topic's own policy decides the publish for.
+const CLOUDWATCH_SERVICE_PRINCIPAL: &str = "cloudwatch.amazonaws.com";
+
+/// The IAM action publishing a notification to a topic performs on that topic, spelled the
+/// way Amazon SNS names its own actions in a topic policy (an action name is matched
+/// case-insensitively, so the spelling decides only the wording of a refusal).
+const PUBLISH_ACTION: &str = "SNS:Publish";
+
+/// The topic attribute carrying a topic's access policy, as `GetTopicAttributes` reports it.
+const POLICY_ATTRIBUTE: &str = "Policy";
+
+/// The condition key naming the resource a cross-service request came FROM — the alarm whose
+/// transition fired the action — which is what a topic policy may scope a statement by.
+const SOURCE_ARN_CONDITION_KEY: &str = "aws:SourceArn";
+
+/// The condition key naming the ACCOUNT that resource belongs to.
+const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
+
+/// The same account under the key a topic's own generated policy uses for it.
+const SOURCE_OWNER_CONDITION_KEY: &str = "aws:SourceOwner";
 
 /// The most characters an SNS `Subject` may carry: "Subjects must be ASCII text that begins
 /// with a letter, number, or punctuation mark; must not include line breaks or control
@@ -65,6 +93,9 @@ const NOTIFICATION_VERSION: &str = super::HISTORY_DATA_VERSION;
 pub struct AlarmNotification {
     /// The alarm whose transition owes this notification; its history records the delivery.
     pub alarm_name: String,
+    /// That alarm's own ARN: the resource the cross-service publish comes FROM, which a target
+    /// topic's policy may scope its grant to.
+    pub alarm_arn: Option<String>,
     /// Which kind of alarm that is, one of the modelled `AlarmType` values: what the history
     /// item recording the delivery is reported under.
     pub alarm_type: String,
@@ -276,6 +307,7 @@ impl Transition<'_> {
 
         Some(AlarmNotification {
             alarm_name: self.name.to_string(),
+            alarm_arn: self.arn.map(str::to_string),
             alarm_type: self.kind.to_string(),
             new_state_value: self.new_state_value.to_string(),
             actions,
@@ -298,7 +330,9 @@ impl Transition<'_> {
 /// may hold (`ResourceList` is modelled `@length 0..5`, its members `@length 1..1024`) and
 /// each carrying one bounded document (`StateReason` `@length 0..1023`, `StateReasonData`
 /// `@length 0..4000`), so the PRODUCT of the fan-out is capped and not just each factor of
-/// it. What the budget does not reach stays queued, within
+/// it. The authorization read an action owes ([`publish_refusal`]) is made at most once per
+/// (topic, alarm) pair per request, so it is bounded by that same budget. What the budget does
+/// not reach stays queued, within
 /// [`super::alarm_evaluation::MAX_PENDING_NOTIFICATIONS`], for the next call that settles —
 /// which is what AWS's own asynchronous delivery looks like to a caller.
 pub async fn settle_alarms<Eng: Send + Sync + 'static>(
@@ -344,6 +378,11 @@ async fn settle<Eng: Send + Sync + 'static>(
 
     let mut executed: Vec<(String, AlarmHistoryItem)> = Vec::new();
     let mut client: Option<(String, ::aws_sdk_sns::Client)> = None;
+    // Every authorization decision this request has already taken. One pass settles the
+    // notifications of SEVERAL alarms, and two of them may fire the same topic, so the pair is
+    // the key: the decision is taken with the FIRING ALARM's own ARN and account in the
+    // request context, which makes another alarm's publish to the same topic another question.
+    let mut decided: Vec<Decided> = Vec::new();
     for notification in owed {
         for action in &notification.actions {
             let Some(region) = ::service_common::arn::region_of(action, SNS_ARN_NAMESPACE) else {
@@ -365,6 +404,39 @@ async fn settle<Eng: Send + Sync + 'static>(
                     &client.insert((region.to_string(), fresh)).1
                 }
             };
+            let refusal = match decided
+                .iter()
+                .find(|held| held.is_about(action, notification.alarm_arn.as_deref()))
+            {
+                Some(held) => held.refusal.clone(),
+                None => {
+                    let refusal =
+                        publish_refusal(client, action, notification.alarm_arn.as_deref()).await;
+                    decided.push(Decided {
+                        topic: action.clone(),
+                        alarm_arn: notification.alarm_arn.clone(),
+                        refusal: refusal.clone(),
+                    });
+                    refusal
+                }
+            };
+            // A publish the topic's own policy DENIES is not made at all: the action is
+            // recorded as the authorization failure it was, and no subscriber of that topic
+            // sees a notification AWS would have suppressed.
+            if let Some(failure) = refusal {
+                ::tracing::warn!(
+                    alarm = %notification.alarm_name,
+                    action = %action,
+                    error = %failure,
+                    "this alarm action's topic denies this service the publish, so the \
+                     notification is withheld"
+                );
+                executed.push((
+                    notification.alarm_name.clone(),
+                    action_history_item(&notification, action, Some(&failure), now),
+                ));
+                continue;
+            }
             let published = client
                 .publish()
                 .topic_arn(action)
@@ -396,6 +468,28 @@ async fn settle<Eng: Send + Sync + 'static>(
     let mut store = state.lock();
     for (alarm_name, item) in executed {
         store.record_history(&alarm_name, now, item);
+    }
+}
+
+/// One authorization decision taken in this pass, remembered so the same question is not
+/// asked twice while it settles several notifications.
+///
+/// The question is a (topic, firing alarm) pair rather than a topic: [`publish_refusal`] puts
+/// the alarm's own ARN and account in the request context, so a policy statement scoped to one
+/// alarm decides only that alarm's publishes.
+struct Decided {
+    /// The topic the publish is aimed at.
+    topic: String,
+    /// The alarm whose transition fires it, as its ARN.
+    alarm_arn: Option<String>,
+    /// The authorization failure the topic's policy refuses it with, if it does.
+    refusal: Option<String>,
+}
+
+impl Decided {
+    /// Whether this decision is the one `topic` and `alarm_arn` ask for.
+    fn is_about(&self, topic: &str, alarm_arn: Option<&str>) -> bool {
+        self.topic == topic && self.alarm_arn.as_deref() == alarm_arn
     }
 }
 
@@ -639,6 +733,92 @@ fn action_history_item(
         history_summary: Some(bounded(summary)),
         history_data: Some(history_data),
         alarm_contributor_attributes: None,
+    }
+}
+
+/// The authorization failure the topic `topic_arn` refuses this alarm action with, or `None`
+/// when its own access policy does not refuse the publish.
+///
+/// A topic is a resource of another service, and this service reaches it as the service
+/// principal [`CLOUDWATCH_SERVICE_PRINCIPAL`] rather than as the topic's owner, so executing
+/// the action asks the ordinary IAM question — may this principal perform this action on this
+/// resource? — which is answered by the shared evaluation of policy documents over the topic's
+/// `Policy` attribute as the topic itself reports it, rather than by a reading of its own.
+///
+/// What refuses the publish is an EXPLICIT deny of it for that principal: an explicit deny is
+/// the one decision a resource policy takes that nothing else can override, and it refuses
+/// whatever else the policy allows. A policy that merely states no grant for the principal
+/// refuses nothing here, because this cross-service publish is one the topic's own account
+/// asked for by configuring the alarm action — the grant for it does not have to be written
+/// into the topic's policy, which is why an alarm action to a topic whose policy never
+/// mentions this principal is executed. That is deliberately narrower than the reading the
+/// SNS side applies to its own deliveries, where a subscribed queue receives nothing unless its
+/// policy ALLOWS the send: a subscription is a grant the queue's owner has to write, while an
+/// alarm action is one the topic's own owner configured on the alarm.
+///
+/// The request carries the keys such a policy scopes its statements by — the alarm's own ARN
+/// and the account it belongs to — so a statement conditioned on them is decided rather than
+/// left undecided.
+async fn publish_refusal(
+    client: &::aws_sdk_sns::Client,
+    topic_arn: &str,
+    alarm_arn: Option<&str>,
+) -> Option<String> {
+    // A topic this call could not read states nothing that could refuse the publish; the
+    // publish itself then answers for it, and a topic that does not exist refuses it with its
+    // own fault, which is the error the action is recorded with.
+    let policy = topic_policy(client, topic_arn).await?;
+    let principals = [CLOUDWATCH_SERVICE_PRINCIPAL.to_string()];
+    let mut context: Vec<(String, String)> = Vec::new();
+    if let Some(alarm_arn) = alarm_arn {
+        context.push((SOURCE_ARN_CONDITION_KEY.to_string(), alarm_arn.to_string()));
+        if let Some(account) = ::service_common::arn::parse(alarm_arn).map(|arn| arn.account) {
+            context.push((
+                SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
+                account.to_string(),
+            ));
+            context.push((SOURCE_OWNER_CONDITION_KEY.to_string(), account.to_string()));
+        }
+    }
+    let request =
+        ::service_common::iam_authorization::Request::new(PUBLISH_ACTION, topic_arn, &principals)
+            .with_context(&context);
+    let stated = ::service_common::iam_authorization::resource_decision(&policy, &request);
+    if stated != ::service_common::iam_authorization::Decision::Denied {
+        return None;
+    }
+    // The authorization decision, in the sentence AWS words an authorization failure in: who
+    // was refused, what action was asked for, which resource it was asked for, and what
+    // refused it.
+    Some(format!(
+        "User: {CLOUDWATCH_SERVICE_PRINCIPAL} is not authorized to perform: {PUBLISH_ACTION} on \
+         resource: {topic_arn} with an explicit deny in a resource-based policy"
+    ))
+}
+
+/// The `Policy` the topic `topic_arn` reports, or `None` when it reports none at all — which
+/// includes a topic this call could not read, where there is nothing to decide and the publish
+/// itself answers.
+async fn topic_policy(client: &::aws_sdk_sns::Client, topic_arn: &str) -> Option<String> {
+    let answered = client
+        .get_topic_attributes()
+        .topic_arn(topic_arn)
+        .send()
+        .await;
+    match answered {
+        Ok(answer) => answer
+            .attributes()
+            .and_then(|attributes| attributes.get(POLICY_ATTRIBUTE))
+            .cloned(),
+        Err(error) => {
+            ::tracing::warn!(
+                topic = %topic_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "this alarm action's topic could not be read, so its access policy is not \
+                 applied here and the publish answers for it"
+            );
+            None
+        }
     }
 }
 
