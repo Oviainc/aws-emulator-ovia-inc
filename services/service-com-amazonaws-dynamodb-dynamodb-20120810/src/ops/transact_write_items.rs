@@ -344,10 +344,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             std::collections::BTreeSet::new();
         let elements = actions.len();
         for (at, action) in actions.iter().enumerate() {
-            // A refusal the ITEM this element writes carries — a key attribute of a
-            // type the table does not declare for it — is decided when the transaction
-            // keys that item, so it cancels the transaction; see
-            // [`cancelled_by_element`].
+            // A refusal the ITEM this element writes carries against the TABLE's own
+            // schema — a key attribute of a type the table does not declare for it,
+            // its own key's or a secondary index's — is decided when the transaction
+            // prepares that item, so it cancels the transaction; see
+            // [`cancelled_by_element`]. A refusal about the VALUE the request carried
+            // (an empty key value, one past the documented key-value size limit) needs
+            // no table to decide, so it stays a request-level refusal and [`lift`]
+            // answers it directly.
             let keying = |error| cancelled_by_element(at, elements, error);
             let name = crate::state::resolve_table_name(action.table_name()).map_err(lift)?;
             let substitutions = crate::state::Substitutions::new(
@@ -388,7 +392,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     deny(table, action, now)?;
-                    table.check_index_key_limits(&item).map_err(lift)?;
+                    table.check_index_key_types(&item).map_err(keying)?;
+                    table.check_index_key_values(&item).map_err(lift)?;
                     Prepared {
                         key: table.key_of_item(&item).map_err(keying)?,
                         addressed: item.clone(),
@@ -461,11 +466,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
                         ));
                     }
-                    store
-                        .active_table(&region, &name, now)
-                        .map_err(lift)?
-                        .check_index_key_limits(&item)
-                        .map_err(lift)?;
+                    let table = store.active_table(&region, &name, now).map_err(lift)?;
+                    table.check_index_key_types(&item).map_err(keying)?;
+                    table.check_index_key_values(&item).map_err(lift)?;
                     Prepared {
                         key,
                         addressed: item.clone(),
@@ -924,18 +927,19 @@ fn lift(error: crate::state::RequestError) -> TransactWriteItemsError {
 const INVALID_PARAMETER_CLAUSE: &str = "One or more parameter values were invalid";
 
 /// Report a refusal the transaction decided for ONE element — the item it writes
-/// carrying a key attribute of a type the table does not declare — as the cancellation
-/// it is.
+/// carrying a key attribute of a type the table does not declare, for its own key schema
+/// or for a secondary index's — as the cancellation it is.
 ///
 /// "All of which must either succeed or fail": an element the transaction itself
-/// refuses when it keys that element's item cancels the whole request, so the answer is
-/// the `TransactionCanceledException` whose `CancellationReasons` name that element with
-/// `ValidationError` and every other element with `None`, since nothing was wrong with
-/// those ("Cancellation reason codes and possible error messages"). A refusal about the
-/// REQUEST rather than about an item it writes — a `Key` member that does not name this
-/// table's key attributes, an item addressed twice, an entry naming no operation, a
-/// table that is not there — is still answered directly, which is what [`lift`] does
-/// with it.
+/// refuses when it prepares that element's item against the TABLE's schema cancels the
+/// whole request, so the answer is the `TransactionCanceledException` whose
+/// `CancellationReasons` name that element with `ValidationError` and every other
+/// element with `None`, since nothing was wrong with those ("Cancellation reason codes
+/// and possible error messages"). A refusal about the REQUEST rather than about the item
+/// as the table's schema sees it — a `Key` member that does not name this table's key
+/// attributes, a key value that is empty or past its size limit, an item addressed
+/// twice, an entry naming no operation, a table that is not there — is still answered
+/// directly, which is what [`lift`] does with it.
 fn cancelled_by_element(
     at: usize,
     elements: usize,

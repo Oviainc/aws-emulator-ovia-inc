@@ -51,6 +51,9 @@ mod custom_lens_versions;
 #[path = "all/delete_idempotency.rs"]
 mod delete_idempotency;
 
+#[path = "all/get_agent_goal.rs"]
+mod get_agent_goal;
+
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 

@@ -47,7 +47,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, four SHARED STORES live here, each held once in the shared engine so
+//! Beside them, five SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
@@ -57,6 +57,11 @@
 //!   DB resource id — written by the database control planes when they mint one, read
 //!   by the services that monitor those resources, which cannot tell an RDS id from a
 //!   DocumentDB id by its form;
+//! * [`agentic_rft_jobs`], the SageMaker job directory the SageMaker control plane writes
+//!   (a create mints a job of a reinforcement-fine-tuning category) and the AgenticRFT job
+//!   runtime data plane reads — whose own API carries no job definition and no call that
+//!   creates one, so whether the job ARN a sampling request names exists at all is
+//!   knowable there only because the control plane recorded it;
 //! * [`feature_store_groups`], the SageMaker Feature Store feature-group directory the
 //!   SageMaker control plane writes (`CreateFeatureGroup` defines a group, its schema
 //!   and its two key feature names) and the FeatureStore Runtime data plane reads — whose
@@ -181,6 +186,10 @@
 
 pub mod rds_cluster_parameters;
 
+/// The SageMaker job directory the SageMaker control plane writes when it creates a job
+/// of a reinforcement-fine-tuning category, and the AgenticRFT job runtime data plane
+/// reads to resolve the job ARN its callers carry.
+pub mod agentic_rft_jobs;
 pub mod arn;
 pub mod bedrock;
 pub mod db_data_sources;

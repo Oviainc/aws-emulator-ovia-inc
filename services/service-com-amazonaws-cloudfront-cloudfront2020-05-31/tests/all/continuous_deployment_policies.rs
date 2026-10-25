@@ -57,7 +57,7 @@ use crate::distribution_lifecycle::{
 
 /// `POST /2020-05-31/continuous-deployment-policy` with the `ContinuousDeploymentPolicyConfig`
 /// document `body` (the operation's `@httpPayload` member).
-async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -69,7 +69,7 @@ async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/continuous-deployment-policy/{Id}`.
-async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",

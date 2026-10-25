@@ -229,6 +229,9 @@ mod stale_security_groups;
 mod state_roundtrip;
 #[path = "all/store_image_tasks.rs"]
 mod store_image_tasks;
+// Reserving part of a subnet's CIDR range, and reading the reservations of one subnet back.
+#[path = "all/subnet_cidr_reservations.rs"]
+mod subnet_cidr_reservations;
 #[path = "all/transit_gateway_acceptance.rs"]
 mod transit_gateway_acceptance;
 #[path = "all/transit_gateway_lifecycle.rs"]

@@ -266,8 +266,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut planned: Vec<(String, Vec<AddOn>)> =
             Vec::with_capacity(input.instance_names.len());
         for name in &input.instance_names {
-            let add_ons =
-                crate::state::add_ons_from_requests(name, &add_on_requests).map_err(invalid)?;
+            let add_ons = crate::state::add_ons_from_requests(
+                crate::state::ADD_ONS_LIST_MEMBER,
+                name,
+                &add_on_requests,
+            )
+            .map_err(invalid)?;
             planned.push((name.clone(), add_ons));
         }
 

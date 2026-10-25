@@ -59,6 +59,9 @@ mod recommendation_report;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 
+#[path = "all/regional_isolation.rs"]
+mod regional_isolation;
+
 #[path = "all/server_config.rs"]
 mod server_config;
 

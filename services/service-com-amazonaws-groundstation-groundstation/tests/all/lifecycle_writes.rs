@@ -810,7 +810,7 @@ async fn a_read_serializes_tags_as_a_map_even_when_the_resource_carries_none() {
         ),
     ];
 
-    for (case, tags) in tag_sets {
+    for (slot, (case, tags)) in tag_sets.into_iter().enumerate() {
         // A config: created with the tags, or with the member omitted entirely for the
         // untagged row — an omitted member is how an untagged resource is created.
         let sent_tags = (!tags.as_object().expect("a JSON object").is_empty())
@@ -849,13 +849,16 @@ async fn a_read_serializes_tags_as_a_map_even_when_the_resource_carries_none() {
             profile.field("tags")
         );
 
-        // A contact, read through `DescribeContact`.
+        // A contact, read through `DescribeContact`, in a window of its own per row: an
+        // antenna serves one pass at a time, so a second reservation of the SAME window at
+        // one ground station is refused.
         let profile_arn = profile.string("missionProfileArn");
+        let start = 1_800_000_000_i64 + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
         let mut reserve = json!({
             "missionProfileArn": profile_arn,
             "groundStation": "Ohio-1",
-            "startTime": 1_800_000_000_i64,
-            "endTime": 1_800_000_600_i64,
+            "startTime": start,
+            "endTime": start + 600,
         });
         if let Some(tags) = &sent_tags {
             reserve["tags"] = tags.clone();

@@ -11,8 +11,10 @@
 //! NOTHING IS ANALYSED: no call is transcribed, no call characteristic, sentiment or
 //! summary is derived and no category is matched, so the `Transcript` URI a completed
 //! job reports names a location nothing writes to (see
-//! [`crate::state::call_analytics_output_uri`]), and the `MediaFormat` /
-//! `MediaSampleRateHertz` the real service DETECTS from the media file stay absent.
+//! [`crate::state::call_analytics_output_uri`]). The language, `MediaFormat` and
+//! `MediaSampleRateHertz` the real service DETERMINES are not members of this request
+//! either: a job reports each of them when it finishes, determined from the record
+//! this operation stored (see [`crate::state::CallAnalyticsJobRecord::advance_clock`]).
 //! The job RECORD is what this emulates.
 //!
 //! The member combinations the request documents but the model cannot express — a
@@ -379,6 +381,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region,
             settings: input.settings,
             channel_definitions: input.channel_definitions,
+            // What the service determines about the call it is given is determined
+            // when the job finishes, not when it is accepted.
+            language_code: None,
+            identified_language_score: None,
+            media_format: None,
+            media_sample_rate_hertz: None,
             transcript: None,
             failure_reason: None,
             creation_time: now,
