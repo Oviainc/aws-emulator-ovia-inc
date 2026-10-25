@@ -70,6 +70,14 @@ pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemor
 /// to drive a recommendation that is computed over another service's resources and the
 /// utilization published for them.
 pub(crate) fn emulator_with_analysed_services() -> MultiServiceRouter {
+    emulator_with_analysed_services_and_engine().0
+}
+
+/// The same emulator, with the engine it was built on — for a suite that has to seed a
+/// CloudWatch series of the AWS-reserved namespace space ([`seed_cloudwatch_series`]), which
+/// no client call can write.
+pub(crate) fn emulator_with_analysed_services_and_engine(
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -80,9 +88,59 @@ pub(crate) fn emulator_with_analysed_services() -> MultiServiceRouter {
         ),
     );
     router.register_service(
-        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(engine),
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
     );
-    router
+    (router, engine)
+}
+
+/// Write datapoints straight into the CloudWatch metric store, the way the AWS service that
+/// OWNS the metric writes them.
+///
+/// A client cannot publish into the AWS-reserved namespace space: `PutMetricData` refuses a
+/// `Namespace` beginning with `AWS/` ("To avoid conflicts with Amazon Web Services service
+/// namespaces, you should not specify a namespace that begins with AWS/"), and the
+/// utilization Compute Optimizer analyses is exactly such a series (`AWS/ECS`), authored by
+/// the service that owns the resource. So a suite seeds it here and reads the recommendation
+/// computed from it over the wire, like any client.
+pub(crate) fn seed_cloudwatch_series(
+    engine: &Arc<engine::InMemoryEngine>,
+    namespace: &str,
+    metric_name: &str,
+    dimensions: &[(&str, &str)],
+    unit: Option<&str>,
+    at_secs: f64,
+    values: &[f64],
+) {
+    use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
+
+    let key = cloudwatch::MetricKey {
+        namespace: namespace.to_string(),
+        metric_name: metric_name.to_string(),
+        dimensions: dimensions
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect(),
+    };
+    let data: Vec<cloudwatch::StoredDatum> = values
+        .iter()
+        .map(|value| cloudwatch::StoredDatum {
+            timestamp_secs: at_secs,
+            sample_count: 1.0,
+            sum: *value,
+            minimum: *value,
+            maximum: *value,
+            unit: unit.map(ToString::to_string),
+            // The default `StorageResolution` of a published datum.
+            storage_resolution: 60,
+        })
+        .collect();
+    engine
+        .state::<cloudwatch::ComAmazonawsCloudwatchGraniteserviceversion20100801State>()
+        .lock()
+        .append_datapoints(key, data)
+        .expect("the metric store has room for the seeded series");
 }
 
 /// Call one Compute Optimizer operation and return the HTTP status and the parsed JSON body.
@@ -125,23 +183,6 @@ pub(crate) async fn call_ecs(
         "ecs",
         "application/x-amz-json-1.1",
         &format!("AmazonEC2ContainerServiceV20141113.{operation}"),
-        body,
-    )
-    .await
-}
-
-/// Call one CloudWatch operation.
-pub(crate) async fn call_cloudwatch(
-    router: &MultiServiceRouter,
-    operation: &str,
-    body: Value,
-) -> (u16, Value) {
-    dispatch(
-        router,
-        REGION,
-        "monitoring",
-        "application/x-amz-json-1.0",
-        &format!("GraniteServiceVersion20100801.{operation}"),
         body,
     )
     .await
