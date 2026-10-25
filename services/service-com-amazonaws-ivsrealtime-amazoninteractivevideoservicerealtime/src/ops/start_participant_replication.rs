@@ -2,8 +2,9 @@
 
 //! @op StartParticipantReplication
 //!
-//! Starts replicating a publishing participant of one stage into another, and persists
-//! the replica `ListParticipantReplicas` reports.
+//! Starts replicating a publishing participant of one stage into another: persists the
+//! replica `ListParticipantReplicas` reports, and the participants of the two sessions it
+//! names that `ListParticipants` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +103,12 @@ use crate::state::ResponseHeaderPolicy;
 /// The resource a participant-replica quota refusal names, as
 /// `crate::state::quota_exceeded_message` states it.
 const PARTICIPANT_REPLICA_QUOTA_RESOURCE: &str = "participant-replica";
+
+/// The resource a refusal over the participants of one stage session names, stated the
+/// same way: a replication puts a participant into each session it names, so the guard on
+/// those records (`crate::state::MAX_PARTICIPANTS_PER_SESSION`) is one this operation can
+/// meet.
+const PARTICIPANT_QUOTA_RESOURCE: &str = "participant";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -326,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // creating the token. If there is overlap in keys, the values in these attributes
         // are replaced" — so the source participant's own attributes first, then the
         // request's over them.
-        let mut attributes = participant.attributes;
+        let mut attributes = participant.attributes.clone();
         attributes.extend(requested_attributes);
 
         let sequence = store.next_sequence();
@@ -344,6 +351,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             started_at: ::std::time::SystemTime::now(),
             sequence,
         };
+
+        // A replicated participant IS a participant of both sessions the replica names:
+        // the publisher in the session it publishes in, and its replica in the destination
+        // stage's session. Those are the records `ListParticipants` reports, written
+        // through `crate::state::record_replicated_participant`; what each reports about
+        // this replication is read back off the replication itself, so nothing here
+        // duplicates it.
+        //
+        // Written BEFORE the replication is persisted, so a replication whose participants
+        // this store cannot hold persists nothing at all.
+        if let Err(refusal) =
+            crate::state::record_replicated_participant(&mut store, &record, &participant)
+        {
+            return Err(match refusal {
+                // This emulator's own guard on the records one session holds, answered the
+                // way every other resource guard of this service is.
+                crate::state::ReplicatedParticipantRefusal::SessionFull { .. } => {
+                    crate::state::quota_exceeded(
+                        StartParticipantReplicationErrorModeled::ServiceQuotaExceededException,
+                        PARTICIPANT_QUOTA_RESOURCE,
+                        crate::state::MAX_PARTICIPANTS_PER_SESSION,
+                    )
+                }
+                // The session of a stage this store no longer holds: not a quota, so it is
+                // answered as the missing resource it is.
+                crate::state::ReplicatedParticipantRefusal::NoSuchSession { stage_arn } => {
+                    crate::state::resource_not_found(
+                        StartParticipantReplicationErrorModeled::ResourceNotFoundException,
+                        &stage_arn,
+                    )
+                }
+            });
+        }
 
         // Replication starting is an occurrence during the session the replicated
         // publisher is in, which is what `ListParticipantEvents` reports: the model marks

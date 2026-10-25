@@ -343,9 +343,13 @@ async fn an_instance_is_readable_taggable_and_deletable_only_in_its_own_region()
 #[tokio::test]
 async fn a_volume_is_deletable_only_in_the_region_it_was_created_in() {
     // The zone letter varies with the row so the rule is asserted across the zones a
-    // Region has (`wsinst::state::AVAILABILITY_ZONE_LETTERS`), not just the first one.
-    let letters = wsinst::state::AVAILABILITY_ZONE_LETTERS;
+    // Region has — each Region's OWN letters
+    // (`wsinst::state::availability_zone_letters`), which differ per Region — not just
+    // the first one.
     for (row, (created_in, foreign)) in region_pairs().into_iter().enumerate() {
+        let letters: Vec<char> = wsinst::state::availability_zone_letters(created_in)
+            .chars()
+            .collect();
         let letter = letters[row % letters.len()];
         let case = format!("volume in {created_in}{letter}, deleted from {foreign}");
         let (router, _engine) = harness();
@@ -504,9 +508,11 @@ async fn the_quota_counters_are_per_region() {
             )
             .await;
         }
+        let letters: Vec<char> = wsinst::state::availability_zone_letters(region)
+            .chars()
+            .collect();
         for index in 0..volumes {
-            let letter = wsinst::state::AVAILABILITY_ZONE_LETTERS
-                [index % wsinst::state::AVAILABILITY_ZONE_LETTERS.len()];
+            let letter = letters[index % letters.len()];
             create_volume_in(&router, region, &case, letter, json!({})).await;
         }
     }
@@ -617,7 +623,16 @@ async fn every_region_the_service_reports_can_hold_a_resource() {
             vec![id.clone()],
             "case {case:?}: expected the Region to report only {id:?}, got {listed:?}"
         );
-        let volume = create_volume_in(&router, region, &case, 'b', json!({})).await;
+        // The LAST zone letter this Region publishes, which differs from Region to
+        // Region (`wsinst::state::availability_zone_letters`): a Region's zone set is
+        // its own, not a run of the same three letters everywhere.
+        let letter = wsinst::state::availability_zone_letters(region)
+            .chars()
+            .next_back()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a Region the service reports must publish zones")
+            });
+        let volume = create_volume_in(&router, region, &case, letter, json!({})).await;
         ok_in(
             &router,
             region,

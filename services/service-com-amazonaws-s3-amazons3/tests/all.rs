@@ -47,6 +47,8 @@ mod bucket_policy_status;
 mod bucket_public_access_block;
 #[path = "all/bucket_replication.rs"]
 mod bucket_replication;
+#[path = "all/bucket_request_payment.rs"]
+mod bucket_request_payment;
 #[path = "all/bucket_subresource_absent_messages.rs"]
 mod bucket_subresource_absent_messages;
 #[path = "all/bucket_tagging.rs"]

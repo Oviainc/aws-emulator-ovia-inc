@@ -399,6 +399,17 @@ pub fn rule_selection_not_found_message() -> String {
     "One or more rules not found".to_string()
 }
 
+/// The message Elastic Load Balancing answers a `RuleNotFound` with for an operation
+/// that addresses ONE rule through its own required `RuleArn` (`DeleteRule`).
+///
+/// Built from the request: the identifier it names is the only thing the caller can act
+/// on, exactly as the listener-addressing operations quote their `ListenerArn` back
+/// ([`listener_not_found_message`]), while a read over a LIST of rule identifiers names
+/// no value ([`rule_selection_not_found_message`]).
+pub fn rule_not_found_message(arn: &str) -> String {
+    format!("Rule '{arn}' not found")
+}
+
 /// The published maximum length of a load balancer name, from `CreateLoadBalancer`'s
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const LOAD_BALANCER_NAME_MAX_LENGTH: usize = 32;
@@ -1488,12 +1499,84 @@ impl RuleRecord {
         Rule {
             rule_arn: Some(self.arn.clone()),
             priority: Some(self.priority.to_string()),
-            conditions: Some(self.conditions.clone()),
+            // Each condition is reported under every spelling the model gives its
+            // field, which is not always the spelling the create used
+            // ([`reported_condition`]).
+            conditions: Some(self.conditions.iter().map(reported_condition).collect()),
             actions: Some(self.actions.clone()),
             // Only the rule a listener mints with itself is the default one.
             is_default: Some(false),
             transforms: (!self.transforms.is_empty()).then(|| self.transforms.clone()),
         }
+    }
+}
+
+/// One rule CONDITION as a read reports it: the arrays it matches on under every
+/// spelling the model gives that field, and nothing under a spelling the field has none
+/// of.
+///
+/// `RuleCondition` carries a condition's values twice over — at the top level (`Values`,
+/// `RegexValues`) and inside the field's own configuration shape — and the model
+/// documents the top-level member as the ALTERNATIVE to the configuration one for the
+/// fields it names: `Values` is to be specified "only when Field is host-header or
+/// path-pattern. Alternatively, to specify multiple host names or multiple path patterns,
+/// use HostHeaderConfig or PathPatternConfig", and `RegexValues` "only when Field is
+/// http-header, host-header, or path-pattern". Two spellings of ONE array, so a read
+/// answers both of the spellings a field has whichever one the create carried, and
+/// reports a member the field has no top-level spelling for not at all — absent, which is
+/// a different answer from an empty list.
+fn reported_condition(condition: &RuleCondition) -> RuleCondition {
+    let mut reported = condition.clone();
+    let field = condition.field.clone().unwrap_or_default();
+    match field.as_str() {
+        "host-header" => {
+            let mut config = reported.host_header_config.take().unwrap_or_default();
+            mirror_condition_values(&mut reported.values, &mut config.values);
+            mirror_condition_values(&mut reported.regex_values, &mut config.regex_values);
+            reported.host_header_config =
+                (config.values.is_some() || config.regex_values.is_some()).then_some(config);
+        }
+        "path-pattern" => {
+            let mut config = reported.path_pattern_config.take().unwrap_or_default();
+            mirror_condition_values(&mut reported.values, &mut config.values);
+            mirror_condition_values(&mut reported.regex_values, &mut config.regex_values);
+            reported.path_pattern_config =
+                (config.values.is_some() || config.regex_values.is_some()).then_some(config);
+        }
+        "http-header" => {
+            // This field has a top-level spelling for its REGULAR EXPRESSIONS and none
+            // for its values: the header a condition matches on and the strings it
+            // compares against are named together, inside the configuration shape.
+            reported.values = None;
+            let mut config = reported.http_header_config.take().unwrap_or_default();
+            mirror_condition_values(&mut reported.regex_values, &mut config.regex_values);
+            reported.http_header_config = (config.http_header_name.is_some()
+                || config.values.is_some()
+                || config.regex_values.is_some())
+            .then_some(config);
+        }
+        // Every other documented field — `query-string`, `http-request-method` and
+        // `source-ip` — the model gives no top-level spelling at all, so neither member
+        // is reported for it.
+        _ => {
+            reported.values = None;
+            reported.regex_values = None;
+        }
+    }
+    reported
+}
+
+/// Fill in whichever of the two spellings of one condition array was left out, leaving a
+/// spelling the caller gave exactly as it was given.
+///
+/// An EMPTY array is not mirrored: the model states that "the value for a condition can't
+/// be empty", so there is nothing in it to answer under the other spelling, and a member
+/// the request carried empty stays empty rather than turning into an absent one.
+fn mirror_condition_values(direct: &mut Option<Vec<String>>, configured: &mut Option<Vec<String>>) {
+    match (direct.as_deref(), configured.as_deref()) {
+        (Some(values), None) if !values.is_empty() => *configured = direct.clone(),
+        (None, Some(values)) if !values.is_empty() => *direct = configured.clone(),
+        _ => {}
     }
 }
 
@@ -2025,6 +2108,35 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
         self.rules_of(listener)
             .into_iter()
             .find(|rule| rule.rule_arn.as_deref() == Some(arn))
+    }
+
+    /// Remove ONE rule a caller added — from the listener that holds it, and with it
+    /// every target group association no remaining action of its load balancer keeps
+    /// alive — answering whether it was there.
+    ///
+    /// The owning listener is resolved from the rule ARN itself, as [`Self::rule_record`]
+    /// resolves it, so nothing scans the store. A listener's DEFAULT rule is NOT removed
+    /// here: it has no record of its own, being derived from the listener
+    /// ([`ListenerRecord::default_rule`]), and the operation that would remove it refuses
+    /// instead.
+    pub fn remove_rule(&mut self, arn: &str) -> bool {
+        let Some(listener_arn) = rule_listener_arn(arn) else {
+            return false;
+        };
+        let Some(listener) = self.listeners.get_mut(&listener_arn) else {
+            return false;
+        };
+        let held = listener.rules.len();
+        listener.rules.retain(|rule| rule.arn != arn);
+        if listener.rules.len() == held {
+            return false;
+        }
+        // A load balancer routes to a target group an action of any of its rules forwards
+        // to, so the rule going away can be what releases that association — and what
+        // lets the target group be deleted.
+        let load_balancer_arn = listener.load_balancer_arn.clone();
+        self.refresh_target_group_associations(&load_balancer_arn);
+        true
     }
 
     /// How many rules a caller has added across every listener of `load_balancer_arn`,

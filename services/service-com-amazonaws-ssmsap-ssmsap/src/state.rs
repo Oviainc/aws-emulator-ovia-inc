@@ -292,6 +292,15 @@ pub const MAX_PERMISSIONED_RESOURCES: usize = 1_000;
 /// [`MAX_PERMISSIONED_RESOURCES`].
 pub const MAX_PERMISSION_SOURCES_PER_RESOURCE: usize = 100;
 
+/// How many tags this emulator will hold for ONE resource.
+///
+/// Neither the model nor this operation's documentation states a tag count, so this is
+/// the emulator's own ceiling rather than a fidelity claim about a published quota: it
+/// is what stops a caller looping on `TagResource` with fresh keys growing this
+/// process's memory without bound. It is reported with `ValidationException`, which
+/// every tagging call models.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The grants held for ONE resource: `PermissionActionType` -> the source resource
 /// ARNs permitted to take that action on it.
 ///
@@ -1267,15 +1276,32 @@ impl RegionState {
         // exists. Its `Operation` records stay: they are the history of calls already
         // made, which `GetOperation` resolves by id, and [`MAX_RETAINED_OPERATIONS`] is
         // what bounds them.
-        let completed: Vec<(String, String)> = self
+        //
+        // The tags that go with it are the ones held for every resource of that
+        // registration — the application's own ARN and the ARNs of the databases
+        // DERIVED from it ([`StoredApplication::databases`]), since a database cannot
+        // outlive the registration it came from and neither can what was tagged on it.
+        let completed: Vec<(String, Vec<String>)> = self
             .applications
             .values()
             .filter(|application| application.removal_due(now))
-            .map(|application| (application.id.clone(), application.arn.clone()))
+            .map(|application| {
+                let region = arn_region(&application.arn);
+                let mut arns = vec![application.arn.clone()];
+                arns.extend(
+                    application
+                        .databases(region)
+                        .into_iter()
+                        .map(|database| database.arn),
+                );
+                (application.id.clone(), arns)
+            })
             .collect();
-        for (id, arn) in completed {
+        for (id, arns) in completed {
             self.applications.remove(&id);
-            self.tags_by_arn.remove(&arn);
+            for arn in arns {
+                self.tags_by_arn.remove(&arn);
+            }
             self.forget_configuration_checks_for(&id);
         }
         for operation in self.operations.values_mut() {
@@ -1338,6 +1364,47 @@ impl RegionState {
             .get(arn)
             .filter(|tags| !tags.is_empty())
             .cloned()
+    }
+
+    /// Attach `tags` to the resource `arn` names, in the one place this service keeps
+    /// tags ([`Self::tags_by_arn`]), so every later read reports them.
+    ///
+    /// Tagging MERGES into what the resource already holds: a key it does not hold is
+    /// added, a key it holds takes the value this call carries, and a key this call
+    /// does not name keeps the value it had. So tagging the same pair twice leaves ONE
+    /// tag and the second call changes nothing, and a call that carries no tags at all
+    /// leaves the set exactly as it was.
+    ///
+    /// Refused with [`validation`] when the resource would be left holding more than
+    /// [`MAX_TAGS_PER_RESOURCE`] tags; a refused call writes nothing.
+    pub fn apply_tags(
+        &mut self,
+        arn: &str,
+        tags: &HashMap<String, String>,
+    ) -> Result<(), ValidationException> {
+        if tags.is_empty() {
+            // Nothing to attach, so nothing is written — not even an empty entry for a
+            // resource no tag is held for.
+            return Ok(());
+        }
+        let held = self.tags_by_arn.get(arn);
+        // Only a key the resource does not already hold grows the set; a key it holds
+        // is overwritten in place.
+        let added = tags
+            .keys()
+            .filter(|key| held.is_none_or(|held| !held.contains_key(*key)))
+            .count();
+        let would_hold = held.map_or(0, HashMap::len) + added;
+        if would_hold > MAX_TAGS_PER_RESOURCE {
+            return Err(validation(format!(
+                "this emulator holds at most {MAX_TAGS_PER_RESOURCE} tags per resource, but this request would leave {arn} holding {would_hold}"
+            )));
+        }
+        let held = self.tags_by_arn.entry(arn.to_string()).or_default();
+        for (key, value) in tags {
+            held.insert(key.clone(), value.clone());
+        }
+        Ok(())
     }
 
     /// Whether `arn` names a resource THIS Region holds.
@@ -1815,6 +1882,18 @@ pub fn database_arn(region: &str, application_id: &str, database_id: &str) -> St
         region,
         &format!("database/{application_id}/{database_id}"),
     )
+}
+
+/// The Region an ARN carries: the fourth colon-separated field of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`, empty for an ARN that
+/// has none.
+///
+/// A partition holds the ARNs of ONE Region ([`RegionState`]), so this is how a record
+/// that holds only its own ARN — the one [`RegionState::settle`] is removing, say —
+/// recovers the Region its derived resources' ARNs are minted in
+/// ([`StoredApplication::databases`]) without a handler passing it in.
+pub fn arn_region(arn: &str) -> &str {
+    arn.split(':').nth(3).unwrap_or_default()
 }
 
 /// The `DatabaseId` of the SAP HANA database named `database_name`.

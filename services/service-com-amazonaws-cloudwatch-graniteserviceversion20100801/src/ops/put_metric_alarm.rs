@@ -895,6 +895,13 @@ fn write_alarm(
         .alarms
         .get(&input.alarm_name)
         .map(|stored| stored.alarm.clone());
+    // The tag set the alarm already carries, which an update keeps
+    // (`PutMetricAlarmInput$Tags`).
+    let existing_tags = store
+        .alarms
+        .get(&input.alarm_name)
+        .map(|stored| stored.tags.clone())
+        .unwrap_or_default();
     let existing = previous.as_ref().map(|alarm| {
         (
             alarm.state_value.clone(),
@@ -992,7 +999,15 @@ fn write_alarm(
         input.alarm_name.clone(),
         crate::state::StoredAlarm {
             alarm,
-            tags: input.tags.clone().unwrap_or_default(),
+            // "If you are using this operation to update an existing alarm, any tags you
+            // specify in this parameter are ignored. To change the tags of an existing
+            // alarm, use TagResource or UntagResource." (`PutMetricAlarmInput$Tags`) — so an
+            // update keeps the tag set the alarm already carries, whatever the request named.
+            tags: if is_update {
+                existing_tags
+            } else {
+                input.tags.clone().unwrap_or_default()
+            },
             // "When this operation creates an alarm, the alarm state is immediately set
             // to INSUFFICIENT_DATA. The alarm is then evaluated and its state is set
             // appropriately." — so this write starts the span during which the alarm

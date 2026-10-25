@@ -23,6 +23,8 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_REGION;
+
 use crate::transcription_jobs::Transcribe;
 
 /// The modelled client error this service answers for an ARN that names no stored
@@ -47,12 +49,16 @@ struct Reader {
 /// One resource family: the ARN `<type>` segment that names it, the create that
 /// establishes a record of it, and the read that reports its tags (when the model gives
 /// that family's output shape a `Tags` member at all).
-struct Family {
-    case: &'static str,
+///
+/// `pub(crate)`, with the members a table of families needs: `crate::tagging_arn_qualifiers`
+/// drives the SAME families through the same creates rather than writing a second copy of
+/// this table.
+pub(crate) struct Family {
+    pub(crate) case: &'static str,
     /// The ARN resource type, as the `TranscribeArn` pattern's `<type>/<name>` segment
     /// spells it for this family.
-    resource_type: &'static str,
-    create: &'static str,
+    pub(crate) resource_type: &'static str,
+    pub(crate) create: &'static str,
     /// This family's create request for a resource named `name`, without `Tags`.
     base_request: fn(&str) -> Value,
     /// `None` for a family no operation of which reports `Tags`: `VocabularyInfo`,
@@ -68,7 +74,7 @@ struct Family {
 /// CreateMedicalVocabulary,CreateVocabularyFilter,CreateLanguageModel,\
 /// CreateCallAnalyticsCategory,StartMedicalScribeJob,StartMedicalTranscriptionJob")`), so
 /// each family's records carry a tag set the three tagging operations own.
-fn families() -> Vec<Family> {
+pub(crate) fn families() -> Vec<Family> {
     vec![
         Family {
             case: "transcription job",
@@ -207,7 +213,7 @@ fn families() -> Vec<Family> {
 
 impl Family {
     /// This family's create request for `name`, carrying `tags` when any are given.
-    fn create_request(&self, name: &str, tags: &[(&str, &str)]) -> Value {
+    pub(crate) fn create_request(&self, name: &str, tags: &[(&str, &str)]) -> Value {
         let mut request = (self.base_request)(name);
         if !tags.is_empty() {
             request["Tags"] = tag_list(tags);
@@ -216,23 +222,30 @@ impl Family {
     }
 
     /// The ARN of this family's resource named `name`, as the three tagging operations
-    /// take it.
+    /// take it: the ARN this service hands out for a request served in the emulator's
+    /// default Region.
     fn arn(&self, name: &str) -> String {
-        format!(
-            "arn:aws:transcribe:us-east-1:{account}:{resource_type}/{name}",
-            account = engine::emulator_account_id(),
-            resource_type = self.resource_type,
+        self.arn_in(DEFAULT_REGION, name)
+    }
+
+    /// The same ARN for a request served in `region` — built through the framework's own
+    /// ARN helper, so no test names a partition or an account literal.
+    pub(crate) fn arn_in(&self, region: &str, name: &str) -> String {
+        engine::emulator_arn(
+            "transcribe",
+            region,
+            &format!("{}/{name}", self.resource_type),
         )
     }
 
     /// The name this suite gives a resource of this family in `scenario`.
-    fn resource_name(&self, scenario: &str) -> String {
+    pub(crate) fn resource_name(&self, scenario: &str) -> String {
         format!("{scenario}-{}", self.resource_type)
     }
 }
 
 /// `tags` as the modelled `TagList` reaches the wire.
-fn tag_list(tags: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_list(tags: &[(&str, &str)]) -> Value {
     tags.iter()
         .map(|(key, value)| json!({"Key": key, "Value": value}))
         .collect()
@@ -240,7 +253,7 @@ fn tag_list(tags: &[(&str, &str)]) -> Value {
 
 /// The tag pairs a `Tags` list carries, sorted by key so a comparison is about the SET
 /// a resource holds rather than the order a merge happened to leave it in.
-fn pairs(tags: &Value, case: &str) -> Vec<(String, String)> {
+pub(crate) fn pairs(tags: &Value, case: &str) -> Vec<(String, String)> {
     let mut found: Vec<(String, String)> = tags
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a Tags list, got {tags:?}"))
@@ -260,7 +273,7 @@ fn pairs(tags: &Value, case: &str) -> Vec<(String, String)> {
 }
 
 /// The same pairs, from a `(key, value)` table.
-fn expected_pairs(tags: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn expected_pairs(tags: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut expected: Vec<(String, String)> = tags
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))

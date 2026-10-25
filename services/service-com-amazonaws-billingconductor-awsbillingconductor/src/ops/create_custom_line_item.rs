@@ -256,6 +256,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "The Amazon Web Services account in which this custom line item will be
+        // applied to": the charge lands on that account's bill, and the only accounts
+        // this billing group bills are its own members — so an account the group does
+        // not bill cannot carry the item's charge.
+        if let Some(account_id) = &input.account_id {
+            if !state.billing_group_bills_account(&billing_group_arn, account_id) {
+                return Err(validation(
+                    "ILLEGAL_ACCOUNT_ID",
+                    "AccountId",
+                    format!(
+                        "account {account_id} is not an account of the billing group \
+                         {billing_group_arn}"
+                    ),
+                ));
+            }
+        }
+
         // The range the item is effective in: the start is inclusive and the end
         // exclusive, so the end has to be a LATER billing period than the start.
         let period_range = input.billing_period_range.clone();
@@ -272,8 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A list of resource ARNs to associate to the percentage custom line item."
-        // Each one has to name a stored billing group or custom line item, and naming
-        // the same resource twice would ask for one association twice.
+        // Each one has to name a stored billing group or custom line item IN SCOPE of
+        // the billing group this item applies to (see
+        // [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::out_of_scope_association`]),
+        // and naming the same resource twice would ask for one association twice.
         let associated_values = percentage
             .as_ref()
             .and_then(|percentage| percentage.associated_values.clone())
@@ -288,6 +307,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     format!("the resource {value} does not exist"),
                 ));
             };
+            // The resources a percentage item's charge is computed over are the ones
+            // its own billing group carries: that group, and the custom line items of
+            // that same group.
+            if let Some(fault) = state.out_of_scope_association(&billing_group_arn, &arn) {
+                return Err(validation(
+                    fault.validation_reason(),
+                    "ChargeDetails.Percentage.AssociatedValues",
+                    fault.message(&billing_group_arn, &arn),
+                ));
+            }
             // The duplicate check is on the RESOLVED ARN, because a full ARN and the
             // bare id the member also admits name ONE resource: that is the same
             // identity `BatchAssociateResourcesToCustomLineItem` is idempotent over,

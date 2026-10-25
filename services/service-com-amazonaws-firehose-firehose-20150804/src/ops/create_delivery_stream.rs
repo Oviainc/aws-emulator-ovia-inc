@@ -493,9 +493,13 @@ fn role_arns(input: &CreateDeliveryStreamInput) -> Vec<&str> {
 /// than one.
 ///
 /// Credentials the caller supplies inside a configuration (a Redshift password, a
-/// Snowflake private key or passphrase, an HTTP endpoint access key) are dropped rather
-/// than stored: every one is `@sensitive` and no modelled description carries it back, so
-/// the emulator has no reason to keep it.
+/// Snowflake private key or passphrase) are dropped rather than stored: every one is
+/// `@sensitive` and no modelled description carries it back, so the emulator has no reason
+/// to keep it. An HTTP endpoint's `AccessKey` is the exception, because the emulator DOES
+/// have a reason: it is "the access key required for Kinesis Firehose to authenticate with
+/// the HTTP endpoint selected as the destination", so every delivery request to that
+/// endpoint carries it (`crate::state::delivery`). It is still never reported back —
+/// `HttpEndpointDescription` models no such member.
 fn sole_destination(
     input: &CreateDeliveryStreamInput,
 ) -> Result<crate::state::DestinationConfigKind, CreateDeliveryStreamError> {
@@ -539,8 +543,7 @@ fn sole_destination(
             Kind::Splunk(Box::new(config)),
         ));
     }
-    if let Some(mut config) = input.http_endpoint_destination_configuration.clone() {
-        config.endpoint_configuration.access_key = None;
+    if let Some(config) = input.http_endpoint_destination_configuration.clone() {
         supplied.push((
             "HttpEndpointDestinationConfiguration",
             Kind::HttpEndpoint(Box::new(config)),

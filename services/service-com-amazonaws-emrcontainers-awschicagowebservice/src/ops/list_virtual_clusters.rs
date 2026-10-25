@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVirtualClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVirtualClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the virtual clusters this region's endpoint HOLDS, newest first, every one of
+//! them the record [`crate::ops::describe_virtual_cluster`] answers with.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVirtualClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@paginated` (`maxResults` + `nextToken`), and filtered by `states`,
+//! `containerProviderId`, `containerProviderType`, `eksAccessEntryIntegrated` and the
+//! `createdAfter` / `createdBefore` bounds; a filter the request omits constrains nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +85,87 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The opaque `nextToken` for the cluster the next page starts at: that cluster's place in
+/// the newest-first order, under this operation's cursor scope.
+///
+/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
+/// one encoder every paginated list in this service shares.
+fn encode_cursor(record: &crate::state::VirtualClusterRecord) -> String {
+    crate::state::encode_list_cursor(
+        crate::state::LIST_VIRTUAL_CLUSTERS_SCOPE,
+        record.created_at_millis,
+        record.sequence,
+    )
+}
+
+/// The place in the newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not one of THIS operation's
+/// cursors: a cursor another listing minted does not carry this scope.
+fn decode_cursor(token: &str) -> Option<(i64, u64)> {
+    crate::state::decode_list_cursor(crate::state::LIST_VIRTUAL_CLUSTERS_SCOPE, token)
+}
+
+/// Whether one stored virtual cluster satisfies every filter the request carried. A filter
+/// the request omitted constrains nothing.
+fn matches_filters(
+    record: &crate::state::VirtualClusterRecord,
+    input: &ListVirtualClustersInput,
+) -> bool {
+    // `states` keeps the clusters in any listed `VirtualClusterState`. An empty list names
+    // no state to keep out, so it constrains nothing.
+    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
+        if !states.contains(&record.state) {
+            return false;
+        }
+    }
+    // `containerProviderId` and `containerProviderType` name the container cluster the
+    // virtual cluster is registered with, matched exactly against the provider the record
+    // was created with: an id is a `ClusterId` and a type is a `ContainerProviderType`,
+    // neither of them a pattern.
+    if input
+        .container_provider_id
+        .as_deref()
+        .is_some_and(|wanted| wanted != record.container_provider.id)
+    {
+        return false;
+    }
+    if input
+        .container_provider_type
+        .as_deref()
+        .is_some_and(|wanted| wanted != record.container_provider.r#type)
+    {
+        return false;
+    }
+    // `eksAccessEntryIntegrated` selects the clusters whose container-provider access is
+    // managed through Amazon EKS access entries. Registering a virtual cluster here
+    // creates no EKS access entry — nothing in `CreateVirtualCluster` asks for one and no
+    // read reports one — so no stored cluster has that integration: the filter keeps every
+    // cluster when it asks for the ones without it and none when it asks for the ones
+    // with it.
+    if input.eks_access_entry_integrated == Some(true) {
+        return false;
+    }
+    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
+    // name an open interval and neither ever returns the cluster created exactly at a
+    // bound.
+    if input
+        .created_before
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    if input
+        .created_after
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    true
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +235,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVirtualClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVirtualClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVirtualClusters"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListVirtualClustersError::Modeled(
+                ListVirtualClustersErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the virtual cluster store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        let mut state = store.lock();
+        // Reporting, but it materialises what the clock already owed: a cluster's
+        // TERMINATING -> TERMINATED step was due at that instant whether or not anybody
+        // listed, so the state a listing reports is the state a describe reports.
+        state.settle();
+
+        // `maxResults` is the page size. The model declares no range for it, but a page of
+        // fewer than one item is not a page, so it is refused rather than silently read as
+        // "no limit".
+        let page_size = match input.max_results {
+            Some(limit) if limit < 1 => {
+                return Err(ListVirtualClustersErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, but {limit} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => None,
+        };
+
+        // Newest first, over the clusters THIS region holds: a cluster created at another
+        // region's endpoint is not one this endpoint lists. The creation sequence breaks a
+        // tie between two clusters created in the same millisecond, so the order is total
+        // and a page boundary never depends on hash order.
+        let mut matching: Vec<&crate::state::VirtualClusterRecord> = state
+            .region_virtual_clusters(&region)
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        matching.sort_by(|left, right| {
+            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
+        });
+
+        // `nextToken` is the cursor the previous page ended on: the POSITION in the
+        // newest-first order of the next cluster to report, not the identity of a row. So a
+        // cluster whose state changed between pages (a TERMINATING one that reached
+        // TERMINATED, say, under a `states` filter) cannot invalidate a token the client
+        // already holds: resuming reports everything ordered after the cursor, with no
+        // repeats and no gaps.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = decode_cursor(token) else {
+                    return Err(ListVirtualClustersErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("nextToken is not a valid pagination token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let end = page_size.map_or(matching.len(), |size| {
+            start.saturating_add(size).min(matching.len())
+        });
+        // Each reported cluster is rendered through the one rendering a describe answers
+        // with, `schedulerStatus` included, so the two readers cannot disagree.
+        let virtual_clusters: Vec<VirtualCluster> = matching[start..end]
+            .iter()
+            .map(|record| state.virtual_cluster_view_of(record))
+            .collect();
+        // A `nextToken` only when clusters remain after this page.
+        let next_token = matching.get(end).map(|record| encode_cursor(record));
+
+        Ok(ListVirtualClustersOutput {
+            virtual_clusters: Some(virtual_clusters),
+            next_token,
+        })
     }
 }

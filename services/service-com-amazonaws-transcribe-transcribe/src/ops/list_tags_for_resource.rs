@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -181,12 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in, which — with the emulator's partition
+        // and account — is what the ARN's own qualifiers have to name for it to name a
+        // resource this call can reach at all.
+        let region = crate::state::request_region(ctx.parts());
+
         let store = state.lock();
-        let Some(tags) = store.tags(&resource) else {
-            // An ARN that names no resource this account holds is this service's
-            // `BadRequestException` — the shape its recorded not-found responses
-            // carry — not the modelled `NotFoundException`, and the message names the
-            // KIND of resource the ARN's type segment denotes.
+        let Some(tags) = store.tags(&resource, &region) else {
+            // An ARN that names no resource this account holds in this Region is this
+            // service's `BadRequestException` — the shape its recorded not-found
+            // responses carry — not the modelled `NotFoundException`, and the message
+            // names the KIND of resource the ARN's type segment denotes. An ARN
+            // qualified for another partition, Region or account lands here too: the
+            // resource it names is not one this request can read, and a refusal that
+            // said so differently would tell the caller what another account holds.
             return Err(ListTagsForResourceErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::not_found_message(

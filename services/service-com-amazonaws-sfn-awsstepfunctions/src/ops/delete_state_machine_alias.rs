@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStateMachineAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStateMachineAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStateMachineAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: drops the alias record the ARN names, leaving the state machine
+//! versions it referenced where they are; this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +139,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStateMachineAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStateMachineAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStateMachineAlias"))
+        // `stateMachineAliasArn` (len 1..256) is modelled, so the centralized walk has
+        // already refused anything outside it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE anything is resolved from it, exactly as the
+        // describe and the update judge it: text that is not an alias ARN of this
+        // service in the region this endpoint serves — a malformed ARN, another
+        // service's, an unqualified state machine ARN, a version ARN — is a defect in
+        // the REQUEST, which `InvalidArn` reports, and never an alias that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_state_machine_alias_arn(
+            &input.state_machine_alias_arn,
+            &endpoint_region,
+        ) {
+            return Err(
+                DeleteStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // The one write this call makes before it looks anything up: a state machine
+        // whose removal the clock already owed is gone, and its aliases went with it.
+        store.settle(crate::state::now());
+
+        // Deleting an alias the store does not hold is a success all the same — the
+        // post-condition the caller asked for already holds, which is how this
+        // service's other deletes answer one that is already gone
+        // (`DeleteStateMachineVersion`, `DeleteStateMachine`). "When you delete a state
+        // machine alias, Step Functions doesn't delete the state machine versions that
+        // alias references", so this drops the pointer and nothing else.
+        store.remove_state_machine_alias(&input.state_machine_alias_arn);
+
+        Ok(DeleteStateMachineAliasOutput {})
     }
 }
