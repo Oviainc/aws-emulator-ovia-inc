@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The page-size window every MemoryDB listing serves, and how an identifier refusal
+//! The page-size window each MemoryDB listing serves, and how an identifier refusal
 //! names what it rejected — end to end over the wire.
 //!
 //! Every case drives the SAME path a client does: an `awsJson1_1` `POST /` with
@@ -10,18 +10,20 @@
 //!
 //! The rules under test, each over a SET of inputs rather than one recorded request:
 //!
-//! * a paginated listing serves a `MaxResults` inside the service's page-size window and
-//!   refuses one outside it with the modelled `InvalidParameterValueException` naming
-//!   both bounds — the SAME window on every paginated listing the service implements,
-//!   exercised at each bound, one past each bound and further out, each listing naming
-//!   its page size in the noun its own refusal uses;
+//! * a paginated listing serves a `MaxResults` inside the window ITS OWN resource
+//!   surface publishes and refuses one outside it with the modelled
+//!   `InvalidParameterValueException` naming both of that window's bounds — every
+//!   paginated listing the service implements, exercised at each bound of its own
+//!   window, one past each bound and further out, each listing naming its page size in
+//!   the noun its own refusal uses (the windows themselves, and that they differ per
+//!   surface, are asserted in `tests/all/access_control_page_size.rs`);
 //! * a served page size is APPLIED: the page holds exactly what the size allows (the
 //!   whole set when the set is smaller), a `NextToken` is handed out exactly when the
 //!   page stopped short of the set, and a request with no page size answers the whole
 //!   set;
 //! * a `NextToken` names a POSITION and nothing about the page that produced it: a walk
-//!   that changes `MaxResults` between pages, to any other size the window serves, still
-//!   visits the whole set once in the listing's own order;
+//!   that changes `MaxResults` between pages, to any other size that listing's window
+//!   serves, still visits the whole set once in the listing's own order;
 //! * an accepted page size really bounds the page: a listing whose set is larger than
 //!   the page hands out a full page and a token, and the pages concatenate to the whole
 //!   set;
@@ -34,18 +36,47 @@ use serde_json::{json, Value};
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
 
-/// The page-size window every MemoryDB listing serves, mirrored from
-/// `crate::state::MIN_MAX_RESULTS` / `MAX_MAX_RESULTS`: a page size inside it is served,
-/// one outside it is refused. Spelled out HERE rather than taken from the crate under
-/// test, so the assertions below are independent of the code that enforces the window.
-const WINDOW_MIN: i32 = 20;
-const WINDOW_MAX: i32 = 100;
+/// The page sizes ONE listing serves, with the noun its refusal names the page size
+/// with: a size inside the window is served, one outside it is refused. Spelled out HERE
+/// rather than taken from the crate under test, so the assertions below are independent
+/// of the code that enforces the windows.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    min: i32,
+    max: i32,
+    noun: &'static str,
+}
 
-/// What the service answers a page size outside the window with — the rule itself,
-/// naming both bounds. The BOUND is one rule for every listing; the noun is how that
-/// listing names its page size (mirrored from `crate::state::PageSizeNoun`).
-fn window_message(noun: &str) -> String {
-    format!("Invalid value for {noun}. Must be between {WINDOW_MIN} and {WINDOW_MAX}")
+/// The window the ACCESS-CONTROL listings serve (`DescribeUsers`, `DescribeACLs`).
+const ACCESS_CONTROL: Window = Window {
+    min: 1,
+    max: 50,
+    noun: "max results",
+};
+
+/// The window the CLUSTER-side listings serve (`DescribeClusters`, `DescribeEvents`,
+/// `DescribeEngineVersions`).
+const CLUSTER: Window = Window {
+    min: 20,
+    max: 100,
+    noun: "max records",
+};
+
+/// The window the parameter-group surface serves (`DescribeParameterGroups`,
+/// `DescribeParameters`): the cluster-side bounds under the other noun.
+const PARAMETER: Window = Window {
+    min: 20,
+    max: 100,
+    noun: "max results",
+};
+
+/// What a listing answers a page size outside its own window with — the rule itself,
+/// naming both of that window's bounds in the noun the listing words it with.
+fn window_message(window: Window) -> String {
+    format!(
+        "Invalid value for {}. Must be between {} and {}",
+        window.noun, window.min, window.max
+    )
 }
 
 /// The clauses of the identifier rule, which every spelling refusal ends with.
@@ -78,30 +109,30 @@ fn page_items(body: &Value, items: &str, case: &str) -> Vec<Value> {
 }
 
 /// Every paginated listing this service implements, with the member it answers its items
-/// in, the noun its own refusal names the page size with, and the rest of the request it
-/// needs (`DescribeParameters` names the group it lists for).
-fn listings(group: &str) -> Vec<(&'static str, &'static str, &'static str, Value)> {
+/// in, the page-size window ITS resource surface publishes, and the rest of the request
+/// it needs (`DescribeParameters` names the group it lists for).
+fn listings(group: &str) -> Vec<(&'static str, &'static str, Window, Value)> {
     vec![
-        ("DescribeUsers", "Users", "max records", json!({})),
-        ("DescribeACLs", "ACLs", "max records", json!({})),
-        ("DescribeClusters", "Clusters", "max records", json!({})),
+        ("DescribeUsers", "Users", ACCESS_CONTROL, json!({})),
+        ("DescribeACLs", "ACLs", ACCESS_CONTROL, json!({})),
+        ("DescribeClusters", "Clusters", CLUSTER, json!({})),
         (
             "DescribeParameterGroups",
             "ParameterGroups",
-            "max results",
+            PARAMETER,
             json!({}),
         ),
         (
             "DescribeEngineVersions",
             "EngineVersions",
-            "max records",
+            CLUSTER,
             json!({}),
         ),
-        ("DescribeEvents", "Events", "max records", json!({})),
+        ("DescribeEvents", "Events", CLUSTER, json!({})),
         (
             "DescribeParameters",
             "Parameters",
-            "max results",
+            PARAMETER,
             json!({ "ParameterGroupName": group }),
         ),
     ]
@@ -151,29 +182,30 @@ async fn seeded_store() -> (smithy_server_runtime::MultiServiceRouter, String) {
     (router, group)
 }
 
-/// A page size inside the window is served by every paginated listing, and it is
-/// APPLIED: the page holds exactly as many items as the size allows — the whole set when
-/// the set is smaller, the size itself when it is not — a `NextToken` is handed out
-/// exactly when the page stopped short of the set, and a request carrying no page size
-/// at all is served and answers the whole set.
+/// A page size inside a listing's own window is served by it, and it is APPLIED: the
+/// page holds exactly as many items as the size allows — the whole set when the set is
+/// smaller, the size itself when it is not — a `NextToken` is handed out exactly when the
+/// page stopped short of the set, and a request carrying no page size at all is served
+/// and answers the whole set.
 #[tokio::test]
 async fn a_page_size_inside_the_window_is_served_by_every_listing() {
     let (router, group) = seeded_store().await;
 
-    // The rows span the window: each bound, one inside each bound, and the middle.
-    let accepted = [
-        WINDOW_MIN,
-        WINDOW_MIN + 1,
-        (WINDOW_MIN + WINDOW_MAX) / 2,
-        WINDOW_MAX - 1,
-        WINDOW_MAX,
-    ];
-    for (operation, items, _, base) in listings(&group) {
+    for (operation, items, window, base) in listings(&group) {
+        // The rows span this listing's window: each bound, one inside each bound, and
+        // the middle.
+        let accepted = [
+            window.min,
+            window.min + 1,
+            (window.min + window.max) / 2,
+            window.max - 1,
+            window.max,
+        ];
         // The whole set, read at the top of the window, so each page below is checked
         // against the set's OWN size rather than a bound that is trivially met.
         let case = format!("{operation} whole set");
         let mut request = base.clone();
-        request["MaxResults"] = json!(WINDOW_MAX);
+        request["MaxResults"] = json!(window.max);
         let whole = ok(&router, operation, &request, &case).await;
         let total = page_items(&whole, items, &case).len();
         assert!(
@@ -215,25 +247,24 @@ async fn a_page_size_inside_the_window_is_served_by_every_listing() {
     }
 }
 
-/// A page size outside the window names no page: every paginated listing refuses it with
-/// the modelled invalid-value error, and the message states the window's own bounds in
-/// the noun that listing names its page size with.
+/// A page size outside a listing's own window names no page: the listing refuses it with
+/// the modelled invalid-value error, and the message states that window's own bounds in
+/// the noun the listing names its page size with.
 #[tokio::test]
 async fn a_page_size_outside_the_window_is_refused_with_the_window_message() {
     let (router, group) = seeded_store().await;
 
-    // The rows span the class on both sides of the window: one past each bound, the
-    // smallest positive size, zero, a negative size, and far above the upper bound.
-    let refused = [
-        WINDOW_MIN - 1,
-        1,
-        0,
-        -1,
-        -4_096,
-        WINDOW_MAX + 1,
-        i32::from(i16::MAX),
-    ];
-    for (operation, _, noun, base) in listings(&group) {
+    for (operation, _, window, base) in listings(&group) {
+        // The rows span the class on both sides of this listing's window: one past each
+        // bound, zero, a negative size, and far above the upper bound.
+        let refused = [
+            window.min - 1,
+            0,
+            -1,
+            -4_096,
+            window.max + 1,
+            i32::from(i16::MAX),
+        ];
         for page_size in refused {
             let case = format!("{operation} MaxResults={page_size}");
             let mut request = base.clone();
@@ -247,7 +278,7 @@ async fn a_page_size_outside_the_window_is_refused_with_the_window_message() {
             );
             assert_eq!(
                 message(&body, &case),
-                window_message(noun),
+                window_message(window),
                 "case {case:?}: expected the window's own bounds, got {body}"
             );
         }
@@ -273,7 +304,7 @@ async fn an_accepted_page_size_bounds_the_page() {
         case,
     );
     assert!(
-        i32::try_from(whole.len()).unwrap_or(i32::MAX) > WINDOW_MIN,
+        i32::try_from(whole.len()).unwrap_or(i32::MAX) > PARAMETER.min,
         "case {case:?}: the family must publish more parameters than the smallest page \
          for this to page at all, got {}",
         whole.len()
@@ -283,7 +314,7 @@ async fn an_accepted_page_size_bounds_the_page() {
     let mut token: Option<String> = None;
     let mut pages = 0_usize;
     loop {
-        let mut request = json!({ "ParameterGroupName": &group, "MaxResults": WINDOW_MIN });
+        let mut request = json!({ "ParameterGroupName": &group, "MaxResults": PARAMETER.min });
         if let Some(token) = token.as_deref() {
             request["NextToken"] = json!(token);
         }
@@ -297,9 +328,9 @@ async fn an_accepted_page_size_bounds_the_page() {
             // A page that is not the last one is FULL: the size asked for bounded it.
             assert_eq!(
                 i32::try_from(page.len()).unwrap_or(i32::MAX),
-                WINDOW_MIN,
-                "case {case:?}: a page before the last holds exactly {WINDOW_MIN} items, \
-                 got {}",
+                PARAMETER.min,
+                "case {case:?}: a page before the last holds exactly {} items, got {}",
+                PARAMETER.min,
                 page.len()
             );
         }
@@ -324,15 +355,15 @@ async fn an_accepted_page_size_bounds_the_page() {
 }
 
 /// A token names a POSITION in the listing and nothing about the page that produced it:
-/// a walk may change `MaxResults` at every step — to any other size the window serves —
-/// and still visit the whole set exactly once, in the listing's own order, ending with no
-/// token left. That is what lets a client lower or raise its page size mid-walk.
+/// a walk may change `MaxResults` at every step — to any other size that listing's window
+/// serves — and still visit the whole set exactly once, in the listing's own order, ending
+/// with no token left. That is what lets a client lower or raise its page size mid-walk.
 #[tokio::test]
 async fn a_token_resumes_the_listing_at_any_served_page_size() {
     let (router, group) = seeded_store().await;
-    // More groups than the SMALLEST page the service serves, so the group listing hands
-    // out a token at the bottom of the window too.
-    for index in 0..WINDOW_MIN {
+    // More groups than the SMALLEST page this surface serves, so the group listing hands
+    // out a token at the bottom of its window too.
+    for index in 0..PARAMETER.min {
         let name = format!("token-group-{index:02}");
         ok(
             &router,
@@ -343,14 +374,14 @@ async fn a_token_resumes_the_listing_at_any_served_page_size() {
         .await;
     }
 
-    // (first page size, every later page size): both bounds of the window in both
-    // directions and a size in between, so a walk narrows, widens and holds still.
+    // (first page size, every later page size): both bounds of this surface's window in
+    // both directions and a size in between, so a walk narrows, widens and holds still.
     let steps: &[(i32, i32)] = &[
-        (WINDOW_MIN, WINDOW_MIN),
-        (WINDOW_MIN, WINDOW_MAX),
-        (WINDOW_MIN, (WINDOW_MIN + WINDOW_MAX) / 2),
-        (WINDOW_MIN + 1, WINDOW_MIN),
-        ((WINDOW_MIN + WINDOW_MAX) / 2, WINDOW_MIN),
+        (PARAMETER.min, PARAMETER.min),
+        (PARAMETER.min, PARAMETER.max),
+        (PARAMETER.min, (PARAMETER.min + PARAMETER.max) / 2),
+        (PARAMETER.min + 1, PARAMETER.min),
+        ((PARAMETER.min + PARAMETER.max) / 2, PARAMETER.min),
     ];
     // The two listings with a set larger than the smallest page: one the SERVICE
     // provides (a family's engine defaults) and one a CALLER created (the groups above).
@@ -367,12 +398,12 @@ async fn a_token_resumes_the_listing_at_any_served_page_size() {
         // The whole set in one page: the order and content every walk must reproduce.
         let case = format!("{operation} whole set");
         let mut request = base.clone();
-        request["MaxResults"] = json!(WINDOW_MAX);
+        request["MaxResults"] = json!(PARAMETER.max);
         let answered = ok(&router, operation, &request, &case).await;
         let whole = page_items(&answered, items, &case);
         assert!(
             answered.get("NextToken").is_none()
-                && i32::try_from(whole.len()).unwrap_or(i32::MAX) > WINDOW_MIN,
+                && i32::try_from(whole.len()).unwrap_or(i32::MAX) > PARAMETER.min,
             "case {case:?}: the set must be larger than the smallest page and fit in the \
              largest, got {} items in {answered}",
             whole.len()

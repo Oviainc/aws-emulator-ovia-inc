@@ -210,13 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if let Some(message) = crate::state::max_results_rejection(
-            crate::state::PageSizeNoun::Records,
-            input.max_results,
-        ) {
-            // A page size outside the window names no page: refused with the service's
-            // own modelled invalid-value error, the same one every other listing in
-            // this service answers with, rather than a generic validation failure.
+        if let Some(message) =
+            crate::state::ACCESS_CONTROL_PAGE_SIZE_WINDOW.rejection(input.max_results)
+        {
+            // A page size outside the window the ACCESS-CONTROL listings serve names no
+            // page: refused with the service's own modelled invalid-value error, the
+            // same one every other listing in this service answers with, rather than a
+            // generic validation failure.
             return Err(DescribeUsersErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(message),

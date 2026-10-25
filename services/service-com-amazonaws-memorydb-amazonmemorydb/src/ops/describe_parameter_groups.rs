@@ -162,13 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if let Some(message) = crate::state::max_results_rejection(
-            crate::state::PageSizeNoun::Results,
-            input.max_results,
-        ) {
-            // A page size outside the window names no page: refused with this
-            // operation's own modelled invalid-value error rather than served as an
-            // empty page.
+        if let Some(message) =
+            crate::state::PARAMETER_PAGE_SIZE_WINDOW.rejection(input.max_results)
+        {
+            // A page size outside the window the PARAMETER-GROUP surface serves names no
+            // page: refused with this operation's own modelled invalid-value error
+            // rather than served as an empty page.
             return Err(
                 DescribeParameterGroupsErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
