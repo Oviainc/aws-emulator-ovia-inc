@@ -103,7 +103,7 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
             // action — one only the Classic model declares, one only the ELBv2 model
             // declares, and `CreateLoadBalancer`/`DescribeLoadBalancers`, which BOTH
             // declare with different inputs and outputs.
-            let calls: [Call; 21] = [
+            let calls: [Call; 24] = [
                 Call {
                     // The request the issue reports as `500 AmbiguousService`: a Classic
                     // DescribeLoadBalancers on the shared signing name.
@@ -405,6 +405,25 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     expected_body_contains: &["<ErrorResponse", CLASSIC_VERSION],
                 },
                 Call {
+                    // The mirror of the row above: an action only the ELBv2 model
+                    // declares, asked for at the CLASSIC version. The version names this
+                    // front door's own model, which has no such operation, so the pair
+                    // resolves to no operation either way round.
+                    case: "an ELBv2-only action at the Classic version",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetGroups",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[("Names.member.1", "router-shared-tg")],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    // The refusal names BOTH halves of the pair it could not resolve.
+                    expected_body_contains: &[
+                        "<ErrorResponse",
+                        "DescribeTargetGroups",
+                        CLASSIC_VERSION,
+                    ],
+                },
+                Call {
                     // A Classic action asked for at the ELBv2 version: the version names
                     // the ELBv2 model, which declares no such action, so the pair names no
                     // operation at all — refused by that model, in its own envelope.
@@ -429,6 +448,40 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     expected_status: 400,
                     expected_code: Some("InvalidAction"),
                     expected_body_contains: &["<ErrorResponse", "2099-01-01"],
+                },
+                Call {
+                    // An action NEITHER model declares, at this front door's own version:
+                    // the version resolves to the Classic model, whose routing table has
+                    // no such operation, so the pair resolves to nothing — the one case
+                    // `InvalidAction` is actually reserved for.
+                    case: "an action neither model declares, at the Classic version",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetGardens",
+                    version: Some(CLASSIC_VERSION),
+                    params: &[],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &[
+                        "<ErrorResponse",
+                        "DescribeTargetGardens",
+                        CLASSIC_VERSION,
+                    ],
+                },
+                Call {
+                    // The same unknown action at the ELBv2 version: the other model
+                    // resolves it to nothing in exactly the same way.
+                    case: "an action neither model declares, at the ELBv2 version",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetGardens",
+                    version: Some(V2_VERSION),
+                    params: &[],
+                    expected_status: 400,
+                    expected_code: Some("InvalidAction"),
+                    expected_body_contains: &[
+                        "<ErrorResponse",
+                        "DescribeTargetGardens",
+                        V2_VERSION,
+                    ],
                 },
             ];
 

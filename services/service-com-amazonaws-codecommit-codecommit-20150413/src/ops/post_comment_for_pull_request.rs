@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PostCommentForPullRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PostCommentForPullRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PostCommentForPullRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -209,6 +200,53 @@ impl From<PostCommentForPullRequestErrorModeled> for PostCommentForPullRequestEr
     }
 }
 
+/// A commit id named in the request, mapped onto the errors THIS operation models
+/// for it: which ids address a commit is `crate::state`'s rule
+/// ([`crate::state::checked_commit_id`]), so every operation taking one agrees
+/// about it and about the message each refusal carries.
+fn checked_commit_id(commit_id: &str) -> Result<(), PostCommentForPullRequestError> {
+    crate::state::checked_commit_id(commit_id).map_err(|problem| {
+        let message = Some(problem.message().to_string());
+        match problem {
+            crate::state::CommitIdProblem::Missing => {
+                PostCommentForPullRequestErrorModeled::CommitIdRequiredException(
+                    CommitIdRequiredException { message },
+                )
+            }
+            crate::state::CommitIdProblem::Invalid => {
+                PostCommentForPullRequestErrorModeled::InvalidCommitIdException(
+                    InvalidCommitIdException { message },
+                )
+            }
+        }
+        .into()
+    })
+}
+
+/// The comment this call posted (or, on a repeated idempotency token, the comment
+/// the first call posted), with the pull request and the comparison it was filed
+/// under.
+///
+/// `caller_arn` is who is asking, because `callerReactions` is the one member of a
+/// comment that depends on that.
+fn posted(
+    repository_name: &str,
+    pull_request_id: u64,
+    caller_arn: &str,
+    record: &crate::state::CommentRecord,
+) -> PostCommentForPullRequestOutput {
+    PostCommentForPullRequestOutput {
+        repository_name: Some(repository_name.to_string()),
+        pull_request_id: Some(pull_request_id.to_string()),
+        before_commit_id: record.comparison.before_commit_id.clone(),
+        after_commit_id: Some(record.comparison.after_commit_id.clone()),
+        before_blob_id: record.comparison.before_blob_id.clone(),
+        after_blob_id: record.comparison.after_blob_id.clone(),
+        location: record.location.clone(),
+        comment: Some(record.comment_as(caller_arn)),
+    }
+}
+
 /// The `PostCommentForPullRequest` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -245,18 +283,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PostCommentForPullRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PostCommentForPullRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PostCommentForPullRequest"))
+        // What content a comment may carry is `crate::state`'s rule, so every
+        // operation that posts one agrees about it; this only maps each outcome
+        // onto the error THIS operation models for it.
+        crate::state::checked_comment_content(&input.content).map_err(|problem| {
+            let message = Some(problem.message());
+            match problem {
+                crate::state::CommentContentProblem::Required => {
+                    PostCommentForPullRequestErrorModeled::CommentContentRequiredException(
+                        CommentContentRequiredException { message },
+                    )
+                }
+                crate::state::CommentContentProblem::TooLarge => {
+                    PostCommentForPullRequestErrorModeled::CommentContentSizeLimitExceededException(
+                        CommentContentSizeLimitExceededException { message },
+                    )
+                }
+            }
+        })?;
+
+        // Which ids address a pull request is likewise `crate::state`'s rule, so
+        // every operation taking a `pullRequestId` agrees about it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    PostCommentForPullRequestErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    PostCommentForPullRequestErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // Both sides of the comparison the comment is posted on are required
+        // members, so a blank one names no commit rather than standing for an
+        // absent one.
+        checked_commit_id(&input.after_commit_id)?;
+        checked_commit_id(&input.before_commit_id)?;
+        if input.before_commit_id == input.after_commit_id {
+            return Err(
+                PostCommentForPullRequestErrorModeled::BeforeCommitIdAndAfterCommitIdAreSameException(
+                    BeforeCommitIdAndAfterCommitIdAreSameException {
+                        // Worded in the one place this crate words this code.
+                        message: Some(
+                            crate::state::BEFORE_AND_AFTER_COMMIT_ID_SAME_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Where a comment may sit in a comparison is `crate::state`'s rule too,
+        // which hands back the location as this service HOLDS it.
+        let location = crate::state::normalized_comment_location(input.location.clone())
+            .map_err(|problem| {
+                let message = Some(problem.message());
+                match problem {
+                    crate::state::CommentLocationProblem::FileLocation => {
+                        PostCommentForPullRequestErrorModeled::InvalidFileLocationException(
+                            InvalidFileLocationException { message },
+                        )
+                    }
+                    crate::state::CommentLocationProblem::PathRequired => {
+                        PostCommentForPullRequestErrorModeled::PathRequiredException(
+                            PathRequiredException { message },
+                        )
+                    }
+                    crate::state::CommentLocationProblem::InvalidPath(_) => {
+                        PostCommentForPullRequestErrorModeled::InvalidPathException(
+                            InvalidPathException { message },
+                        )
+                    }
+                    crate::state::CommentLocationProblem::RelativeFileVersion(_) => {
+                        PostCommentForPullRequestErrorModeled::InvalidRelativeFileVersionEnumException(
+                            InvalidRelativeFileVersionEnumException { message },
+                        )
+                    }
+                    crate::state::CommentLocationProblem::FilePosition => {
+                        PostCommentForPullRequestErrorModeled::InvalidFilePositionException(
+                            InvalidFilePositionException { message },
+                        )
+                    }
+                }
+            })?;
+
+        // A blank idempotency token names no earlier request, the same as leaving
+        // the optional member out.
+        let client_request_token = input
+            .client_request_token
+            .as_deref()
+            .filter(|token| !token.is_empty());
+
+        let now = std::time::SystemTime::now();
+        let author_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // Whether the id names a pull request AT ALL is a question about the whole
+        // store, because a pull request id is unique per account; it is answered
+        // before one repository is borrowed to write, so the two refusals below can
+        // be told apart.
+        let pull_request_exists = store.pull_request(pull_request_id).is_some();
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                PostCommentForPullRequestErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(crate::state::repository_does_not_exist_message(
+                            &input.repository_name,
+                        )),
+                    },
+                )
+            })?;
+        if !repository.pull_requests.contains_key(&pull_request_id) {
+            // A pull request this repository does not hold: one that exists
+            // elsewhere is refused as not associated with this repository, and one
+            // no repository holds as not existing at all.
+            return Err(if pull_request_exists {
+                PostCommentForPullRequestErrorModeled::RepositoryNotAssociatedWithPullRequestException(
+                    RepositoryNotAssociatedWithPullRequestException {
+                        message: Some(
+                            crate::state::REPOSITORY_NOT_ASSOCIATED_WITH_PULL_REQUEST_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into()
+            } else {
+                PostCommentForPullRequestErrorModeled::PullRequestDoesNotExistException(
+                    PullRequestDoesNotExistException {
+                        message: Some(crate::state::pull_request_does_not_exist_message(
+                            &pull_request_id.to_string(),
+                        )),
+                    },
+                )
+                .into()
+            });
+        }
+
+        // Both sides of the comparison have to be commits this repository holds: a
+        // comment is filed against stored commits, never against an id the
+        // repository never had.
+        for commit_id in [
+            input.after_commit_id.as_str(),
+            input.before_commit_id.as_str(),
+        ] {
+            if !repository.commits.contains_key(commit_id) {
+                return Err(
+                    PostCommentForPullRequestErrorModeled::CommitDoesNotExistException(
+                        CommitDoesNotExistException {
+                            // Worded in the one place this crate words this code.
+                            message: Some(crate::state::commit_does_not_exist_message(commit_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The blobs of the commented file in each side of the comparison, read out
+        // of the two commits' tree snapshots — the same anchoring every operation
+        // that posts a comment uses. This operation requires both sides, so the
+        // before side is always named and the no-before-version outcome below
+        // cannot arise here; it is reachable for a caller that may omit it.
+        let (before_blob_id, after_blob_id) = crate::state::comment_anchor(
+            repository,
+            Some(input.before_commit_id.as_str()),
+            &input.after_commit_id,
+            location.as_ref(),
+        )
+        .map_err(|problem| {
+            let message = Some(problem.message());
+            match problem {
+                crate::state::CommentAnchorProblem::PathDoesNotExist { .. } => {
+                    PostCommentForPullRequestErrorModeled::PathDoesNotExistException(
+                        PathDoesNotExistException { message },
+                    )
+                }
+                crate::state::CommentAnchorProblem::FilePosition { .. } => {
+                    PostCommentForPullRequestErrorModeled::InvalidFilePositionException(
+                        InvalidFilePositionException { message },
+                    )
+                }
+                crate::state::CommentAnchorProblem::NoBeforeVersion => {
+                    PostCommentForPullRequestErrorModeled::InvalidRelativeFileVersionEnumException(
+                        InvalidRelativeFileVersionEnumException { message },
+                    )
+                }
+            }
+        })?;
+
+        let comparison = crate::state::ComparedCommit {
+            before_commit_id: Some(input.before_commit_id.clone()),
+            after_commit_id: input.after_commit_id.clone(),
+            before_blob_id,
+            after_blob_id,
+        };
+
+        // An idempotency token that was already used: the same request returns the
+        // comment it first posted, and a changed one is refused rather than posting
+        // a second comment under the same token.
+        if let Some(token) = client_request_token {
+            if let Some(existing) = repository
+                .comment_tokens
+                .get(token)
+                .and_then(|comment_id| repository.comments.get(comment_id))
+            {
+                // The token is judged against the request it was first accepted
+                // for, so a later edit of the comment does not turn a replay of
+                // that request into a mismatch.
+                let unchanged = existing.posted_content == input.content
+                    && existing.pull_request_id == Some(pull_request_id)
+                    && existing.comparison == comparison
+                    && crate::state::location_key(existing.location.as_ref())
+                        == crate::state::location_key(location.as_ref());
+                return if unchanged {
+                    // A replay of the request the token was first accepted for
+                    // posted no second comment, so it is no new activity on the
+                    // pull request either: it answers the first comment and
+                    // leaves `lastActivityDate` where that first post left it.
+                    Ok(posted(
+                        &input.repository_name,
+                        pull_request_id,
+                        &author_arn,
+                        existing,
+                    ))
+                } else {
+                    Err(
+                        PostCommentForPullRequestErrorModeled::IdempotencyParameterMismatchException(
+                            IdempotencyParameterMismatchException {
+                                message: Some(format!(
+                                    "the client request token {token} was used in a previous request with different parameters"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                };
+            }
+        }
+
+        if repository.comments.len() >= crate::state::MAX_COMMENTS_PER_REPOSITORY {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator holds at most {} comments per repository",
+                crate::state::MAX_COMMENTS_PER_REPOSITORY
+            )));
+        }
+
+        let sequence = repository.next_comment_sequence;
+        repository.next_comment_sequence = sequence.saturating_add(1);
+        let record = crate::state::CommentRecord {
+            comment_id: crate::state::comment_id(&input.repository_name, sequence, now),
+            content: input.content.clone(),
+            posted_content: input.content.clone(),
+            in_reply_to: None,
+            creation_date: now,
+            last_modified_date: now,
+            author_arn: author_arn.clone(),
+            deleted: false,
+            client_request_token: client_request_token.map(str::to_string),
+            pull_request_id: Some(pull_request_id),
+            comparison,
+            location,
+            // Reactions arrive through `PutCommentReaction`; a comment is posted
+            // with none.
+            reactions: std::collections::BTreeMap::new(),
+            sequence,
+        };
+        if let Some(token) = client_request_token {
+            repository
+                .comment_tokens
+                .insert(token.to_string(), record.comment_id.clone());
+        }
+        let response = posted(
+            &input.repository_name,
+            pull_request_id,
+            &author_arn,
+            &record,
+        );
+        repository.comments.insert(record.comment_id.clone(), record);
+        // "The day and time of the last user or system activity on the pull
+        // request" (`smithy_query(query="doc",shape="PullRequest",member="lastActivityDate")`):
+        // posting a comment is activity on it, so the pull request a later read
+        // reports carries this instant. The reviewable state of the pull request
+        // has NOT moved, so its `revisionId` is untouched.
+        if let Some(pull_request) = repository.pull_requests.get_mut(&pull_request_id) {
+            pull_request.last_activity_date = now;
+        }
+        Ok(response)
     }
 }
