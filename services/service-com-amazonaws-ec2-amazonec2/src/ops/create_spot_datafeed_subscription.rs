@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSpotDatafeedSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSpotDatafeedSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Creates the account's ONE Spot Instance data feed in
+//! [`crate::state::ComAmazonawsEc2Amazonec2State`] and reports it back as
+//! `DescribeSpotDatafeedSubscription` will.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSpotDatafeedSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You can create one data feed per Amazon Web Services account", so the feed is a
+//! SINGLETON: a create writes the account's one feed, whatever it held before. EC2 publishes
+//! no error code for a second create (`InvalidSpotDatafeed.NotFound`, the one code it has for
+//! the feed, is the absence of one), and the model declares no errors at all for this
+//! operation, so this handler refuses nothing it cannot ground: a repeat writes the bucket
+//! and prefix the new request names rather than answering an invented duplicate error.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +142,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSpotDatafeedSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSpotDatafeedSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSpotDatafeedSubscription"))
+        use crate::state;
+
+        // "Creates a data feed for Spot Instances": the feed is one account-level resource,
+        // and this store is per account (`crate::state`'s module docs), so nothing of the
+        // request beyond `Bucket`, `Prefix` and `DryRun` is read and `ctx` carries nothing
+        // this operation needs.
+        let _ = ctx;
+
+        // "The name of the Amazon S3 bucket in which to store the Spot Instance data feed.
+        // For more information about bucket names, see Bucket naming rules in the Amazon S3
+        // User Guide" (`Bucket`) — so the name has to be one S3 could hold a bucket under,
+        // which is [`crate::state::s3_bucket_name_is_well_formed`], the same rule
+        // `CreateRestoreImageTask` holds a bucket name to. The model puts no `@pattern` or
+        // `@length` on the member, so the handler is the only place that rule can be
+        // enforced. The code is EC2's `InvalidParameterValue` — "a parameter carries a value
+        // the service rejects" — and NOT `InaccessibleStorageLocation`, which says the
+        // service could not read an object out of a location: this operation reads nothing
+        // from S3, the name simply is not a bucket name.
+        let bucket = input.bucket;
+        if !state::s3_bucket_name_is_well_formed(&bucket) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({bucket}) for parameter bucket is invalid: an S3 bucket name holds \
+                 {min} to {max} lowercase letters, digits, dots and hyphens, begins and ends \
+                 with a letter or a digit, carries no two adjacent dots, is not formatted as \
+                 an IP address, and uses none of S3's reserved prefixes or suffixes",
+                min = state::MIN_S3_BUCKET_NAME_CHARS,
+                max = state::MAX_S3_BUCKET_NAME_CHARS,
+            )));
+        }
+
+        // "The prefix for the data feed file names" (`Prefix`): the leading part of the S3
+        // object keys the feed writes, so its UTF-8 encoding cannot be longer than a whole
+        // key. Measured in BYTES, the unit the rule is stated in.
+        let prefix = input.prefix;
+        if let Some(prefix) = prefix.as_deref() {
+            let bytes = prefix.len();
+            if bytes > state::MAX_SPOT_DATAFEED_PREFIX_BYTES {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value for parameter prefix is invalid. A data feed prefix carries at \
+                     most {max} bytes, and this one carries {bytes}",
+                    max = state::MAX_SPOT_DATAFEED_PREFIX_BYTES,
+                )));
+            }
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // DryRun sits AFTER the request's own members have been validated and BEFORE the
+        // write, the way every writer on this surface orders it: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead, and one that would have succeeded leaves the store untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The response is the record as it was STORED, so a create answers exactly what a
+        // `DescribeSpotDatafeedSubscription` made in the same instant reports. The write
+        // answers the growth it could not fit when there is no room, which is the quantity
+        // the refusal states.
+        let stored = store
+            .set_spot_datafeed_subscription(bucket, prefix)
+            .map_err(state::spot_datafeed_store_full)?;
+
+        Ok(CreateSpotDatafeedSubscriptionOutput {
+            spot_datafeed_subscription: Some(stored),
+        })
     }
 }

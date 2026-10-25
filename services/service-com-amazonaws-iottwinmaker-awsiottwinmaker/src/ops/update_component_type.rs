@@ -362,6 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if declares_composite_component_types {
             if let Some(message) = crate::state::composite_component_types_violation(
                 workspace,
+                &input.component_type_id,
                 &updated.composite_component_types,
             ) {
                 return Err(validation_exception(message));

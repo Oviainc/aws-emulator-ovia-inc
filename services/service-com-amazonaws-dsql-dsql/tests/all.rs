@@ -17,6 +17,8 @@ mod boundary_validation_exception;
 mod cluster_lifecycle;
 #[path = "all/cluster_policy.rs"]
 mod cluster_policy;
+#[path = "all/delete_cluster_idempotency.rs"]
+mod delete_cluster_idempotency;
 #[path = "all/encryption_key_selection.rs"]
 mod encryption_key_selection;
 #[path = "all/error_contract.rs"]

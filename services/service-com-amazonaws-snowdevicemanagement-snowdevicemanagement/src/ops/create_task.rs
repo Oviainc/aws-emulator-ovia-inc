@@ -7,7 +7,9 @@
 //! managed device is answered with the modelled `ResourceNotFoundException`, a `tags`
 //! map that breaks the AWS-wide tagging rules with the modelled `ValidationException`,
 //! and `@idempotencyToken` means a repeated `clientToken` reports the first task rather
-//! than minting a second.
+//! than minting a second. A Region that already holds as many tasks IN FLIGHT as the
+//! store's bound allows is answered with the modelled `ServiceQuotaExceededException`,
+//! which lifts as those tasks finish.
 //!
 //! ## Shape of an operation
 //!
@@ -241,14 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The store is bounded: past its quota a create is refused rather than
-        // adding another record.
-        if store.tasks.len() >= crate::state::TASK_QUOTA {
+        // A quota bounds what this Region currently HOLDS, so the bound is taken
+        // over the tasks still in flight here: one the clock carried to `COMPLETED`
+        // or `CancelTask` moved to `CANCELED` is terminal and holds nothing, and a
+        // task of another Region — which this one can neither describe nor list —
+        // holds nothing here either. So the refusal is owed only while the quota is
+        // actually exceeded, and it lifts of its own accord as tasks finish.
+        if store.tasks_in_flight_in(&region) >= crate::state::IN_FLIGHT_TASK_QUOTA {
             return Err(CreateTaskErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "this account already holds the maximum of {} tasks",
-                        crate::state::TASK_QUOTA
+                        "this region already has the maximum of {} tasks in progress",
+                        crate::state::IN_FLIGHT_TASK_QUOTA
                     ),
                 },
             )
@@ -301,8 +307,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(token) = input.client_token {
-            store.idempotency.insert((region, token), task_id.clone());
+            store.idempotency.insert((region.clone(), token), task_id.clone());
         }
+
+        // The store's retention bound, applied where the store grows: this API
+        // models no operation that deletes a task, so past the records one Region
+        // keeps, the oldest TERMINAL tasks make room for this one. Nothing in flight
+        // is dropped, and nothing is refused.
+        store.trim_task_history(&region, crate::state::TASK_HISTORY_LIMIT);
 
         Ok(CreateTaskOutput {
             task_id: Some(task_id),

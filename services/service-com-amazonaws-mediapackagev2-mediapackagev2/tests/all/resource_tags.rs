@@ -44,13 +44,17 @@ use crate::rejection_rule_and_negative_paths::encoded as pct;
 /// shared type, so every suite still drives the emulator through one client.
 impl Emulator {
     /// `GET /tags/{ResourceArn}`.
-    async fn list_tags(&self, arn: &str) -> (u16, Value) {
+    ///
+    /// `pub(crate)` with the two writers below: they are this crate's one client for the
+    /// three tagging operations, so a suite covering a further taggable level
+    /// (`harvest_job_tagging`) addresses the same URIs through them.
+    pub(crate) async fn list_tags(&self, arn: &str) -> (u16, Value) {
         self.call("GET", &format!("/tags/{}", pct(arn)), None).await
     }
 
     /// `POST /tags/{ResourceArn}` with the tag map in the body member the model names
     /// `tags` (`@jsonName("tags")` on `TagResourceRequest$Tags`).
-    async fn tag(&self, arn: &str, tags: &BTreeMap<String, String>) -> (u16, Value) {
+    pub(crate) async fn tag(&self, arn: &str, tags: &BTreeMap<String, String>) -> (u16, Value) {
         self.call(
             "POST",
             &format!("/tags/{}", pct(arn)),
@@ -64,7 +68,7 @@ impl Emulator {
     /// query-safe part of the tag alphabet (a key carrying a space or a `/` is exercised
     /// on the `TagResource` body path, where it needs no escaping), so the shared label
     /// escaper covers every URI this suite builds.
-    async fn untag(&self, arn: &str, keys: &[&str]) -> (u16, Value) {
+    pub(crate) async fn untag(&self, arn: &str, keys: &[&str]) -> (u16, Value) {
         let query = keys
             .iter()
             .map(|key| format!("tagKeys={}", pct(key)))
@@ -239,7 +243,7 @@ fn arn_of(created: &Value) -> String {
 /// Panics when the member is absent or is not an object: the modelled member is a map,
 /// present even when empty, so reading an absent member as "no tags" would hide exactly
 /// the difference several rows below exist to pin.
-fn tag_map(body: &Value, member: &str) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(body: &Value, member: &str) -> BTreeMap<String, String> {
     let Some(Value::Object(map)) = body.get(member) else {
         panic!("expected a {member} map in the response, got {body}");
     };
@@ -257,7 +261,7 @@ fn tag_map(body: &Value, member: &str) -> BTreeMap<String, String> {
 }
 
 /// `pairs` as a tag map.
-fn map_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn map_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))

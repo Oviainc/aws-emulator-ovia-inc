@@ -281,6 +281,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
+        // A probe whose teardown has been accepted is on its way out and its
+        // teardown is irreversible, so it is no longer a target for an update:
+        // the id names a probe this monitor is giving up, which is what the
+        // not-found answer tells the caller. Reads still report it, in the
+        // teardown state it has reached, until the clock has carried it through.
+        if probe.is_being_torn_down() {
+            return Err(UpdateProbeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::probe_not_found_message(
+                        &input.probe_id,
+                        &input.monitor_name,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // A `PATCH`: the request's members override the stored ones, and the
         // members it does not name keep the values the record already holds.

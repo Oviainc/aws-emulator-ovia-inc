@@ -579,14 +579,15 @@ async fn archived_ids(router: &Router, detector_id: &str) -> BTreeSet<String> {
 // CreateFilter: a criterion key that names no finding attribute.
 // ---------------------------------------------------------------------------
 
-/// A `FindingCriteria.Criterion` key must NAME a finding attribute. The model types
+/// A `FindingCriteria.Criterion` key must NAME a field of a finding. The model types
 /// the criterion as a map keyed by a plain string, so the boundary accepts any key and
-/// the handler is what refuses one it cannot evaluate — the same catalogue
-/// `ListFindings` and `GetFindings` resolve a criterion against.
+/// the handler is what refuses one that names no field — the same check `ListFindings`
+/// and `GetFindings` apply.
 ///
-/// The rows differ along the way a key fails to name an attribute: a dotted path into
-/// nothing, a near miss on a real attribute, a casing variant, a path whose prefix is
-/// real, and an attribute the emulator reports but cannot order numerically.
+/// The rows differ along the way a key fails to name a field: a dotted path into
+/// nothing, a near miss on a real field, a casing variant, a path extending a scalar
+/// that has nothing beneath it, and a field the emulator reports but cannot order
+/// numerically.
 #[tokio::test]
 async fn create_filter_with_an_unknown_criterion_field_is_refused_and_persists_nothing() {
     let router = new_router();
@@ -646,9 +647,9 @@ async fn create_filter_with_an_unknown_criterion_field_is_refused_and_persists_n
         );
     }
 
-    // Every attribute the catalogue carries IS accepted, and a saved filter reports
-    // the criteria it was created with. The rows are the whole catalogue, so a
-    // criterion a findings read can evaluate is one a filter can carry.
+    // Every field a stored finding populates IS accepted, and a saved filter reports
+    // the criteria it was created with. The rows are every one of them, so a criterion
+    // a findings read resolves is one a filter can carry.
     for (index, field) in FINDING_ATTRIBUTES.iter().enumerate() {
         let name = format!("accepted-{index}");
         let case = format!("criterion key {field:?}");
@@ -691,14 +692,15 @@ async fn create_filter_with_an_unknown_criterion_field_is_refused_and_persists_n
 /// A `FindingCriteria` carrying exactly one criterion: `field` under `condition`.
 ///
 /// Built through a map rather than a `json!` literal so the KEY can be a row of the
-/// table under test.
-fn criteria(field: &str, condition: Value) -> Value {
+/// table under test. Shared with the `finding_field_catalog` suite, which asserts the
+/// other side of the same rule, so the two cannot build a criterion differently.
+pub(crate) fn criteria(field: &str, condition: Value) -> Value {
     let mut criterion = serde_json::Map::new();
     criterion.insert(field.to_string(), condition);
     json!({"criterion": Value::Object(criterion)})
 }
 
-async fn create_filter(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create_filter(router: &Router, detector_id: &str, body: Value) -> (u16, Value) {
     call(
         router,
         "POST",

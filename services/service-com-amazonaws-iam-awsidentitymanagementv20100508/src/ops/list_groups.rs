@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `PathPrefix` "is optional. If it is not included, it defaults to a slash
+        // (/), listing all groups."
+        let path_prefix = input
+            .path_prefix
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default
+        // for an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the persisted groups and writes nothing.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any group is reported — and before the request's other
+        // values are read, so a caller that may not make this call learns that rather
+        // than learning about its marker. The resource the decision is made on is the
+        // group collection this request addresses — the account's `group` resource type
+        // under the path prefix being listed.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_GROUPS,
+            &crate::state::group_arn(&path_prefix, ""),
+        )?;
+
+        // The page resumes strictly after the POSITION in the key order that the
+        // marker names, exactly as this crate's `ListUsers` and `ListRoles` do, so a
+        // token this service's encoding cannot have produced is refused rather than
+        // silently read as "start from the beginning".
+        let resume_after = match &input.marker {
+            Some(marker) => {
+                match crate::state::decode_marker(crate::state::MARKER_SCOPE_GROUPS, marker) {
+                    Some(key) => Some(key),
+                    None => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Invalid Marker: the value is not a marker this service issued",
+                        ))
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let tail = store.groups.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+
+        let mut groups = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (key, group) in tail.filter(|(_, group)| group.path.starts_with(&path_prefix)) {
+            if groups.len() == page_size {
+                // There is at least one more matching group, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            // Every member of `Group` is `@required` and a listing withholds none of
+            // them, so the stored record is what the page reports.
+            groups.push(group.clone());
+            last_key = Some(key.clone());
+        }
+
+        Ok(ListGroupsOutput {
+            groups,
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(crate::state::MARKER_SCOPE_GROUPS, key)
+                    })
+                })
+                .flatten(),
+        })
     }
 }

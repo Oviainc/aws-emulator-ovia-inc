@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteSMSSandboxPhoneNumberErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::SANDBOX_RESOURCE_DOES_NOT_EXIST.to_string()),
+                    message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
                 },
             )
             .into());

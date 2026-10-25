@@ -246,3 +246,8 @@ mod list_queries;
 #[path = "all/gateway_capability_configuration.rs"]
 mod gateway_capability_configuration;
 
+// Declared last for the same reason as the suites above it. Fold it into the
+// sorted list once the churn settles.
+#[path = "all/project_lifecycle.rs"]
+mod project_lifecycle;
+

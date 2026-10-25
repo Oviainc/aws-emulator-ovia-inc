@@ -189,8 +189,7 @@ pub(crate) struct Taggable {
     /// tag write is asserted to land in the one map the resource's own read reports.
     /// `None` for an agent, whose `GetAgentConfiguration` answers `agentId` and
     /// `taskingDocument` only (`smithy_query(query="operation",
-    /// operation="GetAgentConfiguration")`), and for an ephemeris, whose
-    /// `DescribeEphemeris` is still a scaffolded 501 with its own open issue.
+    /// operation="GetAgentConfiguration")`).
     pub(crate) own_read: Option<String>,
     /// The tags the resource was CREATED with — what a tag read reports before any
     /// `TagResource` call.
@@ -399,12 +398,11 @@ pub(crate) async fn taggable_resources(router: &MultiServiceRouter) -> Vec<Tagga
         "case an ephemeris: expected CreateEphemeris 200, got {} {}",
         ephemeris.status, ephemeris.body
     );
+    let ephemeris_id = ephemeris.string("ephemerisId");
     rows.push(Taggable {
         label: "an ephemeris".to_string(),
-        arn: ephemeris_arn(&ephemeris.string("ephemerisId")),
-        // `DescribeEphemeris` is still a scaffolded 501 (its own open issue), so the tag
-        // read is the only reader of an ephemeris's tags for now.
-        own_read: None,
+        arn: ephemeris_arn(&ephemeris_id),
+        own_read: Some(format!("/ephemeris/{ephemeris_id}")),
         created_with: created.clone(),
     });
 

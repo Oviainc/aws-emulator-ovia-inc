@@ -251,18 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ];
         match destinations.iter().flatten().count() {
             1 => {}
-            0 => {
-                return Err(invalid_parameter(
-                    "Invalid parameter: exactly one of TopicArn, TargetArn or PhoneNumber \
-                     must be specified"
-                        .to_string(),
-                ))
-            }
+            0 => return Err(invalid_parameter(state::NO_DESTINATION_REFUSAL.to_string())),
             _ => {
                 return Err(invalid_parameter(
-                    "Invalid parameter: TopicArn, TargetArn and PhoneNumber are mutually \
-                     exclusive"
-                        .to_string(),
+                    state::DESTINATIONS_NOT_EXCLUSIVE_REFUSAL.to_string(),
                 ))
             }
         }
@@ -280,11 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoints are not emulated yet, so only the topic form is served.
         let destination = input.topic_arn.clone().or_else(|| input.target_arn.clone());
         let Some(destination) = destination else {
-            return Err(invalid_parameter(
-                "Invalid parameter: exactly one of TopicArn, TargetArn or PhoneNumber must \
-                 be specified"
-                    .to_string(),
-            ));
+            return Err(invalid_parameter(state::NO_DESTINATION_REFUSAL.to_string()));
         };
         if state::topic_name_from_arn(&destination).is_none() {
             // Argument validation first: a destination that is not an ARN at all is
@@ -376,7 +364,9 @@ fn publish_into_store(
     let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
 
     let message_id = store.next_unique_id();
-    let published = PublishedMessage {
+    // ONE record of the published message, SHARED by every subscription that receives
+    // it: the retained log holds handles, not a copy of the body per subscriber.
+    let published = ::std::sync::Arc::new(PublishedMessage {
         message_id: message_id.clone(),
         topic_arn: topic.arn.clone(),
         message: input.message,
@@ -387,7 +377,7 @@ fn publish_into_store(
         message_deduplication_id,
         sequence_number: sequence_number.clone(),
         published_at: std::time::SystemTime::now(),
-    };
+    });
 
     // SNS "delivers the message to each endpoint that is subscribed to the topic"
     // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
@@ -400,7 +390,7 @@ fn publish_into_store(
         .collect();
     let deliveries = queue_deliveries(&subscriptions, &published, &mut DeliveryBudget::new());
     for subscription in &subscriptions {
-        store.record_delivery(&subscription.arn, published.clone());
+        store.record_delivery(&subscription.arn, ::std::sync::Arc::clone(&published));
     }
 
     Ok((

@@ -28,14 +28,34 @@
 //! * a property definition of a component type that extends nothing carries no
 //!   `dataType` — a `ValidationException`, because `dataType` is required on
 //!   the `PropertyDefinitionResponse` a read reports and there is no parent
-//!   definition to inherit it from.
+//!   definition to inherit it from;
+//! * a reference the request DECLARES does not resolve — an `extendsFrom` or
+//!   `compositeComponentTypes[*].componentTypeId` id naming a component type
+//!   the service does not hold, inheritance that names the component type being
+//!   created, or a `propertyGroups[*].propertyNames` entry naming a property
+//!   the new component type neither defines nor inherits — a
+//!   `ValidationException` (HTTP 400): the rules
+//!   [`crate::state::extends_from_violation`],
+//!   [`crate::state::composite_component_types_violation`] and
+//!   [`crate::state::property_groups_violation`] hold for every writer of
+//!   those members, this create as much as `UpdateComponentType`, so the store
+//!   cannot come to hold a reference that does not resolve. A declared id
+//!   resolves to a component type stored in the workspace or to one in the
+//!   service's reserved namespace (see
+//!   [`crate::state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]): the real service
+//!   ships more built-in component types than this emulator models, so an id
+//!   there resolves rather than being refused, which keeps the rule from
+//!   rejecting inheritance the real service accepts. A composite entry naming
+//!   the component type being created resolves too — this very call is what
+//!   leaves the workspace holding it — while `extendsFrom` naming it is the
+//!   inheritance cycle no chain can be walked up, which is why the two members
+//!   differ on a self-reference.
 //!
-//! One deliberate gap. `extendsFrom` is stored WITHOUT checking that the
-//! parent component types exist: a real workspace carries more built-in
-//! component types than this emulator models (see
-//! [`crate::state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]), so refusing an id it
-//! cannot resolve would refuse legitimate parents (the same gap `CreateEntity`
-//! documents for a component's `componentTypeId`).
+//! The declared references are resolved BEFORE the `dataType` rule, because a
+//! non-empty `extendsFrom` is what licenses a `PropertyDefinitionRequest`
+//! carrying no `dataType`: a parent that does not resolve would otherwise
+//! license a definition whose `dataType` can never be resolved from anywhere.
+//!
 //! Authorization is not emulated, so the modelled `AccessDeniedException` is
 //! never returned.
 //!
@@ -279,6 +299,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let extends_from = input.extends_from.clone().unwrap_or_default();
         let property_definitions = input.property_definitions.clone().unwrap_or_default();
+        let composite_component_types: ::std::collections::BTreeMap<
+            String,
+            CompositeComponentTypeRequest,
+        > = input
+            .composite_component_types
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        // A reference this create DECLARES has to resolve: the ids it puts in
+        // `extendsFrom` and in `compositeComponentTypes` must name component
+        // types the service holds, and the inheritance it declares must not
+        // name the component type being created. The same rules every writer
+        // of those members meets, so a create cannot store what an update
+        // would be refused, and the store cannot come to hold a dangling
+        // reference — the integrity `DeleteComponentType` already relies on in
+        // the other direction.
+        //
+        // Resolved BEFORE the `dataType` rule below, because a non-empty
+        // `extendsFrom` is what licenses a definition carrying no `dataType`:
+        // a parent that does not resolve would otherwise license a definition
+        // whose `dataType` can never be resolved from anywhere.
+        if let Some(message) =
+            crate::state::extends_from_violation(workspace, &input.component_type_id, &extends_from)
+        {
+            return Err(validation_exception(message));
+        }
+        if let Some(message) = crate::state::composite_component_types_violation(
+            workspace,
+            &input.component_type_id,
+            &composite_component_types,
+        ) {
+            return Err(validation_exception(message));
+        }
         // `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on
         // the `PropertyDefinitionResponse` a read reports, so a definition may
         // omit it only where it refines one it inherits — the rule
@@ -286,15 +340,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writer of a definition.
         for (property_name, definition) in &property_definitions {
             if crate::state::property_definition_needs_data_type(&extends_from, definition) {
-                return Err(CreateComponentTypeErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "propertyDefinitions.{property_name}.dataType is required for a \
-                             component type that extends nothing"
-                        )),
-                    },
-                )
-                .into());
+                return Err(validation_exception(format!(
+                    "propertyDefinitions.{property_name}.dataType is required for a \
+                     component type that extends nothing"
+                )));
             }
         }
 
@@ -334,11 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })
                 .collect(),
-            composite_component_types: input
-                .composite_component_types
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
+            composite_component_types,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_date_time: now,
             update_date_time: now,
@@ -348,6 +393,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::STATE_CREATING.to_string(),
             settles_at: now + crate::state::COMPONENT_TYPE_SETTLE_SPAN,
         };
+        // A property GROUP groups properties of the component type, so each
+        // name it carries has to be one the new component type defines — its
+        // own definitions or the ones its (now resolved) inheritance brings.
+        // Checked over the record as this create leaves it, so a group may name
+        // a property the same request defines: the rule
+        // `crate::state::property_groups_violation` every writer of the member
+        // meets.
+        if let Some(message) = crate::state::property_groups_violation(workspace, &component_type) {
+            return Err(validation_exception(message));
+        }
         // Whether the component type is ABSTRACT is decided here, from the
         // definitions and functions the request declared plus the ones its
         // declared inheritance brings, and STORED on the record: every reader
@@ -387,4 +442,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: created_state,
         })
     }
+}
+
+/// One refusal of this operation's `ValidationException`, with the message the
+/// rule that refused the request produced.
+///
+/// The message is built from the REQUEST — the member and the id or name the
+/// service could not resolve — so a caller is told what to change.
+fn validation_exception(message: String) -> CreateComponentTypeError {
+    CreateComponentTypeErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -2343,6 +2343,71 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(requested.clamp(1, REPORT_PAGE_LIMIT)).unwrap_or(1)
 }
 
+/// The position a paginated operation of this service resumes its collection at, for the
+/// `nextToken` the request carried and the PARSE half of that operation's own cursor pair.
+///
+/// A request carrying no token starts at the beginning. A token is opaque, so the only
+/// thing it has to be is one of that operation's own cursors: a value `parse` does not
+/// place was never issued there, and is refused with the service's one fixed
+/// invalid-token payload ([`invalid_token`]) rather than honoured as an offset.
+///
+/// The refusal is handed back for the caller to lift into its OWN modelled
+/// `ValidationException` variant — the only part of this decision that differs between
+/// the paginated operations.
+pub fn resume_position(
+    next_token: Option<&str>,
+    parse: impl FnOnce(&str) -> Option<usize>,
+) -> Result<usize, ValidationException> {
+    match next_token {
+        None => Ok(0),
+        Some(token) => parse(token).ok_or_else(invalid_token),
+    }
+}
+
+/// One page of `entries`, and the `nextToken` that resumes exactly after it.
+///
+/// The page-walk half of the pagination rule, decided in ONE place for every paginated
+/// operation of this service, as [`page_size`] decides how large a page is and the cursor
+/// codec decides what a token is: skip the entries already reported (`resume_at`), cut the
+/// page by minting a token at the position reached once it holds `page_size` entries, and
+/// otherwise report the entry's projection and advance.
+///
+/// So the position a token carries is the number of entries the operation has already
+/// REPORTED, which is what every cursor of this service means. `entries` is therefore the
+/// iterator of what the operation reports — already filtered, so an entry it passes over
+/// occupies no position and a token is only ever cut where a further entry really follows
+/// — and `project` is called only for the entries the page carries, so a projection that
+/// materialises a clock-owed transition does so for exactly those.
+pub fn walk_page<Entry, Projected>(
+    entries: impl IntoIterator<Item = Entry>,
+    resume_at: usize,
+    page_size: usize,
+    mint: impl Fn(usize) -> String,
+    mut project: impl FnMut(Entry) -> Projected,
+) -> (Vec<Projected>, Option<String>) {
+    let entries = entries.into_iter();
+    // The page holds at most what the collection still carries, and at most a page: the
+    // reservation comes from the iterator's own bound and from [`page_size`], which is
+    // already clamped into the modelled range, never from a number a request carried.
+    let (_, remaining) = entries.size_hint();
+    let mut items = Vec::with_capacity(remaining.map_or(page_size, |len| page_size.min(len)));
+    let mut next_token = None;
+    let mut position = 0usize;
+    for entry in entries {
+        if position < resume_at {
+            position += 1;
+            continue;
+        }
+        if items.len() >= page_size {
+            next_token = Some(mint(position));
+            break;
+        }
+        items.push(project(entry));
+        position += 1;
+    }
+    (items, next_token)
+}
+
 /// A digest of the request one `@idempotencyToken` identifies, so the same token replayed
 /// on a DIFFERENT request can be told from a retry of the same one.
 ///

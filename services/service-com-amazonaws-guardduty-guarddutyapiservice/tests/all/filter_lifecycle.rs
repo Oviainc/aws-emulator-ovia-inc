@@ -664,16 +664,16 @@ async fn an_update_or_delete_of_something_absent_is_refused_and_writes_nothing()
         );
     }
 
-    // A criterion key that names no finding attribute is refused by an update the way
-    // a create refuses it: the catalogue is the one a findings read evaluates against,
-    // so an update cannot save a criterion a create would have rejected.
+    // A criterion key that names no field of a finding is refused by an update the way
+    // a create refuses it: the check is the one a findings read applies, so an update
+    // cannot save a criterion a create would have rejected.
     for (path, why) in [
         (
-            "resource.instanceDetails.instanceId",
-            "a nested path this service does not evaluate",
+            "resource.instanceDetails",
+            "a detail document rather than a field in it",
         ),
-        ("Severity", "a known attribute in the wrong case"),
-        ("not.an.attribute", "no attribute at all"),
+        ("Severity", "a known field in the wrong case"),
+        ("not.an.attribute", "no field at all"),
     ] {
         let (status, refused) = update_filter(
             &router,

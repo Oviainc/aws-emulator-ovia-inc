@@ -79,6 +79,10 @@ fn is_account_id(account_id: &str) -> bool {
     account_id.len() == ACCOUNT_ID_LEN && account_id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The sentence SNS refuses a principal that is not an account id with: it states
+/// that an id the request carried is not one, and never the value the caller sent.
+const INVALID_ACCOUNT_ID_REFUSAL: &str = "Invalid parameter: A provided account ID is not valid";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,15 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        if let Some(bad) = input
+        if input
             .aws_account_id
             .iter()
-            .find(|account_id| !is_account_id(account_id))
+            .any(|account_id| !is_account_id(account_id))
         {
-            return Err(invalid_parameter(format!(
-                "Invalid parameter: AWSAccountId Reason: an Amazon Web Services account id is \
-                 {ACCOUNT_ID_LEN} digits: {bad}"
-            )));
+            return Err(invalid_parameter(
+                INVALID_ACCOUNT_ID_REFUSAL.to_string(),
+            ));
         }
         if let Some(bad) = input
             .action_name

@@ -34,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::monitor_and_probe::{
     call, create_monitor, create_probe, error_code, error_message, get_monitor,
     is_modelled_probe_id, name_of_length, probe_json, probes_of, router, source_arn, string_at,
-    ACCOUNT, PAST_ACTIVATION, REGION,
+    ACCOUNT, PAST_ACTIVATION, PAST_TEARDOWN, REGION,
 };
 
 /// One ICMP probe body of the shared form, for the cases here that vary only
@@ -127,7 +127,8 @@ async fn a_monitors_state_follows_the_probes_it_holds() {
 
 /// Adding the first probe to an `INACTIVE` monitor gives it something to
 /// aggregate, so the clock owes it `ACTIVE` again; deleting its last probe
-/// takes that away and returns it to `INACTIVE`.
+/// takes that away and returns it to `INACTIVE` — once that probe's teardown has
+/// run its course, since until then the monitor still holds it.
 #[tokio::test]
 async fn a_probe_added_to_an_idle_monitor_activates_it_and_its_deletion_idles_it_again() {
     let router = router();
@@ -171,11 +172,26 @@ async fn a_probe_added_to_an_idle_monitor_activates_it_and_its_deletion_idles_it
     )
     .await;
     assert_eq!(status, 200, "expected DeleteProbe 200, got {deleted:?}");
+    // The delete is accepted as the start of the probe's teardown, so the
+    // monitor still holds the probe and keeps aggregating while it drains.
+    let (_, got) = get_monitor(&router, "idle-then-busy").await;
+    assert_eq!(
+        string_at(&got, "state"),
+        "ACTIVE",
+        "case \"while the deleted probe drains\": expected ACTIVE, got {got:?}"
+    );
+    assert_eq!(
+        probes_of(&got).len(),
+        1,
+        "case \"while the deleted probe drains\": the monitor still holds it, got {got:?}"
+    );
+
+    std::thread::sleep(PAST_TEARDOWN);
     let (_, got) = get_monitor(&router, "idle-then-busy").await;
     assert_eq!(
         string_at(&got, "state"),
         "INACTIVE",
-        "case \"after the last probe was deleted\": expected INACTIVE, got {got:?}"
+        "case \"once the last probe's teardown finished\": expected INACTIVE, got {got:?}"
     );
 }
 

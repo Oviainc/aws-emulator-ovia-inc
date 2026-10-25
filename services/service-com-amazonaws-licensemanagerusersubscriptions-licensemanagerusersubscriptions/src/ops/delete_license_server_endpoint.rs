@@ -17,12 +17,20 @@
 //! state holds nothing for cannot be shown to be the caller's, so it is refused with the
 //! non-modelled `UnauthorizedException`
 //! ([`crate::scaffolded::Scaffolded::unauthorized`]) and its fixed sentence, which
-//! discloses nothing about whether the ARN names anything — never a not-found. The
+//! discloses nothing about whether the ARN names anything — never a not-found. That is
+//! what the real service's wire carries for a well-formed endpoint ARN that names no
+//! endpoint, and the model's error list does not say otherwise: the errors a model
+//! declares for an operation are the union of what it may return, not a mapping from a
+//! condition to a code — the same `ResourceNotFoundException` is declared for
+//! `CreateLicenseServerEndpoint`, whose unresolvable `IdentityProviderArn` is answered
+//! with `ValidationException` / [`crate::state::IDENTITY_PROVIDER_NOT_VALID`]. The
 //! `ServerType` the request carries must be the stored endpoint's, or it names a
 //! different resource than the one that exists; `ServerType` has a single value in the
-//! model today (`RDS_SAL`), so that conjunct only starts to bite when the enum grows,
-//! and it is written now so the resolution does not silently ignore a member the
-//! request names.
+//! model today (`RDS_SAL`), so a request carrying any other value is refused by the
+//! boundary validator before this handler runs (HTTP 400 `ValidationException` naming the
+//! member and the admitted set) and that conjunct only starts to bite when the enum grows
+//! — it is written now so the resolution does not silently ignore a member the request
+//! names.
 //!
 //! The answer carries the endpoint as the deletion left it. The operation is
 //! `@idempotent`: a repeat delete answers with the endpoint in the status it has reached
