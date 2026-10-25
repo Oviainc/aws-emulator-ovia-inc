@@ -710,8 +710,8 @@ async fn auto_scaling_requests_that_break_a_documented_rule_are_refused() {
         }
     }
 
-    // A table created without the member has no auto scaling settings to report: the
-    // settings are a resource of their own, and this one does not exist.
+    // A table created without the member has no auto scaling settings to report — and is
+    // still reported, by its identity members, with the optional member absent.
     assert_ok(
         "create a table with no auto scaling",
         emulator
@@ -725,17 +725,18 @@ async fn auto_scaling_requests_that_break_a_documented_rule_are_refused() {
             )
             .await,
     );
-    let (status, body) = emulator
-        .call(
-            "GetTableAutoScalingSettings",
-            json!({"keyspaceName": keyspace, "tableName": "no_auto_scaling"}),
-        )
-        .await;
-    assert_failure(
+    let body = assert_ok(
         "no_auto_scaling",
-        (status, body.clone()),
-        404,
-        "ResourceNotFoundException",
+        emulator
+            .call(
+                "GetTableAutoScalingSettings",
+                json!({"keyspaceName": keyspace, "tableName": "no_auto_scaling"}),
+            )
+            .await,
+    );
+    assert!(
+        body.pointer("/autoScalingSpecification").is_none(),
+        "case \"no_auto_scaling\": expected no autoScalingSpecification, got {body}"
     );
     assert_member(
         "no_auto_scaling",
