@@ -25,6 +25,9 @@ mod kinesisvideo_signing_name_routing;
 mod cognito_vended_session_reads_sse_kms_object;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
+// Out of order for the same reason as the two entries above it.
+#[path = "all/redshift_cluster_iam_role_poll_lifecycle.rs"]
+mod redshift_cluster_iam_role_poll_lifecycle;
 #[path = "all/amplifybackend_app_registration.rs"]
 mod amplifybackend_app_registration;
 #[path = "all/apigateway_signing_name_routing.rs"]

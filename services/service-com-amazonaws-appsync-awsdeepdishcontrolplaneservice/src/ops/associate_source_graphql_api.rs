@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateSourceGraphqlApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateSourceGraphqlApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: links the source API the body names to the Merged API the path names,
+//! mints the association's `associationId` and ARN, and persists it in
+//! [`crate::state`]; `GetSourceApiAssociation` projects the same record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateSourceGraphqlApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creating the association SCHEDULES the merge of the source API's schema into the
+//! Merged API, so the association is reported in the non-terminal `MERGE_SCHEDULED`
+//! status and the clock owes its move to `MERGE_SUCCESS` one
+//! [`crate::state::MERGE_SPAN`] later. A source API is linked to a Merged API at most
+//! once, so a second association of the same pair is refused — whichever side the
+//! request addressed: with `ConcurrentModificationException` while that merge is still
+//! owed, and with `BadRequestException` once it has been performed.
+//!
+//! AppSync creates ONE link from either side, so the rule itself lives in
+//! [`crate::state::create_source_api_association`], which `AssociateMergedGraphqlApi`
+//! (the same create addressed by the source API) reaches with the same request; this
+//! handler only lifts its refusals into this operation's modelled errors.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +169,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateSourceGraphqlApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateSourceGraphqlApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateSourceGraphqlApi"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateSourceGraphqlApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The request this create makes, in the form both association creates share:
+        // this operation takes the Merged API from the path and the source API from the
+        // body, and that is the only way it differs from the other one.
+        let request = crate::state::SourceApiAssociationRequest {
+            merged_api_identifier: input.merged_api_identifier,
+            source_api_identifier: input.source_api_identifier,
+            description: input.description,
+            merge_type: input
+                .source_api_association_config
+                .and_then(|config| config.merge_type),
+            region: crate::state::request_region(ctx),
+        };
+
+        let created = crate::state::create_source_api_association(
+            &mut state.lock(),
+            request,
+            std::time::SystemTime::now(),
+        );
+
+        match created {
+            Ok(source_api_association) => Ok(AssociateSourceGraphqlApiOutput {
+                source_api_association: Some(source_api_association),
+            }),
+            Err(refusal) => Err(refuse(refusal)),
+        }
     }
+}
+
+/// This operation's modelled error for a refusal the shared association rule states.
+///
+/// Each variant keeps the status the model gives its shape, and carries the rule's own
+/// text: a not-found names no identifier, so which side was missing is not reported.
+fn refuse(refusal: crate::state::AssociationRefusal) -> AssociateSourceGraphqlApiError {
+    match refusal {
+        crate::state::AssociationRefusal::BadRequest(message) => {
+            AssociateSourceGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationRefusal::NotFound(message) => {
+            AssociateSourceGraphqlApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        crate::state::AssociationRefusal::ConcurrentModification(message) => {
+            AssociateSourceGraphqlApiErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
 }

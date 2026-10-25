@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeClusterSecurityGroupIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeClusterSecurityGroupIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeClusterSecurityGroupIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Refuses every request, and stores nothing.
+//!
+//! An ingress rule is revoked FROM a cluster security group, which is EC2-Classic's
+//! access-control mechanism for "non-VPC clusters"; a cluster inside a VPC is governed
+//! by VPC security groups (`Cluster$VpcSecurityGroups`) instead. Whether such a group
+//! can exist at all is decided by the platforms this service publishes
+//! ([`crate::state::cluster_security_groups_available`], which reads the one published
+//! list, [`crate::state::zone_supported_platforms`]), so while that list offers the VPC
+//! platform alone there is no group for any request to revoke ingress from — the same
+//! gate every operation of this family answers through. The refusal is a client fault:
+//! HTTP 400 with the `InvalidParameterValue` code Amazon Redshift answers a parameter it
+//! cannot honour with, not the scaffold's 501, which would claim the behaviour is merely
+//! unwritten.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
+        // This operation reads no state and writes none: the engine is held only so the
+        // constructor seam stays identical to every other operation's.
         let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeClusterSecurityGroupIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeClusterSecurityGroupIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeClusterSecurityGroupIngress"))
+
+        // The published platform list decides the answer, not the request: while it
+        // offers no EC2-Classic platform no cluster security group can exist, so no
+        // group name or CIDR/EC2 pair can name one and the store is never opened.
+        // None of the modelled faults fits — the refusal is not a missing group
+        // (`ClusterSecurityGroupNotFoundFault`, which would claim such groups can
+        // exist), a missing rule or a group state — so it goes through the error
+        // channel's `InvalidParameterValue`, the code AWS itself answers with.
+        if !crate::state::cluster_security_groups_available() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                crate::state::CLUSTER_SECURITY_GROUPS_UNAVAILABLE,
+            ));
+        }
+
+        // Reached only if that list ever offers the EC2-Classic platform again. No
+        // ingress path has been written for it — nothing in this service places a
+        // cluster outside a VPC — so the scaffold's 501 ("nobody has written this
+        // yet") is the honest answer.
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            <Self as smithy_server_runtime::Operation>::NAME,
+        ))
     }
 }
