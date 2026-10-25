@@ -19,6 +19,8 @@ mod account_assignment_creation_status;
 mod account_assignment_delete;
 #[path = "all/account_instance_restriction.rs"]
 mod account_instance_restriction;
+#[path = "all/accounts_for_provisioned_permission_set.rs"]
+mod accounts_for_provisioned_permission_set;
 #[path = "all/application_access_scope_limits.rs"]
 mod application_access_scope_limits;
 #[path = "all/application_access_scopes.rs"]
@@ -53,6 +55,8 @@ mod instance_create;
 mod instance_delete;
 #[path = "all/instance_describe.rs"]
 mod instance_describe;
+#[path = "all/instance_encryption_default.rs"]
+mod instance_encryption_default;
 #[path = "all/instance_region_removal.rs"]
 mod instance_region_removal;
 #[path = "all/instance_region_status.rs"]

@@ -10,8 +10,9 @@
 //!   to `Revoked` (Signer never hard-deletes a profile, so there is no removal
 //!   path);
 //! * a **signing job** — started by `StartSigningJob` against a profile whose
-//!   platform, version and signing material it SNAPSHOTS, and reported by
-//!   `DescribeSigningJob`.
+//!   platform, version and signing material it SNAPSHOTS, reported by
+//!   `DescribeSigningJob`, and carrying the revocation `RevokeSignature` records
+//!   on it once its signature is no longer trusted.
 //!
 //! Every handler reads and writes the one record below through [`service_state`];
 //! nothing in this service answers from a literal.
@@ -26,8 +27,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Destination, EncryptionAlgorithmOptions, HashAlgorithmOptions, S3SignedObject,
     SignatureValidityPeriod, SignedObject, SigningConfiguration, SigningImageFormat,
-    SigningMaterial, SigningPlatformOverrides, SigningProfile, SigningProfileRevocationRecord,
-    Source,
+    SigningJobRevocationRecord, SigningMaterial, SigningPlatformOverrides, SigningProfile,
+    SigningProfileRevocationRecord, Source,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -330,6 +331,13 @@ pub struct SigningJobRecord {
     pub job_owner: String,
     pub job_invoker: Option<String>,
     pub client_request_token: String,
+    /// The revocation of the signature this job produced, once somebody has
+    /// revoked it; `None` while the signature is still trusted. `SigningStatus`
+    /// is `InProgress | Failed | Succeeded` and cannot say "revoked", so this
+    /// record — reported as `revocationRecord`, and summarised as `isRevoked`
+    /// ("Indicates whether the signing job is revoked") — is what carries the
+    /// fact.
+    pub revocation_record: Option<SigningJobRevocationRecord>,
 }
 
 impl SigningJobRecord {
@@ -350,6 +358,30 @@ impl SigningJobRecord {
         self.completed_at = Some(due);
         self.signed_object = Some(signed_object_of(&self.destination, &self.job_id));
         self.completion_due = None;
+    }
+
+    /// Record the revocation of the signature this job produced: the job carries
+    /// the caller's `reason`, the instant of the revoking call and the identity
+    /// that revoked it, which every later read of the job reports.
+    ///
+    /// A revocation is a fact about a signature that has already stopped being
+    /// trusted, so it is recorded ONCE: revoking an already-revoked job leaves
+    /// the first record standing rather than restating when, why and by whom
+    /// trust ended.
+    pub fn revoke(&mut self, reason: &str, revoked_by: Option<String>, now: SystemTime) {
+        if self.is_revoked() {
+            return;
+        }
+        self.revocation_record = Some(SigningJobRevocationRecord {
+            reason: Some(reason.to_string()),
+            revoked_at: Some(to_timestamp(now)),
+            revoked_by,
+        });
+    }
+
+    /// Whether the signature this job produced has been revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.revocation_record.is_some()
     }
 
     /// The stored signing parameters, as the wire map — absent when there are none.
@@ -1033,6 +1065,25 @@ pub fn platform_not_found_message(platform_id: &str) -> String {
 /// (`smithy_query(query="shape",shape="PutSigningProfileRequest")`).
 pub fn platform_requires_signing_material(platform_id: &str) -> bool {
     signing_platform(platform_id).is_none_or(|entry| entry.requires_signing_material)
+}
+
+/// Whether a signature produced on `platform_id` can be revoked — the platform's
+/// published `revocationSupported` ("Indicates whether revocation is supported
+/// for the platform", [`SigningPlatformEntry::revocation_supported`]), which is
+/// how a client learns in advance whether revoking one of its signatures is
+/// possible at all.
+///
+/// A platform this emulator publishes NO entry for states nothing either way, so
+/// it is not held to lack the capability: only a platform published as not
+/// supporting revocation does.
+pub fn platform_supports_revocation(platform_id: &str) -> bool {
+    signing_platform(platform_id).is_none_or(|entry| entry.revocation_supported)
+}
+
+/// The refusal prose for revoking a signature produced on a platform published as
+/// not supporting revocation.
+pub fn revocation_unsupported_message(platform_id: &str) -> String {
+    format!("Revocation is not supported for platform {platform_id}")
 }
 
 /// True when `value` satisfies `ProfileName`'s `@length(2, 64)` and

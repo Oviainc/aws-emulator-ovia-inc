@@ -610,6 +610,8 @@ pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
 pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DISABLE_ADD_ON: &str = "DisableAddOn";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ENABLE_ADD_ON: &str = "EnableAddOn";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -10210,6 +10212,15 @@ macro_rules! add_on_records {
 
 add_on_records!(StoredInstance, StoredDisk);
 
+/// What an add-on operation needs from the CALLER's request — the member path a
+/// refusal names, and the sentence an unresolvable name is refused with — in a
+/// module of its own. Re-exported here, so every caller reaches it as
+/// `crate::state::…` exactly like the rest of this module.
+pub mod add_ons;
+pub use add_ons::{
+    add_on_resource_not_found, AddOnMember, ADD_ONS_LIST_MEMBER, ADD_ON_REQUEST_MEMBER,
+};
+
 /// The add-ons of `record` with the one of type `add_on_type` removed.
 ///
 /// A stored add-on is named by its type (the modelled `AddOnType` value the
@@ -10317,13 +10328,18 @@ pub fn tags_without(record: &dyn TaggedRecord, keys: &BTreeSet<String>) -> Vec<T
 /// request structure supplies. An `AutoSnapshot` request that names no
 /// `snapshotTimeOfDay` gets the hour Lightsail would pick for it, drawn here from
 /// the resource's own name so the answer is the same on every later read.
+///
+/// `member` is where the caller's request carries them, so every refusal below
+/// names a member of the request that was actually sent.
 pub fn add_ons_from_requests(
+    member: AddOnMember,
     resource_name: &str,
     requests: &[AddOnRequest],
 ) -> Result<Vec<AddOn>, String> {
     if requests.len() > MAX_ADD_ONS {
         return Err(format!(
-            "addOns carries {} entries, more than the {MAX_ADD_ONS} this service accepts",
+            "{} carries {} entries, more than the {MAX_ADD_ONS} this service accepts",
+            member.carrier,
             requests.len()
         ));
     }
@@ -10356,7 +10372,8 @@ pub fn add_ons_from_requests(
                 ..Default::default()
             }),
             other => Err(format!(
-                "addOns[].addOnType must be one of [{}], got '{other}'",
+                "{}.addOnType must be one of [{}], got '{other}'",
+                member.entry,
                 crate::ops::types::ADD_ON_TYPE_VALUES.join(", ")
             )),
         })
@@ -10381,6 +10398,7 @@ pub const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
 /// act. Every operation that creates a disk goes through here, so `CreateDisk`
 /// and `CreateDiskFromSnapshot` accept exactly the same add-ons.
 pub fn disk_add_ons_from_requests(
+    member: AddOnMember,
     disk_name: &str,
     requests: &[AddOnRequest],
 ) -> Result<Vec<AddOn>, String> {
@@ -10389,12 +10407,12 @@ pub fn disk_add_ons_from_requests(
         .find(|request| request.add_on_type != ADD_ON_TYPE_AUTO_SNAPSHOT)
     {
         return Err(format!(
-            "addOns[].addOnType '{}' cannot be enabled on a disk: a disk accepts only \
+            "{}.addOnType '{}' cannot be enabled on a disk: a disk accepts only \
              {ADD_ON_TYPE_AUTO_SNAPSHOT}",
-            request.add_on_type
+            member.entry, request.add_on_type
         ));
     }
-    add_ons_from_requests(disk_name, requests)
+    add_ons_from_requests(member, disk_name, requests)
 }
 
 /// Whether `value` is a date in the `YYYY-MM-DD` form an automatic snapshot is
@@ -10962,3 +10980,4 @@ mod tests {
         );
     }
 }
+

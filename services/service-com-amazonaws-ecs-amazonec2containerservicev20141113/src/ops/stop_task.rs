@@ -221,8 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             task.stop_code = Some(crate::state::STOP_CODE_USER_INITIATED.to_string());
             task.stopped_due_at = Some(now + crate::state::TRANSITION_SPAN);
             // A task asked to stop never reaches RUNNING: the start it was still
-            // waiting for is cancelled, not merely overtaken.
+            // waiting for, and the placement it was parked for, are cancelled rather
+            // than merely overtaken.
             task.running_due_at = None;
+            task.pending_due_at = None;
             // The operation's own doc: "Any tags associated with the task will be
             // deleted."
             task.tags.clear();

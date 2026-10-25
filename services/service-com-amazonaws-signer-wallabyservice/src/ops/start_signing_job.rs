@@ -306,6 +306,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // none.
             job_invoker: None,
             client_request_token: input.client_request_token.clone(),
+            // A freshly started job's signature is trusted: the revocation record
+            // is what `RevokeSignature` writes, and only when it is called.
+            revocation_record: None,
         };
 
         store.jobs.insert(job_id.clone(), job);

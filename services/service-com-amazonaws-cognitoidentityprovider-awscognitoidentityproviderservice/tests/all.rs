@@ -39,6 +39,8 @@ mod identity_provider_lifecycle;
 mod initiate_auth;
 #[path = "all/list_devices.rs"]
 mod list_devices;
+#[path = "all/list_groups.rs"]
+mod list_groups;
 #[path = "all/list_user_pools.rs"]
 mod list_user_pools;
 #[path = "all/resource_server_lifecycle.rs"]
@@ -51,6 +53,8 @@ mod state_roundtrip;
 mod token_signing;
 #[path = "all/update_group.rs"]
 mod update_group;
+#[path = "all/update_user_attributes.rs"]
+mod update_user_attributes;
 #[path = "all/update_user_pool.rs"]
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]

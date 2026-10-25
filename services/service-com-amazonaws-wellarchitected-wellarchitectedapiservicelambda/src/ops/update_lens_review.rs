@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLensReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLensReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLensReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records what a caller writes to ONE lens review of ONE workload — the review's own
+//! notes, the notes of each pillar of the lens under review and the Jira question
+//! selection — and reports the lens review the write left behind.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +159,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLensReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLensReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLensReview"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLensReviewErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The lens as the request named it resolves to ONE ARN (the one place this service
+        // resolves a lens's ARN); read before the workload is borrowed for writing, so the
+        // review and the ARN come from one view of the store.
+        let lens_arn =
+            store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts()));
+
+        // The resource is resolved BEFORE the request's values are judged, so a request
+        // that names a workload or a lens review that does not exist is answered with that
+        // 404 whatever else it carries.
+        let workload = store
+            .workloads
+            .get_mut(&input.workload_id)
+            .ok_or_else(|| {
+                UpdateLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_not_found(&input.workload_id),
+                )
+            })?;
+
+        // A lens review exists only while that lens is associated with the workload, so a
+        // lens the workload does not carry has no review to write to.
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(UpdateLensReviewErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            )
+            .into());
+        }
+
+        // A `PillarNotes` key is a `PillarId`, and the pillars of a lens are what its lens
+        // content names: a key naming a pillar the lens does NOT define belongs to no
+        // pillar of this lens review and is refused rather than stored.
+        if let Some(exception) = crate::state::undefined_pillar_refusal(
+            crate::state::PILLAR_NOTES_MEMBER,
+            &input.lens_alias,
+            input
+                .pillar_notes
+                .iter()
+                .flat_map(|notes| notes.keys().map(String::as_str)),
+        ) {
+            return Err(UpdateLensReviewErrorModeled::ValidationException(exception).into());
+        }
+
+        // A Jira selection selects pillars and questions OF THIS LENS REVIEW, so its
+        // `PillarId`s are judged by the same rule as a `PillarNotes` key, and each
+        // `SelectedQuestionIds` entry has to be a question that pillar of the lens asks.
+        let selected_pillars = input
+            .jira_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.selected_pillars.as_deref())
+            .unwrap_or_default();
+        if let Some(exception) = crate::state::undefined_pillar_refusal(
+            crate::state::JIRA_CONFIGURATION_MEMBER,
+            &input.lens_alias,
+            selected_pillars
+                .iter()
+                .filter_map(|pillar| pillar.pillar_id.as_deref()),
+        ) {
+            return Err(UpdateLensReviewErrorModeled::ValidationException(exception).into());
+        }
+        for pillar in selected_pillars {
+            let Some(pillar_id) = pillar.pillar_id.as_deref() else {
+                continue;
+            };
+            if let Some(exception) = crate::state::undefined_pillar_question_refusal(
+                // The finding names the path that reaches the offending selection, so a
+                // caller is told WHICH selected pillar to fix.
+                &format!(
+                    "{}.SelectedPillars.{pillar_id}",
+                    crate::state::JIRA_CONFIGURATION_MEMBER
+                ),
+                &input.lens_alias,
+                pillar_id,
+                pillar
+                    .selected_question_ids
+                    .iter()
+                    .flat_map(|ids| ids.iter().map(String::as_str)),
+            ) {
+                return Err(UpdateLensReviewErrorModeled::ValidationException(exception).into());
+            }
+        }
+
+        // Every member a request can write here is optional, so a request that supplies
+        // NONE of them asks for no change: it reports the lens review as it stands and
+        // leaves the workload's `UpdatedAt` where it was, rather than recording an update
+        // nothing wrote.
+        if input.lens_notes.is_some()
+            || input.pillar_notes.is_some()
+            || input.jira_configuration.is_some()
+        {
+            let written = workload.lens_review_record_mut(&input.lens_alias);
+            if let Some(lens_notes) = input.lens_notes {
+                written.notes = Some(lens_notes);
+            }
+            if let Some(pillar_notes) = input.pillar_notes {
+                // The supplied map REPLACES the stored one, the same way the supplied
+                // `LensNotes` replaces the stored notes: a member a request carries is the
+                // new value of that member, not an addition to it.
+                written.pillar_notes = pillar_notes.into_iter().collect();
+            }
+            if let Some(jira_configuration) = input.jira_configuration {
+                written.jira_configuration = Some(jira_configuration);
+            }
+            // Writing to a lens review changes the workload's review, which is what a
+            // workload read and its lens reviews report as the instant they were last
+            // updated.
+            workload.updated_at = now;
+        }
+
+        Ok(UpdateLensReviewOutput {
+            // The workload as STORED, which is the resource this lens review belongs to,
+            // and the lens as the REQUEST named it, beside the ARN it resolves to.
+            workload_id: Some(workload.workload_id.clone()),
+            lens_review: Some(workload.to_lens_review(&input.lens_alias, lens_arn)),
+        })
     }
 }

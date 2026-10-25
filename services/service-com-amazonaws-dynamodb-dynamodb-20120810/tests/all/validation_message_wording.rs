@@ -209,7 +209,7 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
             "Query",
             json!({"TableName": "Music", "Limit": 0, "KeyConditionExpression": "Artist = :a",
                    "ExpressionAttributeValues": {":a": {"S": "Acme"}}}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1"
                 .to_string(),
         ),
@@ -218,7 +218,7 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
             "Query",
             json!({"TableName": "Music", "Limit": -7, "KeyConditionExpression": "Artist = :a",
                    "ExpressionAttributeValues": {":a": {"S": "Acme"}}}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '-7' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1"
                 .to_string(),
         ),
@@ -226,7 +226,7 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
             "the same bound on another operation's Limit",
             "Scan",
             json!({"TableName": "Music", "Limit": 0}),
-            "1 validation error detected: Value at 'Limit' failed to satisfy constraint: \
+            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: \
              Member must have value greater than or equal to 1"
                 .to_string(),
         ),
@@ -398,8 +398,8 @@ async fn two_violations_are_counted_and_joined_in_one_envelope() {
     )
     .await;
 
-    let limit_clause = "Value at 'Limit' failed to satisfy constraint: Member must have value \
-                        greater than or equal to 1";
+    let limit_clause = "Value '0' at 'limit' failed to satisfy constraint: Member must have \
+                        value greater than or equal to 1";
     let select_clause = "Value 'EVERYTHING' at 'select' failed to satisfy constraint: Member \
                          must satisfy enum value set: [ALL_ATTRIBUTES, ALL_PROJECTED_ATTRIBUTES, \
                          SPECIFIC_ATTRIBUTES, COUNT]";
