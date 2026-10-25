@@ -63,9 +63,10 @@
 //! names no member) fills the same two members through
 //! [`stated_validation_exception`], the one place that envelope is built. The
 //! model's other reason (`Other`) names a refusal no field accounts for, and no
-//! operation of this service raises one: a preference write, for instance,
-//! declares no rule about the CALLER, so every refusal it can answer is a
-//! member outside its declared constraint.
+//! operation of this service raises one: every rule a handler of this service
+//! enforces — including the organization rules over a preference write — rejects
+//! a MEMBER the request carries, so every refusal it can answer is attributed to
+//! one.
 //!
 //! # What the top-level `message` of a refusal says
 //!
@@ -78,7 +79,8 @@
 //!   ([`field_validation_exception`]);
 //! - a refusal a HANDLER raises for a rule of the operation the model cannot
 //!   express — a filter member the operation does not support, a dimension that
-//!   names no member, a pagination token this service never issued — is built
+//!   names no member, a pagination token this service never issued, a
+//!   preference only the organization's management account may set — is built
 //!   FROM the request, so its message states the rejected member and the rule
 //!   that rejects it ([`stated_validation_exception`]), with the same per-member
 //!   diagnosis still in `fields`. An SDK error surface commonly shows only

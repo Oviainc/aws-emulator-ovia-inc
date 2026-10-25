@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteModelPackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteModelPackage`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: removes the model package `ModelPackageName` resolves to from
+//! `crate::state` — by bare name, by `<group>/<version>` or by ARN, the three forms
+//! `VersionedArnOrName` admits — so a later `DescribeModelPackage` refuses it, its
+//! identifier is free again and the group that held it becomes deletable. A name the
+//! account holds no package under is refused rather than reported as a delete. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteModelPackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteModelPackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteModelPackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteModelPackage"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageName` is a `VersionedArnOrName`: a bare name, a `<group>/<version>`
+        // pair or the package's ARN. All three name one stored package, so they resolve to
+        // one key — the same resolution `DescribeModelPackage` performs.
+        let key = crate::state::model_package_lookup_key(&input.model_package_name);
+
+        let mut store = state.lock();
+        // Deleting an identifier no package is stored under is refused, never answered
+        // with an empty 200: a caller cannot tell that from a delete that removed
+        // something, so a cleanup loop could not tell whether the identifier was ever
+        // taken. The wording is `DescribeModelPackage`'s, so one identifier form reports
+        // the condition across this resource's operations.
+        let Some(package) = store.model_packages.remove(key) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::could_not_find(
+                    crate::state::MODEL_PACKAGE_KIND_LABEL,
+                    &input.model_package_name,
+                ),
+            ));
+        };
+        let arn = package.arn;
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteModelPackageOutput)
     }
 }

@@ -69,6 +69,8 @@ fn sized_object(length: usize) -> Object {
         encryption: ObjectEncryption::default(),
         // The store mints an object's version id; one handed to `put_object` carries none.
         version_id: None,
+        // A write places no Object Lock retention; `PutObjectRetention` is what does.
+        retention: None,
         body,
     }
 }

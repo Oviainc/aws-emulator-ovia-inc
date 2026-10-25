@@ -23,6 +23,7 @@
 //! already owns; nothing here restates it.
 
 use crate::provisioning_loop::{action, call, emulator, p, Reply};
+use crate::target_group_attributes_and_modification::unescaped;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One row: the case name, the `HealthCheckPort` value, and whether the service accepts
@@ -144,6 +145,14 @@ async fn modify_target_group_accepts_a_health_check_port_only_by_the_published_r
                 reply.status,
                 reply.body
             );
+            // The refusal has to be actionable from its text alone, so it names the
+            // value it refused and the published bounds the caller has to meet.
+            let message = unescaped(&reply.text("Message").unwrap_or_default());
+            assert!(
+                message.contains(&format!("'{value}'")) && message.contains("'1-65535'"),
+                "case {case} ({value}): the refusal must name the value and the bounds, \
+                 got {message:?}"
+            );
             assert_eq!(
                 health_check_of(&described),
                 before,
@@ -191,6 +200,12 @@ async fn create_target_group_accepts_a_health_check_port_only_by_the_published_r
                 "case {case} ({value}): expected 400 ValidationError, got {} {}",
                 reply.status,
                 reply.body
+            );
+            let message = unescaped(&reply.text("Message").unwrap_or_default());
+            assert!(
+                message.contains(&format!("'{value}'")) && message.contains("'1-65535'"),
+                "case {case} ({value}): the refusal must name the value and the bounds, \
+                 got {message:?}"
             );
             // Nothing may be persisted by a refused create.
             let mut form = action("DescribeTargetGroups");

@@ -11,11 +11,19 @@
 //! Records are the service's own storage shape; each one converts to its modelled
 //! Smithy shape through a `to_shape` method, so a describe answers exactly what the
 //! create persisted instead of re-deriving it.
+//!
+//! One set of facts a request is resolved against is NOT this service's: the account's
+//! VPCs, subnets, security groups and instances. [`network`] resolves those against EC2,
+//! which owns them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 pub mod network;
+
+/// The unit tests of [`network`]'s pure half — where an address falls relative to a VPC.
+#[cfg(test)]
+mod vpc_topology;
 
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, Listener, ListenerAttribute, LoadBalancer,
@@ -734,7 +742,7 @@ pub fn check_health_check_port(value: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "Health check port '{value}' must be '{TRAFFIC_PORT}' or an integer from {} to {}",
+        "Health check port '{value}' must be within '{}-{}' or '{TRAFFIC_PORT}'",
         HEALTH_CHECK_PORT_RANGE.start(),
         HEALTH_CHECK_PORT_RANGE.end(),
     ))

@@ -3254,6 +3254,17 @@ pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
 /// documents a default that branches on a request naming it.
 pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
 
+/// The message the `DBSubnetGroupNotFoundFault` carries for `name`: the fault names the
+/// group the request could not resolve, in the folded spelling the group would be stored
+/// under, in the wording Amazon RDS answers that fault with.
+///
+/// It lives here because every operation that RESOLVES a `DBSubnetGroupName` — the
+/// delete, the describe and the create operations that place a resource in a group —
+/// answers the same fault, so the wording is written once rather than per handler.
+pub fn db_subnet_group_not_found_message(name: &str) -> String {
+    format!("DB Subnet group '{name}' not found.")
+}
+
 /// A stored DB subnet group: the name, the description and the EC2 subnets the request
 /// named.
 ///

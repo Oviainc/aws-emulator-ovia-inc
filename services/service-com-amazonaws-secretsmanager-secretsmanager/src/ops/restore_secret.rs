@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels a scheduled deletion of a secret by dropping its `DeletionDate` stamp,
+//! leaving every version and staging label the secret holds untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +146,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreSecret"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // The permanent removal the clock has already made due, materialised
+        // before this call resolves anything: a secret whose removal was owed at
+        // this instant is gone whether or not anybody called, so no call here
+        // restores it back into existence.
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(not_found());
+        };
+
+        // "Cancels the scheduled deletion of a secret by removing the
+        // DeletedDate time stamp", while its deletion date is still ahead. Past
+        // that date the deletion is final — it is "the date and time after which
+        // this secret Secrets Manager can permanently delete this secret, and it
+        // can no longer be restored" (`DeleteSecretResponse$DeletionDate`, this
+        // service's Smithy model) — so there is nothing left to cancel and the
+        // secret is reported the way one the service no longer holds is; a
+        // deletion that skipped the recovery window stamps that date at the
+        // delete call itself, so it is beyond restoring from the moment it is
+        // made. A secret no deletion is scheduled for has no stamp to remove, so
+        // the call changes nothing about it and still reports the secret it
+        // named — which is what makes a repeat of this call answer like the
+        // first one.
+        if secret.deletion_cancellable(now) {
+            secret.cancel_deletion(now);
+        } else if secret.scheduled_for_deletion() {
+            return Err(not_found());
+        }
+
+        Ok(RestoreSecretOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+        })
     }
 }
+
+/// `ResourceNotFoundException` for a `SecretId` this service holds no restorable
+/// secret for, carrying the one sentence every operation of this service answers
+/// a secret it cannot find with ([`crate::state::SECRET_NOT_FOUND_MESSAGE`]).
+fn not_found() -> RestoreSecretError {
+    RestoreSecretErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> RestoreSecretError {
+    RestoreSecretErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
+}
+

@@ -386,7 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             format!(
                                 "the association of {resource_arn} is in effect over at most {} \
                                  separate ranges of billing periods",
-                                crate::state::MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION
+                                crate::state::MAX_BILLING_PERIOD_SPANS
                             ),
                         ));
                         continue;

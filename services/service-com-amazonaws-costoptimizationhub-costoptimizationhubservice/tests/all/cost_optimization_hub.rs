@@ -13,8 +13,14 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice as cost_optimization_hub;
 use service_com_amazonaws_costoptimizationhub_costoptimizationhubservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The `MemberAccountDiscountVisibility` value that makes the organization's
+/// discounts visible to its member accounts — read from the service rather than
+/// copied here, so a suite cannot drift from the value the handler gates on.
+pub(crate) use cost_optimization_hub::state::DISCOUNT_VISIBILITY_ALL;
 
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services.
@@ -22,13 +28,58 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `pub(crate)` so the other suites in this target drive the service through the
 /// one assembly rather than each building its own.
 pub(crate) fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    router_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// A router over `engine`, so a suite that has to reach the store builds the
+/// engine itself and still drives the service through the one assembly.
+fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // In-process tests sign with a placeholder key; signature verification is a
     // front-door setting, not part of what these tests are about.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// A router whose store records the caller as the MANAGEMENT account of the
+/// organization it holds.
+///
+/// Which account is the management account is an Organizations fact, and this
+/// emulator has no Organizations control plane to learn it from, so the store
+/// starts with no organization recorded
+/// (`state::organization_management_account_id`) and every caller is a member
+/// account. A suite that needs the management-account arm of an organization
+/// rule — being allowed to set the organization-wide
+/// `memberAccountDiscountVisibility` preference, and so to reach the savings
+/// estimation mode that preference gates — records the organization here.
+pub(crate) fn management_account_router() -> MultiServiceRouter {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let state = cost_optimization_hub::state::service_state(&*engine)
+        .expect("the Cost Optimization Hub store");
+    state.lock().organization_management_account_id =
+        Some(engine::emulator_account_id().to_string());
+    router_over(engine)
+}
+
+/// Enable the organization-wide member-account discount visibility over the
+/// wire, which is the state `savingsEstimationMode=AfterDiscounts` requires.
+///
+/// The caller must be the organization's management account
+/// ([`management_account_router`]); the call is the same `UpdatePreferences` a
+/// client makes.
+pub(crate) async fn enable_member_account_discount_visibility(router: &MultiServiceRouter) {
+    let updated = ok(
+        router,
+        "UpdatePreferences",
+        &json!({"memberAccountDiscountVisibility": DISCOUNT_VISIBILITY_ALL}),
+    )
+    .await;
+    assert_eq!(
+        updated["memberAccountDiscountVisibility"].as_str(),
+        Some(DISCOUNT_VISIBILITY_ALL),
+        "case enable discount visibility: expected the preference stored, got {updated}"
+    );
 }
 
 /// Call one operation and return its HTTP status and JSON body.
@@ -151,7 +202,21 @@ pub(crate) const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_
 ///
 /// `pub(crate)` so the other suites in this target establish it the one way.
 pub(crate) async fn enrolled_router() -> MultiServiceRouter {
-    let router = router();
+    enrolled(router()).await
+}
+
+/// An enrolled router whose caller is the organization's management account and
+/// whose member-account discount visibility is enabled — the state a test needs
+/// to put the account into the discount-adjusted savings estimation mode
+/// ([`management_account_router`]).
+pub(crate) async fn enrolled_router_with_discounts_visible() -> MultiServiceRouter {
+    let router = enrolled(management_account_router()).await;
+    enable_member_account_discount_visibility(&router).await;
+    router
+}
+
+/// Enroll `router`'s account and wait for the analysis the enrollment starts.
+async fn enrolled(router: MultiServiceRouter) -> MultiServiceRouter {
     ok(
         &router,
         "UpdateEnrollmentStatus",
@@ -345,9 +410,9 @@ async fn list_enrollment_statuses_filters_and_pages() {
 /// following read does.
 ///
 /// `preference_writes` spans the rest of the class: every combination of the
-/// modelled enums (including `memberAccountDiscountVisibility` and an explicit
-/// `savingsEstimationMode=AfterDiscounts`), and the refusal a value outside an
-/// enum gets.
+/// modelled enums, and the refusal a value outside an enum gets.
+/// `preference_gates` owns the two organization rules — who may set
+/// `memberAccountDiscountVisibility`, and what `AfterDiscounts` requires.
 #[tokio::test]
 async fn preferences_merge_and_read_back_with_the_service_defaults() {
     let router = router();
@@ -964,9 +1029,14 @@ async fn get_recommendation_rejects_an_unknown_id() {
 /// and an account that has stated no preference is reported under the default
 /// the service applies (`BeforeDiscounts`), the same mode `GetPreferences`
 /// names.
+///
+/// The discounted mode is available only where the organization has made its
+/// member accounts' discounts visible, so the account here is the organization's
+/// management account with that preference set (`preference_gates` owns the rule
+/// itself).
 #[tokio::test]
 async fn savings_estimation_mode_changes_the_reported_money() {
-    let router = enrolled_router().await;
+    let router = enrolled_router_with_discounts_visible().await;
     let rightsize = id("0001");
 
     // (stored savingsEstimationMode, expected monthly cost, expected saving).

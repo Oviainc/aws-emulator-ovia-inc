@@ -9,6 +9,53 @@ Issue-Commit: 1b15cfcf83a9fafcaa69f938ed17066b612a8ba0
 
 > _Note: this issue was identified against the code base at commit `1b15cfcf83a9fafcaa69f938ed17066b612a8ba0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution (what was fixed here)
+
+**Cause 1 — FIXED.** The shared `elasticloadbalancing` awsQuery endpoint now resolves the
+`(Action, Version)` PAIR rather than the action alone: an envelope naming `2015-12-01` is
+served out of the ELBv2 model's own service — its routing table, handlers, protocol and
+error renderers — over the one shared engine, leaving `InvalidAction` for a pair no
+mounted model declares
+(`services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7/src/service/api_version.rs`,
+`serving_model`; the front door itself landed from the sibling record
+`20261023T025808Z-elbv2-awsquery-action-table-at-api-version-2015.md`). `CreateTargetGroup`
+is therefore reachable, and the surface this record is about is implemented behind it:
+
+* `CreateTargetGroup` persists a target group with every default its model documents
+  materialized — the health-check settings, `ProtocolVersion` (`HTTP1`, for the HTTP/HTTPS
+  protocols its documentation scopes that default to) and `IpAddressType` (`ipv4`) — is
+  idempotent for a repeat of the same settings, and refuses a repeat with different
+  settings with `DuplicateTargetGroupName`; a `HealthCheckPort` that is neither
+  `traffic-port` nor a port inside the bound the model puts on every port member is
+  refused `ValidationError`, naming the value and that bound
+  (`src/ops/create_target_group.rs`, `src/state.rs`).
+* `RegisterTargets` resolves an `ip` target against the target group's VPC as Amazon EC2
+  holds it, read from EC2 itself through the in-process callback: the subnet that holds
+  the address detects the Availability Zone, an address of the VPC no subnet holds is
+  refused, an address outside the VPC is accepted only from the RFC 1918 / RFC 6598
+  ranges — judged before any `AvailabilityZone` is asked for, because whether the address
+  is one an `ip` target may carry at all does not depend on the zone — and then only with
+  that zone named. Each of those refusals is about the VALUE a request member carries, so
+  each answers this service's request-validation code (`400 ValidationError`, as the
+  recorded responses of these very checks do) rather than the modelled `InvalidTarget`,
+  which is about a target that does not exist (`src/state/network.rs`).
+* `DescribeTargetHealth` reports a target of a group no listener forwards to as
+  `unused` / `Target.NotInUse`, and an unregistered one as `Target.NotRegistered`.
+
+Pinned by that crate's `tests/all/ip_targets.rs` (the defaults a created target group
+reports), `tests/all/target_group_health_check_port.rs` (the port rule and the refusal's
+own text) and `core/router/tests/all/elbv2_network_resolution.rs`, which mounts ELBv2 and
+EC2 on one engine and tables the `ip`-target rule over every way an address can fall
+relative to the group's VPC.
+
+**Declined.** `ec2__elbv2.ip-target-from-a-public-range-rejected`,
+`ec2__elbv2.ip-target-in-the-vpc-cidr-but-outside-every-subnet-rejected` and
+`ec2__elbv2.ecsnt-ip-target-outside-the-vpc-rejected` now agree with the recording on the
+status and the error code and differ only in the WORDING of the refusal, which the
+emulator builds from the request (the address, the VPC and the constraint it broke). A
+message is a requirement only where the rule producing it is known; these recorded texts
+are examples, so the difference is not a defect.
+
 ## Operation
 CreateTargetGroup
 

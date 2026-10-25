@@ -11,6 +11,11 @@
 //! put that keeps the name and names a DIFFERENT resource is refused with the
 //! `ConflictException` this operation models rather than re-pointing the stored source.
 //!
+//! The resource must also be one this endpoint serves: a resource of a global service is
+//! reached through its partition's single global endpoint, so a put naming one from any other
+//! Region is refused with `ValidationException`
+//! ([`crate::state::misplaced_delivery_source_message`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,6 +207,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::unparsable_arn_message("resourceArn", &input.resource_arn)
         {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // A resource of a GLOBAL service lives in its partition rather than in a Region and is
+        // reached through that partition's single global endpoint, so that endpoint's Region is
+        // the only one that can hold a delivery source for it: a put naming such a resource
+        // from any other Region names a resource this endpoint does not serve and is refused as
+        // the invalid parameter it is. A regional resource pins nothing here — its Region is
+        // the caller's to name.
+        if let Some(message) = crate::state::misplaced_delivery_source_message(
+            "resourceArn",
+            &input.resource_arn,
+            &region,
+        ) {
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 

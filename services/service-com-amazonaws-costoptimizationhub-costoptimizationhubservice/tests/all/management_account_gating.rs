@@ -13,9 +13,10 @@
 //! (`smithy_query(query="operation", operation="ListRecommendations,ListEnrollmentStatuses")`)
 //! — and the same request without the organization-scoped member is served.
 //!
-//! The PREFERENCE writes are deliberately not here: the model declares no
-//! caller-scoped rule over `UpdatePreferences`' members, so none of them is
-//! refused (see `preference_writes`).
+//! The PREFERENCE writes are not here: a write the organization's management
+//! account alone may make is refused with the modelled `ValidationException`
+//! that operation declares rather than with this 403, and `preference_gates`
+//! owns both of its rules.
 //!
 //! Each rule is asserted over a table that spans the member's values, the
 //! members it is sent beside, and the operations that declare it.

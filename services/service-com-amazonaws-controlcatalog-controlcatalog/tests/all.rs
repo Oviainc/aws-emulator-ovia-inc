@@ -17,6 +17,8 @@ mod control_arn_resolution;
 mod control_catalog;
 #[path = "all/control_mappings.rs"]
 mod control_mappings;
+#[path = "all/framework_cross_walk.rs"]
+mod framework_cross_walk;
 #[path = "all/ontology_listing.rs"]
 mod ontology_listing;
 #[path = "all/published_controls.rs"]

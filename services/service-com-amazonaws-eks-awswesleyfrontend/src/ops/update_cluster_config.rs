@@ -349,17 +349,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member this operation changes belongs to an Amazon EKS control plane:
         // a cluster `RegisterCluster` connected has none — it reports a `connectorConfig`
-        // and nothing else — so there is no configuration of it to update.
-        // `InvalidRequestException` is "the request is invalid given the state of the
-        // cluster", which is exactly that.
+        // and nothing else — so this operation does not apply to it at all. That is a
+        // PERMANENT fact about the cluster, which is why it is `ClientException` and not
+        // `InvalidRequestException` ("the request is invalid given the STATE of the
+        // cluster"): a client reads the state refusal as transient and waits for a status
+        // that will never come. It precedes the status gate below for the same reason.
         if record.is_connected() {
-            return Err(invalid_request(
-                &cluster_name,
-                format!(
-                    "Cluster {cluster_name} is a connected cluster, which has no Amazon EKS \
-                     control plane configuration to update"
-                ),
-            ));
+            return Err(
+                UpdateClusterConfigErrorModeled::ClientException(
+                    crate::state::connected_cluster_refusal(&cluster_name),
+                )
+                .into(),
+            );
         }
 
         // An update can only be started on a cluster that is running: one still being

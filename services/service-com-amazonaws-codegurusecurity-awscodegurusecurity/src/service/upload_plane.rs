@@ -26,6 +26,15 @@
 //! started on is the archive the caller uploaded. A target holds ONE resource, so a
 //! second upload replaces the first and an interrupted upload can simply be retried.
 //!
+//! The archive is accepted WHATEVER the size of a code archive — a real one is a whole
+//! zipped source tree, and this plane answers the upload of one the way the published
+//! target promises to. What this emulator retains of it is bounded instead of the upload
+//! being refused (see [`crate::state::UploadedResource`]). Two size bounds remain: the
+//! published maximum of one `PUT` ([`crate::state::S3_SINGLE_PUT_MAX_BYTES`]) and what
+//! this process takes in one upload ([`crate::state::UPLOAD_ACCEPTED_MAX_BYTES`]), both
+//! read off the DECLARED length before the body is touched, so neither costs an
+//! allocation.
+//!
 //! Every other method on this path space is refused: the published URL describes an
 //! upload, and answering a read on it would serve a resource the URL grants no read of.
 //!
@@ -64,9 +73,11 @@ const STORE_UNAVAILABLE_MESSAGE: &str = "The CodeGuru Security store is unavaila
 
 /// Serve one request to a published upload target.
 ///
-/// The judgement about WHICH artifact the target names, and whether it may hold the
-/// archive, is [`crate::state::Store::receive_upload`]'s: this function reads the request,
-/// hands the bytes to the store under one lock, and renders the store's answer.
+/// The judgement about WHICH artifact the target names is
+/// [`crate::state::Store::receive_upload`]'s: this function reads the request, accounts for
+/// the archive that arrived ([`crate::state::UploadedResource::received`], outside the
+/// store's lock), hands that record to the store under one lock, and renders the store's
+/// answer.
 pub fn serve<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
@@ -75,19 +86,27 @@ pub fn serve<Eng: Send + Sync + 'static>(
     if req.method() != "PUT" {
         return refusal(405, "MethodNotAllowed", METHOD_NOT_ALLOWED_MESSAGE);
     }
+    // The DECLARED length is judged first, before the body is read at all: an upload past
+    // a size bound of this plane is then refused without the archive being touched, so
+    // reaching a bound costs a header parse rather than a copy of the request.
+    if let Some(declared) = declared_length(req) {
+        if let Some(max) = crate::state::upload_size_bound_exceeded(declared) {
+            return too_large(max);
+        }
+    }
     let Some(body) = req.body().bytes() else {
         return refusal(500, "InternalFailure", UNREADABLE_BODY_MESSAGE);
     };
     let Some(state) = crate::state::service_state(engine) else {
         return refusal(500, "InternalServerException", STORE_UNAVAILABLE_MESSAGE);
     };
-    // The BOUND precedes the COPY: an archive past what one target retains is refused
-    // here, before the buffered body is copied into the store's own allocation, so an
-    // over-large upload costs one length check rather than a second copy of itself.
-    // `Store::receive_upload` checks the same ceiling again, because the store is the
-    // authority on what it holds.
-    if body.len() > crate::state::UPLOAD_CONTENT_MAX_BYTES {
-        return too_large();
+    // And the same bounds on what actually arrived, for an upload that declared no length
+    // or declared one it did not send: the length of the body is the authority on the size
+    // of the archive, and no work proportional to it happens before this.
+    if let Some(max) =
+        crate::state::upload_size_bound_exceeded(u64::try_from(body.len()).unwrap_or(u64::MAX))
+    {
+        return too_large(max);
     }
     // "A set of key-value pairs that contain the required headers when uploading your
     // resource" (`CreateUploadUrlResponse$requestHeaders`) names the media type of the
@@ -97,36 +116,33 @@ pub fn serve<Eng: Send + Sync + 'static>(
         .get(::http::header::CONTENT_TYPE.as_str())
         .map(str::to_string);
     let now = crate::state::now_millis();
-    let outcome = state
-        .lock()
-        .receive_upload(target, body.to_vec(), content_type, now);
+    // The archive is accounted for BEFORE the lock is taken: the work proportional to what
+    // was uploaded (the digest over every byte, the copy of the retained prefix) is this
+    // request's own, so no other caller waits on it.
+    let received = crate::state::UploadedResource::received(body, content_type, now);
+    let outcome = state.lock().receive_upload(target, received);
     match outcome {
         UploadOutcome::Stored => stored(),
         UploadOutcome::NoSuchTarget => refusal(404, "NoSuchKey", NO_SUCH_TARGET_MESSAGE),
-        UploadOutcome::TooLarge => too_large(),
-        UploadOutcome::StoreFull => refusal(
-            507,
-            "InsufficientStorage",
-            &format!(
-                "The upload targets of this account already hold the maximum of {max} \
-                 bytes this emulator retains; scan a resource or wait for a minted target \
-                 to expire",
-                max = crate::state::UPLOAD_CONTENT_TOTAL_MAX_BYTES,
-            ),
-        ),
     }
 }
 
-/// The answer to an archive larger than one target retains
-/// ([`crate::state::UPLOAD_CONTENT_MAX_BYTES`]).
-fn too_large() -> RtResponse {
+/// The length the request declares for the archive, when it declares one this plane can
+/// read as a byte count. A header is caller-controlled text, so a value that is not a
+/// plain byte count is simply not a declaration and the body itself is judged instead.
+fn declared_length(req: &RtRequest) -> Option<u64> {
+    req.headers()
+        .get(::http::header::CONTENT_LENGTH.as_str())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// The answer to an archive past a size bound of this plane, naming the bound `max` it is
+/// past: `EntityTooLarge`, which is what S3 answers a `PUT` of an object it will not take.
+fn too_large(max: u64) -> RtResponse {
     refusal(
         400,
         "EntityTooLarge",
-        &format!(
-            "This upload target retains at most {max} bytes",
-            max = crate::state::UPLOAD_CONTENT_MAX_BYTES,
-        ),
+        &format!("One upload to this target accepts at most {max} bytes"),
     )
 }
 

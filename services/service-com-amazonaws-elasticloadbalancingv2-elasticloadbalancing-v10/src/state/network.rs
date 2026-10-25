@@ -503,8 +503,9 @@ pub fn is_private_target_address(address: IpAddr) -> bool {
 ///   subnet's zone whatever the request said;
 /// * an address inside the VPC's own CIDR but in none of its subnets is in no zone the
 ///   load balancer reaches, so it is refused;
-/// * an address outside the VPC needs the zone that is to serve it, and is accepted only
-///   from one of the ranges above.
+/// * an address outside the VPC is accepted only from one of the ranges above — judged
+///   first, because whether the address is one an `ip` target may carry at all does not
+///   depend on the zone — and then needs the zone that is to serve it.
 ///
 /// `vpc_cidrs` and `subnets` are what EC2 answered for the group's VPC; a caller that
 /// could not ask EC2 does not call this at all, because a refusal has to be grounded in
@@ -528,20 +529,24 @@ pub fn resolve_ip_target(
              of its subnets"
         ));
     }
-    // Outside the VPC, so the request has to say which zone serves the address: "an
-    // Availability Zone or `all`. This determines whether the target receives traffic
-    // from the load balancer nodes in the specified Availability Zone or from all enabled
-    // Availability Zones for the load balancer" — and nothing else can be inferred, since
-    // no subnet of the group's VPC holds it.
-    let Some(zone) = availability_zone else {
-        return Err(AVAILABILITY_ZONE_REQUIRED.to_string());
-    };
+    // Outside the VPC. Whether the address is one an `ip` target may carry AT ALL does not
+    // depend on the zone, so it is answered first: a publicly routable address is refused
+    // on its own terms ("you can't specify publicly routable IP addresses"), whether or
+    // not the request named a zone, and naming one would not make it registrable.
     if !is_private_target_address(address) {
         return Err(format!(
             "The IP address '{address}' is not valid: you can't specify publicly routable \
              IP addresses"
         ));
     }
+    // The address is one the group may carry, so what is left is which zone serves it:
+    // "an Availability Zone or `all`. This determines whether the target receives traffic
+    // from the load balancer nodes in the specified Availability Zone or from all enabled
+    // Availability Zones for the load balancer" — and nothing else can be inferred, since
+    // no subnet of the group's VPC holds it.
+    let Some(zone) = availability_zone else {
+        return Err(AVAILABILITY_ZONE_REQUIRED.to_string());
+    };
     Ok(Some(zone.to_string()))
 }
 
