@@ -21,6 +21,8 @@ mod job_template_lifecycle;
 mod managed_endpoint_describe;
 #[path = "all/managed_endpoint_listing.rs"]
 mod managed_endpoint_listing;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
 #[path = "all/resource_tag_removal.rs"]
