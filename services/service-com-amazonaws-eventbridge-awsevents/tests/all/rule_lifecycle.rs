@@ -841,32 +841,42 @@ async fn put_events_reports_one_outcome_per_entry() {
     .await;
     assert_eq!(status, 200, "PutRule answered {status} {body}");
 
-    // (entry, expected ErrorCode — absent means the entry is accepted)
-    let cases: Vec<(Value, Option<&str>)> = vec![
+    // (entry, expected ErrorCode — absent means the entry is accepted, and
+    // whether the accepted entry reaches the routing log)
+    let cases: Vec<(Value, Option<&str>, bool)> = vec![
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "{}" }),
             None,
+            true,
         ),
         (
             json!({ "DetailType": "Order Created", "Detail": "{}" }),
             Some("InvalidArgument"),
+            false,
         ),
         (
             json!({ "Source": "com.demo.widgets", "Detail": "{}" }),
             Some("InvalidArgument"),
+            false,
         ),
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "   " }),
             Some("MalformedDetail"),
+            false,
         ),
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "not json" }),
             Some("MalformedDetail"),
+            false,
         ),
         (
             json!({ "Source": "com.demo.widgets", "DetailType": "Order Created", "Detail": "[1,2]" }),
             Some("MalformedDetail"),
+            false,
         ),
+        // A bus the account does not hold is not a defect of the ENTRY: the
+        // entry is ingested and given an EventId, and the event is routed
+        // nowhere, so it reaches no routing log.
         (
             json!({
                 "Source": "com.demo.widgets",
@@ -874,7 +884,8 @@ async fn put_events_reports_one_outcome_per_entry() {
                 "Detail": "{}",
                 "EventBusName": "no-such-bus",
             }),
-            Some("ResourceNotFoundException"),
+            None,
+            false,
         ),
         (
             json!({
@@ -885,11 +896,12 @@ async fn put_events_reports_one_outcome_per_entry() {
                 "Time": 1_767_225_600_i64,
             }),
             None,
+            true,
         ),
     ];
 
-    let entries: Vec<Value> = cases.iter().map(|(entry, _)| entry.clone()).collect();
-    let expected_failures = cases.iter().filter(|(_, code)| code.is_some()).count();
+    let entries: Vec<Value> = cases.iter().map(|(entry, _, _)| entry.clone()).collect();
+    let expected_failures = cases.iter().filter(|(_, code, _)| code.is_some()).count();
     let (status, body) = call(&emulator, "PutEvents", &json!({ "Entries": entries })).await;
     assert_eq!(status, 200, "PutEvents answered {status} {body}");
     assert_eq!(
@@ -909,7 +921,8 @@ async fn put_events_reports_one_outcome_per_entry() {
         cases.len()
     );
     let mut event_ids: Vec<String> = Vec::new();
-    for (index, (entry, expected_code)) in cases.iter().enumerate() {
+    let mut routed_ids: Vec<String> = Vec::new();
+    for (index, (entry, expected_code, routed)) in cases.iter().enumerate() {
         let result = &results[index];
         let actual_code = result.get("ErrorCode").and_then(Value::as_str);
         assert_eq!(
@@ -924,6 +937,9 @@ async fn put_events_reports_one_outcome_per_entry() {
                     "entry {index} {entry}: an accepted entry carries an EventId, got {result}"
                 );
                 event_ids.push(id.to_string());
+                if *routed {
+                    routed_ids.push(id.to_string());
+                }
             }
             Some(_) => {
                 assert!(
@@ -950,13 +966,13 @@ async fn put_events_reports_one_outcome_per_entry() {
         "every accepted entry gets its own EventId, got {event_ids:?}"
     );
 
-    // Only accepted entries reach the routing log, and each one is recorded
-    // under the EventId the response reported.
+    // Only entries that reached a bus of this account are in the routing log,
+    // and each one is recorded under the EventId the response reported.
     let log = delivered(&emulator);
     let recorded: Vec<String> = log.iter().map(|event| event.0.clone()).collect();
     assert_eq!(
-        recorded, event_ids,
-        "expected the accepted entries' EventIds {event_ids:?} in the routing log, got {recorded:?}"
+        recorded, routed_ids,
+        "expected the routed entries' EventIds {routed_ids:?} in the routing log, got {recorded:?}"
     );
 }
 
@@ -1027,11 +1043,14 @@ async fn pattern_matching_stays_bounded_for_an_adversarial_event() {
     );
 }
 
-/// "The total entry size must be less than 1MB" (`PutEvents`), measured the way
-/// AWS documents under "Calculating PutEvents event entry size". The rows
-/// straddle that published bound: just under it, exactly at it, and past it.
+/// "The total entry size must be less than 1MB" (`PutEvents`), charged the way
+/// AWS documents under "Calculating PutEvents event entry size" and summed over
+/// the REQUEST's entries, with the published bound INCLUSIVE. A request past it
+/// is refused as a whole — never reported entry by entry. The rows straddle the
+/// bound: well under, one byte under, exactly at it, one byte past it, and well
+/// past it.
 #[tokio::test]
-async fn put_events_refuses_an_entry_past_the_published_size_limit() {
+async fn put_events_refuses_a_request_past_the_published_size_limit() {
     let emulator = emulator();
     let source = "com.demo.widgets";
     let detail_type = "Order Created";
@@ -1039,23 +1058,24 @@ async fn put_events_refuses_an_entry_past_the_published_size_limit() {
     // detail below is `{"pad":"<pad>"}`, so everything except the padding is:
     let overhead = source.len() + detail_type.len() + r#"{"pad":""}"#.len();
 
-    // (label, padding bytes, expected ErrorCode — absent means accepted)
-    let cases: Vec<(&str, usize, Option<&str>)> = vec![
-        ("well under the limit", 1_024, None),
+    // (label, padding bytes, whether the request is refused as a whole)
+    let cases: Vec<(&str, usize, bool)> = vec![
+        ("well under the limit", 1_024, false),
         (
             "one byte under the limit",
             MAX_ENTRY_SIZE_BYTES - overhead - 1,
-            None,
+            false,
         ),
+        ("exactly at the limit", MAX_ENTRY_SIZE_BYTES - overhead, false),
         (
-            "exactly at the limit",
-            MAX_ENTRY_SIZE_BYTES - overhead,
-            Some("InvalidArgument"),
+            "one byte past the limit",
+            MAX_ENTRY_SIZE_BYTES - overhead + 1,
+            true,
         ),
-        ("past the limit", MAX_ENTRY_SIZE_BYTES, Some("InvalidArgument")),
+        ("well past the limit", MAX_ENTRY_SIZE_BYTES, true),
     ];
 
-    for (label, padding, expected_code) in &cases {
+    for (label, padding, past_the_limit) in &cases {
         let detail = format!(r#"{{"pad":"{}"}}"#, "a".repeat(*padding));
         let (status, body) = call(
             &emulator,
@@ -1069,16 +1089,31 @@ async fn put_events_refuses_an_entry_past_the_published_size_limit() {
             }),
         )
         .await;
+        if *past_the_limit {
+            assert_eq!(
+                status, 400,
+                "case {label:?}: expected the whole request to be refused, got {status}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {label:?}: expected ValidationException, got {body}"
+            );
+            assert!(
+                body.get("Entries").is_none() && body.get("FailedEntryCount").is_none(),
+                "case {label:?}: a refused request reports no per-entry envelope, got {body}"
+            );
+            continue;
+        }
         assert_eq!(
             status, 200,
             "case {label:?}: PutEvents answered {status}, body member Entries {}",
             body["Entries"].is_array()
         );
-        let expected_failures = usize::from(expected_code.is_some());
         assert_eq!(
             body["FailedEntryCount"],
-            json!(expected_failures),
-            "case {label:?}: expected FailedEntryCount {expected_failures}, got {}",
+            json!(0),
+            "case {label:?}: expected FailedEntryCount 0, got {}",
             body["FailedEntryCount"]
         );
         let actual_code = body["Entries"][0]
@@ -1086,14 +1121,13 @@ async fn put_events_refuses_an_entry_past_the_published_size_limit() {
             .and_then(Value::as_str)
             .map(ToString::to_string);
         assert_eq!(
-            actual_code.as_deref(),
-            *expected_code,
-            "case {label:?}: expected ErrorCode {expected_code:?}, got {actual_code:?}"
+            actual_code, None,
+            "case {label:?}: expected no per-entry failure, got {actual_code:?}"
         );
     }
 
-    // Only the entries under the limit reached the routing log.
-    let accepted = cases.iter().filter(|(_, _, code)| code.is_none()).count();
+    // Only the requests within the limit reached the routing log.
+    let accepted = cases.iter().filter(|(_, _, past)| !past).count();
     let log = delivered(&emulator);
     assert_eq!(
         log.len(),
@@ -1290,7 +1324,8 @@ async fn targets_upsert_by_id_and_page_in_insertion_order() {
         "expected LimitExceededException past {MAX_TARGETS_PER_RULE} targets, got {body}"
     );
 
-    // `RemoveTargets` counts the ids that named nothing.
+    // `RemoveTargets` is idempotent about an id the rule does not carry: the
+    // target it names is already gone, so nothing fails.
     let (status, body) = call(
         &emulator,
         "RemoveTargets",
@@ -1300,13 +1335,13 @@ async fn targets_upsert_by_id_and_page_in_insertion_order() {
     assert_eq!(status, 200, "RemoveTargets answered {status} {body}");
     assert_eq!(
         body["FailedEntryCount"],
-        json!(1),
-        "expected FailedEntryCount 1 for one unknown Id, got {body}"
+        json!(0),
+        "expected FailedEntryCount 0 for one unknown Id, got {body}"
     );
     assert_eq!(
-        body["FailedEntries"][0]["TargetId"],
-        json!("nope"),
-        "expected the failed entry to name the unknown Id, got {body}"
+        body["FailedEntries"],
+        json!([]),
+        "expected no failed entries for one unknown Id, got {body}"
     );
     let ids = target_ids(&emulator, rule, None).await;
     assert_eq!(

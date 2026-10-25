@@ -260,8 +260,9 @@ async fn a_missing_rule_is_named_with_its_event_bus_by_every_operation() {
 }
 
 /// Every operation that resolves an event bus by name refuses a missing one by
-/// NAMING that bus, however the caller addressed it — including the per-entry
-/// failure the data plane reports.
+/// NAMING that bus, however the caller addressed it — while the data plane,
+/// which reports on the ENTRY rather than on the destination, names nothing
+/// because it refuses nothing.
 #[tokio::test]
 async fn a_missing_event_bus_is_named_by_every_operation() {
     let emulator = emulator();
@@ -340,8 +341,10 @@ async fn a_missing_event_bus_is_named_by_every_operation() {
             );
         }
 
-        // `PutEvents` reports the same wording per ENTRY, because the entry names
-        // its own bus: the call succeeds and the entry carries the failure.
+        // `PutEvents` names no bus, because it refuses nothing: an entry's
+        // destination is not a property of the entry, so the entry is ingested,
+        // given an EventId and routed nowhere. A publisher is never told that a
+        // bus is missing.
         let (status, answered) = call(
             &emulator,
             "PutEvents",
@@ -357,19 +360,23 @@ async fn a_missing_event_bus_is_named_by_every_operation() {
         .await;
         assert_eq!(
             status, 200,
-            "case {bus:?}/PutEvents: a per-entry failure is still a 200, got {status} {answered:?}"
+            "case {bus:?}/PutEvents: expected 200, got {status} {answered:?}"
+        );
+        assert_eq!(
+            answered["FailedEntryCount"],
+            json!(0),
+            "case {bus:?}/PutEvents: expected FailedEntryCount 0, got {answered:?}"
         );
         let entry = &answered["Entries"][0];
-        assert_eq!(
-            entry["ErrorCode"],
-            json!("ResourceNotFoundException"),
-            "case {bus:?}/PutEvents: expected a per-entry ResourceNotFoundException, \
+        assert!(
+            entry["EventId"].as_str().is_some_and(|id| !id.is_empty()),
+            "case {bus:?}/PutEvents: expected an ingested entry to carry an EventId, \
              got {answered:?}"
         );
-        assert_eq!(
-            entry["ErrorMessage"],
-            json!(expected),
-            "case {bus:?}/PutEvents: expected {expected:?}, got {answered:?}"
+        assert!(
+            entry.get("ErrorCode").is_none_or(Value::is_null)
+                && entry.get("ErrorMessage").is_none_or(Value::is_null),
+            "case {bus:?}/PutEvents: expected no per-entry failure, got {answered:?}"
         );
     }
 }
