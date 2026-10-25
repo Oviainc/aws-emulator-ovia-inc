@@ -431,6 +431,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A target keyspace whose own deletion is already in progress takes no restored
+        // table, for the same reason it takes no created one: it and everything in it are
+        // on their way out. That is the modelled conflict — "you try to perform an action
+        // and the same or a different action is already in progress".
+        if target_keyspace.is_deleting() {
+            return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::keyspace_deleting_rejection(
+                    &input.target_keyspace_name,
+                )),
+            })
+            .into());
+        }
         // The Regions the restored table will be replicated in: its target keyspace's
         // replication group, which is what a per-Region setting may name.
         let replica_regions: Option<Vec<String>> = target_keyspace

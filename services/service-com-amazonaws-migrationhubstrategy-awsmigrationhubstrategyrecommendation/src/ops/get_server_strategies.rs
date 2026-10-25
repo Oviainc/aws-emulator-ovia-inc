@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetServerStrategiesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -162,9 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A read: the store is only looked at here, so running GetServerStrategies
-        // changes nothing a later caller sees.
+        // changes nothing a later caller sees. The server is looked up in the inventory
+        // of the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let Some(server) = store.servers.get(&input.server_id) else {
+        let Some(server) = store.region(&region).servers.get(&input.server_id) else {
             return Err(
                 GetServerStrategiesErrorModeled::ResourceNotFoundException(server_not_found())
                     .into(),

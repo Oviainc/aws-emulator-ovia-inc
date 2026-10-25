@@ -213,41 +213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let child_policy = requested_child_policy
             .unwrap_or_else(|| execution.effective_config.child_policy.clone());
 
-        execution.status = crate::state::EXECUTION_STATUS_CLOSED.to_string();
-        execution.close_status = Some(crate::state::CLOSE_STATUS_TERMINATED.to_string());
-        execution.close_timestamp = Some(closed_at);
-        // A closed run has no work in flight: its scheduled decision task, and every
-        // other open item, is gone.
-        execution.open_decision_tasks = 0;
-        execution.open_activity_tasks = 0;
-        execution.open_timers = 0;
-        execution.open_child_executions = 0;
-        execution.open_lambda_functions = 0;
-        execution.append_event(
+        // The ONE place a run closes: the close event and `closeStatus`, the `workflowId`
+        // released for a new start, the child policy applied to the children this run
+        // leaves behind (`childPolicy` "specifies the policy to use for the child
+        // workflow executions of this workflow execution if it is terminated"), and the
+        // parent run told what became of it.
+        domain.close_run(
+            &(input.workflow_id.clone(), run_id.clone()),
+            crate::state::RunClose::Terminated {
+                reason: input.reason.clone(),
+                details: input.details.clone(),
+                // `cause` is set only when SWF terminated the run itself: "If set,
+                // indicates that the workflow execution was automatically terminated".
+                // This call is the caller's own, so it stays absent.
+                cause: None,
+                child_policy: Some(child_policy),
+            },
             closed_at,
-            crate::state::EventAttributes::WorkflowExecutionTerminated(
-                WorkflowExecutionTerminatedEventAttributes {
-                    reason: input.reason.clone(),
-                    details: input.details.clone(),
-                    child_policy,
-                    // `cause` is set only when SWF terminated the run itself: "If set,
-                    // indicates that the workflow execution was automatically
-                    // terminated". This call is the caller's own, so it stays absent.
-                    cause: None,
-                },
-            ),
         );
-
-        // Only this run's index entry is cleared: the entry is removed when the runId
-        // it points at is the one just closed, so a future operation that relaxes the
-        // one-open-run-per-workflowId invariant cannot drop another run's entry.
-        if domain
-            .open_by_workflow_id
-            .get(&input.workflow_id)
-            .is_some_and(|open| open == &run_id)
-        {
-            domain.open_by_workflow_id.remove(&input.workflow_id);
-        }
 
         Ok(TerminateWorkflowExecutionOutput)
     }

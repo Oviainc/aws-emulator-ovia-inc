@@ -25,6 +25,9 @@
 //! 6. Listing is REPORTING: repeating a list (whole or paged) reports the same goals, and
 //!    what the list reports changes only when a goal operation changed the stored set.
 //!
+//! The rows the listing spans come from `super::agent_goals::goal_rows`, the one table
+//! the goal suites in this crate share.
+//!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
 //! in production. The HTTP client lives in `super::workload_harness`; the profile the
@@ -32,7 +35,9 @@
 
 use serde_json::{json, Value};
 
-use super::agent_goals::{absent_profile_arn, create_goal, get_goal, profile_arn_of, PILLARS};
+use super::agent_goals::{
+    absent_profile_arn, create_goal, get_goal, goal_rows, profile_arn_of, PILLARS,
+};
 use super::workload_harness::{encode_path_segment, Answer, Client};
 
 /// The published bounds of `ListAgentGoalsRequest$maxResults`
@@ -84,55 +89,6 @@ fn next_token_of(answer: &Answer) -> Option<String> {
         .get("nextToken")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-}
-
-/// The rows the listing spans. They differ along what the rule generalises over: how many
-/// pillars a goal names (one, several, and the whole published catalog, which is the
-/// modelled `Pillars` `@length(1, 5)` maximum), whether the optional `description` is
-/// present, and titles of different size including the modelled `SensitiveString`
-/// `@length(1, 1000)` bounds — so no two entries of the page are copies of one goal.
-fn goal_rows() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "one-pillar-no-description",
-            json!({ "pillars": [PILLARS[1]], "title": "Harden the perimeter" }),
-        ),
-        (
-            "two-pillars-with-description",
-            json!({
-                "pillars": [PILLARS[0], PILLARS[3]],
-                "title": "Right-size the fleet",
-                "description": "Trade idle capacity for latency headroom",
-            }),
-        ),
-        (
-            "every-published-pillar",
-            json!({
-                "pillars": PILLARS,
-                "title": "Review the whole framework",
-                "description": "One goal spanning every pillar the model publishes",
-            }),
-        ),
-        (
-            "pillars-the-issue-did-not-cite",
-            json!({
-                "pillars": [PILLARS[4], PILLARS[2]],
-                "title": "Rehearse the failover runbook",
-            }),
-        ),
-        (
-            "shortest-title",
-            json!({ "pillars": [PILLARS[2]], "title": "x" }),
-        ),
-        (
-            "longest-title",
-            json!({
-                "pillars": [PILLARS[3]],
-                "title": "t".repeat(1000),
-                "description": "d".repeat(1000),
-            }),
-        ),
-    ]
 }
 
 /// Create one goal and answer the `GoalSummary` the create reported.

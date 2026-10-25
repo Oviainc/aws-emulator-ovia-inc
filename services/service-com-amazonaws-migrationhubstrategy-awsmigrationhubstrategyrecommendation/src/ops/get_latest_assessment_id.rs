@@ -143,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (&input, ctx);
+        let _ = &input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLatestAssessmentIdErrorModeled::InternalServerException(
                 InternalServerException {
@@ -156,8 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `@readonly`, and nothing here is owed by the clock: the answer is the id
-        // `StartAssessment` recorded as the most recent one.
-        let latest = state.lock().latest_assessment_id.clone();
+        // `StartAssessment` recorded as the most recent one in the Region this request
+        // was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        let latest = state.lock().region(&region).latest_assessment_id.clone();
         match latest {
             Some(id) => Ok(GetLatestAssessmentIdOutput { id: Some(id) }),
             // There is no latest id to report until an assessment is started. The answer

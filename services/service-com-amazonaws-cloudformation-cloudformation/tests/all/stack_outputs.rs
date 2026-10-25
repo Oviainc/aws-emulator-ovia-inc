@@ -801,34 +801,41 @@ fn output_cases() -> Vec<OutputCase> {
             ]),
         },
         OutputCase {
-            // The resource types the EventBridge Scheduler issue's templates declare:
-            // neither is in the return-value catalogue, so `Ref` answers the physical
-            // name — the name the template declared — and `Fn::GetAtt Arn` answers the
-            // resource's ARN under CloudFormation's uniform naming (the type's service
-            // segment as the ARN namespace, its type segment as the resource path),
-            // rather than leaving a declared output of a CREATE_COMPLETE stack valueless.
+            // A type with no return-value catalogue entry, which no owning service here
+            // provisions: `Ref` answers the physical name — the name the template declared
+            // — and `Fn::GetAtt Arn` answers the resource's ARN under CloudFormation's
+            // uniform naming (the type's service segment as the ARN namespace, its type
+            // segment as the resource path), rather than leaving a declared output of a
+            // CREATE_COMPLETE stack valueless. (The EventBridge Scheduler types this row
+            // used to be written with are catalogued and provisioned now, so they are
+            // exercised end to end against that service in
+            // `core/router/tests/all/cloudformation_provisions_scheduler_schedules.rs`.)
             case: "an uncatalogued type: Ref is its physical name, GetAtt Arn its arn",
-            stack_name: "scheduler",
+            stack_name: "uncatalogued",
             template: r#"{"Resources":{
-                   "G":{"Type":"AWS::Scheduler::ScheduleGroup","Properties":{"Name":"probe-group"}},
-                   "S":{"Type":"AWS::Scheduler::Schedule","Properties":{"Name":"probe-schedule",
-                     "GroupName":{"Ref":"G"}}}},
+                   "G":{"Type":"AWS::MemoryDB::ParameterGroup",
+                     "Properties":{"ParameterGroupName":"probe-group"}},
+                   "S":{"Type":"AWS::MemoryDB::Cluster","Properties":{"ClusterName":"probe-cluster",
+                     "ParameterGroupName":{"Ref":"G"}}}},
                  "Outputs":{"GroupName":{"Value":{"Ref":"G"}},
-                   "ScheduleName":{"Value":{"Ref":"S"}},
-                   "ScheduleGroup":{"Value":{"Fn::GetAtt":["S","GroupName"]}},
-                   "ScheduleArn":{"Value":{"Fn::GetAtt":["S","Arn"]}}}}"#
+                   "ClusterName":{"Value":{"Ref":"S"}},
+                   "ClusterParameterGroup":{"Value":{"Fn::GetAtt":["S","ParameterGroupName"]}},
+                   "ClusterArn":{"Value":{"Fn::GetAtt":["S","Arn"]}}}}"#
                 .to_string(),
             parameters: vec![],
             expected: vec![
                 ("GroupName", Expected::Value("probe-group".to_string())),
-                ("ScheduleName", Expected::Value("probe-schedule".to_string())),
+                ("ClusterName", Expected::Value("probe-cluster".to_string())),
                 // The attribute IS the property the template declared for it, and that
                 // property names another resource of the same template.
-                ("ScheduleGroup", Expected::Value("probe-group".to_string())),
                 (
-                    "ScheduleArn",
+                    "ClusterParameterGroup",
+                    Expected::Value("probe-group".to_string()),
+                ),
+                (
+                    "ClusterArn",
                     Expected::Value(format!(
-                        "arn:aws:scheduler:{REGION}:{ACCOUNT_ID}:schedule/probe-schedule"
+                        "arn:aws:memorydb:{REGION}:{ACCOUNT_ID}:cluster/probe-cluster"
                     )),
                 ),
             ],

@@ -80,6 +80,17 @@ pub const KEYSPACE_STATUS_ACTIVE: &str = "ACTIVE";
 /// (`crate::ops::types::KEYSPACE_STATUS_VALUES`) that names it.
 pub const KEYSPACE_STATUS_UPDATING: &str = "UPDATING";
 
+/// `KeyspaceStatus` = `DELETING`: what `DeleteKeyspace` puts a keyspace in until the
+/// deletion completes, after which the keyspace — and every table and type it held — is
+/// no longer a resource of the account.
+///
+/// A member of the model's `KeyspaceStatus` value set
+/// (`crate::ops::types::KEYSPACE_STATUS_VALUES`), reported for a keyspace through
+/// `ReplicationGroupStatus$keyspaceStatus` ("The status of the keyspace"), which
+/// `GetKeyspace` answers with: the deletion the model gives a status to is one a caller
+/// can still observe, so it is not instantaneous.
+pub const KEYSPACE_STATUS_DELETING: &str = "DELETING";
+
 /// `TableStatus` = `CREATING`: what `CreateTable` puts a new table in.
 ///
 /// The three constants below are members of the model's `TableStatus` value set
@@ -120,7 +131,7 @@ pub const TYPE_STATUS_DELETING: &str = "DELETING";
 /// How long a resource stays in a transient status before the clock owes it the
 /// next one: `CREATING` -> `ACTIVE` after `CreateTable`, `CreateKeyspace` or
 /// `CreateType`, `UPDATING` -> `ACTIVE` after `UpdateTable` or `UpdateKeyspace`,
-/// and `DELETING` -> gone after `DeleteTable` or `DeleteType`.
+/// and `DELETING` -> gone after `DeleteTable`, `DeleteType` or `DeleteKeyspace`.
 ///
 /// CHOSEN, not documented: Amazon Keyspaces publishes no duration for any of
 /// these transitions, only that they happen (`CreateTable`: "the status of the
@@ -330,6 +341,28 @@ pub fn service_managed_rejection(keyspace_name: &str) -> String {
         "Keyspace '{keyspace_name}' is managed by Amazon Keyspaces and cannot be \
          modified."
     )
+}
+
+/// The refusal message a request that would add a resource to — or otherwise change — a
+/// keyspace whose deletion is already in progress carries: ONE wording, so every
+/// operation refuses it the same way.
+///
+/// The caller's recourse is to wait for that deletion to finish, so the status it is
+/// waiting on is in the message.
+pub fn keyspace_deleting_rejection(keyspace_name: &str) -> String {
+    format!(
+        "Keyspace '{keyspace_name}' is in status {KEYSPACE_STATUS_DELETING} and takes no \
+         further change until its deletion completes."
+    )
+}
+
+/// Whether `status` is one whose own change is still in flight: the resource is neither
+/// settled nor on its way out, so the clock still owes it a transition.
+///
+/// `CREATING` and `UPDATING` have the same spelling in the model's `KeyspaceStatus`,
+/// `TableStatus` and `TypeStatus` value sets, so one predicate answers for all three.
+pub fn is_in_flight_status(status: &str) -> bool {
+    status == KEYSPACE_STATUS_CREATING || status == KEYSPACE_STATUS_UPDATING
 }
 
 /// The most keyspaces this emulator holds, and — with [`MAX_TABLES_PER_KEYSPACE`] — the
@@ -733,6 +766,38 @@ impl Keyspace {
     pub fn table_replica_regions(&self) -> Option<&[String]> {
         (self.replication_strategy == MULTI_REGION_STRATEGY)
             .then_some(self.replication_regions.as_slice())
+    }
+
+    /// Whether this keyspace's own deletion is already in progress — the status
+    /// [`KEYSPACE_STATUS_DELETING`] — so it is on its way out and takes no further
+    /// change.
+    pub fn is_deleting(&self) -> bool {
+        self.status == KEYSPACE_STATUS_DELETING
+    }
+
+    /// The first resource of this keyspace that still has a change of its OWN in flight:
+    /// what kind it is (`"Table"` or `"Type"`), its name, and the status it is in.
+    ///
+    /// A resource in flight ([`is_in_flight_status`]) is one the clock still owes a
+    /// transition to, and dropping it is exactly what `DeleteTable` refuses for a table
+    /// in that state — so a keyspace holding one cannot be dropped either, since
+    /// `DeleteKeyspace` "deletes a keyspace and all of its tables". A resource already
+    /// `DELETING` does NOT count: it is on its way out, which is where dropping the
+    /// keyspace takes it anyway.
+    ///
+    /// Tables first, then types, in each map's one total order, so the same keyspace
+    /// always names the same blocking resource.
+    pub fn resource_in_flight(&self) -> Option<(&'static str, &str, &str)> {
+        self.tables
+            .values()
+            .find(|table| is_in_flight_status(&table.status))
+            .map(|table| ("Table", table.table_name.as_str(), table.status.as_str()))
+            .or_else(|| {
+                self.types
+                    .values()
+                    .find(|udt| is_in_flight_status(&udt.status))
+                    .map(|udt| ("Type", udt.type_name.as_str(), udt.status.as_str()))
+            })
     }
 }
 
@@ -1465,7 +1530,7 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
     /// whose `CREATING` or `UPDATING` span has elapsed becomes `ACTIVE`, a table whose `CREATING` or
     /// `UPDATING` span has elapsed becomes `ACTIVE`, a table's warm throughput
     /// configuration whose span has elapsed becomes `AVAILABLE`, a type whose `CREATING` span has
-    /// elapsed becomes `ACTIVE`, and a table or type whose
+    /// elapsed becomes `ACTIVE`, and a keyspace, table or type whose
     /// `DELETING` span has elapsed is gone.
     ///
     /// Every handler calls this first, including the reporting ones. That is the one write
@@ -1480,19 +1545,23 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
             return;
         }
         let mut earliest: Option<SystemTime> = None;
-        for keyspace in self.keyspaces.values_mut() {
+        self.keyspaces.retain(|_, keyspace| {
             match keyspace.status_due_at {
                 // Still pending: nothing to materialise, but `settle` has to look at this
                 // keyspace again once its span elapses.
                 Some(due) if now < due => earliest = earlier_of(earliest, due),
                 Some(_) => {
                     keyspace.status_due_at = None;
+                    // The deletion `DeleteKeyspace` started has completed, so the keyspace
+                    // — and every table and type it held, which live inside this record —
+                    // is no longer a resource of the account at all.
+                    if keyspace.is_deleting() {
+                        return false;
+                    }
                     // The creation `CreateKeyspace` started, or the replication change
                     // `UpdateKeyspace` started, has completed, so the keyspace is usable
                     // again.
-                    if keyspace.status == KEYSPACE_STATUS_CREATING
-                        || keyspace.status == KEYSPACE_STATUS_UPDATING
-                    {
+                    if is_in_flight_status(&keyspace.status) {
                         keyspace.status = KEYSPACE_STATUS_ACTIVE.to_string();
                     }
                 }
@@ -1555,7 +1624,9 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                     _ => true,
                 }
             });
-        }
+            // Nothing is owed for this keyspace itself, so it stays.
+            true
+        });
         self.next_transition_at = earliest;
     }
 

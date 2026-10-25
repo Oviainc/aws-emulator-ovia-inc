@@ -249,7 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each asset property is materialised from a model property definition and
         // inherits its id, so property writes and reads resolve against the asset. A
         // stored model property without an id would make an unaddressable asset
-        // property, so it is skipped rather than materialised with an empty id.
+        // property, so it is skipped rather than materialised with an empty id —
+        // the rule the shared `asset_property_from_model` carries, so every view of
+        // an asset's properties materialises them the same way.
         //
         // The same pass collects the value each materialised property STARTS with,
         // which for an attribute definition is the default value the model declares:
@@ -260,23 +262,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut properties: Vec<AssetProperty> = Vec::with_capacity(model.properties.len());
         let mut initial_values: Vec<(String, AssetPropertyValue)> = Vec::new();
         for property in &model.properties {
-            let Some(id) = property.id.clone().filter(|id| !id.is_empty()) else {
+            let Some(materialised) = crate::state::asset_property_from_model(property) else {
                 continue;
             };
             if let Some(sample) = crate::state::initial_property_sample(property, now) {
-                initial_values.push((id.clone(), sample));
+                initial_values.push((materialised.id.clone(), sample));
             }
-            properties.push(AssetProperty {
-                id,
-                external_id: property.external_id.clone(),
-                name: property.name.clone(),
-                alias: None,
-                notification: None,
-                data_type: property.data_type.clone(),
-                data_type_spec: property.data_type_spec.clone(),
-                unit: property.unit.clone(),
-                path: None,
-            });
+            properties.push(materialised);
         }
         // An asset starts with one (empty) hierarchy per model hierarchy definition.
         let hierarchies: Vec<AssetHierarchy> = model
