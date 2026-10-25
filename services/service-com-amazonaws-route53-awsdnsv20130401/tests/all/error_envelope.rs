@@ -49,6 +49,22 @@ const USER_RECORD: RecordRow = RecordRow {
     values: &["192.0.2.1"],
 };
 
+/// An `UpdateHostedZoneComment` body, with the `Comment` member omitted entirely when
+/// `comment` is empty — the member is optional, so both forms are requests the
+/// operation accepts.
+fn comment_body(comment: &str) -> String {
+    let element = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("<Comment>{comment}</Comment>")
+    };
+    format!(
+        "<UpdateHostedZoneCommentRequest \
+         xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">\
+         {element}</UpdateHostedZoneCommentRequest>"
+    )
+}
+
 /// A valid single-change batch body, for a request whose refusal has nothing to do with
 /// the batch itself (an unknown zone, say).
 fn one_change(action: &str, row: &RecordRow) -> String {
@@ -282,9 +298,12 @@ async fn every_error_envelope_names_the_request() {
 async fn a_missing_zone_is_reported_in_awss_request_derived_form() {
     // The rule: a zone id that names no zone is refused `NoSuchHostedZone` (404) with
     // the message built FROM the request — `No hosted zone found with ID: <the id the
-    // request asked about>` — by every zone-addressed operation. The rows cross the ids
+    // request asked about>` — by every zone-addressed operation, whatever the operation
+    // reads or mutates and whatever else its body carries. The rows cross the ids
     // (never-minted ones of three different lengths, and one that named a zone until it
-    // was deleted) with the zone-addressed operations.
+    // was deleted) with the zone-addressed operations: the zone reads, the record-set
+    // read and mutation, the tag read and mutation, the comment mutation with and
+    // without its optional member, and the DNSSEC report.
     let router = router();
     let deleted = create_zone_ok(&router, "gone.example.com", "ref-gone").await;
     assert_eq!(
@@ -307,7 +326,7 @@ async fn a_missing_zone_is_reported_in_awss_request_derived_form() {
         "ZABC123".to_string(),
         deleted.clone(),
     ];
-    let operations: [ZoneOperation; 6] = [
+    let operations: [ZoneOperation; 9] = [
         (
             "GetHostedZone",
             "GET",
@@ -349,6 +368,26 @@ async fn a_missing_zone_is_reported_in_awss_request_derived_form() {
                  </ChangeTagsForResourceRequest>"
                     .to_string()
             },
+        ),
+        (
+            "UpdateHostedZoneComment",
+            "POST",
+            |id| format!("/2013-04-01/hostedzone/{id}"),
+            || comment_body("post-delete"),
+        ),
+        // The same mutation with `Comment` ABSENT — the member is optional, so a
+        // missing zone must be reported the same way whatever the body carries.
+        (
+            "UpdateHostedZoneComment with no Comment",
+            "POST",
+            |id| format!("/2013-04-01/hostedzone/{id}"),
+            || comment_body(""),
+        ),
+        (
+            "GetDNSSEC",
+            "GET",
+            |id| format!("/2013-04-01/hostedzone/{id}/dnssec"),
+            String::new,
         ),
     ];
 

@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Emulator;
+use crate::harness::{Emulator, REGION};
 
 /// The workspace every case below is created in.
 const WORKSPACE: &str = "composites";
@@ -504,7 +504,8 @@ async fn composite_components_sharing_a_name_are_both_stored_and_reported_as_inc
     // Both are stored: nothing the create accepted was dropped.
     let state = emulator.state();
     let state = state.lock();
-    let stored = &state.workspaces[WORKSPACE].entities["collides"].components["Sensor"]
+    let stored = &state.region(REGION).workspaces[WORKSPACE].entities["collides"].components
+        ["Sensor"]
         .composite_components;
     assert_eq!(
         stored.keys().collect::<Vec<_>>(),
@@ -555,7 +556,7 @@ async fn a_composite_component_persists_the_properties_it_was_created_with() {
 
     let state = emulator.state();
     let state = state.lock();
-    let component = state.workspaces[WORKSPACE].entities["stored"]
+    let component = state.region(REGION).workspaces[WORKSPACE].entities["stored"]
         .components
         .get("Sensor")
         .expect("the created component is stored");
