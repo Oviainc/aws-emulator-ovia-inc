@@ -223,6 +223,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 source.all_aws_regions,
                 source.aws_regions.as_deref(),
             )?;
+            // One source-status record per (account, Region) PAIR is read back out of
+            // this source, so each of the two lists it stores is bounded here rather
+            // than leaving their product to whatever one request wrote.
+            if source.account_ids.len() > crate::state::AGGREGATION_SOURCE_ACCOUNTS_QUOTA {
+                return Err(PutConfigurationAggregatorErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "AccountAggregationSources names {} accounts, which is more than \
+                             the {} an aggregation source can aggregate",
+                            source.account_ids.len(),
+                            crate::state::AGGREGATION_SOURCE_ACCOUNTS_QUOTA,
+                        )),
+                    },
+                )
+                .into());
+            }
         }
         if let Some(organization_source) = organization_source.as_ref() {
             check_aggregated_regions(
@@ -341,7 +357,8 @@ fn invalid_parameter_value(message: &str) -> PutConfigurationAggregatorError {
 }
 
 /// Check that `member`'s aggregation source names the Regions it aggregates: either
-/// `AllAwsRegions` or a non-empty `AwsRegions`, and not both.
+/// `AllAwsRegions` or a non-empty `AwsRegions` within the bound on how many Regions one
+/// source can list ([`crate::state::AGGREGATION_SOURCE_REGIONS_QUOTA`]), and not both.
 ///
 /// The message is BUILT FROM THE REQUEST — it names the member whose Regions are wrong
 /// — so both kinds of aggregation source are refused the same way.
@@ -351,6 +368,15 @@ fn check_aggregated_regions(
     aws_regions: Option<&[String]>,
 ) -> Result<(), PutConfigurationAggregatorError> {
     let listed = aws_regions.is_some_and(|regions| !regions.is_empty());
+    let listed_count = aws_regions.unwrap_or_default().len();
+    if listed_count > crate::state::AGGREGATION_SOURCE_REGIONS_QUOTA {
+        return Err(invalid_parameter_value(&format!(
+            "{member} lists {listed_count} regions, which is more than the {} an aggregation \
+             source can aggregate; aggregate every region with AllAwsRegions instead and try \
+             again",
+            crate::state::AGGREGATION_SOURCE_REGIONS_QUOTA,
+        )));
+    }
     match (all_aws_regions, listed) {
         (true, true) => Err(invalid_parameter_value(&format!(
             "{member} contains both AllAwsRegions and AwsRegions; specify only one of them \

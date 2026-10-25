@@ -37,7 +37,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, organization_router, router, seeded_instance_arn, UNKNOWN_INSTANCE_ARN,
+    account_instance_router, call, error_code, organization_router, UNKNOWN_INSTANCE_ARN,
 };
 
 /// A pattern-valid `PermissionSetArn` that was never minted, for the not-found rows.
@@ -581,8 +581,7 @@ async fn an_unknown_instance_or_permission_set_is_not_found() {
 async fn the_managed_policy_surface_is_withdrawn_on_an_account_instance() {
     // The account's own instance is an ACCOUNT instance, and permission sets are a feature
     // of an organization instance.
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
     let managed_policy_arn = format!("{POLICY_PREFIX}ReadOnlyAccess");
 
     for operation in [

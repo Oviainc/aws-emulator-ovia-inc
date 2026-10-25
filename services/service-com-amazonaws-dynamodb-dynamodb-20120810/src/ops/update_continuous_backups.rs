@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContinuousBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContinuousBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContinuousBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns this table's point-in-time recovery on or off and reports the
+//! continuous-backups settings that leaves. The settings are STORED on the table
+//! (`crate::state::PointInTimeRecovery`) and the restorable window is derived from them
+//! and the clock on every read, so this operation and `DescribeContinuousBackups`
+//! report one answer.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContinuousBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContinuousBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContinuousBackups"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "You can also provide the Amazon Resource Name (ARN) of the table in this
+        // parameter" (`UpdateContinuousBackups$TableName`), so either form resolves to
+        // the stored name. The `RecoveryPeriodInDays` range (1..=35) is the MODEL's own,
+        // so a value outside it is already refused before this handler runs.
+        let name = crate::state::resolve_table_name(&input.table_name)
+            .map_err(|error| lift(&input.table_name, error))?;
+        let specification = &input.point_in_time_recovery_specification;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .table_mut(&region, &name)
+            .map_err(|error| lift(&name, error))?;
+        table.point_in_time_recovery.apply(
+            specification.point_in_time_recovery_enabled,
+            specification.recovery_period_in_days,
+            now,
+        );
+        // "A successful UpdateContinuousBackups call returns the current
+        // ContinuousBackupsDescription" (the doc above): the description is projected
+        // from what this call has just stored, so a later reader reports the same
+        // settings.
+        let description = table.point_in_time_recovery.describe(now);
+
+        // The audit record for a state-changing call: who asked, what was changed and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            point_in_time_recovery_status = %description
+                .point_in_time_recovery_description
+                .as_ref()
+                .and_then(|recovery| recovery.point_in_time_recovery_status.clone())
+                .unwrap_or_default(),
+            "continuous backups updated"
+        );
+
+        Ok(UpdateContinuousBackupsOutput {
+            continuous_backups_description: Some(description),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UpdateContinuousBackupsError {
+    UpdateContinuousBackupsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// A table this operation cannot find is reported as `TableNotFoundException` — "A
+/// source table with the name TableName does not currently exist within the
+/// subscriber's account or the subscriber is operating in the wrong Amazon Web Services
+/// Region" — which is the miss this operation models, rather than the control plane's
+/// `ResourceNotFoundException`, which it does not. The message is built from the
+/// request: the table it asked for.
+fn lift(table_name: &str, error: crate::state::RequestError) -> UpdateContinuousBackupsError {
+    match error {
+        crate::state::RequestError::NotFound(_) => {
+            UpdateContinuousBackupsErrorModeled::TableNotFoundException(TableNotFoundException {
+                message: Some(format!("Table not found: {table_name}")),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

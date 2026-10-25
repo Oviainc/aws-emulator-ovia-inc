@@ -222,16 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The lookup materialises every state change the clock already made due before the
-        // output is read or written — including the completion of an earlier delete, which
-        // is what makes an output whose deletion has finished a not-found here rather than
-        // an updatable record.
+        // Every state change the clock already made due is materialised before the output is
+        // read or written — including the completion of an earlier delete, which is what
+        // makes an output whose deletion has finished a not-found here rather than an
+        // updatable record.
         //
         // The ARN is resolved FIRST, before anything about the request's content is judged,
         // so a request against an output this service does not hold answers the not-found
         // the operation it addressed resolves to rather than a complaint about a member of a
         // resource that does not exist.
-        let Some(output) = store.router_output_mut(&input.arn, now) else {
+        store.settle_due_transitions(now);
+        let Some(output) = store.router_outputs.get(&input.arn) else {
             return Err(not_found(&input.arn));
         };
 
@@ -253,6 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What the request is judged against is the output as the store holds it now. Read
+        // off the record BEFORE anything below needs the store again, so one borrow of the
+        // store does not outlive another.
+        let stored_arn = output.arn.clone();
+        let stored_type = output.output_type();
+        let stored_tier = output.tier.clone();
+        let stored_bitrate = output.maximum_bitrate;
+        let stored_is_routed = output.is_routed();
+        let stored_routed_input_arn = output.routed_input_arn.clone().unwrap_or_default();
+
         // A replacement configuration is stored through the crate's one normalisation, the
         // same one CreateRouterOutput stores through: a STANDARD output's `Protocol` is
         // implied by the variant of its `ProtocolConfiguration`, so the stored value reports
@@ -273,15 +284,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as.
         if let Some(configuration) = requested_configuration.as_ref() {
             let requested_type = crate::state::router_output_type(configuration);
-            if requested_type != output.output_type() {
+            if requested_type != stored_type {
                 return Err(refused_by_output(format!(
-                    "Router output {} is a {} output, so its Configuration cannot be \
-                     replaced with a {} one: changing the type of the configuration is not \
-                     supported.",
-                    output.arn,
-                    output.output_type(),
-                    requested_type
+                    "Router output {stored_arn} is a {stored_type} output, so its \
+                     Configuration cannot be replaced with a {requested_type} one: changing \
+                     the type of the configuration is not supported."
                 )));
+            }
+        }
+
+        // The replacement configuration's target is what the output would egress to, so a
+        // reference it carries to a resource of THIS service is RESOLVED against the store
+        // before it is stored — through the one function CreateRouterOutput resolves a new
+        // output's configuration through, so an update can no more point an output at a
+        // resource the account does not hold than a create can.
+        if let Some(configuration) = requested_configuration.as_ref() {
+            if let Some(rejection) = store.router_output_configuration_rejection(configuration) {
+                return Err(bad_request(rejection));
             }
         }
 
@@ -294,14 +313,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // retryable). The status and the error code are the contract; the sentence states
         // the documented precondition, and carries neither of this service's
         // `BadRequestException` envelopes.
-        if input.fabric_configuration.is_some() && output.is_routed() {
+        if input.fabric_configuration.is_some() && stored_is_routed {
             return Err(UpdateRouterOutputErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "Router output {} has an active route from router input {}, so its \
-                         FabricConfiguration cannot be updated. Unroute the output first.",
-                        output.arn,
-                        output.routed_input_arn.as_deref().unwrap_or_default()
+                        "Router output {stored_arn} has an active route from router input \
+                         {stored_routed_input_arn}, so its FabricConfiguration cannot be \
+                         updated. Unroute the output first."
                     ),
                 },
             )
@@ -310,8 +328,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the tier and the bitrate become once this request is applied: the requested
         // value where it carries one, the stored value where it does not.
-        let tier = input.tier.clone().unwrap_or_else(|| output.tier.clone());
-        let maximum_bitrate = input.maximum_bitrate.unwrap_or(output.maximum_bitrate);
+        let tier = input.tier.clone().unwrap_or(stored_tier);
+        let maximum_bitrate = input.maximum_bitrate.unwrap_or(stored_bitrate);
         // The tier bounds the bitrate, so the pair is judged as the output ENDS UP with it —
         // lowering the tier under a bitrate it no longer allows is refused as surely as
         // raising the bitrate past it. A request that moves NEITHER is never refused for a
@@ -324,9 +342,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Nothing above this line has written anything, so a refused request changes nothing
+        // at all. The record is taken mutably only now, once every verdict is in.
+        let Some(output) = store.router_outputs.get_mut(&input.arn) else {
+            return Err(store_unavailable(
+                "the router output could not be read back before it was updated",
+            ));
+        };
+
         // Each member the request carries replaces its counterpart; one it omits leaves the
-        // stored value alone. Nothing above this line has written anything, so a refused
-        // request changes nothing at all.
+        // stored value alone.
         if let Some(name) = input.name.clone() {
             output.name = name;
         }

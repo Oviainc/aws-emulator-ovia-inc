@@ -40,8 +40,8 @@ use crate::flow_lifecycle::{Emulator, REGION};
 // The fixtures and the create helper are the ONES `router_outputs` owns — the suite that
 // pins CreateRouterOutput's own rules — so the two tables cannot drift apart.
 use crate::router_outputs::{
-    assert_minted_router_output_arn, create_router_output, standard_with_protocol, FLOW_ARN,
-    MEDIALIVE_INPUT_ARN, ROLE_ARN, SECRET_ARN,
+    assert_minted_router_output_arn, create_router_output, minted_configuration_targets,
+    standard_with_protocol, ConfigurationTargets, MEDIALIVE_INPUT_ARN, ROLE_ARN, SECRET_ARN,
 };
 
 /// Longer than [`mc::TRANSITION_SPAN`], so a transition the clock owes — including the
@@ -95,18 +95,30 @@ struct Case {
     availability_zone: &'static str,
 }
 
+/// The resources of THIS service the configurations below name: a router output's
+/// configuration must name a router network interface / flow the account HOLDS, so each
+/// suite mints them on its own emulator first.
+async fn mint_targets(emulator: &Emulator) -> ConfigurationTargets {
+    minted_configuration_targets(emulator, "ro-lifecycle").await
+}
+
+/// How many rows [`cases`] has. The delete suite below drives one row per emulator, so it
+/// needs the count before it has an emulator to mint the targets on; every suite that builds
+/// the rows asserts the count against this.
+const CASE_COUNT: usize = 4;
+
 /// One row per `RouterOutputConfiguration` kind the model declares — all three union
 /// members, and for the standard kind both a protocol that names a destination and one that
 /// does not (`smithy_query(query="closure",operation="CreateRouterOutput")`) — differing
 /// also in tier, maximum bitrate, routing scope, tags, maintenance configuration and
 /// Region / Availability Zone.
-fn cases() -> Vec<Case> {
-    vec![
+fn cases(targets: &ConfigurationTargets) -> Vec<Case> {
+    let rows = vec![
         Case {
             case: "standard rtp, default maintenance",
             body: json!({
                 "name": "rtp-output",
-                "configuration": standard_with_protocol(json!({
+                "configuration": standard_with_protocol(&targets.interface_arn, json!({
                     "Rtp": {
                         "destinationAddress": "203.0.113.10",
                         "destinationPort": 5004,
@@ -127,7 +139,7 @@ fn cases() -> Vec<Case> {
             case: "standard srt listener: no destination address at all, tagged",
             body: json!({
                 "name": "srt-listener-output",
-                "configuration": standard_with_protocol(json!({
+                "configuration": standard_with_protocol(&targets.interface_arn, json!({
                     "SrtListener": {
                         "port": 3100,
                         "minimumLatencyMilliseconds": 120,
@@ -153,7 +165,7 @@ fn cases() -> Vec<Case> {
                 "name": "flow-output",
                 "configuration": json!({
                     "MediaConnectFlow": {
-                        "flowArn": FLOW_ARN,
+                        "flowArn": targets.flow_arn,
                         "destinationTransitEncryption": {
                             "encryptionKeyType": "SECRETS_MANAGER",
                             "encryptionKeyConfiguration": {
@@ -207,7 +219,14 @@ fn cases() -> Vec<Case> {
             region: REGION,
             availability_zone: "us-east-1a",
         },
-    ]
+    ];
+    assert_eq!(
+        rows.len(),
+        CASE_COUNT,
+        "CASE_COUNT must be the number of rows, got {}",
+        rows.len()
+    );
+    rows
 }
 
 /// Create the router output of `expected` and return its `(Arn, Name)`.
@@ -324,8 +343,9 @@ fn assert_reported_router_output(expected: &Case, router_output: &Value) {
 #[tokio::test]
 async fn get_router_output_reports_the_record_the_create_wrote() {
     let emulator = Emulator::new();
+    let targets = mint_targets(&emulator).await;
 
-    for expected in cases() {
+    for expected in cases(&targets) {
         let case = expected.case;
         let (arn, _) = create(&emulator, &expected).await;
 
@@ -352,7 +372,8 @@ async fn get_router_output_reports_the_record_the_create_wrote() {
 #[tokio::test]
 async fn get_router_output_reports_the_state_the_clock_has_moved_the_output_to() {
     let emulator = Emulator::new();
-    let expected = cases().swap_remove(0);
+    let targets = mint_targets(&emulator).await;
+    let expected = cases(&targets).swap_remove(0);
     let (arn, _) = create(&emulator, &expected).await;
 
     let (_, _, immediate) = get_router_output(&emulator, &arn).await;
@@ -381,11 +402,13 @@ async fn get_router_output_reports_the_state_the_clock_has_moved_the_output_to()
 /// number of router outputs, so the answer cannot be a value fixed in the handler.
 #[tokio::test]
 async fn delete_router_output_reports_and_completes_the_deletion_of_the_stored_output() {
-    let suite = cases();
-
-    for (index, expected) in suite.iter().enumerate() {
-        let case = expected.case;
+    for index in 0..CASE_COUNT {
         let emulator = Emulator::new();
+        // The targets are minted per emulator, so the rows are rebuilt against them.
+        let targets = mint_targets(&emulator).await;
+        let suite = cases(&targets);
+        let expected = &suite[index];
+        let case = expected.case;
 
         // A store holding several router outputs, so the delete has to pick the one its ARN
         // names: the count varies with the row.
@@ -495,9 +518,10 @@ async fn delete_router_output_reports_and_completes_the_deletion_of_the_stored_o
 #[tokio::test]
 async fn get_and_delete_refuse_an_arn_that_addresses_no_router_output() {
     let emulator = Emulator::new();
+    let targets = mint_targets(&emulator).await;
 
     // One stored router output, so a not-found is about the ARN rather than an empty store.
-    let (held, _) = create(&emulator, &cases().swap_remove(0)).await;
+    let (held, _) = create(&emulator, &cases(&targets).swap_remove(0)).await;
 
     let not_found = [
         (

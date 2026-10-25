@@ -17,6 +17,8 @@ mod account_association_lifecycle;
 mod cloud_connector_lifecycle;
 #[path = "all/connector_destination_lifecycle.rs"]
 mod connector_destination_lifecycle;
+#[path = "all/credential_locker_lifecycle.rs"]
+mod credential_locker_lifecycle;
 #[path = "all/default_encryption_configuration.rs"]
 mod default_encryption_configuration;
 #[path = "all/destination_lifecycle.rs"]

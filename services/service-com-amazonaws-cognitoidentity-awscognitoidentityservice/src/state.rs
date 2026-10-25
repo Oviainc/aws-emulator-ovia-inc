@@ -357,6 +357,17 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             >= MAX_PRINCIPAL_TAG_ATTRIBUTE_MAPS_PER_POOL
     }
 
+    /// Every stored `IdentityPoolId`, in the order a listing of the account's pools
+    /// reports them: sorted, so two successive pages of one listing neither overlap nor
+    /// skip a pool. The pools are held in a hash map, whose iteration order is not
+    /// stable from one call to the next, so the order has to come from the ids
+    /// themselves — as it does for the login values of an identity.
+    pub fn identity_pool_ids_in_listing_order(&self) -> Vec<String> {
+        let mut identity_pool_ids: Vec<String> = self.identity_pools.keys().cloned().collect();
+        identity_pool_ids.sort();
+        identity_pool_ids
+    }
+
     /// Whether another identity in this pool would take it past
     /// [`MAX_IDENTITIES_PER_POOL`].
     pub fn pool_identity_store_is_full(&self, identity_pool_id: &str) -> bool {
@@ -753,20 +764,28 @@ pub fn identity_pool_id_from_arn(arn: &str) -> Option<&str> {
         .filter(|identity_pool_id| !identity_pool_id.is_empty())
 }
 
-/// An opaque pagination token naming the pool it was minted for and the item a page
-/// resumes at. Hex, so the token is opaque to a caller and still matches the modelled
-/// `^[\S]+$` pattern.
-pub fn encode_pagination_token(identity_pool_id: &str, cursor: &str) -> String {
-    hex::encode(format!("{identity_pool_id}#{cursor}"))
+/// The pagination scope of the account-wide identity-pool listing, for a listing that
+/// pages the account's POOLS rather than the contents of one pool. No `IdentityPoolId`
+/// can take this value — a modelled id is `REGION:GUID` (`^[\w-]+:[0-9a-f-]+$`), so it
+/// always carries a colon — which keeps a token of this listing from resuming a listing
+/// inside a pool, and the other way round.
+pub const IDENTITY_POOL_LISTING_SCOPE: &str = "identitypools";
+
+/// An opaque pagination token naming the listing it was minted for (`scope`: the pool a
+/// listing pages the contents of, or [`IDENTITY_POOL_LISTING_SCOPE`] for the account's
+/// pools) and the item a page resumes at. Hex, so the token is opaque to a caller and
+/// still matches the modelled `^[\S]+$` pattern.
+pub fn encode_pagination_token(scope: &str, cursor: &str) -> String {
+    hex::encode(format!("{scope}#{cursor}"))
 }
 
 /// The cursor inside a token from [`encode_pagination_token`], or `None` when the token
-/// was not produced by this service for THIS pool — a token minted for one pool cannot
-/// resume a listing of another.
-pub fn decode_pagination_token(identity_pool_id: &str, token: &str) -> Option<String> {
+/// was not produced by this service for THIS listing — a token minted for one listing
+/// cannot resume another.
+pub fn decode_pagination_token(scope: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     let (minted_for, cursor) = decoded.split_once('#')?;
-    (minted_for == identity_pool_id).then(|| cursor.to_string())
+    (minted_for == scope).then(|| cursor.to_string())
 }
 
 /// The OpenID Connect token for `identity_id` in `identity_pool_id`, valid from

@@ -237,11 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration configures, and a request naming a different one is refused rather
         // than stored self-contradicting — through the crate's one normalisation, which
         // UpdateRouterOutput stores a replacement configuration through as well.
-        //
-        // No variant's target is RESOLVED here: a MediaLive input belongs to another
-        // service, and the model gives this create no `NotFoundException` to answer with for
-        // a router network interface this account does not hold — so referential checks
-        // belong with the operations that own those resources.
         let configuration =
             crate::state::normalized_router_output_configuration(input.configuration.clone())
                 .map_err(bad_request)?;
@@ -273,7 +268,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is the request's `@idempotencyToken`, "a unique identifier for the
         // request to ensure idempotency": a create replaying a token this store already
-        // holds answers with the output that token minted instead of minting a second one.
+        // holds answers with the output that token minted instead of minting a second one —
+        // the record as it stands, whatever has happened to what it points at since.
         if let Some(token) = input.client_token.as_deref().filter(|t| !t.is_empty()) {
             if let Some(existing) = store
                 .router_outputs
@@ -284,6 +280,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     router_output: existing.to_router_output(),
                 });
             }
+        }
+
+        // The configuration's target is what the output egresses to, so a reference it
+        // carries to a resource of THIS service — the router network interface a STANDARD
+        // output egresses from, the flow and flow source a MEDIACONNECT FLOW output delivers
+        // into — is RESOLVED against the store before anything is stored: an output pointing
+        // at a resource the account does not hold egresses nowhere. Resolved through the one
+        // function UpdateRouterOutput resolves a replacement configuration through
+        // (`crate::state::ComAmazonawsMediaconnectMediaconnectState::router_output_configuration_rejection`).
+        if let Some(rejection) = store.router_output_configuration_rejection(&configuration) {
+            return Err(bad_request(rejection));
         }
 
         // The router output store is bounded: nothing evicts a router output and a read must

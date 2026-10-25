@@ -195,6 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for — the same rule every operation that takes a body is held to.
         crate::state::validate_template_body(template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The documented per-template quotas, named one by one: a body past one of them is
+        // refused for the quota it is past rather than for the form it has, which is the
+        // same verdict the operations that SUBMIT a template for deployment give it.
+        crate::state::validate_template_quotas(template_body)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let Some(template) = template::parse(template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 TEMPLATE_FORMAT_ERROR,

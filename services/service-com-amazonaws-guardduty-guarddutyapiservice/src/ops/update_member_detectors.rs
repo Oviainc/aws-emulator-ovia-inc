@@ -170,14 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::DETECTOR_ID_MEMBER,
             )));
         }
-        if input
-            .account_ids
-            .iter()
-            .any(|account_id| !crate::state::is_account_id(account_id))
-        {
-            return Err(bad_request(crate::state::invalid_parameter_message(
-                crate::state::ACCOUNT_ID_MEMBER,
-            )));
+        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+            return Err(bad_request(message));
         }
         // Refuse an unacceptable feature list before anything is written, so a
         // rejected update leaves every member exactly as it was.

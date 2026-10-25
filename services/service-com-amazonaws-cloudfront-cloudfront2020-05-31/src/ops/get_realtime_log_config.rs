@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRealtimeLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRealtimeLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRealtimeLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the real-time log configuration a request addresses, read from the record its
+//! create stored — nothing here writes.
+//!
+//! A configuration is addressed by its `Name` or by its `ARN`, and a request carrying both
+//! is identified by the NAME: "If you provide both, CloudFront uses the name to identify
+//! the real-time log configuration to get"
+//! ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::addressed_realtime_log_config`]
+//! states the one rule every operation that addresses a configuration either way goes
+//! through). A request that names neither addresses nothing — "You must provide at least
+//! one" — and is refused with the modelled `InvalidArgument`; an identifier no stored
+//! configuration answers to is `NoSuchRealtimeLogConfig`.
+//!
+//! `AccessDenied` is deliberately unreachable from this handler, for the reason
+//! `CreateRealtimeLogConfig`'s is: this emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +149,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRealtimeLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRealtimeLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRealtimeLogConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        let stored = match store
+            .addressed_realtime_log_config(input.name.as_deref(), input.arn.as_deref())
+        {
+            Ok(stored) => stored,
+            // The request addresses no configuration at all, which is a property of the
+            // request rather than of the store.
+            Err(crate::state::RealtimeLogConfigAddress::NoIdentifier) => {
+                return Err(GetRealtimeLogConfigErrorModeled::InvalidArgument(
+                    crate::state::realtime_log_config_identifier_required(),
+                )
+                .into())
+            }
+            Err(crate::state::RealtimeLogConfigAddress::NotFound) => {
+                return Err(GetRealtimeLogConfigErrorModeled::NoSuchRealtimeLogConfig(
+                    crate::state::no_such_realtime_log_config(),
+                )
+                .into())
+            }
+        };
+
+        Ok(GetRealtimeLogConfigOutput {
+            // "A real-time log configuration" — the stored record, not the request.
+            realtime_log_config: Some(stored.to_realtime_log_config()),
+        })
     }
 }

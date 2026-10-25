@@ -6,6 +6,12 @@
 //! 202), so it is stored in the transient `CREATING` status with the instant its move
 //! to `AVAILABLE` falls due; the dictionary readers materialise that move.
 //!
+//! The operation is `@idempotent` and carries no `@idempotencyToken`, so the request's
+//! own members are its key: a request this Region has already served answers with the
+//! dictionary that create minted — same id, same ARN, one stored record — instead of
+//! minting a second one (`crate::state::...::dictionary_created_from`). That is decided
+//! before the quota, so a retry costs the account nothing it has not already spent.
+//!
 //! Tags supplied here are judged by the same rules as tags supplied to `TagResource`
 //! (`crate::state::invalid_tags_message`): a key outside the modelled `TagKey` bounds,
 //! a key in the reserved `aws:` namespace, or more tags than a resource may carry earn
@@ -216,9 +222,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = std::time::Instant::now();
+        // The members this request sets on the record it asks for, normalised the way
+        // they are STORED, so they can be compared with what the Region already holds:
+        // an absent payload is no entries, an absent tag map is no tags.
+        let entries = input.entries.unwrap_or_default();
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
 
         let mut state = state.lock();
         state.settle_due_transitions(now);
+
+        // The operation is `@idempotent` and carries no `@idempotencyToken`, so the
+        // request's own members are its key: a request this Region has already served
+        // is that same create once more — what an SDK retries when it never saw the
+        // first response — and several identical requests have the effect of ONE. It
+        // answers with the dictionary that create minted, reporting the record as it
+        // stands, and is decided BEFORE the quota: a retry costs the account neither a
+        // second record nor a second unit of quota.
+        if let Some(existing) =
+            state.dictionary_created_from(&region, &input.name, &input.language, &entries, &tags)
+        {
+            let references = state.feeds_referencing(&region, &existing.id);
+            return Ok(CreateDictionaryOutput {
+                arn: existing.arn.clone(),
+                id: existing.id.clone(),
+                name: existing.name.clone(),
+                language: existing.language.clone(),
+                status: existing.reported_status(&references).to_string(),
+                references: Some(references),
+                tags: Some(existing.tag_map()),
+            });
+        }
 
         // The dictionary store is BOUNDED, and a service quota is a PER-REGION figure:
         // past the Region's quota the service refuses the create rather than growing
@@ -247,9 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             language: input.language,
             // The payload is optional; a dictionary created without one holds no
             // entries rather than none at all.
-            entries: input.entries.unwrap_or_default(),
+            entries,
             status: crate::state::DictionaryStatus::Creating,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags,
             transition_due_at: Some(due),
             // A dictionary that has just been created holds no completed deletion to
             // report.

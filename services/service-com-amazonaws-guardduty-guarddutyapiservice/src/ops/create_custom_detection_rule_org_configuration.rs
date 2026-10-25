@@ -173,14 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DetectionRuleAccountIds` constrains the LIST length only, so an entry
         // that is not an account id at all reaches the handler: a parameter
         // failure, refused before anything is written.
-        if include
-            .iter()
-            .chain(exclude.iter())
-            .any(|account_id| !crate::state::is_account_id(account_id))
+        if let Some(message) =
+            crate::state::account_ids_rejection(include.iter().chain(exclude.iter()))
         {
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
-            ));
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
 
         let token = input

@@ -12,6 +12,9 @@
 //!   never invoke and is refused with `BadRequestException` (400) naming the absent
 //!   member; the refusal writes nothing, so the name is absent from `ListDataSources`
 //!   and `GetDataSource` for it is a 404. The same request WITH a role succeeds.
+//! * a `serviceRoleArn` present but EMPTY names no role either, so it takes the same
+//!   refusal as the absent member, whatever else the request carries — and the refused
+//!   name stays free, so the identical request with a role creates it.
 //! * the one type whose requirement depends on its configuration is HTTP: a plain
 //!   endpoint needs no role, one whose `authorizationConfig` selects `AWS_IAM` — the
 //!   only `AuthorizationType` value, i.e. "the authorization type is Signature
@@ -300,6 +303,128 @@ async fn a_type_that_needs_a_service_role_is_refused_without_one() {
             listed.contains(name),
             "case the whole listing: expected it to hold {name:?}, got {listed:?}"
         );
+    }
+}
+
+/// The forms a create can take while naming no role for AppSync to assume: the member
+/// left out, and the member present but empty. `serviceRoleArn` is an ARN AppSync
+/// assumes, and an empty string is no ARN, so both forms leave the data source without
+/// the role its type needs.
+const ROLELESS_FORMS: &[(&str, Option<&str>)] = &[
+    ("no serviceRoleArn member", None),
+    ("an empty serviceRoleArn", Some("")),
+];
+
+/// Members a create can carry beside the per-type configuration, as request fragments:
+/// the refusal is the service role's, so it holds whatever else the request says.
+///
+/// Source: `CreateDataSourceRequest$description` and `$metricsConfig`, the latter's
+/// values from the `DataSourceLevelMetricsConfig` enum (`ENABLED` | `DISABLED`).
+fn decorations() -> Vec<(&'static str, Value)> {
+    vec![
+        ("carrying nothing else", json!({})),
+        (
+            "carrying a description",
+            json!({ "description": "the orders backend" }),
+        ),
+        (
+            "carrying enhanced metrics",
+            json!({ "metricsConfig": "ENABLED" }),
+        ),
+        (
+            "carrying a description and disabled metrics",
+            json!({ "description": "the orders backend", "metricsConfig": "DISABLED" }),
+        ),
+    ]
+}
+
+/// The requirement is the ROLE's and nothing else's, and the refusal reserves nothing:
+/// every role-requiring type, in each form that names no role, with each set of extra
+/// members, is refused and stores nothing — and the very same name is then created by
+/// the identical request with a role, which reads back carrying those extra members.
+#[tokio::test]
+async fn the_refusal_turns_on_the_role_alone_and_leaves_the_name_free() {
+    let router = router();
+    let api_id = create_api(&router, "Api_role_forms").await;
+
+    for (type_index, (data_source_type, needs_role)) in DATA_SOURCE_TYPES.iter().enumerate() {
+        if !needs_role {
+            continue;
+        }
+        for (form_index, (form, role)) in ROLELESS_FORMS.iter().enumerate() {
+            for (extra_index, (decoration, extra)) in decorations().into_iter().enumerate() {
+                let name = format!("role_{type_index}_{form_index}_{extra_index}");
+                let case =
+                    format!("a {data_source_type} data source with {form}, {decoration}");
+
+                let refused = call(
+                    &router,
+                    "POST",
+                    &format!("/v1/apis/{api_id}/datasources"),
+                    Some(request_body(&name, data_source_type, *role, extra.clone())),
+                )
+                .await;
+                assert_eq!(
+                    refused.status, 400,
+                    "case {case:?}: expected status 400, got {refused:?}"
+                );
+                assert_eq!(
+                    refused.error_type, "BadRequestException",
+                    "case {case:?}: expected error type BadRequestException, got {refused:?}"
+                );
+                assert_eq!(
+                    refused.message, ROLE_REFUSAL,
+                    "case {case:?}: expected the refusal to name the absent member, \
+                     got {refused:?}"
+                );
+
+                // Nothing was written, so nothing reads back and nothing is listed.
+                let read = get_data_source(&router, &api_id, &name).await;
+                assert_eq!(
+                    read.status, 404,
+                    "case {case:?}: expected the refused name to exist nowhere, got {read:?}"
+                );
+                let listed = list_names(&router, &api_id).await;
+                assert!(
+                    !listed.contains(&name),
+                    "case {case:?}: expected the listing not to hold the refused name, \
+                     got {listed:?}"
+                );
+
+                // The refusal reserved nothing either: the same name, same type and
+                // same extra members, WITH a role, is created and reads back.
+                let created = call(
+                    &router,
+                    "POST",
+                    &format!("/v1/apis/{api_id}/datasources"),
+                    Some(request_body(
+                        &name,
+                        data_source_type,
+                        Some(ROLE_ARN),
+                        extra.clone(),
+                    )),
+                )
+                .await;
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?} retried with a role: expected 200, got {created:?}"
+                );
+                let read = get_data_source(&router, &api_id, &name).await;
+                assert_eq!(
+                    read.body["dataSource"]["serviceRoleArn"].as_str(),
+                    Some(ROLE_ARN),
+                    "case {case:?} retried with a role: expected the stored role, got {read:?}"
+                );
+                for (member, value) in extra.as_object().into_iter().flatten() {
+                    assert_eq!(
+                        &read.body["dataSource"][member],
+                        value,
+                        "case {case:?} retried with a role: expected {member} to report \
+                         {value}, got {read:?}"
+                    );
+                }
+            }
+        }
     }
 }
 

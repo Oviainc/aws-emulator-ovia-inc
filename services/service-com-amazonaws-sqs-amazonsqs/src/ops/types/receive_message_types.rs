@@ -11,7 +11,21 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-sqs-amazonsqs.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.sqs#ReceiveMessageRequest")]
+// `skip_validation` names the two members that carry MESSAGE system attribute names.
+// `AttributeNames` is the discontinued spelling of `MessageSystemAttributeNames` — the
+// model marks it `@deprecated{message: "AttributeNames has been replaced by
+// MessageSystemAttributeNames"}` — so it accepts the value set of the member that
+// replaced it, `MessageSystemAttributeName`. Its modelled target is the QUEUE attribute
+// enum, which lists none of those names, so the boundary walk would refuse
+// `SentTimestamp` and its siblings on the alias; keeping both members off that walk
+// leaves ONE value set, applied by the handler
+// (`crate::ops::receive_message::check_system_attribute_names`), so the two spellings
+// accept and refuse exactly the same names with the same error. Every other member of
+// this shape is still validated at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.sqs#ReceiveMessageRequest",
+    skip_validation = ["AttributeNames", "MessageSystemAttributeNames"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ReceiveMessageInput {
     pub queue_url: String,

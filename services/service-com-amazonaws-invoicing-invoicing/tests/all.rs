@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/create_path_tag_quota.rs"]
 mod create_path_tag_quota;
+#[path = "all/invoice_profile_membership.rs"]
+mod invoice_profile_membership;
 #[path = "all/invoice_profiles.rs"]
 mod invoice_profiles;
 #[path = "all/invoice_summaries.rs"]

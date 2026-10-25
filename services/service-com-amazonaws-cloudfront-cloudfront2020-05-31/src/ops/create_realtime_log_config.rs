@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRealtimeLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRealtimeLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRealtimeLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a real-time log configuration: mints the ARN the configuration is addressed by,
+//! stores the submitted name, sampling rate, endpoints and fields, and reports the record
+//! it stored, so a later `GetRealtimeLogConfig` answers from that record rather than from
+//! the request being served.
+//!
+//! Three refusals are checked BEFORE anything is stored:
+//!
+//! * a `Name` that is empty, a sampling rate outside the documented percentage range, a
+//!   list that names nothing, or an endpoint that names no Kinesis data stream to send to
+//!   — `InvalidArgument` ([`crate::state::realtime_log_config_refusal`] states each rule,
+//!   and [`crate::state::REALTIME_LOG_CONFIG_NAME_REQUIRED`] the one about the name);
+//! * a `Name` another configuration already holds — `RealtimeLogConfig$Name` is "The
+//!   unique name of this real-time log configuration", so the second create under a name
+//!   is `RealtimeLogConfigAlreadyExists` rather than a second configuration, and the
+//!   configuration that holds the name is left exactly as it was;
+//! * more configurations than this emulator holds
+//!   ([`crate::state::MAX_REALTIME_LOG_CONFIGS`]) — `TooManyRealtimeLogConfigs`.
+//!
+//! `AccessDenied` is deliberately unreachable from this handler, so a reader does not take
+//! it for an omission: this emulator authorizes no caller. The request boundary verifies
+//! the signature, and no operation in this service consults a principal, so there is no
+//! permission for this one to refuse on.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +170,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRealtimeLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRealtimeLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRealtimeLogConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+
+        // "A unique name to identify this real-time log configuration": an empty name
+        // identifies nothing, so it names no configuration a later call could address.
+        if input.name.is_empty() {
+            return Err(CreateRealtimeLogConfigErrorModeled::InvalidArgument(
+                crate::state::invalid_realtime_log_config(
+                    crate::state::REALTIME_LOG_CONFIG_NAME_REQUIRED,
+                ),
+            )
+            .into());
+        }
+
+        // The documented constraints the model carries no trait for — the sampling rate's
+        // range above all — refused with the modelled `InvalidArgument` ("An argument is
+        // invalid"), naming the member and the constraint it broke.
+        if let Some(reason) = crate::state::realtime_log_config_refusal(
+            input.sampling_rate,
+            &input.end_points,
+            &input.fields,
+        ) {
+            return Err(CreateRealtimeLogConfigErrorModeled::InvalidArgument(
+                crate::state::invalid_realtime_log_config(&reason),
+            )
+            .into());
+        }
+
+        // "The unique name of this real-time log configuration": a name identifies ONE
+        // configuration, so a name another configuration already holds cannot name a
+        // second one — the configuration that holds it is left exactly as it was.
+        if store.realtime_log_config(&input.name).is_some() {
+            return Err(
+                CreateRealtimeLogConfigErrorModeled::RealtimeLogConfigAlreadyExists(
+                    crate::state::realtime_log_config_already_exists(),
+                )
+                .into(),
+            );
+        }
+
+        // The store grows only here and a configuration cannot be evicted (a later read has
+        // to answer with what this create returned), so the bound is an entry count refused
+        // before the insert.
+        if store.realtime_log_configs.len() >= crate::state::MAX_REALTIME_LOG_CONFIGS {
+            return Err(
+                CreateRealtimeLogConfigErrorModeled::TooManyRealtimeLogConfigs(
+                    crate::state::too_many_realtime_log_configs(),
+                )
+                .into(),
+            );
+        }
+
+        let stored = crate::state::StoredRealtimeLogConfig {
+            arn: crate::state::realtime_log_config_arn(&input.name),
+            name: input.name,
+            sampling_rate: input.sampling_rate,
+            // Stored whole, and in the submitted ORDER: "In an API response, the fields are
+            // provided in the same order in which they are sent to the Amazon Kinesis data
+            // stream."
+            end_points: input.end_points,
+            fields: input.fields,
+        };
+        // Read from the record just built, never from the request.
+        let realtime_log_config = stored.to_realtime_log_config();
+        store
+            .realtime_log_configs
+            .insert(stored.name.clone(), stored);
+
+        Ok(CreateRealtimeLogConfigOutput {
+            // "A real-time log configuration."
+            realtime_log_config: Some(realtime_log_config),
+        })
     }
 }

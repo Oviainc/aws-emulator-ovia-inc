@@ -49,7 +49,7 @@ use service_com_amazonaws_ssoadmin_swbexternalservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, organization_engine, router, router_over, seeded_instance_arn,
+    account_instance_router, call, error_code, organization_engine, router_over,
     UNKNOWN_INSTANCE_ARN,
 };
 
@@ -372,8 +372,7 @@ async fn the_abac_configuration_round_trips_on_an_organization_instance() {
 /// configuration could exist.
 #[tokio::test]
 async fn the_surface_is_refused_on_an_account_instance() {
-    let router = router();
-    let instance_arn = seeded_instance_arn(&router).await;
+    let (router, instance_arn) = account_instance_router().await;
 
     for case in cases() {
         let label = &case.label;

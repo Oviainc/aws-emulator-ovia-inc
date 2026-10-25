@@ -7,7 +7,9 @@
 //! new value, and every other key is left where it is. The tag set lives on the resource's
 //! own record (`crate::state::ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`),
 //! so `ListTagsForResource` and `ListLogGroups`'s `logGroupTags` filter read what this
-//! operation wrote.
+//! operation wrote. A key in the namespace Amazon Web Services reserves for its own tags
+//! (`crate::state::RESERVED_TAG_KEY_PREFIX`) is not the caller's to assign, so a request
+//! naming one is refused and assigns nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -194,6 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
             return Err(invalid(crate::state::UNTAGGABLE_RESOURCE_ARN));
         };
+
+        // "The list of key-value pairs to associate with the resource" are the caller's own,
+        // and the reserved namespace is not: a request naming a key in it is a parameter
+        // specified incorrectly and assigns nothing. `TagKey`'s `@pattern` admits `:`, so the
+        // boundary validator passes such a key through to here. The deprecated `TagLogGroup`
+        // refuses it the same way, so neither door onto one tag set admits what the other
+        // refuses.
+        if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
+            return Err(invalid(crate::state::RESERVED_TAG_KEY_MESSAGE));
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceError::from(TagResourceErrorModeled::ServiceUnavailableException(

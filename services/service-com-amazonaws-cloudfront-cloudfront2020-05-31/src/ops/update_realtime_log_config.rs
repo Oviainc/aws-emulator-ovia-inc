@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRealtimeLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRealtimeLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRealtimeLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the parameters of the real-time log configuration a request addresses and
+//! reports the record as it now stands, so every later read answers from the updated
+//! record.
+//!
+//! The configuration is addressed by its `Name` or by its `ARN`, through the one rule
+//! [`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::addressed_realtime_log_config`]
+//! states (the NAME identifies it when a request carries both): a request naming neither
+//! is refused with `InvalidArgument`, and an identifier no stored configuration answers to
+//! with `NoSuchRealtimeLogConfig`.
+//!
+//! "When you update a real-time log configuration, all the parameters are updated with the
+//! values provided in the request" — a parameter the request supplies replaces the stored
+//! one, and a parameter it leaves out keeps the value the record already carries, since
+//! there is no value in the request to update it with. The identity is NOT a parameter:
+//! "You cannot update a real-time log configuration's `Name` or `ARN`", so the stored name
+//! and ARN are what the updated record keeps and the answer reports.
+//!
+//! The updated parameters satisfy the same rules a create's do
+//! ([`crate::state::realtime_log_config_refusal`]), checked against the configuration the
+//! update WOULD leave behind, before anything is written — `InvalidArgument` otherwise.
+//!
+//! `AccessDenied` is deliberately unreachable from this handler, for the reason
+//! `CreateRealtimeLogConfig`'s is: this emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +169,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRealtimeLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRealtimeLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRealtimeLogConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+
+        // Which configuration the request addresses, by the one rule every operation that
+        // addresses one either way goes through. The record's own name is what keys it:
+        // "You cannot update a real-time log configuration's Name or ARN."
+        let name = match store
+            .addressed_realtime_log_config(input.name.as_deref(), input.arn.as_deref())
+        {
+            Ok(stored) => stored.name.clone(),
+            Err(crate::state::RealtimeLogConfigAddress::NoIdentifier) => {
+                return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(
+                    crate::state::realtime_log_config_identifier_required(),
+                )
+                .into())
+            }
+            Err(crate::state::RealtimeLogConfigAddress::NotFound) => {
+                return Err(
+                    UpdateRealtimeLogConfigErrorModeled::NoSuchRealtimeLogConfig(
+                        crate::state::no_such_realtime_log_config(),
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // The configuration this update WOULD leave behind: each parameter the request
+        // supplies, and the stored value for each one it does not.
+        let stored = store
+            .realtime_log_config(&name)
+            .expect("the record the lookup above resolved is still held under its name");
+        let sampling_rate = input.sampling_rate.unwrap_or(stored.sampling_rate);
+        let end_points = input
+            .end_points
+            .unwrap_or_else(|| stored.end_points.clone());
+        let fields = input.fields.unwrap_or_else(|| stored.fields.clone());
+
+        // Checked against that configuration, by the same rule a create's is, before
+        // anything is written: a refused update leaves the record exactly as it was.
+        if let Some(reason) =
+            crate::state::realtime_log_config_refusal(sampling_rate, &end_points, &fields)
+        {
+            return Err(UpdateRealtimeLogConfigErrorModeled::InvalidArgument(
+                crate::state::invalid_realtime_log_config(&reason),
+            )
+            .into());
+        }
+
+        let updated = store
+            .realtime_log_configs
+            .get_mut(&name)
+            .expect("the record the lookup above resolved is still held under its name");
+        updated.sampling_rate = sampling_rate;
+        updated.end_points = end_points;
+        updated.fields = fields;
+
+        Ok(UpdateRealtimeLogConfigOutput {
+            // "A real-time log configuration" — the record as it now stands, read back from
+            // the store rather than assembled from the request.
+            realtime_log_config: Some(updated.to_realtime_log_config()),
+        })
     }
 }

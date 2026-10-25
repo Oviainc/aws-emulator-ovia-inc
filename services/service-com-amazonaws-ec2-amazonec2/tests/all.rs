@@ -170,6 +170,9 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
 mod instance_types;
+// Associating an ASN brought to IPAM with a BYOIP address range IPAM manages.
+#[path = "all/ipam_byoasn_associations.rs"]
+mod ipam_byoasn_associations;
 // Allocating unused capacity out of a Capacity Reservation into an interruptible one.
 #[path = "all/interruptible_capacity_reservation_allocations.rs"]
 mod interruptible_capacity_reservation_allocations;

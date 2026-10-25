@@ -13,7 +13,8 @@
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the status transitions the clock has already made due (a directory
-//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`, a
+//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`
+//!   (and a removed one leaving the store), a
 //!   trust leaving `Creating` or `Verifying` (and a deleted one leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a directory's data access leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
@@ -82,6 +83,15 @@ pub const IP_ROUTE_STATUS_ADDING: &str = "Adding";
 /// The `IpRouteStatusMsg` an address block reaches once [`TRANSITION_SPAN`] has
 /// elapsed: the `Added` value of the modelled `IpRouteStatusMsg` enum.
 pub const IP_ROUTE_STATUS_ADDED: &str = "Added";
+
+/// The `IpRouteStatusMsg` an address block carries between `RemoveIpRoutes` and
+/// [`TRANSITION_SPAN`]: the `Removing` value of the modelled `IpRouteStatusMsg` enum.
+///
+/// `RemoveIpRoutes` answers while the block is still being taken out of service, so the
+/// block leaving the directory is owed by the clock, on the same span an add's status
+/// transition uses. A block that has left is no longer one `ListIpRoutes` reports, which
+/// is why no record rests on the enum's `Removed` value.
+pub const IP_ROUTE_STATUS_REMOVING: &str = "Removing";
 
 /// The status a snapshot is in between `CreateSnapshot` and [`TRANSITION_SPAN`]: the
 /// first value of the modelled `SnapshotStatus` enum.
@@ -610,8 +620,8 @@ pub struct IpRouteRecord {
     pub description: Option<String>,
     /// One of the modelled `IpRouteStatusMsg` values.
     pub status: String,
-    /// When the status transition the add owes falls due; `None` once there is none
-    /// left to make. See [`TRANSITION_SPAN`].
+    /// When the status transition the add owes, or the removal `RemoveIpRoutes` owes,
+    /// falls due; `None` once there is none left to make. See [`TRANSITION_SPAN`].
     pub status_due_at: Option<SystemTime>,
     /// When `AddIpRoutes` added the block, as `AddedDateTime` reports it.
     pub added_at: SystemTime,
@@ -1679,7 +1689,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// owed at `now` whether or not anybody called, because each due instant was stored
     /// when the record it belongs to was created — a directory's stage when
     /// `CreateDirectory` ran, a snapshot's status when `CreateSnapshot` ran, an IP
-    /// route's status when `AddIpRoutes` ran, an assessment's status when
+    /// route's status when `AddIpRoutes` or `RemoveIpRoutes` ran, an assessment's
+    /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
     /// `EnableDirectoryDataAccess` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
@@ -1691,15 +1702,26 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     directory.stage_due_at = None;
                 }
             }
+            // The status transitions the IP route writes owe: the transient `Adding` an
+            // add answers in settles on `Added`, and a block whose removal has fallen
+            // due is gone — a block the directory no longer routes is not one
+            // `ListIpRoutes` reports.
             for route in directory.ip_routes.values_mut() {
                 let Some(due) = route.status_due_at else {
                     continue;
                 };
-                if now >= due {
+                if now >= due && route.status == IP_ROUTE_STATUS_ADDING {
                     route.status = IP_ROUTE_STATUS_ADDED.to_string();
                     route.status_due_at = None;
                 }
+                // A block being removed has no settled status to move to: it leaves the
+                // store below, so its due instant is left in place for that pass to
+                // find.
             }
+            directory.ip_routes.retain(|_, route| {
+                route.status != IP_ROUTE_STATUS_REMOVING
+                    || route.status_due_at.is_some_and(|due| now < due)
+            });
             // The data-access transition `EnableDirectoryDataAccess` owes: the
             // transient `Enabling` settles on `Enabled`. The mirrored transition out of
             // `Disabling` belongs to `DisableDirectoryDataAccess`, which is still

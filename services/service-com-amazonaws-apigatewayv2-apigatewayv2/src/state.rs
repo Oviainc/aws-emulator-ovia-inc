@@ -1922,6 +1922,17 @@ pub struct PortalProduct {
     /// the record.
     pub last_modified: SystemTime,
     pub tags: BTreeMap<String, String>,
+    /// This product's product REST endpoint pages, keyed by
+    /// `ProductRestEndpointPageId`. A page is addressed UNDER its product
+    /// (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{id}`), so the
+    /// product OWNS its pages the way an [`Api`] owns its routes: removing the product
+    /// takes its pages with it, and no second map can drift out of step with it.
+    /// `BTreeMap` for the stable key order a paginated listing resumes through.
+    pub product_rest_endpoint_pages: BTreeMap<String, ProductRestEndpointPage>,
+    /// Drives [`PortalProduct::mint_product_rest_endpoint_page_id`]. Per-product, for
+    /// the same reason [`Api::route_id_seed`] is per-api: the id only has to be unique
+    /// within the product that owns the page.
+    pub product_rest_endpoint_page_id_seed: u64,
 }
 
 /// The members `CreatePortalProduct`, `GetPortalProduct` and `UpdatePortalProduct`
@@ -1940,6 +1951,16 @@ pub struct PortalProductView {
 }
 
 impl PortalProduct {
+    /// Mint a fresh `ProductRestEndpointPageId` for this product: ten lowercase
+    /// alphanumerics, never one this product already minted. The member targets
+    /// `__stringMin10Max30PatternAZ09` (len 10..30, pattern `^[a-z0-9]+$`), which
+    /// [`mint_id`]'s ten-character lowercase alphanumeric id satisfies by construction.
+    pub fn mint_product_rest_endpoint_page_id(&mut self) -> String {
+        self.product_rest_endpoint_page_id_seed =
+            self.product_rest_endpoint_page_id_seed.wrapping_add(1);
+        mint_id(self.product_rest_endpoint_page_id_seed)
+    }
+
     /// Project the record onto the members every portal-product reader reports.
     pub fn to_wire(&self) -> PortalProductView {
         PortalProductView {
@@ -1955,6 +1976,275 @@ impl PortalProduct {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
+        }
+    }
+}
+
+/// The most product REST endpoint pages one portal product may hold, after which
+/// CreateProductRestEndpointPage is refused.
+///
+/// An EMULATOR growth bound, not a figure AWS publishes: it keeps a loop of
+/// CreateProductRestEndpointPage calls from growing one product without end, and is set
+/// to the per-parent bound this service already uses for the other child collections it
+/// mints ids into ([`MAX_ROUTES_PER_API`]). `TooManyRequestsException` ("A limit has
+/// been exceeded") is the modelled error the operation refuses with. Do not cite this as
+/// a published quota.
+pub const MAX_PRODUCT_REST_ENDPOINT_PAGES_PER_PRODUCT: usize = 300;
+
+/// The `Status` a resource carries while the service is still assembling it, from
+/// `STATUS_VALUES` (`AVAILABLE | FAILED | IN_PROGRESS`).
+pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `Status` a resource carries once the service finished assembling it, from
+/// `STATUS_VALUES`.
+pub const STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// How long a created product REST endpoint page reports [`STATUS_IN_PROGRESS`] before
+/// it reports [`STATUS_AVAILABLE`]: the page's content is generated from the REST
+/// endpoint it documents, which is not done when the create call answers — the reason
+/// the modelled response carries a `Status` and a `StatusException` at all.
+///
+/// AWS documents no duration for it, so this span is the emulator's own, chosen short
+/// enough not to slow a caller down and long enough that a caller reading straight after
+/// the create still observes the transient status. It is the span
+/// [`VPC_LINK_CREATE_SPAN`] uses for the same kind of transition.
+pub const PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN: Duration = Duration::from_millis(500);
+
+/// The `TryItState` a product REST endpoint page gets when the request names none, from
+/// `TRY_IT_STATE_VALUES` (`DISABLED | ENABLED`).
+///
+/// The member is REQUIRED on the modelled page summary, so a page always reports one,
+/// and the request may leave it out; `DISABLED` is the CHOSEN default, since a caller
+/// that did not ask for the portal's try-it console to invoke this endpoint has not asked
+/// for it to be invocable from the portal.
+pub const DEFAULT_TRY_IT_STATE: &str = "DISABLED";
+
+/// The resource portion a product REST endpoint page's ARN carries after its product's:
+/// API Gateway names a resource by its own REST path, and a page's path is
+/// `/portalproducts/{portalProductId}/productrestendpointpages/{pageId}`.
+pub const PRODUCT_REST_ENDPOINT_PAGE_RESOURCE_SEGMENT: &str = "/productrestendpointpages/";
+
+/// The ARN of a stored product REST endpoint page.
+///
+/// Built like every other ARN this store names — through [`::engine::emulator_arn`] under
+/// [`ARN_SERVICE`], with the resource portion the page's own REST path (see
+/// [`PRODUCT_REST_ENDPOINT_PAGE_RESOURCE_SEGMENT`]) — so it names the page's product as
+/// well as the page, and satisfies the modelled `len 20..2048` of
+/// `ProductRestEndpointPageArn`.
+pub fn product_rest_endpoint_page_arn(
+    region: &str,
+    portal_product_id: &str,
+    product_rest_endpoint_page_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{PORTAL_PRODUCT_RESOURCE_PREFIX}{portal_product_id}\
+             {PRODUCT_REST_ENDPOINT_PAGE_RESOURCE_SEGMENT}{product_rest_endpoint_page_id}"
+        ),
+    )
+}
+
+/// The longest `Endpoint` a page's display content may report: the modelled
+/// `EndpointDisplayContentResponse$Endpoint` is `len 1..1024`.
+pub const DISPLAY_CONTENT_ENDPOINT_MAX_LENGTH: usize = 1024;
+
+/// The identifier parts of the REST endpoint a `RestEndpointIdentifier` names, or the
+/// refusal of one that names no endpoint.
+///
+/// `RestEndpointIdentifier` is a structure with exactly one alternative,
+/// `IdentifierParts` ("The identifier parts of the REST endpoint identifier"), so an
+/// identifier carrying none identifies nothing to document — incomplete input, which is
+/// what `BadRequestException` reports. The wording is
+/// [`exclusive_choice_required`]'s, so this refusal reads like the service's other
+/// one-of refusals.
+pub fn rest_endpoint_identifier_parts(
+    identifier: &wire::RestEndpointIdentifier,
+) -> Result<&wire::IdentifierParts, String> {
+    match identifier.identifier_parts.as_ref() {
+        Some(parts) => Ok(parts),
+        None => Err(exclusive_choice_required(
+            "RestEndpointIdentifier",
+            &["IdentifierParts"],
+        )),
+    }
+}
+
+/// The URL a consumer invokes the REST endpoint a page documents on.
+///
+/// A REST endpoint is identified by its REST API, stage, method and path
+/// (`IdentifierParts`), and API Gateway serves it on that API's default execute-api
+/// endpoint under the stage and the path — the host
+/// `{api-id}.execute-api.{region}.amazonaws.com` [`execute_api_endpoint`] builds for
+/// every api of this service. The method is not part of a URL, so it does not appear
+/// here.
+pub fn rest_endpoint_invoke_url(parts: &wire::IdentifierParts, region: &str) -> String {
+    // The path is written with a leading separator (`/orders`), and the stage already
+    // contributes one, so a leading separator is dropped rather than doubled.
+    let path = parts.path.strip_prefix('/').unwrap_or(&parts.path);
+    format!(
+        "{}/{}/{path}",
+        execute_api_endpoint(&parts.rest_api_id, region, HTTP_PROTOCOL_TYPE),
+        parts.stage
+    )
+}
+
+/// Resolve the display content a product REST endpoint page reports from the content the
+/// request asked for.
+///
+/// "Contains any values that override the default configuration generated from API
+/// Gateway" (`DisplayContentOverrides`): each member of the page's display content is
+/// the value the request overrode it with, or the default API Gateway derives from the
+/// REST endpoint the page documents. `Endpoint` is required on the response, and its
+/// default is that endpoint's own invoke URL ("By default, API Gateway uses the default
+/// execute API endpoint. You can provide a custom domain to override this value",
+/// `DisplayContentOverrides$Endpoint`). `Body` ("By default, this is the documentation of
+/// your REST API from API Gateway") and `OperationName` default to documentation that
+/// lives in the REST API itself — a resource of the REST (API Gateway v1) API this
+/// emulator does not hold — so nothing is invented for them and they are reported only
+/// where the request supplied them.
+///
+/// `requested` is the request's `DisplayContent`, absent for a request that named none —
+/// which says the same as its `None` alternative: this endpoint carries no overrides.
+/// `Err` carries the message for the operation's `BadRequestException`.
+pub fn resolve_endpoint_display_content(
+    region: &str,
+    parts: &wire::IdentifierParts,
+    requested: Option<&wire::EndpointDisplayContent>,
+) -> Result<wire::EndpointDisplayContentResponse, String> {
+    let overrides = match requested {
+        None => None,
+        Some(content) => {
+            validate_exclusive_choice(
+                "DisplayContent",
+                &[
+                    ("None", content.none.is_some()),
+                    ("Overrides", content.overrides.is_some()),
+                ],
+            )?;
+            content.overrides.as_ref()
+        }
+    };
+
+    let endpoint = match overrides.and_then(|overrides| overrides.endpoint.clone()) {
+        Some(endpoint) => endpoint,
+        None => {
+            let derived = rest_endpoint_invoke_url(parts, region);
+            // An overriding `Endpoint` is bounded by the model (len 1..1024) and refused
+            // at the boundary, but a DERIVED one is this service's own value: the parts
+            // it is built from are bounded far wider (a `Path` alone is len 1..4096), so
+            // a request naming an endpoint whose invoke URL cannot be reported is refused
+            // rather than answered with a response the model does not allow.
+            if derived.len() > DISPLAY_CONTENT_ENDPOINT_MAX_LENGTH {
+                return Err(format!(
+                    "Invalid value for RestEndpointIdentifier: the invoke URL of the \
+                     identified REST endpoint is {} characters, past the \
+                     {DISPLAY_CONTENT_ENDPOINT_MAX_LENGTH} an endpoint may carry.",
+                    derived.len()
+                ));
+            }
+            derived
+        }
+    };
+
+    Ok(wire::EndpointDisplayContentResponse {
+        body: overrides.and_then(|overrides| overrides.body.clone()),
+        endpoint,
+        operation_name: overrides.and_then(|overrides| overrides.operation_name.clone()),
+    })
+}
+
+/// A persisted `ProductRestEndpointPage` resource: one REST endpoint of a portal
+/// product, as a published portal documents it.
+///
+/// Owned by its [`PortalProduct`] (see
+/// [`PortalProduct::product_rest_endpoint_pages`]). The record keeps what the write
+/// RESOLVED — the id and ARN it minted, the display content it resolved from the
+/// request's overrides and the identified endpoint, the instant the page was last
+/// modified — so every reader of the page reports one value.
+#[derive(Debug, Clone)]
+pub struct ProductRestEndpointPage {
+    pub product_rest_endpoint_page_id: String,
+    /// Built once at write time by [`product_rest_endpoint_page_arn`] from the Region the
+    /// creating request addressed: an ARN names the Region its resource was created in,
+    /// so it cannot be rebuilt per read from whatever Region a later caller signs for.
+    pub product_rest_endpoint_page_arn: String,
+    /// The REST endpoint this page documents, as the request identified it.
+    pub rest_endpoint_identifier: wire::RestEndpointIdentifier,
+    /// The display content this page reports, resolved ONCE by
+    /// [`resolve_endpoint_display_content`] rather than per read, so the endpoint it
+    /// names does not follow the Region a later reader signs for.
+    pub display_content: wire::EndpointDisplayContentResponse,
+    /// "The timestamp when the product REST endpoint page was last modified" — the
+    /// creation instant until something rewrites the record.
+    pub last_modified: SystemTime,
+    /// One of `TRY_IT_STATE_VALUES`; [`DEFAULT_TRY_IT_STATE`] for a page whose create
+    /// named none.
+    pub try_it_state: String,
+    /// When this page's content finishes being generated, after which it reports
+    /// [`STATUS_AVAILABLE`]; before it, [`STATUS_IN_PROGRESS`]. See
+    /// [`ProductRestEndpointPage::status`] and
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`].
+    pub available_at: Instant,
+}
+
+/// The members `CreateProductRestEndpointPage` and `GetProductRestEndpointPage` each
+/// report for one page — the Get response carries the create's members plus
+/// `RawDisplayContent` — so [`ProductRestEndpointPage::to_wire`] projects the record
+/// ONCE and every reader serializes that projection rather than assembling its own.
+#[derive(Debug, Clone)]
+pub struct ProductRestEndpointPageView {
+    pub display_content: Option<wire::EndpointDisplayContentResponse>,
+    pub last_modified: Option<::aws_smithy_types::DateTime>,
+    pub product_rest_endpoint_page_arn: Option<String>,
+    pub product_rest_endpoint_page_id: Option<String>,
+    pub rest_endpoint_identifier: Option<wire::RestEndpointIdentifier>,
+    pub status: Option<String>,
+    pub status_exception: Option<wire::StatusException>,
+    pub try_it_state: Option<String>,
+}
+
+impl ProductRestEndpointPage {
+    /// The `Status` this page reports now.
+    ///
+    /// A created page's content is still being generated when the create call answers, so
+    /// it is reported [`STATUS_IN_PROGRESS`] until
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] has passed and [`STATUS_AVAILABLE`]
+    /// after it. The transition is one the CLOCK owes, materialised from the stored due
+    /// instant rather than by sleeping or by being read, so every reader agrees on it and
+    /// a read changes nothing.
+    pub fn status(&self) -> &'static str {
+        if Instant::now() < self.available_at {
+            STATUS_IN_PROGRESS
+        } else {
+            STATUS_AVAILABLE
+        }
+    }
+
+    /// The page's content as it was supplied, for the reader that asks for it
+    /// (`GetProductRestEndpointPage$IncludeRawDisplayContent`): the body of the page,
+    /// before a portal renders it. A page whose body is API Gateway's own documentation
+    /// of the REST API carries none here, for the reason
+    /// [`resolve_endpoint_display_content`] gives.
+    pub fn raw_display_content(&self) -> Option<String> {
+        self.display_content.body.clone()
+    }
+
+    /// Project the record onto the members every page reader reports.
+    pub fn to_wire(&self) -> ProductRestEndpointPageView {
+        ProductRestEndpointPageView {
+            display_content: Some(self.display_content.clone()),
+            last_modified: Some(to_timestamp(self.last_modified)),
+            product_rest_endpoint_page_arn: Some(self.product_rest_endpoint_page_arn.clone()),
+            product_rest_endpoint_page_id: Some(self.product_rest_endpoint_page_id.clone()),
+            rest_endpoint_identifier: Some(self.rest_endpoint_identifier.clone()),
+            status: Some(self.status().to_string()),
+            // "The status exception information" reports what went WRONG with a page the
+            // service could not assemble (`Status` `FAILED`). Nothing failed here, so
+            // there is no exception to report rather than an empty one.
+            status_exception: None,
+            try_it_state: Some(self.try_it_state.clone()),
         }
     }
 }
@@ -2141,16 +2431,22 @@ pub fn validate_exclusive_choice(
         .collect();
     match named.len() {
         1 => Ok(()),
-        0 => Err(format!(
-            "{member} must specify exactly one of: {}.",
-            names.join(", ")
-        )),
+        0 => Err(exclusive_choice_required(member, &names)),
         _ => Err(format!(
             "{member} must specify exactly one of: {}, but specifies {}.",
             names.join(", "),
             named.join(", ")
         )),
     }
+}
+
+/// The message a structure naming NO alternative is refused with: the member, and the
+/// alternatives it has to choose between. Declared once, so
+/// [`validate_exclusive_choice`] and the readers of a one-alternative structure (see
+/// [`rest_endpoint_identifier_parts`]) refuse the same shape of input with the same
+/// wording.
+fn exclusive_choice_required(member: &str, names: &[&str]) -> String {
+    format!("{member} must specify exactly one of: {}.", names.join(", "))
 }
 
 /// The resource portion every portal-product ARN opens with: API Gateway names a
@@ -2615,6 +2911,24 @@ pub fn execute_api_endpoint(api_id: &str, region: &str, protocol_type: &str) -> 
         "{}://{api_id}.execute-api.{region}.amazonaws.com",
         execute_api_scheme(protocol_type)
     )
+}
+
+/// Read a boolean out of a query parameter the model types as `__string`.
+///
+/// A query parameter modelled as a string carries its boolean as text, so the parse is
+/// the handler's: `true` and `false` in any case are the two values a boolean query
+/// parameter spells, and anything else says neither. `member` names the parameter in the
+/// message; `Err` carries the message for the operation's `BadRequestException`. A
+/// parameter the request left out answers `false`, the behaviour of a flag nobody set.
+pub fn parse_boolean_query(member: &str, raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) => Err(format!(
+            "Invalid value for {member}: '{value}'. {member} must be true or false."
+        )),
+    }
 }
 
 /// Resolve a `MaxResults` query value into the page size to serve.
