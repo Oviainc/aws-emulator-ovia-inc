@@ -210,14 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // The service-managed keyspaces and their system tables are part of the account
-        // before any call, so `keyspaceName` resolves against them too — a keyspace
-        // Amazon Keyspaces always holds is never the `ResourceNotFoundException` below.
-        store.ensure_service_managed_catalog(&region);
         // Reporting, not mutating: see the note in `get_table.rs`.
         store.settle(::std::time::SystemTime::now());
 
-        let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
+        // `keyspaceName` resolves against what this Region holds: the keyspaces created in
+        // it, and the service-managed ones with their system tables, which every Region
+        // holds before any call.
+        let Some(keyspace) = store.keyspace(&region, &input.keyspace_name) else {
             return Err(ListTablesErrorModeled::ResourceNotFoundException(
                 crate::state::keyspace_not_found(&region, &input.keyspace_name),
             )

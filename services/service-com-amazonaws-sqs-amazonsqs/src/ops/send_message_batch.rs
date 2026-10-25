@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendMessageBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendMessageBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Appends up to ten messages to one queue's arrival-order deque in [`crate::state`],
+//! reporting the outcome of each one individually. This is the batch version of
+//! `SendMessage`, and it is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendMessageBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals about the REQUEST come first and persist nothing: a request with no
+//! entries (`EmptyBatchRequest`), one carrying more than
+//! [`crate::state::MAX_BATCH_ENTRIES`] (`TooManyEntriesInBatchRequest`), an entry whose
+//! `Id` is not one the specification admits (`InvalidBatchEntryId`), two entries sharing
+//! an `Id` (`BatchEntryIdsNotDistinct`), a `QueueUrl` no queue answers to
+//! (`QueueDoesNotExist`) and a batch whose entries together carry more bytes than the
+//! queue's `MaximumMessageSize` (`BatchRequestTooLong`) — "the maximum allowed
+//! individual message size and the maximum total payload size (the sum of the individual
+//! lengths of all of the batched messages)" are the same bound, so an oversized single
+//! entry is refused by it too.
+//!
+//! Past those, each entry is judged on its own against the queue, by exactly the rules
+//! `SendMessage` applies to one message — the body's character set, the FIFO members
+//! (`MessageGroupId`, `MessageDeduplicationId`), `DelaySeconds` and the message
+//! attributes — because "the result of sending each message is reported individually in
+//! the response. Because the batch request can result in a combination of successful and
+//! unsuccessful actions, you should check for batch errors even when the call returns an
+//! HTTP status code of 200." An entry the queue takes is reported in `Successful` with
+//! its id and content digests; one it does not is reported in `Failed` with the sender's
+//! fault, the code AWS answers that condition with and the reason. Entries are enqueued
+//! in request order, so "for a FIFO queue, multiple messages within a single batch are
+//! enqueued in the order they are sent".
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +136,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -131,7 +151,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sqs-amazonsqs.json");
 // here — hence the `SendMessageBatchError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessageBatch")]
+// `OverLimit` is widened in with `extra_errors`, for the same reason `SendMessage`
+// widens it in: it is a shape this SERVICE models (declared on ReceiveMessage and
+// AddPermission) whose own documentation states the refusal this emulator needs — "the
+// specified action violates a limit" — when a queue is already holding as much as
+// `crate::state`'s message bounds allow. A batch is judged against those bounds as a
+// whole, so it is accepted entirely or refused entirely.
+#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessageBatch", extra_errors = ["OverLimit"])]
 #[derive(Debug)]
 pub enum SendMessageBatchErrorModeled {
     BatchEntryIdsNotDistinct(BatchEntryIdsNotDistinct),
@@ -147,6 +173,7 @@ pub enum SendMessageBatchErrorModeled {
     KmsNotFound(KmsNotFound),
     KmsOptInRequired(KmsOptInRequired),
     KmsThrottled(KmsThrottled),
+    OverLimit(OverLimit),
     QueueDoesNotExist(QueueDoesNotExist),
     RequestThrottled(RequestThrottled),
     TooManyEntriesInBatchRequest(TooManyEntriesInBatchRequest),
@@ -204,18 +231,420 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendMessageBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendMessageBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendMessageBatch"))
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            SendMessageBatchErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+
+        // The whole-request refusals, before anything is enqueued: a batch that is not
+        // one AWS would act on stores nothing at all.
+        if input.entries.is_empty() {
+            return Err(SendMessageBatchErrorModeled::EmptyBatchRequest(
+                EmptyBatchRequest {
+                    message: Some("The batch request doesn't contain any entries.".to_string()),
+                },
+            )
+            .into());
+        }
+        if input.entries.len() > sqs::MAX_BATCH_ENTRIES {
+            return Err(
+                SendMessageBatchErrorModeled::TooManyEntriesInBatchRequest(
+                    TooManyEntriesInBatchRequest {
+                        message: Some(format!(
+                            "Maximum number of entries per request are {}. You have sent {}.",
+                            sqs::MAX_BATCH_ENTRIES,
+                            input.entries.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for entry in &input.entries {
+            if !sqs::is_valid_batch_entry_id(&entry.id) {
+                return Err(SendMessageBatchErrorModeled::InvalidBatchEntryId(
+                    InvalidBatchEntryId {
+                        message: Some(format!(
+                            "A batch entry id can only contain alphanumeric characters, hyphens \
+                             and underscores. It can be at most {} letters long.",
+                            sqs::MAX_BATCH_ENTRY_ID_LEN
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !seen.insert(entry.id.as_str()) {
+                return Err(SendMessageBatchErrorModeled::BatchEntryIdsNotDistinct(
+                    BatchEntryIdsNotDistinct {
+                        message: Some(format!("Id {} repeated.", entry.id)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = store.lock();
+        let now = SystemTime::now();
+        // Retention and visibility are owed by the clock, not by this call. Applied
+        // across the whole store, so the store-wide byte budget below is measured
+        // against what the store actually still holds.
+        state.materialise_due(now);
+        let store_bytes = state.retained_message_bytes();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(SendMessageBatchErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(),
+            )
+            .into());
+        };
+        let fifo = queue.is_fifo();
+
+        // A member this emulator does not honour is refused rather than silently dropped
+        // on a 200: `MessageSystemAttributes` carries the X-Ray trace header, which
+        // nothing here propagates. It is the whole request that is refused, because the
+        // emulator cannot honour the member for ANY entry.
+        if let Some(entry) = input.entries.iter().find(|entry| {
+            entry
+                .message_system_attributes
+                .as_ref()
+                .is_some_and(|attributes| !attributes.is_empty())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Entry {} includes MessageSystemAttributes, which this emulator does not \
+                 support yet: it carries the X-Ray trace header, which nothing here propagates.",
+                entry.id
+            )));
+        }
+
+        // Everything each message carries counts toward the batch's payload, attributes
+        // included: "all parts of a message are included in the ... size limit: the
+        // message body, the message attributes".
+        let mut sized: Vec<(BTreeMap<String, MessageAttributeValue>, usize)> =
+            Vec::with_capacity(input.entries.len());
+        let mut total_bytes = 0usize;
+        for entry in &input.entries {
+            let attributes: BTreeMap<String, MessageAttributeValue> = entry
+                .message_attributes
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let bytes = entry
+                .message_body
+                .len()
+                .saturating_add(sqs::message_attribute_bytes(&attributes));
+            total_bytes = total_bytes.saturating_add(bytes);
+            sized.push((attributes, bytes));
+        }
+        // The sum of the batched messages is bounded by the same `MaximumMessageSize` as
+        // one message, so a single entry over that bound is refused here as well.
+        let maximum = queue.integer(sqs::MAXIMUM_MESSAGE_SIZE);
+        if i64::try_from(total_bytes).unwrap_or(i64::MAX) > maximum {
+            return Err(SendMessageBatchErrorModeled::BatchRequestTooLong(
+                BatchRequestTooLong {
+                    message: Some(format!(
+                        "Batch requests cannot be longer than {maximum} bytes. \
+                         You have sent {total_bytes} bytes."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each entry judged on its own against the queue, nothing stored yet: an entry
+        // the queue will not take fails ALONE.
+        let outcomes: Vec<Result<Prepared, BatchResultErrorEntry>> = input
+            .entries
+            .iter()
+            .zip(sized)
+            .map(|(entry, (attributes, bytes))| prepare(queue, entry, attributes, bytes))
+            .collect();
+
+        // What this in-memory store can be made to hold is bounded, and the batch is
+        // judged against those bounds as a whole: it is enqueued entirely or refused
+        // entirely, never half-applied.
+        let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let accepted_bytes: usize = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().ok())
+            .map(|prepared| prepared.bytes)
+            .sum();
+        if accepted > 0 {
+            if let Some(reason) = queue.batch_rejection(accepted, accepted_bytes, store_bytes) {
+                return Err(SendMessageBatchErrorModeled::OverLimit(OverLimit {
+                    message: Some(reason),
+                })
+                .into());
+            }
+        }
+
+        let mut successful = Vec::with_capacity(accepted);
+        let mut failed = Vec::new();
+        for outcome in outcomes {
+            let prepared = match outcome {
+                Ok(prepared) => prepared,
+                Err(refusal) => {
+                    failed.push(refusal);
+                    continue;
+                }
+            };
+
+            // "If a message with a particular MessageDeduplicationId is sent
+            // successfully, subsequent messages with the same MessageDeduplicationId are
+            // accepted successfully but aren't delivered": the resend stores nothing and
+            // answers for the message the token already admitted — including a resend of
+            // an entry earlier in this same batch.
+            let deduplication_key = prepared.deduplication_id.as_ref().map(|token| {
+                queue.deduplication_key(prepared.group_id.as_deref().unwrap_or_default(), token)
+            });
+            if let Some(admitted) = deduplication_key
+                .as_ref()
+                .and_then(|key| queue.deduplication.get(key))
+            {
+                successful.push(SendMessageBatchResultEntry {
+                    id: prepared.id,
+                    message_id: admitted.message_id.clone(),
+                    md5_of_message_body: prepared.md5_of_body,
+                    md5_of_message_attributes: prepared.md5_of_attributes,
+                    md5_of_message_system_attributes: None,
+                    sequence_number: Some(admitted.sequence_number.clone()),
+                });
+                continue;
+            }
+
+            let message_id = sqs::new_identifier();
+            // Only a FIFO queue sequences its messages; `SequenceNumber` "applies only
+            // to FIFO (first-in-first-out) queues".
+            let sequence_number = fifo.then(|| queue.next_sequence_number());
+            queue.messages.push_back(sqs::StoredMessage {
+                message_id: message_id.clone(),
+                body: prepared.body,
+                md5_of_body: prepared.md5_of_body.clone(),
+                message_attributes: prepared.attributes,
+                message_group_id: prepared.group_id,
+                message_deduplication_id: prepared.deduplication_id,
+                sequence_number: sequence_number.clone(),
+                sent_at: now,
+                available_at: sqs::after(now, prepared.delay),
+                invisible_until: None,
+                receive_count: 0,
+                first_received_at: None,
+            });
+            if let (Some(key), Some(sequence_number)) =
+                (deduplication_key, sequence_number.clone())
+            {
+                queue.record_deduplication(
+                    key,
+                    sqs::Deduplication {
+                        message_id: message_id.clone(),
+                        sequence_number,
+                        accepted_at: now,
+                    },
+                );
+            }
+
+            successful.push(SendMessageBatchResultEntry {
+                id: prepared.id,
+                message_id,
+                md5_of_message_body: prepared.md5_of_body,
+                md5_of_message_attributes: prepared.md5_of_attributes,
+                md5_of_message_system_attributes: None,
+                sequence_number,
+            });
+        }
+
+        Ok(SendMessageBatchOutput { successful, failed })
     }
 }
+
+/// A batch entry the queue will take, with everything the store and the result entry
+/// need: the entry's own `Id`, its body and attributes, their digests, the FIFO members
+/// it resolved to and the delay that applies to it.
+struct Prepared {
+    id: String,
+    body: String,
+    attributes: BTreeMap<String, MessageAttributeValue>,
+    md5_of_body: String,
+    md5_of_attributes: Option<String>,
+    group_id: Option<String>,
+    deduplication_id: Option<String>,
+    delay: i64,
+    bytes: usize,
+}
+
+/// Judge one entry against `queue` by the rules `SendMessage` applies to one message,
+/// answering either what the store needs or the result entry reporting why this entry
+/// alone was not taken.
+///
+/// `attributes` and `bytes` are the entry's message attributes and the bytes it retains,
+/// already measured for the batch's payload bound.
+fn prepare(
+    queue: &sqs::Queue,
+    entry: &SendMessageBatchRequestEntry,
+    attributes: BTreeMap<String, MessageAttributeValue>,
+    bytes: usize,
+) -> Result<Prepared, BatchResultErrorEntry> {
+    let fifo = queue.is_fifo();
+
+    // "A message can include only XML, JSON, and unformatted text. The following Unicode
+    // characters are allowed ... If a message contains characters outside the allowed
+    // set, Amazon SQS rejects the message".
+    if let Some(character) = sqs::invalid_body_character(&entry.message_body) {
+        return Err(refused(
+            entry,
+            INVALID_MESSAGE_CONTENTS,
+            format!(
+                "MessageBody holds U+{:04X}, which is outside the allowed set \
+                 #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to #x10FFFF.",
+                character as u32
+            ),
+        ));
+    }
+
+    // "In FIFO queues, MessageGroupId organizes messages into distinct groups ... If you
+    // do not provide a MessageGroupId when sending a message to a FIFO queue, the action
+    // fails." A standard queue may carry one too ("in standard queues, using
+    // MessageGroupId enables fair queues"), where it identifies a tenant and orders
+    // nothing.
+    let group_id = entry.message_group_id.clone();
+    match &group_id {
+        Some(given) => {
+            if let Some(reason) = sqs::message_token_refusal("MessageGroupId", given) {
+                return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
+            }
+        }
+        None if fifo => {
+            return Err(refused(
+                entry,
+                MISSING_PARAMETER,
+                "The entry must carry a MessageGroupId: the queue it addresses is a FIFO \
+                 queue, which hands a group's messages over in strict order."
+                    .to_string(),
+            ));
+        }
+        None => {}
+    }
+
+    // The token this message is deduplicated under, on a FIFO queue: the one the entry
+    // supplied, or — "if you aren't able to provide a MessageDeduplicationId and you
+    // enable ContentBasedDeduplication for your queue" — a SHA-256 hash of the body. "If
+    // you don't provide a MessageDeduplicationId and the queue doesn't have
+    // ContentBasedDeduplication set, the action fails with an error."
+    let deduplication_id = match entry.message_deduplication_id.clone() {
+        Some(given) => {
+            if !fifo {
+                return Err(refused(
+                    entry,
+                    INVALID_PARAMETER_VALUE,
+                    "The entry includes MessageDeduplicationId, which applies only to a FIFO \
+                     queue; the queue it addresses is a standard queue."
+                        .to_string(),
+                ));
+            }
+            if let Some(reason) = sqs::message_token_refusal("MessageDeduplicationId", &given) {
+                return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
+            }
+            Some(given)
+        }
+        None if fifo && queue.content_based_deduplication() => {
+            Some(sqs::content_deduplication_token(&entry.message_body))
+        }
+        None if fifo => {
+            return Err(refused(
+                entry,
+                MISSING_PARAMETER,
+                "The entry must carry a MessageDeduplicationId, or the FIFO queue it \
+                 addresses must have ContentBasedDeduplication enabled."
+                    .to_string(),
+            ));
+        }
+        None => None,
+    };
+
+    // "When you set FifoQueue, you can't set DelaySeconds per message. You can set this
+    // parameter only on a queue level." The queue's own value applies when the entry
+    // names none; either way the value must be inside the range the model documents for
+    // the attribute.
+    let (min_delay, max_delay) = sqs::integer_bounds(sqs::DELAY_SECONDS);
+    if fifo && entry.delay_seconds.is_some() {
+        return Err(refused(
+            entry,
+            INVALID_PARAMETER_VALUE,
+            "The entry includes DelaySeconds, which cannot be set per message on a FIFO \
+             queue; set the DelaySeconds attribute on the queue instead."
+                .to_string(),
+        ));
+    }
+    let delay = match entry.delay_seconds {
+        Some(requested) => i64::from(requested),
+        None => queue.integer(sqs::DELAY_SECONDS),
+    };
+    if delay < min_delay || delay > max_delay {
+        return Err(refused(
+            entry,
+            INVALID_PARAMETER_VALUE,
+            format!("DelaySeconds must be an integer from {min_delay} to {max_delay}; got {delay}."),
+        ));
+    }
+
+    if attributes.len() > sqs::MAX_MESSAGE_ATTRIBUTES {
+        return Err(refused(
+            entry,
+            INVALID_PARAMETER_VALUE,
+            format!(
+                "A message can have up to {} attributes; got {}.",
+                sqs::MAX_MESSAGE_ATTRIBUTES,
+                attributes.len()
+            ),
+        ));
+    }
+    // Name-ordered, so an entry with two bad attributes is always refused for the same
+    // one.
+    if let Some(reason) = attributes
+        .iter()
+        .find_map(|(name, value)| sqs::message_attribute_refusal(name, value))
+    {
+        return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
+    }
+
+    Ok(Prepared {
+        id: entry.id.clone(),
+        md5_of_body: sqs::md5_hex(entry.message_body.as_bytes()),
+        md5_of_attributes: sqs::md5_of_message_attributes(&attributes),
+        body: entry.message_body.clone(),
+        attributes,
+        group_id,
+        deduplication_id,
+        delay,
+        bytes,
+    })
+}
+
+/// Report `entry` as not taken, under its own `Id`: the caller supplied what the queue
+/// refused, so the fault is the sender's.
+fn refused(
+    entry: &SendMessageBatchRequestEntry,
+    code: &str,
+    message: String,
+) -> BatchResultErrorEntry {
+    BatchResultErrorEntry {
+        id: entry.id.clone(),
+        sender_fault: true,
+        code: code.to_string(),
+        message: Some(message),
+    }
+}
+
+/// The per-entry error code for a body holding a character outside the allowed set: the
+/// name of the modelled error `SendMessage` answers for the same condition
+/// (`com.amazonaws.sqs#InvalidMessageContents`), which is what AWS reports in a batch
+/// result entry's `Code`.
+const INVALID_MESSAGE_CONTENTS: &str = "InvalidMessageContents";
+
+/// The per-entry error code for a member whose value this queue does not accept: the
+/// sender-fault code AWS answers a send whose parameter value a queue rejects.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// The per-entry error code for a member the entry had to carry and did not: the
+/// sender-fault code AWS answers a send that leaves out a required parameter.
+const MISSING_PARAMETER: &str = "MissingParameter";

@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::alarm_evaluation::{element, emulator, grant_sns_delivery, rpc, sns, Emulator};
+use crate::harness::{element, emulator, grant_sns_delivery, rpc, sns, Emulator};
 
 /// `DescribeAlarms` for one alarm, as the state value it reports.
 async fn alarm_state(emulator: &Emulator, name: &str) -> String {

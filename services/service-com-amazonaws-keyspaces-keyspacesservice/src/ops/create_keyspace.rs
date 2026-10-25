@@ -199,17 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // The service-managed keyspaces are part of the account before any call, so a
-        // create that names one is a name already taken, refused by the duplicate check
-        // below rather than by a rule of its own.
-        store.ensure_service_managed_catalog(&region);
         store.settle(now);
 
         // "keyspace names must be unique within each Region": a create of a name already
-        // taken is the `ConflictException` the model declares for this operation. Checked
-        // BEFORE the cap below (as `create_table` checks its own duplicate first), because
-        // a name that is already taken adds no entry, so the cap is not what refuses it.
-        if store.keyspaces.contains_key(&input.keyspace_name) {
+        // taken IN THIS REGION is the `ConflictException` the model declares for this
+        // operation, and the same name is free in every other Region. The
+        // service-managed keyspaces every Region holds are names already taken too, which
+        // is what refuses a create of one. Checked BEFORE the caps below (as
+        // `create_table` checks its own duplicate first), because a name that is already
+        // taken adds no entry, so no cap is what refuses it.
+        if store.holds_keyspace(&region, &input.keyspace_name) {
             return Err(CreateKeyspaceErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
                     "Keyspace '{}' already exists in Region '{region}'.",
@@ -222,12 +221,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store grows by one keyspace per call and lives for the life of the process,
         // so the growth is capped; past the cap the service answers the quota error it
         // models rather than accepting another entry.
-        if store.keyspaces.len() >= crate::state::MAX_KEYSPACES {
+        if store.keyspace_count(&region) >= crate::state::MAX_KEYSPACES {
             return Err(CreateKeyspaceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
-                        "the number of keyspaces would exceed the limit of {}",
+                        "the number of keyspaces in Region '{region}' would exceed the \
+                         limit of {}",
                         crate::state::MAX_KEYSPACES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each Region holds its own keyspaces and the caller picks the Region it signs
+        // for, so how many Regions the store keeps keyspaces for is capped the same way:
+        // past it a create that would be the first keyspace of a further Region answers
+        // the same modelled quota error.
+        if store.region_capacity_reached(&region) {
+            return Err(CreateKeyspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds keyspaces in the limit of {} Amazon \
+                         Web Services Regions, which does not include Region '{region}'",
+                        crate::state::MAX_REGIONS
                     )),
                 },
             )
@@ -236,8 +253,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_arn = crate::state::keyspace_arn(&region, &input.keyspace_name);
         let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
-        store.keyspaces.insert(
-            input.keyspace_name.clone(),
+        store.insert_keyspace(
+            &region,
             crate::state::Keyspace {
                 name: input.keyspace_name,
                 resource_arn: resource_arn.clone(),
