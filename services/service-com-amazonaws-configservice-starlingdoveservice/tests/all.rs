@@ -114,5 +114,7 @@ mod put_evaluations;
 mod conformance_pack_rule_names;
 #[path = "all/remediation_execution.rs"]
 mod remediation_execution;
+#[path = "all/config_refusal_message_templates.rs"]
+mod config_refusal_message_templates;
 #[path = "all/compliance_summary_by_resource_type.rs"]
 mod compliance_summary_by_resource_type;

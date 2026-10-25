@@ -175,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteConfigurationAggregatorErrorModeled::NoSuchConfigurationAggregatorException(
                     NoSuchConfigurationAggregatorException {
-                        message: Some(crate::state::no_such_configuration_aggregator_message(
-                            &name,
-                        )),
+                        message: Some(
+                            crate::state::NO_SUCH_CONFIGURATION_AGGREGATOR_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
