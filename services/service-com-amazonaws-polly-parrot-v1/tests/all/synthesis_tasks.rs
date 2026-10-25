@@ -23,14 +23,14 @@ use crate::lexicons_and_speech::{error_code, json, Polly};
 use crate::support::{fixture_task_id, seed_task, stored_task};
 
 /// One `ListSpeechSynthesisTasks` call with the given query string.
-async fn list(polly: &Polly, query: &str) -> http::Response<Bytes> {
+pub(crate) async fn list(polly: &Polly, query: &str) -> http::Response<Bytes> {
     polly
         .call("GET", &format!("/v1/synthesisTasks{query}"), "")
         .await
 }
 
 /// The task ids one page reports, in page order.
-fn task_ids(body: &serde_json::Value) -> Vec<String> {
+pub(crate) fn task_ids(body: &serde_json::Value) -> Vec<String> {
     body["SynthesisTasks"]
         .as_array()
         .expect("SynthesisTasks is a list")
@@ -40,7 +40,7 @@ fn task_ids(body: &serde_json::Value) -> Vec<String> {
 }
 
 /// The task ids one successful page reports, in page order.
-async fn list_ids(polly: &Polly, query: &str) -> Vec<String> {
+pub(crate) async fn list_ids(polly: &Polly, query: &str) -> Vec<String> {
     let response = list(polly, query).await;
     assert_eq!(
         response.status(),
@@ -215,8 +215,8 @@ async fn pagination_visits_every_task_exactly_once() {
     }
     let expected: Vec<String> = (0..total).map(|index| format!("Task{index:02}")).collect();
 
-    // Both published bounds of `MaxResults` (1 and 100), sizes in between, and the
-    // default the service picks when the request names none (`None`).
+    // Both published bounds of `MaxResults` (1 and 100), sizes in between, and a
+    // request that names no bound at all (`None`), which is therefore not paged.
     for max_results in [Some(1usize), Some(2), Some(7), Some(24), Some(100), None] {
         let mut seen: Vec<String> = Vec::new();
         let mut pages = 0;
