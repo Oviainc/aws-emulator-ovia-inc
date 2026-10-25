@@ -31,6 +31,8 @@ mod execution_alias_routing;
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/map_runs.rs"]
+mod map_runs;
 #[path = "all/nested_type_discriminator.rs"]
 mod nested_type_discriminator;
 #[path = "all/resource_tags.rs"]

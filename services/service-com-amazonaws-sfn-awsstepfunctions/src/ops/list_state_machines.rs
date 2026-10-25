@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
             return Err(ListStateMachinesErrorModeled::InvalidToken(InvalidToken {
-                message: Some("nextToken is not a token this service issued".to_string()),
+                message: Some(crate::state::invalid_token_message()),
             })
             .into());
         };
