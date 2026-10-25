@@ -18,6 +18,10 @@
 //! asserted here is what a client reads off the wire, and a response that is not computed
 //! from the shared store cannot pass.
 //!
+//! A resource of a GLOBAL service is reached through its partition's one global endpoint, so
+//! only that endpoint's Region can hold a delivery source for it and a put naming one from any
+//! other Region is refused as invalid; a regional resource pins no Region at all.
+//!
 //! The table spans what the rule generalises over rather than one request: a sending resource
 //! of several vendors (regional, global and region-and-account-less ARNs, and a wildcard ARN),
 //! log types drawn from the `logType` member's own catalogue, a source configuration absent /
@@ -60,6 +64,10 @@ const AGENTCORE_ARN: &str = "arn:aws:bedrock-agentcore:eu-west-2:123456789012:ru
 const SECURITY_HUB_ARN: &str = "arn:aws:securityhub:eu-west-2:111122223333:hubv2/*";
 const QUERY_LOG_GROUP_ARN: &str = "arn:aws:logs:eu-west-2:111122223333:log-group:*";
 
+/// The Region CloudFront — a global service of the commercial partition — is reached through,
+/// and so the only one that can hold a delivery source for a distribution.
+const CLOUDFRONT_HOME_REGION: &str = "us-east-1";
+
 /// Log types the `logType` member's own catalogue names — "For Amazon Web Services Amplify,
 /// the valid values are ACCESS_LOGS and WAF_LOGS. For Application Load Balancer, the valid
 /// values are ALB_ACCESS_LOGS, ALB_CONNECTION_LOGS, and ALB_HEALTH_CHECK_LOGS. For Amazon
@@ -82,6 +90,10 @@ const LOG_TYPES: [&str; 7] = [
 struct Case {
     /// What this row varies, for the assertion messages.
     label: &'static str,
+    /// The Region the put is made in — the one its SigV4 credential scope names, and the one
+    /// the source's own ARN is built from. [`REGION`] unless the resource is reached through
+    /// another one.
+    region: &'static str,
     /// `name` (`DeliverySourceName`, 1..60, `^[\w-]*$`).
     name: String,
     /// `resourceArn` — the resource whose logs this source represents.
@@ -106,6 +118,7 @@ impl Case {
     ) -> Self {
         Self {
             label,
+            region: REGION,
             name: name.to_string(),
             resource_arn,
             log_type: log_type.to_string(),
@@ -113,6 +126,12 @@ impl Case {
             tags: Vec::new(),
             expected_service,
         }
+    }
+
+    /// This put, made in `region` instead of [`REGION`].
+    fn in_region(mut self, region: &'static str) -> Self {
+        self.region = region;
+        self
     }
 
     fn with_configuration(mut self, configuration: &[(&str, &str)]) -> Self {
@@ -155,7 +174,7 @@ impl Case {
     fn expected(&self) -> Value {
         let mut expected = json!({
             "name": self.name,
-            "arn": delivery_source_arn(REGION, &self.name),
+            "arn": delivery_source_arn(self.region, &self.name),
             "resourceArns": [self.resource_arn],
             "service": self.expected_service,
             "logType": self.log_type,
@@ -214,6 +233,8 @@ fn cases() -> Vec<Case> {
             "ACCESS_LOGS",
             "workmail",
         ),
+        // A resource of a global service, which is reached only through its partition's global
+        // endpoint Region — so this row is put there rather than in `REGION`.
         Case::of(
             "a global resource (no Region segment), one tag",
             "cloudfront_access_logs",
@@ -221,6 +242,7 @@ fn cases() -> Vec<Case> {
             "ACCESS_LOGS",
             "cloudfront",
         )
+        .in_region(CLOUDFRONT_HOME_REGION)
         .with_tags(&[("team", "platform")]),
         Case::of(
             "a resource ARN with neither Region nor account, several tags",
@@ -284,7 +306,7 @@ async fn a_put_delivery_source_is_reported_and_read_back() {
 
     for case in &cases {
         let body = case.body();
-        let response = logs.ok(PUT, &body).await;
+        let response = logs.ok_in_region(case.region, PUT, &body).await;
         let put_reported = reported(PUT, &body, &response);
         let expected = case.expected();
         assert_eq!(
@@ -444,7 +466,7 @@ async fn a_put_under_a_held_name_naming_another_resource_is_a_conflict() {
 
     // (case, the other resource the put names, the logType it names)
     let conflicting: [(&str, &str, &str); 4] = [
-        ("another vendor's resource", CLOUDFRONT_ARN, "ACCESS_LOGS"),
+        ("another vendor's resource", LOAD_BALANCER_ARN, "ALB_ACCESS_LOGS"),
         ("another resource of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/m-0000EXAMPLEabcd1234abcd1234abcd1234", "ACCESS_LOGS"),
         ("another resource and another logType", BUCKET_ARN, "WAF_LOGS"),
         ("a wildcard ARN of the same vendor", "arn:aws:workmail:eu-west-2:123456789012:organization/*", "ACCESS_LOGS"),
@@ -565,6 +587,197 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused() {
     );
 }
 
+/// A resource of a GLOBAL service — one that lives in its partition rather than in a Region,
+/// so its ARN carries no Region segment — is reached through that partition's single global
+/// endpoint, so only that endpoint's Region can hold a delivery source for it: a put naming
+/// one from any other Region is refused with the modelled validation error and stores nothing.
+///
+/// The rows span every global sender the `logType` catalogue names (not CloudFront alone) and
+/// every partition that publishes a global endpoint, each put from several Regions that are not
+/// the one it is reached through, and then from the one that is — where it is stored, reported
+/// and read back carrying an ARN of that Region.
+#[tokio::test]
+async fn a_global_resource_source_lives_only_in_its_partitions_global_region() {
+    let logs = Logs::new();
+
+    // (case, the resourceArn, the Region the resource is reached through, a logType)
+    //
+    // Source: these are the global senders the `logType` member's catalogue names — "For
+    // CloudFront, the valid value is ACCESS_LOGS", "For Route 53 Global Resolver, the valid
+    // value is GLOBAL_RESOLVER_LOGS", "For Amazon Web Services Shield Advanced, the valid
+    // value is FLOW_LOGS"
+    // (smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")) — the
+    // documented ARN form of each carries no Region, and each partition reaches them through
+    // one global endpoint: the commercial partition's in US East (N. Virginia), the China
+    // partitions' in Beijing, the AWS GovCloud (US) partition's in US-Gov-West.
+    let global: [(&str, &str, &str, &str); 7] = [
+        (
+            "a CloudFront distribution",
+            CLOUDFRONT_ARN,
+            "us-east-1",
+            "ACCESS_LOGS",
+        ),
+        (
+            "a Route 53 hosted zone",
+            "arn:aws:route53:::hostedzone/Z1EXAMPLE1EXAMP",
+            "us-east-1",
+            "GLOBAL_RESOLVER_LOGS",
+        ),
+        (
+            "a Shield Advanced protection",
+            "arn:aws:shield::123456789012:protection/abcd1234-1234-abcd-1234-abcd1234abcd",
+            "us-east-1",
+            "FLOW_LOGS",
+        ),
+        (
+            "a CloudFront distribution of the China partition",
+            "arn:aws-cn:cloudfront::123456789012:distribution/E2EXAMPLE2EXAMPLE",
+            "cn-north-1",
+            "ACCESS_LOGS",
+        ),
+        (
+            "a Route 53 hosted zone of the China partition",
+            "arn:aws-cn:route53:::hostedzone/Z2EXAMPLE2EXAMP",
+            "cn-north-1",
+            "GLOBAL_RESOLVER_LOGS",
+        ),
+        (
+            "a CloudFront distribution of the GovCloud partition",
+            "arn:aws-us-gov:cloudfront::123456789012:distribution/E3EXAMPLE3EXAMPLE",
+            "us-gov-west-1",
+            "ACCESS_LOGS",
+        ),
+        (
+            "a Shield Advanced protection of the GovCloud partition",
+            "arn:aws-us-gov:shield::123456789012:protection/dcba4321-4321-dcba-4321-dcba4321dcba",
+            "us-gov-west-1",
+            "FLOW_LOGS",
+        ),
+    ];
+
+    for (index, (case, resource_arn, home_region, log_type)) in global.iter().enumerate() {
+        // Every other partition's global Region, plus two ordinary ones: none of them serves
+        // this resource.
+        let elsewhere: Vec<&str> = ["us-east-1", "cn-north-1", "us-gov-west-1", REGION, "us-west-2"]
+            .into_iter()
+            .filter(|region| region != home_region)
+            .collect();
+
+        for region in &elsewhere {
+            let name = format!("global-{index}-{region}");
+            let body =
+                json!({"name": name, "resourceArn": resource_arn, "logType": log_type});
+            let (code, message) = logs.refusal_in_region(region, PUT, &body).await;
+            assert_eq!(
+                code, VALIDATION,
+                "case {case:?} put in {region}: expected {VALIDATION}, got {code}"
+            );
+            assert!(
+                message.contains("resourceArn") && message.contains(home_region),
+                "case {case:?} put in {region}: the refusal must name the member and the Region \
+                 the resource is reached through ({home_region}), got {message:?}"
+            );
+
+            // A refused put stores nothing.
+            let code = logs.err(GET, &json!({"name": name})).await;
+            assert_eq!(
+                code, NOT_FOUND,
+                "case {case:?} put in {region}: a refused put must store nothing, got {code}"
+            );
+        }
+
+        // From the Region the resource IS reached through, the put is served and the source is
+        // stored under an ARN of that Region.
+        let name = format!("global-{index}-home");
+        let body = json!({"name": name, "resourceArn": resource_arn, "logType": log_type});
+        let response = logs.ok_in_region(home_region, PUT, &body).await;
+        let put_reported = reported(PUT, &body, &response);
+        let read = get(&logs, &name).await;
+        assert_eq!(
+            read, put_reported,
+            "case {case:?}: expected the read-back to report {put_reported}, got {read}"
+        );
+        let expected_arn = delivery_source_arn(home_region, &name);
+        assert_eq!(
+            read.get("arn").and_then(Value::as_str),
+            Some(expected_arn.as_str()),
+            "case {case:?}: expected the stored source to carry {expected_arn}, got {read}"
+        );
+    }
+}
+
+/// A resource whose ARN pins NO Region is accepted from every Region: the rule is about the
+/// vendor being one of the global log senders, never about the ARN merely carrying an empty
+/// Region segment (an Amazon S3 bucket ARN carries none and a bucket is regional), and a
+/// regional resource's Region is the caller's to name.
+#[tokio::test]
+async fn a_resource_that_pins_no_region_is_accepted_from_every_region() {
+    let logs = Logs::new();
+
+    // (case, the resourceArn, a logType)
+    let unpinned: [(&str, &str, &str); 7] = [
+        (
+            "a regional resource of the request's own Region",
+            WORKMAIL_ARN,
+            "ACCESS_LOGS",
+        ),
+        (
+            "a regional resource of another Region",
+            "arn:aws:workmail:ap-southeast-2:123456789012:organization/m-9999EXAMPLEabcd1234abcd1234abcd",
+            "AUTHENTICATION_LOGS",
+        ),
+        (
+            "an S3 bucket, Region-less but not global",
+            BUCKET_ARN,
+            "S3_SERVER_ACCESS_LOGS",
+        ),
+        (
+            "a wildcard log group of another Region",
+            "arn:aws:logs:us-east-1:111122223333:log-group:*",
+            "INSIGHTS_QUERY_LOGS",
+        ),
+        (
+            "a global sender of a partition with no global endpoint of its own",
+            "arn:aws-iso:cloudfront::123456789012:distribution/E4EXAMPLE4EXAMPLE",
+            "ACCESS_LOGS",
+        ),
+        // A global service the `logType` catalogue does NOT name as a log sender pins no
+        // Region here: Global Accelerator's own global endpoint is not the partition's usual
+        // one, so no Region is required for it rather than the wrong one.
+        (
+            "a Global Accelerator accelerator, a global service that sends no logs",
+            "arn:aws:globalaccelerator::123456789012:accelerator/1234abcd-abcd-1234-abcd-1234abcdefab",
+            "ACCESS_LOGS",
+        ),
+        (
+            "an IAM role, a global service that sends no logs",
+            "arn:aws:iam::123456789012:role/service-role/vended-logs",
+            "ACCESS_LOGS",
+        ),
+    ];
+
+    for (index, (case, resource_arn, log_type)) in unpinned.iter().enumerate() {
+        for region in [REGION, "us-east-1", "us-west-2", "cn-north-1"] {
+            let name = format!("unpinned-{index}-{region}");
+            let body = json!({"name": name, "resourceArn": resource_arn, "logType": log_type});
+            let response = logs.ok_in_region(region, PUT, &body).await;
+            let put_reported = reported(PUT, &body, &response);
+            let expected_arn = delivery_source_arn(region, &name);
+            assert_eq!(
+                put_reported.get("arn").and_then(Value::as_str),
+                Some(expected_arn.as_str()),
+                "case {case:?} put in {region}: expected {expected_arn}, got {put_reported}"
+            );
+            let read = get(&logs, &name).await;
+            assert_eq!(
+                read, put_reported,
+                "case {case:?} put in {region}: expected the read-back to report \
+                 {put_reported}, got {read}"
+            );
+        }
+    }
+}
+
 /// A `name` at either published bound is accepted and one past each is refused by the modelled
 /// constraint. Source: the model's `DeliverySourceName` shape (`@length` 1..60, `@pattern
 /// ^[\w-]*$`), which both operations' `name` targets.
@@ -673,7 +886,7 @@ async fn describe_reports_every_stored_source_and_filters_by_resource_arn() {
     let logs = Logs::new();
     let cases = cases();
     for case in &cases {
-        logs.ok(PUT, &case.body()).await;
+        logs.ok_in_region(case.region, PUT, &case.body()).await;
     }
 
     // No filter: every source, in name order.
@@ -742,7 +955,7 @@ async fn describe_pages_the_enumeration_whatever_the_page_size() {
     let logs = Logs::new();
     let cases = cases();
     for case in &cases {
-        logs.ok(PUT, &case.body()).await;
+        logs.ok_in_region(case.region, PUT, &case.body()).await;
     }
     let mut names: Vec<String> = cases.iter().map(|case| case.name.clone()).collect();
     names.sort();

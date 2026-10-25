@@ -41,3 +41,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/unknown_resource_id.rs"]
 mod unknown_resource_id;
+#[path = "all/untag_resource_key_validation.rs"]
+mod untag_resource_key_validation;

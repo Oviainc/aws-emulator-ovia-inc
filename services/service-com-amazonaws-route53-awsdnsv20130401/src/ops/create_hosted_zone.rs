@@ -451,6 +451,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CreateHostedZone takes no tags; a zone is tagged afterwards,
             // through ChangeTagsForResource.
             tags: BTreeMap::new(),
+            // CreateHostedZone carries no DNSSEC input, so a zone is created
+            // unsigned and with no key-signing key; signing is enabled
+            // afterwards, through EnableHostedZoneDNSSEC, over a KSK created
+            // through CreateKeySigningKey.
+            dnssec_signing_enabled: false,
+            key_signing_keys: BTreeMap::new(),
             // A zone is created without deletion protection; nothing in this
             // API version turns it on.
             deletion_protection_enabled: false,

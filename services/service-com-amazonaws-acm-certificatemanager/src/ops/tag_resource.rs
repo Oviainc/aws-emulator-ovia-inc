@@ -205,16 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The per-resource tag quota, which `ServiceQuotaExceededException` is this
         // operation's modelled answer for. Refused BEFORE the record is written, so a
-        // rejected request leaves the resource's tags exactly as they were.
+        // rejected request leaves the resource's tags exactly as they were. The
+        // sentence is the one every path that enforces this quota states
+        // ([`crate::state::tag_quota_message`]).
         if merged.len() > crate::state::TAG_LIMIT {
-            let over = merged.len();
             return Err(
                 TagResourceErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "a resource may carry at most {} tags; this request would leave {over}",
-                            crate::state::TAG_LIMIT
-                        )),
+                        message: Some(crate::state::tag_quota_message()),
                     },
                 )
                 .into(),

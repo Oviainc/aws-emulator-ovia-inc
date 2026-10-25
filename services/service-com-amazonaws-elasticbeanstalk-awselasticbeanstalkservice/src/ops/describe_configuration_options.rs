@@ -333,14 +333,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN, and this service's catalog publishes both, so either form
         // resolves the one published version — the same resolution
         // `CreateConfigurationTemplate` and `CreateEnvironment` make.
-        let stack = solution_stack_name
-            .as_deref()
-            .and_then(crate::state::solution_stack_named)
-            .or_else(|| {
-                platform_arn
-                    .as_deref()
-                    .and_then(|arn| crate::state::managed_platform_version(&region, arn))
-            });
+        let stack = crate::state::configuration_platform(
+            &region,
+            solution_stack_name.as_deref(),
+            platform_arn.as_deref(),
+        );
 
         // A platform version the request named OUTRIGHT has to be one this
         // account can read: a version this service publishes, or a custom
@@ -367,19 +364,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The Amazon SQS daemon's options belong to a platform version that can
-        // run a WORKER environment, which is what its branch's supported tiers
-        // say — the same rule this service applies to the worker daemon
-        // addition it reports for a platform version.
-        let supports_worker_tier = stack
-            .and_then(|stack| store.platform_branch_named(stack.branch_name))
-            .is_some_and(|branch| {
-                branch
-                    .supported_tiers
-                    .iter()
-                    .any(|tier| tier == crate::state::TIER_WORKER)
-            });
-
         // "SolutionStackName: the name of the solution stack these
         // configuration options belong to" and "PlatformArn: the ARN of the
         // platform version": the form the request did not use is filled in from
@@ -393,7 +377,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified options." A request that restricts to nothing restricts
         // nothing: the whole catalog is reported.
         let specifications = input.options.as_deref().unwrap_or_default();
-        let options = crate::state::published_configuration_options(stack, supports_worker_tier)
+        // The Amazon SQS daemon's options belong to a platform version that can
+        // run a WORKER environment, which the store's catalog decides — the same
+        // catalog a configuration set for this platform version resolves its
+        // settings against.
+        let options = store
+            .published_option_catalog(stack)
             .into_iter()
             .filter(|option| {
                 specifications.is_empty()

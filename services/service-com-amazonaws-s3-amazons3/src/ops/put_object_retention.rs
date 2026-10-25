@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObjectRetention
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutObjectRetention`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutObjectRetention::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Places the `Retention` container the request carries on the addressed object version —
+//! the one `versionId` names, or the key's current object — and answers 200.
+//! `GetObjectRetention` reads the same state back.
+//!
+//! A retention already IN FORCE on that version bounds what this write may do: a call that
+//! would end the period earlier than it does now, take the retention away, or put
+//! `GOVERNANCE` where `COMPLIANCE` is in force protects the version less than it is
+//! protected now, and such a call is refused with HTTP 403 `AccessDenied` unless the
+//! retention in force is a governance one AND the request asks to bypass it
+//! (`x-amz-bypass-governance-retention`). Lengthening a period, or replacing an expired
+//! retention, needs nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -115,14 +118,25 @@ use super::types::*;
 // `PutObjectRetentionError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutObjectRetentionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutObjectRetention")]
+// The operation's MODELED errors, widened with `extra_errors` by the two 404 shapes this
+// SERVICE models for an address that does not exist.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutObjectRetention")` reports `errors: []`),
+// yet `Bucket` and `Key` are both @httpLabels, so a request can name a bucket or a key
+// that does not exist — AWS answers `NoSuchBucket` ("The specified bucket does not
+// exist") and `NoSuchKey` ("The specified key does not exist"), each modelled
+// `@httpError(404)`. Widening the set with those two shapes is what lets this handler
+// answer the same two 404s its reader `GetObjectRetention` answers for the same two
+// causes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutObjectRetention",
+    extra_errors = ["NoSuchBucket", "NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum PutObjectRetentionErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -177,17 +191,234 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutObjectRetention` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutObjectRetentionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata only, and this write needs nothing from it.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutObjectRetentionRequest$ExpectedBucketOwner`, judged the way every
+        // other handler here judges it: this emulator serves one account, so the owner of
+        // every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        // The EVENT HOLD members of the container are a hold that runs from an event rather
+        // than to a date (`ObjectLockRetention$EventHold` / `$EventHoldDuration`), so they
+        // decide something no stored retention here could then report. Nothing emulates
+        // them, and answering 200 would claim behaviour nothing performed, so the request
+        // is refused as unwritten rather than quietly stripped of its meaning — the way
+        // `PutObject` refuses the object-lock headers it cannot carry out.
+        if let Some(retention) = input.retention.as_ref() {
+            for (member, present) in [
+                ("EventHold", retention.event_hold.is_some()),
+                (
+                    "EventHoldDuration",
+                    retention.event_hold_duration.is_some(),
+                ),
+            ] {
+                if present {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "PutObjectRetention with Retention.{member}"
+                    )));
+                }
+            }
+        }
+
+        // The retention this call asks for, or `None` for a call that asks for NONE: the
+        // `Retention` container is optional and describes one period in one mode, so a
+        // request that carries no container — or an empty one — is the documented way to
+        // take a retention away, which is exactly what needs the governance bypass below.
+        let requested = match input.retention.as_ref() {
+            None => None,
+            Some(retention) => {
+                match (
+                    retention.mode.as_deref(),
+                    retention.retain_until_date.as_ref(),
+                ) {
+                    (None, None) => None,
+                    (Some(mode), Some(date)) => {
+                        // `Mode` targets the `ObjectLockRetentionMode` enum, whose values
+                        // the boundary validator already refuses anything outside; checked
+                        // again here because what is stored decides whether a later write
+                        // may weaken it, so an unknown mode must never reach the store.
+                        if !super::types::OBJECT_LOCK_RETENTION_MODE_VALUES.contains(&mode) {
+                            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                                "Retention.Mode {mode:?} is not one of {:?}",
+                                super::types::OBJECT_LOCK_RETENTION_MODE_VALUES
+                            )));
+                        }
+                        let Some(retain_until) = crate::state::instant_of(date) else {
+                            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                                "Retention.RetainUntilDate {} is outside the range of dates \
+                                 this emulator can hold",
+                                date.secs()
+                            )));
+                        };
+                        Some(crate::state::ObjectRetention {
+                            mode: mode.to_string(),
+                            retain_until,
+                        })
+                    }
+                    // One member without the other describes no period: a retention runs
+                    // in a mode TO a date, so AWS refuses the half of one. No error code of
+                    // this model says that, so it goes out through the framework's 400
+                    // refusal channel.
+                    _ => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Retention names one of Mode and RetainUntilDate: a retention \
+                             carries both or neither",
+                        ))
+                    }
+                }
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the retention cannot be recorded at all, and no modelled
+            // error says that, so the scaffold's 501 carries what is true: this emulator
+            // cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutObjectRetention",
+            ));
+        };
+
+        let mut store = state.lock();
+        let version_id = input.version_id.as_deref();
+
+        // The ADDRESS is resolved first, so a request naming a bucket, a key or a version
+        // this emulator does not hold answers that — the way the service orders the
+        // refusals — rather than reporting whatever is wrong with a retention no object
+        // version could have carried.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(PutObjectRetentionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // A delete marker is a version with no object behind it, so there is nothing to
+        // place a retention on: 405, the status S3 answers an object-level call on a marker
+        // with, as `HeadObject` already answers it for the same cause.
+        if version_id.is_some_and(|named| {
+            bucket
+                .stored_version(&input.key, named)
+                .is_some_and(|held| held.as_delete_marker().is_some())
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::METHOD_NOT_ALLOWED_CODE,
+                crate::state::METHOD_NOT_ALLOWED_STATUS,
+                crate::state::METHOD_NOT_ALLOWED_MESSAGE,
+            ));
+        }
+        let Some(object) = bucket.addressed_object(&input.key, version_id) else {
+            return Err(no_such_object(version_id));
+        };
+        // The retention IN FORCE on the addressed version, read out here so the judgement
+        // below works over an owned value and the store is free to be written through.
+        // A retention whose date has passed has expired and restricts nothing.
+        let now = ::std::time::SystemTime::now();
+        let in_force = object
+            .retention
+            .clone()
+            .filter(|retention| retention.in_force_at(now));
+
+        if let Some(in_force) = in_force {
+            // What this call would leave the version with, against what protects it now:
+            // "you can lengthen a retention period after you have applied a retention
+            // setting to an object version", and nothing else about one may be undone from
+            // the outside. A call that asks for no retention at all takes the whole
+            // protection away, which is the plainest weakening there is.
+            let weakens = requested
+                .as_ref()
+                .is_none_or(|asked| asked.weakens(&in_force));
+            // Only a GOVERNANCE retention has a bypass: it is "Governance-mode
+            // restrictions" the header asks to bypass
+            // (`PutObjectRetentionRequest$BypassGovernanceRetention`), so a compliance-mode
+            // period is not weakened by anyone, header or no header.
+            let bypassed = input.bypass_governance_retention == Some(true)
+                && in_force.mode == crate::state::GOVERNANCE_RETENTION_MODE;
+            if weakens && !bypassed {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    ACCESS_DENIED_CODE,
+                    ACCESS_DENIED_STATUS,
+                    crate::state::OBJECT_LOCK_ACCESS_DENIED_MESSAGE,
+                ));
+            }
+        }
+
+        // A REPLACEMENT of the whole subresource: what the version carries afterwards is
+        // exactly this `Retention` and nothing of the one before it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutObjectRetention"))
+        // The store reports what the write did, because it may refuse: a retention is
+        // retained with the object, so one that would take the bucket or the whole store
+        // past the byte budgets this emulator keeps is refused rather than recorded.
+        match store.replace_object_retention(&input.bucket, &input.key, version_id, requested) {
+            Some(crate::state::ObjectRetentionWrite::Applied) => {}
+            // Unreachable through this handler (the address was just resolved under the
+            // same lock), and answered rather than asserted so a future caller of this
+            // state seam cannot turn a vanished address into a panic.
+            None => return Err(PutObjectRetentionErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
+            Some(crate::state::ObjectRetentionWrite::NoSuchObject) => {
+                return Err(no_such_object(version_id))
+            }
+            // The emulator's own ceilings, not AWS limits (S3 bounds neither the number of
+            // objects nor their total size), so no AWS error code describes them: they go
+            // out through the framework's 400 refusal channel, the same channel
+            // `PutObjectTagging` uses for the same two budgets.
+            Some(crate::state::ObjectRetentionWrite::ByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the retention on {:?} would leave the bucket {:?} holding {would_hold} \
+                     bytes of objects, past the {} bytes this emulator keeps per bucket",
+                    input.key,
+                    input.bucket,
+                    crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+                )));
+            }
+            Some(crate::state::ObjectRetentionWrite::TotalByteBudgetReached { would_hold }) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the retention on {:?} would leave this emulator holding {would_hold} \
+                     bytes of objects across every bucket, past the {} bytes it keeps in \
+                     total",
+                    input.key,
+                    crate::state::MAX_OBJECT_BYTES_TOTAL
+                )));
+            }
+        }
+
+        Ok(PutObjectRetentionOutput {
+            // "If present, indicates that the requester was successfully charged for the
+            // request" (`PutObjectRetentionOutput$RequestCharged`) — Requester Pays is not
+            // emulated, so nobody was charged and nothing is reported.
+            request_charged: None,
+        })
+    }
+}
+
+/// The wire error code a request this emulator will not serve for the caller is refused
+/// with, and its status and message: "403 Forbidden (access denied)", the way every other
+/// handler in this crate answers an expected-bucket-owner mismatch.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The 404 for an address whose bucket this emulator holds but whose object version it does
+/// not: the version the request NAMED is missing (`NoSuchVersion`), or the key has no
+/// current object (`NoSuchKey`) — which is also the case where the key's current version is
+/// a delete marker, "Amazon S3 behaves as if the object was deleted".
+fn no_such_object(version_id: Option<&str>) -> PutObjectRetentionError {
+    match version_id {
+        Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::NO_SUCH_VERSION_CODE,
+            404,
+            crate::state::NO_SUCH_VERSION_MESSAGE,
+        ),
+        None => PutObjectRetentionErrorModeled::NoSuchKey(NoSuchKey {}).into(),
     }
 }

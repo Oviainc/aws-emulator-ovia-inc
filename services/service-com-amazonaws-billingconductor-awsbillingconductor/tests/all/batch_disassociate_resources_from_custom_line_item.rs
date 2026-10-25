@@ -1114,13 +1114,13 @@ fn period(month_index: usize) -> String {
 
 /// Each bounded disassociation can carve one more separate stretch of billing periods
 /// out of an association, and a caller decides how many to make — so the store holds at
-/// most `MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION` of them, and the call that would
+/// most `MAX_BILLING_PERIOD_SPANS` of them, and the call that would
 /// carve one too many fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED`
 /// reason and writes nothing, rather than growing without bound or coarsening what a
 /// later read reports.
 #[tokio::test]
 async fn the_separate_ranges_of_one_association_are_bounded() {
-    use service_com_amazonaws_billingconductor_awsbillingconductor::state::MAX_BILLING_PERIOD_SPANS_PER_ASSOCIATION as MAX_RANGES;
+    use service_com_amazonaws_billingconductor_awsbillingconductor::state::MAX_BILLING_PERIOD_SPANS as MAX_RANGES;
 
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;

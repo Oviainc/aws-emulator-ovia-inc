@@ -340,19 +340,23 @@ async fn a_new_refresh_replaces_the_one_that_ended() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: the analysis needs a live control plane, so a refresh can only be started
-// on a cluster that is `ACTIVE`; any other status is `InvalidRequestException` and
-// nothing is recorded for it.
+// RULE: the analysis needs a live control plane Amazon EKS manages, so a refresh
+// starts only on a cluster that is `ACTIVE` — any other status is
+// `InvalidRequestException` — and not at all on a cluster EKS does not manage,
+// which is the permanent `ClientException` refusal. Nothing is recorded either way.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_refresh_only_starts_on_an_active_cluster() {
-    // Rows differ along the status the call lands on: the `CREATING` of a cluster
-    // whose activation the clock has not owed yet, and the `PENDING` of a
-    // connected cluster, which has no Amazon EKS control plane at all.
-    let cases: Vec<(&str, bool)> = vec![("CREATING cluster", false), ("PENDING cluster", true)];
+    // Rows differ along what stops the refresh: the `CREATING` of a cluster whose
+    // activation the clock has not owed yet (a state refusal), and a connected
+    // cluster, which has no Amazon EKS control plane at all (the gate).
+    let cases: Vec<(&str, bool, &str)> = vec![
+        ("CREATING cluster", false, "InvalidRequestException"),
+        ("connected cluster", true, "ClientException"),
+    ];
 
-    for (index, (case, connected)) in cases.iter().enumerate() {
+    for (index, (case, connected, expected_code)) in cases.iter().enumerate() {
         let router = emulator();
         let name = format!("inactive-{index}");
         let created = if *connected {
@@ -385,25 +389,36 @@ async fn a_refresh_only_starts_on_an_active_cluster() {
         let refused = start_refresh(&router, &name).await;
         assert_eq!(
             refused.status, 400,
-            "case {case:?}: a non-ACTIVE cluster refuses the refresh, got {refused:?}"
+            "case {case:?}: a cluster with no live EKS control plane refuses the refresh, got \
+             {refused:?}"
         );
         assert_eq!(
             error_code(&refused),
-            "InvalidRequestException",
-            "case {case:?}: expected InvalidRequestException, got {refused:?}"
+            *expected_code,
+            "case {case:?}: expected {expected_code}, got {refused:?}"
         );
 
-        // And nothing was recorded for it: there is no refresh to report.
+        // And nothing was recorded for it: there is no refresh to report. A connected
+        // cluster answers the gate here too — the describe is an operation of the same
+        // EKS-managed plane — so only the non-connected row can read the 404 back.
         let described = describe_refresh(&router, &name).await;
-        assert_eq!(
-            described.status, 404,
-            "case {case:?}: a refused start records no refresh, got {described:?}"
-        );
-        assert_eq!(
-            error_code(&described),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {described:?}"
-        );
+        if *connected {
+            assert_eq!(
+                error_code(&described),
+                "ClientException",
+                "case {case:?}: the read is gated too, got {described:?}"
+            );
+        } else {
+            assert_eq!(
+                described.status, 404,
+                "case {case:?}: a refused start records no refresh, got {described:?}"
+            );
+            assert_eq!(
+                error_code(&described),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {described:?}"
+            );
+        }
     }
 }
 

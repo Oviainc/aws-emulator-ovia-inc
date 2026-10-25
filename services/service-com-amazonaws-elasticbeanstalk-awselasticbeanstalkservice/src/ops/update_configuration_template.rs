@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: applies to the ONE stored configuration template the request names
+//! the parts of it the request supplies — a new description, the option settings it
+//! sets, and the options it removes — and answers with the template's resolved
+//! configuration set. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An option `OptionsToRemove` takes out stops overriding the platform version's
+//! published default, so it resolves back to that default rather than vanishing from
+//! the configuration set.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +175,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationTemplate"))
+        // The region the platform version this template is for is named in: the
+        // settings the answer reports are resolved against that version's
+        // option catalog.
+        let region = crate::state::request_region(ctx);
+
+        // How many option settings one configuration may carry is a bound on the
+        // REQUEST, so it is answered before anything is resolved; the merged
+        // result is checked against it again below, so neither the stored record
+        // nor the merge's own work is unbounded. See
+        // `crate::state::MAX_CONFIGURATION_OPTION_SETTINGS`.
+        let requested_settings = input.option_settings.as_deref().unwrap_or_default();
+        if requested_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(requested_settings.len()),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigurationTemplateError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        let request_id = crate::state::new_request_id();
+        // An application the clock has already finished deleting holds no
+        // templates, so the deletion is settled before this one is resolved.
+        store.materialize_due_transitions();
+
+        // "The name of the application associated with the configuration
+        // template to update. If no application is found with this name,
+        // UpdateConfigurationTemplate returns an InvalidParameterValue error."
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
+                format!("No Application named '{}' found.", input.application_name),
+            ));
+        }
+
+        // "The name of the configuration template to update. If no
+        // configuration template is found with this name,
+        // UpdateConfigurationTemplate returns an InvalidParameterValue error."
+        // A template name is unique per application, so the pair resolves one
+        // record.
+        let key = (input.application_name.clone(), input.template_name.clone());
+        let Some(template) = store.configuration_templates.get(&key) else {
+            return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
+                crate::state::missing_configuration_template_message(&input.template_name),
+            ));
+        };
+
+        // "Constraint: You can remove only UserDefined configuration options."
+        // An option the catalog of the platform version this template is for
+        // defines as the SERVICE's own is not the caller's to take out; one the
+        // catalog does not define at all is the caller's own option, so naming
+        // it is no such removal.
+        let options_to_remove = input.options_to_remove.as_deref().unwrap_or_default();
+        let catalog = store.published_option_catalog(crate::state::configuration_platform(
+            &region,
+            template.solution_stack_name.as_deref(),
+            template.platform_arn.as_deref(),
+        ));
+        for specification in options_to_remove {
+            let (namespace, option_name, _) =
+                crate::state::option_specification_key(specification);
+            let service_defined = catalog.iter().any(|option| {
+                option.namespace == namespace && option.name == option_name && !option.user_defined
+            });
+            if service_defined {
+                return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
+                    format!(
+                        "Configuration option '{namespace}:{option_name}' is not a UserDefined \
+                         option and cannot be removed from the configuration set."
+                    ),
+                ));
+            }
+        }
+
+        // The configuration the template holds after this call: the settings it
+        // held, with "a list of configuration options to remove from the
+        // configuration set" taken out and "a list of configuration option
+        // settings to update with the new specified option value" applied over
+        // what is left, so an option both removed and set ends up set.
+        let retained =
+            crate::state::remove_option_settings(&template.option_settings, options_to_remove);
+        let option_settings = crate::state::merge_option_settings(&retained, requested_settings);
+        if option_settings.len() > crate::state::MAX_CONFIGURATION_OPTION_SETTINGS {
+            return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
+                crate::state::too_many_option_settings_message(option_settings.len()),
+            ));
+        }
+
+        // Everything the request named resolved, so the update is written to the
+        // one stored record every reader of this template reads.
+        let updated = {
+            let template = store.configuration_templates.get_mut(&key).ok_or_else(|| {
+                UpdateConfigurationTemplateError::internal_failure(
+                    "the configuration template was resolved but is gone",
+                )
+            })?;
+            // "A new description for the configuration." "If a property is not
+            // provided, its value remains unchanged. To clear such properties,
+            // specify an empty string" — and the modelled minimum length is 0,
+            // so an empty description is one the caller set.
+            if let Some(description) = input.description.clone() {
+                template.description = Some(description);
+            }
+            template.option_settings = option_settings;
+            // "DateUpdated: the date (in UTC time) when this configuration set
+            // was last modified", which this call is.
+            template.date_updated = crate::state::now();
+            template.clone()
+        };
+
+        let output = crate::state::configuration_settings_description!(
+            UpdateConfigurationTemplateOutput,
+            store,
+            &region,
+            &updated
+        );
+
+        // The activity this call performed, recorded for `DescribeEvents`: the
+        // operation starting and completing, under this request's id.
+        store.record_completed_activity(
+            &request_id,
+            "updateConfigurationTemplate",
+            None,
+            updated.event_subject(),
+        );
+
+        Ok(output)
     }
 }

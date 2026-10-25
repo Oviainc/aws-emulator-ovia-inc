@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one index on the named domain and persists the schema the request carried,
+//! so a later read of that index answers with exactly that schema.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +91,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{Index, INDEX_QUOTA, INDEX_STATUS_CREATED};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -172,18 +168,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `IndexName`'s pattern is not enforced at the request boundary (see
+        // `crate::state::is_index_name`), so a name no index could have is refused
+        // here — as a malformed request, before the store is consulted, so it can
+        // never be reported as an index that merely does not exist.
+        if !crate::state::is_index_name(&input.index_name) {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_name("IndexName", &input.index_name),
+            )
+            .into());
+        }
+
+        // The schema is a set of named sections, so a document carrying a scalar or
+        // an array instead is refused rather than persisted as this index's schema.
+        if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_schema("IndexSchema"),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An index belongs to a domain, so a create against a name the store holds no
+        // domain for is the modelled not-found refusal. `settled_mut` first
+        // materialises any configuration change the clock already owes that domain,
+        // which this call neither starts nor changes.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            CreateIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // An index's name identifies it within its domain, so a create cannot land on
+        // a name the domain already holds: the existing index keeps the schema it has
+        // and the call is refused with the modelled already-exists error.
+        if domain.indexes.contains_key(&input.index_name) {
+            return Err(CreateIndexErrorModeled::ResourceAlreadyExistsException(
+                crate::state::index_exists(&input.domain_name, &input.index_name),
+            )
+            .into());
+        }
+
+        // The per-domain store is BOUNDED: past its quota a create is refused rather
+        // than adding another record, so a caller looping with fresh names cannot grow
+        // the state without end. This operation models no limit error, so the refusal
+        // is its `ValidationException`.
+        if domain.indexes.len() >= INDEX_QUOTA {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Domain {} already holds the maximum of {INDEX_QUOTA} indexes.",
+                        input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        domain.indexes.insert(
+            input.index_name.clone(),
+            Index {
+                index_name: input.index_name.clone(),
+                // Stored VERBATIM: the semantic-enrichment configuration is part of
+                // the schema the caller sent, and `GetIndex` reports that schema.
+                schema: input.index_schema,
+            },
+        );
+
+        // `CreateIndexResponse$Status` is "the status of the index creation
+        // operation": this call created the index, so it is `CREATED`.
+        Ok(CreateIndexOutput {
+            status: INDEX_STATUS_CREATED.to_string(),
+        })
     }
 }

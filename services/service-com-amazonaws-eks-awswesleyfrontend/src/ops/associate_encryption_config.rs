@@ -178,6 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // An encryption configuration encrypts the secrets of an Amazon EKS control
+        // plane, and a cluster `RegisterCluster` connected has none: this operation does
+        // not apply to it at all, which is what the connected-cluster gate reports. The
+        // gate is a fact about the CLUSTER, so it is answered as soon as the cluster is
+        // resolved — before anything in the body is judged against it, and before the
+        // cluster's STATUS is, because no wait makes a connected cluster take this call.
+        if record.is_connected() {
+            return Err(AssociateEncryptionConfigErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&cluster_name),
+            )
+            .into());
+        }
+
         // `clientRequestToken` is `@idempotencyToken`: an SDK generates it once per call
         // and RESENDS the same value when it retries, so a retry of the call that started
         // an update is answered with THAT update rather than starting a second one. A

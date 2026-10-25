@@ -1646,6 +1646,36 @@ pub struct CompletedUpgradeToken {
 /// 50 is the most a stored resource can hold too.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The modelled member a tag-count refusal reports (`TagResourceInput$Tags`,
+/// `ImportLensInput$Tags` — every tag-writing operation names its tag map `Tags`).
+pub const TAGS_MEMBER: &str = "Tags";
+
+/// How many tags a resource would hold once `requested` is merged into `stored` — the
+/// count [`MAX_TAGS_PER_RESOURCE`] bounds.
+///
+/// The UNION of the two key sets, because a request that names a key the resource
+/// already carries overwrites that tag rather than adding one: the stored count plus
+/// the requested keys the resource does not carry yet. Shared by every operation that
+/// writes tags to a resource, so two tag writers cannot drift on what they count.
+pub fn merged_tag_count(
+    stored: &BTreeMap<String, String>,
+    requested: &BTreeMap<String, String>,
+) -> usize {
+    stored.len()
+        + requested
+            .keys()
+            .filter(|key| !stored.contains_key(*key))
+            .count()
+}
+
+/// The constraint sentence a tag write is refused with when it would raise `subject`'s
+/// stored tag count above [`MAX_TAGS_PER_RESOURCE`] (`subject` is the resource as the
+/// operation names it, e.g. `the lens`). One wording for every tag writer, for the
+/// reason [`merged_tag_count`] is shared.
+pub fn tag_ceiling_constraint(subject: &str) -> String {
+    format!("Member must not raise {subject}'s tag count above {MAX_TAGS_PER_RESOURCE}")
+}
+
 /// One profile associated with a workload: "The profile associated with a workload"
 /// (`smithy_query(query="shape", shape="WorkloadProfile")`).
 ///

@@ -203,6 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = guard.clusters.get_mut(&(region, input.name.clone())) else {
             return Err(not_found(crate::state::cluster_not_found(&input.name)));
         };
+        // A cluster update is a change to an Amazon EKS-managed control plane, and a
+        // cluster `RegisterCluster` connected has none — so it has no update of this
+        // kind to cancel, whatever id the request names. The gate is a fact about the
+        // CLUSTER, so it is answered before the update id is resolved.
+        if cluster.is_connected() {
+            return Err(CancelUpdateErrorModeled::ClientException(
+                crate::state::connected_cluster_refusal(&input.name),
+            )
+            .into());
+        }
         // "Currently, this is supported for VersionRollback update types on EKS Auto
         // Mode clusters": a cluster whose compute capability EKS does not manage rolls
         // its own nodes back, so there is no node rollback for this call to stop.

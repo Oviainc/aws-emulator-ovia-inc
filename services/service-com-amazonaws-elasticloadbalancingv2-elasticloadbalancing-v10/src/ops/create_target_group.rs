@@ -2,8 +2,9 @@
 
 //! @op CreateTargetGroup
 //!
-//! Mints and persists a target group in [`crate::state`], with every health-check
-//! default the model documents materialized, and answers with the stored record.
+//! Mints and persists a target group in [`crate::state`], with every default the model
+//! documents materialized — the health-check settings, the protocol version and the IP
+//! address type — and answers with the stored record.
 //! The model documents the operation as idempotent — "if you attempt to create
 //! multiple target groups with the same settings, each call succeeds" — so a repeat
 //! of the same name with the same settings returns the stored target group, and only

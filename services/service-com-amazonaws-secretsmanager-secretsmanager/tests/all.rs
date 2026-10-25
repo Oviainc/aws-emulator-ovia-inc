@@ -17,6 +17,8 @@ mod secret_error_responses;
 mod secret_lifecycle;
 #[path = "all/secret_resource_policy.rs"]
 mod secret_resource_policy;
+#[path = "all/secret_restore.rs"]
+mod secret_restore;
 #[path = "all/secret_rotation.rs"]
 mod secret_rotation;
 #[path = "all/secret_rotation_cancel.rs"]

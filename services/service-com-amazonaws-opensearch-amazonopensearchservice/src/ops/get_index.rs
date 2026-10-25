@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the schema of one index of the named domain — the reader that proves what
+//! `CreateIndex` persisted. A pure read: nothing about the stored index changes, so
+//! the next caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIndex"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `IndexName`'s pattern is not enforced at the request boundary (see
+        // `crate::state::is_index_name`), so a name no index could have is a malformed
+        // request rather than an index that merely does not exist.
+        if !crate::state::is_index_name(&input.index_name) {
+            return Err(GetIndexErrorModeled::ValidationException(
+                crate::state::malformed_index_name("IndexName", &input.index_name),
+            )
+            .into());
+        }
+
+        // A pure read: the stored record is projected onto the response and nothing
+        // about it changes, so the next caller sees what this one saw.
+        let store = state.lock();
+        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            GetIndexErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+        // The domain exists; the name it carries names no index OF it. An index is a
+        // resource of its own, so that is the modelled missing-resource refusal, and
+        // its message names both so a caller tells the two apart.
+        let index = domain.indexes.get(&input.index_name).ok_or_else(|| {
+            GetIndexErrorModeled::ResourceNotFoundException(crate::state::index_not_found(
+                &input.domain_name,
+                &input.index_name,
+            ))
+        })?;
+
+        // "The JSON schema of the index including mappings, settings, and semantic
+        // enrichment configuration" is the document the create persisted, reported
+        // back verbatim.
+        Ok(GetIndexOutput {
+            index_schema: index.schema.clone(),
+        })
     }
 }

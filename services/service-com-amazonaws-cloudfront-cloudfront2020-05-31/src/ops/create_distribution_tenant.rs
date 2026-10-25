@@ -379,6 +379,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let id = store.allocate_distribution_tenant_id();
         let etag = store.next_etag();
+        // "The configuration for the CloudFront managed ACM certificate request": the
+        // request is what MINTS the certificate, over the domains this tenant claims, and
+        // the clock owes it its issuance from here. A create that asked for none leaves the
+        // tenant without one.
+        let managed_certificate = input
+            .managed_certificate_request
+            .map(|request| store.request_managed_certificate(request, &domains, now));
         let stored = crate::state::StoredDistributionTenant {
             arn: crate::state::distribution_tenant_arn(&id),
             id: id.clone(),
@@ -391,9 +398,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // own here, and a tenant that named none carries none.
             customizations: input.customizations,
             parameters,
-            // Held, not acted on: no certificate is issued here, and nothing in this
-            // response claims one was. The certificate surface answers for itself.
-            managed_certificate_request: input.managed_certificate_request,
+            // Minted above from the request this create carried: the certificate is
+            // requested by this call, and the certificate surface answers from that one
+            // record rather than from the request being served.
+            managed_certificate,
             tags,
             enabled: input.enabled.unwrap_or(crate::state::DEFAULT_TENANT_ENABLED),
             // A tenant CloudFront has just accepted has not propagated to the edge

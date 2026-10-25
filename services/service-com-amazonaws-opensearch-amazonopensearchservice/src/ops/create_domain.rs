@@ -348,6 +348,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: now,
             option_versions: BTreeMap::new(),
             data_sources: BTreeMap::new(),
+            // A new domain holds no index; `CreateIndex` is what mints one.
+            indexes: BTreeMap::new(),
             // A new domain has no package associated with it; `AssociatePackages`
             // is what links one.
             package_associations: BTreeMap::new(),

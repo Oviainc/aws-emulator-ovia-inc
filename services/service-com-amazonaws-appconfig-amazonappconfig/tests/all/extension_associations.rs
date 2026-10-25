@@ -39,13 +39,15 @@ use crate::appconfig_workflow::{
 use crate::extensions::{actions, create_extension, get_extension, minted_id};
 use crate::resource_tags::{arn, list_tags, pct};
 
-/// `POST /extensionassociations`.
-async fn associate(router: &MultiServiceRouter, body: &Value) -> Answer {
+/// `POST /extensionassociations`. `pub(crate)` because the `ListExtensionAssociations`
+/// suite creates its fixtures through the same front door.
+pub(crate) async fn associate(router: &MultiServiceRouter, body: &Value) -> Answer {
     json_call(router, "POST", "/extensionassociations", body).await
 }
 
-/// `GET /extensionassociations/{ExtensionAssociationId}`.
-async fn get_association(router: &MultiServiceRouter, id: &str) -> Answer {
+/// `GET /extensionassociations/{ExtensionAssociationId}`. `pub(crate)` because the
+/// `ListExtensionAssociations` suite reads its fixtures back through the same reader.
+pub(crate) async fn get_association(router: &MultiServiceRouter, id: &str) -> Answer {
     json_call(
         router,
         "GET",

@@ -44,3 +44,40 @@ No cluster carries stub_path or owned_by.
 1. Boot the emulator from mainline and replay trace set simparity-wire-aws-v1.
 2. POST /list-control-mappings with a ControlMappingFilter naming each control ARN above (fixture controlcatalog-catalog-list-control-mappings, steps task#1 through task#9).
 3. Each answers 200 with a ControlMappings array that omits every recorded mapping for that control.
+
+## Resolution
+
+The rule — a FRAMEWORK control mapping names the compliance framework by the compact,
+version-bearing designator the catalog publishes it under (`NIST-CSF-v1.1`), paired
+with that framework's own identifier for the requirement, and the requirements a
+control satisfies follow from the control OBJECTIVE it implements, so every control
+implementing one objective reports that objective's whole cross-walk — is now
+implemented and pinned by
+`services/service-com-amazonaws-controlcatalog-controlcatalog/tests/all/framework_cross_walk.rs`.
+
+Two parts of the catalog were wrong under that rule and were fixed:
+
+* a FRAMEWORK mapping named its framework by a prose title ("NIST Special Publication
+  800-53 Revision 5"), which is one surface's wording rather than the designator a
+  client joins on. Every framework the catalog publishes now carries its designator
+  (`src/state/published_controls.rs`).
+* a control reported only the two or three framework items written on its own row, so
+  its framework coverage depended on which surface implemented it. The cross-walk is
+  now recorded once per control objective (`OBJECTIVE_FRAMEWORKS`) and reported by
+  every control implementing it, plus the items naming that control's own check, plus
+  the restatements those imply — a `FedRAMP-r5` row for each `NIST-SP-800-53-r5`
+  control, and a `CMMC-Level2` practice for each `NIST-SP-800-171-r2` requirement,
+  both derived rather than transcribed.
+
+All nine recorded causes are DECLINED, for the reason the earlier
+`20261021T234107Z-controlcatalog-listcontrolmappings-yields-no-framework-common-control-or-related`
+issue recorded: each asks for the mapping set AWS publishes for one opaque AWS catalog
+identifier (`control/1038h7d21e6g8i10g6v3xsssi`, …), and those identifiers — with the
+6–44 framework, common-control and related-control rows attached to each — are AWS's
+published catalog CONTENT. No rule derives them from the request or from the model, and
+they exist only in the recording, so seeding them would be fitting the recorded
+instance rather than implementing the rule. The catalog publishes its own controls
+under identifiers minted deterministically from each row's slug, and a control ARN it
+does not publish selects no mapping (200 with an empty list), which
+`tests/all/control_mappings.rs` pins. The replay of this fixture therefore still
+diverges on `$.ControlMappings[*]`.

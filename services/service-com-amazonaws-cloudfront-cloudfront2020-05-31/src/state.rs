@@ -66,7 +66,8 @@ use crate::ops::types::{
     DistributionTenant, DomainResult, EntityAlreadyExists, EntityNotFound, ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, KGKeyPairIds, KeyPairIds, KeyValueStore, LambdaFunctionAssociations,
-    LoggingConfig, ManagedCertificateRequest, MonitoringSubscription, NoSuchCachePolicy,
+    LoggingConfig, ManagedCertificateDetails, ManagedCertificateRequest, MonitoringSubscription,
+    NoSuchCachePolicy,
     NoSuchCloudFrontOriginAccessIdentity, NoSuchDistribution, NoSuchInvalidation,
     NoSuchMonitoringSubscription, NoSuchOriginAccessControl, NoSuchOriginRequestPolicy,
     NoSuchResource,
@@ -77,7 +78,7 @@ use crate::ops::types::{
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
     SessionStickinessConfig, Signer, StreamingDistribution, StreamingDistributionConfig,
     StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
-    TrafficConfig, TrustedKeyGroups, TrustedSigners, ViewerCertificate,
+    TrafficConfig, TrustedKeyGroups, TrustedSigners, ValidationTokenDetail, ViewerCertificate,
 };
 
 /// The CloudFront FUNCTION slice of this store: the function record, its two stages,
@@ -387,6 +388,43 @@ pub const KVS_STATUS_READY: &str = "READY";
 /// [`KVS_STATUS_PROVISIONING`], short enough that a caller that waits observes the
 /// terminal one. The instant is stored on the record; nothing ever sleeps for it.
 pub const KVS_PROVISIONING_DELAY: Duration = Duration::from_millis(500);
+
+/// `ManagedCertificateStatus` while the domains of a CloudFront managed ACM certificate
+/// are still being validated
+/// (`smithy_query(query="shape",shape="ManagedCertificateStatus")`).
+///
+/// A certificate CloudFront has just requested for a distribution tenant has not been
+/// validated yet, so the request answers this non-terminal status and the clock — not a
+/// later call — owes the certificate [`CERTIFICATE_STATUS_ISSUED`].
+pub const CERTIFICATE_STATUS_PENDING_VALIDATION: &str = "pending-validation";
+
+/// `ManagedCertificateStatus` once the certificate has been validated and issued: the
+/// terminal status a tenant's viewers are served over it in.
+pub const CERTIFICATE_STATUS_ISSUED: &str = "issued";
+
+/// How long after the call that requests it a CloudFront managed ACM certificate is owed
+/// [`CERTIFICATE_STATUS_ISSUED`].
+///
+/// No validation deadline is published, so — like [`PROPAGATION_DELAY`] — this span is the
+/// EMULATOR's choice rather than a claim about the service: long enough that a caller
+/// reading the certificate straight after the request still observes
+/// [`CERTIFICATE_STATUS_PENDING_VALIDATION`], short enough that a caller that waits
+/// observes the terminal one. The instant is stored on the record; nothing ever sleeps for
+/// it.
+pub const CERTIFICATE_VALIDATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The well-known path an HTTP domain validation token is served at, between the host and
+/// the token's own file name.
+pub const VALIDATION_TOKEN_PATH: &str = "/.well-known/pki-validation/";
+
+/// The suffix of the host that serves the content of an HTTP domain validation token, the
+/// one a self-hosted validation redirects to.
+pub const VALIDATION_HOST_SUFFIX: &str = "acm-validations.aws";
+
+/// The region a CloudFront managed ACM certificate lives in: CloudFront serves viewers
+/// over certificates in `us-east-1`, so that is the region segment of one's ARN, and the
+/// only region segment any ARN of this global service's resources carries.
+pub const CERTIFICATE_REGION: &str = "us-east-1";
 
 /// The most key value stores this emulator holds.
 ///
@@ -1700,11 +1738,11 @@ pub struct StoredDistributionTenant {
     /// `DistributionTenant$Parameters`, exactly as submitted \u2014 the values that fill in the
     /// distribution's `TenantConfig$ParameterDefinitions`.
     pub parameters: Vec<Parameter>,
-    /// The `ManagedCertificateRequest` the create carried, held so the certificate surface
-    /// (`GetManagedCertificateDetails`, still a scaffold) reads what was asked for. No
-    /// certificate is issued and no validation state is reported for it: this emulator
-    /// runs no ACM.
-    pub managed_certificate_request: Option<ManagedCertificateRequest>,
+    /// The CloudFront managed ACM certificate requested for this tenant, or `None` when
+    /// the create asked for none. It is MINTED by the call that carried the
+    /// `ManagedCertificateRequest` and is the single source of truth every later read of
+    /// the certificate surface answers from.
+    pub managed_certificate: Option<StoredManagedCertificate>,
     /// The tags submitted with the create, in the one representation every tagged
     /// resource in this store uses.
     pub tags: TagSet,
@@ -1745,6 +1783,9 @@ impl StoredDistributionTenant {
     pub fn settle(&mut self, now: SystemTime) {
         if self.status == STATUS_IN_PROGRESS && now >= self.deployed_due {
             self.status = STATUS_DEPLOYED.to_string();
+        }
+        if let Some(certificate) = &mut self.managed_certificate {
+            certificate.settle(now);
         }
         settle_invalidations(&mut self.invalidations, now);
     }
@@ -1790,6 +1831,113 @@ impl StoredDistributionTenant {
             status: Some(self.status.clone()),
         }
     }
+}
+
+/// One CloudFront managed ACM certificate, as this emulator persists it.
+///
+/// The certificate is MINTED by the call that carries a `ManagedCertificateRequest` for a
+/// distribution tenant — nothing a read does brings one into being — and this record is
+/// the single source of truth for its ARN, its status, the validation-token host that was
+/// asked for and the validation token of each domain it covers, so every later read of
+/// the certificate answers from it rather than from the request being served.
+///
+/// Its status is the one thing here the CLOCK owes: a certificate that has just been
+/// requested is [`CERTIFICATE_STATUS_PENDING_VALIDATION`] until its domains have been
+/// validated ([`CERTIFICATE_VALIDATION_DELAY`]), and [`CERTIFICATE_STATUS_ISSUED`] after.
+#[derive(Debug, Clone)]
+pub struct StoredManagedCertificate {
+    /// `ManagedCertificateDetails$CertificateArn` — the ARN minted for the certificate at
+    /// the moment it was requested, fixed for its whole life.
+    pub arn: String,
+    /// `ManagedCertificateDetails$CertificateStatus`:
+    /// [`CERTIFICATE_STATUS_PENDING_VALIDATION`] until
+    /// [`StoredManagedCertificate::issued_due`], then [`CERTIFICATE_STATUS_ISSUED`].
+    pub status: String,
+    /// The instant this certificate is owed its issuance. Stored rather than slept for.
+    pub issued_due: SystemTime,
+    /// The request the certificate was minted from, held because what it asked for is
+    /// what the certificate reports: its `ValidationTokenHost` is
+    /// `ManagedCertificateDetails$ValidationTokenHost`.
+    pub request: ManagedCertificateRequest,
+    /// One validation token per domain the certificate covers, in the order the request
+    /// that minted it listed them — "Contains details about the validation token of the
+    /// specified CloudFront managed ACM certificate."
+    pub validation_tokens: Vec<StoredValidationToken>,
+}
+
+impl StoredManagedCertificate {
+    /// Apply the transition the clock owes this certificate at `now`.
+    ///
+    /// Idempotent and monotonic for the same reason every other `settle` here is: it only
+    /// ever moves the non-terminal status to the terminal one, and only once the deadline
+    /// has passed, so a read that calls it cannot change what a later caller sees.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.status == CERTIFICATE_STATUS_PENDING_VALIDATION && now >= self.issued_due {
+            self.status = CERTIFICATE_STATUS_ISSUED.to_string();
+        }
+    }
+
+    /// The `ManagedCertificateDetails` projection the certificate surface returns, read
+    /// from the one stored record.
+    pub fn to_managed_certificate_details(&self) -> ManagedCertificateDetails {
+        ManagedCertificateDetails {
+            certificate_arn: Some(self.arn.clone()),
+            certificate_status: Some(self.status.clone()),
+            // "Specify how the HTTP validation token will be served when requesting the
+            // CloudFront managed ACM certificate": the mode the request chose is the mode
+            // the certificate is validated in, so it is reported back unchanged.
+            validation_token_host: Some(self.request.validation_token_host.clone()),
+            validation_token_details: Some(
+                self.validation_tokens
+                    .iter()
+                    .map(StoredValidationToken::to_detail)
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The HTTP validation token of ONE domain of a managed certificate.
+///
+/// A token is minted per domain with the certificate, so the pair of locations a caller
+/// serving the token itself has to redirect between is a property of the stored record
+/// rather than of the call that reads it.
+#[derive(Debug, Clone)]
+pub struct StoredValidationToken {
+    /// `ValidationTokenDetail$Domain` — the domain this token validates.
+    pub domain: String,
+    /// The token's own opaque name, the last segment of both locations below.
+    pub token: String,
+}
+
+impl StoredValidationToken {
+    /// The `ValidationTokenDetail` a certificate read reports for this token.
+    pub fn to_detail(&self) -> ValidationTokenDetail {
+        ValidationTokenDetail {
+            domain: self.domain.clone(),
+            // "The domain to redirect from" is where a viewer asks for the token — the
+            // well-known path under the domain being validated; "The domain to redirect
+            // to" is where the token's content is served from.
+            redirect_from: Some(validation_token_location(&self.domain, &self.token)),
+            redirect_to: Some(validation_token_location(
+                &format!("{}.{VALIDATION_HOST_SUFFIX}", self.token),
+                &self.token,
+            )),
+        }
+    }
+}
+
+/// Where the HTTP validation token `token` is served under `host`: the well-known
+/// validation path under the host, ending in the token's own file name.
+pub fn validation_token_location(host: &str, token: &str) -> String {
+    format!("{host}{VALIDATION_TOKEN_PATH}{token}.txt")
+}
+
+/// The ARN of a CloudFront managed ACM certificate. The certificate is an ACM resource in
+/// the one region CloudFront serves viewers over certificates from
+/// ([`CERTIFICATE_REGION`]): `arn:aws:acm:us-east-1:<account>:certificate/<id>`.
+pub fn managed_certificate_arn(id: &str) -> String {
+    ::engine::emulator_arn("acm", CERTIFICATE_REGION, &format!("certificate/{id}"))
 }
 
 /// One CloudFront origin access identity, as this emulator persists it.
@@ -3357,6 +3505,43 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 break candidate;
             }
         }
+    }
+
+    /// Mint the CloudFront managed ACM certificate a `ManagedCertificateRequest` asks
+    /// for, covering `domains`.
+    ///
+    /// The identity of the certificate — its ARN and the validation token of each domain
+    /// — is drawn from the one mint every other generated value here comes from, so no
+    /// two certificates and no two tokens are minted the same. The certificate starts
+    /// [`CERTIFICATE_STATUS_PENDING_VALIDATION`] and the CLOCK owes it its issuance, so
+    /// nothing a later call does decides when it is issued.
+    pub fn request_managed_certificate(
+        &mut self,
+        request: ManagedCertificateRequest,
+        domains: &[String],
+        now: SystemTime,
+    ) -> StoredManagedCertificate {
+        let arn = managed_certificate_arn(&self.mint_uuid());
+        let validation_tokens = domains
+            .iter()
+            .map(|domain| StoredValidationToken {
+                domain: domain.clone(),
+                token: self.mint_validation_token(),
+            })
+            .collect();
+        StoredManagedCertificate {
+            arn,
+            status: CERTIFICATE_STATUS_PENDING_VALIDATION.to_string(),
+            issued_due: now + CERTIFICATE_VALIDATION_DELAY,
+            request,
+            validation_tokens,
+        }
+    }
+
+    /// One fresh HTTP validation token name: two draws of the mint (128 bits) rendered as
+    /// the lowercase hex an opaque token file name is written in.
+    fn mint_validation_token(&mut self) -> String {
+        format!("{:016x}{:016x}", self.mint_u64(), self.mint_u64())
     }
 
     /// One fresh UUID from the mint: two draws (128 bits) rendered as the 8-4-4-4-12
@@ -5773,6 +5958,18 @@ pub fn distribution_not_found(id: &str) -> EntityNotFound {
 pub fn distribution_tenant_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some("The specified distribution tenant doesn't exist.".to_string()),
+    }
+}
+
+/// The modelled `EntityNotFound` (HTTP 404) for a distribution tenant that carries no
+/// CloudFront managed ACM certificate: the tenant exists, but no certificate was ever
+/// requested for it, so there is no certificate for a read of one to answer from.
+pub fn managed_certificate_not_found() -> EntityNotFound {
+    EntityNotFound {
+        message: Some(
+            "The specified distribution tenant has no CloudFront managed certificate."
+                .to_string(),
+        ),
     }
 }
 

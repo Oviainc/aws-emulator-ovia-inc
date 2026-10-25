@@ -6,11 +6,15 @@
 //! template, and its timestamps. An id naming no record answers
 //! `ResourceNotFoundException` (HTTP 404).
 //!
-//! Reporting, with ONE write: [`crate::state::ExperimentRecord::settle`] materialises a
-//! transition the CLOCK already owed at the instant of this call (`initiating` ->
-//! `running`, `stopping` -> `stopped`) — one that was due whether or not anybody called,
-//! so two reads at the same instant report the same status and this read changes nothing
-//! a later caller would not have seen anyway.
+//! Reporting, with TWO writes, both of them the CLOCK's and neither of them this call's:
+//! [`crate::state::ExperimentRecord::settle`] materialises a transition that was already
+//! owed at the instant of this call (`initiating` -> `running`, `running` ->
+//! `completed`/`failed`, `stopping` -> `stopped`), and
+//! [`crate::state::materialise_experiment_report`] materialises the EXPERIMENT REPORT an
+//! ended experiment that configured one owes — FIS generates it once the experiment has
+//! ended, so it too was due whether or not anybody called. Two reads at the same instant
+//! therefore report the same status and the same report, and this read changes nothing a
+//! later caller would not have seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -138,14 +142,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::internal_failure(
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // The report generation an ENDED experiment owes the clock, which writes the report
+        // to the Amazon S3 output its configuration names. It settles the record and takes
+        // the store lock itself, holding it across no call, so it runs before this handler
+        // takes the lock to read the record out. A no-op for an experiment that configured
+        // no report, that has not ended, or whose report has already been generated.
+        crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &input.id, now)
+            .await;
+
         let mut store = state.lock();
         let Some(record) = store.settled_experiment_mut(&input.id, now) else {
             return Err(GetExperimentErrorModeled::ResourceNotFoundException(

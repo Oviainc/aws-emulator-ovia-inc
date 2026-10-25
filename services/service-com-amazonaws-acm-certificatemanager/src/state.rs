@@ -1927,12 +1927,12 @@ pub fn tag_map(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> {
 /// and the untagging paths refuse the same pairs with the same sentence.
 pub fn check_tag_not_reserved(tag: &Tag) -> Result<(), String> {
     check_tag_key_not_reserved(&tag.key)?;
-    if tag
+    if let Some(value) = tag
         .value
         .as_deref()
-        .is_some_and(|value| value.starts_with(RESERVED_TAG_PREFIX))
+        .filter(|value| value.starts_with(RESERVED_TAG_PREFIX))
     {
-        return Err(reserved_tag_message(&tag.key));
+        return Err(reserved_tag_message(TAG_VALUE_HALF, value));
     }
     Ok(())
 }
@@ -1945,14 +1945,37 @@ pub fn check_tag_not_reserved(tag: &Tag) -> Result<(), String> {
 /// same sentence either way.
 pub fn check_tag_key_not_reserved(key: &str) -> Result<(), String> {
     if key.starts_with(RESERVED_TAG_PREFIX) {
-        return Err(reserved_tag_message(key));
+        return Err(reserved_tag_message(TAG_KEY_HALF, key));
     }
     Ok(())
 }
 
-/// The message a refused reserved tag reports, naming the key of the offending pair.
-fn reserved_tag_message(key: &str) -> String {
-    format!("tag {key} is reserved: neither a tag key nor its value may begin with {RESERVED_TAG_PREFIX}")
+/// How the reserved-tag refusal names the KEY half of a pair.
+const TAG_KEY_HALF: &str = "Key";
+
+/// How it names the VALUE half.
+const TAG_VALUE_HALF: &str = "Value";
+
+/// The message a refused reserved tag reports: which half of the pair carried the
+/// reserved prefix, that half's text in double quotes, and why it may not be named.
+///
+/// A fixed template with the offending text interpolated — the pair is not named any
+/// other way, so a client can read the rejected key or value straight back out of the
+/// sentence.
+fn reserved_tag_message(half: &str, offending: &str) -> String {
+    format!(
+        "Invalid Tag {half}: \"{offending}\". AWS internal tags cannot be changed with this API."
+    )
+}
+
+/// The message a refusal of the per-resource tag quota reports: the quota, and nothing
+/// of the request that reached it.
+///
+/// A constant sentence for the rule rather than a count computed from the request, so
+/// every path that enforces [`TAG_LIMIT`] — whichever modelled error carries it — states
+/// the same quota the same way.
+pub fn tag_quota_message() -> String {
+    format!("The resultant tag set must not have more than {TAG_LIMIT} user tags.")
 }
 
 /// Drop the requested tags from a stored tag map, as ACM's untagging operations

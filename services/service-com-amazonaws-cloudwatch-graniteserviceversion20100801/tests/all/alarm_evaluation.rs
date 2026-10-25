@@ -60,6 +60,13 @@ fn wait_for_evaluation() {
     std::thread::sleep(PAST_EVALUATION_DELAY);
 }
 
+/// The shortest `Period` an alarm may be evaluated on: "Valid values are 10, 20, 30, and any
+/// multiple of 60." (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`).
+///
+/// The rows that wait out a span measured in evaluation periods use it, so they wait the
+/// shortest span an alarm can be configured for.
+const SHORTEST_PERIOD_SECS: i32 = 10;
+
 /// Wall-clock now as epoch seconds, the clock the evaluation windows are measured against.
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -608,9 +615,12 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
     // (case, the alarm's `EvaluationPeriods`, the reason the evaluation must report once its
     //  datapoint has fallen out of the range)
     //
-    // A one-second period, so the evaluation range the alarms search is short enough to wait
-    // out: no datapoint is left in it, the default `missing` treatment substitutes none, and
-    // the evaluation reports the datapoints it does not have instead of naming an arm.
+    // The shortest period an alarm may be evaluated on (`Period`: "Valid values are 10, 20,
+    // 30, and any multiple of 60."), with each row's datapoint published close to the end of
+    // the evaluation range its alarm searches — so the range it falls out of is short enough
+    // to wait out: no datapoint is left in it, the default `missing` treatment substitutes
+    // none, and the evaluation reports the datapoints it does not have instead of naming an
+    // arm.
     let rows = [
         (
             "one evaluation period",
@@ -628,9 +638,15 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
     let mut names: Vec<String> = Vec::with_capacity(rows.len());
     for (index, (_, periods, _)) in rows.iter().enumerate() {
         let name = format!("aged-out-{index}");
-        let alarm = patched(&name, &json!({"Period": 1, "EvaluationPeriods": periods}));
+        let alarm = patched(
+            &name,
+            &json!({"Period": SHORTEST_PERIOD_SECS, "EvaluationPeriods": periods}),
+        );
         ok(&router, "PutMetricAlarm", &alarm).await;
-        publish(&router, &name, &[datum(42.0, 0.0)]).await;
+        // The evaluation range reaches twice the look-back back, so a datapoint three
+        // seconds short of it is still evaluated now and out of the range a few seconds on.
+        let age = f64::from(SHORTEST_PERIOD_SECS * 2 * periods) - 3.0;
+        publish(&router, &name, &[datum(42.0, age)]).await;
         names.push(name);
     }
     wait_for_evaluation();
@@ -647,7 +663,8 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
         );
     }
 
-    // Past the widest of these alarms' evaluation ranges, every window they search is empty.
+    // Past the end of every one of these alarms' evaluation ranges, every window they search
+    // is empty: each row's datapoint was published three seconds short of its range.
     std::thread::sleep(Duration::from_millis(4_600));
     for ((case, _, expected), name) in rows.iter().zip(&names) {
         let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": [name]})).await;
@@ -747,10 +764,10 @@ async fn an_evaluated_transition_is_recorded_in_the_alarm_history() {
 #[tokio::test]
 async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
     let router = build_router();
-    // A one-second period, so the span a forced state stands for — one evaluation period of
-    // the alarm — is short enough to wait out. (`Period`: "Valid values are 1, 5, 10, 20, 30,
-    // 60, and any multiple of 60.")
-    let alarm = patched("forced", &json!({"Period": 1}));
+    // The shortest period an alarm may be evaluated on, so the span a forced state stands for
+    // — one evaluation period of the alarm — is the shortest one there is. (`Period`: "Valid
+    // values are 10, 20, 30, and any multiple of 60.")
+    let alarm = patched("forced", &json!({"Period": SHORTEST_PERIOD_SECS}));
     ok(&router, "PutMetricAlarm", &alarm).await;
     ok(
         &router,
@@ -770,8 +787,8 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
     );
 
     // Past the forced span, the evaluation owns the state again: a datapoint under the
-    // threshold puts the alarm in OK.
-    std::thread::sleep(Duration::from_millis(1_100));
+    // threshold puts the alarm in OK. The span is one evaluation period of the alarm.
+    std::thread::sleep(Duration::from_millis(10_500));
     publish(&router, "forced", &[datum(1.0, 0.0)]).await;
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
@@ -787,11 +804,12 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
 #[tokio::test]
 async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_it() {
     let router = build_router();
-    // A one-second period, so the span a forced state stands for is short enough to wait out
-    // and the evaluation runs with the look-back window holding no datapoint at all.
+    // The shortest period an alarm may be evaluated on, so the span a forced state stands for
+    // is the shortest one there is and the evaluation then runs with the look-back window
+    // holding no datapoint at all.
     let alarm = patched(
         "ignoring",
-        &json!({"Period": 1, "TreatMissingData": "ignore"}),
+        &json!({"Period": SHORTEST_PERIOD_SECS, "TreatMissingData": "ignore"}),
     );
     ok(&router, "PutMetricAlarm", &alarm).await;
     ok(
@@ -800,7 +818,8 @@ async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_
         &json!({"AlarmName": "ignoring", "StateValue": "ALARM", "StateReason": "testing"}),
     )
     .await;
-    std::thread::sleep(Duration::from_millis(1_100));
+    // One evaluation period of the alarm, the span the forced state stands for.
+    std::thread::sleep(Duration::from_millis(10_500));
 
     // "ignore — the current alarm state is maintained": with no datapoint to decide on, the
     // evaluation leaves the alarm in the state it has.

@@ -26,6 +26,13 @@
 //! nothing: it is accepted and the stored output is answered unchanged, the same way
 //! UpdateBridgeSource and UpdateBridge answer a request that carries no setting.
 //!
+//! A network output REFERENCES a network outside itself, and the request's value for that
+//! member is resolved against the store before it is written:
+//! `BridgeNetworkOutput$NetworkName` is "the network output's gateway network name" — one of
+//! the networks declared on the gateway the bridge is placed on (`Bridge$PlacementArn`). A
+//! name no such network carries is `BadRequestException` (HTTP 400) too, in the envelope
+//! every refusal about a request's content carries, and nothing is written.
+//!
 //! The model gives this operation no state member and documents no state change for it, so
 //! it leaves the bridge's state alone: it only settles a transition the clock had already
 //! made due, exactly as DescribeBridge, AddBridgeOutputs and UpdateBridgeSource do.
@@ -102,6 +109,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable about the REQUEST's content — a reference that resolves to no resource, say
+/// — and the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]), the one every refusal about a request's
+/// content carries.
+fn bad_request(detail: impl Into<String>) -> UpdateBridgeOutputError {
+    UpdateBridgeOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
 
 /// Refuse a WELL-FORMED request the addressed OUTPUT itself does not admit, with
 /// `BadRequestException` (HTTP 400) under this service's bad-request envelope
@@ -226,8 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         // This operation updates an output of "an existing bridge", addressed by the
-        // bridge's own ARN.
-        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+        // bridge's own ARN. The bridge is resolved READ-ONLY first, so the network name the
+        // request carries can be resolved against the placement gateway before anything is
+        // written.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
             return Err(not_found(&input.bridge_arn));
         };
         // The output updated is the one of THIS bridge's outputs the bridge addresses by
@@ -245,13 +267,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a refused update leaves the bridge exactly as it was. A request that carries
         // no wrapper updates no setting, so it writes NOTHING and the stored output is
         // answered as it stands.
+        let Some(stored) = bridge.outputs.get(position).cloned() else {
+            return Err(not_found(&input.output_name));
+        };
+        // The gateway this bridge is placed on (`Bridge$PlacementArn`): the one gateway
+        // whose declared networks a network output of this bridge may be delivered on.
+        let placement_arn = bridge.placement_arn.clone();
+
         if let Some(update) = input.network_output.as_ref() {
-            let stored = &bridge.outputs[position];
             let Some(stored_network) = stored.network_output.as_ref() else {
                 return Err(refused_by_output(
                     "NetworkOutput cannot be updated on a flow output of a bridge.",
                 ));
             };
+            // "The network output's gateway network name"
+            // (`BridgeNetworkOutput$NetworkName`): a network output is delivered on one of
+            // the networks the gateway this bridge is placed on declares, so the name is
+            // resolved against that gateway's own networks.
+            if let Some(network_name) = update.network_name.as_deref() {
+                if let Some(rejection) = store.unknown_gateway_network_rejection(
+                    "NetworkOutput NetworkName",
+                    &placement_arn,
+                    network_name,
+                ) {
+                    return Err(bad_request(rejection));
+                }
+            }
             let merged = BridgeOutput {
                 // The request shape has no member for a flow output, so whatever the
                 // stored output holds there is carried over untouched — the same
@@ -278,8 +319,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ttl: update.ttl.unwrap_or(stored_network.ttl),
                 }),
             };
-            bridge.outputs[position] = merged;
+            // Nothing is written until the network name has resolved, so the bridge is
+            // reached mutably only here. The position was resolved on this same bridge
+            // under this same lock, so it still addresses the output the request named —
+            // and it is resolved again rather than indexed, so no arithmetic about the
+            // store's shape can reach a panic.
+            let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+                return Err(not_found(&input.bridge_arn));
+            };
+            let Some(slot) = bridge.outputs.get_mut(position) else {
+                return Err(not_found(&input.output_name));
+            };
+            *slot = merged;
         }
+
+        // The stored bridge, read back after the write: this is the record the answer is
+        // computed from, so it reports what this call actually wrote.
+        let Some(bridge) = store.bridges.get(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
 
         // "The ARN of the bridge that was updated" and "the bridge output that was updated"
         // — both read back out of the STORED bridge rather than echoed from the request, so
@@ -288,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock owes a change for an updated output.
         Ok(UpdateBridgeOutputOutput {
             bridge_arn: Some(bridge.bridge_arn.clone()),
-            output: Some(bridge.outputs[position].clone()),
+            output: bridge.outputs.get(position).cloned(),
         })
     }
 }
