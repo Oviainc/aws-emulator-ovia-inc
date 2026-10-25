@@ -20,6 +20,9 @@ mod data_protection_policy;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 
+#[path = "all/list_subscriptions.rs"]
+mod list_subscriptions;
+
 #[path = "all/phone_number_opt_in.rs"]
 mod phone_number_opt_in;
 

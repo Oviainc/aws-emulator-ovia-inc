@@ -149,7 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every subscription this account holds, whatever topic it is on and whatever
         // its endpoint names: a subscription record is what this listing reports, and
-        // nothing here resolves an endpoint to decide whether to report it.
+        // nothing here resolves an endpoint to decide whether to report it. The order
+        // is the one every subscription listing reports, so a page boundary falls in
+        // the same place however many times the listing is read.
         let all: Vec<Subscription> = store
             .subscriptions_in_order()
             .into_iter()
