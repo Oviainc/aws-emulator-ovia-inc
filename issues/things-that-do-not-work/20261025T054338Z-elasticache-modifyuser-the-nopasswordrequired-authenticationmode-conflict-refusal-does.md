@@ -1,0 +1,47 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: elasticache.modify-user-conflicting-auth-params-rejected
+Issue-Shape-Id: com.amazonaws.elasticache#AmazonElastiCacheV9
+Issue-Key: elasticache.modify-user-conflicting-auth-params-rejected|run#11|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Commit: ab676ea2ce82740f1a7a4978c7271b044c4482ab
+
+# ElastiCache ModifyUser: the NoPasswordRequired + AuthenticationMode conflict refusal does not state the submitted directives (1 cause)
+
+> _Note: this issue was identified against the code base at commit `ab676ea2ce82740f1a7a4978c7271b044c4482ab`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ModifyUser
+
+## Description
+One net-new root cause in the `elasticache` service, reached over the ordinary Query surface with no supporting EC2/VPC resources (so it is not blocked by another service's gap). ModifyUser is now implemented and refuses the contradictory-authentication request with the correct status and error code; what diverges is the refusal's diagnosis, which no longer reports WHICH two directives the request carried.
+
+Relation to already-open issues: 20261024T075915Z-elasticache-rbac-surface-deleteusergroup-and-modifyuser-answer-501.md lists this check id, but the cause it describes (ModifyUser answering HTTP 501 `NotImplemented`) is NOT what the check now observes — the emulator answers HTTP 400 `InvalidParameterCombination`, the modeled classification, and the replay now fails one assertion later, on the message. The suite report did not mark this check as owned by that issue (its replay key no longer matches), so the surviving divergence is recorded here. It is also not covered by 20261024T182307Z-elasticache-refusal-fidelity-cacheparametergroupname-identifier-validation-missing-and.md, which names six other rules (DeleteCacheParameterGroup identifier validation, ModifyCacheParameterGroup non-modifiable parameters, tag key/value refusals, RemoveTagsFromResource, CreateUserGroup collision) and no ModifyUser rule.
+
+Cause 1 of 1 — ModifyUser's InvalidParameterCombination refusal for `NoPasswordRequired` together with `AuthenticationMode` is a generic rule sentence instead of a refusal built from the submitted directives.
+AWS: Smithy (com-amazonaws-elasticache-amazonelasticachev9) binds `ModifyUser` with input `ModifyUserMessage{UserId (required, @length min 1, @pattern ^[a-zA-Z][a-zA-Z0-9\-]*$), AccessString, AppendAccessString, Passwords, NoPasswordRequired, AuthenticationMode, Engine}` and output shape `User` at HTTP 200; its modeled errors are `InvalidParameterCombinationException` (httpError 400, awsQueryError code `InvalidParameterCombination`), `InvalidParameterValueException` (400, `InvalidParameterValue`), `InvalidUserStateFault` (400, `InvalidUserState`), `ServiceLinkedRoleNotFoundFault` (400) and `UserNotFoundFault` (404, `UserNotFound`). A request that carries both `NoPasswordRequired` and an `AuthenticationMode` is two mutually exclusive authentication directives, and AWS refuses it HTTP 400 `InvalidParameterCombination`. The model states no message text for that error, so the refusal text is recorded behavior only — and the recording shows it is BUILT FROM THE REQUEST: it reports the submitted state of the `NoPasswordRequired` flag and the submitted `AuthenticationMode.Type`, e.g. for NoPasswordRequired=true with AuthenticationMode={Type: password} the recorded sentence is 'No password required flag is true but provided authentication type is password'. The requirement is that rule — name the flag's submitted value and the submitted authentication type — not that one recorded string.
+Emulator: the status (400) and the code (`InvalidParameterCombination`) are correct, but the message is a fixed rule statement that echoes neither submitted value: 'AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: either states how the user authenticates on its own.'
+Why: the response is the only statement of which of the caller's two directives collided. Because the emulator's sentence is constant across every combination (NoPasswordRequired=true with Type=password, NoPasswordRequired=false with Type=no-password-required, Passwords together with AuthenticationMode), a caller or an operator reading the error cannot tell which submitted directive AWS objected to, and tooling or golden-output tests that surface AWS's request-derived sentence for this combination see an unrelated one for the identical condition. The divergence also stops the replay before its remaining legs are exercised, so the effect-absence guarantee (the refused ModifyUser must leave Authentication.Type/PasswordCount byte-identical) and the positive control (an unopposed ModifyUser on the same user still succeeding and settling `active`) are left unverified by the suite.
+Fix: the operation's validation in the ModifyUser handler — `services/service-com-amazonaws-elasticache-amazonelasticachev9/src/ops/modify_user.rs` — where the auth-directive combination rule is enforced before any write; it must render the refusal from the request's members and their submitted values (the NoPasswordRequired flag's value and the AuthenticationMode.Type that was provided) rather than emitting one constant rule sentence. The refusal must stay HTTP 400 `InvalidParameterCombination` and must remain effect-free.
+Traces: elasticache.modify-user-conflicting-auth-params-rejected.
+
+## Evidence
+Cause 1 — elasticache.modify-user-conflicting-auth-params-rejected:
+  setup (succeeds): CreateUser(UserId=<id>, UserName=<id>, Engine=redis, AccessString="on ~* +@all", Passwords=[<pw1>]) -> Authentication.Type=password, Authentication.PasswordCount=1, Status active
+  call: ModifyUser(UserId=<id>, NoPasswordRequired=true, AuthenticationMode={Type: "password", Passwords: [<pw2>]})
+  expected: HTTP 400, Error.Code `InvalidParameterCombination` (modeled `InvalidParameterCombinationException`, awsQueryError httpResponseCode 400), message built from the submitted directives — recorded example: 'No password required flag is true but provided authentication type is password'
+  actual:   HTTP 400, Error.Code `InvalidParameterCombination` (status and code CORRECT), message 'AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: either states how the user authenticates on its own.' — a constant sentence that reports neither NoPasswordRequired's submitted value nor the submitted AuthenticationMode.Type
+  replay assertion: "AssertionError: expected message 'No password required flag is true but provided authentication type is password', got 'AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: either states how the user authenticates on its own.'" (check line 97)
+  model grounding: smithy_query operation=ModifyUser on services/service-com-amazonaws-elasticache-amazonelasticachev9/smithy-model/com-amazonaws-elasticache-amazonelasticachev9.json — input members NoPasswordRequired (BooleanOptional) and AuthenticationMode both present and both optional; InvalidParameterCombinationException modeled with httpError 400 / awsQueryError code InvalidParameterCombination. The model carries no message text, hence "recorded behavior only" for the sentence's shape.
+  not exercised because the replay stops here: the post-refusal DescribeUsers effect-absence check (Authentication.Type == password, PasswordCount == 1) and the positive control ModifyUser(UserId=<id>, AccessString="on ~* -@all +@read") -> 200 with the updated AccessString and Status active.
+  note: the earlier-filed open issue 20261024T075915Z recorded this same check failing with HTTP 501 `NotImplemented`; the 501 is gone, so only the refusal text above remains.
+
+## Steps to Reproduce
+Point an elasticache client at the emulator (Query surface; no VPC/EC2 resources needed).
+1. aws elasticache create-user --user-id <u> --user-name <u> --engine redis --access-string "on ~* +@all" --passwords <pw1>
+   -> 200, Authentication.Type=password, PasswordCount=1; wait for Status active via aws elasticache describe-users --user-id <u>.
+2. aws elasticache modify-user --user-id <u> --no-password-required --authentication-mode Type=password,Passwords=<pw2>
+   -> observe HTTP 400 / InvalidParameterCombination (correct) with the constant message 'AuthenticationMode cannot be combined with Passwords or NoPasswordRequired: either states how the user authenticates on its own.'; AWS refuses with the same status and code but a message built from the submitted directives, e.g. 'No password required flag is true but provided authentication type is password'.
+3. Vary the directives (--no-password-required with --authentication-mode Type=no-password-required, or --passwords together with --authentication-mode) -> the emulator emits the SAME sentence every time, so the response never identifies which submitted directive was rejected.
+4. aws elasticache describe-users --user-id <u> -> Authentication must still be Type=password, PasswordCount=1 (the refusal must be effect-free), and aws elasticache modify-user --user-id <u> --access-string "on ~* -@all +@read" must still answer 200.
+Replay: elasticache.modify-user-conflicting-auth-params-rejected

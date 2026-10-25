@@ -20,6 +20,12 @@
 //! `ServiceQuotaExceededException` (HTTP 402), the bound every writer of a feed's
 //! output list is held to.
 //!
+//! The operation is `@idempotent` and carries no `@idempotencyToken`, so the request's
+//! own members are its key: a request this Region has already served answers with the
+//! feed that create minted — same id, same ARN, one stored record — instead of minting
+//! a second one (`crate::state::...::feed_created_from`). That is decided before the
+//! quota, so a retry costs the account nothing it has not already spent.
+//!
 //! The scaffold's own notes on the operation shape and on reaching state are kept
 //! below, minus the line that recorded this operation as a stub.
 //!
@@ -274,8 +280,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The outputs this request asks for, as they are STORED (the service's own
+        // config defaults already materialised, `fromAssociation` false because they
+        // did not come from `AssociateFeed`) — which is also the form they are compared
+        // in below. Built BEFORE the lock, so the store is not held while a request's
+        // own members are normalised.
+        let outputs: Vec<crate::state::Output> = input
+            .outputs
+            .into_iter()
+            .map(|output| {
+                crate::state::Output::new(
+                    output.name,
+                    output.output_config,
+                    output.status,
+                    output.description,
+                    false,
+                )
+            })
+            .collect();
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
         let mut state = state.lock();
         state.settle_due_transitions(now);
+
+        // The operation is `@idempotent` and carries no `@idempotencyToken`, so the
+        // request's own members are its key: a request this Region has already served
+        // is that same create once more — what an SDK retries when it never saw the
+        // first response — and several identical requests have the effect of ONE. It
+        // answers with the feed that create minted, reporting the record as it stands,
+        // and is decided BEFORE the quota: a retry costs the account neither a second
+        // record nor a second unit of quota.
+        if let Some(existing) = state.feed_created_from(
+            &region,
+            &input.name,
+            input.access_role_arn.as_deref(),
+            &outputs,
+            &tags,
+        ) {
+            return Ok(CreateFeedOutput {
+                arn: existing.arn.clone(),
+                name: existing.name.clone(),
+                id: existing.id.clone(),
+                data_endpoints: existing.data_endpoints.clone(),
+                outputs: existing.get_outputs(),
+                access_role_arn: existing.access_role_arn.clone(),
+                status: existing.status.as_wire().to_string(),
+                association: existing.association.clone(),
+                tags: Some(existing.tag_map()),
+            });
+        }
 
         // The feed store is BOUNDED, and a service quota is a PER-REGION figure: past
         // the Region's quota the service refuses the create rather than growing its
@@ -303,19 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             // Outputs supplied to CreateFeed did not come from AssociateFeed, so
             // `fromAssociation` is false for every one of them.
-            outputs: input
-                .outputs
-                .into_iter()
-                .map(|output| {
-                    crate::state::Output::new(
-                        output.name,
-                        output.output_config,
-                        output.status,
-                        output.description,
-                        false,
-                    )
-                })
-                .collect(),
+            outputs,
             access_role_arn: input.access_role_arn,
             // "After creation of the feed has succeeded, the status will be AVAILABLE"
             // (`CreateFeedResponse$status`), and creation HAS succeeded by the time this
@@ -335,7 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is what attaches one, so GetFeedPolicy has nothing to report until it
             // runs.
             policy: None,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags,
             transition_due_at: None,
             // Nothing is in flight on a feed that has just been created, so there is no
             // status for the clock to settle it back into.

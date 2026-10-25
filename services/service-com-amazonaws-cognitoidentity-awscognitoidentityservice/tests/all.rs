@@ -21,6 +21,8 @@ mod developer_identity_tokens;
 mod identity_pool_flow;
 #[path = "all/identity_pool_roles.rs"]
 mod identity_pool_roles;
+#[path = "all/list_identity_pools.rs"]
+mod list_identity_pools;
 #[path = "all/lookup_developer_identity.rs"]
 mod lookup_developer_identity;
 #[path = "all/principal_tag_attribute_map.rs"]
@@ -29,3 +31,5 @@ mod principal_tag_attribute_map;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_identity_pool.rs"]
+mod update_identity_pool;

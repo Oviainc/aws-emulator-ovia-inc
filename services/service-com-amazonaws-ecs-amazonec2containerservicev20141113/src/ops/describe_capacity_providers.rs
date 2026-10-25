@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityProviders
-//! Reports the capacity providers the account holds, out of the records
-//! `CreateCapacityProvider` wrote. A REPORTING operation: it filters, pages and projects
-//! what is stored and changes nothing.
+//! Reports the capacity providers the account holds: the records
+//! `CreateCapacityProvider` wrote, plus the ones Amazon ECS manages for every account
+//! (`crate::state::MANAGED_CAPACITY_PROVIDERS`), which nothing creates. A REPORTING
+//! operation: it filters, pages and projects what the account holds and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -262,19 +263,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut failures = Vec::new();
         // "The short name or full ARN of one or more capacity providers" — a request that
         // names none describes every one in scope.
-        let mut matching: Vec<String> = if requested.is_empty() {
+        let mut matching: Vec<crate::state::CapacityProviderRecord> = if requested.is_empty() {
             guard
-                .capacity_providers
-                .values()
+                .all_capacity_providers(&region)
+                .into_iter()
                 .filter(|provider| in_scope(provider))
-                .map(|provider| provider.name.clone())
                 .collect()
         } else {
             let mut named = Vec::with_capacity(requested.len());
             for reference in &requested {
                 let name = crate::state::capacity_provider_name_from_reference(reference);
-                match guard.capacity_providers.get(&name) {
-                    Some(provider) if in_scope(provider) => named.push(name),
+                match guard.capacity_provider(&name, &region) {
+                    Some(provider) if in_scope(&provider) => named.push(provider),
                     // An id that names nothing in scope is a FAILURE beside the results,
                     // not an error for the whole call: that is what `failures` is for.
                     _ => failures.push(crate::state::missing_failure(
@@ -286,8 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Provider names are unique, so sorting them gives paging a stable sequence to
         // walk whichever order the map happened to hold them in.
-        matching.sort();
-        matching.dedup();
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+        matching.dedup_by(|left, right| left.name == right.name);
 
         let page_size = input
             .max_results
@@ -296,17 +296,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is the NAME the next page starts at, so a page is unaffected by
         // providers created or deleted before it.
         let start = match input.next_token.as_deref() {
-            Some(token) => matching.partition_point(|name| name.as_str() < token),
+            Some(token) => matching.partition_point(|provider| provider.name.as_str() < token),
             None => 0,
         };
         let end = start.saturating_add(page_size).min(matching.len());
         let capacity_providers = matching[start..end]
             .iter()
-            .filter_map(|name| guard.capacity_providers.get(name))
             .map(|provider| provider.view(include_tags))
             .collect();
         // "This value is null when there are no more results to return."
-        let next_token = matching.get(end).cloned();
+        let next_token = matching.get(end).map(|provider| provider.name.clone());
 
         Ok(DescribeCapacityProvidersOutput {
             capacity_providers: Some(capacity_providers),

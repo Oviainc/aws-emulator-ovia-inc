@@ -179,14 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(shape="DetectionRuleAccountIds")`), so an entry of the
         // right length that is not an account id at all reaches the handler: a
         // parameter failure, refused before anything is written.
-        if include
-            .iter()
-            .chain(exclude.iter())
-            .any(|account_id| !crate::state::is_account_id(account_id))
+        if let Some(message) =
+            crate::state::account_ids_rejection(include.iter().chain(exclude.iter()))
         {
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
-            ));
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
         // Carrying EITHER list replaces the whole scope, because the two ARE one
         // scope: the side the request names wins and the other is cleared, so no

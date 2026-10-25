@@ -135,6 +135,9 @@
 //! ## Errors
 //!
 //! * `InvalidAddress` (HTTP 404) — The specified ID is invalid.
+//! * `InvalidAttributeName` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this SERVICE models for an attribute name that does not exist, which is what a
+//!   name outside the message system attribute set is on either name member.
 //! * `InvalidSecurity` (HTTP 403) — The request was not made over HTTPS or did not use SigV4
 //!   for signing.
 //! * `KmsAccessDenied` (HTTP 400) — The caller doesn't have the required KMS access.
@@ -207,10 +210,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sqs-amazonsqs.json");
 // here — hence the `ReceiveMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sqs#ReceiveMessage")]
+//
+// `InvalidAttributeName` is widened in through `extra_errors`: this SERVICE models that
+// shape ("The specified attribute doesn't exist.") and three of its operations declare
+// it, while `ReceiveMessage`'s own `errors` list omits it. It is the code a caller that
+// names a non-existent attribute gets everywhere else in this service, so the two
+// system-attribute name members answer with it too rather than with a generic refusal.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sqs#ReceiveMessage",
+    extra_errors = ["InvalidAttributeName"]
+)]
 #[derive(Debug)]
 pub enum ReceiveMessageErrorModeled {
     InvalidAddress(InvalidAddress),
+    InvalidAttributeName(InvalidAttributeName),
     InvalidSecurity(InvalidSecurity),
     KmsAccessDenied(KmsAccessDenied),
     KmsDisabled(KmsDisabled),
@@ -309,10 +322,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `AttributeNames` is the deprecated spelling of `MessageSystemAttributeNames`;
-        // a request may use either, so both select the same system attributes.
+        // a request may use either, so both carry the same value set and both select the
+        // same system attributes.
         let mut system_requested: Vec<String> =
             input.message_system_attribute_names.unwrap_or_default();
         system_requested.extend(input.attribute_names.unwrap_or_default());
+        check_system_attribute_names(&system_requested)?;
         let attribute_requested: Vec<String> = input.message_attribute_names.unwrap_or_default();
 
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
@@ -403,6 +418,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tokio::time::sleep((wait - elapsed).min(POLL_INTERVAL)).await;
         }
     }
+}
+
+/// Refuse a name neither of this operation's system-attribute name members accepts.
+///
+/// Both carry one value set: `MessageSystemAttributeNames` takes the message system
+/// attribute names, and `AttributeNames` is the discontinued alias of that member, so it
+/// takes the same ones. Applied here rather than at the boundary because the alias's
+/// modelled target is the queue attribute enum, which names none of them (see the
+/// `skip_validation` note on `ReceiveMessageInput`), and applying it once keeps the two
+/// spellings from answering the same request differently.
+fn check_system_attribute_names(requested: &[String]) -> Result<(), ReceiveMessageError> {
+    for name in requested {
+        if !MESSAGE_SYSTEM_ATTRIBUTE_NAME_VALUES.contains(&name.as_str()) {
+            return Err(ReceiveMessageErrorModeled::InvalidAttributeName(
+                sqs::unknown_attribute_name(name),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// The message system attributes this emulator holds, filtered to the ones `requested`

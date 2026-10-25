@@ -205,6 +205,36 @@ pub const MAX_ACCOUNT_RESOURCE_POLICIES: usize = 10;
 /// push past when the resource already carries tags.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The tag-key namespace Amazon Web Services keeps for its own tags, from AWS's tag
+/// restrictions: "Do not use the aws: prefix in your tag names or values because it is
+/// reserved for Amazon Web Services use. You can't edit or delete tag names or values with
+/// this prefix."
+///
+/// So a key in it is never a caller's to assign: a tagging request that names one is refused
+/// and assigns nothing. `TagKey`'s own `@pattern` admits `:`, so nothing refuses such a key
+/// before a handler runs.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether a tagging request names any key in [`RESERVED_TAG_KEY_PREFIX`] — the keys that are
+/// not the caller's to assign.
+///
+/// What is reserved is the prefix itself rather than one spelling of it, so a key is matched
+/// against it without regard to case. The comparison is on BYTES, so a key whose fifth byte
+/// falls inside a multi-byte character is answered rather than panicked on.
+pub fn names_reserved_tag_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    keys.into_iter().any(|key| {
+        key.as_bytes()
+            .get(..RESERVED_TAG_KEY_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+    })
+}
+
+/// The refusal CloudWatch Logs answers a tagging request that names a key in the reserved
+/// namespace. ONE sentence for every such request: what is refused is the namespace itself,
+/// so the refusal carries nothing the request chose, and it states the prefix in the casing
+/// the service names it by even though the reservation ignores case.
+pub const RESERVED_TAG_KEY_MESSAGE: &str = "Tags starting with 'AWS:' are reserved for AWS use.";
+
 /// The longest `policyDocument` `PutDataProtectionPolicy` admits, from that member's own
 /// documentation: "The JSON specified in policyDocument can be up to 30,720 characters."
 /// The model puts no `@length` on `DataProtectionPolicyDocument`, so nothing refuses an

@@ -321,9 +321,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let response = response_for(&workspace);
-        store
-            .arn_index
-            .insert(workspace.arn.clone(), workspace_id.clone());
         if let Some(token) = input.client_token {
             store.client_tokens.insert(token, workspace_id.clone());
         }

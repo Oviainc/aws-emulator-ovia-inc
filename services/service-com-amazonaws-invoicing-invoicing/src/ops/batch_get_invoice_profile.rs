@@ -2,20 +2,22 @@
 
 //! @op BatchGetInvoiceProfile
 //!
-//! Reports the invoice profile of each account the request names, for the accounts of
-//! the requester's organization as [`crate::state::ComAmazonawsInvoicingInvoicingState::organization_accounts`]
-//! knows them — the requester's own management account and every linked account under
-//! it. The operation is documented "the accounts must be linked accounts under
-//! the requester management account organization", so a request that names an account
-//! from OUTSIDE that organization is refused WHOLE with the modelled
-//! `AccessDeniedException` (HTTP 403) — the requester has no access to an account
-//! outside its own organization, and none of the requested profiles is reported, because
-//! the request itself is what the service refuses.
+//! Reports the invoice profile of each account the request names, for the LINKED
+//! accounts of the requester's organization as
+//! [`crate::state::ComAmazonawsInvoicingInvoicingState::linked_accounts`] knows them.
+//! The operation is documented "the accounts must be linked accounts under the
+//! requester management account organization", so an account id that is not such a
+//! linked account is one the requester holds no access to, and naming it refuses the
+//! request WHOLE with the modelled `AccessDeniedException` (HTTP 403) — none of the
+//! requested profiles is reported, because the request itself is what the service
+//! refuses.
 //!
-//! The requester's OWN account is inside its organization (it is that organization's
-//! management account), so naming it answers that account's profile: the recorded
-//! behaviour of this operation reports a profile for the caller's own account and keeps
-//! the 403 for an account id the organization does not contain.
+//! Membership is read out of state and nothing else: no account is readable because of
+//! WHO asked. The requester's own account is the MANAGEMENT account of this
+//! organization, and a management account is not a linked account under itself, so it
+//! takes the same test as every other account id — readable exactly when a stored
+//! configuration names it as a linked account of the organization, refused with the
+//! same 403 when none does.
 //!
 //! `@readonly`: this handler only reads state.
 //!
@@ -178,15 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         // "The accounts must be linked accounts under the requester management account
-        // organization": the requester holds no access to an account that is not in its
-        // organization, so naming one is refused with the modelled 403, naming the first
-        // such account in request order, and refused WHOLE rather than answered for the
-        // accounts it may read. Its own account IS in that organization — it is the
-        // management account the organization is named for — so it resolves to a profile.
-        let organization = store.organization_accounts();
+        // organization": the requester holds no access to an account that is not a
+        // linked account of its organization, so naming one is refused with the modelled
+        // 403, naming the first such account in request order, and refused WHOLE rather
+        // than answered for the accounts it may read. The requester's own account is the
+        // management account rather than a linked account under itself, so it is here
+        // only when a stored configuration names it as a linked account.
+        let linked = store.linked_accounts();
         if let Some(outsider) = requested
             .iter()
-            .find(|account_id| !organization.contains(**account_id))
+            .find(|account_id| !linked.contains(**account_id))
         {
             return Err(BatchGetInvoiceProfileErrorModeled::AccessDeniedException(
                 crate::state::not_authorized_for_account(outsider),
