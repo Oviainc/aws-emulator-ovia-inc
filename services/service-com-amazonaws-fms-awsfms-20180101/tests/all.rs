@@ -37,6 +37,8 @@ mod apps_list_reporting;
 mod apps_lists_enumeration;
 #[path = "all/compliance_status.rs"]
 mod compliance_status;
+#[path = "all/discovered_resources.rs"]
+mod discovered_resources;
 #[path = "all/error_message_members.rs"]
 mod error_message_members;
 #[path = "all/managed_list_deletion.rs"]

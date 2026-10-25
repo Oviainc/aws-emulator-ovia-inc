@@ -260,18 +260,22 @@ async fn a_search_job_walks_creating_then_running_then_its_terminal_status() {
 
 #[tokio::test]
 async fn a_stop_replaces_whatever_the_scan_still_owed() {
-    // A stop issued in each phase a scan can be stopped in: the job winds down to
-    // STOPPED and never settles to the terminal status its scan would have reached, so
-    // the owed statuses the stop replaced cannot resurface.
+    // A stop of a running scan, with rows differing in the terminal status the scan was
+    // still owed: the job winds down to STOPPED and never settles to the status its scan
+    // would have reached, so the owed statuses the stop replaced cannot resurface. (A
+    // stop issued before the scan is running is outside the status the operation acts
+    // from and is refused instead; that is asserted in
+    // `stop_search_job_status_gate.rs`.)
     let stop_cases = [
-        ("stopped while being created", WITHIN_THE_DUE_INSTANT),
-        ("stopped while scanning", PAST_THE_CREATING_INSTANT),
+        ("stopped while scanning a scope that resolved to one recovery point", vec![s3_point("stopped")]),
+        ("stopped while scanning a scope that resolved to nothing", Vec::new()),
     ];
-    for (case, wait) in stop_cases {
+    for (case, held) in stop_cases {
         let (emulator, engine) = emulator_with_engine();
-        // One recovery point in scope, so an unstopped scan would settle to COMPLETED:
-        // reaching STOPPED therefore shows the stop replaced that owed status.
-        seed_recovery_points(&engine, vec![s3_point("stopped")]);
+        // Whatever the scan was owed — COMPLETED for a scope that resolved to something,
+        // FAILED for one that resolved to nothing — reaching STOPPED shows the stop
+        // replaced it.
+        seed_recovery_points(&engine, held);
         let started = call(
             &emulator,
             REGION,
@@ -283,7 +287,7 @@ async fn a_stop_replaces_whatever_the_scan_still_owed() {
         let identifier = started.string("SearchJobIdentifier");
         let job_uri = format!("/search-jobs/{identifier}");
 
-        tokio::time::sleep(wait).await;
+        tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
         let stopped = call(
             &emulator,
             REGION,
@@ -294,7 +298,7 @@ async fn a_stop_replaces_whatever_the_scan_still_owed() {
         .await;
         assert_eq!(
             stopped.status, 200,
-            "case {case:?}: StopSearchJob on a job whose scan has not ended must succeed, got {} ({:?})",
+            "case {case:?}: StopSearchJob on a running scan must succeed, got {} ({:?})",
             stopped.status, stopped.body
         );
 

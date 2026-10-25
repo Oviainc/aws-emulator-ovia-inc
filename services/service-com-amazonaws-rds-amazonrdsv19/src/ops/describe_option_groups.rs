@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx)
             .map_err(DescribeOptionGroupsError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeOptionGroupsError::validation)?;
+            .map_err(DescribeOptionGroupsError::invalid_parameter_value)?;
         check_selection(&input).map_err(DescribeOptionGroupsError::validation)?;
         if let Some(engine_name) = &input.engine_name {
             crate::state::check_option_group_engine_name(engine_name)

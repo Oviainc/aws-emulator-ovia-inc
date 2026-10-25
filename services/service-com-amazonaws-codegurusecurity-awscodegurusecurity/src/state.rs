@@ -20,8 +20,10 @@
 //!   enforced in [`Store::receive_upload`], which is the only writer of uploaded bytes.
 //! * [`SCAN_QUOTA`] caps `scans`, and [`RUNS_PER_SCAN_QUOTA`] caps the runs of one scan,
 //!   so the (scans x runs) product is bounded.
-//! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in `TagResource`, so
-//!   repeatedly tagging one scan cannot grow its tag store without end.
+//! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in every writer of the
+//!   tag store (`CreateScan` and `TagResource`, through [`tag_count_after_merge`] and
+//!   [`tag_quota_refusal`]), so repeatedly tagging one scan cannot grow its tag store
+//!   without end.
 //! * `idempotency` gains one entry only where a run was created, so it is bounded by the
 //!   same (scans x runs) product.
 //! * `findings` is written only by a scan run's analysis, so no request path grows it;
@@ -180,6 +182,61 @@ pub fn reserved_tag_key_refusal(member: &str, key: &str) -> ValidationException 
             name: member.to_string(),
             message: format!(
                 "a tag key must not begin with {RESERVED_TAG_KEY_PREFIX}; {key} does"
+            ),
+        }]),
+    }
+}
+
+/// Apply the tag map `requested` to the tags `held` on a resource the way a tagging
+/// input is applied: every key `requested` names takes the value it carries, and every
+/// key it does not name is left exactly as it is.
+///
+/// Tagging an AWS resource is ADDITIVE — the only operation that removes a tag key is
+/// `UntagResource` — so every writer of a scan's tag store goes through here rather than
+/// assigning the request's map over the stored one, which would delete the keys the
+/// request happens not to mention.
+pub fn merge_tags(held: &mut BTreeMap<String, String>, requested: &HashMap<String, String>) {
+    for (key, value) in requested {
+        held.insert(key.clone(), value.clone());
+    }
+}
+
+/// How many tags a resource would hold once [`merge_tags`] applied `requested` to
+/// `held`: the keys it already carries plus only those `requested` keys that are new,
+/// since a key already held takes a new value rather than adding an entry.
+pub fn tag_count_after_merge(
+    held: &BTreeMap<String, String>,
+    requested: &HashMap<String, String>,
+) -> usize {
+    let added = requested
+        .keys()
+        .filter(|key| !held.contains_key(key.as_str()))
+        .count();
+    held.len().saturating_add(added)
+}
+
+/// The modelled refusal of a request whose tag map would leave `would` tags on the scan
+/// `resource`, past [`TAGS_PER_SCAN_QUOTA`]: a `ValidationException` (HTTP 400) naming
+/// the member at fault, the bound and how much room is left. Shared by every writer of
+/// the tag store, so the bound is reported the same way whichever call reaches it.
+pub fn tag_quota_refusal(
+    member: &str,
+    resource: &str,
+    held: usize,
+    would: usize,
+) -> ValidationException {
+    ValidationException {
+        error_code: "ValidationException".to_string(),
+        message: format!(
+            "a scan holds at most {TAGS_PER_SCAN_QUOTA} tags; this request would leave \
+             {would} on {resource}"
+        ),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "remove tags from the scan, or send at most {remaining} new keys",
+                remaining = TAGS_PER_SCAN_QUOTA.saturating_sub(held),
             ),
         }]),
     }

@@ -4,10 +4,12 @@
 //! Ends a running search job. The operation is `@idempotent` and asks for ONE end state,
 //! the job stopped, so a job that is already `STOPPED` (or `STOPPING`) answers the
 //! modelled empty 200 and changes nothing: a retry of a safe-to-retry operation is never
-//! a caller-visible failure. A job that ended in a status this operation does not
-//! produce (`COMPLETED`, `FAILED`) can no longer be stopped and is a
-//! `ConflictException` (409), and an identifier this account holds no job for is a
-//! `ResourceNotFoundException` (404).
+//! a caller-visible failure. Every other status is judged against the gate the model
+//! documents — only a `RUNNING` search job can be stopped
+//! (`crate::state::STOPPABLE_SEARCH_JOB_STATES`) — so a job that has not started
+//! scanning yet (`CREATING`) and one that ended in a status this operation does not
+//! produce (`COMPLETED`, `FAILED`) are both a `ConflictException` (409), and an
+//! identifier this account holds no job for is a `ResourceNotFoundException` (404).
 //!
 //! A stop moves the job to `STOPPING`, the transient status, and the clock owes it
 //! `STOPPED` — so a `GetSearchJob` straight after this call observes the stop in
@@ -184,13 +186,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(StopSearchJobOutput {});
         }
 
-        // A job that ended in a status this operation does not produce cannot be stopped
-        // at all: the request asks for a transition the record can no longer make.
-        if job.is_terminal() {
+        // Every other status is judged against the gate the operation's own documentation
+        // states: only a job whose scan is RUNNING can be stopped, which is what
+        // `crate::state::STOPPABLE_SEARCH_JOB_STATES` holds. A job that has not started
+        // scanning yet, and a job whose scan already ended in a status this operation does
+        // not produce, are both asking for a transition the record cannot make from where
+        // it is, so both are the modelled conflict and neither is written to.
+        if !job.is_stoppable() {
             return Err(StopSearchJobErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "search job '{identifier}' is {} and can no longer be stopped",
-                    job.status
+                    "search job '{identifier}' is {}; only a {} search job can be stopped",
+                    job.status,
+                    crate::state::STOPPABLE_SEARCH_JOB_STATES.join(" or ")
                 ),
                 resource_id: identifier,
                 resource_type: SEARCH_JOB_RESOURCE.to_string(),

@@ -33,6 +33,8 @@ mod client_error_wire_status;
 mod describe_language_model;
 #[path = "all/job_concurrency_quota.rs"]
 mod job_concurrency_quota;
+#[path = "all/language_model_listing.rs"]
+mod language_model_listing;
 #[path = "all/language_models.rs"]
 mod language_models;
 #[path = "all/medical_scribe_job_listing.rs"]

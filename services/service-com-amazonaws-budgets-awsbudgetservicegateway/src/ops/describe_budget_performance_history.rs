@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBudgetPerformanceHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBudgetPerformanceHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBudgetPerformanceHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports how one stored budget performed over the periods it covers: the budget's own
+//! identity and cost scoping, plus one `BudgetedAndActualAmounts` record per period of
+//! the budget's `TimeUnit` that the history retains, OLDEST FIRST — narrowed to the
+//! periods the caller's `TimePeriod` covers and handed back one `MaxResults`-sized page
+//! at a time. Reporting only: nothing here writes, so what a later caller sees is
+//! unchanged.
+//!
+//! Which periods there are, and the amounts each one reports, are derived from the stored
+//! budget and the clock ([`crate::state::retained_periods`],
+//! [`crate::state::amounts_in_period`]) — never from the request.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +146,12 @@ pub struct DescribeBudgetPerformanceHistory<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The biggest page this operation reports to a caller that named no `MaxResults`:
+/// `MaxResults`' own `@range(max: 100)` — "an integer that represents how many entries a
+/// paginated response contains. The maximum is 100" — so a longer history is paged with a
+/// `NextToken` for the rest rather than reported whole.
+const PERFORMANCE_HISTORY_MAX_PAGE: i32 = 100;
+
 impl<Eng> DescribeBudgetPerformanceHistory<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -170,18 +178,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBudgetPerformanceHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBudgetPerformanceHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBudgetPerformanceHistory"))
+        let _ = ctx;
+        // The budgets control plane is scoped to the account the caller signed with, so
+        // an `AccountId` naming any other account is refused with the modelled 403
+        // before anything is read (`crate::state::foreign_account_refusal`).
+        if let Some(message) = crate::state::foreign_account_refusal(&input.account_id) {
+            return Err(
+                DescribeBudgetPerformanceHistoryErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBudgetPerformanceHistoryErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "budgets is mounted on an engine that holds no state for it".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // The window the caller asked about has to hold together — "The start date must
+        // come before the end date" (`TimePeriod`) — and one that does not is an invalid
+        // input value, not an empty history.
+        if input
+            .time_period
+            .as_ref()
+            .is_some_and(|window| !crate::state::time_period_ordered(window))
+        {
+            return Err(
+                DescribeBudgetPerformanceHistoryErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Unable to get budget performance history: TimePeriod Start must \
+                             come before End."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // The one door into the store, so a budget whose end date has passed is as absent
+        // from a history as it is from every other read.
+        let store = crate::state::store_at(&state, now);
+        let stored = store
+            .budgets
+            .get(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DescribeBudgetPerformanceHistoryErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "Unable to get budget performance history: {} - the budget doesn't \
+                             exist.",
+                            input.budget_name
+                        )),
+                    },
+                )
+            })?;
+
+        // "Describes the history for DAILY, MONTHLY, and QUARTERLY budgets. Budget history
+        // isn't available for ANNUAL budgets" — a budget whose time unit has no history is
+        // a budget this operation cannot be asked about, which is an invalid input value
+        // rather than a budget with an empty history.
+        if stored.budget.time_unit == crate::state::TIME_UNIT_ANNUALLY {
+            return Err(
+                DescribeBudgetPerformanceHistoryErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Unable to get budget performance history: {} - budget history \
+                             isn't available for ANNUAL budgets.",
+                            input.budget_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The periods this budget HAS: the retained series of its own time unit, or — for
+        // the time unit that names no repeating period — the single period its caller
+        // chose, which is the whole of such a budget's history.
+        let candidates = if stored.budget.time_unit == crate::state::TIME_UNIT_CUSTOM {
+            stored.budget.time_period.clone().into_iter().collect()
+        } else {
+            crate::state::retained_periods(&stored.budget.time_unit, now)
+        };
+
+        // A history covers the periods of the budget's own `TimePeriod` — "the period of
+        // time that's covered by a budget" — and only those that have BEGUN: a period
+        // still ahead of the clock has no performance to report yet.
+        let covered = stored.budget.time_period.clone().unwrap_or_default();
+        let begun = TimePeriod {
+            start: None,
+            end: Some(::aws_smithy_types::DateTime::from(now)),
+        };
+        let records: Vec<BudgetedAndActualAmounts> = candidates
+            .iter()
+            .filter(|period| crate::state::period_overlaps(period, &begun))
+            .filter(|period| crate::state::period_overlaps(period, &covered))
+            .filter(|period| {
+                input
+                    .time_period
+                    .as_ref()
+                    .is_none_or(|window| crate::state::period_overlaps(period, window))
+            })
+            .map(|period| crate::state::amounts_in_period(stored, period))
+            .collect();
+
+        let (page, next_token) = crate::state::page(
+            &records,
+            Some(input.max_results.unwrap_or(PERFORMANCE_HISTORY_MAX_PAGE)),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(|| {
+            DescribeBudgetPerformanceHistoryErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some("The pagination token is invalid.".to_string()),
+                },
+            )
+        })?;
+
+        // The budget's own scoping members, as the store holds them: this emulator keeps
+        // one record per budget rather than a version per edit, so "the history of the cost
+        // filters for a budget" (`BudgetPerformanceHistory$CostFilters`) is the scoping the
+        // budget carries now — the only scoping any period of it has been measured under.
+        Ok(DescribeBudgetPerformanceHistoryOutput {
+            budget_performance_history: Some(BudgetPerformanceHistory {
+                budget_name: Some(stored.budget.budget_name.clone()),
+                budget_type: Some(stored.budget.budget_type.clone()),
+                cost_filters: stored.budget.cost_filters.clone(),
+                cost_types: stored.budget.cost_types.clone(),
+                time_unit: Some(stored.budget.time_unit.clone()),
+                billing_view_arn: stored.budget.billing_view_arn.clone(),
+                budgeted_and_actual_amounts_list: Some(page),
+                filter_expression: stored.budget.filter_expression.clone(),
+                metrics: stored.budget.metrics.clone(),
+            }),
+            next_token,
+        })
     }
 }

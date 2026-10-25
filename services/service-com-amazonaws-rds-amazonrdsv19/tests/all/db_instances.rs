@@ -1324,7 +1324,9 @@ async fn describe_pages_with_max_records_and_resumes_from_the_marker() {
         "paging must report every record exactly once, in the same order"
     );
 
-    // The highest documented page size is accepted; one step past either bound is not.
+    // The highest documented page size is accepted; one step past either bound is not. A
+    // `MaxRecords` outside the documented window is a value the parameter does not accept, so
+    // the refusal carries the Query API common error code `InvalidParameterValue`.
     expect_ok(
         "the highest MaxRecords",
         call(&router, "DescribeDBInstances", &params!["MaxRecords" => 100]).await,
@@ -1335,7 +1337,7 @@ async fn describe_pages_with_max_records_and_resumes_from_the_marker() {
                 &format!("{case} MaxRecords for {action}"),
                 call(&router, action, &params!["MaxRecords" => value]).await,
                 400,
-                "ValidationException",
+                "InvalidParameterValue",
             );
             assert!(
                 text(&body, "Message").contains("MaxRecords"),

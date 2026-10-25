@@ -26,6 +26,7 @@ use crate::ops::types::{
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
     Interface, ListedBridge, ListedEntitlement, ListedFlow,
     ListedGateway,
+    ListedGatewayInstance,
     Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
     MediaConnectFlowRouterInputStreamDetails,
     MediaConnectFlowRouterOutputStreamDetails, MediaStream,
@@ -2272,6 +2273,22 @@ impl StoredGatewayInstance {
             running_bridge_count,
         }
     }
+
+    /// The modelled `ListedGatewayInstance` summary for this record — "a summary of an
+    /// instance" (`smithy_query(query="shape",shape="ListedGatewayInstance")`), which
+    /// carries four of the members [`Self::to_gateway_instance`] reports and no others:
+    /// the gateway's ARN, the instance's ARN, its SSM instance id and its state.
+    ///
+    /// Projected from the SAME stored fields as the full `GatewayInstance`, so a listing
+    /// and a describe can never report one instance differently.
+    pub fn to_listed_gateway_instance(&self) -> ListedGatewayInstance {
+        ListedGatewayInstance {
+            gateway_arn: self.gateway_arn.clone(),
+            gateway_instance_arn: self.gateway_instance_arn.clone(),
+            instance_id: self.instance_id.clone(),
+            instance_state: Some(self.instance_state.clone()),
+        }
+    }
 }
 
 /// The modelled `BridgeSource` a request entry configures, or `None` when the entry
@@ -4016,7 +4033,7 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     pub gateways: BTreeMap<String, StoredGateway>,
     /// Every gateway instance the store holds, keyed by its ARN — the identity every
     /// instance operation addresses one by (`@httpLabel GatewayInstanceArn`). Ordered, so
-    /// ListGatewayInstances can page stably once it is implemented.
+    /// ListGatewayInstances pages stably.
     ///
     /// Registered instances and deregistered ones alike: `InstanceState` carries the
     /// terminal `DEREGISTERED` value, so a deregistered instance stays in this map — and
@@ -4903,7 +4920,7 @@ pub fn is_mintable_gateway_arn(arn: &str) -> bool {
 /// (`smithy_query(query="shape",shape="GatewayInstanceArn")`:
 /// `^arn:.+:mediaconnect.+:gateway:.+:instance:.+$`), which is looser than this. The
 /// instance it names need NOT exist: this is a judgement on the ARN's FORM, which is what
-/// ListGatewayInstances' `FilterArn` and a pagination token are checked for.
+/// ListGatewayInstances' pagination token is checked for.
 pub fn is_mintable_gateway_instance_arn(arn: &str) -> bool {
     let Some((gateway_arn, instance_id)) = split_gateway_instance_arn(arn) else {
         return false;

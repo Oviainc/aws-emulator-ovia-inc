@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused by the request layer before this handler runs and only the `None`
         // branch — "Default: 100" — is reachable here.
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeDBMajorEngineVersionsError::validation)?;
+            .map_err(DescribeDBMajorEngineVersionsError::invalid_parameter_value)?;
         // `families()` yields the families in catalogue order, so the keys below ascend
         // and `paginate` can cut a page from them directly.
         let matching: Vec<(String, DBMajorEngineVersion)> = families()

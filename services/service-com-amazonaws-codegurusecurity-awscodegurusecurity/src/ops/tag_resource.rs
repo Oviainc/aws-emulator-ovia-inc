@@ -203,37 +203,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The tags this call would leave on the scan: the keys it adds, plus the keys
         // the scan already carries that this call does not replace. Bounded, so no
         // sequence of TagResource calls can grow one scan's tag store without end.
-        let added = input
-            .tags
-            .keys()
-            .filter(|key| !scan.tags.contains_key(key.as_str()))
-            .count();
-        if scan.tags.len() + added > crate::state::TAGS_PER_SCAN_QUOTA {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                error_code: "ValidationException".to_string(),
-                message: format!(
-                    "a scan holds at most {quota} tags; this request would leave {would} on \
-                     {resource_arn}",
-                    quota = crate::state::TAGS_PER_SCAN_QUOTA,
-                    would = scan.tags.len() + added,
-                    resource_arn = input.resource_arn,
+        let would = crate::state::tag_count_after_merge(&scan.tags, &input.tags);
+        if would > crate::state::TAGS_PER_SCAN_QUOTA {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::tag_quota_refusal(
+                    "tags",
+                    &input.resource_arn,
+                    scan.tags.len(),
+                    would,
                 ),
-                reason: "fieldValidationFailed".to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "tags".to_string(),
-                    message: format!(
-                        "remove tags from the scan, or send at most {remaining} new keys",
-                        remaining = crate::state::TAGS_PER_SCAN_QUOTA
-                            .saturating_sub(scan.tags.len()),
-                    ),
-                }]),
-            })
+            )
             .into());
         }
 
-        for (key, value) in &input.tags {
-            scan.tags.insert(key.clone(), value.clone());
-        }
+        // Tagging is additive: the keys this call names take its values and every other
+        // key the scan carries stays.
+        crate::state::merge_tags(&mut scan.tags, &input.tags);
 
         Ok(TagResourceOutput {})
     }
