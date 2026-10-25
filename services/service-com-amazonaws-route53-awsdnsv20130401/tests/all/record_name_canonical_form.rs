@@ -101,7 +101,10 @@ fn message(reply: &Reply) -> String {
 }
 
 /// How many of the listed record sets carry `name`.
-async fn count_named(router: &MultiServiceRouter, zone_id: &str, name: &str) -> usize {
+///
+/// `pub(crate)` so a sibling suite in this test target counts a name through
+/// the SAME listing call rather than growing a second copy of it.
+pub(crate) async fn count_named(router: &MultiServiceRouter, zone_id: &str, name: &str) -> usize {
     list(router, zone_id)
         .await
         .all("ResourceRecordSet/Name")
@@ -774,11 +777,23 @@ async fn one_name_and_type_hold_either_a_simple_record_set_or_a_routing_group() 
             "case {label}: the first record set must be created"
         );
 
-        let expected = format!(
-            "[RRSet of type {} with DNS name {} is not permitted as it conflicts with other \
-             records with the same DNS name and type in zone {ZONE}.]",
-            case.rr_type, case.canonical
-        );
+        // Each direction of the mix is refused in its own wording: a record set
+        // with a routing policy conflicts with what the name and type already
+        // answer, while a simple record set cannot be created at a name and
+        // type other record sets already hold.
+        let expected = if case.conflicting.is_some() {
+            format!(
+                "[RRSet of type {} with DNS name {} is not permitted as it conflicts with other \
+                 records with the same DNS name and type in zone {ZONE}.]",
+                case.rr_type, case.canonical
+            )
+        } else {
+            format!(
+                "[RRSet with DNS name {}, type {} cannot be created as other RRSets exist with \
+                 the same name and type.]",
+                case.canonical, case.rr_type
+            )
+        };
         for action in ["CREATE", "UPSERT"] {
             let refused = submit(
                 &router,
