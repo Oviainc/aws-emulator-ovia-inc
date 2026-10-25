@@ -548,6 +548,10 @@ pub struct ScheduledActivity {
     /// "The string that contains the JSON input data for the task": the state's
     /// effective input, after `InputPath` and the `Parameters` payload template.
     pub input: Value,
+    /// The RAW input of the state that scheduled it, before `InputPath` and
+    /// `Parameters`: what the state's `ResultPath` combines a worker's reply with, so
+    /// the reply can be placed when it arrives rather than guessed at.
+    pub raw_input: Value,
     /// How far into the run the state scheduled the task.
     pub at: Duration,
     /// `TimeoutSeconds`: "If the task runs longer than the specified seconds, this
@@ -556,6 +560,24 @@ pub struct ScheduledActivity {
     /// `HeartbeatSeconds`: "If more time than the specified seconds elapses between
     /// heartbeats from the task, this state fails with a States.Timeout error name."
     pub heartbeat_seconds: Option<u64>,
+}
+
+/// A worker's reply to the activity task an execution SUSPENDED at.
+///
+/// `SendTaskSuccess` is "used by activity workers [...] to report that the task
+/// identified by the taskToken completed successfully": the output it carries IS the
+/// result of the state that scheduled the task, so the state's own result-side data
+/// flow is applied to it and the execution continues from there rather than waiting a
+/// second time.
+#[derive(Debug, Clone)]
+pub struct ActivityReply {
+    /// The state that scheduled the task being answered, which the stored task names.
+    pub state_name: String,
+    /// The RAW input that state was entered with, as the stored task carries it: what
+    /// the state's `ResultPath` combines the result with.
+    pub state_input: String,
+    /// "The JSON output of the task", as the worker reported it.
+    pub result: Value,
 }
 
 /// What the context object (`$$`) reports about the run being interpreted.
@@ -786,7 +808,7 @@ pub const MAX_LOCATION_CHARS: usize = 256;
 
 /// `value` as a diagnostic echoes it: itself when it is short, and its first
 /// [`MAX_ECHOED_CHARS`] characters followed by an ellipsis when it is not.
-fn echoed(value: &str) -> String {
+pub fn echoed(value: &str) -> String {
     clipped(value, MAX_ECHOED_CHARS)
 }
 
@@ -1866,15 +1888,77 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
 /// Walk `definition` from its `StartAt` state with `input` as the first state's
 /// input, and report what happened.
 pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) -> Run {
+    interpret(definition, input, start, context, None, Duration::ZERO).0
+}
+
+/// Walk `definition` on from the activity task `reply` answers, and report what
+/// happened.
+///
+/// A worker's reply is the result of the state that scheduled its task, so the walk
+/// begins AT that state — with the raw input the state was entered with the first
+/// time, which `reply` carries and which its `ResultPath` combines the reply with —
+/// applies the reply there instead of scheduling a task, and carries on from its
+/// `Next`. The states before it already ran, under the call that scheduled the task,
+/// so neither their work nor their events are repeated: what this reports begins at
+/// the reply.
+///
+/// `input` is the EXECUTION's own input, which the context object (`$$`) reports; it
+/// is not the document the walk starts from.
+///
+/// `elapsed` is how long the execution has ALREADY been running when the reply
+/// arrives, which is what a definition-level `TimeoutSeconds` bounds: the span a task
+/// spent outstanding is part of the execution's own run.
+///
+/// `None` when the definition declares no such state any more, so there is nothing to
+/// continue from.
+pub fn resume(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &Context,
+    reply: &ActivityReply,
+    elapsed: Duration,
+) -> Option<Run> {
+    let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
+    let (run, applied) = interpret(
+        definition,
+        input,
+        start,
+        context,
+        Some((reply.clone(), state_input)),
+        elapsed,
+    );
+    applied.then_some(run)
+}
+
+/// One walk of `definition`, and whether the reply `resuming` carries was applied in
+/// it.
+///
+/// `resuming` is the worker's reply and the raw input of the state it answers: a walk
+/// that carries one begins at THAT state rather than at `StartAt`.
+///
+/// `elapsed` is the span the execution had already spent before this walk's first
+/// state, which a definition-level `TimeoutSeconds` counts.
+fn interpret(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &Context,
+    resuming: Option<(ActivityReply, Value)>,
+    elapsed: Duration,
+) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
         Ok(document) => document,
         Err(error) => {
-            return failed(
-                Vec::new(),
-                Duration::ZERO,
-                runtime(format!(
-                    "the state machine definition is not valid JSON: {error}"
-                )),
+            return (
+                failed(
+                    Vec::new(),
+                    Duration::ZERO,
+                    runtime(format!(
+                        "the state machine definition is not valid JSON: {error}"
+                    )),
+                ),
+                false,
             );
         }
     };
@@ -1882,33 +1966,56 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         document.get("StartAt").and_then(Value::as_str),
         document.get("States").and_then(Value::as_object),
     ) else {
-        return failed(
-            Vec::new(),
-            Duration::ZERO,
-            runtime("the state machine definition carries no 'StartAt' and 'States' pair".to_string()),
+        return (
+            failed(
+                Vec::new(),
+                Duration::ZERO,
+                runtime(
+                    "the state machine definition carries no 'StartAt' and 'States' pair"
+                        .to_string(),
+                ),
+            ),
+            false,
         );
     };
     if let Some(language) = document.get("QueryLanguage").and_then(Value::as_str) {
         if language != JSONPATH {
-            return failed(
-                Vec::new(),
-                Duration::ZERO,
-                runtime(format!(
-                    "the definition is written in '{language}', and this emulator evaluates only \
-                     '{JSONPATH}' definitions, so nothing was run for it"
-                )),
+            return (
+                failed(
+                    Vec::new(),
+                    Duration::ZERO,
+                    runtime(format!(
+                        "the definition is written in '{language}', and this emulator evaluates \
+                         only '{JSONPATH}' definitions, so nothing was run for it"
+                    )),
+                ),
+                false,
             );
         }
     }
     let input_value: Value = match serde_json::from_str(input) {
         Ok(value) => value,
         Err(error) => {
-            return failed(
-                Vec::new(),
-                Duration::ZERO,
-                runtime(format!("the execution input is not valid JSON: {error}")),
+            return (
+                failed(
+                    Vec::new(),
+                    Duration::ZERO,
+                    runtime(format!("the execution input is not valid JSON: {error}")),
+                ),
+                false,
             );
         }
+    };
+
+    // A walk that CONTINUES an execution begins at the state whose task the reply
+    // answers, with the raw input that state was entered with; one that is an attempt
+    // of its own begins at `StartAt` with the execution's input.
+    let (reply, start_at, first_input) = match resuming {
+        Some((reply, state_input)) => {
+            let state_name = reply.state_name.clone();
+            (Some(reply), state_name, state_input)
+        }
+        None => (None, start_at.to_string(), input_value.clone()),
     };
 
     let mut interpreter = Interpreter {
@@ -1924,48 +2031,81 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
         base_context: context.value(&input_value, start),
         waiting: None,
         map_runs: Vec::new(),
+        reply,
+        resumed: None,
     };
     let branch = interpreter.walk(
         states,
-        start_at,
-        input_value.clone(),
+        &start_at,
+        first_input,
         Duration::ZERO,
         &Scope::default(),
     );
-    let waiting = interpreter.waiting.take();
-    let steps = interpreter.steps;
-    let map_runs = interpreter.map_runs;
+    let mut waiting = interpreter.waiting.take();
+    let mut steps = interpreter.steps;
+    let mut map_runs = interpreter.map_runs;
+    let mut end = branch.end;
+    // A walk that applied a reply reports only what FOLLOWS it: the steps the replying
+    // state writes before the reply is placed are the ones the call that scheduled the
+    // task already recorded.
+    let resumed = interpreter.resumed;
+    if let Some(resumed) = resumed {
+        steps.drain(..resumed.index.min(steps.len()));
+        for step in &mut steps {
+            step.after = step.after.saturating_sub(resumed.at);
+        }
+        map_runs.retain(|map_run| map_run.started_at >= resumed.at);
+        for map_run in &mut map_runs {
+            map_run.started_at = map_run.started_at.saturating_sub(resumed.at);
+            map_run.stopped_at = map_run.stopped_at.saturating_sub(resumed.at);
+        }
+        if let Some(waiting) = waiting.as_mut() {
+            waiting.at = waiting.at.saturating_sub(resumed.at);
+        }
+        end = end.saturating_sub(resumed.at);
+    }
+    let applied = resumed.is_some();
 
     // A definition-level `TimeoutSeconds` bounds the whole execution: a run that got
-    // past it ended TIMED_OUT at the timeout, whatever it went on to compute.
+    // past it ended TIMED_OUT at the timeout, whatever it went on to compute. The span
+    // an execution had already spent before this walk — the time a task it was
+    // suspended at stayed outstanding, say — counts towards it, so what is left of the
+    // timeout for THIS walk is what its own offsets are judged against.
     if let Some(seconds) = document.get("TimeoutSeconds").and_then(Value::as_u64) {
         let timeout = Duration::from_secs(seconds);
-        if branch.end > timeout {
-            let kept = steps.into_iter().filter(|step| step.after <= timeout).collect();
+        let remaining = timeout.saturating_sub(elapsed);
+        if end > remaining {
+            let kept = steps
+                .into_iter()
+                .filter(|step| step.after <= remaining)
+                .collect();
             // A Map Run the walk only reached past the timeout never started, exactly
             // as the events past it never happened; one that had started stopped WHEN
             // THE EXECUTION DID, so its own stop cannot be later than the timeout.
             let kept_map_runs = map_runs
                 .into_iter()
-                .filter(|map_run| map_run.started_at <= timeout)
+                .filter(|map_run| map_run.started_at <= remaining)
                 .map(|mut map_run| {
-                    map_run.stopped_at = map_run.stopped_at.min(timeout);
+                    map_run.stopped_at = map_run.stopped_at.min(remaining);
                     map_run
                 })
                 .collect();
-            return terminal(
-                kept,
-                timeout,
-                "ExecutionTimedOut",
-                super::EXECUTION_STATUS_TIMED_OUT,
-                None,
-                Some(TIMEOUT_ERROR.to_string()),
-                Some(format!(
-                    "the execution ran for longer than the {seconds} seconds its definition's \
-                     'TimeoutSeconds' allows"
-                )),
-            )
-            .with_map_runs(kept_map_runs);
+            return (
+                terminal(
+                    kept,
+                    remaining,
+                    "ExecutionTimedOut",
+                    super::EXECUTION_STATUS_TIMED_OUT,
+                    None,
+                    Some(TIMEOUT_ERROR.to_string()),
+                    Some(format!(
+                        "the execution ran for longer than the {seconds} seconds its definition's \
+                         'TimeoutSeconds' allows"
+                    )),
+                )
+                .with_map_runs(kept_map_runs),
+                applied,
+            );
         }
     }
 
@@ -1977,30 +2117,34 @@ pub fn run(definition: &str, input: &str, start: SystemTime, context: &Context) 
     // spent, and the branch's outcome, which is a FAILURE where the document the task
     // would carry outgrew what a state may produce.
     if let (Some(waiting), true) = (waiting, branch.outcome.is_ok()) {
-        return Run {
-            status: super::EXECUTION_STATUS_RUNNING,
-            output: None,
-            error: None,
-            cause: None,
-            steps,
-            elapsed: branch.end,
-            waiting: Some(waiting),
-            map_runs,
-        };
+        return (
+            Run {
+                status: super::EXECUTION_STATUS_RUNNING,
+                output: None,
+                error: None,
+                cause: None,
+                steps,
+                elapsed: end,
+                waiting: Some(waiting),
+                map_runs,
+            },
+            applied,
+        );
     }
 
-    match branch.outcome {
+    let run = match branch.outcome {
         // A state's input and output is a JSON DOCUMENT: when the document the run
         // ended with is the one the caller wrote — no state transformed it — the
         // caller's own BYTES are what the execution reports, rather than a
         // re-encoding of a parsed copy. A document the definition built is reported
         // in the encoding the walk produced it in.
         Ok(value) if value == input_value => {
-            succeeded(steps, branch.end, input.to_string()).with_map_runs(map_runs)
+            succeeded(steps, end, input.to_string()).with_map_runs(map_runs)
         }
-        Ok(value) => succeeded(steps, branch.end, value.to_string()).with_map_runs(map_runs),
-        Err(failure) => failed(steps, branch.end, failure).with_map_runs(map_runs),
-    }
+        Ok(value) => succeeded(steps, end, value.to_string()).with_map_runs(map_runs),
+        Err(failure) => failed(steps, end, failure).with_map_runs(map_runs),
+    };
+    (run, applied)
 }
 
 /// The run of a definition that ended at a `Succeed` state or at `"End": true`.
@@ -2211,6 +2355,22 @@ struct Interpreter {
     /// order they were entered. Bounded by [`MAX_STATE_TRANSITIONS`], which every
     /// `Map` state spends from.
     map_runs: Vec<StartedMapRun>,
+    /// The reply a worker made to the activity task this walk is CONTINUING from,
+    /// when it is one: the state the reply names produces that result instead of
+    /// suspending. Taken when it is applied, so one reply answers one task.
+    reply: Option<ActivityReply>,
+    /// Where the reply was applied, once it has been: what the walk did BEFORE that
+    /// point already happened under an earlier call, so [`interpret`] reports only
+    /// what follows it.
+    resumed: Option<Resumed>,
+}
+
+/// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
+/// the offset into the walk at which the replying state was entered.
+#[derive(Debug, Clone, Copy)]
+struct Resumed {
+    index: usize,
+    at: Duration,
 }
 
 /// How the items of ONE `Map` attempt turned out, counted as they are run.
@@ -2484,7 +2644,7 @@ impl Interpreter {
                 Err(Failure { error, cause }.at(at))
             }
             "Map" => self.map_state(name, state, raw, effective, &context, at),
-            "Task" => self.activity_task_state(name, state, effective, &context, at),
+            "Task" => self.activity_task_state(name, state, &raw, effective, &context, at),
             // `Parallel` is the only type left: the list above is exhaustive.
             _ => self.parallel_state(name, state, raw, effective, &context, at),
         }
@@ -2500,10 +2660,15 @@ impl Interpreter {
     /// own `TimeoutSeconds`/`HeartbeatSeconds` bound how long it may stay
     /// outstanding. A `Resource` naming any OTHER integration is a call to another
     /// service, which this process does not make.
+    ///
+    /// A walk CONTINUING from a worker's reply to this state's task applies that reply
+    /// here instead of suspending: the reply is the state's result, so the state's own
+    /// result-side data flow places it and the walk goes on to its `Next`.
     fn activity_task_state(
         &mut self,
         name: &str,
         state: &Map<String, Value>,
+        raw: &Value,
         effective: Value,
         context: &Value,
         at: Duration,
@@ -2549,10 +2714,34 @@ impl Interpreter {
         };
         self.push("TaskStateEntered", name, at);
         self.push("ActivityScheduled", name, at);
+        // A worker has already answered THIS state's task: the reply is that task's
+        // result — "the JSON output of the task" — so the state's own result-side data
+        // flow (`ResultSelector`, `ResultPath`, `OutputPath`) is applied to it and the
+        // walk carries on to the state's `Next`, instead of suspending again. The
+        // steps up to here are what the call that suspended the walk already recorded,
+        // which is what [`Resumed::index`] marks.
+        let replied = match &self.reply {
+            Some(reply) if reply.state_name == name => self.reply.take(),
+            _ => None,
+        };
+        if let Some(reply) = replied {
+            self.resumed = Some(Resumed {
+                index: self.steps.len(),
+                at,
+            });
+            self.push("ActivitySucceeded", name, at);
+            let value = self
+                .place_result(state, raw, reply.result, context, true)
+                .map_err(|failure| failure.at(at))?;
+            self.push("TaskStateExited", name, at);
+            let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
+            return Ok(StateStep { value, at, next });
+        }
         self.waiting = Some(ScheduledActivity {
             activity_arn: resource.to_string(),
             state_name: name.to_string(),
             input: input.clone(),
+            raw_input: raw.clone(),
             at,
             timeout_seconds,
             heartbeat_seconds,
@@ -4928,6 +5117,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TestState` starts nothing: it reports what one state computes, and the
         // Map Runs a Distributed Map starts belong to an execution.
         map_runs: Vec::new(),
+        // `TestState` continues no execution: a state whose work is an invocation is
+        // answered by the request's own `mock`, not by a worker's reply.
+        reply: None,
+        resumed: None,
     };
     interpreter.trial(test, &raw, inspection)
 }
