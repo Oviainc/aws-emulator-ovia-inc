@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterWebhookWithThirdParty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterWebhookWithThirdParty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterWebhookWithThirdParty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## The rule this handler is
+//!
+//! "Removes the connection between the webhook that was created by CodePipeline and
+//! the external tool with events to be detected": what the call names is a webhook of
+//! this account, by the name `PutWebhook` stored it under, so the name is RESOLVED
+//! against the stored webhooks and a name no stored webhook carries is refused with
+//! the error the model declares for exactly that condition —
+//! `WebhookNotFoundException` ("The specified webhook was entered in an invalid format
+//! or cannot be found"), the only outcome besides `ValidationException` this operation
+//! models.
+//!
+//! The connection itself is held by the external tool, not by this service: this
+//! emulator reaches no external tool and serves no webhook trigger plane, so there is
+//! nothing of a connection here to drop, and the acceptance asserts only what it
+//! checked — that the account holds a webhook of that name, targeting an action this
+//! operation supports. The webhook itself is left exactly as it is: deleting one is
+//! `DeleteWebhook`.
+//!
+//! The support is stated by the operation itself — "Currently supported only for
+//! webhooks that target an action type of GitHub" — so a webhook whose target action
+//! declares any other provider is refused with `ValidationException`, the other error
+//! the operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +150,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterWebhookWithThirdParty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterWebhookWithThirdPartyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // `webhookName` is not a modelled `@required` member, so a request carrying
+        // none reaches here: there is no webhook for it to name, and the operation
+        // models `ValidationException` for a request in an invalid format.
+        let Some(name) = input.webhook_name.as_deref() else {
+            return Err(DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "webhookName must name the webhook to deregister".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Resolved against the stored webhooks under ONE guard, so the name and what
+        // the webhook targets are read from one snapshot of the store: a well-formed
+        // name the account holds no webhook for is a terminal, handleable condition the
+        // model has an error for. `WebhookNotFoundException` models no `message`
+        // member, so the code is the whole refusal.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterWebhookWithThirdParty"))
+        // "Currently supported only for webhooks that target an action type of
+        // GitHub": what a webhook targets is the action its `targetPipeline` and
+        // `targetAction` name, so the question is put to the store through the one rule
+        // both third-party webhook operations ask it with. A webhook targeting anything
+        // else is a request this operation does not support, which is the condition its
+        // `ValidationException` states.
+        let supported = {
+            let store = state.lock();
+            store
+                .webhooks
+                .get(name)
+                .map(|webhook| store.webhook_targets_third_party(&webhook.definition))
+        };
+        match supported {
+            None => {
+                return Err(
+                    DeregisterWebhookWithThirdPartyErrorModeled::WebhookNotFoundException(
+                        WebhookNotFoundException {},
+                    )
+                    .into(),
+                )
+            }
+            Some(false) => {
+                return Err(
+                    DeregisterWebhookWithThirdPartyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "Webhook {name} does not target an action type of {}, and \
+                                 deregistering a webhook with a third party is supported \
+                                 only for those",
+                                crate::state::PROVIDER_GITHUB
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Some(true) => {}
+        }
+
+        Ok(DeregisterWebhookWithThirdPartyOutput {})
     }
 }
