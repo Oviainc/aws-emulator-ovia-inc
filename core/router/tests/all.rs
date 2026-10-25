@@ -133,6 +133,12 @@ mod fis_execution_role_permissions;
 mod fis_execution_role_trust;
 #[path = "all/forecast_signing_name_routing.rs"]
 mod forecast_signing_name_routing;
+// Declared HERE, in the sorted list at its own name, rather than at the head or the tail
+// of this file: both of those are where every concurrently landing suite puts its line, so
+// a declaration there conflicts with all of them, while these neighbouring lines are
+// stable.
+#[path = "all/guardduty_runtime_coverage.rs"]
+mod guardduty_runtime_coverage;
 // Declared HERE, in the sorted list, rather than appended at the end of this file: the
 // tail is where every concurrently landing router suite appends, so a line added there
 // conflicts with all of them, while these neighbouring lines are stable.
