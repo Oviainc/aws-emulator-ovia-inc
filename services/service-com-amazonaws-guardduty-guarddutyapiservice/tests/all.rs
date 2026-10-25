@@ -53,6 +53,8 @@ mod investigation_lifecycle;
 mod investigation_listing;
 #[path = "all/invitation_count.rs"]
 mod invitation_count;
+#[path = "all/invitation_delete.rs"]
+mod invitation_delete;
 #[path = "all/invitation_listing.rs"]
 mod invitation_listing;
 #[path = "all/ip_set_lifecycle.rs"]

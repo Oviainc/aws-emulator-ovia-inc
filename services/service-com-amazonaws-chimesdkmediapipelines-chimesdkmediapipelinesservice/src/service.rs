@@ -45,6 +45,15 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// This service's own `aws.api#service$endpointPrefix`, the name that identifies it
+/// among the six services that sign as `chime`.
+///
+/// Source: `smithy_query(query="service_info", model_path="services/\
+/// service-com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice/\
+/// smithy-model/com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice.json")`
+/// — `awsService.endpointPrefix`.
+const OWN_ENDPOINT_PREFIX: &str = "media-pipelines-chime";
+
 /// The `com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +83,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `chime` — a signing name it SHARES with the five other
+        // Amazon Chime services in this workspace, each of which serves its OWN endpoint
+        // (`chime`, `identity-chime`, `meetings-chime`, `messaging-chime`,
+        // `voice-chime`). The router resolves a request's routing key from the SigV4
+        // credential scope first, so all six see the key `chime`: claiming on the signing
+        // name alone makes every one of them a claimant for every one of the others'
+        // requests, and the router — which refuses rather than guesses — answers
+        // `500 AmbiguousService` for ALL of it, including this service's own
+        // `/sdk-media-pipelines` traffic.
+        //
+        // So the claim is keyed on what identifies ONE service: the endpoint the request
+        // addresses, and failing that this model's own URI path space. That rule, and the
+        // readers for the path spaces the family shares, live once in `service-common`.
+        //
+        // Every path space this model binds is its own except `/tags`, which five of the
+        // six publish identically and which is resolved by endpoint prefix only — see
+        // `chime_family` — so there is no shared space left for this service to claim on
+        // a request that names no endpoint.
+        service_common::chime_family::claims_chime_family_request(
+            parts,
+            OWN_ENDPOINT_PREFIX,
+            crate::ROUTE_PATH_SEGMENTS,
+            |_| false,
+        )
     }
 
     fn override_operation(

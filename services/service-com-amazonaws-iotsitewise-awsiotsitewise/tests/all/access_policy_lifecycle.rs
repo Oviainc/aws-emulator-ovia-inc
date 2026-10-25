@@ -154,8 +154,8 @@ fn create_body(case: &PolicyCase) -> Value {
 }
 
 /// Create a portal and return its id: the Monitor resource a portal-scoped
-/// policy is about.
-async fn create_portal(router: &MultiServiceRouter, name: &str) -> String {
+/// policy is about, and the portal a project is created in.
+pub(crate) async fn create_portal(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "POST",

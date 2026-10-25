@@ -159,7 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListUsersErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -199,6 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read: it reports the persisted users and writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any user is reported. The resource the decision is made
+        // on is the user collection this request addresses — the account's `user`
+        // resource type under the path prefix being listed.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_USERS,
+            &crate::state::user_arn(&path_prefix, ""),
+        )?;
+
         let tail = store.users.range::<str, _>((
             match &resume_after {
                 Some(key) => ::std::ops::Bound::Excluded(key.as_str()),

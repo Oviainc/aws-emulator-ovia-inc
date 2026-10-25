@@ -11,20 +11,17 @@
 //! stub issue), so seeding is how a scraper exists to delete at all — and it is the same
 //! record the handler reads, not a second copy of it.
 //!
-//! `DescribeScraper` is a scaffold too (its own stub issue), and reporting a
-//! `ScraperDescription` needs the `scrapeConfiguration` only `CreateScraper` can persist,
-//! so the deletion is read back through `ListScrapers`, which is implemented and reports
-//! the stored record.
+//! The deletion is read back through `ListScrapers`, which reports the stored record.
 
 use crate::scraper_listing::{
-    dataset_destination, eks_source, listed, scraper, workspace_destination,
+    dataset_destination, eks_source, listed, scraper, seed, workspace_destination,
 };
 use crate::workspace_lifecycle::{text, wait_for_due_transition, Amp};
 use service_com_amazonaws_amp_amazonprometheusservice::ops::types::{
     Source, VpcConfiguration, SCRAPER_STATUS_CODE_VALUES,
 };
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    Scraper, SCRAPER_NOT_FOUND_MESSAGE, SCRAPER_RESOURCE_TYPE, STATUS_ACTIVE, STATUS_DELETING,
+    SCRAPER_NOT_FOUND_MESSAGE, SCRAPER_RESOURCE_TYPE, STATUS_ACTIVE, STATUS_DELETING,
 };
 
 /// A VPC source — the `Source` union's other variant, so the rule is exercised on a
@@ -49,14 +46,6 @@ async fn delete(
         None => format!("/scrapers/{scraper_id}"),
     };
     amp.call("DELETE", &uri, region, "").await
-}
-
-/// Seed one scraper into the store the mounted service reads.
-fn seed(amp: &Amp, record: &Scraper) {
-    amp.store()
-        .lock()
-        .scrapers
-        .insert(record.scraper_id.clone(), record.clone());
 }
 
 /// The stored status of one scraper, or `None` once the store no longer holds it.

@@ -221,6 +221,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A web ACL that is still in front of a protected resource is in USE, and
+        // "WAF couldn’t perform the operation because your resource is being used by
+        // another resource or it’s associated with another resource"
+        // (`WAFAssociatedItemException`, this operation's own modelled error) is what
+        // that refusal is: the association has to be taken away first.
+        let web_acl_arn = entry.web_acl.arn.clone();
+        if !state.protected_resources(&web_acl_arn).is_empty() {
+            crate::state::audit(
+                "DeleteWebACL",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFAssociatedItemException",
+            );
+            return Err(DeleteWebACLErrorModeled::WAFAssociatedItemException(
+                crate::state::associated_item_exception(),
+            )
+            .into());
+        }
+
         state.remove_web_acl(&input.scope, &input.id);
         crate::state::audit(
             "DeleteWebACL",

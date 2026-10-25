@@ -224,7 +224,11 @@ impl Emulator {
 /// Percent-encode a value for a URI path segment or query value, the way an AWS SDK
 /// encodes an `@httpLabel`: everything outside RFC 3986's unreserved set, so an ARN's
 /// `:` and `/` are escaped and the whole ARN stays inside one segment.
-fn encode(value: &str) -> String {
+///
+/// `pub(crate)` because the sibling suites in this ONE test binary (`tests/all.rs`) all
+/// address the same restJson1 surface and must encode a label identically; a second copy
+/// could drift from this one.
+pub(crate) fn encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
         match byte {
@@ -237,8 +241,9 @@ fn encode(value: &str) -> String {
     out
 }
 
-/// Assemble a query string from already-decoded pairs.
-fn query(params: &[(&str, String)]) -> String {
+/// Assemble a query string from already-decoded pairs. `pub(crate)` for the reason
+/// [`encode`] is.
+pub(crate) fn query(params: &[(&str, String)]) -> String {
     if params.is_empty() {
         return String::new();
     }

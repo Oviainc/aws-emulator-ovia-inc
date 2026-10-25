@@ -39,7 +39,16 @@ use crate::virtual_cluster_scheduler_status::{
 /// `PATCH /virtualclusters/{id}`, carrying `scheduler` as the `schedulerConfiguration`
 /// when the row has one. A row with none omits the member entirely, which is a different
 /// request from an empty structure on the wire and (by RULE 1) the same statement.
-async fn update_cluster(emr: &Emr, id: &str, token: &str, scheduler: Option<Value>) -> Answer {
+///
+/// `pub(crate)` because [`crate::virtual_cluster_queue_depth`] installs a limit through
+/// this same endpoint: one definition of the request, so no two suites can disagree about
+/// what an update looks like.
+pub(crate) async fn update_cluster(
+    emr: &Emr,
+    id: &str,
+    token: &str,
+    scheduler: Option<Value>,
+) -> Answer {
     let mut body = json!({"clientToken": token});
     if let (Some(target), Some(scheduler)) = (body.as_object_mut(), scheduler) {
         target.insert("schedulerConfiguration".to_string(), scheduler);

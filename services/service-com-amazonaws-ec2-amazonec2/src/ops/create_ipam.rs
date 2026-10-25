@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIpam
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIpam`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: creates an IPAM from the request, stores it as the modelled [`Ipam`]
+//! shape together with the two default scopes, the default resource discovery and that
+//! discovery's association AWS creates with it (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_ipam`]), and answers it in
+//! `create-in-progress` with the instant the clock owes all four `create-complete`
+//! recorded beside it. A replayed `ClientToken` answers with the IPAM that token minted,
+//! or refuses with `IdempotentParameterMismatch` when the rest of the request differs.
+//! This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIpam::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIpam` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIpamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIpam"))
+        use crate::state;
+
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency
+        // of the request" (`CreateIpamRequest$ClientToken`). The model declares no
+        // `@length` on it, so the bound every client token in this crate is held to is
+        // applied here — a stored token is kept for the process's lifetime.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "IPAM is offered in a Free Tier and an Advanced Tier" (`IpamTier`, one of `free`
+        // | `advanced`), and the metered account is one of `IpamMeteredAccount`'s two
+        // members. Both are MODELLED enums, so a word outside either is already refused
+        // before this handler runs; what is left for the handler is the default each one
+        // takes when the request names neither.
+        let tier = input.tier.as_deref().unwrap_or(state::DEFAULT_IPAM_TIER);
+        let metered_account = input
+            .metered_account
+            .as_deref()
+            .unwrap_or(state::DEFAULT_IPAM_METERED_ACCOUNT);
+
+        // "The operating Regions for the IPAM. Operating Regions are Amazon Web Services
+        // Regions where the IPAM is allowed to manage IP address CIDRs"
+        // (`CreateIpamRequest$OperatingRegions`). A Region a REQUEST names is held to the
+        // catalog itself — [`crate::state::commercial_regions`], the Regions of the `aws`
+        // partition this emulator's ARNs name — the way an instance type is held to the
+        // offered catalog; the grammar alone is what the Region in a credential scope is
+        // held to. They are also a SET, and the Region the IPAM is created in belongs to it
+        // whether or not the request names it: it is the IPAM's home Region
+        // (`Ipam$IpamRegion`), and an IPAM that did not operate in its own Region could
+        // manage nothing there. So a name the set already holds adds nothing rather than
+        // being stored twice, and the model's `len 0..50` has already bounded how many may
+        // be named.
+        let region = state::request_region(ctx.parts());
+        let mut operating_regions: Vec<String> = vec![region.clone()];
+        let catalog = state::commercial_regions();
+        for requested in input.operating_regions.iter().flatten() {
+            let Some(region_name) = requested
+                .region_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(state::missing_parameter(
+                    "An operating region must have a region name",
+                ));
+            };
+            if !catalog.contains(&region_name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({region_name}) for parameter operatingRegion is invalid. \
+                     This is not a valid Region name."
+                )));
+            }
+            if !operating_regions.iter().any(|held| held == region_name) {
+                operating_regions.push(region_name.to_string());
+            }
+        }
+
+        // "The key/value combination of a tag assigned to the resource"
+        // (`CreateIpamRequest$TagSpecifications`) — the only resource type this action tags
+        // is the IPAM it creates, and the tag payload's own bounds (the count per resource,
+        // each key and value's length, no key twice, nothing in the reserved namespace) are
+        // applied by the one shared reader every create in this crate uses.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM,
+            Self::NAME,
+        )?;
+
+        let spec = state::IpamSpec {
+            region,
+            description: input.description.clone(),
+            operating_regions,
+            tier: tier.to_string(),
+            metered_account: metered_account.to_string(),
+            // "This option is disabled by default" (`CreateIpamRequest$EnablePrivateGua`).
+            enable_private_gua: input.enable_private_gua.unwrap_or(false),
+            tags,
+            client_token: input.client_token.clone(),
+        };
+        let payload_bytes = state::ipam_payload_bytes(&spec);
+
+        let ec2_state = state::require_service_state(&*self.engine)?;
+        let mut store = ec2_state.lock();
+
+        // Idempotency: one client token names the one IPAM it minted, so a replay reports
+        // that IPAM and creates nothing. Resolved BEFORE the ceilings and the dry run
+        // below, because a replay stores nothing — so it is charged nothing — and because a
+        // replay the token cannot serve is a request that would NOT have succeeded.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.ipam_client_tokens.get(token).cloned());
+        let replayed = match replayed {
+            None => None,
+            Some(ipam_id) => {
+                let ipam = store.ipams.get(&ipam_id).cloned().ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names IPAM '{ipam_id}', which is not stored"
+                    ))
+                })?;
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different parameter it names an IPAM the caller did not
+                // ask for, which EC2 refuses rather than answers, the way every other
+                // create in this crate that reads a client token does.
+                if !same_request(&ipam, &spec) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(ipam)
+            }
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if replayed.is_none() && !store.has_ipam_capacity() {
+            return Err(state::ipam_limit_exceeded());
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`CreateIpamRequest$DryRun`). Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The IPAM that token already minted, exactly as it is stored now.
+        if let Some(ipam) = replayed {
+            return Ok(CreateIpamOutput { ipam: Some(ipam) });
+        }
+
+        // `insert_ipam` records the request's client token against the IPAM it mints, so
+        // the replay above and this create cannot disagree about which IPAM a token names.
+        // It answers `None` when the store cannot hold the IPAM together with the two
+        // default scopes that come up with it, which is the same refusal the count ceiling
+        // above gives.
+        let Some(ipam_id) = store.insert_ipam(spec) else {
+            return Err(state::ipam_limit_exceeded());
+        };
+
+        // The answer is the record as it was stored, so `CreateIpam` and `DescribeIpams`
+        // cannot drift apart.
+        let Some(ipam) = store.ipams.get(&ipam_id).cloned() else {
+            return Err(state::internal_error(
+                "the IPAM just created could not be read back",
+            ));
+        };
+        Ok(CreateIpamOutput { ipam: Some(ipam) })
     }
+}
+
+/// Does `ipam` — the IPAM a replayed `ClientToken` names — hold what THIS request asks for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with an IPAM
+/// the caller did not ask for; the same contract `create_ipam_pool`'s `same_request` has for
+/// a pool. The members this service derives (the ids, the ARN, the owner, the home Region,
+/// the states and the counts) are not compared: they follow from the ones that are — except
+/// the home Region, which is the Region the REQUEST was signed for, so the same token sent
+/// to another Region asks for an IPAM homed there rather than for this one. The operating
+/// Regions are a SET, so the order a request names them in is not a difference.
+fn same_request(ipam: &Ipam, spec: &crate::state::IpamSpec) -> bool {
+    let sorted = |mut values: Vec<String>| {
+        values.sort();
+        values
+    };
+    let tag_pairs = |tags: &[Tag]| {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    ipam.ipam_region.as_deref() == Some(spec.region.as_str())
+        && ipam.description == spec.description
+        && ipam.tier.as_deref() == Some(spec.tier.as_str())
+        && ipam.metered_account.as_deref() == Some(spec.metered_account.as_str())
+        && ipam.enable_private_gua == Some(spec.enable_private_gua)
+        && sorted(
+            ipam.operating_regions
+                .iter()
+                .flatten()
+                .filter_map(|region| region.region_name.clone())
+                .collect(),
+        ) == sorted(spec.operating_regions.clone())
+        && tag_pairs(ipam.tags.as_deref().unwrap_or_default()) == tag_pairs(&spec.tags)
 }

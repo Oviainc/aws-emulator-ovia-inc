@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannelFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannelFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannelFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the channel flow [`crate::state`] holds under the `ChannelFlowArn` the request
+//! names — the processors, name and timestamps `CreateChannelFlow` stored. Reporting only
+//! — it writes nothing.
+//!
+//! An ARN that names no channel flow this account holds is answered with the modelled
+//! `ForbiddenException` (HTTP 403, `Code` `Forbidden`): this operation's error set carries
+//! no `NotFoundException` (see the modelled contract below), so the terminal client error
+//! the service states for an ARN it cannot resolve for the caller is that one. A 5xx would
+//! say the service failed, and an SDK would retry it.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +149,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannelFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannelFlow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeChannelFlowErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        let channel_flow = store
+            .channel_flows
+            .get(&input.channel_flow_arn)
+            .ok_or_else(|| {
+                // No `NotFoundException` is modelled for this operation, so an ARN that
+                // resolves to no channel flow of an app instance this caller can reach is
+                // the modelled client refusal below — a TERMINAL 403, not a retryable
+                // server fault.
+                DescribeChannelFlowErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::UNRESOLVABLE_APP_INSTANCE.to_string()),
+                })
+            })?;
+
+        Ok(DescribeChannelFlowOutput {
+            channel_flow: Some(channel_flow.to_channel_flow()),
+        })
     }
 }

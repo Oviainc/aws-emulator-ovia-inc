@@ -116,7 +116,7 @@ fn stored_user(password_permanent: bool, password_set_at: Option<SystemTime>) ->
         user_last_modified_date: created,
         groups: std::collections::BTreeSet::new(),
         devices: std::collections::BTreeMap::new(),
-        pending_attribute_verifications: std::collections::BTreeMap::new(),
+        outstanding_codes: std::collections::BTreeMap::new(),
     }
 }
 
@@ -399,6 +399,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
                 username: "alice".to_string(),
                 challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
                 expires_at: *expires_at,
+                code: None,
             },
         );
     }
@@ -411,6 +412,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
             username: "bob".to_string(),
             challenge_name: "NEW_PASSWORD_REQUIRED".to_string(),
             expires_at: now + Duration::from_secs(180),
+            code: None,
         },
     );
 

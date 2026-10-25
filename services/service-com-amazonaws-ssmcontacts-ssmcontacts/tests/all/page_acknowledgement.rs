@@ -66,8 +66,8 @@ pub(crate) const CHANNELS: &[(&str, &str, &str)] = &[
     ("voice", "VOICE", "+15550101"),
 ];
 
-/// A well-formed `SsmContactsArn` for a contact channel nothing ever created, so a plan can
-/// target a channel the store does not hold.
+/// A well-formed `SsmContactsArn` for a contact channel nothing ever created, so a request
+/// can name a channel the store does not hold.
 fn absent_channel_arn() -> String {
     format!(
         "arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:contact-channel/oncall-primary/\
@@ -93,8 +93,8 @@ struct Fixture {
     /// An escalation plan whose second stage targets `primary`, so its engagement reaches
     /// `primary`'s channels through a contact target, 7 minutes in.
     escalation: String,
-    /// A contact whose plan targets one real channel and one channel the store does not
-    /// hold.
+    /// A contact whose plan targets one channel the store still holds and one it no longer
+    /// does, because the channel that target names was DELETED after the plan was written.
     partial: String,
     /// A contact whose plan targets no channel at all.
     silent: String,
@@ -206,17 +206,46 @@ async fn fixture(emulator: &Emulator) -> Fixture {
             json!({
                 "Alias": "oncall-secondary",
                 "Type": "PERSONAL",
-                "Plan": {"Stages": [{
-                    "DurationInMinutes": 1,
-                    "Targets": [
-                        channel_target(&channels[2]),
-                        channel_target(&absent_channel_arn()),
-                    ],
-                }]},
+                "Plan": {"Stages": []},
             }),
             "the suite's partially resolvable plan",
         )
         .await;
+
+    // A plan target can only be written while the channel it names exists, so the way a
+    // stored plan comes to name a channel the store does not hold is a DELETE after the
+    // write: "deleting a contact channel removes it from the contact's engagement plan, but
+    // the stage that includes the channel will be ignored" is what the delete documents.
+    let doomed = emulator
+        .create_channel(
+            json!({
+                "ContactId": primary,
+                "Name": "pager",
+                "Type": "SMS",
+                "DeliveryAddress": {"SimpleAddress": "+15550102"},
+            }),
+            "the channel the partially resolvable plan loses",
+        )
+        .await;
+    set_plan(
+        emulator,
+        &partial,
+        json!({
+            "Stages": [{
+                "DurationInMinutes": 1,
+                "Targets": [channel_target(&channels[2]), channel_target(&doomed)],
+            }]
+        }),
+        "the partially resolvable plan",
+    )
+    .await;
+    let (status, body) = emulator
+        .call("DeleteContactChannel", json!({"ContactChannelId": doomed}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "the fixture's doomed channel must be deleted, got {status} {body:?}"
+    );
 
     let silent = emulator
         .create_contact(

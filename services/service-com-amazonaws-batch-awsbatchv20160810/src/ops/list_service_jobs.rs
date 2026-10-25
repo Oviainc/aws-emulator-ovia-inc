@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Lists the service jobs of ONE job queue, the only selector this operation documents
+//! ("The name or ARN of the job queue with which to list service jobs"), newest first by
+//! `createdAt` and paginated through `maxResults`/`nextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Filtering follows the model's own docs: with no `filters`, `jobStatus` selects the
+//! status and only `RUNNING` service jobs are returned when it is absent; with a `filters`
+//! entry, `jobStatus` is ignored except alongside `SHARE_IDENTIFIER` or
+//! `QUOTA_SHARE_NAME`, only one filter may be used at a time, and the documented filter
+//! names are `JOB_NAME` (case-insensitive, `*` suffix matches a prefix),
+//! `BEFORE_CREATED_AT`, `AFTER_CREATED_AT`, `SHARE_IDENTIFIER` and `QUOTA_SHARE_NAME`.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +174,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceJobs"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                ListServiceJobsErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+
+        // A job queue is what this operation lists the service jobs OF, so a request that
+        // names none selects nothing to list and is refused the way Batch's frontend
+        // refuses a missing identifier, inside the envelope naming the refused call's id.
+        let Some(reference) = input
+            .job_queue
+            .as_deref()
+            .filter(|reference| !reference.is_empty())
+        else {
+            return Err(ListServiceJobsErrorModeled::ClientException(
+                batch::client_exception_enveloped("Job queue name is required."),
+            )
+            .into());
+        };
+
+        // `maxResults`: "This value can be between 1 and 100." A plain `Integer` in the
+        // model, so the published bound is applied here.
+        if let Some(requested) = input.max_results.filter(|requested| {
+            !(batch::MIN_LIST_SERVICE_JOBS_RESULTS..=batch::MAX_LIST_SERVICE_JOBS_RESULTS)
+                .contains(requested)
+        }) {
+            return Err(ListServiceJobsErrorModeled::ClientException(batch::client_exception(
+                format!(
+                    "maxResults {requested} must be between {} and {}",
+                    batch::MIN_LIST_SERVICE_JOBS_RESULTS,
+                    batch::MAX_LIST_SERVICE_JOBS_RESULTS
+                ),
+            ))
+            .into());
+        }
+
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // the transitions it materialised are published below (that call reaches another
+        // service in-process).
+        let mut jobs: Vec<batch::ServiceJob> = {
+            let mut state = state.lock();
+            // A read: this only materialises what the clock already owed at `now`, so a
+            // later caller sees exactly what this caller saw.
+            state.materialize_due(now);
+
+            // "You can specify either the name or the ARN of the queue." A reference this
+            // service holds no queue for selects NOTHING — an empty page, not a refusal,
+            // so a caller may poll a queue before it exists.
+            match state.job_queue(reference) {
+                Some(queue) => {
+                    let queue_arn = queue.arn.clone();
+                    state
+                        .service_jobs
+                        .values()
+                        .filter(|job| job.job_queue_arn == queue_arn)
+                        .cloned()
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        };
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        let filters = input.filters.unwrap_or_default();
+        // "Only one filter can be used at a time."
+        if filters.len() > 1 {
+            return Err(ListServiceJobsErrorModeled::ClientException(batch::client_exception(
+                "Only one filter can be used at a time",
+            ))
+            .into());
+        }
+        let mut status_filter_applies = true;
+        if let Some(filter) = filters.first() {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let values = filter.values.clone().unwrap_or_default();
+            match name {
+                "JOB_NAME" => {
+                    jobs.retain(|job| {
+                        values
+                            .iter()
+                            .any(|value| batch::matches_name_filter(&job.job_name, value))
+                    });
+                    status_filter_applies = false;
+                }
+                "BEFORE_CREATED_AT" | "AFTER_CREATED_AT" => {
+                    let bounds =
+                        batch::created_at_filter_bounds(name, &values).map_err(|message| {
+                            ListServiceJobsError::from(
+                                ListServiceJobsErrorModeled::ClientException(
+                                    batch::client_exception(message),
+                                ),
+                            )
+                        })?;
+                    jobs.retain(|job| {
+                        batch::matches_created_at_filter(name, job.created_at, &bounds)
+                    });
+                    status_filter_applies = false;
+                }
+                // The two filters the model documents as usable together with `jobStatus`.
+                "SHARE_IDENTIFIER" => {
+                    jobs.retain(|job| {
+                        job.share_identifier
+                            .as_deref()
+                            .is_some_and(|identifier| values.iter().any(|value| value == identifier))
+                    });
+                }
+                "QUOTA_SHARE_NAME" => {
+                    jobs.retain(|job| {
+                        job.quota_share_name
+                            .as_deref()
+                            .is_some_and(|share| values.iter().any(|value| value == share))
+                    });
+                }
+                other => {
+                    return Err(ListServiceJobsErrorModeled::ClientException(
+                        batch::client_exception(format!("Unknown filter name {other}")),
+                    )
+                    .into());
+                }
+            }
+        }
+        if status_filter_applies {
+            // The model's own doc for `jobStatus`: "If you don't specify a status, only
+            // RUNNING jobs are returned."
+            let status = input
+                .job_status
+                .as_deref()
+                .unwrap_or(batch::SERVICE_JOB_RUNNING);
+            jobs.retain(|job| job.status == status);
+        }
+
+        // "The results are sorted by the createdAt field, with the most recent jobs being
+        // first"; the id breaks a tie, so two jobs created in the same millisecond still
+        // page in one stable order.
+        jobs.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then(left.job_id.cmp(&right.job_id))
+        });
+
+        let (page, next_token) =
+            batch::paginate(jobs, input.max_results, input.next_token.as_deref()).map_err(
+                |message| {
+                    ListServiceJobsError::from(ListServiceJobsErrorModeled::ClientException(
+                        batch::client_exception(message),
+                    ))
+                },
+            )?;
+
+        let job_summary_list = page
+            .into_iter()
+            .map(|job| ServiceJobSummary {
+                job_arn: Some(job.job_arn),
+                job_id: job.job_id,
+                job_name: job.job_name,
+                service_job_type: job.service_job_type,
+                status: Some(job.status),
+                status_reason: job.status_reason,
+                created_at: Some(job.created_at),
+                scheduled_at: job.scheduled_at,
+                started_at: job.started_at,
+                stopped_at: job.stopped_at,
+                share_identifier: job.share_identifier,
+                quota_share_name: job.quota_share_name,
+                // `isTerminated`: "This field is only present when the value is true."
+                is_terminated: job.is_terminated.then_some(true),
+                // A service job's work is dispatched to another service, which nothing
+                // here runs, so no attempt or capacity usage is invented for it.
+                latest_attempt: None,
+                capacity_usage: None,
+            })
+            .collect();
+
+        Ok(ListServiceJobsOutput {
+            job_summary_list,
+            next_token,
+        })
     }
 }
+
