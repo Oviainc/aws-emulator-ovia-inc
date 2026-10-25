@@ -25,6 +25,8 @@ mod configuration_check_reads;
 mod configuration_checks;
 #[path = "all/deregistration_window.rs"]
 mod deregistration_window;
+#[path = "all/get_database.rs"]
+mod get_database;
 #[path = "all/list_configuration_check_definitions.rs"]
 mod list_configuration_check_definitions;
 #[path = "all/list_configuration_check_operations.rs"]

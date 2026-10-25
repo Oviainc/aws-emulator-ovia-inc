@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApiKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApiKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApiKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: updates a stored API key's expiration and description in place in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApiKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApiKey"))
+        // The update is applied to stored state and judged against the clock; no
+        // request metadata beyond the deserialized input takes part, so `ctx` is unused.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApiKeyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(UpdateApiKeyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // "From the update time, the time after which the API key expires": the window
+        // the new expiration has to land in is measured from THIS call, and is judged
+        // on the submitted instant, before it is floored. An `expires` the request did
+        // not carry arrives as the modelled default, 0, and names no new expiration at
+        // all, so the stored one stands and the call updates the description alone.
+        let now = crate::state::unix_seconds();
+        let requested = (input.expires != 0).then_some(input.expires);
+        if let Some(expires) = requested {
+            let validity = expires.saturating_sub(now);
+            if !crate::state::is_api_key_validity(validity) {
+                return Err(UpdateApiKeyErrorModeled::ApiKeyValidityOutOfBoundsException(
+                    ApiKeyValidityOutOfBoundsException {
+                        message: Some(crate::state::api_key_validity_out_of_bounds_message(
+                            validity,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+        // "You can update the key as long as it's not deleted": a key its parent API
+        // does not hold is the not-found case, and nothing is written for it.
+        let Some(stored) = api.api_keys.get_mut(&input.id) else {
+            return Err(UpdateApiKeyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_KEY_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // Each member the request carries is applied to the STORED key and everything
+        // else about it is left as it was: it keeps its id and its creation order, and
+        // a new expiration carries the deletion time with it (see
+        // `crate::state::ApiKeyRecord::set_expiration`).
+        if let Some(expires) = requested {
+            stored.set_expiration(expires);
+        }
+        if let Some(description) = input.description {
+            stored.description = Some(description);
+        }
+
+        // Answer from the key this update STORED, so `ListApiKeys` reports the same one.
+        Ok(UpdateApiKeyOutput {
+            api_key: Some(stored.to_api_key()),
+        })
     }
 }

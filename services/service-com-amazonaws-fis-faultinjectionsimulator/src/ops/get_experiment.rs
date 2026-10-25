@@ -16,6 +16,11 @@
 //! therefore report the same status and the same report, and this read changes nothing a
 //! later caller would not have seen anyway.
 //!
+//! A transition the clock owed is also an event of the experiment's RUN, so this call
+//! writes the log records it materialised to the destination the experiment's template
+//! configured — the same records, at the same instants, whichever operation happened to
+//! materialise them. See [`crate::state::experiment_logs`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,16 +164,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &input.id, now)
             .await;
 
-        let mut store = state.lock();
-        let Some(record) = store.settled_experiment_mut(&input.id, now) else {
-            return Err(GetExperimentErrorModeled::ResourceNotFoundException(
-                crate::state::experiment_not_found(&input.id),
-            )
-            .into());
+        // The guard is taken, spent and RELEASED inside this block: the log records the
+        // settle produced — including anything the settle inside the report generation
+        // above materialised — are written after it, so nothing is delivered while the
+        // store is locked.
+        let (experiment, deliveries) = {
+            let mut store = state.lock();
+            let Some(record) = store.settled_experiment_mut(&input.id, now) else {
+                return Err(GetExperimentErrorModeled::ResourceNotFoundException(
+                    crate::state::experiment_not_found(&input.id),
+                )
+                .into());
+            };
+            let experiment = record.to_experiment();
+            let deliveries = store.take_pending_log_deliveries();
+            (experiment, deliveries)
         };
 
+        // The records the clock already owed, to the destination the experiment's template
+        // configured. Best effort, and never the caller's problem: see
+        // [`crate::state::experiment_logs`].
+        crate::state::experiment_logs::deliver(ctx, &region, deliveries).await;
+
         Ok(GetExperimentOutput {
-            experiment: Some(record.to_experiment()),
+            experiment: Some(experiment),
         })
     }
 }

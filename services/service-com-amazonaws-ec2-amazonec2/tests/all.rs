@@ -348,6 +348,11 @@ mod export_task_cancellation;
 // Associating a VPC with a local gateway route table, and reading the association back.
 #[path = "all/local_gateway_route_table_vpc_associations.rs"]
 mod local_gateway_route_table_vpc_associations;
+// Declared LAST for the reason the header gives: the sorted region of this file is where
+// every new ec2 suite inserts its lines. What `DeleteTags` removes from a resource of any
+// kind, and what it refuses.
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 // Giving Dedicated Hosts back: which of the named hosts `ReleaseHosts` releases, what it
 // reports per id, and what a released host still looks like through `DescribeHosts`.
 // Declared LAST for the reason the header gives.

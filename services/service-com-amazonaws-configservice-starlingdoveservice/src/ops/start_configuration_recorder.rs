@@ -174,7 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 StartConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
                     NoSuchConfigurationRecorderException {
                         message: Some(
-                            crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string(),
+                            crate::state::no_such_configuration_recorder_message(
+                                crate::state::RecorderSelector::Name,
+                            ),
                         ),
                     },
                 )

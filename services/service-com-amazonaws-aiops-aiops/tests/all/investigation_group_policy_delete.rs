@@ -255,8 +255,8 @@ async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
     for (index, document) in documents.iter().enumerate() {
         let name = format!("delete-policy-{index}");
         let arn = create_ok(&router, &region(index), &name).await;
-        // The ARN is one of the two identifier forms that resolve the group, and the
-        // one every row here addresses; the name form has its own suite
+        // The ARN is the identifier form that resolves the group, and so the one every
+        // row here addresses; the bare-label form has its own suite
         // (`investigation_group_identifier_forms.rs`).
         let identifier = arn.clone();
         let case = format!("{name} ({} byte document)", document.len());
@@ -358,15 +358,15 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
         "the two conditions must be distinguishable, got {group_absent:?} for both"
     );
 
-    // Rows: identifiers that resolve to no group at all — the bare id form (which no
-    // `{identifier}` member documents), a label nothing carries, and ARNs that differ
-    // from a stored one in exactly one field. The group's own NAME is not among them: it
-    // is the second documented form and resolves the group, which the policy-absent rows
-    // below assert.
+    // Rows: identifiers that resolve to no group at all — the bare-label forms the
+    // modelled pattern admits beside the ARN (the group's own id, the label it carries
+    // as its name, a label nothing carries) and ARNs that differ from a stored one in
+    // exactly one field.
     let arn = create_ok(&router, REGION, "policy-bearer").await;
     let id = id_of(&arn);
     for (form, identifier) in [
         ("the group's own bare id", id.clone()),
+        ("the group's own name", "policy-bearer".to_string()),
         ("a name no group carries", "no-such-group".to_string()),
         ("an id no group carries", "A".repeat(16)),
         (
@@ -404,11 +404,12 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
         );
     }
 
-    // Rows: a group that exists and carries no document — never put, and already
-    // deleted — reports the POLICY absent instead, addressed by EITHER form that
-    // resolves it: its ARN and its own name.
-    for (form, identifier) in [("arn", arn.clone()), ("name", "policy-bearer".to_string())] {
-        let case = format!("never put, via {form}");
+    // A group that exists and carries no document — never put, and already deleted —
+    // reports the POLICY absent instead, addressed by the ARN, the one identifier form
+    // that resolves it.
+    {
+        let identifier = arn.clone();
+        let case = "never put, via the arn";
         let (status, code, body) = delete_policy(&router, &identifier).await;
         assert_eq!(
             (status, code.as_str()),
@@ -421,7 +422,7 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
             "case {case}: expected the policy reported absent, got {body:?}"
         );
 
-        let case = format!("deleted twice, via {form}");
+        let case = "deleted twice, via the arn";
         let (status, code, put) = put_policy(&router, &identifier, r#"{"Version":"2012-10-17"}"#).await;
         assert_eq!(
             status, 200,

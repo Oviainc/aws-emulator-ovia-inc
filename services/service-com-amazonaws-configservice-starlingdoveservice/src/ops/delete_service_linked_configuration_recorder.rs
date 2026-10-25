@@ -228,7 +228,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteServiceLinkedConfigurationRecorderErrorModeled::NoSuchConfigurationRecorderException(
                     NoSuchConfigurationRecorderException {
-                        message: Some(crate::state::NO_SUCH_CONFIGURATION_RECORDER.to_string()),
+                        message: Some(match &selector {
+                            Selector::Arn(arn) => {
+                                crate::state::service_linked_recorder_not_found_message(
+                                    crate::state::RecorderSelector::Arn,
+                                    arn,
+                                )
+                            }
+                            Selector::ServicePrincipal(service_principal) => {
+                                crate::state::service_linked_recorder_not_found_message(
+                                    crate::state::RecorderSelector::ServicePrincipal,
+                                    service_principal,
+                                )
+                            }
+                        }),
                     },
                 )
                 .into(),

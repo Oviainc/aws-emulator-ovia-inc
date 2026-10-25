@@ -33,6 +33,8 @@ mod daemon_task_definitions;
 mod ecs_wire;
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/list_attributes.rs"]
+mod list_attributes;
 #[path = "all/list_clusters.rs"]
 mod list_clusters;
 #[path = "all/list_service_deployments.rs"]
