@@ -562,7 +562,96 @@ pub fn repository_name_exists_message(repository_name: &str) -> String {
 /// returns this constant and names neither the branch nor the repository, because
 /// a reference that resolves to a tag rather than a branch answers the very same
 /// message — an ambiguity clients are written against.
+///
+/// Whether the error body carries a message AT ALL is a per-operation property of
+/// what the service answers, not formatting latitude: `GetBranch`'s own
+/// branch-not-found body carries none (see `crate::ops::get_branch`), so that
+/// operation raises the code with no message rather than with this constant.
 pub const BRANCH_DOES_NOT_EXIST_MESSAGE: &str = "The specified branch does not exist";
+
+/// The commit specifier an operation reads when the request names none.
+///
+/// `CommitName` documents the default on every member that takes one — GetFile's
+/// and ListFileCommitHistory's "If none is provided, the head commit is used" and
+/// GetFolder's "If no specifier is provided, the folder content is returned as it
+/// exists in the HEAD commit" — so an absent specifier RESOLVES to `HEAD`
+/// ([`Repository::resolve_commit`] takes it from there, to the repository's
+/// default branch) and a refusal names `HEAD` rather than an empty string.
+pub const DEFAULT_COMMIT_SPECIFIER: &str = "HEAD";
+
+/// `CommitDoesNotExistException`'s message, built from the specifier the request
+/// was resolved against — the one place this crate words that code, for the same
+/// reason [`repository_does_not_exist_message`] is the one place it words its own.
+///
+/// The template's single slot is the commit specifier, so the message names the
+/// reference that resolved to nothing (`HEAD` for a request that named none) and
+/// NOT the repository.
+pub fn commit_does_not_exist_message(specifier: &str) -> String {
+    format!("Could not find commit {specifier}")
+}
+
+/// `ParentCommitIdOutdatedException`'s message: a FIXED sentence group carrying
+/// nothing from the request — neither the stale id nor the branch.
+///
+/// This is the optimistic-concurrency refusal every write path hits under
+/// contention, and the text states the rule and then the remediation (re-read the
+/// tip with `GetBranch`, or pull). The one place this crate words that code, so
+/// `PutFile`, `CreateCommit` and `DeleteFile` cannot word it differently.
+pub const PARENT_COMMIT_ID_OUTDATED_MESSAGE: &str =
+    "The parent commit ID is not valid because it is not the current tip of the branch. You must \
+     provide the commit ID for the tip of the branch. The most common reason for this error is \
+     that your local repository is not synchronized to the latest changes in the AWS CodeCommit \
+     repository. Either synchronize your local repo by using the git pull command, or use \
+     GetBranch to retrieve the latest commit ID for the branch, and then try again.";
+
+/// `ParentCommitIdRequiredException`'s message: a FIXED sentence pair that states
+/// the failure and then how to find the id, naming neither the branch nor the
+/// repository. The one place this crate words that code, for the write operations
+/// that refuse a request omitting `parentCommitId` on a branch that has a tip.
+pub const PARENT_COMMIT_ID_REQUIRED_MESSAGE: &str =
+    "A parent commit ID is required. Either use GetBranch to retrieve the latest commit ID for \
+     the branch, or use a Git command such as git pull or git log, and then try again.";
+
+/// `NoChangeException`'s message: a FIXED sentence group that states the rule and
+/// then the only way to make the commit the caller asked for (a git client, which
+/// is the only thing that writes an empty commit). It names no file, branch or
+/// commit from the request.
+pub const NO_CHANGE_MESSAGE: &str =
+    "Cannot create the commit. At least one change is required to create a commit, but the files \
+     in the commit are exactly the same as the files in the parent commit. If you want to create \
+     an empty commit, use a Git client.";
+
+/// `SameFileContentException`'s message: a FIXED sentence pair that states the
+/// rule and then what did NOT happen, carrying nothing from the request.
+///
+/// The single-file sibling of [`NO_CHANGE_MESSAGE`] — `PutFile` raises this code
+/// where `CreateCommit` raises `NoChangeException` — and the one place this crate
+/// words it.
+pub const SAME_FILE_CONTENT_MESSAGE: &str =
+    "The content of the file is exactly the same as the content of the file in the AWS CodeCommit \
+     repository and branch you specified. The file has not been added.";
+
+/// `DefaultBranchCannotBeDeletedException`'s message, built from the branch the
+/// request asked to delete — the one place this crate words that code.
+///
+/// The template's single slot is that branch as a FULLY QUALIFIED reference
+/// (`refs/heads/<branch>`, [`qualified_reference`]), which is how a git host names
+/// the reference it is refusing to drop.
+pub fn default_branch_cannot_be_deleted_message(branch_name: &str) -> String {
+    format!(
+        "The current default branch {} cannot be deleted",
+        qualified_reference(branch_name)
+    )
+}
+
+/// `BlobIdDoesNotExistException`'s message, built from the blob id the request
+/// asked for — the one place this crate words that code.
+///
+/// The template's single slot is that id; the repository is NOT named, because the
+/// sentence states which object the service looked for and failed to find.
+pub fn blob_id_does_not_exist_message(blob_id: &str) -> String {
+    format!("AWS CodeCommit could not find the blob {blob_id} in the repository.")
+}
 
 /// The combined size of all the file content one commit may carry, in bytes.
 /// CodeCommit documents this on `FileContentSizeLimitExceededException`: "The

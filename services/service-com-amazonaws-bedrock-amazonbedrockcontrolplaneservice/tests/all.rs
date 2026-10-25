@@ -31,6 +31,8 @@ mod guardrail_wire_shape;
 mod guardrails;
 #[path = "all/imported_models.rs"]
 mod imported_models;
+#[path = "all/inference_profiles.rs"]
+mod inference_profiles;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
 #[path = "all/model_import_jobs.rs"]

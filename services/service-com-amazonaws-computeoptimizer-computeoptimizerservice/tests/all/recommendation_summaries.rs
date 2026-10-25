@@ -547,6 +547,104 @@ async fn paging_walks_the_same_summaries_in_the_same_order() {
     }
 }
 
+/// An `accountIds` value that is not an account id names no account to summarise, so it is
+/// a bad request rather than "an account with no findings": every value past the "12-digit
+/// Amazon Web Services account ID" shape (`Scope$value`) is refused with the modelled
+/// `InvalidParameterValueException` (HTTP 400), whatever direction it misses the shape in,
+/// and the refusal is answered before the enrollment gate because it is about the request
+/// and not about what the store holds.
+#[tokio::test]
+async fn account_ids_refuses_a_value_that_is_not_a_12_digit_account_id() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    // Rows: the class of values that are not a 12-digit account id, each missing the shape
+    // in a different direction — nothing at all, too short, too long, letters, one non-digit
+    // among twelve characters, digits with separators, a signed number, surrounding
+    // whitespace, and twelve non-ASCII digits.
+    let malformed = [
+        "",
+        "123",
+        "not-an-account",
+        "12345678901",
+        "1234567890123",
+        "00000000000a",
+        "123-456-7890",
+        "+12345678901",
+        " 123456789012",
+        "123456789012 ",
+        "１２３４５６７８９０１２",
+    ];
+
+    for account_id in malformed {
+        let (status, body) = call(
+            &router,
+            "GetRecommendationSummaries",
+            json!({"accountIds": [account_id]}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {account_id:?}: a value that is not an account id must be refused, got \
+             {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case {account_id:?}: expected InvalidParameterValueException, got {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("accountIds") && message.contains("12-digit"),
+            "case {account_id:?}: the refusal must name the member and its constraint, got \
+             {message:?}"
+        );
+        assert!(
+            body["recommendationSummaries"].is_null(),
+            "case {account_id:?}: a refused request summarises nothing, got {body}"
+        );
+    }
+
+    // Contrast row: the one well-formed value this service can be asked about still reads
+    // the caller's own summaries, so the rule above refuses malformed values rather than
+    // every value.
+    let own = caller_account();
+    assert_eq!(
+        summaries_of(&get_summaries(&router, json!({"accountIds": [own.clone()]})).await),
+        summaries_of(&get_summaries(&router, json!({})).await),
+        "case {own:?}: a well-formed own account id must read the caller's own summaries"
+    );
+
+    // The refusal is about the request, so it does not wait on the enrollment gate: an
+    // account that never opted in reads nothing (403) but still gets the 400 for a value
+    // that is not an account id.
+    let not_opted_in = emulator();
+    let (status, body) = call(&not_opted_in, "GetRecommendationSummaries", json!({})).await;
+    assert_eq!(
+        status, 403,
+        "case \"not opted in\": expected 403, got {status}: {body}"
+    );
+    for account_id in malformed {
+        let (status, body) = call(
+            &not_opted_in,
+            "GetRecommendationSummaries",
+            json!({"accountIds": [account_id]}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case \"not opted in\"/{account_id:?}: the parameter refusal precedes the opt-in \
+             gate, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValueException",
+            "case \"not opted in\"/{account_id:?}: expected InvalidParameterValueException, got \
+             {body}"
+        );
+    }
+}
+
 /// Summarising is a READ: two identical calls answer identically, and reading the
 /// summaries moves neither the enrollment record nor the stored preferences.
 #[tokio::test]

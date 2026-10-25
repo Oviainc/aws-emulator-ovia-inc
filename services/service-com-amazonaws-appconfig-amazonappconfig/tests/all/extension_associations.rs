@@ -36,7 +36,7 @@ use crate::appconfig_workflow::{
     create_application, create_environment, create_profile, is_modelled_id, json_call, router,
     Answer,
 };
-use crate::extensions::{actions, create_extension, minted_id};
+use crate::extensions::{actions, create_extension, get_extension, minted_id};
 use crate::resource_tags::{arn, list_tags, pct};
 
 /// `POST /extensionassociations`.
@@ -851,3 +851,159 @@ async fn an_association_this_service_cannot_bind_is_refused() {
         String::from_utf8_lossy(&answer.body)
     );
 }
+
+/// The extension VERSION an association binds is the one the request pins — by number, or
+/// by naming that version's own ARN as the `ExtensionIdentifier` — and the extension's
+/// HIGHEST version when the request pins none: "the version number of the extension. If
+/// not specified, AppConfig uses the maximum version of the extension"
+/// (`smithy_query(query="doc",shape="CreateExtensionAssociationRequest",member="ExtensionVersionNumber")`).
+///
+/// The rows differ along how the version is selected, over an extension that holds MORE
+/// than one version — which is what makes "the maximum version" distinguishable from
+/// "version 1" — and along which resource kind the association binds.
+#[tokio::test]
+async fn the_version_an_association_binds_is_the_one_pinned_or_the_extensions_highest() {
+    let router = router();
+    let tree = tree(&router).await;
+    let name = "two-version-extension";
+    let extension_id = created_extension(&router, name).await;
+
+    // One more version under the same name: `LatestVersionNumber` is the optimistic lock on
+    // the name's current latest version, so naming 1 appends version 2.
+    let appended = create_extension(
+        &router,
+        &json!({
+            "Name": name,
+            "Actions": actions(&[ACTION_POINT_VALUES[0]]),
+            "Parameters": {
+                "mandatory": { "Required": true, "Dynamic": false },
+                "optional": { "Required": false, "Dynamic": false },
+            },
+        }),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        appended.status,
+        201,
+        "a second version of {name:?} must be created, got {} / {}",
+        appended.status,
+        String::from_utf8_lossy(&appended.body)
+    );
+    let highest = appended
+        .json()
+        .get("VersionNumber")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("the appended version answered no VersionNumber"));
+    assert!(
+        highest > 1,
+        "the fixture must hold more than one version, got {highest}"
+    );
+    let first_version_arn = get_extension(&router, &extension_id, Some(1))
+        .await
+        .string("Arn")
+        .unwrap_or_else(|| panic!("version 1 of {name:?} must report an Arn"));
+
+    // (case, the `ExtensionIdentifier`, the version the request names, the resource, the
+    // version the association must bind)
+    let rows: Vec<(&str, String, Option<i64>, String, i64)> = vec![
+        (
+            "no version named binds the highest",
+            extension_id.clone(),
+            None,
+            tree.application_arn.clone(),
+            highest,
+        ),
+        (
+            "version 1 named explicitly binds version 1",
+            extension_id.clone(),
+            Some(1),
+            tree.environment_arn.clone(),
+            1,
+        ),
+        (
+            "the first version's own ARN pins that version",
+            first_version_arn.clone(),
+            None,
+            tree.profile_arn.clone(),
+            1,
+        ),
+        (
+            "the highest named explicitly binds the highest",
+            extension_id.clone(),
+            Some(highest),
+            tree.profile_arn.clone(),
+            highest,
+        ),
+    ];
+
+    for (case, extension, version, resource, expected_version) in &rows {
+        let mut body = Map::new();
+        body.insert(
+            "ExtensionIdentifier".to_string(),
+            Value::from(extension.clone()),
+        );
+        body.insert(
+            "ResourceIdentifier".to_string(),
+            Value::from(resource.clone()),
+        );
+        if let Some(version) = version {
+            body.insert("ExtensionVersionNumber".to_string(), Value::from(*version));
+        }
+        body.insert("Parameters".to_string(), json!({ "mandatory": "yes" }));
+
+        let created = associate(&router, &Value::Object(body)).await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: CreateExtensionAssociation expected 201, got {} / {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        let created_body = created.json();
+        assert_eq!(
+            created_body
+                .get("ExtensionVersionNumber")
+                .and_then(Value::as_i64),
+            Some(*expected_version),
+            "case {case:?}: expected version {expected_version}, got {created_body}"
+        );
+        // The extension end is the ARN that extension VERSION carries, which is what the
+        // extension's own reader reports for it.
+        let version_arn = get_extension(&router, &extension_id, Some(*expected_version as i32))
+            .await
+            .string("Arn");
+        assert_eq!(
+            created_body.get("ExtensionArn").and_then(Value::as_str),
+            version_arn.as_deref(),
+            "case {case:?}: expected the bound version's own ARN, got {created_body}"
+        );
+        assert_eq!(
+            created_body.get("ResourceArn").and_then(Value::as_str),
+            Some(resource.as_str()),
+            "case {case:?}: expected the bound resource's ARN, got {created_body}"
+        );
+
+        // What the create answered is what the reader reports, so the pinned version was
+        // persisted rather than recomputed per read.
+        let id = created_body
+            .get("Id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: the create answered no Id: {created_body}"));
+        let read = get_association(&router, id).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case:?}: GetExtensionAssociation expected 200, got {} / {}",
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        assert_eq!(
+            facts(&read.json()),
+            facts(&created_body),
+            "case {case:?}: the reader must report what the create stored, got {}",
+            read.json()
+        );
+    }
+}
+

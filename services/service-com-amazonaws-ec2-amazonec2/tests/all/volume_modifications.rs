@@ -1056,9 +1056,10 @@ mod modify_volume {
     //    modification, and a request naming no target member asks for nothing;
     // 2. a target configuration outside what the model publishes FOR THE TARGET TYPE is refused
     //    with EC2's own error code and nothing is written — a target size below the volume's
-    //    existing size, a size or an IOPS rate or a throughput outside the target type's
-    //    published range or named for a type that carries none, and a Multi-Attach flag that
-    //    cannot hold together with the target type;
+    //    existing size, a size or a throughput outside the target type's published range, an
+    //    IOPS rate or a throughput named for a type that carries none, and a Multi-Attach flag
+    //    that cannot hold together with the target type; an IOPS rate outside the target type's
+    //    published range is the exception, and is NORMALIZED into that range instead;
     // 3. the CLOCK, not a caller, finishes a modification, and until it is `completed` another
     //    modification of the same volume is refused;
     // 4. `DryRun` asks whether the request WOULD have worked and writes nothing either way.
@@ -1482,7 +1483,7 @@ mod modify_volume {
     #[tokio::test]
     async fn a_target_configuration_the_model_refuses_leaves_the_volume_untouched() {
         // (case, source type, source size, create extras, modify parameters, the error code)
-        let rows: [(&str, &str, i64, Params, Params, &str); 12] = [
+        let rows: [(&str, &str, i64, Params, Params, &str); 10] = [
             (
                 // "The target volume size must be greater than or equal to the existing size of
                 // the volume" (`ModifyVolumeRequest$Size`).
@@ -1511,23 +1512,12 @@ mod modify_volume {
                 "InvalidParameterValue",
             ),
             (
-                "an IOPS rate below the target type's minimum",
-                "gp3",
-                40,
-                Vec::new(),
-                vec![p("Iops", "2999")],
-                "InvalidParameterValue",
-            ),
-            (
-                "an IOPS rate above the target type's maximum",
-                "io1",
-                100,
-                Vec::new(),
-                vec![p("Iops", "64001")],
-                "InvalidParameterValue",
-            ),
-            (
-                // "This parameter is valid only for gp3, io1, and io2 volumes" (`$Iops`).
+                // An IOPS rate OUTSIDE the target type's published range is not here: it is
+                // normalized, not refused — see
+                // [`an_out_of_range_target_iops_is_normalized_into_the_target_type_range`].
+                // A type that provisions NO IOPS is a different rule: "This parameter is
+                // valid only for gp3, io1, and io2 volumes" (`$Iops`), so there is no range
+                // to normalize into.
                 "an IOPS rate on a type that provisions none",
                 "gp2",
                 10,
@@ -1703,20 +1693,31 @@ mod modify_volume {
             }
         }
 
+        // A target IOPS rate is NORMALIZED rather than refused, so each row carries the
+        // value the type ends up provisioning: the request's own inside the published
+        // range, the nearer bound outside it.
         for (volume_type, iops_min, iops_max) in VOLUME_IOPS_RANGES {
-            for (case, iops, expected_status) in [
+            for (case, iops, expected_target) in [
                 (
                     "at the bottom of its published IOPS range",
                     i64::from(iops_min),
-                    200,
+                    i64::from(iops_min),
                 ),
-                ("one below that bottom", i64::from(iops_min) - 1, 400),
+                (
+                    "one below that bottom",
+                    i64::from(iops_min) - 1,
+                    i64::from(iops_min),
+                ),
                 (
                     "at the top of its published IOPS range",
                     i64::from(iops_max),
-                    200,
+                    i64::from(iops_max),
                 ),
-                ("one above that top", i64::from(iops_max) + 1, 400),
+                (
+                    "one above that top",
+                    i64::from(iops_max) + 1,
+                    i64::from(iops_max),
+                ),
             ] {
                 let case = format!("a {volume_type} volume {case}");
                 let router = emulator();
@@ -1735,20 +1736,101 @@ mod modify_volume {
                 )
                 .await;
                 assert_eq!(
-                    status, expected_status,
-                    "case {case:?}: expected HTTP {expected_status} for iops {iops}, got {status} \
+                    status, 200,
+                    "case {case:?}: expected HTTP 200 for iops {iops}, got {status} \
                      with body {body}"
                 );
-                if expected_status == 400 {
-                    assert_eq!(
-                        error_code(&body),
-                        "InvalidParameterValue",
-                        "case {case:?}: expected InvalidParameterValue for iops {iops}, got {body}"
-                    );
-                } else {
-                    assert_members(&case, &body, &[("targetIops", iops.to_string())]);
-                }
+                assert_members(&case, &body, &[("targetIops", expected_target.to_string())]);
             }
+        }
+    }
+
+    /// The RULE the clamp follows: `ModifyVolume`'s `Iops` is a TARGET the service
+    /// normalizes into the range the target volume type supports — a value below that
+    /// range provisions its minimum and one above it provisions its maximum — so the
+    /// request is accepted and the value actually applied always lies inside the range,
+    /// never the out-of-range one the caller sent.
+    ///
+    /// The rows differ along the volume type (every type that provisions IOPS), which side
+    /// of the range the target falls on, how far outside it falls, and whether the request
+    /// also changes the volume type — and each is read back through BOTH readers, so the
+    /// normalized value is the one stored rather than one the accept invented.
+    ///
+    /// Source of the per-type ranges: [`VOLUME_IOPS_RANGES`] (`ModifyVolumeRequest$Iops`),
+    /// read here rather than restated.
+    #[tokio::test]
+    async fn an_out_of_range_target_iops_is_normalized_into_the_target_type_range() {
+        // (case, source type, the type the request targets or "" for none, the Iops asked for)
+        let rows: [(&str, &str, &str, i64); 8] = [
+            ("a gp3 volume far below its floor", "gp3", "", 100),
+            ("a gp3 volume one below its floor", "gp3", "", 2_999),
+            ("a gp3 volume asked for no IOPS at all", "gp3", "", 0),
+            ("a gp3 volume asked for a negative rate", "gp3", "", -1),
+            ("a gp3 volume far above its ceiling", "gp3", "", 1_000_000),
+            ("an io1 volume below its floor", "io1", "", 50),
+            ("an io2 volume above its ceiling", "io2", "", 300_000),
+            // The range that bounds the target is the TARGET type's, not the source's: 100
+            // is inside io1's range and below gp3's.
+            ("an io1 volume converted to gp3", "io1", "gp3", 100),
+        ];
+
+        for (case, source_type, target_type, iops) in rows {
+            let router = emulator();
+            let effective_type = if target_type.is_empty() {
+                source_type
+            } else {
+                target_type
+            };
+            let (_, iops_min, iops_max) = VOLUME_IOPS_RANGES
+                .iter()
+                .find(|(name, _, _)| *name == effective_type)
+                .copied()
+                .expect("every type in these rows provisions IOPS");
+            let expected = iops.clamp(i64::from(iops_min), i64::from(iops_max));
+            // Large enough for every type in the table, and big enough that the size rule
+            // plays no part in the outcome.
+            let volume_id = seed_volume(&router, case, source_type, 200, Vec::new()).await;
+
+            let mut params = vec![p("VolumeId", volume_id.clone()), p("Iops", iops.to_string())];
+            if !target_type.is_empty() {
+                params.push(p("VolumeType", target_type));
+            }
+            let (status, body) = modify(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 for iops {iops}, got {status} with body {body}"
+            );
+            assert_members(case, &body, &[("targetIops", expected.to_string())]);
+            assert_state(case, &body, &RUNNING_STATES);
+
+            // Both readers report the normalized rate, and never the requested one.
+            let (status, reported) =
+                describe_modifications(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 describing the modification, got {status} with \
+                 body {reported}"
+            );
+            assert_members(case, &reported, &[("targetIops", expected.to_string())]);
+
+            let (_, described) = describe_volumes(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_members(case, &described, &[("iops", expected.to_string())]);
+
+            // And the modification the clock finishes still reports the normalized rate.
+            past_the_modification().await;
+            let (_, finished) =
+                describe_modifications(&router, &indexed("VolumeId", &[&volume_id])).await;
+            assert_members(
+                case,
+                &finished,
+                &[
+                    ("targetIops", expected.to_string()),
+                    (
+                        "progress",
+                        VOLUME_MODIFICATION_PROGRESS_COMPLETE.to_string(),
+                    ),
+                ],
+            );
         }
     }
 

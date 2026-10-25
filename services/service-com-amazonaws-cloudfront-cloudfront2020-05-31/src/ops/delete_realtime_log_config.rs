@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRealtimeLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRealtimeLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRealtimeLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the real-time log configuration a request addresses, so every later read of it
+//! answers `NoSuchRealtimeLogConfig`.
+//!
+//! The configuration is addressed by its `Name` or by its `ARN`, through the one rule
+//! [`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::addressed_realtime_log_config`]
+//! states (the NAME identifies it when a request carries both): a request naming neither
+//! is refused with `InvalidArgument`, and an identifier no stored configuration answers to
+//! with `NoSuchRealtimeLogConfig`.
+//!
+//! "You cannot delete a real-time log configuration if it's attached to a cache behavior":
+//! a configuration a stored distribution still sends its logs through is left in place and
+//! the delete is refused with `RealtimeLogConfigInUse`
+//! ([`crate::state::references_realtime_log_config`] states which attachments count).
+//!
+//! `AccessDenied` is deliberately unreachable from this handler, for the reason
+//! `CreateRealtimeLogConfig`'s is: this emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +177,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRealtimeLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRealtimeLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRealtimeLogConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+
+        // Which configuration the request addresses, by the one rule every operation that
+        // addresses one either way goes through.
+        let (name, arn) = match store
+            .addressed_realtime_log_config(input.name.as_deref(), input.arn.as_deref())
+        {
+            Ok(stored) => (stored.name.clone(), stored.arn.clone()),
+            Err(crate::state::RealtimeLogConfigAddress::NoIdentifier) => {
+                return Err(DeleteRealtimeLogConfigErrorModeled::InvalidArgument(
+                    crate::state::realtime_log_config_identifier_required(),
+                )
+                .into())
+            }
+            Err(crate::state::RealtimeLogConfigAddress::NotFound) => {
+                return Err(
+                    DeleteRealtimeLogConfigErrorModeled::NoSuchRealtimeLogConfig(
+                        crate::state::no_such_realtime_log_config(),
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // "You cannot delete a real-time log configuration if it's attached to a cache
+        // behavior": the configuration a distribution still sends its logs through stays
+        // exactly as it was, and the caller is told to detach it first. The ARN compared
+        // against is the STORED one, not one re-derived from the request.
+        if store.distribution_using_realtime_log_config(&arn).is_some() {
+            return Err(DeleteRealtimeLogConfigErrorModeled::RealtimeLogConfigInUse(
+                crate::state::realtime_log_config_in_use(),
+            )
+            .into());
+        }
+
+        store.realtime_log_configs.remove(&name);
+
+        Ok(DeleteRealtimeLogConfigOutput)
     }
 }
