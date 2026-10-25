@@ -60,7 +60,7 @@ use super::event_topics::epoch_seconds;
 /// value the boundary validator admits and the handler must resolve in the store. The
 /// first row is the id the behavioural corpus used; the rest are the same shape with
 /// different digits, including the two extremes of the alphabet.
-const ABSENT_DIRECTORY_IDS: [(&str, &str); 5] = [
+pub(crate) const ABSENT_DIRECTORY_IDS: [(&str, &str); 5] = [
     ("d-1dca5812e8", "the recorded id"),
     ("d-74acc7c03b", "another recorded id"),
     ("d-0000000000", "all zeros, the low end of the alphabet"),
@@ -92,7 +92,7 @@ const SEEDED_INSTANT: Duration = Duration::from_secs(1_700_000_000);
 
 /// A router and the engine it serves from, so a test can seed the records whose writing
 /// operations are still scaffolded.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     (emulator_on(Arc::clone(&engine)), engine)
 }
@@ -115,7 +115,7 @@ fn with_directory<T>(
 
 /// A directory created over HTTP and waited past the clock-owed stage transition, so it
 /// is in the `Active` stage every mutation below needs.
-async fn active_directory(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+pub(crate) async fn active_directory(router: &MultiServiceRouter, name: &str, case: &str) -> String {
     active_directory_in(router, REGION, name, case).await
 }
 
@@ -163,7 +163,7 @@ async fn refused_in(
 
 /// The `IpRoutesInfo` of a `ListIpRoutes` answer, keyed by the address block each entry
 /// routes.
-async fn routes_of(
+pub(crate) async fn routes_of(
     router: &MultiServiceRouter,
     directory_id: &str,
     case: &str,

@@ -220,6 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `CreatePipeline` enforces
+        // it, and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
         // `assetModelType` is optional and defaults to ASSET_MODEL.
         let model_type = input
             .asset_model_type

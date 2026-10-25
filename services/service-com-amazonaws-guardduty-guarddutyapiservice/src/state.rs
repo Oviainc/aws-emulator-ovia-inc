@@ -1374,6 +1374,31 @@ pub fn is_account_id(id: &str) -> bool {
     id.len() == ACCOUNT_ID_LEN && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Classify a LIST of account ids the caller named: `Some(message)` when an entry
+/// cannot be an account id at all, `None` when every entry is well formed.
+///
+/// One reader for every operation that takes account ids, so the form cannot drift
+/// between them, and one message — [`invalid_parameter_message`] for
+/// [`ACCOUNT_ID_MEMBER`] — because the member at fault is the same one whichever
+/// operation carried it. The whole call is refused rather than the entry reported:
+/// `UnprocessedAccounts` reports accounts that were not PROCESSED, never a request
+/// that was not understood.
+///
+/// The argument is any iterator of string-like entries, so an operation whose scope
+/// is carried by TWO lists (an include list and an exclude list, which together name
+/// one scope) chains them into one call and refuses the same way whichever list the
+/// malformed entry sits in.
+pub fn account_ids_rejection<I>(account_ids: I) -> Option<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    account_ids
+        .into_iter()
+        .any(|account_id| !is_account_id(account_id.as_ref()))
+        .then(|| invalid_parameter_message(ACCOUNT_ID_MEMBER))
+}
+
 /// The administrator account the members of this emulator's detectors belong to:
 /// the single account this emulator serves, which is the account every request it
 /// answers is signed for.

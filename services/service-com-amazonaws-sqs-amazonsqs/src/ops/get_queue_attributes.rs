@@ -204,9 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // error's code, which is why the two agree.
             if !QUEUE_ATTRIBUTE_NAME_VALUES.contains(&name.as_str()) {
                 return Err(GetQueueAttributesErrorModeled::InvalidAttributeName(
-                    InvalidAttributeName {
-                        message: Some(format!("Unknown Attribute {name}.")),
-                    },
+                    state::unknown_attribute_name(name),
                 )
                 .into());
             }

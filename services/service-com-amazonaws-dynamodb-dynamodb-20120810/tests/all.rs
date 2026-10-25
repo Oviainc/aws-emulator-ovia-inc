@@ -19,6 +19,8 @@ mod batch_and_transact_items;
 mod batch_execute_statement;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
+#[path = "all/continuous_backups.rs"]
+mod continuous_backups;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/global_secondary_indexes.rs"]
