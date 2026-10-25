@@ -260,22 +260,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::application_arn(&region, &input.application_id);
 
         // The emulator discovers nothing on the registered instances, so the only
-        // components an application has are the ones the registration described. A
-        // component is identified by the SID and type it was declared with, so two
-        // entries describing the same component are one component.
-        let mut components: Vec<crate::state::StoredComponent> = Vec::new();
-        for component in input.components_info.into_iter().flatten() {
-            let id = crate::state::component_id(&component.sid, &component.component_type);
-            if components.iter().any(|stored| stored.id == id) {
-                continue;
-            }
-            components.push(crate::state::StoredComponent {
-                id,
-                component_type: component.component_type,
-                sid: component.sid,
-                ec2_instance_id: component.ec2_instance_id,
-            });
-        }
+        // components an application has are the ones the registration described: one per
+        // `ComponentsInfo` entry, plus the SAP HANA component of the SAP system its `Sid`
+        // names — the component its databases belong to, so a `ComponentId` a later
+        // `ListDatabases` or `GetDatabase` reports is one `GetComponent` resolves.
+        let components = crate::state::registered_components(
+            input.sid.as_deref(),
+            &input.instances,
+            input.components_info.unwrap_or_default(),
+        );
 
         let application = crate::state::StoredApplication {
             id: input.application_id.clone(),

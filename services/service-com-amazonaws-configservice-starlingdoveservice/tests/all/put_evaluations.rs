@@ -93,7 +93,10 @@ impl Verdict {
 /// A Config rule whose evaluation Config performs by invoking a function of the
 /// account's own, which is the rule class that delivers its verdicts with
 /// `PutEvaluations` (`Source$Owner` `CUSTOM_LAMBDA`).
-fn custom_lambda_rule(name: &str) -> Value {
+///
+/// `pub(crate)` because every suite that drives a DELIVERED verdict over the wire needs
+/// exactly this rule (`compliance_summary_by_resource_type` is the other one).
+pub(crate) fn custom_lambda_rule(name: &str) -> Value {
     json!({
         "ConfigRule": {
             "ConfigRuleName": name,
@@ -113,7 +116,10 @@ fn custom_lambda_rule(name: &str) -> Value {
 /// The `ResultToken` Config minted when it invoked the rule `name` — the token the
 /// invocation carries to whatever performs the evaluation, read from the shared store
 /// the handler wrote it to.
-fn result_token(emulator: &Emulator, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`custom_lambda_rule`] is: a delivery cannot be
+/// driven over the wire without the token that associates it with its rule.
+pub(crate) fn result_token(emulator: &Emulator, name: &str) -> String {
     let state = emulator.engine.state::<ConfigState>();
     let store = state.lock();
     store

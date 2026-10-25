@@ -79,6 +79,12 @@
 //! [`engine::emulator_account_id`], and one addressed to any other account id
 //! stays pending for a recipient that never calls.
 //!
+//! The SENDER's own way out of a pending transfer is
+//! `CancelInputDeviceTransfer` ([`InputDeviceRecord::cancel_transfer`]):
+//! "[c]ancel an input device transfer that you have requested" ends the
+//! transfer this account started, so the device stays this account's with
+//! nothing pending on it and can be transferred again.
+//!
 //! A device's latest THUMBNAIL is one optional record on the device it is a
 //! thumbnail of ([`InputDeviceThumbnailRecord`]): the image data, the media type
 //! it is in and the instant the device last updated it — which is exactly what
@@ -829,6 +835,28 @@ impl InputDeviceRecord {
         TransferAcceptance::Accepted
     }
 
+    /// Cancel the transfer pending on this device on behalf of the account that
+    /// REQUESTED it, and report what that resolved to.
+    ///
+    /// "Cancel an input device transfer that you have requested" is what the
+    /// operation does, so the transfer a cancel ends is one this account SENT —
+    /// the direction the model calls "an input device that you are transferring
+    /// to another AWS account", read through the slice's one definition of a
+    /// transfer's direction ([`transfer_has_direction`]) rather than a second
+    /// rule beside it. Cancelling is what ENDS the transfer: nothing waits on
+    /// the recipient's decision any more, so the device stays this account's and
+    /// can be transferred again, and a second cancel has nothing left to end.
+    pub fn cancel_transfer(&mut self) -> TransferCancellation {
+        let requested_here = self.transfer.as_ref().is_some_and(|transfer| {
+            transfer_has_direction(transfer, input_device_transfer_type::OUTGOING)
+        });
+        if !requested_here {
+            return TransferCancellation::NotBeingTransferred;
+        }
+        self.transfer = None;
+        TransferCancellation::Cancelled
+    }
+
     /// The latest thumbnail this device has sent, or `None` while it has sent
     /// none — which is every device of this emulator, because no Link unit is
     /// connected to it to send one (see the module docs).
@@ -882,14 +910,28 @@ pub enum TransferAcceptance {
     NotTheRecipient(String),
 }
 
+/// What cancelling a device's pending transfer resolved to
+/// ([`InputDeviceRecord::cancel_transfer`]).
+///
+/// On the store beside [`TransferAcceptance`], for the same reason: the rule for
+/// which transfer a cancel may end belongs to the slice that holds the
+/// transfers, not to the handler that calls it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferCancellation {
+    /// The transfer this account had requested is cancelled: nothing is pending
+    /// on the device any more and it is still this account's.
+    Cancelled,
+    /// There is no transfer of this device for this account to cancel.
+    NotBeingTransferred,
+}
+
 /// How a refusal about a pending transfer names the recipient that transfer is
 /// waiting on: the account id it named, or that it named none (the
 /// `TargetCustomerId` member is optional in the model).
 ///
 /// ONE helper, so the operations that refuse something about a pending transfer
-/// — `AcceptInputDeviceTransfer` today, `RejectInputDeviceTransfer` and
-/// `CancelInputDeviceTransfer` when their own issues land — cannot word its
-/// recipient two ways. Private to the slice: every caller reads it through the
+/// — `AcceptInputDeviceTransfer` today, and `RejectInputDeviceTransfer` when
+/// its own issue lands — cannot word its recipient two ways. Private to the slice: every caller reads it through the
 /// [`TransferAcceptance::NotTheRecipient`] it is carried in.
 fn transfer_recipient(target_customer_id: Option<&str>) -> String {
     target_customer_id.map_or_else(

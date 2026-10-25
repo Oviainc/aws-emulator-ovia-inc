@@ -197,10 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_primary_email_updates(now);
         // Whether the presented address is already in use is read BEFORE the
         // target record is borrowed mutably, and it is a question about the
-        // whole store: an address another account holds, or has an accepted
-        // update for, cannot become this one's. The target's own update is
-        // still PENDING at this point, so it never conflicts with itself.
-        let address_in_use = store.primary_email_in_use(&input.primary_email);
+        // OTHER accounts in the store: an address another account holds, or has
+        // an accepted update for, cannot become this one's. The target itself
+        // is skipped on both halves of that test — the address it already
+        // holds, or is already owed, is taken from nobody, so re-affirming it
+        // is no change and no conflict.
+        let address_in_use =
+            store.primary_email_in_use_by_other(&input.primary_email, &input.account_id);
 
         // This operation acts on an update that already exists, so it creates
         // no account record: an account this emulator has never been told about

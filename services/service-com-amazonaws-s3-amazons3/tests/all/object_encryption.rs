@@ -320,11 +320,11 @@ async fn an_encryption_member_s3_could_not_honour_is_refused_and_stores_nothing(
     }
 
     // An algorithm outside the model's `ServerSideEncryption` enum is refused too — by
-    // the boundary validator, before the handler runs, through the framework's own
-    // refusal channel (`ValidationException`, HTTP 400) rather than S3's
-    // `InvalidArgument`. What this pins is that it is REFUSED rather than stored and
-    // reported back as an encryption no S3 knows; the handler carries the same guard
-    // behind it, the way `PutBucketEncryption` guards its own `SSEAlgorithm`.
+    // the boundary validator, before the handler runs, with the code S3 answers a bad
+    // header value: `InvalidArgument`, HTTP 400. What this pins is that it is REFUSED
+    // rather than stored and reported back as an encryption no S3 knows; the handler
+    // carries the same guard behind it, the way `PutBucketEncryption` guards its own
+    // `SSEAlgorithm`.
     let unmodelled_algorithm = put_object(
         &router,
         "encryption-refusals",
@@ -342,7 +342,7 @@ async fn an_encryption_member_s3_could_not_honour_is_refused_and_stores_nothing(
     );
     assert_eq!(
         unmodelled_algorithm.error_code(),
-        "ValidationException",
+        "InvalidArgument",
         "case \"an algorithm the model does not declare\": expected the boundary's refusal \
          code, got {:?}",
         unmodelled_algorithm.error_code()

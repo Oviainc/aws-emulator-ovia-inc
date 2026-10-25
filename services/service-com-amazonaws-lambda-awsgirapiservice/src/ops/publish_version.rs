@@ -352,22 +352,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.materialize(now);
 
         // "Only update the function if the revision ID matches the ID that's specified."
-        // A mismatch is the one failure `PreconditionFailedException` is modelled for:
-        // "The RevisionId provided does not match the latest RevisionId for the Lambda
-        // function or alias."
-        if let Some(expected) = input
+        // A mismatch is the one failure `PreconditionFailedException` is modelled for,
+        // and the refusal is the one fixed sentence naming the readers that report a
+        // function configuration's current revision.
+        if input
             .revision_id
             .as_deref()
-            .filter(|expected| *expected != record.config.revision_id)
+            .is_some_and(|expected| expected != record.config.revision_id)
         {
             return Err(PublishVersionErrorModeled::PreconditionFailedException(
                 PreconditionFailedException {
                     r#type: None,
-                    message: Some(format!(
-                        "The RevisionId provided ({expected}) does not match the latest \
-                         RevisionId for the Lambda function. Call the GetFunction API to \
-                         retrieve the latest RevisionId for your resource."
-                    )),
+                    message: Some(
+                        crate::state::CONFIGURATION_REVISION_PRECONDITION_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
@@ -375,22 +373,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Only publish a version if the hash value matches the value that's
         // specified." The digest is the one computed from the stored deployment package,
-        // so a function whose package this emulator holds no bytes for can match no
-        // hash at all.
+        // so a function whose package this emulator holds no bytes for can match no hash
+        // at all: the refusal reports the supplied digest beside the one $LATEST carries,
+        // or says there is none to compare against.
         if let Some(expected) = input.code_sha256.as_deref() {
             match record.config.code_sha256.as_deref() {
                 Some(stored) if stored == expected => {}
                 Some(stored) => {
-                    return Err(invalid_parameter(format!(
-                        "CodeSha256 '{expected}' does not match the SHA256 of the function's \
-                         deployment package, which is '{stored}'"
-                    )))
+                    return Err(invalid_parameter(
+                        crate::state::code_sha256_precondition_message(expected, stored),
+                    ))
                 }
                 None => {
-                    return Err(invalid_parameter(format!(
-                        "CodeSha256 '{expected}' cannot be matched: no deployment package \
-                         bytes are stored for this function, so it has no SHA256 to compare"
-                    )))
+                    return Err(invalid_parameter(
+                        crate::state::code_sha256_without_package_message(expected),
+                    ))
                 }
             }
         }

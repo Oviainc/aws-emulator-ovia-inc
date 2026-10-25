@@ -320,6 +320,66 @@ pub fn notification_rule_arn(region: &str, id: &str) -> String {
     )
 }
 
+/// The rule a notification-rule ARN names, as the ARN names it: the resource segment
+/// after `notificationrule/`, which is the `NotificationRuleId` the rule was minted
+/// with ([`notification_rule_arn`] is what writes that segment).
+///
+/// A value carrying no such segment has no id inside it, so it names the rule by itself:
+/// the member is modelled `NotificationRuleArn`, so a request that reaches a handler at
+/// all matched that shape's pattern, and nothing is parsed out of a value that did not.
+pub fn rule_id_of_arn(arn: &str) -> &str {
+    arn.split_once("notificationrule/")
+        .map_or(arn, |(_, id)| id)
+}
+
+/// The text this service answers a rule-name conflict with: ONE constant for the class,
+/// used wherever a request would take a name the account already holds.
+///
+/// A SERVICE CONSTANT: it states the name-uniqueness rule and names neither the
+/// submitted name — `NotificationRuleName` is `@sensitive`, so its value is not echoed
+/// back to a caller — nor the rule that holds it, whose id and ARN belong to a resource
+/// this caller did not name.
+///
+/// This is the text the service is known to emit for the class (the recorded conflict is
+/// `CreateNotificationRule`'s). The RENAME path — where `UpdateNotificationRule` would
+/// move a rule onto a name another rule holds — states the SAME text rather than a second
+/// variant: nothing records a separate sentence for it, and authoring one would be this
+/// emulator's wording rather than the service's. Only the error SHAPE differs there,
+/// because `UpdateNotificationRule` models no `ResourceAlreadyExistsException`
+/// (`smithy_query(query="operation",operation="UpdateNotificationRule")` lists
+/// `ConfigurationException`, `ResourceNotFoundException` and `ValidationException`), so
+/// that path answers the `ValidationException` it does model.
+pub const RULE_NAME_ALREADY_IN_USE: &str =
+    "The notification rule was not created because another notification rule already \
+     exists with the same name. Notification rule names must be unique within an AWS \
+     account. This helps prevent exceeding the maximum allowed number of notification \
+     rules.";
+
+/// How the REPORTING paths state that no rule matches the ARN a request named: the rule
+/// ID that ARN carries, and the sentence telling the caller to check it.
+///
+/// Built from the REQUEST, which is what makes it actionable — a caller reading the
+/// message learns which rule id missed — and from nothing else: no other resource and no
+/// stored value appears in it.
+pub fn no_rule_with_id(arn: &str) -> String {
+    format!(
+        "A notification rule with the following ID cannot be found: {}. Verify that the \
+         notification rule ID is correct, and then try again.",
+        rule_id_of_arn(arn)
+    )
+}
+
+/// How the MUTATING paths state the same absence: `A notification rule with the Id
+/// <identifier> was not found.`
+///
+/// `identifier` is what the calling operation names the rule by, which is the one thing
+/// that differs between them — `UpdateNotificationRule` names it by the id its ARN
+/// carries ([`rule_id_of_arn`]), `Subscribe` by the whole ARN it was given — so the slot
+/// is the caller's, not this function's.
+pub fn no_rule_with_identifier(identifier: &str) -> String {
+    format!("A notification rule with the Id {identifier} was not found.")
+}
+
 /// Mint a `NotificationRuleId`: a UUID-shaped, 36-character id (inside the modelled
 /// 1..40) derived from the account-wide creation counter and the wall clock, so two
 /// rules created from identical parameters still get distinct ids.

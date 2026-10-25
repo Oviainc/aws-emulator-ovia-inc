@@ -427,9 +427,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // query string it is declared to be and judged against an OBJECT's published
         // tag-set limits, the same seam `PutObject` judges its own header through, so one
         // header cannot mean two different things. AWS refuses these with `InvalidTag`, a
-        // code this service's model declares no shape for, so the refusal goes out through
-        // the framework's 400 `ValidationException` channel — and BEFORE anything is
-        // recorded, so a refused initiation leaves the bucket's uploads untouched.
+        // code this service's model declares no shape for, so the refusal carries the
+        // rejection's own wire code ([`crate::state::TagSetRejection::code`]) through the
+        // unmodelled channel — and is decided BEFORE anything is recorded, so a refused
+        // initiation leaves the bucket's uploads untouched.
         let tags = match input.tagging.as_deref() {
             Some(header) => {
                 match crate::state::tag_set_from_header(
@@ -438,7 +439,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ) {
                     Ok(tags) => tags,
                     Err(rejection) => {
-                        return Err(crate::scaffolded::Scaffolded::validation(
+                        return Err(crate::scaffolded::Scaffolded::unmodeled(
+                            rejection.code(),
+                            crate::state::TAG_REJECTION_STATUS,
                             rejection.to_string(),
                         ))
                     }
@@ -458,7 +461,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .storage_class
                 .clone()
                 .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
-            content_type: input.content_type.clone(),
+            // The same default a one-shot write takes: S3 never infers a type from the
+            // key, so an upload that names no `Content-Type` becomes an object stored as
+            // `binary/octet-stream`.
+            content_type: Some(
+                input
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_CONTENT_TYPE.to_string()),
+            ),
             cache_control: input.cache_control.clone(),
             content_disposition: input.content_disposition.clone(),
             content_encoding: input.content_encoding.clone(),

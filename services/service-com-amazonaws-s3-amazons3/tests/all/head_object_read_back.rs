@@ -270,10 +270,16 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
     for (case, query, expected_status, expected_code) in [
         ("the null version of an unversioned object", "versionId=null", 200, ""),
         (
-            "a version id the bucket holds no version for",
-            "versionId=abc",
+            "a WELL-FORMED version id the bucket holds no version for",
+            "versionId=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             404,
             "NoSuchVersion",
+        ),
+        (
+            "a version id that is not shaped like one",
+            "versionId=abc",
+            400,
+            "InvalidArgument",
         ),
     ] {
         let answer = send(

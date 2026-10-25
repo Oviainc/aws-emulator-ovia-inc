@@ -197,8 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let project_arn = crate::state::project_arn(&region, &input.project_name);
 
         // Checked before anything is read or written: the constraint is on the request
-        // alone, and the model cannot express it.
-        check_filter_groups(input.filter_groups.as_deref())?;
+        // alone, and the model cannot express it. The rule is the one every operation
+        // that sets a webhook's filter groups follows, so it lives in `crate::state`.
+        if let Some(message) =
+            crate::state::webhook_filter_groups_violation(input.filter_groups.as_deref())
+        {
+            return Err(invalid_input(message));
+        }
 
         // READ PASS: the project's source type decides whether a webhook can exist at
         // all, so it is read first and the request is judged against it. The write pass
@@ -316,83 +321,37 @@ fn already_exists(project_arn: &str) -> CreateWebhookError {
     .into()
 }
 
-/// Refuse a filter group no webhook event can ever satisfy.
-///
-/// AWS documents the rule on `filterGroups`: "At least one WebhookFilter in the array
-/// must specify EVENT as its type", and "for a filter group to pass, each of its
-/// filters must pass", so a group without an `EVENT` filter can never trigger a build.
-/// The model expresses no such constraint, so the boundary validator passes it and the
-/// refusal belongs here; it names the member and the constraint the way a boundary
-/// refusal does.
-fn check_filter_groups(
-    filter_groups: Option<&[Vec<WebhookFilter>]>,
-) -> Result<(), CreateWebhookError> {
-    for (index, group) in filter_groups.unwrap_or_default().iter().enumerate() {
-        if !group
-            .iter()
-            .any(|filter| filter.r#type == crate::state::EVENT_WEBHOOK_FILTER_TYPE)
-        {
-            return Err(CreateWebhookErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Value at 'filterGroups[{index}]' failed to satisfy constraint: \
-                         at least one WebhookFilter must specify {} as its type",
-                        crate::state::EVENT_WEBHOOK_FILTER_TYPE
-                    )),
-                },
-            )
-            .into());
-        }
-    }
-    Ok(())
+/// The modelled refusal of a request this operation cannot serve as sent.
+fn invalid_input(message: String) -> CreateWebhookError {
+    CreateWebhookErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// Refuse a webhook the project's source provider cannot deliver events for.
 ///
-/// Three rules, each documented on the member it is about:
-///
-/// * a repository-event webhook needs a source whose provider sends repository events
-///   ([`crate::state::WEBHOOK_SOURCE_TYPES`]);
-/// * a runner webhook (`buildType` [`crate::state::RUNNER_WEBHOOK_BUILD_TYPE`]) is
-///   "only available for NO_SOURCE source type projects", and is the only webhook such
-///   a project takes;
-/// * `manualCreation` is "only available for GitHub webhooks".
+/// The build-type rules — a runner webhook needs a `NO_SOURCE` project, every other
+/// build type needs a provider that sends repository events — hold wherever a webhook's
+/// build type is set, so they live in [`crate::state::webhook_build_type_violation`].
+/// What is only this operation's is `manualCreation`, which AWS documents as "only
+/// available for GitHub webhooks" and which `UpdateWebhook` does not model.
 fn check_source_supports_webhook(
     source_type: &str,
     input: &CreateWebhookInput,
     project_arn: &str,
 ) -> Result<(), CreateWebhookError> {
-    let invalid = |message: String| -> CreateWebhookError {
-        CreateWebhookErrorModeled::InvalidInputException(InvalidInputException {
-            message: Some(message),
-        })
-        .into()
-    };
-    let runner = input
-        .build_type
-        .as_deref()
-        .is_some_and(|build_type| build_type == crate::state::RUNNER_WEBHOOK_BUILD_TYPE);
-    if runner {
-        if source_type != crate::state::RUNNER_WEBHOOK_SOURCE_TYPE {
-            return Err(invalid(format!(
-                "Value at 'buildType' failed to satisfy constraint: {} is only available for \
-                 {} source type projects, and project {project_arn} has source type \
-                 {source_type}",
-                crate::state::RUNNER_WEBHOOK_BUILD_TYPE,
-                crate::state::RUNNER_WEBHOOK_SOURCE_TYPE,
-            )));
-        }
-    } else if !crate::state::WEBHOOK_SOURCE_TYPES.contains(&source_type) {
-        return Err(invalid(format!(
-            "A webhook cannot be created for project {project_arn}: its source type \
-             {source_type} does not support webhooks. Supported source types are {}",
-            crate::state::WEBHOOK_SOURCE_TYPES.join(", "),
-        )));
+    if let Some(message) = crate::state::webhook_build_type_violation(
+        source_type,
+        input.build_type.as_deref(),
+        project_arn,
+    ) {
+        return Err(invalid_input(message));
     }
     if input.manual_creation == Some(true)
         && source_type != crate::state::MANUAL_CREATION_SOURCE_TYPE
     {
-        return Err(invalid(format!(
+        return Err(invalid_input(format!(
             "Value at 'manualCreation' failed to satisfy constraint: manualCreation is only \
              available for {} webhooks, and project {project_arn} has source type {source_type}",
             crate::state::MANUAL_CREATION_SOURCE_TYPE,

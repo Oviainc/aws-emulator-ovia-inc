@@ -41,11 +41,36 @@ impl Emulator {
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let request = ::http::Request::builder()
+        self.call_in_region(None, operation, body).await
+    }
+
+    /// Call `operation` with `body` as a request whose SigV4 credential scope
+    /// names `region`, answering its HTTP status and parsed body.
+    ///
+    /// The scope is where this service takes the region of an ARN it reports
+    /// from, so a case about an ARN's region drives the call through here; the
+    /// suite verifies no signature, so the signature field is not one.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
             .header("x-amz-target", format!("CodeDeploy_20141006.{operation}"))
-            .header("content-type", "application/x-amz-json-1.1")
+            .header("content-type", "application/x-amz-json-1.1");
+        if let Some(region) = region {
+            builder = builder.header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/codedeploy/\
+                     aws4_request, SignedHeaders=host, Signature=0000"
+                ),
+            );
+        }
+        let request = builder
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request is well formed");
         let response = self.router.dispatch(request).await;

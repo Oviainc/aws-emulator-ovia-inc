@@ -216,6 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 let group_name =
                     crate::state::log_group_name_from_identifier(resource_arn).to_string();
+                // Whether the presented revision id is one this service ever issued is a
+                // question about the STORE's revision counter, so it is answered before the
+                // log group is borrowed to write through.
+                let presented_revision_was_issued = input
+                    .expected_revision_id
+                    .as_deref()
+                    .is_some_and(|expected| store.issued_revision_id(expected));
                 let Some(group) = store.log_groups.get_mut(&group_name) else {
                     return Err(not_found(&crate::state::resource_not_found_message(
                         "log group",
@@ -256,11 +263,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 };
                 if policy.revision_id.as_deref() != Some(expected) {
-                    // The revision the caller held was superseded, which the service
-                    // reports as a conflict against the resource rather than as a bad
-                    // parameter: the caller is to re-read the policy and retry. The text
-                    // is the error class's own, naming neither the revision presented nor
-                    // the stored one.
+                    // A value the service never issued as a revision id — one in another
+                    // form, or one no update has reached — is a bad PARAMETER: no retry can
+                    // make it match, so it is not the conflict below. The well-formedness
+                    // check comes FIRST and is distinct from the comparison against the
+                    // current revision.
+                    if !presented_revision_was_issued {
+                        return Err(invalid(
+                            crate::state::INVALID_EXPECTED_REVISION_ID_MESSAGE,
+                        ));
+                    }
+                    // The revision the caller held was issued and has since been
+                    // superseded, which the service reports as a conflict against the
+                    // resource rather than as a bad parameter: the caller is to re-read the
+                    // policy and retry. The text is the error class's own, naming neither
+                    // the revision presented nor the stored one.
                     return Err(
                         DeleteResourcePolicyErrorModeled::OperationAbortedException(
                             OperationAbortedException {

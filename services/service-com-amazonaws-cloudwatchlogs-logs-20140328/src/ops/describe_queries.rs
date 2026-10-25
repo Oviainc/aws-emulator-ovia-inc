@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: reports the stored CloudWatch Logs Insights queries, filtered by the log
+//! group, status or query language the request names and served one page at a time. This
+//! is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeQueries::handle`] with real behaviour and
@@ -130,6 +130,52 @@ pub struct DescribeQueries<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeQueries";
+
+/// Where the next page resumes: the `queryId` of the last query returned, plus the filters
+/// of the enumeration it belongs to. A continuation that changes a filter is refused, because
+/// the token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name: Option<String>,
+    status: Option<String>,
+    query_language: Option<String>,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.log_group_name,
+            "status": self.status,
+            "queryLanguage": self.query_language,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let string = |name: &str| {
+            value
+                .get(name)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            log_group_name: string("logGroupName"),
+            status: string("status"),
+            query_language: string("queryLanguage"),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 impl<Eng> DescribeQueries<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -156,18 +202,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeQueries"))
+        // `ctx` carries only request metadata; this operation reports on stored queries and
+        // needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeQueriesError::from(
+                DescribeQueriesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeQueriesError::from(
+                DescribeQueriesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // A query runs asynchronously, so the status this call reports is the one the clock
+        // has already made due — materialised before the read, never moved on because of it.
+        store.materialize_due_query_transitions(crate::state::now_ms());
+
+        // "Limits the returned queries to only those for the specified log group": a log
+        // group this account does not hold is a missing resource rather than an empty page,
+        // the way every other operation of this service that NAMES a log group answers.
+        if let Some(log_group_name) = input.log_group_name.as_deref() {
+            if !store.log_groups.contains_key(log_group_name) {
+                return Err(DescribeQueriesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("log group")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.log_group_name != input.log_group_name
+                    || cursor.status != input.status
+                    || cursor.query_language != input.query_language
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeQueries request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // One enumeration, in the order the store holds it (by `queryId`), of the queries
+        // that satisfy EVERY filter the request named. `status` and `queryLanguage` target
+        // modelled enums, so the boundary validator has already refused a value outside
+        // either.
+        let matching: Vec<&crate::state::QueryRecord> = store
+            .queries
+            .values()
+            .filter(|query| {
+                input
+                    .log_group_name
+                    .as_deref()
+                    // A query reads the log groups it named, so one of them being the named
+                    // group is what makes the query "for the specified log group".
+                    .is_none_or(|wanted| {
+                        query
+                            .log_group_names
+                            .iter()
+                            .any(|name| name == wanted)
+                    })
+            })
+            .filter(|query| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == query.status)
+            })
+            .filter(|query| {
+                input
+                    .query_language
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == query.query_language)
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|query| query.query_id <= cursor.after),
+            None => 0,
+        };
+        // "Limits the number of returned queries to the specified number." `maxResults` is
+        // modelled `range 1..1000`, so the boundary validator has already refused a value
+        // outside it; a request naming none gets the largest page the member admits.
+        let limit = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::MAX_QUERIES_PER_PAGE),
+        )
+        .unwrap_or(0)
+        .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        let next_token = page.last().filter(|_| last < matching.len()).map(|query| {
+            Cursor {
+                log_group_name: input.log_group_name.clone(),
+                status: input.status.clone(),
+                query_language: input.query_language.clone(),
+                after: query.query_id.clone(),
+            }
+            .encode()
+        });
+
+        Ok(DescribeQueriesOutput {
+            queries: Some(
+                page.iter()
+                    .map(|query| query.reported())
+                    .collect::<Vec<QueryInfo>>(),
+            ),
+            next_token,
+        })
     }
 }

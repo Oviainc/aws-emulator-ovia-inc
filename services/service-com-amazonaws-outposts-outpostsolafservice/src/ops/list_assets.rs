@@ -7,15 +7,15 @@
 //! caller sent, in the Outpost's own installation order, cut into pages of at most
 //! `MaxResults` with the modelled `NextToken` the next page resumes from.
 //!
-//! A read, and one that writes NOTHING: it answers from
-//! [`crate::state::OutpostRecord::assets`], so a caller that lists an Outpost's assets
-//! sees exactly what the next caller does. An asset is a physical unit of hardware
-//! Amazon Web Services installs once an order is fulfilled, so no call in this API
-//! creates one and this operation invents none: an Outpost with no installed hardware
-//! is answered with no asset. See [`crate::state::OutpostRecord::assets`] for the
-//! operations an
-//! Outpost's hardware would arrive with — all still scaffold stubs with issues of
-//! their own.
+//! A read: it answers from [`crate::state::OutpostRecord::assets`], so a caller that
+//! lists an Outpost's assets sees exactly what the next caller does. An asset is a
+//! physical unit of hardware Amazon Web Services installs for the Outpost, so no call
+//! in this API creates one and this operation invents none — it materialises only the
+//! installation the clock has already made due, which is the same transition the
+//! Outpost reaches its settled lifecycle status by
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`]),
+//! and an Outpost whose form factor names no hardware configuration is answered with
+//! no asset.
 //!
 //! ## Shape of an operation
 //!
@@ -194,10 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let size = crate::state::page_size(input.max_results);
 
-        // A read, so the guard is taken immutably: an asset's state is a fact about
-        // installed hardware rather than a transition the clock owes, so there is
-        // nothing here for this call to materialise and nothing for it to write.
-        let store = state.lock();
+        // An Outpost's hardware is installed as its provisioning finishes, so the
+        // installation the clock has already made due is materialised before the
+        // list is read: this answers the hardware the Outpost holds at the instant it
+        // is asked for, and writes nothing a later caller would not have seen anyway.
+        let mut store = state.lock();
+        store.settle_outposts();
         // An Outpost's assets are listed OFF that Outpost, so one the store does not
         // hold is the not-found error this operation models, worded as the identifier
         // echo of the value AS SUPPLIED — not of the bare id an ARN resolved to.

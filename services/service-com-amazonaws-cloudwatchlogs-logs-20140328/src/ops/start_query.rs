@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: compiles the query string, resolves the log groups it reads and starts the
+//! query `DescribeQueries` then reports. This is the ONLY file to touch for this
+//! operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`StartQuery::handle`] with real behaviour and
@@ -182,6 +182,48 @@ pub struct StartQuery<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that is
+/// "specified incorrectly".
+fn invalid_parameter(message: String) -> StartQueryError {
+    StartQueryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for a query string that does not
+/// compile: "The query string is not valid. Details about this error are displayed in a
+/// QueryCompileError object."
+///
+/// The `QueryCompileError` is where the detail goes — what the compiler stopped on and the
+/// character range it stopped in — so the top-level message states the condition and the
+/// location travels in the structure the model declares for it.
+fn malformed_query(failure: &crate::state::query_compile::QueryCompileFailure) -> StartQueryError {
+    StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
+        message: Some(MALFORMED_QUERY_MESSAGE.to_string()),
+        query_compile_error: Some(QueryCompileError {
+            message: Some(failure.message.clone()),
+            location: Some(QueryCompileErrorLocation {
+                start_char_offset: Some(
+                    i32::try_from(failure.start_char_offset).unwrap_or(i32::MAX),
+                ),
+                end_char_offset: Some(i32::try_from(failure.end_char_offset).unwrap_or(i32::MAX)),
+            }),
+        }),
+    })
+    .into()
+}
+
+/// The sentence `MalformedQueryException` itself publishes for the condition, which every
+/// query this operation cannot compile is refused with: the detail of WHY is in the
+/// accompanying `QueryCompileError`, so this text interpolates nothing.
+const MALFORMED_QUERY_MESSAGE: &str = "The query string is not valid.";
+
+/// The three members a request may name the log groups to query by, in the order
+/// `StartQuery`'s own documentation lists them ("Either exactly one of the following
+/// parameters: logGroupName, logGroupNames, or logGroupIdentifiers").
+const LOG_GROUP_MEMBERS: [&str; 3] = ["logGroupName", "logGroupNames", "logGroupIdentifiers"];
+
 impl<Eng> StartQuery<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -208,18 +250,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata; a query is identified by the id this call
+        // mints and by nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartQueryError::from(StartQueryErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // "The range is inclusive, so the specified end time is included in the query"
+        // (`StartQuery$endTime`) — a range whose end precedes its start includes nothing, so
+        // it is not a time range at all and the request is refused as the incorrectly
+        // specified parameter it is, in the sentence CloudWatch Logs states for a reversed
+        // window: fixed text about the two ends, interpolating neither of them.
+        if input.end_time < input.start_time {
+            return Err(invalid_parameter(
+                crate::state::REVERSED_TIME_RANGE_MESSAGE.to_string(),
+            ));
+        }
+
+        // "Specify the query language to use for this query": a request that names none uses
+        // Logs Insights QL, which is also the only language whose syntax this service
+        // compiles.
+        let query_language = input
+            .query_language
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_QUERY_LANGUAGE.to_string());
+        let compiled = if query_language == crate::state::DEFAULT_QUERY_LANGUAGE {
+            Some(
+                crate::state::query_compile::compile(&input.query_string)
+                    .map_err(|failure| malformed_query(&failure))?,
+            )
+        } else {
+            // The OpenSearch languages are compiled by the engine that runs them, which this
+            // service does not host: a query string in one of them is taken as given rather
+            // than judged against Logs Insights QL's grammar.
+            None
+        };
+
+        // "To specify the log groups to query, a StartQuery operation must include one of the
+        // following: Either exactly one of the following parameters: logGroupName,
+        // logGroupNames, or logGroupIdentifiers; Or the queryString must include a SOURCE
+        // command to select log groups for the query."
+        let named_members: Vec<&str> = LOG_GROUP_MEMBERS
+            .iter()
+            .zip([
+                input.log_group_name.is_some(),
+                input.log_group_names.is_some(),
+                input.log_group_identifiers.is_some(),
+            ])
+            .filter(|(_, named)| *named)
+            .map(|(member, _)| *member)
+            .collect();
+        let query_selects_sources = compiled
+            .as_ref()
+            .is_some_and(crate::state::query_compile::CompiledQuery::selects_its_own_sources)
+            // A query in one of the OpenSearch languages names its log groups inside the
+            // query string ("The exception is queries using the OpenSearch Service SQL query
+            // language, where you specify the log group names inside the querystring"), so
+            // such a request need name none of the three members.
+            || compiled.is_none();
+        if named_members.len() > 1 {
+            return Err(invalid_parameter(format!(
+                "Exactly one of {} must be specified.",
+                LOG_GROUP_MEMBERS.join(", ")
+            )));
+        }
+        if named_members.is_empty() && !query_selects_sources {
+            return Err(invalid_parameter(format!(
+                "Exactly one of {}, or a SOURCE command in the query string, must specify the \
+                 log groups to query.",
+                LOG_GROUP_MEMBERS.join(", ")
+            )));
+        }
+
+        // Whichever member named them, the log groups are resolved to the names the store
+        // keys them by: an identifier may be a name or either ARN form of one group.
+        let identifiers: Vec<String> = input
+            .log_group_name
+            .clone()
+            .map(|name| vec![name])
+            .or_else(|| input.log_group_names.clone())
+            .or_else(|| input.log_group_identifiers.clone())
+            .unwrap_or_default();
+        // "You can include up to 50 log groups" (`logGroupNames`, `logGroupIdentifiers`).
+        if identifiers.len() > crate::state::MAX_QUERY_LOG_GROUPS {
+            return Err(invalid_parameter(format!(
+                "A query can include up to {} log groups.",
+                crate::state::MAX_QUERY_LOG_GROUPS
+            )));
+        }
+        let mut log_group_names: Vec<String> = Vec::with_capacity(identifiers.len());
+        for identifier in &identifiers {
+            let name = crate::state::log_group_name_from_identifier(identifier).to_string();
+            if !store.log_groups.contains_key(&name) {
+                return Err(StartQueryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("log group")),
+                    },
+                )
+                .into());
+            }
+            if !log_group_names.contains(&name) {
+                log_group_names.push(name);
+            }
+        }
+
+        // A query window that ends before every log group it reads existed can be compiled
+        // against none of them: there is no log group in the window to resolve the query's
+        // fields against, so the query string is refused rather than run over nothing. A
+        // window that reaches into the lifetime of at least one named group is a query of
+        // that group.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQuery"))
+        // The window is in epoch SECONDS ("the number of seconds since January 1, 1970") and
+        // a log group's creation instant is in epoch MILLISECONDS, so the two are compared in
+        // one unit rather than as the numbers they arrive as.
+        let window_end_ms = input
+            .end_time
+            .saturating_mul(crate::state::MILLIS_PER_SECOND);
+        let window_precedes_every_group = !log_group_names.is_empty()
+            && log_group_names.iter().all(|name| {
+                store
+                    .log_groups
+                    .get(name)
+                    .is_some_and(|group| window_end_ms < group.creation_time_ms)
+            });
+        if window_precedes_every_group {
+            return Err(malformed_query(
+                &crate::state::query_compile::QueryCompileFailure {
+                    message: "The query window ends before the log group was created."
+                        .to_string(),
+                    start_char_offset: 0,
+                    end_char_offset: input.query_string.chars().count(),
+                },
+            ));
+        }
+
+        // "You can have up to 100 concurrent CloudWatch Logs insights queries": the statuses
+        // the clock already owed are materialised first, so a query it has since completed
+        // holds no slot.
+        let now = crate::state::now_ms();
+        store.materialize_due_query_transitions(now);
+        if store.active_queries() >= crate::state::MAX_CONCURRENT_QUERIES {
+            return Err(StartQueryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} concurrent CloudWatch Logs Insights \
+                         queries.",
+                        crate::state::MAX_CONCURRENT_QUERIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let query_id = crate::state::mint_query_id(store.take_query_seq());
+        let mut record = crate::state::QueryRecord::new(
+            &query_id,
+            &query_language,
+            &input.query_string,
+            log_group_names,
+            input.start_time,
+            input.end_time,
+            now,
+        );
+        record.limit = input.limit;
+        store.queries.insert(query_id.clone(), record);
+        store.enforce_query_ceiling();
+
+        Ok(StartQueryOutput {
+            // "The unique ID of the query", which is the id the store now holds it under —
+            // so `DescribeQueries` reports this query under exactly this id.
+            query_id: Some(query_id),
+        })
     }
 }

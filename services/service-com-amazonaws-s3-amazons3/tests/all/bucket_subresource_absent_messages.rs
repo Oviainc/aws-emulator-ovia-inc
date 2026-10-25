@@ -128,6 +128,25 @@ async fn an_absent_subresource_is_refused_with_its_codes_published_message() {
         String::from_utf8_lossy(&emptied.body)
     );
 
+    // A bucket is CREATED carrying the Object Ownership setting it comes into being with,
+    // so the only way to a bucket with NO ownership controls is to withdraw them — the
+    // case `GetBucketOwnershipControls` names ("you've manually deleted the bucket
+    // ownership control value").
+    let withdrawn = send(
+        &router,
+        "DELETE",
+        "/subresource-absent?ownershipControls",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        withdrawn.status, 204,
+        "the setup delete of the ownership controls must succeed, got {} with body {:?}",
+        withdrawn.status,
+        String::from_utf8_lossy(&withdrawn.body)
+    );
+
     let rows = [
         Row {
             case: "a bucket that was never tagged",

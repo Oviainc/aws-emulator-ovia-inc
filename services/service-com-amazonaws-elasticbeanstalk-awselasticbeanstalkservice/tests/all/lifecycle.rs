@@ -221,7 +221,23 @@ impl Emulator {
     /// request reaches no service and this panics rather than letting a suite assert
     /// against an archive that was never stored.
     pub(crate) async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) {
-        let created = self.s3("PUT", &format!("/{bucket}"), b"").await;
+        // The create names its `LocationConstraint`: a create that names none can only
+        // mean us-east-1, the Region the unspecified constraint stands for, so S3 refuses
+        // one sent to any other Region's endpoint and this harness signs for
+        // [`TEST_REGION`].
+        let created = self
+            .s3(
+                "PUT",
+                &format!("/{bucket}"),
+                format!(
+                    "<CreateBucketConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LocationConstraint>{TEST_REGION}</LocationConstraint>\
+                     </CreateBucketConfiguration>"
+                )
+                .as_bytes(),
+            )
+            .await;
         assert_eq!(
             created, 200,
             "seeding s3://{bucket}: expected 200 from CreateBucket, got {created}"

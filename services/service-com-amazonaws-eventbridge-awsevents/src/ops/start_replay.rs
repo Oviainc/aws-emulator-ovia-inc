@@ -350,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_deref()
                         .is_none_or(|filters| filters.contains(&rule.arn))
                 })
-                .filter_map(crate::ops::put_events::CompiledRule::of)
+                .filter_map(|rule| crate::ops::put_events::CompiledRule::of(rule, &store))
                 .collect();
 
             let answered = record.clone();

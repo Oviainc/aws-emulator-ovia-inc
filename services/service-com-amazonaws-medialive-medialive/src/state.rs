@@ -36,8 +36,9 @@
 //! `MedialiveInputArns` out of the inputs this store holds — see
 //! [`input_devices`]. A device also carries the TRANSFER pending on it, which
 //! `TransferInputDevice` records, `ListInputDeviceTransfers` reports in the
-//! direction the reader asks for and `AcceptInputDeviceTransfer` ends for the
-//! account the transfer names as its recipient, and the latest THUMBNAIL it has
+//! direction the reader asks for, `AcceptInputDeviceTransfer` ends for the
+//! account the transfer names as its recipient and `CancelInputDeviceTransfer`
+//! ends for the account that requested it, and the latest THUMBNAIL it has
 //! sent, which `DescribeInputDeviceThumbnail` reports — one only a connected
 //! Link unit sends, so a device claimed through this emulator's API has none.
 //!
@@ -339,7 +340,8 @@ pub use input_devices::{
     configurable_settings_error, input_device_transfer_type, input_device_type_for_id,
     is_account_id, not_a_device_id_message, not_an_account_id_message,
     settings_member_mismatch_message, InputDeviceConfiguration, InputDeviceRecord,
-    InputDeviceThumbnailRecord, InputDeviceTransferRecord, TransferAcceptance, MAX_INPUT_DEVICES,
+    InputDeviceThumbnailRecord, InputDeviceTransferRecord, TransferAcceptance, TransferCancellation,
+    MAX_INPUT_DEVICES,
     MAX_INPUT_DEVICE_THUMBNAIL_BYTES, MAX_TRANSFER_MESSAGE_CHARS,
 };
 

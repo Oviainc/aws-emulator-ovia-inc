@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use super::topics_subscriptions_publish::{xml_unescape, Answer, Sns};
+use super::topics_subscriptions_publish::{text_of, Answer, Sns};
 
 /// "Adding more than 50 tags to a topic isn't recommended" / "Can't add more than 50
 /// tags to a topic" (`TagResource` doc and `TagLimitExceededException` doc): the most
@@ -35,20 +35,6 @@ const MAX_TAG_KEY_LEN: usize = 128;
 /// `smithy_query(query="shape", shape="TagValue")` reports `length {min: 0, max: 256}`:
 /// a tag's value may be empty, and is at most this long.
 const MAX_TAG_VALUE_LEN: usize = 256;
-
-/// The text of the first `<tag>…</tag>` element inside `block`, or `""` when the
-/// element is absent or empty (`<tag/>`, `<tag></tag>`).
-fn text_of(block: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let Some(start) = block.find(&open) else {
-        return String::new();
-    };
-    let rest = &block[start + open.len()..];
-    match rest.find(&format!("</{tag}>")) {
-        Some(end) => xml_unescape(&rest[..end]),
-        None => String::new(),
-    }
-}
 
 /// The body of the response's `<Tags>` element, or `None` when the response carries no
 /// `Tags` member at all — which is a DIFFERENT document from one carrying an empty

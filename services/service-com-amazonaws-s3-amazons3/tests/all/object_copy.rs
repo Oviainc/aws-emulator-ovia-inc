@@ -611,12 +611,12 @@ async fn the_directives_decide_what_a_copy_carries_over_from_the_source() {
             redirect: None,
         },
         // A `REPLACE` that names no metadata replaces the source's with nothing, so the
-        // copy stores no content type at all and a read of it reports the serializer's
-        // own fallback rather than the source's `text/csv`.
+        // copy carries S3's default `Content-Type` for a write that names none rather
+        // than the source's `text/csv`.
         DirectiveRow {
             case: "metadata REPLACE naming none, which replaces it with nothing",
             headers: vec![("x-amz-metadata-directive", "REPLACE")],
-            content_type: Some("application/octet-stream"),
+            content_type: Some("binary/octet-stream"),
             stage: None,
             tags: vec![("team", "data"), ("stage", "raw")],
             storage_class: None,
@@ -1016,13 +1016,23 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             code: "NoSuchKey",
         },
         RefusalRow {
-            case: "a source version the source bucket holds no version for",
+            case: "a WELL-FORMED source version the source bucket holds no version for",
             destination_bucket: "copy-refusal-target",
             destination_key: "copies/absent-version.csv",
-            copy_source: "copy-refusal-origin/source.csv?versionId=no-such-version",
+            copy_source:
+                "copy-refusal-origin/source.csv?versionId=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             headers: Vec::new(),
             status: 404,
             code: "NoSuchVersion",
+        },
+        RefusalRow {
+            case: "a source version id that is not shaped like a version id",
+            destination_bucket: "copy-refusal-target",
+            destination_key: "copies/malformed-version.csv",
+            copy_source: "copy-refusal-origin/source.csv?versionId=no-such-version",
+            headers: Vec::new(),
+            status: 400,
+            code: "InvalidArgument",
         },
         RefusalRow {
             case: "a copy source naming no bucket at all",

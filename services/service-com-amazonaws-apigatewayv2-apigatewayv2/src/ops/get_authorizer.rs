@@ -190,13 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.api_id)
             .and_then(|api| api.authorizers.get(&input.authorizer_id));
         let Some(stored) = stored else {
+            // The sentence API Gateway answers an unknown `AuthorizerId` with, shared
+            // with every other reader and writer of an authorizer: it names neither the
+            // account nor the identifier the request carried.
             return Err(GetAuthorizerErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Invalid Authorizer identifier specified {}:{}",
-                        ::engine::emulator_account_id(),
-                        input.authorizer_id
-                    )),
+                    message: Some(
+                        crate::state::INVALID_AUTHORIZER_IDENTIFIER_MESSAGE.to_string(),
+                    ),
                     resource_type: ::std::option::Option::None,
                 },
             )

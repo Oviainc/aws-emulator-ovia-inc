@@ -56,13 +56,16 @@
 //!
 //! An application's COMPONENTS are held the same way, ON the application rather than in
 //! a map of their own (a `ComponentId` names a component only within its application):
-//! the [`StoredComponent`] records in [`StoredApplication::components`] are the ones the
-//! registration's `ComponentsInfo` declared, projected onto the wire `Component` by
+//! the [`StoredComponent`] records in [`StoredApplication::components`] are the ones its
+//! registration describes ([`registered_components`]) — each `ComponentsInfo` entry, plus
+//! the SAP HANA component of the SAP system the registration's own `Sid` names, which is
+//! the component its databases belong to — projected onto the wire `Component` by
 //! [`StoredApplication::component_view`] — which is what `GetComponent` reads back — and
 //! onto `ComponentSummary` by [`StoredComponent::summary`], which is what
 //! `ListComponents` reports. So a component a caller can read is one a registration
-//! declared, it reports the status its application is in, and the databases it reports
-//! are the ones that registration gave it.
+//! described, every `ComponentId` another response reports is one of them, it reports the
+//! status its application is in, and the databases it reports are the ones that
+//! registration gave it.
 //!
 //! What a configuration check RUN produced hangs off that same record: the sub-check
 //! results in [`StoredConfigurationCheckOperation::sub_check_results`], each holding the
@@ -296,16 +299,20 @@ pub const MAX_RETAINED_OPERATIONS: usize = 10_000;
 /// allows and the default page.
 pub const MAX_PAGE_SIZE: i32 = 50;
 
-/// How many components ONE registered application holds.
+/// How many components ONE registration may DECLARE in its `ComponentsInfo`.
 ///
 /// The model gives `ComponentInfoList` `@length(min: 0, max: 5)`
-/// (`smithy_query(query="shape", shape="ComponentInfoList")`) and a component exists
-/// only because a registration declared it, so the boundary validator already refuses a
-/// longer `ComponentsInfo`; [`components_within_bounds`] re-states the bound HERE so the
-/// work every component-scoped call does is bounded by a check in this crate rather than
-/// by one that lives elsewhere. It is reported with `ValidationException`, which
-/// `RegisterApplication` models.
-pub const MAX_COMPONENTS_PER_APPLICATION: usize = 5;
+/// (`smithy_query(query="shape", shape="ComponentInfoList")`), so the boundary validator
+/// already refuses a longer `ComponentsInfo`; [`components_within_bounds`] re-states the
+/// bound HERE so the work every component-scoped call does is bounded by a check in this
+/// crate rather than by one that lives elsewhere. It is reported with
+/// `ValidationException`, which `RegisterApplication` models.
+pub const MAX_DECLARED_COMPONENTS: usize = 5;
+
+/// How many components ONE registered application holds: the ones its `ComponentsInfo`
+/// declared, plus the one SAP HANA component the registration's own `Sid` identifies
+/// ([`registered_components`]) when no declaration already describes it.
+pub const MAX_COMPONENTS_PER_APPLICATION: usize = MAX_DECLARED_COMPONENTS + 1;
 
 /// How many components one Region can hold, derived from the two ceilings that bound
 /// it: at most [`MAX_APPLICATIONS`] applications, each with at most
@@ -316,8 +323,8 @@ pub const MAX_COMPONENTS_PER_APPLICATION: usize = 5;
 /// assertion and still reports every component it holds.
 pub const MAX_COMPONENTS_PER_REGION: usize = MAX_APPLICATIONS * MAX_COMPONENTS_PER_APPLICATION;
 
-/// Refuse a registration that declares more components than an application may hold
-/// ([`MAX_COMPONENTS_PER_APPLICATION`]).
+/// Refuse a registration that declares more components than one `ComponentsInfo` may
+/// carry ([`MAX_DECLARED_COMPONENTS`]).
 ///
 /// `Ok(())` when the declaration is within the bound. The boundary validator enforces
 /// the same bound from the model, so this cannot normally fire; it is here so the size
@@ -327,9 +334,9 @@ pub const MAX_COMPONENTS_PER_REGION: usize = MAX_APPLICATIONS * MAX_COMPONENTS_P
 pub fn components_within_bounds(
     components_info: &[ComponentInfo],
 ) -> Result<(), ValidationException> {
-    if components_info.len() > MAX_COMPONENTS_PER_APPLICATION {
+    if components_info.len() > MAX_DECLARED_COMPONENTS {
         return Err(validation(format!(
-            "ComponentsInfo holds at most {MAX_COMPONENTS_PER_APPLICATION} components, but {} were given",
+            "ComponentsInfo holds at most {MAX_DECLARED_COMPONENTS} components, but {} were given",
             components_info.len()
         )));
     }
@@ -442,9 +449,10 @@ pub struct StoredApplication {
     /// An `ApplicationDiscoveryStatus` value; see the `DISCOVERY_STATUS_*` constants.
     pub discovery_status: String,
     pub status_message: Option<String>,
-    /// The components of this application, derived from the `ComponentsInfo` the
-    /// registration carried. The emulator discovers nothing on its own, so an
-    /// application registered without `ComponentsInfo` has no components.
+    /// The components of this application, derived from the registration
+    /// ([`registered_components`]): one per `ComponentsInfo` entry, plus the SAP HANA
+    /// component of the SAP system its `Sid` names. The emulator discovers nothing on its
+    /// own, so an application whose registration described neither has no components.
     pub components: Vec<StoredComponent>,
     pub associated_application_arns: Vec<String>,
     pub last_updated: SystemTime,
@@ -574,14 +582,10 @@ impl StoredApplication {
     /// `region` is the Region the application is registered in, which is the Region the
     /// ARNs minted here carry.
     pub fn databases(&self, region: &str) -> Vec<ApplicationDatabase> {
-        // The component a HANA database belongs to is the application's HANA component,
-        // identified the way this service identifies every component: by the System ID
-        // and the component type. An application whose registration named no System ID
-        // has nothing to identify that component by.
-        let component_id = self
-            .sid
-            .as_deref()
-            .map(|sid| component_id(sid, COMPONENT_TYPE_HANA));
+        // The component a HANA database belongs to, READ OFF the components this
+        // application has rather than derived a second time, so a `ComponentId` reported
+        // for a database is one `GetComponent` resolves.
+        let component_id = self.hana_component_id().map(str::to_string);
         // Keyed by `DatabaseId`, which both deduplicates and puts the databases in id
         // order, so a page taken over them is stable between calls.
         let mut databases: BTreeMap<String, ApplicationDatabase> = BTreeMap::new();
@@ -620,6 +624,21 @@ impl StoredApplication {
                 });
         }
         databases.into_values().collect()
+    }
+
+    /// The `ComponentId` of the SAP HANA component of this application's own SAP system,
+    /// or `None` when it has no such component.
+    ///
+    /// It is the component this application's SAP HANA databases belong to
+    /// ([`Self::databases`]): the one identified by the System ID the registration named
+    /// and the SAP HANA component type ([`component_id`]), which a registration naming a
+    /// System ID describes ([`registered_components`]). Resolved THROUGH the component
+    /// set, so the id a database reports is one [`Self::component`] answers and
+    /// [`Self::view`] lists, and the two cannot drift apart.
+    pub fn hana_component_id(&self) -> Option<&str> {
+        let sid = self.sid.as_deref()?;
+        let id = component_id(sid, COMPONENT_TYPE_HANA);
+        self.component(&id).map(|component| component.id.as_str())
     }
 
     /// The component of this application whose `ComponentId` is `component_id`, or `None`
@@ -775,18 +794,18 @@ impl StoredApplication {
 /// [`StoredApplication::component_view`].
 ///
 /// The emulator discovers nothing on the registered instances, so a component is what the
-/// registration DECLARED about it in one `ComponentsInfo` entry — the type it runs, the
+/// registration described about it ([`registered_components`]) — the type it runs, the
 /// System ID of the SAP system it belongs to, and the EC2 instance it runs on.
 #[derive(Debug, Clone)]
 pub struct StoredComponent {
     /// The `ComponentId`, derived from the System ID and the type by [`component_id`].
     pub id: String,
-    /// A `ComponentType` value, exactly as declared (see
+    /// A `ComponentType` value, exactly as described (see
     /// [`crate::ops::types::COMPONENT_TYPE_VALUES`]).
     pub component_type: String,
-    /// The `SID` the component was declared under.
+    /// The `SID` of the SAP system the component belongs to.
     pub sid: String,
-    /// The `Ec2InstanceId` the component was declared on.
+    /// The `Ec2InstanceId` the component runs on.
     pub ec2_instance_id: String,
 }
 
@@ -2093,6 +2112,60 @@ pub fn new_app_registry_application_id() -> String {
 /// database belongs to is named the same way as one the registration listed.
 pub fn component_id(sid: &str, component_type: &str) -> String {
     format!("{sid}-{component_type}")
+}
+
+/// The components of an application its registration describes: the ones its
+/// `components_info` declared, followed by the SAP HANA component of the SAP system `sid`
+/// names when nothing declared that one already.
+///
+/// The emulator discovers nothing on the registered `instances`, so a component exists
+/// only because the registration described it — and a registration describes a component
+/// in EITHER of two places:
+///
+/// * each `ComponentsInfo` entry describes one component: the type it runs, the System ID
+///   of the SAP system it belongs to, and the EC2 instance it runs on.
+/// * naming a `Sid` describes the SAP system of the application itself, whose SAP HANA
+///   component is identified by that System ID and that type ([`component_id`]) — the
+///   component the application's SAP HANA databases belong to
+///   ([`StoredApplication::databases`]). It runs on the instance the registration named,
+///   there being exactly one (`InstanceList` is `@length(min: 1, max: 1)`), so a
+///   registration that named no System ID or no instance describes no such component.
+///
+/// A component is identified by its id, so a declaration of the component the `Sid`
+/// already describes is that ONE component, declared: the declaration comes first and
+/// keeps the EC2 instance it was declared on. The result therefore holds at most
+/// [`MAX_COMPONENTS_PER_APPLICATION`] components, and every `ComponentId` a response
+/// reports for this application resolves to one of them.
+pub fn registered_components(
+    sid: Option<&str>,
+    instances: &[String],
+    components_info: Vec<ComponentInfo>,
+) -> Vec<StoredComponent> {
+    let mut components: Vec<StoredComponent> = Vec::new();
+    for component in components_info {
+        let id = component_id(&component.sid, &component.component_type);
+        if components.iter().any(|stored| stored.id == id) {
+            continue;
+        }
+        components.push(StoredComponent {
+            id,
+            component_type: component.component_type,
+            sid: component.sid,
+            ec2_instance_id: component.ec2_instance_id,
+        });
+    }
+    if let (Some(sid), Some(instance)) = (sid, instances.first()) {
+        let id = component_id(sid, COMPONENT_TYPE_HANA);
+        if !components.iter().any(|stored| stored.id == id) {
+            components.push(StoredComponent {
+                id,
+                component_type: COMPONENT_TYPE_HANA.to_string(),
+                sid: sid.to_string(),
+                ec2_instance_id: instance.clone(),
+            });
+        }
+    }
+    components
 }
 
 /// The ARN of the component `component_id` of the application `application_id` in

@@ -152,10 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetCodeSigningConfigErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
-                    message: Some(format!(
-                        "The resource you requested does not exist. Resource: {}",
-                        input.code_signing_config_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

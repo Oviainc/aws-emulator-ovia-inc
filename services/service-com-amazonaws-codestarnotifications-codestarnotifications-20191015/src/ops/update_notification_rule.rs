@@ -177,12 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(current) = store.rule_in_region(&region, &input.arn).cloned() else {
+            // This operation names the missing rule by the ID its ARN carries.
             return Err(UpdateNotificationRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No notification rule matches the ARN {}",
-                        input.arn
-                    )),
+                    message: Some(st::no_rule_with_identifier(st::rule_id_of_arn(&input.arn))),
                 },
             )
             .into());
@@ -191,12 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Rule names stay unique per account and region, so a rename onto another
         // rule's name is refused rather than silently shadowing it.
         if let Some(name) = input.name.as_deref() {
-            if name != current.name {
-                if let Some(owner) = store.rule_names.get(&st::rule_name_key(&region, name)) {
-                    return Err(invalid(format!(
-                        "A notification rule with the name {name:?} already exists in this account and region: {owner}"
-                    )));
-                }
+            if name != current.name
+                && store
+                    .rule_names
+                    .contains_key(&st::rule_name_key(&region, name))
+            {
+                // The name-uniqueness refusal states the class's one text and nothing of
+                // the request: `Name` is `@sensitive`, and the rule that holds the name
+                // is a resource this caller did not name. Only the SHAPE differs from the
+                // create path, which models a conflict error this operation does not.
+                return Err(invalid(st::RULE_NAME_ALREADY_IN_USE));
             }
         }
 
@@ -220,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(rule) = store.rules.get_mut(&arn) else {
                 return Err(UpdateNotificationRuleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("No notification rule matches the ARN {arn}")),
+                        message: Some(st::no_rule_with_identifier(st::rule_id_of_arn(&arn))),
                     },
                 )
                 .into());

@@ -210,12 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     r#type: None,
-                    message: Some(format!(
-                        "Tags may not exceed {limit} per resource. The request would leave \
-                         '{resource}' with {merged} tags.",
-                        limit = crate::state::MAX_TAGS_PER_RESOURCE,
-                        resource = input.resource,
-                    )),
+                    message: Some(crate::state::TAG_LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The other admitted form, `arn:<partition>:lambda:::awslayer:<name>`, names
             // a layer Lambda itself provides: it belongs to no account, so this account
             // holds no version of it for a read to report either.
-            return Err(no_such_layer_version(&input.arn));
+            return Err(no_such_layer_version());
         };
 
         let store = state.lock();
@@ -194,17 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let held = record.versions.get(&version)?;
                 Some(record.version_detail(held))
             })
-            .ok_or_else(|| no_such_layer_version(&input.arn))?;
+            .ok_or_else(no_such_layer_version)?;
         Ok(layer_version(detail))
     }
 }
 
 /// The modelled 404 this operation answers for an ARN naming a layer version this
 /// account holds none of.
-fn no_such_layer_version(arn: &str) -> GetLayerVersionByArnError {
+///
+/// A layer version is one of the resource kinds AWS answers the canonical
+/// `ResourceNotFoundException` sentence for, so the message names nothing the request
+/// carried — the request already says which version it asked about.
+fn no_such_layer_version() -> GetLayerVersionByArnError {
     GetLayerVersionByArnErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         r#type: None,
-        message: Some(format!("Layer version {arn} does not exist")),
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

@@ -646,7 +646,7 @@ async fn an_address_or_a_feature_this_emulator_does_not_hold_is_refused() {
             uri: format!("/{bucket}/{key}?uploads"),
             headers: vec![("x-amz-tagging", too_many_tags)],
             status: 400,
-            code: "ValidationException",
+            code: "BadRequest",
         },
         RefusalCase {
             case: "an initiation whose key is one byte past the published maximum",
