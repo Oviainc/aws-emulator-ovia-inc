@@ -76,8 +76,8 @@
 use super::types::*;
 
 use crate::state::{
-    apply_tag_changes, no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
-    TAG_RESOURCE_TYPE_HOSTED_ZONE,
+    apply_tag_changes, no_such_health_check, no_such_hosted_zone, normalize_zone_id,
+    TAG_RESOURCE_TYPE_HEALTH_CHECK, TAG_RESOURCE_TYPE_HOSTED_ZONE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -186,19 +186,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(ChangeTagsForResourceOutput {})
             }
             TAG_RESOURCE_TYPE_HEALTH_CHECK => {
-                // This service's store holds no health checks — `CreateHealthCheck`
-                // is still a scaffold — so no health check exists with any id.
-                // When health checks are implemented, resolve the id against that
-                // store and tag it with `apply_tag_changes`, exactly as above.
-                Err(
-                    ChangeTagsForResourceErrorModeled::NoSuchHealthCheck(NoSuchHealthCheck {
-                        message: Some(format!(
-                            "no health check exists with the ID {}",
-                            input.resource_id
-                        )),
-                    })
-                    .into(),
+                // A health check is addressed by the bare id
+                // `CreateHealthCheck` assigned it, which is the id the store is
+                // keyed by; tagging it is the same rule as tagging a zone, so
+                // it runs through the same helper.
+                let mut store = state.lock();
+                let health_check = store
+                    .health_checks
+                    .get_mut(&input.resource_id)
+                    .ok_or_else(|| {
+                        ChangeTagsForResourceErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                            &input.resource_id,
+                        ))
+                    })?;
+                apply_tag_changes(
+                    &mut health_check.tags,
+                    input.add_tags.as_deref(),
+                    input.remove_tag_keys.as_deref(),
                 )
+                .map_err(|message| {
+                    ChangeTagsForResourceErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(message),
+                    })
+                })?;
+                // The response carries nothing: the tag set is read back through
+                // `ListTagsForResource`.
+                Ok(ChangeTagsForResourceOutput {})
             }
             // Unreachable: `ResourceType` is a modelled enum, so a value outside
             // `TagResourceType` is refused before this handler runs.

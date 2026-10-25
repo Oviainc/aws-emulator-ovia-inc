@@ -327,6 +327,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             username: input.username.clone(),
             sub: sub.clone(),
             attributes,
+            // Nothing is pending for a user that has just registered: the
+            // attributes above are its values, not values awaiting a
+            // confirmation of a changed email address or phone number.
+            pending_attributes: ::std::collections::BTreeMap::new(),
             password: password.map(str::to_string),
             // The user chose this password itself, so there is nothing to change at the
             // next sign-in: it is permanent, unlike the one `AdminCreateUser` sets.

@@ -578,6 +578,11 @@ pub const ANOMALY_DETECTOR_TRAINING_DELAY_MS: i64 = 500;
 /// [`ANOMALY_DETECTOR_TRAINING_DELAY_MS`].
 pub const ANOMALY_DETECTOR_ANALYSIS_DELAY_MS: i64 = 500;
 
+/// `INFINITE`, one of the two values the model's `SuppressionType` enum carries: a
+/// suppression that does not run out — "If you specify INFINITE, any value for
+/// suppressionPeriod is ignored." (`UpdateAnomaly$suppressionType`)
+pub const SUPPRESSION_TYPE_INFINITE: &str = "INFINITE";
+
 /// How many log groups one log anomaly detector watches, from
 /// `CreateLogAnomalyDetector$logGroupArnList`: "An array containing the ARN of the log
 /// group that this anomaly detector will watch. You can specify only one log group ARN."
@@ -1741,6 +1746,54 @@ pub struct AnomalyDetectorRecord {
     /// ([`AnomalyDetectorRecord::materialize_due_transitions`]). `None` once the detector is
     /// in a status the clock owes nothing after.
     pub status_due_ms: Option<i64>,
+    /// The anomalies this detector has REPORTED, keyed by `anomalyId`: the set
+    /// `ListAnomalies` enumerates and every suppression request resolves its
+    /// `anomalyId` / `patternId` against.
+    ///
+    /// An anomaly is stored as the modelled `Anomaly` shape itself rather than a parallel
+    /// record, so every member its reader reports round-trips without a field-by-field copy
+    /// that can silently drop one; the suppression members are filled in by the reader from
+    /// [`AnomalyDetectorRecord::suppressions`], and the detector's own ARN and log groups
+    /// from the record around it.
+    ///
+    /// A detector reports an anomaly from its own pattern-recognition pass over the log
+    /// groups it watches — "The anomaly detector uses pattern recognition to find anomalies,
+    /// which are unusual log events" (`CreateLogAnomalyDetector`) — so no REQUEST adds one,
+    /// and an id outside this map names an anomaly this detector has not found.
+    pub anomalies: BTreeMap<String, crate::ops::types::Anomaly>,
+    /// The suppressions placed on this detector's findings, keyed by the `anomalyId` or
+    /// `patternId` suppressed. `UpdateAnomaly` writes one here and removes it again when a
+    /// later call ends the suppression.
+    pub suppressions: BTreeMap<String, FindingSuppression>,
+}
+
+/// One suppression `UpdateAnomaly` placed on a finding of a detector: "Use this operation to
+/// suppress anomaly detection for a specified anomaly or pattern."
+#[derive(Debug, Clone)]
+pub struct FindingSuppression {
+    /// The `SuppressionType` the call named — `INFINITE` or `LIMITED` — or `None` when it
+    /// named none and the suppression lasts until a later call ends it.
+    pub suppression_type: Option<String>,
+    /// When the suppression was placed, in epoch milliseconds (`Anomaly$suppressedDate`).
+    pub suppressed_at_ms: i64,
+    /// When a `LIMITED` suppression runs out, in epoch milliseconds
+    /// (`Anomaly$suppressedUntil`). `None` for one that does not run out.
+    pub suppressed_until_ms: Option<i64>,
+    /// `UpdateAnomaly$baseline` — "Set this to true to prevent CloudWatch Logs from
+    /// displaying this behavior as an anomaly in the future."
+    pub baseline: bool,
+}
+
+/// How long a `suppressionPeriod` lasts, in milliseconds: its `value` in the
+/// `suppressionUnit` beside it (`SuppressionUnit` is `SECONDS | MINUTES | HOURS`). A period
+/// naming no unit is taken as the value in seconds, the smallest unit the enum carries.
+pub fn suppression_period_ms(period: &crate::ops::types::SuppressionPeriod) -> i64 {
+    let unit_ms = match period.suppression_unit.as_deref() {
+        Some("MINUTES") => 60 * 1_000,
+        Some("HOURS") => 60 * 60 * 1_000,
+        _ => 1_000,
+    };
+    i64::from(period.value).saturating_mul(unit_ms)
 }
 
 impl AnomalyDetectorRecord {
@@ -1765,6 +1818,10 @@ impl AnomalyDetectorRecord {
             anomaly_visibility_time: None,
             tags: BTreeMap::new(),
             status_due_ms: Some(creation_time_ms.saturating_add(ANOMALY_DETECTOR_TRAINING_DELAY_MS)),
+            // A detector that has not run a pass over its log groups yet has reported
+            // nothing, so it has no finding to suppress either.
+            anomalies: BTreeMap::new(),
+            suppressions: BTreeMap::new(),
         }
     }
 
@@ -1784,6 +1841,113 @@ impl AnomalyDetectorRecord {
             last_modified_time_stamp: self.last_modified_time_ms,
             anomaly_visibility_time: self.anomaly_visibility_time,
         }
+    }
+
+    /// Whether this detector has reported the anomaly `anomaly_id` names.
+    pub fn reports_anomaly(&self, anomaly_id: &str) -> bool {
+        self.anomalies.contains_key(anomaly_id)
+    }
+
+    /// Whether this detector has reported an anomaly of the pattern `pattern_id` names.
+    pub fn reports_pattern(&self, pattern_id: &str) -> bool {
+        self.anomalies
+            .values()
+            .any(|anomaly| anomaly.pattern_id == pattern_id)
+    }
+
+    /// The suppression in force over `anomaly` at `now_ms`, and whether it was placed on the
+    /// anomaly's PATTERN rather than on the anomaly itself.
+    ///
+    /// "If you suppress a pattern, CloudWatch Logs won't report any anomalies related to that
+    /// pattern" (`UpdateAnomaly`), so a pattern-level suppression covers every anomaly of
+    /// that pattern; a suppression placed on the anomaly itself is the more specific one and
+    /// wins. A `LIMITED` suppression stops being in force once the clock passes the instant
+    /// it was due to run out, which is DERIVED here rather than written by a sweep.
+    pub fn suppression_in_force(
+        &self,
+        anomaly: &crate::ops::types::Anomaly,
+        now_ms: i64,
+    ) -> Option<(&FindingSuppression, bool)> {
+        let in_force = |suppression: &FindingSuppression| {
+            suppression
+                .suppressed_until_ms
+                .is_none_or(|until| now_ms < until)
+        };
+        if let Some(suppression) = self.suppressions.get(&anomaly.anomaly_id).filter(|s| in_force(s))
+        {
+            return Some((suppression, false));
+        }
+        self.suppressions
+            .get(&anomaly.pattern_id)
+            .filter(|s| in_force(s))
+            .map(|suppression| (suppression, true))
+    }
+
+    /// This detector's anomalies as `ListAnomalies` reports them, in `anomalyId` order: the
+    /// stored shape, with the detector's own ARN and log groups and the suppression members
+    /// the store keeps beside it.
+    pub fn reported_anomalies(&self, now_ms: i64) -> Vec<crate::ops::types::Anomaly> {
+        self.anomalies
+            .values()
+            .map(|anomaly| {
+                let mut reported = anomaly.clone();
+                reported.anomaly_detector_arn = self.arn.clone();
+                reported.log_group_arn_list = self.log_group_arn_list.clone();
+                match self.suppression_in_force(anomaly, now_ms) {
+                    Some((suppression, pattern_level)) => {
+                        reported.suppressed = Some(true);
+                        reported.suppressed_date = suppression.suppressed_at_ms;
+                        reported.suppressed_until = suppression.suppressed_until_ms.unwrap_or(0);
+                        reported.is_pattern_level_suppression = Some(pattern_level);
+                    }
+                    None => {
+                        reported.suppressed = Some(false);
+                        reported.suppressed_date = 0;
+                        reported.suppressed_until = 0;
+                        reported.is_pattern_level_suppression = Some(false);
+                    }
+                }
+                reported
+            })
+            .collect()
+    }
+
+    /// Suppress the finding `id` names, or end its suppression.
+    ///
+    /// "If you have previously used this operation to suppress detection of a pattern or
+    /// anomaly, you can use it again to cause CloudWatch Logs to end the suppression. To do
+    /// this, use this operation and specify the anomaly or pattern to stop suppressing, and
+    /// omit the suppressionType and suppressionPeriod parameters." (`UpdateAnomaly`) — so a
+    /// call naming neither member removes the suppression the finding carries, and any other
+    /// call places one. "If you specify INFINITE, any value for suppressionPeriod is
+    /// ignored."
+    pub fn suppress_finding(
+        &mut self,
+        id: &str,
+        suppression_type: Option<&str>,
+        suppression_period: Option<&crate::ops::types::SuppressionPeriod>,
+        baseline: bool,
+        now_ms: i64,
+    ) {
+        if suppression_type.is_none() && suppression_period.is_none() {
+            self.suppressions.remove(id);
+            return;
+        }
+        let suppressed_until_ms = (suppression_type != Some(SUPPRESSION_TYPE_INFINITE))
+            .then(|| {
+                suppression_period
+                    .map(|period| now_ms.saturating_add(suppression_period_ms(period)))
+            })
+            .flatten();
+        self.suppressions.insert(
+            id.to_string(),
+            FindingSuppression {
+                suppression_type: suppression_type.map(ToString::to_string),
+                suppressed_at_ms: now_ms,
+                suppressed_until_ms,
+                baseline,
+            },
+        );
     }
 
     /// Materialise the status changes the clock owes this detector: a detector whose next
@@ -2976,23 +3140,33 @@ pub fn check_account_policy_criteria_overlap(
         let Some(held_selection) = CriteriaSelection::of(&held_criteria) else {
             continue;
         };
-        if let Some(conflict) = criteria_conflict(policy_type, &putting, &held_selection) {
-            return Err(format!(
-                "selectionCriteria conflicts with the account-level {policy_type} policy '{}': {conflict}",
-                held.policy_name
-            ));
+        if criteria_conflict(policy_type, &putting, &held_selection) {
+            return Err(selection_criteria_overlap_message(&held.policy_name));
         }
     }
     Ok(())
 }
 
-/// Why two criteria of one policy type conflict, or `None` when they do not. See
+/// How CloudWatch Logs refuses a `selectionCriteria` that overlaps the criteria of an
+/// account-level policy the account already holds.
+///
+/// Built FROM the request and the conflicting resource: the refusal names the policy whose
+/// criteria the put would overlap, so a caller holding several policies knows which one to
+/// narrow without describing them all.
+pub fn selection_criteria_overlap_message(held_policy_name: &str) -> String {
+    format!(
+        "SelectionCriteria is overlapping with an existing policy with policy name: \
+         {held_policy_name}"
+    )
+}
+
+/// Whether two criteria of one policy type conflict. See
 /// [`check_account_policy_criteria_overlap`] for the sentence behind each answer.
 fn criteria_conflict(
     policy_type: &str,
     putting: &CriteriaSelection<'_>,
     held: &CriteriaSelection<'_>,
-) -> Option<&'static str> {
+) -> bool {
     match (putting, held) {
         (
             CriteriaSelection::DataSource { names, types },
@@ -3001,10 +3175,10 @@ fn criteria_conflict(
                 types: held_types,
             },
         ) => {
+            // "no two of them can use the same data source name and type combination"
             let same_name = names.iter().any(|name| held_names.contains(name));
             let same_type = types.iter().any(|source| held_types.contains(source));
-            (same_name && same_type)
-                .then_some("no two of them can use the same data source name and type combination")
+            same_name && same_type
         }
         (
             CriteriaSelection::Groups { negated, selectors },
@@ -3018,38 +3192,31 @@ fn criteria_conflict(
                 // them can use the same or overlapping log group name prefixes".
                 return selectors
                     .iter()
-                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two)))
-                    .then_some("no two of them can use the same or overlapping log group name prefixes");
+                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two)));
             }
             match (negated, held_negated) {
-                (true, true) => {
-                    Some("when using NOT IN, only one policy with this operator is allowed per account")
-                }
+                // "When using NOT IN, only one policy with this operator is allowed per
+                // account".
+                (true, true) => true,
+                // "no two of them can have overlapping criteria"
                 (false, false) => selectors
                     .iter()
-                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two)))
-                    .then_some("no two of them can have overlapping criteria"),
+                    .any(|one| held_selectors.iter().any(|two| one.intersects(*two))),
                 // One selects the log groups it lists and the other excludes the ones it
                 // lists: they do not overlap only when every selected value is completely
                 // contained within some excluded value.
-                (false, true) => (!selectors
+                (false, true) => !selectors
                     .iter()
-                    .all(|one| held_selectors.iter().any(|two| one.contained_in(*two))))
-                .then_some(
-                    "every value of an IN policy must be completely contained within some value of the NOT IN policy",
-                ),
-                (true, false) => (!held_selectors
+                    .all(|one| held_selectors.iter().any(|two| one.contained_in(*two))),
+                (true, false) => !held_selectors
                     .iter()
-                    .all(|one| selectors.iter().any(|two| one.contained_in(*two))))
-                .then_some(
-                    "every value of an IN policy must be completely contained within some value of the NOT IN policy",
-                ),
+                    .all(|one| selectors.iter().any(|two| one.contained_in(*two))),
             }
         }
         // One criteria selects log groups and the other a data source name and type: they
         // select along different dimensions, which the field index policy's quota sentences
         // count separately, so neither constrains the other.
-        _ => None,
+        _ => false,
     }
 }
 

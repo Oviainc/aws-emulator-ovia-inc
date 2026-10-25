@@ -96,6 +96,12 @@ use super::types::*;
 ///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
 ///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
 ///   shared with every other `IAMRoleArn` member of this service.
+///
+/// `TypeVersion` is not checked here: the versions a configuration version may name
+/// are the ones the catalog publishes for the definition's own `Type`, which is known
+/// only once the `{ManagerArn}/{Id}` pair has been resolved to a stored definition, so
+/// that check lives in the handler beside the lookup
+/// ([`crate::state::resolve_type_version`]).
 fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String> {
     let parameters = input
         .parameters
@@ -282,13 +288,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A `TypeVersion` names one shipped revision of the service-owned template
+        // this definition's `Type` deploys, so it is resolved against the published
+        // catalog before anything is written: a version that type publishes (or the
+        // `LATEST` alias) resolves to the published version the definition is moved
+        // to, and anything else is refused with nothing stored. `Type` is not an
+        // input of this operation, so the stored type is what the version resolves
+        // against.
+        let resolved_version = match input.type_version.as_deref() {
+            Some(requested) => {
+                match crate::state::resolve_type_version(
+                    "TypeVersion",
+                    &definition.type_,
+                    Some(requested),
+                ) {
+                    Ok(resolved) => Some(resolved),
+                    Err(why) => {
+                        return Err(
+                            UpdateConfigurationDefinitionErrorModeled::ValidationException(
+                                ValidationException { message: Some(why) },
+                            )
+                            .into(),
+                        )
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Every member but the two labels is optional, and only what the request
         // carries is replaced, so an update naming one member leaves the others as they
         // were stored. `Parameters` is the definition's whole parameter set — the model
         // names no per-entry update — so a request carrying it replaces that set rather
         // than merging into it, which is also what keeps the operation `@idempotent`:
         // replaying one request leaves exactly the same definition.
-        if let Some(type_version) = input.type_version {
+        if let Some(type_version) = resolved_version {
             definition.type_version = Some(type_version);
         }
         if let Some(parameters) = input.parameters {

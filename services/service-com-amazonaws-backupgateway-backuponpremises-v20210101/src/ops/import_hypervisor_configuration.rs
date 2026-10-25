@@ -178,23 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A hypervisor is regional, so its ARN carries the region the caller signed for.
         let region = crate::state::request_region(ctx.parts());
 
-        // One guard spans the host lookup, the ceiling check and the insert, so two
-        // concurrent imports of one host cannot both pass a check only one of them
-        // should.
+        // One guard spans the ceiling check and the insert, so two concurrent imports
+        // cannot both pass a check only one of them should. There is no lookup to do
+        // first: the model declares no uniqueness constraint and no idempotency token on
+        // any input member, so every accepted import mints its OWN record under its own
+        // freshly minted ARN, whatever `Name` or `Host` another record already carries.
         let mut store = state.lock();
-
-        // The record stands for the machine reachable at `Host`, so a host this service
-        // has already imported cannot take a second record: that is the modelled
-        // `ConflictException` (HTTP 409), refused BEFORE anything is written.
-        if store.hypervisor_by_host(&input.host).is_some() {
-            return Err(ImportHypervisorConfigurationErrorModeled::ConflictException(
-                ConflictException {
-                    error_code: crate::state::HYPERVISOR_ALREADY_EXISTS.to_string(),
-                    message: Some(crate::state::HYPERVISOR_ALREADY_EXISTS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
 
         if store.hypervisor_count() >= crate::state::MAX_STORED_HYPERVISORS {
             // Not an AWS quota: the emulator's own store ceiling, refused the way the

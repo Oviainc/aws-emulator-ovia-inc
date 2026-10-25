@@ -4,7 +4,14 @@
 //! IMPLEMENTED: writes the item into the stored table, keyed by the primary key
 //! extracted from it, so a put over an existing key REPLACES that item. `Item` must
 //! carry every key attribute the table's `KeySchema` declares, with the type its
-//! `AttributeDefinitions` declare. `ReturnValues=ALL_OLD` reports the replaced item.
+//! `AttributeDefinitions` declare; an attribute that is part of a SECONDARY-INDEX key
+//! schema must carry its declared type too ("If you specify any attributes that are
+//! part of an index key, then the data types for those attributes must match those of
+//! the schema in the table's attribute definition" — `PutItem$Item`) and must be
+//! non-empty ("Attribute values of type String and Binary must have a length greater
+//! than zero if the attribute is used as a key attribute for a table or index"), and a
+//! violation of either is a `ValidationException` naming the index key and the index.
+//! `ReturnValues=ALL_OLD` reports the replaced item.
 //! An unknown — or not yet `ACTIVE` — table is `ResourceNotFoundException`.
 //!
 //! Every number the item carries is stored CANONICALLY — "DynamoDB treats them as
@@ -394,8 +401,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The key attributes are bounded by the documented key-value limits, for
             // this table's own key schema (inside `key_of_item`) and for every index
-            // key the item would be projected into.
-            table.check_index_key_limits(&item).map_err(lift)?;
+            // key the item would be projected into — which is also where an index key
+            // whose type is not the one the table declared for it, or whose `S`/`B`
+            // value is empty, is refused.
+            table.check_index_keys(&item).map_err(lift)?;
             table.key_of_item(&item).map_err(lift)?
         };
         // The condition is read against the item this put would replace, which is the

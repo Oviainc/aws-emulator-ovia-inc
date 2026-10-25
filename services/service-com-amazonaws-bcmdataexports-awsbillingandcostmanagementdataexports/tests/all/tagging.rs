@@ -158,7 +158,15 @@ fn walk() -> Vec<(String, Step)> {
 }
 
 /// The tag set `ListTagsForResource` reports for `arn`, as a map.
-async fn listed_tags(client: &Client, case: &str, arn: &str) -> BTreeMap<String, String> {
+///
+/// `pub(crate)` so the other tagging suites in this target read a tag set through the SAME
+/// reader — which also asserts the listing's ordering and its modelled bound — instead of
+/// each growing a copy of it.
+pub(crate) async fn listed_tags(
+    client: &Client,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let body = client
         .ok("ListTagsForResource", &json!({ "ResourceArn": arn }))
         .await;
@@ -199,7 +207,9 @@ async fn listed_tags(client: &Client, case: &str, arn: &str) -> BTreeMap<String,
 }
 
 /// Create one export without tags and return its ARN.
-async fn untagged_export(client: &Client, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`listed_tags`] is.
+pub(crate) async fn untagged_export(client: &Client, name: &str) -> String {
     let mut case = cases().remove(0);
     case.set_name(name);
     let created = client.ok("CreateExport", &case.create_request()).await;

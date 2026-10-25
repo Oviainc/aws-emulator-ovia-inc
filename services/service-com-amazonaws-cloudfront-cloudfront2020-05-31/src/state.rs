@@ -2200,6 +2200,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.distributions.get(id)
     }
 
+    /// The distribution whose edge domain name is `domain_name`, or `None` when the store
+    /// holds none.
+    ///
+    /// A domain name is allocated to one distribution at creation and is stable for its
+    /// whole life, so it addresses at most one record. This is how a resource that names a
+    /// distribution by its DOMAIN name rather than by its id — a continuous deployment
+    /// policy's `StagingDistributionDnsNames` — resolves to the distribution it routes
+    /// traffic to.
+    pub fn distribution_by_domain_name(&self, domain_name: &str) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| distribution.domain_name == domain_name)
+    }
+
     /// The continuous deployment policy `id` names, or `None` when the store holds none.
     pub fn continuous_deployment_policy(
         &self,
@@ -3177,6 +3191,35 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let etag = self.next_etag();
         let stored = self.origin_access_identities.get_mut(id)?;
         stored.config = config;
+        stored.etag = etag;
+        Some(stored)
+    }
+
+    /// Replace the configuration of the continuous deployment policy `id` names, and
+    /// report the record as it now stands.
+    ///
+    /// The submitted configuration becomes the stored one WHOLE, `LastModifiedTime`
+    /// becomes `now` — "the date and time the policy was last modified" — and the version
+    /// token is freshly minted, so the token the caller matched on no longer satisfies an
+    /// `If-Match` against this policy. Nothing else about a policy changes: the id is the
+    /// one it was created under, and a policy carries neither a status nor a propagation
+    /// deadline, so the clock owes it nothing.
+    ///
+    /// `None` when the store holds no such policy, checked BEFORE the mint so a version
+    /// token is never spent on a policy that is not there.
+    pub fn apply_continuous_deployment_policy_config(
+        &mut self,
+        id: &str,
+        config: ContinuousDeploymentPolicyConfig,
+        now: SystemTime,
+    ) -> Option<&StoredContinuousDeploymentPolicy> {
+        if !self.continuous_deployment_policies.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.continuous_deployment_policies.get_mut(id)?;
+        stored.config = config;
+        stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)
     }

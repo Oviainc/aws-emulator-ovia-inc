@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::pi_harness::{call, emulator_with_engine};
+use crate::pi_harness::{call, emulator_with_engine, register_data_source};
 
 use service_com_amazonaws_pi_performanceinsightsv20180227::state;
 
@@ -152,19 +152,18 @@ const UNREGISTERED: &str = "db-ABCDEFGHIJKLMNOPQRSTU1VW2X";
 /// Seed the shared data-source directory the way a database control plane does
 /// when it mints a resource id and persists its monitoring settings.
 fn register(engine: &engine::InMemoryEngine, row: &Row) {
-    let directory = state::data_source_directory(engine)
-        .expect("the shared data-source directory is reachable from the engine");
-    let mut directory = directory.lock();
-    directory.register(row.resource_id, row.owner, row.engine);
-    if let Some((performance_insights_enabled, database_insights_mode)) = row.monitoring {
-        directory.record_monitoring(
-            row.resource_id,
+    register_data_source(
+        engine,
+        row.resource_id,
+        row.owner,
+        row.engine,
+        row.monitoring.map(|(performance_insights_enabled, database_insights_mode)| {
             ::service_common::db_data_sources::MonitoringConfiguration {
                 performance_insights_enabled,
                 database_insights_mode: database_insights_mode.map(str::to_string),
-            },
-        );
-    }
+            }
+        }),
+    );
 }
 
 /// The `Status` of one feature in an answer.
