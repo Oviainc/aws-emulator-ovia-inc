@@ -233,7 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateLoginProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
-                        "Login Profile for user {} cannot be found.",
+                        // The same refusal `GetLoginProfile` answers with, naming the
+                        // entity type and then the user the request named.
+                        "Login Profile for User {} cannot be found.",
                         input.user_name
                     )),
                 },

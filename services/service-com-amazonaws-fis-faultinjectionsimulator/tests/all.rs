@@ -59,5 +59,7 @@ mod target_account_configuration_errors;
 mod target_account_configurations;
 #[path = "all/target_account_role_ownership.rs"]
 mod target_account_role_ownership;
+#[path = "all/template_admissibility_sequence.rs"]
+mod template_admissibility_sequence;
 #[path = "all/update_experiment_template.rs"]
 mod update_experiment_template;

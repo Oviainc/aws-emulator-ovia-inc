@@ -1575,6 +1575,48 @@ fn resolve_dependent_identities(
     }
 }
 
+/// The resource type of a wait condition — the one type that exists to wait for signals:
+/// "CloudFormation doesn't proceed with a stack creation or update until resources receive
+/// the required number of signals" (`SignalResource`).
+pub const WAIT_CONDITION: &str = "AWS::CloudFormation::WaitCondition";
+
+/// Whether the declaration of a resource makes a stack operation WAIT for signals on it.
+///
+/// A signal is sent "in conjunction with a creation policy or update policy"
+/// (`SignalResource`), and those attributes are what declare the wait — each for the
+/// operation it governs, which is what `updating` says: a `CreationPolicy`'s
+/// `ResourceSignal` (the signals a CREATE must receive before the resource is complete), an
+/// `UpdatePolicy` whose policy asks the UPDATE to wait on them (`WaitOnResourceSignals`),
+/// and a [`WAIT_CONDITION`], which waits for them whichever operation deploys it. A
+/// resource whose declaration carries none of those is signalled with nothing waiting on
+/// the signal.
+pub fn waits_for_resource_signals(declared: &DeclaredResource, updating: bool) -> bool {
+    if declared.resource_type == WAIT_CONDITION {
+        return true;
+    }
+    if !updating
+        && declared
+            .declaration
+            .get("CreationPolicy")
+            .and_then(|policy| policy.get("ResourceSignal"))
+            .is_some()
+    {
+        return true;
+    }
+    // `UpdatePolicy` keys its policies by name (`AutoScalingRollingUpdate`,
+    // `AutoScalingReplacingUpdate`); the wait is whichever of them asks for it.
+    updating
+        && declared
+            .declaration
+            .get("UpdatePolicy")
+            .and_then(Value::as_object)
+            .is_some_and(|policies| {
+                policies
+                    .values()
+                    .any(|policy| policy.get("WaitOnResourceSignals").is_some_and(flag))
+            })
+}
+
 /// The content of the `Metadata` resource attribute a declaration carries, as JSON.
 ///
 /// `Metadata` is one of the resource attributes CloudFormation defines on a template's

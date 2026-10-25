@@ -358,6 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
             first_recorded_at: Some(now),
             last_recorded_at: Some(now),
+            // A caller's own configuration item carries no supplementary blocks: this
+            // operation records the document it was handed and nothing beside it. The
+            // states this resource has already left are carried over by the store's own
+            // write path.
+            supplementary_configuration: ::std::collections::BTreeMap::new(),
+            history: Vec::new(),
         });
 
         Ok(PutResourceConfigOutput)

@@ -155,8 +155,9 @@
 use super::types::*;
 
 use crate::state::{
-    canonical_dns_name, resource_location, vpc_id_is_well_formed, vpc_region_is_modelled,
-    RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
+    canonical_dns_name, no_such_delegation_set, normalize_delegation_set_id, resource_location,
+    vpc_id_is_well_formed, vpc_region_is_modelled, RecordKey, StoredZone,
+    HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES, MAX_HOSTED_ZONES_PER_DELEGATION_SET,
 };
 use std::collections::BTreeMap;
 
@@ -316,17 +317,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A reusable delegation set has to exist before a zone can be created in
-        // it, and this emulator mints none (CreateReusableDelegationSet is not
-        // implemented), so no id a caller can pass names one.
-        if let Some(set_id) = input.delegation_set_id.as_deref().filter(|id| !id.is_empty()) {
-            return Err(CreateHostedZoneErrorModeled::NoSuchDelegationSet(NoSuchDelegationSet {
-                message: Some(format!(
-                    "no reusable delegation set exists with the ID {set_id}"
-                )),
-            })
-            .into());
-        }
+        // A reusable delegation set is named here by the id
+        // `CreateReusableDelegationSet` answered with; an empty one names none.
+        // The set itself is resolved against the store below, under the lock.
+        let requested_set = input
+            .delegation_set_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
 
         let comment = input
             .hosted_zone_config
@@ -397,6 +395,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // "You can't associate a reusable delegation set with a private
+            // hosted zone", so the two parameters cannot be sent together.
+            if let Some(requested) = requested_set.as_deref() {
+                return Err(CreateHostedZoneErrorModeled::InvalidInput(InvalidInput {
+                    message: Some(format!(
+                        "Invalid request: a private hosted zone cannot be created in the reusable \
+                         delegation set {requested}"
+                    )),
+                })
+                .into());
+            }
         }
 
         let mut store = state.lock();
@@ -429,8 +438,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A zone created in a reusable delegation set delegates to THAT set's
+        // four name servers rather than to four of its own, which is what makes
+        // the set reusable; a zone created in none gets four minted for it.
+        let (delegation_set_id, name_servers) = match requested_set.as_deref() {
+            None => (None, store.mint_name_servers()),
+            Some(requested) => {
+                // The caller may pass the bare id or the
+                // `/delegationset/`-prefixed `Id` a delegation-set response
+                // handed it back; both name the same set.
+                let set_id = normalize_delegation_set_id(requested).to_string();
+                let name_servers = store
+                    .delegation_sets
+                    .get(&set_id)
+                    .map(|set| set.name_servers.clone())
+                    .ok_or_else(|| {
+                        CreateHostedZoneErrorModeled::NoSuchDelegationSet(no_such_delegation_set(
+                            requested,
+                        ))
+                    })?;
+                // The per-set quota the operation's own `TooManyHostedZones`
+                // names ("you've reached the limit on the number of hosted
+                // zones that can be associated with a reusable delegation
+                // set"), so one set cannot take on zones without end.
+                if store.zones_in_delegation_set(&set_id) >= MAX_HOSTED_ZONES_PER_DELEGATION_SET {
+                    return Err(CreateHostedZoneErrorModeled::TooManyHostedZones(
+                        TooManyHostedZones {
+                            message: Some(format!(
+                                "the reusable delegation set {requested} has reached the limit of \
+                                 {MAX_HOSTED_ZONES_PER_DELEGATION_SET} hosted zones"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                (Some(set_id), name_servers)
+            }
+        };
         let id = store.mint_zone_id();
-        let name_servers = store.mint_name_servers();
         let mut records = BTreeMap::new();
         for record in default_apex_records(&name, &name_servers) {
             records.insert(RecordKey::of_record(&record), record);
@@ -460,6 +505,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A zone is created without deletion protection; nothing in this
             // API version turns it on.
             deletion_protection_enabled: false,
+            delegation_set_id,
         };
 
         let change = store.submit_change(None);
@@ -477,7 +523,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateHostedZoneOutput {
             hosted_zone: stored.to_hosted_zone(),
             change_info: change.to_change_info(),
-            delegation_set: stored.to_delegation_set(),
+            // The reusable delegation set the zone was created in, when it names
+            // one, so the `Id` and `CallerReference` the caller reads back are
+            // the set's own; otherwise the zone's own four name servers.
+            delegation_set: store.zone_delegation_set(stored),
             vpc: stored.vpcs.first().cloned(),
             location: resource_location(ctx, &format!("hostedzone/{id}")),
         })

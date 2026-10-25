@@ -65,6 +65,8 @@ mod invalidation_list;
 mod key_value_store_lifecycle;
 #[path = "all/key_value_store_update.rs"]
 mod key_value_store_update;
+#[path = "all/managed_cache_policy_catalog.rs"]
+mod managed_cache_policy_catalog;
 #[path = "all/managed_certificate_details.rs"]
 mod managed_certificate_details;
 #[path = "all/monitoring_subscription.rs"]
@@ -105,6 +107,8 @@ mod tag_resource;
 mod tenant_distribution_and_method_order;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
+#[path = "all/tenant_web_acl_association.rs"]
+mod tenant_web_acl_association;
 #[path = "all/verify_dns_configuration.rs"]
 mod verify_dns_configuration;
 #[path = "all/web_acl_association.rs"]

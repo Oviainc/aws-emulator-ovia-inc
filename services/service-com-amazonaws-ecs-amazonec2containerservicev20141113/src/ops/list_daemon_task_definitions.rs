@@ -214,7 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // family name and revision number" — and `DESC` reverses that one order.
         let descending = input.sort.as_deref() == Some(crate::state::SORT_ORDER_DESC);
 
-        let guard = state.lock();
+        let mut guard = state.lock();
+        // A requested delete completes on the clock, so the statuses this listing filters
+        // and reports are the ones the revisions stand in at THIS instant — the
+        // transitions were owed whether or not anybody called.
+        guard.advance_clock(::std::time::SystemTime::now());
 
         // `nextToken`: "This token should be treated as an opaque identifier that is only
         // used to retrieve the next items in a list and not for other programmatic

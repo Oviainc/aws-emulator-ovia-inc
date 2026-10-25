@@ -185,8 +185,7 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
             .find_map(|definition| {
                 crate::state::deployment_targets_rejection(
                     "ConfigurationDefinitions.Parameters",
-                    parameter(&definition.parameters, crate::state::PARAMETER_TARGET_REGIONS),
-                    parameter(&definition.parameters, crate::state::PARAMETER_TARGET_ACCOUNTS),
+                    &definition.parameters,
                 )
             })
     })
@@ -215,15 +214,6 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
                 )
             })
     })
-}
-
-/// The value one configuration parameter carries, or `None` when the definition names
-/// no such parameter.
-fn parameter<'p>(
-    parameters: &'p std::collections::HashMap<String, String>,
-    key: &str,
-) -> Option<&'p str> {
-    parameters.get(key).map(String::as_str)
 }
 
 /// The `CreateConfigurationManager` operation.
@@ -364,18 +354,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // and Region each of them then reports. A definition naming no target
             // deploys in this manager's own account and Region. Every configuration id
             // is service-generated and distinct from the definition id it names.
-            let targets = crate::state::deployment_targets(
-                record
-                    .parameters
-                    .get(crate::state::PARAMETER_TARGET_REGIONS)
-                    .map(String::as_str),
-                record
-                    .parameters
-                    .get(crate::state::PARAMETER_TARGET_ACCOUNTS)
-                    .map(String::as_str),
-                &account,
-                &region,
-            );
+            let targets =
+                crate::state::deployment_targets(&record.parameters, &account, &region);
             store.deploy_definition(&manager_arn, &record, &targets, created_at);
             definitions.push(record);
         }

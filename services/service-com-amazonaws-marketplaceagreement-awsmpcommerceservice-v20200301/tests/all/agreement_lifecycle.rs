@@ -196,6 +196,30 @@ pub(crate) fn term(id: &str) -> Value {
     json!({"id": id})
 }
 
+/// The one filter `SearchAgreementsInput$filters` requires every search to carry
+/// ("A proposer can use any combination of the preceding filters along with
+/// `AgreementType`, which is required"), on the type every agreement this crate
+/// mints carries — so a search this harness makes is about the rule under test
+/// rather than about that requirement.
+///
+/// `pub(crate)` because every suite that searches has to carry it.
+pub(crate) fn agreement_type_filter() -> Value {
+    json!({"name": "AgreementType", "values": ["PurchaseAgreement"]})
+}
+
+/// `filters` with [`agreement_type_filter`] appended unless it already names
+/// that filter, so a case's own filters keep the positions its assertions name.
+pub(crate) fn with_agreement_type(filters: &Value) -> Value {
+    let mut filters: Vec<Value> = filters.as_array().cloned().unwrap_or_default();
+    if !filters
+        .iter()
+        .any(|filter| filter["name"].as_str() == Some("AgreementType"))
+    {
+        filters.push(agreement_type_filter());
+    }
+    Value::Array(filters)
+}
+
 /// A requested term configuring a prepaid purchase, with the dimensions and
 /// quantities the acceptor asked for.
 ///
@@ -1346,8 +1370,11 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
     let second = agreement_over(&router, "ap-offer2", vec![term("UsageBasedPricingTerm")]).await;
     cancel(&router, &second).await;
 
+    // Every row carries the required agreement-type filter, appended by
+    // `with_agreement_type` below unless the row names it itself: the rule under
+    // test here is what a filter SELECTS, and `search_filter_combinations.rs`
+    // owns the rule about which filter lists are supported at all.
     let cases: Vec<(&str, Value, Vec<&String>)> = vec![
-        ("no filters at all reports every agreement", json!([]), vec![&first, &second]),
         (
             "the agreement type every agreement carries",
             json!([{"name": "AgreementType", "values": ["PurchaseAgreement"]}]),
@@ -1438,9 +1465,7 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
 
     for (case, filters, expected) in cases {
         let mut request = json!({"catalog": "AWSMarketplace"});
-        if !filters.as_array().is_some_and(Vec::is_empty) {
-            request["filters"] = filters;
-        }
+        request["filters"] = with_agreement_type(&filters);
         let answer = search(&router, request).await;
         assert_eq!(
             answer.status, 200,
@@ -1465,7 +1490,11 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
     // AWS Marketplace exposes exactly one catalog, so a `catalog` naming
     // another one is not a selector that matches nothing: it is refused, which
     // `selector_resolution.rs` pins over every operation carrying the member.
-    let other_catalog = search(&router, json!({"catalog": "SomeOtherCatalog"})).await;
+    let other_catalog = search(
+        &router,
+        json!({"catalog": "SomeOtherCatalog", "filters": [agreement_type_filter()]}),
+    )
+    .await;
     assert_eq!(
         other_catalog.status, 400,
         "an agreement is created in the AWSMarketplace catalog only, got {} with {:?}",
@@ -1570,7 +1599,11 @@ async fn a_search_pages_and_sorts_the_agreements_it_selects() {
             let mut token: Option<String> = None;
             let mut pages = 0;
             loop {
-                let mut request = json!({"maxResults": page_size, "sort": sort.clone()});
+                let mut request = json!({
+                    "maxResults": page_size,
+                    "sort": sort.clone(),
+                    "filters": [agreement_type_filter()],
+                });
                 if let Some(token) = token.as_deref() {
                     request["nextToken"] = json!(token);
                 }
@@ -1612,9 +1645,12 @@ async fn a_search_pages_and_sorts_the_agreements_it_selects() {
 
     // A token belongs to the search that minted it: resuming a different search
     // with it would index into a different sequence.
-    let token = search(&router, json!({"maxResults": 1}))
-        .await
-        .str_at("/nextToken");
+    let token = search(
+        &router,
+        json!({"maxResults": 1, "filters": [agreement_type_filter()]}),
+    )
+    .await
+    .str_at("/nextToken");
     assert!(
         is_next_token(&token),
         "a search with more results must mint a token, got {token:?}"
@@ -1624,7 +1660,7 @@ async fn a_search_pages_and_sorts_the_agreements_it_selects() {
         json!({
             "maxResults": 1,
             "nextToken": token,
-            "filters": [{"name": "Status", "values": ["ACTIVE"]}],
+            "filters": [agreement_type_filter(), {"name": "Status", "values": ["ACTIVE"]}],
         }),
     )
     .await;
@@ -1642,7 +1678,11 @@ async fn a_search_pages_and_sorts_the_agreements_it_selects() {
 
     // `sortBy` is a free-form string in the model, so an attribute the service
     // does not sort on is refused here rather than at the boundary.
-    let refused = search(&router, json!({"sort": {"sortBy": "Whatever"}})).await;
+    let refused = search(
+        &router,
+        json!({"sort": {"sortBy": "Whatever"}, "filters": [agreement_type_filter()]}),
+    )
+    .await;
     assert_eq!(
         refused.status, 400,
         "an unknown sortBy must be refused, got {} with {:?}",
@@ -1776,7 +1816,7 @@ async fn every_state_change_is_recorded() {
     for (operation, body) in [
         ("CancelAgreement", json!({"agreementId": agreement_id})),
         ("DescribeAgreement", json!({"agreementId": agreement_id})),
-        ("SearchAgreements", json!({})),
+        ("SearchAgreements", json!({"filters": [agreement_type_filter()]})),
     ] {
         call_as(&router, operation, body, sign).await;
     }
@@ -1845,7 +1885,10 @@ async fn cancelling_persists_the_new_status() {
 
     let found = search(
         &router,
-        json!({"filters": [{"name": "Status", "values": ["CANCELLED"]}]}),
+        json!({"filters": [
+            agreement_type_filter(),
+            {"name": "Status", "values": ["CANCELLED"]},
+        ]}),
     )
     .await;
     assert_eq!(

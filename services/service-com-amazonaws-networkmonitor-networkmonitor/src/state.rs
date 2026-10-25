@@ -200,9 +200,32 @@ pub const MAX_PAGE_SIZE: usize = 25;
 pub const MAX_MONITORS: usize = 500;
 
 /// The most probes this emulator keeps in ONE monitor. An EMULATOR-CHOSEN
-/// ceiling, for the reason given on [`MAX_MONITORS`]; AWS caps probes per
-/// monitor too and answers `ServiceQuotaExceededException`.
+/// ceiling, for the reason given on [`MAX_MONITORS`]; AWS caps the probes of a
+/// monitor too. Like every probe-count ceiling this service applies it is
+/// refused as a `ValidationException` (see [`PROBES_PER_SUBNET_MESSAGE`]).
 pub const MAX_PROBES_PER_MONITOR: usize = 100;
+
+/// The most probes one monitor holds in ONE source subnet: AWS's Network
+/// Monitor quota "Number of probes per subnet for each monitor", whose default
+/// value this is. The limit is per (monitor, source subnet) pair, so probes
+/// spread over separate subnets of the same monitor do not share it.
+pub const MAX_PROBES_PER_SUBNET: usize = 4;
+
+/// What this service states when a request would leave a monitor holding more
+/// than [`MAX_PROBES_PER_SUBNET`] probes in one source subnet.
+///
+/// A whole sentence rather than a constraint clause: the refusal is the one AWS
+/// states for this limit, and it names neither the member nor the count, so it
+/// reads the same whichever operation added the probes. The class is the
+/// `ValidationException` AWS answers here, not the `ServiceQuotaExceededException`
+/// the model also declares.
+pub const PROBES_PER_SUBNET_MESSAGE: &str = "Maximum probes per subnet limit exceeded.";
+
+/// The same, for the probes of a monitor as a whole
+/// ([`MAX_PROBES_PER_MONITOR`]): one refusal class and one sentence shape for
+/// every probe-count ceiling, so a caller catching the refusal of one catches
+/// the refusal of the other.
+pub const PROBES_PER_MONITOR_MESSAGE: &str = "Maximum probes per monitor limit exceeded.";
 
 /// The most `clientToken` records this emulator keeps. An EMULATOR-CHOSEN
 /// ceiling: the key is a string the CALLER picks, so this is the one store whose
@@ -669,6 +692,44 @@ pub fn validate_probe_spec(spec: &ProbeSpec, probe_path: &str) -> Result<&'stati
         }
     }
     Ok(address_family)
+}
+
+/// Check the per-subnet probe limit for a request that would ADD probes to a
+/// monitor ([`MAX_PROBES_PER_SUBNET`]).
+///
+/// The limit is counted per (monitor, source subnet) pair, so the probes
+/// `existing` already holds are grouped by their `sourceArn` and each requested
+/// `sourceArn` is counted on top of that group, in request order: one call that
+/// adds several probes to one subnet is bounded exactly as several calls adding
+/// one each are. `existing` is `None` for a monitor the request is creating,
+/// which holds no probe yet.
+///
+/// Shared by every operation that ADDS a probe to a monitor (`CreateProbe`, and
+/// `CreateMonitor`'s inline `probes` list), so the limit cannot be enforced on
+/// one path and not the other. `Err` carries
+/// [`PROBES_PER_SUBNET_MESSAGE`].
+pub fn check_probes_per_subnet<'a>(
+    existing: Option<&'a Monitor>,
+    requested: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut per_subnet: BTreeMap<&str, usize> = BTreeMap::new();
+    if let Some(monitor) = existing {
+        // Every probe the monitor holds occupies a slot in its own subnet,
+        // including one whose teardown is still draining: such a probe is still
+        // attached, and the store drops it once the teardown has run its course
+        // ([`Probe::is_forgotten_at`]), which frees the slot.
+        for probe in monitor.probes.values() {
+            *per_subnet.entry(probe.source_arn.as_str()).or_default() += 1;
+        }
+    }
+    for source_arn in requested {
+        let count = per_subnet.entry(source_arn).or_default();
+        *count += 1;
+        if *count > MAX_PROBES_PER_SUBNET {
+            return Err(PROBES_PER_SUBNET_MESSAGE.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// The dotted path of one member of the probe sitting at `probe_path`, which is

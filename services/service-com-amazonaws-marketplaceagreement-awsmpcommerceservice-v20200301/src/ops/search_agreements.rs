@@ -206,6 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `SearchAgreementsInput$filters` states two rules over the filter LIST
+        // beside the per-filter ones above: the agreement type "is required",
+        // and a search scoped to the acceptor party type may only add the
+        // filters one of the combinations that member lists adds. A list
+        // outside them is refused rather than answered with the whole
+        // population, and — like the per-filter refusals — before any agreement
+        // is scanned, so the answer is the same whatever the store holds.
+        if let Some(refusal) = crate::state::filter_combination_refusal(&filters) {
+            return Err(SearchAgreementsErrorModeled::ValidationException(refusal).into());
+        }
+
         // `Sort$sortBy`: "`StartTime` and `LastUpdateTime` are supported only
         // when `PartyType` is `Proposer`" — so a search scoped to a party type
         // may only sort on an attribute that party type supports, and the

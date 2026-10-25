@@ -161,7 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -234,6 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // materialises.
             status.status_settles_at = Some(now + crate::state::RECORDER_STATUS_SETTLE_AFTER);
         }
+        // A recorder that is recording keeps observing this account's resources with no
+        // further call, so the guard is released and the pump that runs those passes is
+        // started.
+        drop(store);
+        crate::state::drive_recorder_clock(ctx, &self.engine, &crate::state::request_region(ctx));
 
         Ok(StartConfigurationRecorderOutput)
     }

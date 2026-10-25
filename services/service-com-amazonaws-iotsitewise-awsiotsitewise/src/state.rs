@@ -62,7 +62,11 @@
 //! minted `applicationId` — which identifies one across every workspace — each
 //! record naming the workspace it was created in, the Identity Center instance
 //! the create named and the instant the `CREATING` -> `ACTIVE` transition it
-//! owes falls due. Every
+//! owes falls due. The Monitor dashboards live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dashboards`], keyed by the
+//! minted `dashboardId` — which identifies one across every project — each
+//! record naming the project it was created in and holding the definition
+//! literal the last write to it stated. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -3293,6 +3297,12 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// applied to several asset models. Bounded by
     /// [`MAX_INTERFACE_RELATIONSHIPS`].
     pub interface_relationships: HashMap<(String, String), InterfaceRelationshipRecord>,
+    /// IoT SiteWise Monitor dashboards by `dashboardId`, which identifies one
+    /// across every project; the project it was created in lives on its record,
+    /// because that is what a read reports and what the listing form filters on.
+    /// Written by `CreateDashboard` and `UpdateDashboard`, read by
+    /// `DescribeDashboard`.
+    pub dashboards: HashMap<String, DashboardRecord>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -4021,6 +4031,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
             COMPUTATION_MODEL_RESOURCE_TYPE => tags_of(self.computation_models.get(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of(self.access_policies.get(id), arn),
+            DASHBOARD_RESOURCE_TYPE => tags_of(self.dashboards.get(id), arn),
             _ => None,
         }
     }
@@ -4049,6 +4060,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of_mut(self.computation_models.get_mut(id), arn)
             }
             ACCESS_POLICY_RESOURCE_TYPE => tags_of_mut(self.access_policies.get_mut(id), arn),
+            DASHBOARD_RESOURCE_TYPE => tags_of_mut(self.dashboards.get_mut(id), arn),
             _ => None,
         }
     }
@@ -6308,3 +6320,92 @@ pub fn idc_application_arn(idc_instance_arn: &str, application_id: &str) -> Stri
 // `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
 // through.
 tagged_record!(ApplicationRecord);
+
+// ---------------------------------------------------------------------------
+// The dashboard slice: the record `CreateDashboard` writes, `UpdateDashboard`
+// rewrites and `DescribeDashboard` reports, its bound, the resource kind a
+// refusal names and its ARN.
+//
+// One section, like the application slice above: what a dashboard IS and every
+// value derived from it sit beside each other, so the create, the update and the
+// read cannot disagree about either.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource-type segment of a dashboard ARN, as [`dashboard_arn`] builds
+/// it.
+pub const DASHBOARD_RESOURCE_TYPE: &str = "dashboard";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the dashboard map.
+/// `CreateDashboard` is the only thing that adds a dashboard and it declares the
+/// modelled `LimitExceededException` (HTTP 410), so that is how this store
+/// refuses past the cap. The emulator's own bound, not a published AWS default.
+pub const MAX_DASHBOARDS: usize = 1_000;
+
+/// The resource kind a not-found refusal names for an IoT SiteWise Monitor
+/// dashboard; see [`not_found_message`].
+pub const RESOURCE_DASHBOARD: &str = "Dashboard";
+
+/// A stored IoT SiteWise Monitor dashboard: everything `DescribeDashboard`
+/// reports, plus the `tags` the tagging operations read.
+///
+/// A dashboard has no lifecycle state of its own — no operation on one answers a
+/// status member — so, unlike a portal or an application, nothing here is owed a
+/// later transition; the two dates are what a read derives from.
+#[derive(Debug, Clone)]
+pub struct DashboardRecord {
+    pub id: String,
+    pub arn: String,
+    /// The project the create named, which every read of the dashboard reports
+    /// and which the listing form filters on. Not the update's to change: no
+    /// member of `UpdateDashboard` carries a project.
+    pub project_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The dashboard definition JSON literal, held exactly as the last write
+    /// stated it: the service stores the literal and reports it back unparsed.
+    pub definition: String,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    pub tags: HashMap<String, String>,
+}
+
+impl DashboardRecord {
+    /// Replace the caller-owned members with what an update stated, and record
+    /// that instant as the dashboard's last update.
+    ///
+    /// The request describes the dashboard's NEW state rather than patching
+    /// selected members, so an omitted optional member clears the stored one —
+    /// the same rule `UpdateAsset` applies to an asset's description. The
+    /// dashboard's identity and provenance — its id, its ARN, its project, its
+    /// tags and its creation date — are not that call's to change, and no member
+    /// of its input carries them.
+    pub fn apply_update(
+        &mut self,
+        name: String,
+        description: Option<String>,
+        definition: String,
+        now: SystemTime,
+    ) {
+        self.name = name;
+        self.description = description;
+        self.definition = definition;
+        self.last_update_date = now;
+    }
+}
+
+/// The canonical ARN of a dashboard in `region`, in the form `CreateDashboard`
+/// documents:
+/// `arn:${Partition}:iotsitewise:${Region}:${Account}:dashboard/${DashboardId}`.
+pub fn dashboard_arn(region: &str, dashboard_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{DASHBOARD_RESOURCE_TYPE}/{dashboard_id}"),
+    )
+}
+
+// A dashboard's tags live on its own record, reached by ARN like every other
+// taggable resource's; the shared `TaggedRecord` seam is what
+// `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
+// through.
+tagged_record!(DashboardRecord);

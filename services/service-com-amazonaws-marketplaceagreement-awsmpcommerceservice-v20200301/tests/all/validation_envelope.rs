@@ -176,6 +176,22 @@ fn status_filter() -> Value {
     json!({"name": "Status", "values": ["ACTIVE"]})
 }
 
+/// The filter `SearchAgreementsInput$filters` requires every search to carry, so
+/// a row about another member is not answered by that requirement instead.
+fn agreement_type_filter() -> Value {
+    json!({"name": "AgreementType", "values": ["PurchaseAgreement"]})
+}
+
+/// A filter list `len` long that the combination rules support: the required
+/// agreement-type filter, padded to length with status filters.
+fn filter_list(len: usize) -> Value {
+    let mut filters = vec![agreement_type_filter()];
+    while filters.len() < len {
+        filters.push(status_filter());
+    }
+    Value::Array(filters)
+}
+
 /// The rows: one refused member each, spanning the constraints, the depths, the
 /// positions, the two kinds of failure and six operations.
 fn rows() -> Vec<Row> {
@@ -264,7 +280,10 @@ fn rows() -> Vec<Row> {
         Row {
             case: "a token the pattern admits that names no page of this search",
             operation: "SearchAgreements",
-            request: json!({"nextToken": "0123456789abcdef00000001"}),
+            request: json!({
+                "nextToken": "0123456789abcdef00000001",
+                "filters": [agreement_type_filter()],
+            }),
             reason: "INVALID_NEXT_TOKEN",
             field: "nextToken".to_string(),
             member: Member::Invalid,
@@ -630,13 +649,13 @@ async fn a_value_on_a_published_bound_is_not_refused() {
         (
             "maxResults at its minimum",
             "SearchAgreements",
-            json!({"maxResults": 1}),
+            json!({"maxResults": 1, "filters": [agreement_type_filter()]}),
             false,
         ),
         (
             "maxResults at its maximum",
             "SearchAgreements",
-            json!({"maxResults": 50}),
+            json!({"maxResults": 50, "filters": [agreement_type_filter()]}),
             false,
         ),
         (
@@ -648,7 +667,7 @@ async fn a_value_on_a_published_bound_is_not_refused() {
         (
             "a filter list at its maximum length",
             "SearchAgreements",
-            json!({"filters": vec![status_filter(); 10]}),
+            json!({"filters": filter_list(10)}),
             false,
         ),
         (

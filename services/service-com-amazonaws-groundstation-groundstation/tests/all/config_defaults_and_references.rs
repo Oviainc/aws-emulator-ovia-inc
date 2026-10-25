@@ -312,11 +312,14 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
         case: &'static str,
         /// The config whose deletion must be refused, as `(configType, configData)`.
         referenced: (&'static str, Value),
-        /// Builds the profile request that references `referenced`'s ARN.
-        profile: fn(&str, &str, &str) -> Value,
+        /// Builds the profile request that references `referenced`'s ARN, from the
+        /// `(referenced, tracking, downlink, endpoint)` ARNs — the last two being the
+        /// ends an edge needs beside the referenced config, so every edge the rows build
+        /// is a dataflow the service runs (an antenna downlink into a dataflow endpoint).
+        profile: fn(&str, &str, &str, &str) -> Value,
     }
 
-    fn profile_via_tracking(referenced: &str, _endpoint: &str, _downlink: &str) -> Value {
+    fn profile_via_tracking(referenced: &str, _tracking: &str, _downlink: &str, _endpoint: &str) -> Value {
         json!({
             "name": "profile via tracking",
             "minimumViableContactDurationSeconds": 30,
@@ -325,7 +328,7 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
         })
     }
 
-    fn profile_via_telemetry(referenced: &str, tracking: &str, _downlink: &str) -> Value {
+    fn profile_via_telemetry(referenced: &str, tracking: &str, _downlink: &str, _endpoint: &str) -> Value {
         json!({
             "name": "profile via telemetry sink",
             "minimumViableContactDurationSeconds": 30,
@@ -335,7 +338,7 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
         })
     }
 
-    fn profile_via_edge_source(referenced: &str, tracking: &str, endpoint: &str) -> Value {
+    fn profile_via_edge_source(referenced: &str, tracking: &str, _downlink: &str, endpoint: &str) -> Value {
         json!({
             "name": "profile via edge source",
             "minimumViableContactDurationSeconds": 30,
@@ -344,11 +347,11 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
         })
     }
 
-    fn profile_via_edge_destination(referenced: &str, tracking: &str, endpoint: &str) -> Value {
+    fn profile_via_edge_destination(referenced: &str, tracking: &str, downlink: &str, _endpoint: &str) -> Value {
         json!({
             "name": "profile via edge destination",
             "minimumViableContactDurationSeconds": 30,
-            "dataflowEdges": [[endpoint, referenced]],
+            "dataflowEdges": [[downlink, referenced]],
             "trackingConfigArn": tracking,
         })
     }
@@ -393,8 +396,17 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
         )
         .await;
         // The members a profile needs beside the referenced one: its own tracking config
-        // (every profile has one) and a second config to put at the other end of an edge.
+        // (every profile has one) and a config for each end of an edge — a dataflow runs
+        // FROM an antenna downlink TO a dataflow endpoint, so the row puts the referenced
+        // config at its own end and one of these at the other.
         let tracking_arn = create_tracking_config(&router, &format!("own tracking {case}")).await;
+        let (_, _, downlink_arn) = create_config(
+            &router,
+            &format!("edge downlink {case}"),
+            json!({"antennaDownlinkConfig": {"spectrumConfig": spectrum(Some("RIGHT_HAND"))}}),
+            None,
+        )
+        .await;
         let (_, _, endpoint_arn) = create_config(
             &router,
             &format!("edge endpoint {case}"),
@@ -407,7 +419,12 @@ async fn a_config_a_mission_profile_references_cannot_be_deleted() {
             &router,
             "POST",
             "/missionprofile",
-            Some((row.profile)(&referenced_arn, &tracking_arn, &endpoint_arn)),
+            Some((row.profile)(
+                &referenced_arn,
+                &tracking_arn,
+                &downlink_arn,
+                &endpoint_arn,
+            )),
         )
         .await;
         assert_eq!(

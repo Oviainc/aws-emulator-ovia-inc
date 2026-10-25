@@ -21,6 +21,35 @@ Fix: the front-door service-resolution/routing layer (the component that maps an
 
 Traces: all 24 chime-sdk-identity behavioral checks fail identically, each aborting on its very first call (CreateAppInstance) with AmbiguousService: concurrent-create-app-instance-admin-race, concurrent-register-endpoint-same-token-dedup, create-app-instance-admin-promotes-user, create-app-instance-bot-malformed-lex-arn-rejected, create-app-instance-describe-roundtrip, create-app-instance-idempotent-token, create-app-instance-token-reuse-conflict-rejected, create-app-instance-user-duplicate-id-conflict-rejected, create-app-instance-user-with-expiration-settings-at-creation, delete-app-instance-admin-demotes, delete-app-instance-admin-not-admin-succeeds-as-a-noop, delete-app-instance-cascades-users, deregister-endpoint-removes, describe-app-instance-bot-not-found-rejected, expiration-settings-set-and-clear, list-app-instance-users-reflects-created, put-app-instance-retention-settings-range-rejected, register-endpoint-idempotent-token, register-endpoint-invalid-pinpoint-arn-inactive, retention-settings-put-get-roundtrip, tag-resource-lifecycle-roundtrip, update-app-instance-name-metadata-persists, update-app-instance-user-endpoint-allow-messages-persists, update-app-instance-user-persists.
 
+## Resolution (fixer note)
+
+The router-level refusal is gone: the signing name is no longer treated as an identity.
+Each of the six services sharing `chime` now claims only a request that ADDRESSES it —
+the endpoint the `Host`/`:authority` names, and, for a request naming no endpoint (what a
+client pointed at a local `endpoint_url` sends), the URI path space its own model binds,
+with each space two of the models share split at the segment they differ at
+(`services/common/src/chime_family.rs`). So all 30 of this service's operations are
+reachable and `CreateAppInstance` answers 201 with the ARN it minted
+(`core/router/tests/all/chime_family_signing_name_routing.rs` mounts all six: it tabulates
+the claim decision service by service and host by host, and
+`create_app_instance_is_served_by_chime_sdk_identity_and_reads_back` pins that request end
+to end, including the read-back through `ListAppInstances` and `DescribeAppInstance`; and
+`services/service-com-amazonaws-chimesdkidentity-chimeidentityservice/tests/all/signing_name_route_claim.rs`
+pins this service's own claim rule).
+
+ONE of the 24 traces above is NOT yet passable: `tag-resource-lifecycle-roundtrip`.
+Five members of the family bind the very same generic tagging routes (`GET /tags`,
+`POST /tags?operation=tag-resource|untag-resource`), and for Tag/UntagResource the only
+discriminator — `ResourceARN` — travels in the request BODY, which the claim predicate
+(`Service::can_handle`, handed `http::request::Parts`) does not receive. That space is
+therefore resolved by endpoint prefix only: addressed to `identity-chime` it reaches this
+service (which answers those operations' scaffold), and a request naming no endpoint is
+claimed by nobody, so the router answers its terminal `404 UnknownService` instead of the
+retryable `500 AmbiguousService` with five claimants. That residual is filed as
+`20261022T060000Z-chime-family-generic-tagging-routes-still-ambiguous.md`, which also
+records that this service's three tagging operations are themselves still scaffolded.
+The other 23 traces are no longer blocked by routing.
+
 ## Evidence
 Suite result: 0/24 passed (0.0%); chime-sdk-identity 0/24 (0%), 24 failed, all with verdict [error].
 

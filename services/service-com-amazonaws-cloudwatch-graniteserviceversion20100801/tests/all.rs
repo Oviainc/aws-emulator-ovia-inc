@@ -31,6 +31,8 @@ mod harness;
 mod insight_rules;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
+#[path = "all/managed_insight_rules.rs"]
+mod managed_insight_rules;
 #[path = "all/metric_data.rs"]
 mod metric_data;
 #[path = "all/metric_streams.rs"]
