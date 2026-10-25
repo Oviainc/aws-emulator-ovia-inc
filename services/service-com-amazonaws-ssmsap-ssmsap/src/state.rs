@@ -82,7 +82,10 @@
 //! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
 //! and the `Policy` document both report is PROJECTED from them by
 //! [`RegionState::resource_policy`] — so a grant is observable by every later read in
-//! that Region and neither handler writes a policy document of its own.
+//! that Region and neither handler writes a policy document of its own. The target of a
+//! grant is a resource this Region holds ([`RegionState::holds_resource`], the same
+//! resolution the tagging calls run), so the policy a read reports always belongs to a
+//! resource some registration brought into being, and the grants go when it does.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -1469,16 +1472,18 @@ impl RegionState {
         }
         // A deregistration whose removal has fallen due is COMPLETE: from that instant
         // the application stops resolving, whether or not anybody called, and what was
-        // held FOR it goes with it — its tags, keyed by its ARN, and the configuration
+        // held FOR it goes with it — its tags and the resource permissions granted on
+        // it, both keyed by its ARN, and the configuration
         // check runs that inspected it, which describe a configuration that no longer
         // exists. Its `Operation` records stay: they are the history of calls already
         // made, which `GetOperation` resolves by id, and [`MAX_RETAINED_OPERATIONS`] is
         // what bounds them.
         //
-        // The tags that go with it are the ones held for every resource of that
+        // What is held PER RESOURCE goes with it for every resource of that
         // registration — the application's own ARN and the ARNs of the databases
         // DERIVED from it ([`StoredApplication::databases`]), since a database cannot
-        // outlive the registration it came from and neither can what was tagged on it.
+        // outlive the registration it came from and neither can what was tagged on it
+        // or granted on it.
         let completed: Vec<(String, Vec<String>)> = self
             .applications
             .values()
@@ -1499,6 +1504,10 @@ impl RegionState {
             self.applications.remove(&id);
             for arn in arns {
                 self.tags_by_arn.remove(&arn);
+                // A resource permission is held ON a resource, so it cannot outlive
+                // that resource either: once the ARN names nothing, the grants keyed
+                // by it are gone and no policy is rendered from them.
+                self.resource_permissions.remove(&arn);
             }
             self.forget_configuration_checks_for(&id);
         }
