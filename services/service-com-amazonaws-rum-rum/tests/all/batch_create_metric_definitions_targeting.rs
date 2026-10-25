@@ -45,11 +45,18 @@ const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// One extended metric definition that every acceptable request below carries: an
-/// extended metric name the model lists, with no dimensions, so a refusal can only come
-/// from the target the request names.
-/// Source: `smithy_query(query="shape", shape="MetricDefinitionRequest")`, member `Name`.
+/// extended metric name the model lists, with the `ValueKey` and the `EventPattern` the
+/// model pins for that name and no dimensions, so a refusal can only come from the target
+/// the request names.
+/// Source: `smithy_query(query="doc", shape="MetricDefinitionRequest")` — "If `Name` is
+/// `PerformanceNavigationDuration`, then `ValueKey` must be `event_details.duration` and
+/// the `EventPattern` must include `{"event_type":["com.amazon.rum.performance_navigation_event"]}`".
 fn definition() -> Value {
-    json!({"Name": "PerformanceNavigationDuration"})
+    json!({
+        "Name": "PerformanceNavigationDuration",
+        "ValueKey": "event_details.duration",
+        "EventPattern": r#"{"event_type":["com.amazon.rum.performance_navigation_event"]}"#,
+    })
 }
 
 /// The ARN of an emulated Evidently experiment — the resource an `Evidently` destination
