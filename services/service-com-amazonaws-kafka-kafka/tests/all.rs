@@ -37,6 +37,8 @@ mod kafka_harness;
 mod kafka_versions;
 #[path = "all/list_clusters_v2.rs"]
 mod list_clusters_v2;
+#[path = "all/node_listing.rs"]
+mod node_listing;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/replicator_lifecycle.rs"]

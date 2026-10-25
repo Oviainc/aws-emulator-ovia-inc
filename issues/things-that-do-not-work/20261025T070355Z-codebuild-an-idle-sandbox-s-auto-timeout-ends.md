@@ -1,0 +1,57 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: codebuild.sandbox-idle-timeout-auto-stop
+Issue-Shape-Id: com.amazonaws.codebuild#CodeBuild_20161006
+Issue-Key: codebuild.sandbox-idle-timeout-auto-stop|_poll_until#13|Timeout|time.sleep(interval_s)
+Issue-Commit: f29a5831c5957291c6cb768de44e48e5e558bd01
+
+# CodeBuild: an idle sandbox's auto-timeout ends it as TIMED_OUT instead of STOPPED, and the timer is keyed to real wall-clock minutes so no auto-stop is ever observable
+
+> _Note: this issue was identified against the code base at commit `f29a5831c5957291c6cb768de44e48e5e558bd01`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+BatchGetSandboxes
+
+## Description
+ONE net-new root cause in the `codebuild` behavioral suite, in the CodeBuild service crate services/service-com-amazonaws-codebuild-codebuild-20161006. Checks the replay report marked ALREADY FILED or OWNED are excluded; the open CodeBuild issues are named below where they touch the same area, and none of them carries this replay key.
+
+Cause 1 of 1: the terminal status a sandbox reaches on its OWN idle timeout is wrong (TIMED_OUT rather than STOPPED), and the transition is scheduled on real wall-clock minutes rather than on the compressed emulated spans the rest of this crate uses, so a caller never observes the auto-stop at all.
+
+AWS: Smithy `StartSandbox(projectName) -> Sandbox`, `StopSandbox(id @required) -> Sandbox`, `BatchGetSandboxes(ids @required) -> {sandboxes, sandboxesNotFound}`. `Sandbox$status` targets plain `String` (the model pins no value set for it), and `Sandbox$timeoutInMinutes` is documented as "How long, in minutes, from 5 to 2160 (36 hours), for CodeBuild to wait before timing out this sandbox if it does not get marked as completed" — so the model fixes the timeout semantics but NOT the status token the timeout produces. Recorded behavior only for that token: the check's own header records it measured on real AWS (us-west-2) that, unlike a Build's `buildStatus` (which distinguishes TIMED_OUT from STOPPED), a Sandbox's idle-timeout auto-stop reports the SAME terminal status as an explicit StopSandbox call, namely `STOPPED`. The requirement is therefore: a RUNNING sandbox left untouched past its configured `timeoutInMinutes` auto-transitions, with no StopSandbox call, to status `STOPPED`, and that transition is observable through an independent BatchGetSandboxes read.
+
+Emulator: two parts, one cause. (a) The settle path ends an un-stopped sandbox with `TIMED_OUT`: services/service-com-amazonaws-codebuild-codebuild-20161006/src/state.rs defines SANDBOX_STATUS_TIMED_OUT and `StoredSandbox::settle` calls `self.end(SANDBOX_STATUS_TIMED_OUT, timed_out_at)` once `timeout_due_millis()` has passed, while `StopSandbox` ends it with SANDBOX_STATUS_STOPPED — so the emulator deliberately splits the two outcomes that AWS reports identically. (b) `timeout_due_millis()` is `settle_due_millis + timeoutInMinutes * MILLIS_PER_MINUTE`, i.e. the full real-time span, whereas every other emulated transition in this crate is compressed to the project's 250-750 ms band (SANDBOX_SETTLE_MILLIS = 500 for QUEUED -> RUNNING, BUILD_SETTLE_MILLIS = 750 for a build). With the minimum documented timeout of 5 minutes the sandbox therefore stays RUNNING for 300 s of wall clock; the replayed check polls BatchGetSandboxes for a status other than RUNNING and is reaped by its budget first, reported as `Check timed out after 60.0s`. Observed: the sandbox is still RUNNING for the whole observation window, and when the timer does fire the status is TIMED_OUT, not STOPPED.
+
+Why: a client that provisions a sandbox and relies on CodeBuild to reap it cannot observe the reaping. It either waits forever on a sandbox that stays RUNNING, or — once the real-time timer finally fires — it sees a status token AWS never produces for this path, so code that branches on `STOPPED` (the token AWS uses for both an explicit stop and an idle timeout) never fires, and code that treats TIMED_OUT as an infrastructure fault misclassifies a normal idle reap. Every downstream read that depends on a terminal sandbox (its endTime, its session's closing RUN_SANDBOX phase status, the refusal of StartCommandExecution against a non-RUNNING sandbox) is reached through a state the emulator cannot be driven into within any usable window.
+
+Fix: the sandbox settle/timeout path in the CodeBuild state, not an operation handler — `StoredSandbox::settle`, `StoredSandbox::timeout_due_millis` and `StoredSandbox::end` in services/service-com-amazonaws-codebuild-codebuild-20161006/src/state.rs, read back by services/service-com-amazonaws-codebuild-codebuild-20161006/src/ops/batch_get_sandboxes.rs (and by `settled_sandbox`, the shared reporting read). The idle reap must end the sandbox with the same terminal status token StopSandbox uses, and its due instant must be an emulated span of the same compressed order as SANDBOX_SETTLE_MILLIS / BUILD_SETTLE_MILLIS rather than `timeoutInMinutes` of real wall clock, so the transition is reachable from a reporting read. `StartSandbox`'s own doc comment (src/ops/start_sandbox.rs) already states the intended rule — the sandbox "leaves that state only when StopSandbox ends it or the timeoutInMinutes it carries elapses" — so only the status token and the span need to change. Related open issues, neither of which covers this: 20261025T062553Z-codebuild-6-further-divergences-startbuildbatch-takes-no-input.md (its Cause 4 is the COMMAND EXECUTION settling to FAULT and explicitly records that the sandbox itself does reach RUNNING — it says nothing about the sandbox's own idle timeout or its terminal token) and 20261022T172625Z-codebuild-builds-never-execute-every-build-faults-at.md (single builds FAULTing at PROVISIONING).
+
+Traces: codebuild.sandbox-idle-timeout-auto-stop.
+
+## Evidence
+Replay of suite simparity-behavioral-ga-prod-v1 against the emulator built from this checkout: 26/110 passed, 65 mismatched, 19 errored, 0 skipped, 0 unloadable. Per-service: codebuild 26/86 (30%), 60 failed.
+
+Cause 1 — codebuild.sandbox-idle-timeout-auto-stop: verdict `mismatch`, detail `Check timed out after 60.0s`.
+
+What the check does, from its replayed source: CreateProject (NO_SOURCE, inline buildspec) with `timeoutInMinutes=5` (_SANDBOX_TIMEOUT_MINUTES, the documented minimum); StartSandbox(projectName=...); asserts StartSandbox's own response carries timeoutInMinutes == 5; polls BatchGetSandboxes until status == RUNNING (timeout_s=180) and re-asserts timeoutInMinutes == 5 there; then, WITHOUT calling StopSandbox or StartCommandExecution, polls BatchGetSandboxes for `status != "RUNNING"` with _IDLE_TIMEOUT_S = 600.0, and finally asserts `terminal["status"] == "STOPPED"` ("expected the idle sandbox to auto-transition to STOPPED, got ..."). The replay is reaped inside that last poll — the sandbox is still RUNNING throughout the observed window, so neither the auto-transition nor the token assertion is ever satisfied.
+
+Emulator source confirming the behavior (services/service-com-amazonaws-codebuild-codebuild-20161006/src/state.rs):
+- `pub const SANDBOX_STATUS_TIMED_OUT: &str = "TIMED_OUT";` documented as "The terminal status a sandbox nobody stopped reaches once the `timeoutInMinutes` it carries has elapsed".
+- `pub const SANDBOX_STATUS_STOPPED: &str = "STOPPED";` documented as "The terminal status a sandbox `StopSandbox` ended reaches".
+- `StoredSandbox::settle(&mut self, now_millis)`: `if self.is_terminal() || now_millis < self.settle_due_millis { return; } self.run(); let timed_out_at = self.timeout_due_millis(); if now_millis >= timed_out_at { self.end(SANDBOX_STATUS_TIMED_OUT, timed_out_at); }` — the idle reap is hard-coded to the TIMED_OUT token.
+- `StoredSandbox::timeout_due_millis()`: `self.settle_due_millis.saturating_add(i64::from(self.timeout_minutes()).saturating_mul(MILLIS_PER_MINUTE))` — 5 configured minutes become 300,000 ms of real wall clock.
+- `StoredSandbox::timeout_minutes()` falls back to DEFAULT_BUILD_TIMEOUT_MINUTES (60), so a project that omits the member gives a 60-minute real-time wait.
+- For contrast, the compressed spans the same file uses for every other emulated transition: `SANDBOX_SETTLE_MILLIS: i64 = 500` (QUEUED -> RUNNING) and `BUILD_SETTLE_MILLIS: i64 = 750`, both described as "inside the 250-750 ms band this project fixes for an emulated transition".
+- `ended_session_phases(...)` already closes the RUN_SANDBOX phase "with the status the session ended in (`TIMED_OUT` or `STOPPED`)", so the token chosen by `settle` also propagates into the session phase projection.
+
+Smithy model consulted: services/service-com-amazonaws-codebuild-codebuild-20161006/smithy-model/com-amazonaws-codebuild-codebuild-20161006.json — StartSandbox (input projectName NonEmptyString + idempotencyToken SensitiveString; output `sandbox`; errors AccountSuspendedException/InvalidInputException/ResourceNotFoundException, all client, httpError 400 defaulted), StopSandbox (id @required; output `sandbox`), BatchGetSandboxes (ids @required; output sandboxes + sandboxesNotFound), and the `Sandbox` structure — `status` targets plain `String` with doc "The status of the sandbox" (NO enum, so the model pins no token) and `timeoutInMinutes` targets WrapperInt with doc "How long, in minutes, from 5 to 2160 (36 hours), for CodeBuild to wait before timing out this sandbox if it does not get marked as completed". The STOPPED-vs-TIMED_OUT token is therefore recorded behavior only, as recorded in the check's own header.
+
+## Steps to Reproduce
+1. git clone the repo and boot the emulator built from this checkout.
+2. Replay the behavioral suite (run_behavioral_suite) and read the `codebuild` section — codebuild.sandbox-idle-timeout-auto-stop reports `Check timed out after 60.0s`. Or reproduce directly:
+3. CreateRole for codebuild.amazonaws.com, then CreateProject with source {type: NO_SOURCE, buildspec: a trivial inline 0.2 buildspec}, artifacts {type: NO_ARTIFACTS}, environment {type: LINUX_CONTAINER, image: aws/codebuild/amazonlinux2-x86_64-standard:5.0, computeType: BUILD_GENERAL1_SMALL}, serviceRole=<that role>, and timeoutInMinutes=5 (the documented minimum).
+4. StartSandbox(projectName=<that project>) and poll BatchGetSandboxes(ids=[<sandbox id>]) until status == RUNNING (it settles in ~500 ms).
+5. Do NOT call StopSandbox and do NOT call StartCommandExecution. Keep polling BatchGetSandboxes for a status other than RUNNING.
+6. Observe the sandbox stays RUNNING for the full 5 real minutes (and for 60 real minutes when the project omits timeoutInMinutes, since the record falls back to DEFAULT_BUILD_TIMEOUT_MINUTES = 60), so no auto-stop is observable inside any ordinary polling window. Expect the idle reap to be reachable on an emulated, compressed span like the 500 ms QUEUED -> RUNNING transition.
+7. Wait past the real 5-minute mark and read BatchGetSandboxes again: observe status `TIMED_OUT` (and the session's RUN_SANDBOX phase closed with TIMED_OUT). Expect status `STOPPED` — the same terminal token an explicit StopSandbox produces.
+8. Control: on a second sandbox of the same project, call StopSandbox(id=...) and read BatchGetSandboxes — observe status `STOPPED`, showing the emulator splits into two tokens the one outcome AWS reports as STOPPED.

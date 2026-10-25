@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new gateway has no capability configured yet: only
             // `UpdateGatewayCapabilityConfiguration` adds one, so nothing is invented
             // here.
-            capability_summaries: Vec::new(),
+            capabilities: Vec::new(),
             creation_date: now,
             last_update_date: now,
             tags: input.tags.clone().unwrap_or_default(),

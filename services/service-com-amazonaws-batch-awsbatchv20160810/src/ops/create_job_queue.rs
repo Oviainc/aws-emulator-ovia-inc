@@ -227,6 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested_order = input.compute_environment_order.unwrap_or_default();
         let requested_services = input.service_environment_order.unwrap_or_default();
+        // `serviceEnvironmentOrder` is stored and walked every time a service job of this
+        // queue is placed, so how many entries are kept is bounded
+        // (`state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        batch::validate_stored_list_length(
+            "serviceEnvironmentOrder",
+            requested_services.len(),
+            batch::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES,
+        )
+        .map_err(|detail| {
+            CreateJobQueueError::from(CreateJobQueueErrorModeled::ClientException(
+                batch::client_exception(detail),
+            ))
+        })?;
         if requested_order.is_empty() && requested_services.is_empty() {
             // A queue allocates jobs to environments, so it cannot be created over none.
             // AWS states this as the missing `computeEnvironmentOrder` — the order a

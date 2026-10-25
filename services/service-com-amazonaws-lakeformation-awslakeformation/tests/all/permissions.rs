@@ -23,6 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // emulator, the seeded catalog, the `restJson1` wire path and the error-code extractor.
 use crate::glue_catalog::{
     account_catalog, create_database, emulator, error_code, lake_formation as call,
+    revoke_default_database_grant,
 };
 
 /// One row of the repeated-grant table: the case name, the permissions each successive
@@ -269,8 +270,11 @@ async fn a_grant_is_read_back_on_every_resource_kind_the_model_carries() {
     ];
 
     for (case, resource, permissions, expected_resource) in cases {
-        // A fresh emulator per row, so a listing's single entry can only be this grant.
+        // A fresh emulator per row, so a listing's single entry can only be this grant —
+        // with the database's creation-time default grant revoked, since this row is about
+        // the record the grant wrote rather than the one the database was created with.
         let router = emulator_with_catalog().await;
+        revoke_default_database_grant(&router, "sales").await;
         let principal = format!("arn:aws:iam::{}:role/analyst", account_catalog());
         grant(&router, case, &principal, &resource, &permissions).await;
 
@@ -547,7 +551,10 @@ async fn a_revoke_takes_away_only_what_it_names() {
     ];
 
     for (case, granted, with_grant_option, revoked, remaining) in cases {
+        // The database's creation-time default grant goes first: this table is about what
+        // a revoke takes out of the record its own grant wrote.
         let router = emulator_with_catalog().await;
+        revoke_default_database_grant(&router, "sales").await;
         let (status, payload) = call(
             &router,
             "GrantPermissions",
@@ -606,6 +613,9 @@ async fn a_revoke_takes_away_only_what_it_names() {
 #[tokio::test]
 async fn the_filters_select_by_principal_resource_and_resource_type() {
     let router = emulator_with_catalog().await;
+    // This table is about the filters over the explicit grant store, so the database's
+    // creation-time default grant is revoked before the grants below are made.
+    revoke_default_database_grant(&router, "sales").await;
     let catalog = account_catalog();
     let analyst = format!("arn:aws:iam::{catalog}:role/analyst");
     let auditor = format!("arn:aws:iam::{catalog}:role/auditor");
@@ -921,6 +931,9 @@ async fn a_listing_pages_through_every_grant_exactly_once() {
 #[tokio::test]
 async fn a_resource_that_names_no_single_target_is_refused() {
     let router = emulator_with_catalog().await;
+    // The closing assertion is that nothing was recorded, so the database's creation-time
+    // default grant is revoked first and the listing can only hold what a call wrote.
+    revoke_default_database_grant(&router, "sales").await;
     // Rows differ along HOW the `Resource` fails to name exactly one target: none, two,
     // a table named both ways, a table named neither way, columns named both ways and an
     // empty column list.
@@ -1039,6 +1052,10 @@ async fn a_permission_the_model_does_not_carry_is_refused_on_both_write_paths() 
     ];
 
     let router = emulator_with_catalog().await;
+    // Each row reads back the record its own grant wrote, so the database's creation-time
+    // default grant — which a Principal-and-Resource listing would resolve onto the row's
+    // principal — is revoked first.
+    revoke_default_database_grant(&router, "sales").await;
     for (index, (case, permissions, with_grant_option, accepted)) in
         cases.into_iter().enumerate()
     {
@@ -1167,6 +1184,9 @@ async fn a_grant_records_the_set_of_the_permissions_it_names_up_to_the_modelled_
     ];
 
     let router = emulator_with_catalog().await;
+    // Each row reads back the set its own grant recorded, so the database's creation-time
+    // default grant is revoked first.
+    revoke_default_database_grant(&router, "sales").await;
     for (index, (case, granted, held)) in cases.into_iter().enumerate() {
         // One principal per row, so the rows cannot merge into one another's record.
         let principal = format!("arn:aws:iam::000000000000:role/ceiling-{index}");

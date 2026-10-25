@@ -21,14 +21,15 @@ use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrai
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutoParticipantRecordingConfiguration, Composition, ConflictException, Destination,
-    DestinationConfiguration, DestinationDetail, EncoderConfiguration, Event, GridConfiguration,
-    IngestConfiguration, InternalServerException, LayoutConfiguration,
-    ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
-    ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
+    AutoParticipantRecordingConfiguration, Composition, ConflictException,
+    CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
+    EncoderConfiguration, Event, GridConfiguration, IngestConfiguration, InternalServerException,
+    LayoutConfiguration, ParticipantRecordingHlsConfiguration, ParticipantReplica,
+    ParticipantSummary, ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
     RedundantIngestCredential, ResourceNotFoundException, S3StorageConfiguration,
     ServiceQuotaExceededException, Stage, StageEndpoints, StageSessionSummary, StageSummary,
-    StorageConfiguration, StorageConfigurationSummary, ValidationException, Video,
+    StartParticipantReplicationOutput, StopParticipantReplicationOutput, StorageConfiguration,
+    StorageConfigurationSummary, UpdateIngestConfigurationOutput, ValidationException, Video,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -2215,6 +2216,122 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
             .min_by_key(|composition| composition.sequence)
     }
 }
+
+// `CreateIngestConfigurationResponse$accessControlAllowOrigin` and its three siblings are
+// deliberately left UNSET, and no value for them appears below: which web origin may read
+// an answer off this listener is the emulator operator's decision, not this service's, and
+// the framework that owns the listener is what answers it (it reflects an origin the
+// operator allowed and grants no origin otherwise). A service that asserted an origin of
+// its own would hand that grant to every caller of this emulator with nothing to turn it
+// off. The model's `@cors` trait names no origin either
+// (`smithy_query(query="service_info")` reports the trait carrying
+// `additionalAllowedHeaders` and `additionalExposedHeaders` only), so there is no modelled
+// origin to report. The six headers below are restrictions rather than grants, and are
+// this service's to state.
+
+/// Response headers a browser client may read off an answer of this endpoint.
+///
+/// The model's `@cors` trait lists them as `additionalExposedHeaders`
+/// (`smithy_query(query="service_info")`): `x-amzn-errortype`, `x-amzn-requestid`,
+/// `x-amzn-errormessage`, `x-amzn-trace-id`, `x-amz-apigw-id` and `date` — the trait's own
+/// list, with the one name it repeats stated once. The first three are the three
+/// `crate::service` writes on a failure, so what this header publishes is exactly what the
+/// responses carry.
+pub const ACCESS_CONTROL_EXPOSE_HEADERS: &str = "x-amzn-errortype, x-amzn-requestid, \
+     x-amzn-errormessage, x-amzn-trace-id, x-amz-apigw-id, date";
+
+/// How long an answer of this endpoint may be reused: not at all.
+///
+/// Every operation of this service reports state a later call can change — a stage's
+/// `activeSessionId`, an ingest configuration's `state` — so no answer is a representation
+/// a client or a proxy may serve again.
+pub const CACHE_CONTROL: &str = "no-store";
+
+/// What an answer of this endpoint may load: nothing. The answer is a JSON document, never
+/// one a browser renders, so no source of any kind is allowed.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'";
+
+/// How long a client holds this endpoint to TLS, stated as the header's `max-age` in
+/// seconds and applied to its subdomains too. The span is this emulator's own choice; what
+/// the policy says is that a client which once reached the endpoint never tries cleartext
+/// to it again.
+pub const STRICT_TRANSPORT_SECURITY: &str = "max-age=47304000; includeSubDomains";
+
+/// Whether a client may second-guess the content type of an answer: it may not. The one
+/// value this header defines.
+pub const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
+
+/// Whether a browser may frame an answer of this endpoint: it may not. The header defines
+/// `DENY` and `SAMEORIGIN`, and an API answer belongs in no frame at all.
+pub const X_FRAME_OPTIONS: &str = "DENY";
+
+/// The six headers above, each paired with the name the model's `@httpHeader` trait gives
+/// it.
+///
+/// A SUCCESS does not go through this table: there they are modelled output members
+/// ([`ResponseHeaderPolicy`]), so the protocol serializer writes each under the name its
+/// own `@httpHeader` trait carries. The table is for the responses whose modelled members
+/// never reach the wire — every failure of this service renders the one-member body
+/// `crate::scaffolded::STATED_ERROR_SCHEMA` describes rather than the modelled error
+/// shape, though the same members are on each of those shapes too — so `crate::service`
+/// writes them onto the response itself, at the one place every response passes through.
+pub const RESPONSE_HEADER_POLICY: [(&str, &str); 6] = [
+    (
+        "Access-Control-Expose-Headers",
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+    ),
+    ("Cache-Control", CACHE_CONTROL),
+    ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
+    ("Strict-Transport-Security", STRICT_TRANSPORT_SECURITY),
+    ("X-Content-Type-Options", X_CONTENT_TYPE_OPTIONS),
+    ("X-Frame-Options", X_FRAME_OPTIONS),
+];
+
+/// An output shape of this service that binds the CORS and security response headers.
+///
+/// Four of this model's output shapes bind those members —
+/// `CreateIngestConfigurationResponse`, `StartParticipantReplicationResponse`,
+/// `StopParticipantReplicationResponse` and `UpdateIngestConfigurationResponse`
+/// (`smithy_query(query="shape",shape="CreateIngestConfigurationResponse")`) — and the
+/// values are a property of the ENDPOINT rather than of the resource any one of them
+/// reports, so they are filled in here, in one place, instead of in each handler.
+pub trait ResponseHeaderPolicy {
+    /// This output with each restriction member the shape binds carrying the endpoint's
+    /// value for it, so the protocol serializer writes all six on the response. The
+    /// cross-origin grant member is left absent; see the note above
+    /// [`ACCESS_CONTROL_EXPOSE_HEADERS`].
+    #[must_use]
+    fn with_response_header_policy(self) -> Self;
+}
+
+/// Implement [`ResponseHeaderPolicy`] for each output shape that binds those members, so
+/// one shape cannot report a different policy from another.
+macro_rules! impl_response_header_policy {
+    ($($output:ty),+ $(,)?) => {
+        $(impl ResponseHeaderPolicy for $output {
+            fn with_response_header_policy(mut self) -> Self {
+                self.access_control_expose_headers =
+                    Some(ACCESS_CONTROL_EXPOSE_HEADERS.to_string());
+                self.cache_control = Some(CACHE_CONTROL.to_string());
+                self.content_security_policy = Some(CONTENT_SECURITY_POLICY.to_string());
+                self.strict_transport_security = Some(STRICT_TRANSPORT_SECURITY.to_string());
+                self.x_content_type_options = Some(X_CONTENT_TYPE_OPTIONS.to_string());
+                self.x_frame_options = Some(X_FRAME_OPTIONS.to_string());
+                self
+            }
+        })+
+    };
+}
+
+// The two still-scaffolded operations of the four are implemented here as well: the policy
+// is the shape's, not the handler's, so implementing one of those operations is a call to
+// this trait rather than six more assignments.
+impl_response_header_policy!(
+    CreateIngestConfigurationOutput,
+    StartParticipantReplicationOutput,
+    StopParticipantReplicationOutput,
+    UpdateIngestConfigurationOutput,
+);
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

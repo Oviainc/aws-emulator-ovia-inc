@@ -47,6 +47,8 @@ mod failed_create_rollback;
 mod generated_physical_names;
 #[path = "all/generated_templates.rs"]
 mod generated_templates;
+#[path = "all/hook_result_invocations.rs"]
+mod hook_result_invocations;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
 #[path = "all/list_stack_resources.rs"]

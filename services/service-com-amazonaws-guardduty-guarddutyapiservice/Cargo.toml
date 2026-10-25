@@ -24,6 +24,15 @@ tracing = { workspace = true }
 # Parses an entity set's `Location` as a URL, so a valid Amazon S3 URL is told
 # from an invalid one by the URL grammar rather than by string matching.
 url = "2"
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the Runtime Monitoring coverage report asks EC2
+# for the instances of the account, because the account's instances are EC2's.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for EKS, over the same callback: the coverage report asks EKS for
+# the account's clusters and for the GuardDuty security agent add-on installed on
+# each, because both are EKS resources.
+aws-sdk-eks = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

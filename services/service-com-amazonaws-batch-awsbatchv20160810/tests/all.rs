@@ -35,10 +35,14 @@ mod refusal_contract;
 mod resource_tags;
 #[path = "all/scheduling_policies.rs"]
 mod scheduling_policies;
+#[path = "all/scheduling_policy_refusal_messages.rs"]
+mod scheduling_policy_refusal_messages;
 #[path = "all/scheduling_policy_teardown_and_conflicts.rs"]
 mod scheduling_policy_teardown_and_conflicts;
 #[path = "all/service_environment.rs"]
 mod service_environment;
+#[path = "all/service_job_capacity_placement.rs"]
+mod service_job_capacity_placement;
 #[path = "all/service_job_priority_updates.rs"]
 mod service_job_priority_updates;
 #[path = "all/service_job_submission.rs"]
