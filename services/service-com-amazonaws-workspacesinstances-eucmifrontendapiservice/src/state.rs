@@ -1189,27 +1189,70 @@ pub fn region_not_supported() -> ValidationException {
     }
 }
 
-/// The letters an AWS Region's Availability Zones are named with.
+/// The zone letters each Region this service serves publishes Availability Zones for,
+/// in ascending order, one row per Region of [`SUPPORTED_REGIONS`].
 ///
-/// A zone's name is its Region's name followed by a letter, counting from `a`
-/// (`us-east-1a`). WHICH zones the account has is a fact of the account's Region
-/// rather than of this service, so the set is the one this emulator models
-/// everywhere: `services/common/src/network.rs` states the account-network contract
-/// as "a Region's default subnets sit one per Availability Zone, in the zones named
-/// `<region>a`, `<region>b`, `<region>c`", and the EC2 service derives exactly those
-/// three zones for a Region. A client that asks EC2 which zones a Region has and then
-/// creates a volume here must see one set of zones, not two.
-pub const AVAILABILITY_ZONE_LETTERS: [char; 3] = ['a', 'b', 'c'];
+/// A zone's name is its Region's name followed by one of that Region's letters
+/// (`us-east-1a`). WHICH letters a Region publishes is PER REGION data: the count
+/// differs from Region to Region and the letters are not a run starting at `a` — the
+/// oldest US Region publishes six zones, two of the four-zone Regions publish `a`
+/// through `d`, Tokyo publishes `a`, `c` and `d` with no `b`, and Canada Central
+/// publishes `a`, `b` and `d`. A caller names the zone its subnet sits in, so a zone
+/// a Region really has must be accepted and a letter that Region does not publish must
+/// not be, whichever side of the third letter it falls on.
+///
+/// SOURCE: AWS's published Availability Zones per Region ("Regions and Zones" in the
+/// AWS documentation, the same table the Lightsail service's own Region catalog in
+/// this emulator records its `availability_zone_letters` from). Every Region whose
+/// published zones are the three letters `a`, `b`, `c` carries that string here rather
+/// than defaulting to it, so the catalog states what each Region has instead of
+/// assuming a shape.
+///
+/// Kept SORTED by Region name and free of duplicates, like [`SUPPORTED_REGIONS`], and
+/// covering exactly that set: a Region this service does not serve has no endpoint
+/// here and so no zones here either.
+pub const REGION_AVAILABILITY_ZONE_LETTERS: &[(&str, &str)] = &[
+    ("af-south-1", "abc"),
+    ("ap-east-1", "abc"),
+    ("ap-northeast-1", "acd"),
+    ("ap-northeast-2", "abcd"),
+    ("ap-south-1", "abc"),
+    ("ap-southeast-1", "abc"),
+    ("ap-southeast-2", "abc"),
+    ("ap-southeast-5", "abc"),
+    ("ca-central-1", "abd"),
+    ("eu-central-1", "abc"),
+    ("eu-south-2", "abc"),
+    ("eu-west-1", "abc"),
+    ("eu-west-2", "abc"),
+    ("eu-west-3", "abc"),
+    ("il-central-1", "abc"),
+    ("me-central-1", "abc"),
+    ("sa-east-1", "abc"),
+    ("us-east-1", "abcdef"),
+    ("us-east-2", "abc"),
+    ("us-west-2", "abcd"),
+];
 
-/// The Availability Zone names Region `region` has: `<region><letter>`, one per
-/// [`AVAILABILITY_ZONE_LETTERS`].
-///
-/// Derived rather than stored: no operation of this service creates, changes or
-/// deletes an Availability Zone, so two emulators built from this source place a
-/// volume in the same zones and reading the set changes nothing.
-pub fn availability_zones_in_region(region: &str) -> Vec<String> {
-    AVAILABILITY_ZONE_LETTERS
+/// The zone letters Region `region` publishes, from
+/// [`REGION_AVAILABILITY_ZONE_LETTERS`]; the empty string for a Region this service
+/// does not serve, which publishes no zones here at all.
+pub fn availability_zone_letters(region: &str) -> &'static str {
+    REGION_AVAILABILITY_ZONE_LETTERS
         .iter()
+        .find(|(name, _)| *name == region)
+        .map_or("", |(_, letters)| *letters)
+}
+
+/// The Availability Zone names Region `region` has: `<region><letter>`, one per letter
+/// [`availability_zone_letters`] gives for that Region.
+///
+/// Derived from the catalog rather than stored: no operation of this service creates,
+/// changes or deletes an Availability Zone, so two emulators built from this source
+/// place a volume in the same zones and reading the set changes nothing.
+pub fn availability_zones_in_region(region: &str) -> Vec<String> {
+    availability_zone_letters(region)
+        .chars()
         .map(|letter| format!("{region}{letter}"))
         .collect()
 }
