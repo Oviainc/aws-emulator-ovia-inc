@@ -109,6 +109,41 @@ pub const RUN_STATUS_STARTING: &str = "STARTING";
 pub const RUN_STATUS_QUEUED: &str = "QUEUED";
 /// The modelled failure state a run that could not execute ends in.
 pub const RUN_STATUS_FAILED: &str = "FAILED";
+/// The status a run carries while the shutdown a stop started is still running:
+/// "transitions the workflow run to a STOPPING state and then to STOPPED once all
+/// cleanup is complete" (`smithy_query(query="operation",
+/// operation="StopWorkflowRun")`).
+pub const RUN_STATUS_STOPPING: &str = "STOPPING";
+/// The status a run that was stopped reports once that shutdown is complete.
+pub const RUN_STATUS_STOPPED: &str = "STOPPED";
+/// The modelled success state. No run of this emulator reaches it — nothing executes
+/// a workflow definition here ([`NO_AIRFLOW_ENGINE`]) — but it is one of the statuses
+/// a run never leaves, so it belongs to [`RUN_TERMINAL_STATUSES`].
+pub const RUN_STATUS_SUCCESS: &str = "SUCCESS";
+/// The modelled timeout state, likewise terminal and likewise never assigned here.
+pub const RUN_STATUS_TIMEOUT: &str = "TIMEOUT";
+
+/// The `WorkflowRunStatus` values a run has FINISHED in and never leaves, out of the
+/// eight the model declares (`smithy_query(query="shape",
+/// shape="WorkflowRunStatus")`: the other four — `STARTING`, `QUEUED`, `RUNNING` and
+/// `STOPPING` — are each on their way somewhere).
+///
+/// What is terminal is what decides whether there is still an execution for a stop to
+/// end ([`WorkflowRun::begin_stop`]).
+pub const RUN_TERMINAL_STATUSES: &[&str] = &[
+    RUN_STATUS_SUCCESS,
+    RUN_STATUS_FAILED,
+    RUN_STATUS_TIMEOUT,
+    RUN_STATUS_STOPPED,
+];
+
+/// How long after `StopWorkflowRun` the run leaves [`RUN_STATUS_STOPPING`] for
+/// [`RUN_STATUS_STOPPED`]: the span the documented shutdown — stopping task
+/// scheduling and terminating the active workers — occupies. The length is the
+/// emulator's own choice, not a fidelity claim about how long AWS takes, and it is
+/// deliberately non-zero so a caller that reads the run straight back still observes
+/// the `STOPPING` its stop reported.
+pub const RUN_STOPPED_AFTER: Duration = Duration::from_millis(400);
 
 /// `RunType` for a run a caller started explicitly.
 pub const RUN_TYPE_ON_DEMAND: &str = "ON_DEMAND";
@@ -266,6 +301,10 @@ impl WorkflowRun {
     ///   never reaches `RUNNING` or `SUCCESS` here — those would be a status for
     ///   work nothing ran — so it ends in the service's modelled failure state
     ///   with a reason that says exactly that, and holds no task instance.
+    /// * `STOPPING` -> `STOPPED` after [`RUN_STOPPED_AFTER`]: the shutdown a stop
+    ///   started is complete, so the run is finished and carries the completion
+    ///   instant and duration every finished run does. It records no `ErrorMessage`:
+    ///   a run the caller stopped did not fail.
     ///
     /// A terminal status is never left: the loop stops at any status no
     /// transition is owed from, which is what makes a settled run stable across
@@ -288,12 +327,45 @@ impl WorkflowRun {
                     self.duration = Some(duration_in_seconds(elapsed));
                     self.error_message = Some(NO_AIRFLOW_ENGINE.to_string());
                 }
+                RUN_STATUS_STOPPING => {
+                    let elapsed = due.duration_since(self.started_on).unwrap_or_default();
+                    self.status = RUN_STATUS_STOPPED.to_string();
+                    self.completed_on = Some(due);
+                    self.modified_at = due;
+                    self.duration = Some(duration_in_seconds(elapsed));
+                }
                 // Terminal, or a status whose exit no clock owes.
                 _ => break,
             }
             changed = true;
         }
         changed
+    }
+
+    /// Whether this run has finished: its status is one a run never leaves
+    /// ([`RUN_TERMINAL_STATUSES`]), so no execution of it remains to be stopped.
+    pub fn is_terminal(&self) -> bool {
+        RUN_TERMINAL_STATUSES.contains(&self.status.as_str())
+    }
+
+    /// Start the shutdown `StopWorkflowRun` describes: a run that has not finished
+    /// moves to [`RUN_STATUS_STOPPING`], and its arrival in [`RUN_STATUS_STOPPED`]
+    /// falls due [`RUN_STOPPED_AFTER`] later — stored, never slept on, and
+    /// materialised by [`WorkflowRun::settle`] like every other owed change. Reports
+    /// whether this call moved the run.
+    ///
+    /// Idempotent, because the operation is `@idempotent` and models no conflict for a
+    /// run there is nothing to stop: a run already stopping keeps the deadline it has,
+    /// and a run that already finished keeps the status, completion and reason it
+    /// finished with, so a repeated stop REPORTS the run rather than restarting it.
+    pub fn begin_stop(&mut self, now: SystemTime) -> bool {
+        if self.is_terminal() || self.status == RUN_STATUS_STOPPING {
+            return false;
+        }
+        self.status = RUN_STATUS_STOPPING.to_string();
+        self.modified_at = now;
+        self.next_status_at = now + RUN_STOPPED_AFTER;
+        true
     }
 }
 
