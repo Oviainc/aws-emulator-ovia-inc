@@ -27,14 +27,12 @@
 //! `DescribeListeners` rather than trusted from the create's own answer.
 
 use smithy_server_runtime::MultiServiceRouter;
-use std::sync::Arc;
 
-/// The region every request below is signed for.
-const REGION: &str = "us-west-2";
-
-/// The API version every awsQuery request carries, from this model's service version
-/// (`smithy_query(query="service_info")`: `version: 2015-12-01`).
-const VERSION: &str = "2015-12-01";
+// The wire plumbing — the emulator under test, the request builder and the XML envelope
+// reader — is `crate::wire`, shared with this crate's other suites rather than copied per
+// suite. `VERSION` there is this model's own API version, read from the crate's
+// `service::shared_endpoint` rather than restated.
+use crate::wire::{action, call, first_text, members, p, router, VERSION};
 
 /// The awsQuery error code AWS reserves for an action the service does not have.
 const INVALID_ACTION: &str = "InvalidAction";
@@ -63,177 +61,12 @@ const CERT_ONE: &str = "arn:aws:acm:us-west-2:000000000000:certificate/11111111-
 /// A second certificate ARN, for the "more than one" rows.
 const CERT_TWO: &str = "arn:aws:acm:us-west-2:000000000000:certificate/22222222-2222-2222-2222-222222222222";
 
-/// A router carrying only this service, over one shared engine.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::EmulatedService::new(
-            engine,
-        ),
-    );
-    router
-}
-
-/// One answer from the emulator.
-struct Reply {
-    status: u16,
-    body: String,
-}
-
-impl Reply {
-    /// The text of the first element named `tag`, or `None` when it is absent or
-    /// empty.
-    fn text(&self, tag: &str) -> Option<String> {
-        let (inner, _) = element_span(&self.body, tag, 0)?;
-        (!inner.is_empty()).then(|| inner.to_string())
-    }
-
-    /// The `<Code>` of an awsQuery error envelope, or the empty string on a success.
-    fn error_code(&self) -> String {
-        self.text("Code").unwrap_or_default()
-    }
-}
-
-/// Percent-encode one form component, so an ARN crosses the wire intact.
-///
-/// Hand-written, as in this crate's sibling suite, so the change adds no dependency
-/// and leaves `Cargo.lock` alone: escaping every non-alphanumeric byte is always a
-/// valid form encoding.
-fn encode(value: &str) -> String {
-    let mut out = String::new();
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(char::from(*byte)),
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-/// One form field.
-fn p(key: &str, value: &str) -> (String, String) {
-    (key.to_string(), value.to_string())
-}
-
 /// The form fields of one awsQuery request.
 type Form = Vec<(String, String)>;
 
 /// One row of the dispatch table: the action's name, the request fields it carries and
 /// the HTTP status the one operation that owns that action must answer.
 type DispatchCase = (&'static str, Form, u16);
-
-/// `Action` plus `Version`, the two routing fields every awsQuery request carries.
-fn action(name: &str) -> Form {
-    vec![p("Action", name), p("Version", VERSION)]
-}
-
-/// Send one awsQuery request: `pairs` are the form fields, `Action` included.
-async fn call(router: &MultiServiceRouter, pairs: &[(String, String)]) -> Reply {
-    let body = pairs
-        .iter()
-        .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    // Signed for this model's OWN routing key: the `elasticloadbalancing` signing name
-    // both Elastic Load Balancing models declare is claimed by the Classic front door,
-    // which serves this model for a `Version=2015-12-01` envelope. That shared-endpoint
-    // half needs both services mounted and lives in
-    // `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`; this suite
-    // mounts this service alone, so it addresses it directly.
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("https://elasticloadbalancingv2.us-west-2.amazonaws.com/")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/elasticloadbalancingv2/aws4_request, SignedHeaders=host, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = String::from_utf8_lossy(response.body()).to_string();
-    Reply { status, body }
-}
-
-/// The XML inside each `<member>` of the first element named `container`.
-fn members(xml: &str, container: &str) -> Vec<String> {
-    let Some((inner, _)) = element_span(xml, container, 0) else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    let mut at = 0usize;
-    while let Some((member, past)) = element_span(inner, "member", at) {
-        found.push(member.to_string());
-        at = past;
-    }
-    found
-}
-
-/// The XML inside the first element named `name` at or after `from`, and the offset
-/// just past that element's closing tag.
-///
-/// The responses are the framework's own serializer output: elements, text and the
-/// `xmlns` attribute it puts on the response root and on each `<member>` — no
-/// comments, CDATA or processing instructions.
-fn element_span<'a>(xml: &'a str, name: &str, from: usize) -> Option<(&'a str, usize)> {
-    let (_, inner_start, self_closing) = find_tag(xml, name, from)?;
-    if self_closing {
-        return Some(("", inner_start));
-    }
-    let close = format!("</{name}>");
-    let mut depth = 1usize;
-    let mut cursor = inner_start;
-    while depth > 0 {
-        let next_close = xml[cursor..].find(&close).map(|at| cursor + at)?;
-        match find_tag(xml, name, cursor) {
-            Some((open_at, inner, false)) if open_at < next_close => {
-                depth += 1;
-                cursor = inner;
-            }
-            Some((open_at, past, true)) if open_at < next_close => {
-                // `<name/>` opens and closes at once.
-                cursor = past;
-            }
-            _ => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&xml[inner_start..next_close], next_close + close.len()));
-                }
-                cursor = next_close + close.len();
-            }
-        }
-    }
-    None
-}
-
-/// The offsets of the first opening tag named `name` at or after `from`: where the tag
-/// starts, where its content starts, and whether it is self-closing.
-fn find_tag(xml: &str, name: &str, from: usize) -> Option<(usize, usize, bool)> {
-    let needle = format!("<{name}");
-    let mut at = from;
-    loop {
-        let start = xml[at..].find(&needle).map(|found| at + found)?;
-        let after = start + needle.len();
-        let rest = &xml[after..];
-        if rest.starts_with('>') {
-            return Some((start, after + 1, false));
-        }
-        if rest.starts_with("/>") {
-            return Some((start, after + 2, true));
-        }
-        if rest.starts_with(|c: char| c.is_ascii_whitespace()) {
-            let end = rest.find('>').map(|found| found + after)?;
-            return Some((start, end + 1, xml[..end].ends_with('/')));
-        }
-        // A longer element name that merely starts with `name`.
-        at = after;
-    }
-}
 
 /// Create a load balancer across two subnets and answer its ARN.
 async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> String {
@@ -524,14 +357,11 @@ async fn the_default_certificate_is_bracketed_to_tls_terminating_protocols() {
         let port = row.port;
         let listener = stored
             .iter()
-            .find(|member| {
-                element_span(member, "Port", 0).map(|(inner, _)| inner) == Some(&port.to_string())
-            })
+            .find(|member| first_text(member, "Port") == Some(port.to_string()))
             .unwrap_or_else(|| {
                 panic!("case {case:?}: no stored listener on port {port} in {stored:?}")
             });
-        let reported_protocol = element_span(listener, "Protocol", 0)
-            .and_then(|(inner, _)| (!inner.is_empty()).then(|| inner.to_string()));
+        let reported_protocol = first_text(listener, "Protocol");
         assert_eq!(
             reported_protocol.as_deref(),
             row.protocol,

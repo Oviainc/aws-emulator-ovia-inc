@@ -4,8 +4,9 @@
 //! endpoint: the ELBv2 model's own validation, its own handlers' state, and its scaffolds.
 //!
 //! The routing rule itself — which of the two models an awsQuery envelope's `Version`
-//! names, and the `400 InvalidAction` for a pair neither resolves — is pinned next door in
-//! `shared_endpoint_api_versions.rs`. This suite pins the consequence that made the
+//! names, and the `400 InvalidAction` for a pair neither resolves — is pinned by
+//! `core/router/tests/all/elb_classic_and_v2_signing_name_routing.rs`, which mounts both
+//! services. This suite pins the consequence that made the
 //! defect critical: before it, EVERY `2015-12-01` envelope was answered `InvalidAction`,
 //! which tells an SDK the action does not exist. So for a pair that resolves, what comes
 //! back must be the ELBv2 model's OWN answer, whatever that answer is:
