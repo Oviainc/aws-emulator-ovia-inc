@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Map, Value};
 
-use crate::emulator::{text, Emulator, ATTACH_POINT_TYPE};
+use crate::emulator::{remote_account_for, text, Emulator, ATTACH_POINT_TYPE};
 
 /// `MaxResults` is modelled `@range(min: 1, max: 100)`, so these are the published
 /// bounds a page size may take, and 0 / 101 are the first values past them.
@@ -397,15 +397,15 @@ async fn a_listed_attach_point_creates_a_connection_that_reports_it_back() {
             let identifier = text(descriptor, "identifier");
             let bandwidth = &available[index % available.len()];
             let attach_point = json!({ "directConnectGateway": identifier });
+            let mut request = Map::new();
+            request.insert("environmentId".to_string(), json!(id));
+            request.insert("bandwidth".to_string(), json!(bandwidth));
+            request.insert("attachPoint".to_string(), attach_point.clone());
+            if let Some(remote_account) = remote_account_for(&environment) {
+                request.insert("remoteAccount".to_string(), remote_account);
+            }
             let created = emulator
-                .ic_ok(
-                    "CreateConnection",
-                    json!({
-                        "environmentId": id,
-                        "bandwidth": bandwidth,
-                        "attachPoint": attach_point,
-                    }),
-                )
+                .ic_ok("CreateConnection", Value::Object(request))
                 .await;
             let connection = &created["connection"];
             let case = format!("{id} / {identifier} / {bandwidth}");

@@ -38,7 +38,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     METADATA_TRANSFER_JOB_STATE_ERROR, METADATA_TRANSFER_JOB_STATE_VALIDATING,
 };
 
-use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, Resp, REGION};
 
 /// The workspaces the rows name: an IoT TwinMaker end of a transfer names a
 /// workspace by ARN, and two of them let a row name a different workspace at
@@ -370,6 +370,7 @@ async fn cancelling_a_job_turns_only_on_whether_it_has_already_finished() {
             let state_handle = emulator.state();
             let mut store = state_handle.lock();
             let job = store
+                .region_mut(REGION)
                 .metadata_transfer_jobs
                 .get_mut(&job_id)
                 .expect("the created job is in the store");
@@ -606,7 +607,12 @@ async fn cancelling_a_job_the_account_does_not_hold_reserves_nothing() {
     }
 
     assert!(
-        emulator.state().lock().metadata_transfer_jobs.is_empty(),
+        emulator
+            .state()
+            .lock()
+            .region(REGION)
+            .metadata_transfer_jobs
+            .is_empty(),
         "a refused cancel must materialise no job"
     );
 

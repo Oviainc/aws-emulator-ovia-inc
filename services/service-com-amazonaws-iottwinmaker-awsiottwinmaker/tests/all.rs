@@ -77,6 +77,9 @@ mod property_value_read;
 #[path = "all/refusal_constructions.rs"]
 mod refusal_constructions;
 
+#[path = "all/region_scoping.rs"]
+mod region_scoping;
+
 #[path = "all/reported_members.rs"]
 mod reported_members;
 

@@ -29,7 +29,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     METADATA_TRANSFER_JOB_STATE_VALIDATING,
 };
 
-use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, Resp, REGION};
 
 /// The workspaces every suite here creates: an IoT TwinMaker end of a transfer
 /// names a workspace by ARN, and two of them let a row name a different
@@ -517,9 +517,14 @@ async fn a_create_whose_configuration_does_not_match_its_type_is_refused() {
     );
 
     assert!(
-        emulator.state().lock().metadata_transfer_jobs.is_empty(),
+        emulator
+            .state()
+            .lock()
+            .region(REGION)
+            .metadata_transfer_jobs
+            .is_empty(),
         "a refused create must persist nothing, got {:?}",
-        emulator.state().lock().metadata_transfer_jobs
+        emulator.state().lock().region(REGION).metadata_transfer_jobs
     );
 }
 
@@ -591,7 +596,12 @@ async fn a_create_naming_a_workspace_the_service_does_not_hold_is_refused() {
     }
 
     assert!(
-        emulator.state().lock().metadata_transfer_jobs.is_empty(),
+        emulator
+            .state()
+            .lock()
+            .region(REGION)
+            .metadata_transfer_jobs
+            .is_empty(),
         "a refused create must persist nothing"
     );
 
@@ -687,6 +697,7 @@ async fn a_taken_job_id_conflicts_and_a_full_account_is_refused() {
     {
         let state = emulator.state();
         let mut store = state.lock();
+        let store = store.region_mut(REGION);
         for index in store.metadata_transfer_jobs.len()..MAX_METADATA_TRANSFER_JOBS {
             let id = format!("seededJob{index}");
             let job = MetadataTransferJob::accepted(
@@ -725,7 +736,12 @@ async fn a_taken_job_id_conflicts_and_a_full_account_is_refused() {
         "case \"full account\": the refusal must name the ceiling, got {over:?}"
     );
     assert_eq!(
-        emulator.state().lock().metadata_transfer_jobs.len(),
+        emulator
+            .state()
+            .lock()
+            .region(REGION)
+            .metadata_transfer_jobs
+            .len(),
         MAX_METADATA_TRANSFER_JOBS,
         "a refused create must persist nothing"
     );
