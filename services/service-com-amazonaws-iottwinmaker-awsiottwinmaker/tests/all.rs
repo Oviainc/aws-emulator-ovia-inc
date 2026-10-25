@@ -119,6 +119,9 @@ mod sync_job_listing;
 #[path = "all/sync_job_role_trust.rs"]
 mod sync_job_role_trust;
 
+#[path = "all/time_series_property_values.rs"]
+mod time_series_property_values;
+
 #[path = "all/workspace_built_in_component_types.rs"]
 mod workspace_built_in_component_types;
 
