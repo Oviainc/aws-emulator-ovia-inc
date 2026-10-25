@@ -143,20 +143,18 @@ pub const DOES_NOT_END_WITH: &str = "DOES_NOT_END_WITH";
 /// The operation is `@idempotent` and asks for ONE end state: the job stopped. A job
 /// that is `STOPPED` is in that state and one that is `STOPPING` is on its way to it, so
 /// a repeat has nothing left to do and answers the empty 200 the model declares. Any
-/// other status is judged against [`STOPPABLE_SEARCH_JOB_STATES`].
+/// other status is judged by [`SearchJob::is_stoppable`].
 pub const STOP_SATISFIED_STATES: &[&str] = &[STOPPING, STOPPED];
 
-/// The search-job statuses a stop may be started from.
+/// The message this service refuses a stop of a job it cannot stop with.
 ///
-/// MODELLED, not chosen: the operation's own documentation states the gate in one
-/// sentence — only a search job with a status of [`RUNNING`] can be stopped
-/// (`smithy_query(query="doc", shape="StopSearchJob")`). So a job whose scan has not
-/// started yet ([`CREATING`]) is as unstoppable as one whose scan already ended
-/// ([`COMPLETED`], [`FAILED`]): there is no running scan for the call to end, and the
-/// request asks for a transition the record cannot make from where it is. Only the
-/// statuses that already satisfy the call ([`STOP_SATISFIED_STATES`], judged first)
-/// answer the empty 200 without being in this set.
-pub const STOPPABLE_SEARCH_JOB_STATES: &[&str] = &[RUNNING];
+/// Recorded behaviour, not modelled: the model states no text for `ConflictException`, so
+/// the service's own wording is the requirement — ONE fixed sentence whose only variable
+/// part is the state the job is in, which is read from the record rather than from the
+/// request.
+pub fn stop_conflict_message(status: &str) -> String {
+    format!("SearchJob can not be stopped since it is in {status} state. Please try again later")
+}
 
 /// The search-job statuses an export may be started from.
 ///
@@ -594,10 +592,24 @@ impl SearchJob {
         STOP_SATISFIED_STATES.contains(&self.status.as_str())
     }
 
-    /// Whether this job is in a status a stop may act from (see
-    /// [`STOPPABLE_SEARCH_JOB_STATES`]).
+    /// Whether this job is in a status a stop may act from.
+    ///
+    /// DERIVED from the two status sets rather than listed, so a status this service
+    /// later reports cannot be judged by a stale list. The operation's one-sentence
+    /// documentation names the status a stop acts on ([`RUNNING`],
+    /// `smithy_query(query="doc", shape="StopSearchJob")`) but says nothing about a job
+    /// the service has accepted and not yet started scanning, and the service's own
+    /// recordings settle that: a stop sent straight after `StartSearchJob`, while the job
+    /// is still [`CREATING`], is accepted with the modelled empty 200 and the job
+    /// converges on [`STOPPED`]. The service exposes no window in which a job it has
+    /// accepted cannot be cancelled — the cancel is recorded against the job record and
+    /// honoured by the scan whenever it starts — so a stop is refused only once the job
+    /// has reached a status it never leaves ([`TERMINAL_STATES`]) that the stop itself
+    /// does not produce: there the scan is over, so there is nothing left to cancel and
+    /// the record cannot move from where it is. [`STOPPED`] is terminal too, but it
+    /// already satisfies the call ([`STOP_SATISFIED_STATES`]).
     pub fn is_stoppable(&self) -> bool {
-        STOPPABLE_SEARCH_JOB_STATES.contains(&self.status.as_str())
+        !self.is_terminal() || self.is_stop_satisfied()
     }
 
     /// Make `status` the ONE status this job is still owed, due at `due`, dropping

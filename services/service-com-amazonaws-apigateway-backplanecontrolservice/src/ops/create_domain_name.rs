@@ -445,10 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateDomainNameErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of custom domain names exceeded: {}",
-                        crate::state::MAX_DOMAIN_NAMES
-                    )),
+                    message: Some(crate::state::quota_reached("Custom Domain Names", "account")),
                 },
             )
             .into());

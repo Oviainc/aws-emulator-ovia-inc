@@ -4,13 +4,13 @@
 //! drives it: `StartSearchJob`, `GetSearchJob`, `StopSearchJob` and
 //! `ListSearchJobResults`.
 //!
-//! The rule under test: the operation acts only from the status its modelled
-//! documentation names (`smithy_query(query="doc", shape="StopSearchJob")` — only a
-//! search job with a status of `RUNNING` can be stopped), so a job whose scan is not
-//! running is refused with the modelled `ConflictException` (409) and the record is left
-//! exactly as it was, including the statuses the clock still owes it. The statuses that
-//! already satisfy the call are the one exception the `@idempotent` trait makes: a job
-//! already stopping or stopped answers the modelled empty 200.
+//! The rule under test: the operation acts on any search job the service has accepted
+//! that has not yet reached a status it never leaves — the set-up phase included — so the
+//! stop replaces whatever the scan still owed and the job converges on `STOPPED` instead
+//! of on the terminal status its own scan would have reached. The statuses that already
+//! satisfy the call answer the modelled empty 200 unchanged, as the `@idempotent` trait
+//! asks; the statuses a stop is refused from (the terminal ones it does not produce) are
+//! asserted in `tests/all/stop_search_job_cancel_window.rs`.
 //!
 //! Each assertion is made over a TABLE whose rows differ in what the rule generalises
 //! over — the phase the job is in when the stop arrives, what the scan still owed (a
@@ -25,7 +25,8 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
     call, emulator_with_engine, recovery_point, seed_indexed_recovery_points,
-    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    start_s3_search_job, PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT,
+    WITHIN_THE_DUE_INSTANT,
 };
 
 /// One row of the table: what this account holds, so the terminal status and the results
@@ -88,26 +89,8 @@ fn scan_cases() -> Vec<ScanCase> {
     ]
 }
 
-/// `StartSearchJob` for an S3 scope, answering the identifier it minted.
-async fn start(emulator: &smithy_server_runtime::MultiServiceRouter, region: &str, case: &str) -> String {
-    let started = call(
-        emulator,
-        region,
-        "PUT",
-        "/search-jobs",
-        Some(json!({"Name": "gated", "SearchScope": {"BackupResourceTypes": ["S3"]}})),
-    )
-    .await;
-    assert_eq!(
-        started.status, 200,
-        "case {case:?}: StartSearchJob must succeed, got {} ({:?})",
-        started.status, started.body
-    );
-    started.string("SearchJobIdentifier")
-}
-
 #[tokio::test]
-async fn a_stop_before_the_scan_runs_is_refused_and_leaves_the_scan_its_owed_statuses() {
+async fn a_stop_before_the_scan_runs_is_accepted_and_replaces_what_the_scan_still_owed() {
     for ScanCase {
         case,
         region,
@@ -118,7 +101,7 @@ async fn a_stop_before_the_scan_runs_is_refused_and_leaves_the_scan_its_owed_sta
     {
         let (emulator, engine) = emulator_with_engine();
         seed_indexed_recovery_points(&engine, index);
-        let identifier = start(&emulator, region, case).await;
+        let identifier = start_s3_search_job(&emulator, region, case).await;
         let job_uri = format!("/search-jobs/{identifier}");
 
         // Inside the set-up phase, which is the first status any caller can observe.
@@ -131,7 +114,7 @@ async fn a_stop_before_the_scan_runs_is_refused_and_leaves_the_scan_its_owed_sta
             creating.get("Status")
         );
 
-        let refused = call(
+        let accepted = call(
             &emulator,
             region,
             "PUT",
@@ -140,48 +123,44 @@ async fn a_stop_before_the_scan_runs_is_refused_and_leaves_the_scan_its_owed_sta
         )
         .await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: a stop of a job whose scan is not running must be refused 409, got {} ({:?})",
-            refused.status, refused.body
+            accepted.status, 200,
+            "case {case:?}: a stop of a job the service has accepted must succeed, got {} ({:?})",
+            accepted.status, accepted.body
         );
         assert_eq!(
-            refused.error_code.as_deref(),
-            Some("ConflictException"),
-            "case {case:?}: the refusal must carry ConflictException, got {:?}",
-            refused.error_code
-        );
-        let message = refused.string("message");
-        assert!(
-            message.contains(state::CREATING),
-            "case {case:?}: the refusal must name the status the job is in, got {message:?}"
+            accepted.body,
+            json!({}),
+            "case {case:?}: the modelled output is empty, got {:?}",
+            accepted.body
         );
 
-        // The refusal wrote nothing: the job is in the same status, has completed
-        // nothing, and still owes the statuses its scan was scheduled.
+        // The stop is in flight, and nothing has completed yet.
         let after = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             after.string("Status"),
-            state::CREATING,
-            "case {case:?}: a refused stop must leave the status where it was, got {:?}",
+            state::STOPPING,
+            "case {case:?}: a job whose stop is in flight is stopping, got {:?}",
             after.get("Status")
         );
         assert_eq!(
             after.get("CompletionTime"),
             &Value::Null,
-            "case {case:?}: a refused stop completes nothing, got {:?}",
+            "case {case:?}: a stop in flight has completed nothing, got {:?}",
             after.get("CompletionTime")
         );
 
-        // So the scan the stop did not cancel goes on to run and to record exactly the
-        // matches it was owed.
+        // The stop replaced what the scan still owed, so the job converges on STOPPED and
+        // never on the terminal status that scan would have reached.
         tokio::time::sleep(PAST_THE_DUE_INSTANT).await;
         let settled = call(&emulator, region, "GET", &job_uri, None).await;
         assert_eq!(
             settled.string("Status"),
-            owed_terminal,
-            "case {case:?}: the scan a refused stop left alone must settle to {owed_terminal}, got {:?}",
+            state::STOPPED,
+            "case {case:?}: a stopped job settles to stopped and not to the {owed_terminal} its scan would have reached, got {:?}",
             settled.get("Status")
         );
+        // And a scan that never got through its scope recorded no match, so the results it
+        // would have reported had it completed are not readable.
         let results = call(
             &emulator,
             region,
@@ -192,8 +171,8 @@ async fn a_stop_before_the_scan_runs_is_refused_and_leaves_the_scan_its_owed_sta
         .await;
         assert_eq!(
             results.get("Results").as_array().map(Vec::len).unwrap_or_default(),
-            owed_results,
-            "case {case:?}: the scan must report the {owed_results} match(es) it recorded, got {:?}",
+            0,
+            "case {case:?}: a cancelled scan reports none of the {owed_results} match(es) it would have recorded, got {:?}",
             results.body
         );
     }
@@ -210,7 +189,7 @@ async fn a_stop_of_a_running_scan_is_accepted_and_every_repeat_is_idempotent() {
     {
         let (emulator, engine) = emulator_with_engine();
         seed_indexed_recovery_points(&engine, index);
-        let identifier = start(&emulator, region, case).await;
+        let identifier = start_s3_search_job(&emulator, region, case).await;
         let job_uri = format!("/search-jobs/{identifier}");
         let cancel_uri = format!("{job_uri}/actions/cancel");
 

@@ -7,9 +7,10 @@
 //!
 //! The store is seeded directly here, through the same engine the mounted service reads
 //! ([`Amp::store`]) and with the same builder the listing suite uses
-//! ([`crate::scraper_listing::scraper`]): `CreateScraper` is still scaffolded (its own
-//! stub issue), so seeding is how a scraper exists to delete at all — and it is the same
-//! record the handler reads, not a second copy of it.
+//! ([`crate::scraper_listing::scraper`]): seeding is how a scraper in an EXACT status
+//! exists to delete — and it is the same record the handler reads, not a second copy of
+//! it. A deletion of a scraper `CreateScraper` itself made is driven in
+//! `crate::scraper_creation`.
 //!
 //! The deletion is read back through `ListScrapers`, which reports the stored record.
 

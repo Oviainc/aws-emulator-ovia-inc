@@ -149,10 +149,10 @@ fn bound_input(input: &CreateUsagePlanInput) -> Result<(), String> {
         bound_chars("description", description, MAX_STRING_CHARS)?;
     }
     if let Some(throttle) = &input.throttle {
-        bound_throttle_settings("throttle", throttle)?;
+        bound_throttle_settings(throttle)?;
     }
     if let Some(quota) = &input.quota {
-        bound_quota_settings("quota", quota)?;
+        bound_quota_settings(quota)?;
     }
     if let Some(api_stages) = &input.api_stages {
         bound_entries("apiStages", api_stages.len(), MAX_COLLECTION_ENTRIES)?;
@@ -167,7 +167,7 @@ fn bound_input(input: &CreateUsagePlanInput) -> Result<(), String> {
             )?;
             for (method, settings) in throttle.into_iter().flatten() {
                 bound_chars("apiStages.throttle key", method, MAX_STRING_CHARS)?;
-                bound_throttle_settings(&format!("apiStages.throttle[{method}]"), settings)?;
+                bound_throttle_settings(settings)?;
             }
         }
     }
@@ -287,10 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateUsagePlanErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of usage plans exceeded: {}",
-                        crate::state::MAX_USAGE_PLANS
-                    )),
+                    message: Some(crate::state::quota_reached("Usage Plans", "account")),
                 },
             )
             .into());

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_read_precondition.rs"]
 mod arn_read_precondition;
+#[path = "all/cold_account_gate.rs"]
+mod cold_account_gate;
 #[path = "all/contact_channel_deactivation.rs"]
 mod contact_channel_deactivation;
 #[path = "all/contact_channel_name_uniqueness.rs"]

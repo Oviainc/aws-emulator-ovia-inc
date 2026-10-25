@@ -257,10 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateVpcLinkErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of VPC links exceeded for this account: {}",
-                        crate::state::MAX_VPC_LINKS
-                    )),
+                    message: Some(crate::state::quota_reached("VPC Links", "account")),
                 },
             )
             .into());
