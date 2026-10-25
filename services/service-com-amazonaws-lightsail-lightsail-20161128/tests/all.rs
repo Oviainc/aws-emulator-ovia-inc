@@ -29,6 +29,8 @@ mod bucket_lifecycle;
 mod bucket_object_data_plane;
 #[path = "all/bundle_catalog.rs"]
 mod bundle_catalog;
+#[path = "all/cloud_formation_stack.rs"]
+mod cloud_formation_stack;
 #[path = "all/contact_method_notifications.rs"]
 mod contact_method_notifications;
 #[path = "all/container_image_registry.rs"]
