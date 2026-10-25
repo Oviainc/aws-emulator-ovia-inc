@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // been moved to, so accepting it now would move it a second time — which
         // also makes a replayed accept of the same request a conflict rather
         // than a second approval.
-        if request.status != crate::state::CANCELLATION_STATUS_PENDING_APPROVAL {
+        if !request.is_pending_approval() {
             let status = request.status.clone();
             return Err(
                 AcceptAgreementCancellationRequestErrorModeled::ConflictException(

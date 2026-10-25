@@ -15,12 +15,16 @@
 mod data_set_notifications;
 #[path = "all/data_sets.rs"]
 mod data_sets;
+#[path = "all/event_actions.rs"]
+mod event_actions;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/optional_page_size.rs"]
 mod optional_page_size;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/revision_finalization.rs"]
+mod revision_finalization;
 #[path = "all/revisions.rs"]
 mod revisions;
 #[path = "all/state_roundtrip.rs"]

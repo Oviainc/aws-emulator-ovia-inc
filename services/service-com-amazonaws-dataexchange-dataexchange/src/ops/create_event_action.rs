@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores the event action the request describes and answers 201 with the
+//! record it minted. The event's data set must exist (the modelled 404, widened in — see
+//! the `extra_errors` note below) and must carry `Origin` `ENTITLED`, otherwise the
+//! create is refused and leaves nothing behind. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +74,9 @@
 //! * `ThrottlingException` (HTTP 429) — The limit on the number of requests per second was
 //!   exceeded.
 //! * `ValidationException` (HTTP 400) — The request was invalid.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   the model's own `errors` list for this operation omits it, but the event names a data
+//!   set that may not exist.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -88,16 +87,24 @@ use super::types::*;
 // `CreateEventActionError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-dataexchange-dataexchange.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateEventActionError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dataexchange#CreateEventAction")]
+// The operation's MODELED errors, widened with `ResourceNotFoundException`.
+//
+// The event's `RevisionPublished.DataSetId` names a data set that may not exist, and
+// every sibling operation that takes a `DataSetId` (`GetDataSet`, `CreateRevision`,
+// `SendDataSetNotification`) declares `ResourceNotFoundException` for exactly that
+// case; this operation's `errors` list omits it, so it is widened in here through
+// `extra_errors` rather than answered as some other status. The shape is this
+// service's own (`com.amazonaws.dataexchange#ResourceNotFoundException`, HTTP 404),
+// declared in `types/shared_types.rs`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dataexchange#CreateEventAction",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateEventActionErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceLimitExceededException(ServiceLimitExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
@@ -154,18 +161,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventAction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEventActionErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // `Event` and `Action` are modelled structures whose single member is
+        // optional, so the boundary walk admits an empty one: an event action that
+        // names neither the event that fires it nor what it then does describes no
+        // automation at all.
+        let Some(published) = input.event.revision_published.clone() else {
+            return Err(CreateEventActionErrorModeled::ValidationException(
+                crate::state::invalid_request(
+                    "Event must name the event that starts the action: RevisionPublished",
+                ),
+            )
+            .into());
+        };
+        if let Err(message) = crate::state::bound_action(&input.action)
+            .and_then(|()| crate::state::bound_tags(input.tags.as_ref()))
+        {
+            return Err(CreateEventActionErrorModeled::ValidationException(
+                crate::state::invalid_request(message),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+
+        // Persist first, then answer out of what was stored. Every refusal below is
+        // taken under the same lock as the insert and before any id is minted, so a
+        // refused create leaves no event action behind for a later listing to find.
+        let stored = {
+            let mut store = state.lock();
+            let Some(data_set) = store.data_sets.get(&published.data_set_id) else {
+                return Err(CreateEventActionErrorModeled::ResourceNotFoundException(
+                    crate::state::data_set_not_found(&published.data_set_id),
+                )
+                .into());
+            };
+            // An event action exports a revision of a data set this account
+            // subscribes to, so the data set its event watches must be an entitled
+            // copy rather than one this account owns.
+            if data_set.origin != crate::state::ORIGIN_ENTITLED {
+                return Err(CreateEventActionErrorModeled::ValidationException(
+                    crate::state::event_action_requires_entitled_data_set(),
+                )
+                .into());
+            }
+            // The store is bounded, and the model declares the 402 for exactly this.
+            if store.event_actions.len() >= crate::state::MAX_EVENT_ACTIONS {
+                return Err(CreateEventActionErrorModeled::ServiceLimitExceededException(
+                    crate::state::event_action_limit_exceeded(),
+                )
+                .into());
+            }
+
+            let id = crate::state::mint_id();
+            let created_at = crate::state::now();
+            let record = crate::state::EventAction {
+                arn: crate::state::event_action_arn(&region, &id),
+                id: id.clone(),
+                event_source_id: published.data_set_id.clone(),
+                event: Event {
+                    revision_published: Some(published),
+                },
+                action: input.action,
+                tags: input.tags.unwrap_or_default(),
+                created_at,
+                updated_at: created_at,
+            };
+            let stored = record.clone();
+            store.event_action_order.push(id.clone());
+            store.event_actions.insert(id, record);
+            stored
+        };
+
+        Ok(CreateEventActionOutput {
+            action: Some(stored.action),
+            arn: Some(stored.arn),
+            created_at: Some(stored.created_at),
+            event: Some(stored.event),
+            id: Some(stored.id),
+            // An untagged event action carries no Tags member at all, not an empty map.
+            tags: (!stored.tags.is_empty()).then_some(stored.tags),
+            updated_at: Some(stored.updated_at),
+        })
     }
 }

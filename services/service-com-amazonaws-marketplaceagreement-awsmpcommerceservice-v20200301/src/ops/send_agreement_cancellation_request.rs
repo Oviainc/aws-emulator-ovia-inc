@@ -297,6 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // documents no refusal of a second pending request over one
             // agreement, so none is invented.
             status: crate::state::CANCELLATION_STATUS_PENDING_APPROVAL.to_string(),
+            // A `statusMessage` is "a message providing additional context
+            // about the cancellation request status", which only a call that
+            // supplies one gives a value to — the buyer's `rejectionReason` —
+            // so a request that has just been created carries none.
+            status_message: None,
             // Both already satisfy the model: `reasonCode` is a modelled enum
             // and `description` is `@length(1, 2000)`, so the boundary
             // validator refused anything else before this handler ran.
