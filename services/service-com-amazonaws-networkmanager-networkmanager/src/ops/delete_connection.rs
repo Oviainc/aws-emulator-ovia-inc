@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one connection of a global network: the tie between two of its devices that
+//! `CreateConnection` minted. The connection is addressed through its global network, so
+//! the parent is resolved first and a connection stored under another parent is not found
+//! here; the removed record is reported in the `DELETING` state the way every other delete
+//! of this service reports the resource it just removed.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // The delete acts on an EXISTING resource addressed by its path, so a parent the
+        // store does not hold is the missing-resource answer (404), not a field failure.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // A connection is addressed through its global network, so one stored under a
+        // different parent is not found here either — and neither is one already deleted,
+        // so a repeated delete of the same connection answers the missing-resource error
+        // instead of removing anything.
+        let addressed = store
+            .connections
+            .get(&input.connection_id)
+            .is_some_and(|record| record.global_network_id == input.global_network_id);
+        if !addressed {
+            return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::CONNECTION_KIND,
+                    &input.connection_id,
+                ),
+            )
+            .into());
+        }
+
+        // Nothing hangs off a connection: the two devices and the optional links it names
+        // are its REFERENCES, which outlive it, so no dependency refusal applies here and
+        // the record goes away on its own. Removing it is what makes those devices, and
+        // the global network above them, deletable in turn.
+        let removed = store
+            .connections
+            .remove(&input.connection_id)
+            .ok_or_else(|| {
+                DeleteConnectionErrorModeled::InternalServerException(InternalServerException {
+                    message: "the connection vanished while being deleted".to_string(),
+                    retry_after_seconds: None,
+                })
+            })?;
+
+        Ok(DeleteConnectionOutput {
+            connection: Some(removed.to_shape_with_state(crate::state::STATE_DELETING)),
+        })
     }
 }
+

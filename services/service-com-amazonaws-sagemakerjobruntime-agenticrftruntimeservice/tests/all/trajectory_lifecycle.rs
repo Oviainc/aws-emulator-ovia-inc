@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
+use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A host-style endpoint built from the model's endpoint prefix
@@ -207,10 +208,27 @@ async fn update_reward(
 
 /// A job ARN that satisfies the modelled
 /// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`
-/// pattern, assembled so a row can vary the partition, the region, the account
-/// and the job name independently.
+/// pattern, assembled so a row can vary the partition, the region, the account,
+/// the job category and the job name independently.
 fn job_arn(partition: &str, region: &str, account: &str, job: &str, run: &str) -> String {
     format!("arn:{partition}:sagemaker:{region}:{account}:job/{job}/{run}")
+}
+
+/// Create the job `job_arn` names in the shared job directory — the registration the
+/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable in
+/// this data plane. This service binds no operation that creates a job, so every rollout
+/// below starts from one created this way.
+fn create_job(engine: &engine::InMemoryEngine, job_arn: &str) {
+    let resource = ::service_common::arn::resource_id_of_type(job_arn, "job")
+        .expect("a job ARN naming a job resource");
+    let (category, name) = resource
+        .split_once('/')
+        .expect("a job resource of the form <category>/<name>");
+    engine.state::<JobDirectory>().lock().register(JobRecord {
+        name: name.to_string(),
+        category: category.to_string(),
+        arn: job_arn.to_string(),
+    });
 }
 
 /// One row of the trajectory table: a whole rollout, so a row differs from its
@@ -239,7 +257,7 @@ fn trajectory_cases() -> Vec<TrajectoryCase> {
     vec![
         TrajectoryCase {
             case: "one Sample turn, chat-completions payload",
-            job_arn: job_arn("aws", "us-east-1", "123456789012", "rft-job", "traj-run"),
+            job_arn: job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "traj-run"),
             trajectory_id: "traj-1".to_string(),
             turns: vec![(chat_payload("Summarize the rollout."), false)],
         },
@@ -249,7 +267,7 @@ fn trajectory_cases() -> Vec<TrajectoryCase> {
                 "aws-us-gov",
                 "us-gov-west-1",
                 "210987654321",
-                "agentic_rft-2",
+                "AgentRFTEvaluation",
                 "run-7",
             ),
             trajectory_id: "trajectory-with-a-longer-id-0042".to_string(),
@@ -264,7 +282,7 @@ fn trajectory_cases() -> Vec<TrajectoryCase> {
         },
         TrajectoryCase {
             case: "two streamed turns, trajectory id at the modelled maximum of 256",
-            job_arn: job_arn("aws-cn", "cn-north-1", "000000000001", "j", "r"),
+            job_arn: job_arn("aws-cn", "cn-north-1", "000000000001", "AgentRFT", "r"),
             trajectory_id: "t".repeat(256),
             turns: vec![
                 (chat_payload("first"), true),
@@ -277,7 +295,7 @@ fn trajectory_cases() -> Vec<TrajectoryCase> {
                 "aws",
                 "ap-southeast-2",
                 "999999999999",
-                "JobName-With_Mixed-Case",
+                "AgentRFTEvaluation",
                 "a",
             ),
             trajectory_id: "x".to_string(),
@@ -305,6 +323,7 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
         } = case;
 
         let mut served: Vec<Reply> = Vec::new();
+        create_job(&engine, &job_arn);
         for (index, (payload, streamed)) in turns.iter().enumerate() {
             let reply = sample(&router, &job_arn, &trajectory_id, payload, *streamed).await;
             assert_eq!(
@@ -468,10 +487,14 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
 #[tokio::test]
 async fn the_trajectory_key_is_the_job_and_trajectory_pair() {
     let (engine, router) = mounted_service();
-    let first = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-a");
-    let second = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-b");
-    let third = job_arn("aws", "eu-west-1", "123456789012", "rft-job", "run-a");
+    let first = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-a");
+    let second = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-b");
+    let third = job_arn("aws", "eu-west-1", "123456789012", "AgentRFT", "run-a");
     let rows = [(&first, 2usize), (&second, 1), (&third, 3)];
+
+    for (arn, _turns) in rows {
+        create_job(&engine, arn);
+    }
 
     for (arn, turns) in rows {
         for _ in 0..turns {
@@ -542,7 +565,8 @@ async fn complete_rollout_seals_the_trajectory_and_refuses_a_different_status() 
 
     for (case, requested, expected, other) in rows {
         let (engine, router) = mounted_service();
-        let arn = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
+        let arn = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
+        create_job(&engine, &arn);
         assert_eq!(
             sample(&router, &arn, "traj-1", &chat_payload("go"), false)
                 .await
@@ -677,7 +701,8 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
 
     for (case, rewards, other) in rows {
         let (engine, router) = mounted_service();
-        let arn = job_arn("aws", "us-west-2", "123456789012", "rft-job", "run-1");
+        let arn = job_arn("aws", "us-west-2", "123456789012", "AgentRFT", "run-1");
+        create_job(&engine, &arn);
 
         // Not eligible before CompleteRollout.
         assert_eq!(
@@ -820,9 +845,9 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
 /// TrajectoryId)` pair this emulator holds no trajectory for is not found.
 #[tokio::test]
 async fn an_unknown_trajectory_is_not_found() {
-    let known = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
-    let other_job = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-2");
-    let other_region = job_arn("aws", "eu-central-1", "123456789012", "rft-job", "run-1");
+    let known = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
+    let other_job = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-2");
+    let other_region = job_arn("aws", "eu-central-1", "123456789012", "AgentRFT", "run-1");
 
     // Rows: the pair that is looked up, against a store holding exactly
     // (known, "traj-1").
@@ -834,7 +859,8 @@ async fn an_unknown_trajectory_is_not_found() {
     ];
 
     for (case, arn, trajectory_id) in rows {
-        let (_engine, router) = mounted_service();
+        let (engine, router) = mounted_service();
+        create_job(&engine, &known);
         assert_eq!(
             sample(&router, &known, "traj-1", &chat_payload("go"), false)
                 .await
@@ -880,13 +906,13 @@ async fn an_unknown_trajectory_is_not_found() {
 /// modelled `CompletionStatus` enum, is refused as invalid and writes nothing.
 #[tokio::test]
 async fn a_malformed_request_is_refused_as_invalid() {
-    let valid = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
+    let valid = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
 
     // Rows: each one breaks a DIFFERENT modelled constraint — the ARN pattern in
     // four places, both ends of the trajectory id's 1..256 length range, the
     // required payload, and the enum catalogue.
     let long_trajectory_id = "t".repeat(257);
-    let long_arn = job_arn("aws", "us-east-1", "123456789012", "rft-job", &"a".repeat(63));
+    let long_arn = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", &"a".repeat(63));
     let sampling_rows: Vec<(&str, String, String, Vec<u8>)> = vec![
         (
             "JobArn is not an ARN",
@@ -896,19 +922,19 @@ async fn a_malformed_request_is_refused_as_invalid() {
         ),
         (
             "JobArn names another service",
-            "arn:aws:bedrock:us-east-1:123456789012:job/rft-job/run-1".to_string(),
+            "arn:aws:bedrock:us-east-1:123456789012:job/AgentRFT/run-1".to_string(),
             "traj-1".to_string(),
             chat_payload("go"),
         ),
         (
             "JobArn account is not 12 digits",
-            "arn:aws:sagemaker:us-east-1:12345:job/rft-job/run-1".to_string(),
+            "arn:aws:sagemaker:us-east-1:12345:job/AgentRFT/run-1".to_string(),
             "traj-1".to_string(),
             chat_payload("go"),
         ),
         (
             "JobArn has no job run segment",
-            "arn:aws:sagemaker:us-east-1:123456789012:job/rft-job".to_string(),
+            "arn:aws:sagemaker:us-east-1:123456789012:job/AgentRFT".to_string(),
             "traj-1".to_string(),
             chat_payload("go"),
         ),
@@ -935,6 +961,7 @@ async fn a_malformed_request_is_refused_as_invalid() {
     for (case, arn, trajectory_id, payload) in sampling_rows {
         for streamed in [false, true] {
             let (engine, router) = mounted_service();
+            create_job(&engine, &valid);
             let reply = sample(&router, &arn, &trajectory_id, &payload, streamed).await;
             assert_eq!(
                 reply.status,
@@ -962,7 +989,8 @@ async fn a_malformed_request_is_refused_as_invalid() {
     // The ARN rows above are refused on the pattern; this one satisfies it at the
     // job-run segment's 63-character maximum and is accepted, which is what makes
     // the refusals above about the pattern and not about length.
-    let (_engine, router) = mounted_service();
+    let (engine, router) = mounted_service();
+    create_job(&engine, &long_arn);
     let accepted = sample(&router, &long_arn, "traj-1", &chat_payload("go"), false).await;
     assert_eq!(
         accepted.status,
@@ -974,6 +1002,7 @@ async fn a_malformed_request_is_refused_as_invalid() {
 
     // A `Status` outside the modelled enum, on a trajectory that does exist.
     let (engine, router) = mounted_service();
+    create_job(&engine, &valid);
     assert_eq!(
         sample(&router, &valid, "traj-1", &chat_payload("go"), false)
             .await
@@ -1010,9 +1039,10 @@ async fn a_malformed_request_is_refused_as_invalid() {
 /// `ServiceQuotaExceededException`, and the turn is not captured.
 #[tokio::test]
 async fn the_turn_bound_is_reported_as_a_service_quota() {
-    let arn = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
+    let arn = job_arn("aws", "us-east-1", "123456789012", "AgentRFT", "run-1");
     for streamed in [false, true] {
         let (engine, router) = mounted_service();
+        create_job(&engine, &arn);
 
         // Seed a trajectory that already holds the bound, so the test does not
         // have to drive a thousand requests to reach it.

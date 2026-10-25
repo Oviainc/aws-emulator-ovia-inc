@@ -30,6 +30,22 @@
 //! state reaches its next one on its own, [`CONNECTION_TRANSITION`] later
 //! ([`ComAmazonawsEventbridgeAwseventsState::settle_connections`]).
 //!
+//! It also owns the PARTNER EVENT SOURCE ([`PartnerEventSourceRecord`]), the one
+//! resource two accounts share: an SaaS partner authors it in a namespace it is
+//! the registered partner of ([`not_entitled_to_namespace`] refuses any other
+//! caller) with `CreatePartnerEventSource`, reads it back with
+//! `DescribePartnerEventSource`, `ListPartnerEventSources` and
+//! `ListPartnerEventSourceAccounts`, publishes to it with `PutPartnerEvents` and
+//! removes it with `DeletePartnerEventSource`; the customer the source was
+//! offered to reads it with `DescribeEventSource`, matches it with a bus through
+//! `CreateEventBus`, and turns its ingestion on and off with
+//! `ActivateEventSource` and `DeactivateEventSource`. The state such a source
+//! reports is derived from the record and that bus
+//! ([`ComAmazonawsEventbridgeAwseventsState::event_source_state`]), and a source
+//! nobody matched within [`PARTNER_EVENT_SOURCE_EXPIRY`] of entering `PENDING`
+//! expires on its own
+//! ([`ComAmazonawsEventbridgeAwseventsState::settle_partner_sources`]).
+//!
 //! Everything a handler of this service reads or writes lives below; the maps
 //! are ordered so enumeration is deterministic, which is what lets the list
 //! operations resume from an opaque page token.
@@ -39,7 +55,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ConnectionAuthResponseParameters, DeadLetterConfig, DescribeConnectionOutput, LogConfig,
-    Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
+    PartnerEventSourceAccount, Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES,
+    LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -330,9 +347,9 @@ pub struct EventBus {
     pub dead_letter_config: Option<DeadLetterConfig>,
     /// The logging configuration, as it was stored.
     pub log_config: Option<LogConfig>,
-    /// The partner event source this bus is matched with, set only for a partner
-    /// event bus. Nothing in this emulator creates a partner event source yet,
-    /// so no stored bus carries one.
+    /// The partner event source this bus is matched with
+    /// ([`PartnerEventSourceRecord`]), set only for a partner event bus — the one
+    /// `CreateEventBus` was given an `EventSourceName` for.
     pub event_source_name: Option<String>,
     /// The tags `CreateEventBus` was given, in the order they arrived, so the
     /// tagging operations report back exactly what was stored.
@@ -363,6 +380,53 @@ impl EventBus {
             policy: BusPolicy::default(),
             rules: BTreeMap::new(),
         }
+    }
+
+    /// Every rule of this bus a published event can match, with its
+    /// `EventPattern` parsed ONCE: the snapshot a publisher takes under the
+    /// store's lock so the matching itself can run with no lock held.
+    ///
+    /// A rule no published event can match is left out
+    /// ([`RuleRecord::matches_published_events`]), as is one whose pattern no
+    /// longer parses.
+    pub fn matchable_rules(&self) -> Vec<MatchableRule> {
+        self.rules
+            .values()
+            .filter(|rule| rule.matches_published_events())
+            .filter_map(|rule| {
+                Some(MatchableRule {
+                    name: rule.name.clone(),
+                    pattern: event_pattern::parse(rule.event_pattern.as_deref()?).ok()?,
+                    target_arns: rule.targets.iter().map(|target| target.arn.clone()).collect(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One rule of a bus, ready to match a published event: its name, its parsed
+/// `EventPattern`, and the `Arn` of every target an event matching it is
+/// delivered to.
+///
+/// Taken from the stored rule ([`EventBus::matchable_rules`]) so routing never
+/// re-parses a pattern and never holds the store's lock while matching.
+#[derive(Debug, Clone)]
+pub struct MatchableRule {
+    pub name: String,
+    pattern: ::serde_json::Map<String, ::serde_json::Value>,
+    pub target_arns: Vec<String>,
+}
+
+impl MatchableRule {
+    /// Whether `envelope` matches this rule's pattern, spending `budget` — which
+    /// is what bounds the comparison work one event can demand across every rule
+    /// of its bus (see [`event_pattern::Budget`]).
+    pub fn matches(
+        &self,
+        envelope: &::serde_json::Value,
+        budget: &mut event_pattern::Budget,
+    ) -> bool {
+        event_pattern::matches_parsed(&self.pattern, envelope, budget)
     }
 }
 
@@ -808,6 +872,187 @@ impl ConnectionRecord {
     }
 }
 
+/// The prefix every partner event source name carries.
+///
+/// `EventSourceName` is modelled `pattern ^aws\.partner(/[\.\-_A-Za-z0-9]+){2,}$`,
+/// so a name is this prefix followed by at least two `/`-separated segments:
+/// "partner event source names follow this format:
+/// `partner_name/event_namespace/event_name`" (`CreatePartnerEventSource`).
+pub const PARTNER_EVENT_SOURCE_PREFIX: &str = "aws.partner/";
+
+/// `EventSourceState`'s value for a source whose matching event bus does not
+/// exist yet, or exists but is deactivated: "If it is PENDING, either you
+/// haven't yet created a matching event bus, or that event bus is deactivated"
+/// (`DescribeEventSource$State`).
+pub const EVENT_SOURCE_STATE_PENDING: &str = "PENDING";
+
+/// `EventSourceState`'s value for a source whose matching event bus exists and
+/// is receiving events: "If it is ACTIVE, you have already created a matching
+/// event bus for this event source, and that event bus is active"
+/// (`DescribeEventSource$State`).
+pub const EVENT_SOURCE_STATE_ACTIVE: &str = "ACTIVE";
+
+/// `EventSourceState`'s value for a source the partner has deleted while the
+/// customer's matching bus still exists: "If it is DELETED, you have created a
+/// matching event bus, but the event source has since been deleted"
+/// (`DescribeEventSource$State`).
+pub const EVENT_SOURCE_STATE_DELETED: &str = "DELETED";
+
+/// How long a partner event source may stay `PENDING` before it is gone.
+///
+/// "When you deactivate a partner event source, the source goes into PENDING
+/// state. If it remains in PENDING state for more than two weeks, it is deleted"
+/// (`DeactivateEventSource`), and `ExpirationTime` is "the date and time that the
+/// event source will expire, if the Amazon Web Services account doesn't create a
+/// matching event bus for it" (`PartnerEventSourceAccount$ExpirationTime`) — the
+/// same window, counted from the instant the source entered `PENDING`. It is
+/// stored as a DUE INSTANT and never waited for.
+pub const PARTNER_EVENT_SOURCE_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Largest number of partner event sources this store holds.
+///
+/// This emulator's OWN bound, not a quota AWS publishes: a
+/// `CreatePartnerEventSource` past it answers the modelled
+/// `LimitExceededException` instead of growing memory without limit. It is far
+/// above any realistic fixture's needs.
+pub const MAX_PARTNER_EVENT_SOURCES: usize = 1_000;
+
+/// A partner event source as this emulator persists it.
+///
+/// "A partner event source is created by an SaaS partner. If a customer creates a
+/// partner event bus that matches this event source, that Amazon Web Services
+/// account can receive events from the partner's applications or services"
+/// ([`crate::ops::types::PartnerEventSource`]). The source is a SHARED resource:
+/// the partner authors it ([`ComAmazonawsEventbridgeAwseventsState::partner_sources`])
+/// and exactly one customer account may match it with a bus — "each partner event
+/// source can be used by one Amazon Web Services account to create a matching
+/// partner event bus in that Amazon Web Services account"
+/// (`CreatePartnerEventSource`) — which is why [`Self::account`] is one account
+/// and not a set.
+///
+/// The reported `EventSourceState` is DERIVED from this record and the bus slice
+/// ([`ComAmazonawsEventbridgeAwseventsState::event_source_state`]) rather than
+/// stored, so a source and the bus matched with it can never disagree about it.
+#[derive(Debug, Clone)]
+pub struct PartnerEventSourceRecord {
+    /// The whole source name, `aws.partner/<partner_name>/<namespace>/<event>`.
+    pub name: String,
+    /// "The Amazon Web Services account ID that is permitted to create a
+    /// matching partner event bus for this partner event source"
+    /// (`CreatePartnerEventSource$Account`).
+    pub account: String,
+    pub created: SystemTime,
+    /// When this source entered `PENDING`, which is what its expiry is counted
+    /// from ([`PARTNER_EVENT_SOURCE_EXPIRY`]); `None` once the matching bus is
+    /// receiving events, because a matched source does not expire.
+    pub pending_since: Option<SystemTime>,
+    /// Whether the matching bus is receiving events from this source — set when
+    /// the customer creates the matching bus or calls `ActivateEventSource`, and
+    /// cleared by `DeactivateEventSource`.
+    pub activated: bool,
+    /// Whether the PARTNER has deleted the source while the customer's matching
+    /// bus still exists, which is the `DELETED` state the customer reads.
+    pub deleted: bool,
+}
+
+impl PartnerEventSourceRecord {
+    /// A source named `name`, offered to `account` at `created`: what
+    /// `CreatePartnerEventSource` stores. It starts `PENDING` — the customer has
+    /// not matched it with a bus yet — so its expiry clock starts now.
+    pub fn new(name: &str, account: &str, created: SystemTime) -> Self {
+        Self {
+            name: name.to_string(),
+            account: account.to_string(),
+            created,
+            pending_since: Some(created),
+            activated: false,
+            deleted: false,
+        }
+    }
+
+    /// "The date and time that the event source will expire, if the Amazon Web
+    /// Services account doesn't create a matching event bus for it" — the end of
+    /// the [`PARTNER_EVENT_SOURCE_EXPIRY`] window this source entered `PENDING`
+    /// at, and `None` for one that is not waiting to be matched.
+    pub fn expiration(&self) -> Option<SystemTime> {
+        self.pending_since
+            .map(|since| since + PARTNER_EVENT_SOURCE_EXPIRY)
+    }
+
+    /// "The name of the SaaS partner that created the event source"
+    /// (`DescribeEventSource$CreatedBy`): the `partner_name` segment of the
+    /// source's own name, which is "determined during partner registration, and
+    /// identifies the partner to Amazon Web Services customers"
+    /// (`CreatePartnerEventSource`).
+    pub fn created_by(&self) -> Option<&str> {
+        partner_name(&self.name)
+    }
+}
+
+/// The `partner_name` segment of a partner event source name or name prefix:
+/// the first segment after [`PARTNER_EVENT_SOURCE_PREFIX`], or `None` for a
+/// value that is not in the partner namespace at all.
+pub fn partner_name(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(PARTNER_EVENT_SOURCE_PREFIX)?;
+    let partner = rest.split('/').next().unwrap_or(rest);
+    (!partner.is_empty()).then_some(partner)
+}
+
+/// The partner NAMESPACE a source name or name prefix lies in,
+/// `aws.partner/<partner_name>`.
+///
+/// It is the unit an SaaS partner is entitled to author in: every name under one
+/// `partner_name` belongs to that one partner, so the namespace — not the whole
+/// source name — is what an authoring call is checked against
+/// ([`ComAmazonawsEventbridgeAwseventsState::may_author_partner_namespace`]).
+pub fn partner_namespace(name: &str) -> Option<String> {
+    partner_name(name).map(|partner| format!("{PARTNER_EVENT_SOURCE_PREFIX}{partner}"))
+}
+
+/// What an authoring operation of the partner slice reports to a caller that is
+/// not the SaaS partner of the namespace it named.
+///
+/// Authoring a partner event source is "called by an SaaS partner … this
+/// operation is not used by Amazon Web Services customers"
+/// (`CreatePartnerEventSource`), and the partner of a namespace is registered
+/// with Amazon Web Services outside this API, so a caller holding no
+/// registration for the namespace it named is refused rather than told whether
+/// the source exists. The message is built from the request: it names that
+/// namespace, which is the one thing the caller has to change.
+pub fn not_entitled_to_namespace(namespace: &str) -> String {
+    format!("Caller is not whitelisted for the event source partner namespace {namespace}")
+}
+
+/// What any reader reports for a name that names no partner event source: the
+/// missing SOURCE by name, built from the request, in the same words every
+/// reader of this resource kind uses (see [`no_such_rule`]).
+pub fn no_such_event_source(name: &str) -> String {
+    format!("Event source {name} does not exist.")
+}
+
+/// What the operations that act on a source THROUGH its matching bus
+/// (`ActivateEventSource`, `DeactivateEventSource`) report when either of the
+/// two is missing.
+///
+/// Both have to exist for the call to mean anything — activating a source is
+/// what makes "your matching event bus start receiving events from the event
+/// source" (`ActivateEventSource`) — and the refusal names both rather than
+/// telling the caller which of them it was: the caller's next step, creating the
+/// pair, is the same either way.
+pub fn no_such_event_source_or_bus(name: &str) -> String {
+    format!("Event source {name} or event bus {name} does not exist.")
+}
+
+/// `arn:aws:events:<region>:<account>:event-source/<name>`.
+///
+/// `DescribeEventSource$Arn` and `CreatePartnerEventSource$EventSourceArn` are
+/// modelled as plain strings, so the ARN is built the way every other ARN of
+/// this service is ([`event_bus_arn`]): this service's namespace, the region the
+/// request was signed for, and the resource type that names the resource kind.
+pub fn event_source_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("event-source/{name}"))
+}
+
 /// Per-service state for com-amazonaws-eventbridge-awsevents. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEventbridgeAwseventsState {
@@ -816,6 +1061,25 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     /// Every connection, by name — the resource `CreateConnection` writes and
     /// `DescribeConnection` reports.
     pub connections: BTreeMap<String, ConnectionRecord>,
+    /// Every partner event source, by name — the resource
+    /// `CreatePartnerEventSource` writes, `DescribePartnerEventSource` and
+    /// `DescribeEventSource` report, and `PutPartnerEvents` publishes to. Ordered
+    /// by name, so enumeration is deterministic and the list operations can
+    /// resume from a page token.
+    pub partner_sources: BTreeMap<String, PartnerEventSourceRecord>,
+    /// The partner namespaces ([`partner_namespace`]) this account is the
+    /// registered SaaS partner of, and may therefore author partner event
+    /// sources in.
+    ///
+    /// Empty by default, and no operation of this API adds to it: a partner's
+    /// `partner_name` "is determined during partner registration"
+    /// (`CreatePartnerEventSource`), which happens outside EventBridge, so an
+    /// ordinary account holds no registration and every authoring call it makes
+    /// is refused ([`not_entitled_to_namespace`]). A deployment that stands in
+    /// for an onboarded SaaS partner installs the registration it was given with
+    /// [`Self::register_partner_namespace`], and the whole partner slice then
+    /// works off it.
+    pub partner_namespaces: BTreeSet<String>,
     /// The routing log: what `PutEvents` accepted and where it went, newest
     /// last. A ring bounded by [`MAX_DELIVERED_EVENTS`] — see
     /// [`Self::record_delivery`], the one place it grows.
@@ -846,6 +1110,8 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
         Self {
             buses,
             connections: BTreeMap::new(),
+            partner_sources: BTreeMap::new(),
+            partner_namespaces: BTreeSet::new(),
             delivered: VecDeque::new(),
             invocations: VecDeque::new(),
             delivered_bytes: 0,
@@ -986,6 +1252,127 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// comes into existence through `CreateConnection`.
     pub fn connection_mut(&mut self, name: &str) -> Option<&mut ConnectionRecord> {
         self.connections.get_mut(name)
+    }
+
+    /// Whether this account may author partner event sources in `namespace`,
+    /// which is what every authoring call of the partner slice is checked
+    /// against (see [`Self::partner_namespaces`]).
+    pub fn may_author_partner_namespace(&self, namespace: &str) -> bool {
+        self.partner_namespaces.contains(namespace)
+    }
+
+    /// Why this account may not author the partner event source `name` names, or
+    /// `None` when it may.
+    ///
+    /// The ONE check every authoring operation of the partner slice makes, and
+    /// the FIRST thing each of them does: a caller that is not the namespace's
+    /// registered SaaS partner is told that and nothing else — not whether the
+    /// source exists, not which accounts it was offered to — so one partner
+    /// cannot probe another's namespace. `name` may be a whole source name or a
+    /// name prefix; both carry the namespace in the same leading segments.
+    pub fn partner_authoring_refusal(&self, name: &str) -> Option<String> {
+        let namespace = partner_namespace(name).unwrap_or_else(|| name.to_string());
+        (!self.may_author_partner_namespace(&namespace))
+            .then(|| not_entitled_to_namespace(&namespace))
+    }
+
+    /// Install the registration that makes this account the SaaS partner of
+    /// `namespace`, answering whether it was not already held.
+    ///
+    /// The ONE way [`Self::partner_namespaces`] grows: partner registration
+    /// happens outside EventBridge, so nothing a client can call reaches here.
+    pub fn register_partner_namespace(&mut self, namespace: &str) -> bool {
+        self.partner_namespaces.insert(namespace.to_string())
+    }
+
+    /// The partner event source `name` names, for a REPORTING operation.
+    pub fn partner_source(&self, name: &str) -> Option<&PartnerEventSourceRecord> {
+        self.partner_sources.get(name)
+    }
+
+    /// The partner event source `name` names, mutably. Creates nothing: a source
+    /// comes into existence through `CreatePartnerEventSource`.
+    pub fn partner_source_mut(&mut self, name: &str) -> Option<&mut PartnerEventSourceRecord> {
+        self.partner_sources.get_mut(name)
+    }
+
+    /// The source `name` names IF it is shared with `account` — the customer-side
+    /// view, which is what `DescribeEventSource` reports ("a partner event source
+    /// that is shared with your account") and what `ActivateEventSource` and
+    /// `DeactivateEventSource` act on.
+    ///
+    /// A source authored for another account is not shared with this one, so it
+    /// reads exactly like a source that was never authored at all: a customer
+    /// learns nothing about another customer's sources.
+    pub fn event_source_shared_with(
+        &self,
+        name: &str,
+        account: &str,
+    ) -> Option<&PartnerEventSourceRecord> {
+        self.partner_source(name)
+            .filter(|record| record.account == account)
+    }
+
+    /// The `EventSourceState` a source is in, DERIVED from the source record and
+    /// the bus slice: `DELETED` once the partner deleted it, `ACTIVE` while the
+    /// matching bus exists and is receiving its events, and `PENDING` otherwise —
+    /// the three cases `DescribeEventSource$State` documents.
+    pub fn event_source_state(&self, record: &PartnerEventSourceRecord) -> &'static str {
+        if record.deleted {
+            EVENT_SOURCE_STATE_DELETED
+        } else if record.activated && self.matching_bus(&record.name).is_some() {
+            EVENT_SOURCE_STATE_ACTIVE
+        } else {
+            EVENT_SOURCE_STATE_PENDING
+        }
+    }
+
+    /// The partner event bus matched with the source `name`: "for partner event
+    /// buses, the name must exactly match the name of the partner event source
+    /// that this event bus is matched to" (`CreateEventBus$Name`), so the match
+    /// is on the bus's own `event_source_name`.
+    pub fn matching_bus(&self, name: &str) -> Option<&EventBus> {
+        self.bus(name)
+            .filter(|bus| bus.event_source_name.as_deref() == Some(name))
+    }
+
+    /// The accounts a partner event source was offered to, as
+    /// `ListPartnerEventSourceAccounts` reports them — one per source, because
+    /// "each partner event source can be used by one Amazon Web Services account"
+    /// (`CreatePartnerEventSource`).
+    pub fn partner_source_accounts(
+        &self,
+        record: &PartnerEventSourceRecord,
+    ) -> Vec<PartnerEventSourceAccount> {
+        vec![PartnerEventSourceAccount {
+            account: Some(record.account.clone()),
+            creation_time: Some(to_wire_timestamp(record.created)),
+            expiration_time: record.expiration().map(to_wire_timestamp),
+            state: Some(self.event_source_state(record).to_string()),
+        }]
+    }
+
+    /// Materialise every partner-event-source expiry the clock has ALREADY made
+    /// due at `now`, and answer how many records went away.
+    ///
+    /// "If it remains in PENDING state for more than two weeks, it is deleted"
+    /// (`DeactivateEventSource`): a source nobody matched with a bus within
+    /// [`PARTNER_EVENT_SOURCE_EXPIRY`] of entering `PENDING` is gone. It was owed
+    /// at the same instant even if nobody had called, which is why a reporting
+    /// operation may apply it.
+    pub fn settle_partner_sources(&mut self, now: SystemTime) -> usize {
+        let due: Vec<String> = self
+            .partner_sources
+            .values()
+            .filter(|record| {
+                !record.deleted && record.expiration().is_some_and(|expires| expires <= now)
+            })
+            .map(|record| record.name.clone())
+            .collect();
+        for name in &due {
+            self.partner_sources.remove(name);
+        }
+        due.len()
     }
 
     /// Materialise every connection transition the clock has ALREADY made due

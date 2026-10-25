@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
-        let (executions, next_token) = crate::state::page(
+        let (executions, next_token) = crate::state::page_or_token_refusal(
             // The token names a position among THIS export's executions, so one cut from
             // another listing, or from another export's executions, is refused rather than
             // resumed at an unrelated offset.
@@ -224,20 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &references,
             input.max_results,
             input.next_token.as_deref(),
-        )
-        .ok_or_else(|| {
-            ListExecutionsErrorModeled::ValidationException(ValidationException {
-                message: "NextToken is not a pagination token issued by this service."
-                    .to_string(),
-                reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "The token must be one returned by a previous ListExecutions \
-                              call for this export."
-                        .to_string(),
-                }]),
-            })
-        })?;
+            "The token must be one returned by a previous ListExecutions call for this export.",
+            ListExecutionsErrorModeled::ValidationException,
+        )?;
 
         Ok(ListExecutionsOutput {
             executions: Some(executions),

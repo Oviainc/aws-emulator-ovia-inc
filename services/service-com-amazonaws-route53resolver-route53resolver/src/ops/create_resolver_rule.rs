@@ -220,10 +220,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `TargetIps`: "TargetIps is available only when the value of Rule type
-        // is FORWARD", and a FORWARD rule is what forwards queries "to the IP
-        // addresses that are specified in TargetIps", so it cannot do without
-        // them.
+        // A rule of a type Resolver answers itself names no forwarding target:
+        // `TargetIps` "is available only when the value of Rule type is
+        // FORWARD", and `ResolverEndpointId` is "the ID of the outbound Resolver
+        // endpoint that you want to use to route DNS queries to the IP addresses
+        // that you specify in TargetIps" — with no target IPs there is nothing
+        // to route through an endpoint. So a SYSTEM rule carrying either member
+        // is refused, naming both in the RSLVR-coded refusal.
+        if rule_type == RULE_TYPE_SYSTEM
+            && (!target_ips.is_empty() || input.resolver_endpoint_id.is_some())
+        {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::rslvr_message(
+                        crate::state::RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET,
+                        "Cannot specify resolver endpoint ID and target IP for SYSTEM type resolver rule",
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `TargetIps`: "when creating a DELEGATE rule, you must not provide the
+        // TargetIps parameter. If you provide the TargetIps, you may receive an
+        // ERROR message similar to 'Delegate resolver rules need to specify a
+        // nameserver name'" — the model states that wording, so it is reported.
+        if rule_type == RULE_TYPE_DELEGATE && !target_ips.is_empty() {
+            return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "Delegate resolver rules need to specify a nameserver name.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A FORWARD rule is what forwards queries "to the IP addresses that are
+        // specified in TargetIps", so it cannot do without them; and no other
+        // rule type may carry them.
         if rule_type == RULE_TYPE_FORWARD {
             if target_ips.is_empty() {
                 return Err(CreateResolverRuleErrorModeled::InvalidRequestException(
@@ -387,6 +422,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Resolver selects on a fully-qualified domain name, so the name a rule
+        // reports is canonical whatever form the request wrote it in.
+        let domain_name = input
+            .domain_name
+            .as_deref()
+            .map(crate::state::canonical_domain_name);
+
         let region = crate::state::request_region(&ctx.parts().headers);
         let timestamp = crate::state::now_rfc3339();
         let seq = store.next_seq();
@@ -426,7 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn,
             creator_request_id: input.creator_request_id.clone(),
             name: input.name.clone(),
-            domain_name: input.domain_name.clone(),
+            domain_name,
             rule_type: input.rule_type.clone(),
             target_ips: stored_targets,
             resolver_endpoint_id: input.resolver_endpoint_id.clone(),

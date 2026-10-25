@@ -201,6 +201,27 @@ fn definition(type_: &str, parameters: Value) -> Value {
     json!({ "Type": type_, "Parameters": parameters })
 }
 
+/// The `TypeVersion` the stored definition (and every configuration deployed from it)
+/// must report for `submitted`: the version the request named, or — when it named none
+/// — the newest version the catalog publishes for that type, which is the version the
+/// service deploys and therefore the one a caller reads back.
+fn expected_type_version(case: &str, submitted: &Value) -> Value {
+    if let Some(named) = submitted.get("TypeVersion") {
+        return named.clone();
+    }
+    let type_ = submitted
+        .get("Type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case}: a submitted definition carries its Type, got {submitted:?}")
+        });
+    let entry = QUICK_SETUP_TYPE_CATALOG
+        .iter()
+        .find(|entry| entry.type_ == type_)
+        .unwrap_or_else(|| panic!("case {case}: {type_:?} must be a published type"));
+    json!(entry.latest_version())
+}
+
 /// Read back the manager, asserting the read succeeded.
 async fn get_ok(router: &MultiServiceRouter, case: &str, manager_arn: &str) -> Value {
     let (status, answer) = get(router, manager_arn).await;
@@ -463,7 +484,6 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
             for member in [
                 "Type",
                 "Parameters",
-                "TypeVersion",
                 "LocalDeploymentExecutionRoleName",
                 "LocalDeploymentAdministrationRoleArn",
             ] {
@@ -473,6 +493,13 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
                     "case {case}: definition {index}'s {member} must come back as stored, got {got:?}"
                 );
             }
+            let version = expected_type_version(case, want);
+            assert_eq!(
+                got.get("TypeVersion"),
+                Some(&version),
+                "case {case}: definition {index} must report the published version it was \
+                 deployed at ({version}), got {got:?}"
+            );
             let id = got
                 .get("Id")
                 .and_then(Value::as_str)
@@ -1616,13 +1643,18 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                 Some(definition_id),
                 "case {case}: the Get must name the definition it deploys, got {got:?}"
             );
-            for member in ["Type", "TypeVersion"] {
-                assert_eq!(
-                    got.get(member),
-                    want.get(member),
-                    "case {case}: {member} must come back as it was stored, got {got:?}"
-                );
-            }
+            assert_eq!(
+                got.get("Type"),
+                want.get("Type"),
+                "case {case}: Type must come back as it was stored, got {got:?}"
+            );
+            let version = expected_type_version(case, want);
+            assert_eq!(
+                got.get("TypeVersion"),
+                Some(&version),
+                "case {case}: the deployed configuration must report the published version it \
+                 was deployed at ({version}), got {got:?}"
+            );
             // The create supplied the parameters; `GetConfiguration$Parameters` and the
             // listing's `ConfigurationSummary$FirstClassParameters` are both that map.
             let stored_parameters = got.get("Parameters").cloned().unwrap_or_else(|| json!({}));
@@ -1993,7 +2025,7 @@ async fn every_published_configuration_type_is_accepted_and_read_back() {
                 "Name": "published",
                 "ConfigurationDefinitions": [{
                     "Type": entry.type_,
-                    "TypeVersion": entry.latest_version,
+                    "TypeVersion": entry.latest_version(),
                     "Parameters": { "TargetRegions": REGION },
                 }],
             }),
@@ -2035,7 +2067,7 @@ async fn every_published_configuration_type_is_accepted_and_read_back() {
         );
         assert_eq!(
             got["TypeVersion"].as_str(),
-            Some(entry.latest_version),
+            Some(entry.latest_version()),
             "case {case}: the published LatestVersion must be accepted as the TypeVersion, got {got:?}"
         );
     }

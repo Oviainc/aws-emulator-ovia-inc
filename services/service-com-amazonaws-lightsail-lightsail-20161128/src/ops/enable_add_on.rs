@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableAddOn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableAddOn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableAddOn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables or modifies ONE add-on on the resource `resourceName` names, which is
+//! an instance or a block storage disk — the two resources the model gives an
+//! `addOns` member. The add-on is keyed by its type, so enabling one the
+//! resource already carries MODIFIES that one (the modelled
+//! `AutoSnapshotAddOnRequest` documentation: a changed snapshot time "is
+//! typically effective immediately") and every other add-on it carries is left
+//! alone. The change is applied by the time this call answers, so its
+//! operation-log entry is terminal, and the enabled add-on is what every later
+//! read of the resource (`GetInstance`, `GetInstances`, `GetDisk`) reports.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +162,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableAddOn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableAddOnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableAddOn"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the add-on is recorded on the resource the request
+        // names, which already knows where it is.
+        let _ = ctx;
+
+        // `resourceName` and `addOnRequest` are modelled `@required` members,
+        // the name carries the modelled `ResourceName` pattern, `addOnType` is a
+        // modelled enum and `snapshotTimeOfDay` carries the modelled `TimeOfDay`
+        // pattern, so the centralized walk refused anything outside them before
+        // this body ran. What is left is what the model cannot express: the name
+        // must be one of this account's add-on-carrying resources, and the
+        // add-on must be one that kind of resource can carry.
+        let name = input.resource_name;
+        let request = input.add_on_request;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The request says which resource, not which KIND of resource, so
+            // the name is resolved through the one place an add-on change
+            // resolves a resource — the same one `DisableAddOn` goes through, so
+            // both admit exactly the same set of them. It hands back the record
+            // the add-on is written to and the `ResourceType` that record
+            // reports, which is also what decides which add-ons it can carry.
+            let resolved = store.with_add_on_record(&name, |record, resource_type| {
+                // The same conversion the calls that CREATE each resource go
+                // through, so an add-on a resource cannot carry — the idle-stop
+                // add-on on a block storage disk — is refused here rather than
+                // stored as one that can never act. Refused BEFORE the write,
+                // so a request this service does not accept changes nothing.
+                let enabled = enabled_add_ons(resource_type, &name, &request).map_err(invalid)?;
+                // An add-on is keyed by its TYPE: a resource holds at most one
+                // of each, so enabling one it already carries MODIFIES that one
+                // and leaves every other add-on it carries exactly as it was.
+                let mut kept = crate::state::add_ons_without(record, &request.add_on_type);
+                kept.extend(enabled);
+                record.set_add_ons(kept);
+                Ok::<_, Self::Error>((resource_type, record.location().clone()))
+            });
+            // A name this account holds no add-on-carrying resource of is
+            // Lightsail's `DoesNotExist` rejection, the same envelope every
+            // other not-found path in this crate answers with.
+            let Some(written) = resolved else {
+                return Err(resource_does_not_exist(&name));
+            };
+            let (resource_type, location) = written?;
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; `EnableAddOn` acts on exactly one, so
+            // it answers exactly one entry, located where that resource is. The
+            // entry is terminal because the add-on is enabled by the time this
+            // call answers — there is no later instant at which the service
+            // still owes the caller the change.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_ENABLE_ADD_ON,
+                resource_type,
+                &name,
+                &location,
+                None,
+            );
+            Ok(EnableAddOnOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The add-ons `request` enables on a resource of type `resource_type`, or a
+/// refusal naming the member that is wrong.
+///
+/// The add-ons a resource can carry depend on what the resource IS, not on which
+/// call enabled them, so this dispatches to the SAME conversion the operations
+/// that create that kind of resource go through: a block storage disk accepts
+/// only the automatic snapshot add-on, an instance every modelled `AddOnType`.
+/// The member path is this request's own, so a refusal names the member the
+/// caller sent (`addOnRequest`) rather than a create call's list.
+fn enabled_add_ons(
+    resource_type: &str,
+    resource_name: &str,
+    request: &AddOnRequest,
+) -> Result<Vec<AddOn>, String> {
+    let requests = std::slice::from_ref(request);
+    if resource_type == crate::state::RESOURCE_TYPE_DISK {
+        return crate::state::disk_add_ons_from_requests(
+            crate::state::ADD_ON_REQUEST_MEMBER,
+            resource_name,
+            requests,
+        );
+    }
+    crate::state::add_ons_from_requests(
+        crate::state::ADD_ON_REQUEST_MEMBER,
+        resource_name,
+        requests,
+    )
+}
+
+/// No resource that carries add-ons is stored under that name: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist`, and a message built from the request.
+///
+/// The sentence is the shared one every operation that resolves an
+/// add-on-carrying resource refuses with, so the one resolution rule answers one
+/// refusal.
+fn resource_does_not_exist(name: &str) -> EnableAddOnError {
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::add_on_resource_not_found(name))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the
+/// member that is wrong and the constraint it broke.
+fn invalid(message: String) -> EnableAddOnError {
+    EnableAddOnErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> EnableAddOnError {
+    EnableAddOnErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail resource store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
