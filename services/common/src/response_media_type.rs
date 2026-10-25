@@ -35,13 +35,27 @@
 //!   [`ResponseMediaType::announce`] through `Service::override_operation`,
 //!   `Service::override_routing_error` and `Service::override_framework_error`.
 //!
+//! The first of those three is the one that needs plumbing rather than a one-line call: the
+//! refusal tail is rendered INSIDE the centralized walk, so reaching it means serving that
+//! walk and re-announcing what it answered. That plumbing is therefore stated here once, as
+//! [`ResponseMediaTypeOperation`] (the wrapper a service hands back from
+//! `Service::override_operation`) and [`routes`] (the condition under which it claims a
+//! request); the other two seams are handed the rendered response and need nothing but the
+//! call.
+//!
+//! One response no author seam reaches: the authentication refusal, which the router renders
+//! through `definition().refusal_response(..)` before the service is asked anything
+//! (`vendor/smithy-server-runtime/src/multi_service_router.rs`), so it keeps the
+//! protocol-implied value.
+//!
 //! Nothing else about a response is touched: the status, every other header and every body
 //! byte stay with the renderer that owns them, and a response announcing a media type that
 //! is NOT the protocol-implied one — an event-stream frame, say — is left exactly as its
 //! producer wrote it rather than relabelled.
 //!
 //! This rule is CALLED by
-//! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator`, and it lives here
+//! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator` and
+//! `service-com-amazonaws-freetier-awsfreetierservice`, and it lives here
 //! rather than in that crate because it is not that service's rule alone: the sibling
 //! `service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice` — the same AWS billing
 //! front door, the same `1.1` framing over an `awsJson1_0` model — states it inline today
@@ -52,12 +66,16 @@
 //! (which takes `override_protocol` alone, so the responses its framework renders still
 //! announce the protocol-implied value).
 //!
-//! STILL TO MIGRATE: those three onto this module. Each is a change of its own rather than a
-//! side effect of the fix that hoisted the rule — two of them need a path dependency their
-//! crate does not carry yet, and none of their issues or recordings is owned here — but
-//! nothing new should state the rule a fourth time.
+//! STILL TO MIGRATE: those three onto this module — `bcmdashboards` including its own copy
+//! of [`ResponseMediaTypeOperation`]. Each is a change of its own rather than a side effect
+//! of the fix that hoisted the rule — two of them need a path dependency their crate does
+//! not carry yet, and none of their issues or recordings is owned here — but nothing new
+//! should state the rule a fourth time.
 
-use aws_smithy_runtime_api::http::Response as RtResponse;
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use smithy_server_runtime::{
+    BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Service,
+};
 
 /// The response header carrying the media type.
 const CONTENT_TYPE: &str = "content-type";
@@ -112,6 +130,82 @@ impl ResponseMediaType {
             resp.headers_mut().insert(CONTENT_TYPE, self.announced);
         }
         resp
+    }
+}
+
+/// Whether `definition`'s generated routing table can serve this request — the condition
+/// under which a service claims it for [`ResponseMediaTypeOperation`].
+///
+/// A request the table cannot serve is declined rather than claimed, so the router answers
+/// it as the unroutable request it is (through `Service::override_routing_error`) instead of
+/// authenticating a request that names no operation first.
+pub fn routes(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool {
+    definition
+        .protocol()
+        .routing_key(req)
+        .ok()
+        .and_then(|key| definition.routing_table().get(key))
+        .is_some()
+}
+
+/// Serves the modelled operation the service's routing table names for the request, exactly
+/// as that table would, then announces the response the way the service announces it.
+///
+/// This wrapper exists for ONE response: the framework-level refusal tail, which renders a
+/// constraint the model declares in the model-derived envelope INSIDE the centralized walk
+/// (`run_operation_http`), where `Service::override_protocol` explicitly does not reach.
+/// Every other response of a routed request is already serialized by the codec that seam
+/// returns, so [`ResponseMediaType::announce`] finds nothing to change on it.
+///
+/// It holds no operation of its own: the one it delegates to is the one the service's
+/// routing table names for the request, resolved from the `svc` the framework passes into
+/// [`ErasedOperation::run`] — a wrapper held on the service cannot borrow from the entry it
+/// is held beside, which is why the key is resolved here rather than carried in. So the
+/// framework keeps the whole deserialize → validate → handle → serialize walk and every
+/// status, code, message and body byte it answers with, and this wrapper owns one header.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseMediaTypeOperation {
+    media_type: ResponseMediaType,
+}
+
+impl ResponseMediaTypeOperation {
+    /// The wrapper that re-announces across `media_type`. A service builds one in its
+    /// constructor, because `Service::override_operation` hands back a borrow of it.
+    pub const fn new(media_type: ResponseMediaType) -> Self {
+        Self { media_type }
+    }
+}
+
+impl ErasedOperation for ResponseMediaTypeOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let definition = svc.definition();
+            let modeled = definition
+                .protocol()
+                .routing_key(req)
+                .ok()
+                .and_then(|key| definition.routing_table().get(key));
+            let resp = match modeled {
+                Some(op) => op.run(svc, req, ctx).await,
+                // Unreachable through a `Service::override_operation` that claims a request
+                // only when the routing table holds its key ([`routes`]); answered as the
+                // framework answers an unroutable request rather than guessed at.
+                None => definition.routing_error_response(req),
+            };
+            self.media_type.announce(resp)
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names" — which is the
+        // operation this wrapper delegates to, so its model-declared schemes decide and this
+        // wrapper cannot weaken them.
+        None
     }
 }
 

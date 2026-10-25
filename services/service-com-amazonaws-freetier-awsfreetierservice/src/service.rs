@@ -22,18 +22,22 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Return `Some(op)` to route one yourself; this
+//!   service returns the shared wrapper that serves the routing table's own
+//!   operation and re-announces its answer's media type (see "The media type this
+//!   service announces" below).
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   404, …); this service keeps that rendering word for word and re-announces its
+//!   media type.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
-//!   rendering. Return `Some(resp)` to reword it if desired.
+//!   rendering; this service keeps that rendering and re-announces its media type.
 //! - `override_protocol` — the codec this service's own responses are serialized
 //!   in. The default returns `None`, keeping the model-derived protocol; this
 //!   service overrides it (see "The media type this service announces" below).
@@ -46,21 +50,39 @@
 //! ## The media type this service announces
 //!
 //! The model declares the `awsJson1_0` protocol trait, but every recorded response
-//! this SERVICE produces — a success and a modelled failure its handler raises
-//! alike — announces `application/x-amz-json-1.1`, and the media type a client
-//! reads is what it keys content negotiation and protocol assertion off.
-//! `override_protocol` below therefore serves the awsJson `1.1` codec: the JSON
-//! framing is byte-identical to `1.0`, so a request sent with either media type
-//! still reads, and only the announced media type changes.
+//! of this service — HTTP 200 and HTTP 400 alike — announces
+//! `application/x-amz-json-1.1`, and the media type a client reads is what it keys
+//! content negotiation and protocol assertion off. The rule, the one function that
+//! applies it and the operation-seam wrapper that reaches the refusal tail all live
+//! in [`service_common::response_media_type`];
+//! [`RESPONSE_MEDIA_TYPE`](announced_media_type::RESPONSE_MEDIA_TYPE) is this
+//! service's pair, and the three seams it is applied at are:
 //!
-//! A refusal of the REQUEST is not a response the service produced — the framework
-//! answers it in front of the service — so the routing, transport and refusal
-//! envelopes keep the media type the model's protocol trait declares, which is the
-//! one seam `override_protocol` deliberately does not reach.
+//! - `override_protocol` serves the awsJson `1.1` codec, which is what the
+//!   centralized walk serializes this service's own responses with — every success
+//!   and every error a handler raises. The JSON framing is byte-identical to `1.0`,
+//!   so a request sent with either media type still reads, and only the announced
+//!   media type changes;
+//! - `override_operation` hands back the shared
+//!   [`ResponseMediaTypeOperation`](service_common::response_media_type::ResponseMediaTypeOperation),
+//!   which serves the modelled operation the generated routing table names and
+//!   re-announces what that walk answered — reaching the framework's refusal tail
+//!   INSIDE the walk (an absent `@required` member, a value outside a declared
+//!   bound), which `override_protocol` deliberately does not reach;
+//! - `override_routing_error` and `override_framework_error` re-announce the other
+//!   two framework-rendered responses, keeping their status, code and body word for
+//!   word.
+//!
+//! One response is still announced by the framework alone, because no author seam
+//! reaches it: the authentication refusal, which the router renders through
+//! `definition().refusal_response(..)` before this service is asked anything
+//! (`vendor/smithy-server-runtime/src/multi_service_router.rs`).
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+pub mod announced_media_type;
+
+use announced_media_type::RESPONSE_MEDIA_TYPE;
+use service_common::response_media_type::ResponseMediaTypeOperation;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-freetier-awsfreetierservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -76,6 +98,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     protocol: aws_smithy_schema_server::rpc::HttpRpcServerProtocol<
         aws_smithy_schema_server::json::JsonCodec,
     >,
+    /// The wrapper every routable request is served through, so a refusal raised
+    /// inside the request walk announces this service's media type too. Held in a
+    /// field, built once, because [`Service::override_operation`] hands back a
+    /// borrow of it.
+    media_type: ResponseMediaTypeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -86,6 +113,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: aws_smithy_schema_server::rpc::AwsJson11(),
+            media_type: ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
         }
     }
 }
@@ -112,12 +140,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // shared media-type wrapper, which delegates to that same table entry and
+        // then re-announces the media type of what it answered — reaching the
+        // refusal the framework renders inside the request walk, which
+        // `override_protocol` does not (see the module header). The routing stays
+        // the model's: a request whose routing key names no modelled operation is
+        // declined here, so the framework answers it as the unroutable request it
+        // is — through `override_routing_error` below, which re-announces that
+        // answer too.
+        service_common::response_media_type::routes(&self.entry, req)
+            .then_some(&self.media_type as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -139,7 +172,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // its handler raises — is serialized by the protocol returned here, so this
         // is the one place the media type it announces is decided. See the module
         // docs: every recorded response of this service carries the awsJson `1.1`
-        // media type, which is what a client keys its parsing off.
+        // media type, which is what a client keys its parsing off. A refusal the
+        // framework renders in front of a handler is not reached from here; the
+        // three seams the module header names re-announce those.
         Some(&self.protocol)
     }
 
@@ -149,12 +184,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The framework's protocol-correct default for
+        // this service's envelope is kept word for word, status, code and body
+        // alike; only the media type is re-announced, so an unroutable request is
+        // answered under the same media type as a routed one (see the module
+        // header).
+        Some(RESPONSE_MEDIA_TYPE.announce(self.entry.routing_error_response(req)))
     }
 
     fn override_framework_error(
@@ -163,11 +198,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
-        let _ = error;
-        None
+        // `aws-chunked` body. The entry's protocol-correct rendering is kept word
+        // for word; only the media type is re-announced (see the module header).
+        //
+        // The error is borrowed and `ProtocolError` is neither `Clone` nor
+        // reconstructable in general, so the default renderer is reached by
+        // rebuilding the error. The match is TOTAL over what this seam is ever
+        // handed, not a partial application of the rule: the router raises it from
+        // exactly ONE call site, with exactly one variant —
+        // `ProtocolError::Malformed(..)`, from the `aws-chunked` decode it runs
+        // before naming an operation. `ProtocolError` is an open enum this crate
+        // does not own, so the remaining arm exists for a variant a future
+        // framework may route here: it declines to `None`, keeping the framework's
+        // own rendering of an error this service cannot rebuild rather than losing
+        // what that error said.
+        match error {
+            aws_smithy_schema_server::ProtocolError::Malformed(message) => {
+                let rebuilt =
+                    aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
+                Some(RESPONSE_MEDIA_TYPE.announce(self.entry.framework_error_response(rebuilt)))
+            }
+            _ => None,
+        }
     }
 }

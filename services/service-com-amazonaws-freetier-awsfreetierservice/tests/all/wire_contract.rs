@@ -4,12 +4,13 @@
 //! with `X-Amz-Target: AWSFreeTierService.<Operation>`) through the same
 //! multi-service router the emulator boots.
 //!
-//! 1. The media type a response ANNOUNCES. Every response this service produces
-//!    — a success and a modelled failure its handler raises, on every operation —
+//! 1. The media type a response ANNOUNCES. Every response of this service
 //!    announces `application/x-amz-json-1.1`, whatever the client sent and
-//!    whatever the outcome. A refusal the framework answers in FRONT of the
-//!    service is not a response the service produced, and keeps the media type
-//!    the model's `aws.protocols#awsJson1_0` trait declares.
+//!    whatever the outcome: a success, a modelled failure its handler raises, a
+//!    request the framework refused in front of the handler, and a target naming
+//!    no modelled operation alike. The refusal classes are spanned in
+//!    `refused_request_media_type.rs`; the rows here span the operations and the
+//!    media type the REQUEST announced.
 //!
 //! 2. What a REPORTING operation answers for a resource the store does not hold.
 //!    `GetAccountPlanState`'s output is required members of one stored record, so
@@ -27,13 +28,18 @@ use service_com_amazonaws_freetier_awsfreetierservice::state::{
 use service_com_amazonaws_freetier_awsfreetierservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The media type every response this SERVICE produces announces.
-const SERVICE_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+/// The media type every response of this service announces, read from the service
+/// itself so the expectation and the implementation share one source.
+const SERVICE_MEDIA_TYPE: &str =
+    service_com_amazonaws_freetier_awsfreetierservice::service::announced_media_type::RESPONSE_MEDIA_TYPE
+        .announced();
 
-/// The media type the model's `aws.protocols#awsJson1_0` protocol trait
-/// declares, which the framework's own refusal and routing envelopes — answered
-/// in front of the service — keep.
-const MODEL_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
+/// The media type the model's `aws.protocols#awsJson1_0` protocol trait declares.
+/// A client may send it — the JSON framing of the two revisions is identical — and
+/// no response announces it.
+const MODEL_MEDIA_TYPE: &str =
+    service_com_amazonaws_freetier_awsfreetierservice::service::announced_media_type::RESPONSE_MEDIA_TYPE
+        .implied();
 
 /// The emulator under test: this service mounted on one shared engine, plus that
 /// engine, so a test can look at the store the handlers wrote.
@@ -264,7 +270,7 @@ async fn every_response_announces_the_services_media_type() {
             request_media_type: Some(MODEL_MEDIA_TYPE),
             establish_plan: false,
             expected_status: 400,
-            expected_media_type: MODEL_MEDIA_TYPE,
+            expected_media_type: SERVICE_MEDIA_TYPE,
         },
         MediaTypeCase {
             name: "a target this service models no operation for",
@@ -273,7 +279,7 @@ async fn every_response_announces_the_services_media_type() {
             request_media_type: Some(MODEL_MEDIA_TYPE),
             establish_plan: false,
             expected_status: 501,
-            expected_media_type: MODEL_MEDIA_TYPE,
+            expected_media_type: SERVICE_MEDIA_TYPE,
         },
     ];
 
