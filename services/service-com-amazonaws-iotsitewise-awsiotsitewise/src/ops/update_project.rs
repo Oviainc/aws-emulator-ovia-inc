@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored project's caller-owned members — its name and
+//! its description — with what this request states, so `DescribeProject` reads back
+//! what this call wrote and the project's last-update instant moves to now.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +147,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProject"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProjectError::Modeled(UpdateProjectErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token writes the project a
+        // second time rather than replaying the first answer. Left to the idempotency
+        // issue, exactly as `UpdateAsset` leaves it; nothing is fabricated for it.
+        let mut store = state.lock();
+
+        let project = store
+            .projects
+            .get_mut(&input.project_id)
+            .ok_or_else(|| not_found(&input.project_id))?;
+
+        // The caller-owned members are REPLACED by what this request carries, so an
+        // omitted optional description clears the stored one: the request describes
+        // the project's new state rather than patching selected members. Nothing else
+        // on the record — its id, its ARN, the portal it lives in, its tags, its
+        // creation date — is this call's to change.
+        project.apply_update(
+            input.project_name.clone(),
+            input.project_description.clone(),
+            now,
+        );
+
+        Ok(UpdateProjectOutput {})
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing, in
+/// the one wording every not-found refusal in this service carries.
+fn not_found(project_id: &str) -> UpdateProjectError {
+    UpdateProjectError::Modeled(UpdateProjectErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PROJECT, project_id),
+        },
+    ))
 }
