@@ -41,6 +41,8 @@ mod db_instances;
 mod db_major_engine_versions;
 #[path = "all/db_parameter_groups.rs"]
 mod db_parameter_groups;
+#[path = "all/db_parameters.rs"]
+mod db_parameters;
 #[path = "all/db_shard_groups.rs"]
 mod db_shard_groups;
 #[path = "all/db_subnet_group_deletion.rs"]
