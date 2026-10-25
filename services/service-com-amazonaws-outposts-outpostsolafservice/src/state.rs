@@ -2157,22 +2157,55 @@ pub fn request_region(parts: &http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// A `SiteArn`: `arn:aws:outposts:<region>:<account>:site/os-…`.
-pub fn site_arn(region: &str, site_id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("{SITE_RESOURCE_TYPE}/{site_id}"),
+/// The ARN partition a region belongs to, as the modelled ARN patterns'
+/// `arn:aws([a-z-]+)?:` partition segment allows.
+///
+/// AWS's published region-to-partition prefixes: `cn-*` is `aws-cn`, `us-gov-*` is
+/// `aws-us-gov`, `eusc-de-*` is `aws-eusc`, the ISO regions carry their own
+/// partitions (`us-iso-*` -> `aws-iso`, `us-isob-*` -> `aws-iso-b`, `eu-isoe-*` ->
+/// `aws-iso-e`, `us-isof-*` -> `aws-iso-f`), and every other (commercial) region is
+/// `aws`. Matched longest prefix first, so `us-isob-east-1` is not read as a
+/// `us-iso-*` region.
+pub fn partition_for(region: &str) -> &'static str {
+    const PARTITIONS: &[(&str, &str)] = &[
+        ("cn-", "aws-cn"),
+        ("us-gov-", "aws-us-gov"),
+        ("eusc-de-", "aws-eusc"),
+        ("us-isob-", "aws-iso-b"),
+        ("us-isof-", "aws-iso-f"),
+        ("eu-isoe-", "aws-iso-e"),
+        ("us-iso-", "aws-iso"),
+    ];
+    PARTITIONS
+        .iter()
+        .find(|(prefix, _)| region.starts_with(prefix))
+        .map_or("aws", |(_, partition)| *partition)
+}
+
+/// One Outposts resource ARN:
+/// `arn:<partition>:outposts:<region>:<account>:<type>/<id>`.
+///
+/// Built here rather than with `engine::emulator_arn`, whose only format fixes the
+/// partition at the literal `aws`: the partition of a resource is a function of its
+/// region ([`partition_for`]), which is why every ARN pattern in this model spells
+/// that segment `aws([a-z-]+)?` rather than `aws`. The account segment is still the
+/// one emulator account (`engine::emulator_account_id`).
+fn resource_arn(region: &str, resource_type: &str, resource_id: &str) -> String {
+    format!(
+        "arn:{}:{ARN_NAMESPACE}:{region}:{}:{resource_type}/{resource_id}",
+        partition_for(region),
+        ::engine::emulator_account_id()
     )
 }
 
-/// An `OutpostArn`: `arn:aws:outposts:<region>:<account>:outpost/op-…`.
+/// A `SiteArn`: `arn:<partition>:outposts:<region>:<account>:site/os-…`.
+pub fn site_arn(region: &str, site_id: &str) -> String {
+    resource_arn(region, SITE_RESOURCE_TYPE, site_id)
+}
+
+/// An `OutpostArn`: `arn:<partition>:outposts:<region>:<account>:outpost/op-…`.
 pub fn outpost_arn(region: &str, outpost_id: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_NAMESPACE,
-        region,
-        &format!("{OUTPOST_RESOURCE_TYPE}/{outpost_id}"),
-    )
+    resource_arn(region, OUTPOST_RESOURCE_TYPE, outpost_id)
 }
 
 /// The bare resource id an Outposts identifier names, whether it arrived as the id
