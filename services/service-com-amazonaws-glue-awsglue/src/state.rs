@@ -3663,6 +3663,75 @@ pub fn fold_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// Ceiling on the number of `*` wildcards and `|` alternatives one pattern passed to
+/// [`matches_name_pattern`] may carry.
+///
+/// A pattern is request text and every stored name is matched against it, so the work it
+/// can buy is bounded here rather than left to grow with a model's pattern length:
+/// matching is O(name length x wildcards) per name, so this ceiling and the per-database
+/// table ceiling together bound one request. It lives beside the matcher because every
+/// listing that takes such a pattern needs the same bound; each refuses a pattern past it
+/// with its OWN modelled client error.
+pub const MAX_PATTERN_WILDCARDS: usize = 64;
+
+/// How many wildcards and alternatives `pattern` carries, the count
+/// [`MAX_PATTERN_WILDCARDS`] bounds.
+pub fn pattern_wildcards(pattern: &str) -> usize {
+    pattern
+        .chars()
+        .filter(|character| *character == '*' || *character == '|')
+        .count()
+}
+
+/// Whether `name` matches the Hive-style `pattern` in FULL: `|` separates alternatives
+/// and `*` matches any run of characters (including none) within one, every other
+/// character — `.`, `[`, `(` included — being a literal.
+///
+/// This is the pattern language the catalog's table listing takes: the Data Catalog is
+/// Hive-metastore compatible (the model folds both `DatabaseInput$Name` and
+/// `TableInput$Name` "for Hive compatibility"), which is why `events*` selects `events`
+/// and `events_raw`. It lives here rather than in one operation's file because every
+/// listing of these tables has to select them the same way — `GetTables`'s own
+/// `Expression`, and Athena's `ListTableMetadata` over this same catalog — so there is
+/// ONE pattern language and two listings of one set of tables can never disagree.
+///
+/// Every string is a valid pattern, so a pattern is never refused as malformed. Matching
+/// is O(name length x wildcards) and needs no backtracking, so a caller that bounds the
+/// pattern's wildcards bounds the work it can buy.
+pub fn matches_name_pattern(pattern: &str, name: &str) -> bool {
+    pattern
+        .split('|')
+        .any(|alternative| matches_wildcard(alternative, name))
+}
+
+/// Whether `name` matches one alternative of [`matches_name_pattern`] in full. The
+/// pattern's literal segments (what sits between its `*`s) must appear in order: the
+/// first as a prefix, the last as a suffix, and each middle one at its leftmost
+/// occurrence after the previous — which is the standard wildcard match.
+fn matches_wildcard(pattern: &str, name: &str) -> bool {
+    let mut segments = pattern.split('*');
+    // `split` always yields at least one segment, so this cannot be `None`.
+    let first = segments.next().unwrap_or_default();
+    if !name.starts_with(first) {
+        return false;
+    }
+    // Safe to slice: `starts_with` means `first.len()` is a character boundary.
+    let mut rest = &name[first.len()..];
+    let after_first: Vec<&str> = segments.collect();
+    let Some((last, middle)) = after_first.split_last() else {
+        // No `*` at all: the pattern is a literal, so it must be the whole name.
+        return rest.is_empty();
+    };
+    for segment in middle {
+        match rest.find(segment) {
+            // `find` answers a character boundary, so this slice is safe too.
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
+}
+
 /// The IAM user name of the identity this emulator's long-term credentials speak for.
 ///
 /// The emulator publishes exactly ONE long-term identity, and STS is what defines it:

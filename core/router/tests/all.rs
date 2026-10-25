@@ -80,6 +80,10 @@ mod chime_family_signing_name_routing;
 mod cloudformation_provisions_acm_acme_endpoints;
 #[path = "all/cloudformation_provisions_cognito_user_pool_groups.rs"]
 mod cloudformation_provisions_cognito_user_pool_groups;
+// Declared in this same quiet span of the sorted list, for the reason the note above gives:
+// the tail of this file is where every concurrently landing router suite appends.
+#[path = "all/cloudformation_provisions_cloudwatch_dashboards.rs"]
+mod cloudformation_provisions_cloudwatch_dashboards;
 #[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
 mod cloudformation_provisions_sagemaker_model_package_group;
 // Declared in this span of the sorted list rather than appended at the end of this file,

@@ -35,12 +35,17 @@ const WORKSPACE: &str = "plant-floor";
 
 /// `POST|GET /workspaces/{workspaceName}/tasks`, as `OPERATIONS.md` reports the
 /// route.
-fn tasks_uri(workspace: &str) -> String {
+///
+/// This module owns the task slice's harness: the helpers a sibling suite under
+/// `tests/all/` also needs are `pub(crate)`, the way `asset_lifecycle` exposes
+/// `call` / `router` / `error_code`, so no second copy of a route or a body
+/// builder can drift from this one.
+pub(crate) fn tasks_uri(workspace: &str) -> String {
     format!("/workspaces/{workspace}/tasks")
 }
 
 /// `GET|PUT|DELETE /workspaces/{workspaceName}/tasks/{taskName}`.
-fn task_uri(workspace: &str, name: &str) -> String {
+pub(crate) fn task_uri(workspace: &str, name: &str) -> String {
     format!("/workspaces/{workspace}/tasks/{name}")
 }
 
@@ -54,31 +59,31 @@ fn expected_arn(workspace: &str, name: &str) -> String {
 }
 
 /// The `state` of a `ResourceStatus` in a response body.
-fn state(body: &Value) -> &str {
+pub(crate) fn state(body: &Value) -> &str {
     body["status"]["state"].as_str().unwrap_or("")
 }
 
 /// An ECR image URI of the private-registry form `EcrUri`'s pattern admits
 /// (smithy_query query="shape" shape="ContainerTaskConfiguration": `ecrUri`).
-const PRIVATE_IMAGE: &str = "123456789012.dkr.ecr.us-west-2.amazonaws.com/analytics:v1";
+pub(crate) const PRIVATE_IMAGE: &str = "123456789012.dkr.ecr.us-west-2.amazonaws.com/analytics:v1";
 
 /// The same member's public-registry form.
-const PUBLIC_IMAGE: &str = "public.ecr.aws/docker/library/python:3.12";
+pub(crate) const PUBLIC_IMAGE: &str = "public.ecr.aws/docker/library/python:3.12";
 
 /// An IAM role ARN of the form `IamRoleArn`'s pattern admits (same shape,
 /// `taskExecutionRole`).
-const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/SiteWiseTaskRole";
+pub(crate) const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/SiteWiseTaskRole";
 
 /// The `ProcessingType` values, from the enum itself (smithy_query query="shape"
 /// shape="ProcessingType").
-const PROCESSING_TYPES: [&str; 2] = [
+pub(crate) const PROCESSING_TYPES: [&str; 2] = [
     "GENERIC_COMPUTE_PROCESSING",
     "HARDWARE_ACCELERATED_PROCESSING",
 ];
 
 /// The `ProcessingUnit` values, from the enum itself (smithy_query query="shape"
 /// shape="ProcessingUnit").
-const PROCESSING_UNITS: [&str; 14] = [
+pub(crate) const PROCESSING_UNITS: [&str; 14] = [
     "UNITS_2", "UNITS_4", "UNITS_8", "UNITS_12", "UNITS_16", "UNITS_24", "UNITS_32", "UNITS_36",
     "UNITS_48", "UNITS_60", "UNITS_64", "UNITS_72", "UNITS_84", "UNITS_96",
 ];
@@ -98,7 +103,7 @@ const STORAGE_SIZE_MIN: i64 = 1;
 const STORAGE_SIZE_MAX: i64 = 16_384;
 
 /// A `containerTaskConfiguration` carrying only the members the shape requires.
-fn minimal_container(processing_type: &str, processing_unit: &str) -> Value {
+pub(crate) fn minimal_container(processing_type: &str, processing_unit: &str) -> Value {
     json!({
         "containerTaskConfiguration": {
             "ecrUri": PRIVATE_IMAGE,
@@ -132,12 +137,16 @@ fn s3_mount(name: &str, relative_path: &str, prefix: Option<&str>) -> Value {
 }
 
 /// `CreateTask` with `body`.
-async fn create(router: &MultiServiceRouter, workspace: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn create(
+    router: &MultiServiceRouter,
+    workspace: &str,
+    body: Value,
+) -> (u16, Value) {
     call(router, "POST", &tasks_uri(workspace), Some(body)).await
 }
 
 /// `UpdateTask` with `body`.
-async fn update(
+pub(crate) async fn update(
     router: &MultiServiceRouter,
     workspace: &str,
     name: &str,
@@ -147,7 +156,11 @@ async fn update(
 }
 
 /// `DescribeTask`, at the latest version or at `version`.
-async fn describe(
+///
+/// `taskVersion` rides the query string as `version` (smithy_query
+/// query="operation" operation="DescribeTask"), so the label is sent exactly as
+/// the caller spells it — including one the modelled form does not admit.
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     workspace: &str,
     name: &str,
@@ -162,7 +175,7 @@ async fn describe(
 
 /// A `DescribeTask` body without its lifecycle `status`, which time moves on its
 /// own.
-fn without_status(body: &Value) -> Value {
+pub(crate) fn without_status(body: &Value) -> Value {
     let mut copy = body.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove("status");

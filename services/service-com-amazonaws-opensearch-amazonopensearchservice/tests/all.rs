@@ -35,6 +35,8 @@ mod domain_nodes;
 mod index_registry;
 #[path = "all/index_schema_updates.rs"]
 mod index_schema_updates;
+#[path = "all/insight_details.rs"]
+mod insight_details;
 #[path = "all/insights.rs"]
 mod insights;
 #[path = "all/instance_type_catalog.rs"]

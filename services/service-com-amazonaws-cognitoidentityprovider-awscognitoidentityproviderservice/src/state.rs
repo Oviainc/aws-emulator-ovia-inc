@@ -14,15 +14,17 @@ use ::ring::signature::KeyPair;
 use ::sha2::Digest;
 
 use crate::ops::types::{
-    AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
+    AccountRecoverySettingType, AccountTakeoverRiskConfigurationType, AcrLevelConfigType,
+    AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType,
-    CodeDeliveryDetailsType, CustomDomainConfigType,
+    CodeDeliveryDetailsType, CompromisedCredentialsRiskConfigurationType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
     IssuerConfigurationType,
     KeyConfigurationType, LambdaConfigType, MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
-    ResourceServerScopeType, ResourceServerType, RoutingType,
+    ResourceServerScopeType, ResourceServerType, RiskConfigurationType,
+    RiskExceptionConfigurationType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, SmsMfaConfigType,
     SoftwareTokenMfaConfigType, StringAttributeConstraintsType,
     TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserImportJobType,
@@ -213,6 +215,26 @@ const PASSWORD_NEEDS_SYMBOLS: &str = "Password must have symbol characters";
 fn password_policy_message(requirement: &str) -> String {
     format!("{PASSWORD_POLICY_PREFIX}{requirement}")
 }
+
+// ---------------------------------------------------------------------------
+// Threat protection (risk configuration)
+// ---------------------------------------------------------------------------
+
+/// The `AdvancedSecurityMode` that leaves threat protection switched off: one of
+/// the modelled [`crate::ops::types::ADVANCED_SECURITY_MODE_TYPE_VALUES`], and
+/// the value a pool that carries no `UserPoolAddOns` behaves as.
+pub const ADVANCED_SECURITY_MODE_OFF: &str = "OFF";
+
+/// The message a `UserPoolAddOnNotEnabledException` carries.
+///
+/// `UserPoolAddOnNotEnabledException` is thrown "when user pool add-ons aren't
+/// enabled" (this service's model), which is the state of a pool that carries no
+/// threat-protection surface: "to change threat protection to audit-only or off,
+/// update the value of `UserPoolAddOns` in an `UpdateUserPool` request"
+/// (`SetRiskConfiguration`). The refusal reports that state of the pool and names
+/// nothing the request asked for, so it is the same sentence for every pool and
+/// app client.
+pub const USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE: &str = "User pool add-ons is not enabled.";
 
 // ---------------------------------------------------------------------------
 // User pool domains
@@ -872,6 +894,15 @@ pub struct UserPool {
     /// requirement and whether a passkey satisfies MFA
     /// (`WebAuthnConfigurationType`). `None` until a call configures it.
     pub web_authn_configuration: Option<WebAuthnConfigurationType>,
+    /// This pool's threat-protection settings, once a call has set them:
+    /// `RiskConfigurationType.ClientId` is "the app client where this
+    /// configuration is applied. When this parameter isn't present, the risk
+    /// configuration applies to all user pool app clients that don't have
+    /// client-level settings" — so this is the pool-level configuration, the one
+    /// every app client of the pool that holds none of its own uses. `None`
+    /// until a call sets it, so a pool nobody configured reports no settings and
+    /// no modification instant.
+    pub risk_configuration: Option<RiskConfiguration>,
     pub tags: HashMap<String, String>,
     /// This pool's Amazon Cognito prefix domain, once one is created:
     /// `UserPoolType.Domain` is "The domain prefix, if the user pool has a
@@ -938,6 +969,67 @@ pub struct MfaConfig {
     pub email_mfa_configuration: Option<EmailMfaConfigType>,
     pub mfa_configuration: String,
     pub web_authn_configuration: Option<WebAuthnConfigurationType>,
+}
+
+/// The threat-protection settings stored at one level — a user pool, or one app
+/// client of it — beside the instant the last call that set them ran.
+///
+/// The three settings are exactly the ones `SetRiskConfiguration` carries, and
+/// `RiskConfigurationType` reports them back with the level they were stored at
+/// (the pool id alone, or the pool id and the app client id) and
+/// `LastModifiedDate`, "the date and time when the item was modified".
+///
+/// A setting this struct holds as `None` is one no stored call configured: the
+/// operation SETS the whole configuration of the level it names, so a request
+/// that carries none of the three leaves a configuration with nothing in it —
+/// which is what "to set the risk configuration for the user pool to defaults,
+/// send this request with only the `UserPoolId` parameter" asks for.
+#[derive(Debug, Clone)]
+pub struct RiskConfiguration {
+    pub compromised_credentials_risk_configuration:
+        Option<CompromisedCredentialsRiskConfigurationType>,
+    pub account_takeover_risk_configuration: Option<AccountTakeoverRiskConfigurationType>,
+    pub risk_exception_configuration: Option<RiskExceptionConfigurationType>,
+    pub last_modified_date: SystemTime,
+}
+
+impl RiskConfiguration {
+    /// The stored settings as the two operations that report them render them:
+    /// `user_pool_id` and `client_id` name the level they are stored at, so a
+    /// client-level configuration carries the app client it applies to and a
+    /// pool-level one carries none.
+    pub fn to_risk_configuration_type(
+        &self,
+        user_pool_id: &str,
+        client_id: Option<&str>,
+    ) -> RiskConfigurationType {
+        RiskConfigurationType {
+            user_pool_id: Some(user_pool_id.to_string()),
+            client_id: client_id.map(str::to_string),
+            compromised_credentials_risk_configuration: self
+                .compromised_credentials_risk_configuration
+                .clone(),
+            account_takeover_risk_configuration: self.account_takeover_risk_configuration.clone(),
+            risk_exception_configuration: self.risk_exception_configuration.clone(),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+        }
+    }
+}
+
+/// The configuration a level that nothing has ever configured reports: the level
+/// itself, with no setting and no modification instant — nothing was modified
+/// there, so there is no "date and time when the item was modified" to report.
+/// `RiskConfiguration` is a modelled required member of both responses that carry
+/// it, so the level is named even where it holds nothing.
+pub fn unconfigured_risk_configuration_type(
+    user_pool_id: &str,
+    client_id: Option<&str>,
+) -> RiskConfigurationType {
+    RiskConfigurationType {
+        user_pool_id: Some(user_pool_id.to_string()),
+        client_id: client_id.map(str::to_string),
+        ..RiskConfigurationType::default()
+    }
 }
 
 impl UserPool {
@@ -1375,6 +1467,21 @@ impl UserPool {
             .find(|stored| stored.client_id == client_id && stored.terms_name == terms_name)
     }
 
+    /// Whether this pool's user pool add-ons are enabled, which is what the
+    /// threat-protection surface rests on.
+    ///
+    /// `UserPoolAddOns` "contains settings for activation of threat protection"
+    /// (`CreateUserPool`) and threat protection is changed "to audit-only or
+    /// off" by updating that member (`SetRiskConfiguration`), so add-ons are on
+    /// exactly when the pool stores a mode other than
+    /// [`ADVANCED_SECURITY_MODE_OFF`] — and a pool that stores no
+    /// `UserPoolAddOns` at all has them off.
+    pub fn add_ons_enabled(&self) -> bool {
+        self.user_pool_add_ons
+            .as_ref()
+            .is_some_and(|add_ons| add_ons.advanced_security_mode != ADVANCED_SECURITY_MODE_OFF)
+    }
+
     /// The modelled view of this pool's MFA and passkey configuration, rendered
     /// from what is stored.
     ///
@@ -1607,6 +1714,14 @@ pub struct UserPoolClient {
     pub enable_propagate_additional_user_context_data: bool,
     pub auth_session_validity: Option<i32>,
     pub refresh_token_rotation: Option<RefreshTokenRotationType>,
+    /// This app client's own threat-protection settings, once a call has set
+    /// them: `RiskConfigurationType.ClientId` is "the app client where this
+    /// configuration is applied", and a client that holds none uses the pool's
+    /// — "to reset the threat protection settings of an app client to be
+    /// inherited from the user pool, send `UserPoolId` and `ClientId`
+    /// parameters only" (`SetRiskConfiguration`), which stores a configuration
+    /// with nothing in it.
+    pub risk_configuration: Option<RiskConfiguration>,
 }
 
 impl UserPoolClient {
@@ -3187,6 +3302,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         // scalar multiplication, so creating a pool waits on nothing.
         signing_key: PoolSigningKey::generate(),
         device_group_key: new_device_group_key(),
+        risk_configuration: None,
     }
 }
 

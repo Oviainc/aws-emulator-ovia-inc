@@ -41,9 +41,65 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
+
+/// The error code the layer that fronts this service's tagging operations refuses a
+/// broken tag rule with. No operation of this model declares it — the layer is not the
+/// service — so a refusal worded with it cannot come from the modelled error enums; see
+/// `crate::scaffolded::Scaffolded::BadRequest` for the handler-side channel.
+const TAG_RULE_REFUSAL_CODE: &str = "BadRequestException";
+
+/// The input members a TAG's own content arrives on, and the name request validation
+/// reports a refused tag at for each.
+///
+/// `tagKeys` is bound ONLY by `UntagResource`
+/// (`smithy_query(query="digest")`), so a violation on it is attributable and is reported
+/// at the name that operation's validation uses. `tags` is bound by `TagResource` AND by
+/// `CreatePipe`, and a [`Refusal`] carries no operation id, so a violation on it is
+/// reported at the member as the MODEL names it (lowerCamel, which is what both
+/// operations' paths spell) rather than at either operation's own validation name.
+/// Narrowing that needs an operation-aware refusal seam, which this service cannot add.
+const TAG_CONTENT_MEMBERS: &[&str] = &["tags", "tagKeys"];
+
+/// The input member a violation is about: a `Violation::path` is DOTTED
+/// (`tagKeys.1.member` for a list element, `tags.<key>` for a map value), so the member
+/// is the path's first segment and not the whole path.
+fn member_of(violation: &Violation) -> &str {
+    violation.path.split('.').next().unwrap_or_default()
+}
+
+/// How a violation on one of [`TAG_CONTENT_MEMBERS`] is worded, or `None` when the
+/// violation is not about ONE tag's content.
+///
+/// A violation at the member itself (`tags`, `tagKeys`) is about how MANY tags the
+/// request carries — the collection's own `@length` — which is not a tag rule and keeps
+/// the modelled wording. A violation one step inside it (a map VALUE, whose path segment
+/// is the entry's key, or a list ELEMENT) is a tag whose content breaks the published
+/// `TagKey`/`TagValue` bound, which is the layer's refusal to word.
+fn tag_content_clause(violation: &Violation) -> Option<String> {
+    let (member, inside) = violation.path.split_once('.')?;
+    let value = violation.value.as_deref().unwrap_or_default();
+    match member {
+        // `tags.<key>`: the VALUE sent for that key is outside `TagValue`'s bound. The
+        // key is the rest of the path, which it contributes whole (a key may carry a
+        // dot of its own). A [`Refusal`] carries only the value that broke the rule, so
+        // the entry it broke is the whole of the member's value this can echo.
+        "tags" => Some(crate::state::tag_refusal(
+            crate::state::CREATE_TAGS_MEMBER,
+            crate::state::TagViolation::ValueLength,
+            inside,
+            &crate::state::echoed_tags(std::iter::once((inside, value))),
+        )),
+        // `tagKeys.<position>.member`: that key is outside `TagKey`'s bound.
+        "tagKeys" => Some(crate::state::tag_key_refusal(
+            crate::state::REMOVED_TAG_KEYS_MEMBER,
+            value,
+        )),
+        _ => None,
+    }
+}
 
 /// The `com-amazonaws-pipes-pipes` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +152,41 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Two layers answer a refused pipes request, and they do not answer alike.
+        //
+        // The resource-tagging layer in FRONT of this service owns the three
+        // ARN-addressed tagging operations, and it refuses a tag whose content breaks a
+        // published tag rule with its own code — `BadRequestException`, which no
+        // operation of this model declares, because the layer is not the service. The
+        // rule the tag broke is one the model DOES declare (`TagKey`'s and `TagValue`'s
+        // `@length`), so the boundary validator is what finds it, and this is where that
+        // refusal is worded. `crate::state::tag_refusal` states the same sentences for
+        // the rules the handlers enforce themselves, so one tag rule is worded one way
+        // whichever layer catches it.
+        //
+        // Everything else is the SERVICE's own refusal, and this service models
+        // `ValidationException` for it — which is the code the default already names —
+        // so it keeps the framework's wording.
+        let violations = match refusal {
+            Refusal::Invalid(violations) => violations,
+            // An authentication refusal is the framework's 403 to word, not ours.
+            _ => return None,
+        };
+        if !violations
+            .iter()
+            .all(|violation| TAG_CONTENT_MEMBERS.contains(&member_of(violation)))
+        {
+            return None;
+        }
+        let clauses: Vec<String> = violations.iter().filter_map(tag_content_clause).collect();
+        // One refused tag at a time: the layer states the first tag rule the request
+        // broke, as the handlers do, so the two cannot be told apart by how many
+        // clauses they carry.
+        let message = clauses.into_iter().next()?;
+        Some(Refused {
+            code: TAG_RULE_REFUSAL_CODE.to_string(),
+            message,
+        })
     }
 
     fn override_routing_error(

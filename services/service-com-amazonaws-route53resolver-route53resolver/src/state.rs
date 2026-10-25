@@ -16,9 +16,10 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse,
-    OutpostResolver, ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
-    ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress, ValidationException,
+    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidRequestException,
+    IpAddressResponse, OutpostResolver, ResolverDnssecConfig, ResolverEndpoint, ResolverRule,
+    ResolverRuleAssociation, ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress,
+    ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -184,6 +185,19 @@ pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
 /// the recorded responses of the rule operation that raises
 /// `InvalidRequestException` for it.
 pub const RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET: &str = "RSLVR-00707";
+
+/// The Route 53 Resolver service error code reported when a request asks for a
+/// rule that forwards queries onward, yet does not say where to: it names no
+/// Resolver endpoint to forward through, or no target IP addresses to forward
+/// to, or neither.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`], and it is
+/// the counterpart of [`RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes from
+/// the recorded responses of the rule operation that raises
+/// `InvalidRequestException` for it.
+pub const RSLVR_CODE_FORWARD_RULE_FORWARDING_TARGET_REQUIRED: &str = "RSLVR-00706";
 
 /// The Route 53 Resolver service error code reported when a request asks for a
 /// Resolver on an Outpost with fewer EC2 instances than `InstanceCount`'s
@@ -396,6 +410,39 @@ pub fn outpost_resolver_instance_count_below_minimum() -> ValidationException {
             RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM,
             &format!(
                 r#"The instance count must be equal to or greater than "{OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT}""#
+            ),
+        )),
+    }
+}
+
+/// The `InvalidRequestException` the rule write path answers for a rule that
+/// forwards queries onward but does not say where to.
+///
+/// One body for the whole precondition — a missing `ResolverEndpointId`, missing
+/// `TargetIps`, or both — because a forwarding rule needs the endpoint and the
+/// target addresses TOGETHER: either one alone describes no forwarding path, so
+/// it is one fault and carries one service error code.
+pub fn forward_rule_requires_forwarding_target() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_FORWARD_RULE_FORWARDING_TARGET_REQUIRED,
+            &format!(
+                "Resolver endpoint ID and target IP are required for {RULE_TYPE_FORWARD} type resolver rule"
+            ),
+        )),
+    }
+}
+
+/// The `InvalidRequestException` the rule write path answers for a rule of a
+/// type Resolver answers itself that still names where to forward queries to —
+/// the mirror image of [`forward_rule_requires_forwarding_target`], and one body
+/// for the endpoint, the target addresses or both.
+pub fn system_rule_forbids_forwarding_target() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET,
+            &format!(
+                "Cannot specify resolver endpoint ID and target IP for {RULE_TYPE_SYSTEM} type resolver rule"
             ),
         )),
     }
@@ -988,6 +1035,21 @@ impl ResolverEndpointRecord {
     }
 }
 
+/// Fold a wire filter name for matching against a catalog.
+///
+/// `Filter$Name`'s doc says the early, upper-snake spellings
+/// (`CREATOR_REQUEST_ID` for `CreatorRequestId`) "are still supported", so the
+/// name is upper-cased with `_` removed before it is matched — which accepts
+/// both spellings and nothing else. Written once here because the rule is the
+/// same for every list operation's catalog, while the catalogs themselves
+/// differ.
+fn fold_filter_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
 /// The member a `ListResolverEndpoints` filter selects on.
 ///
 /// The catalog is exactly the one the model documents for this operation
@@ -1021,19 +1083,10 @@ impl FilterKey {
     }
 
     /// Resolve a wire filter name, or `None` when it is outside the documented
-    /// catalog.
-    ///
-    /// The same doc note says the early, upper-snake spellings
-    /// (`CREATOR_REQUEST_ID` for `CreatorRequestId`) "are still supported", so
-    /// the name is folded to upper case with `_` removed before matching —
-    /// which accepts both spellings and nothing else.
+    /// catalog. The name is folded by [`fold_filter_name`], which is what
+    /// accepts the early upper-snake spelling as well as the documented one.
     pub fn parse(name: &str) -> Option<Self> {
-        let folded: String = name
-            .chars()
-            .filter(|c| *c != '_')
-            .flat_map(char::to_uppercase)
-            .collect();
-        match folded.as_str() {
+        match fold_filter_name(name).as_str() {
             "CREATORREQUESTID" => Some(Self::CreatorRequestId),
             "DIRECTION" => Some(Self::Direction),
             "HOSTVPCID" => Some(Self::HostVpcId),
@@ -1155,6 +1208,87 @@ impl ResolverRuleRecord {
             creation_time: Some(self.creation_time.clone()),
             modification_time: Some(self.modification_time.clone()),
             delegation_record: self.delegation_record.clone(),
+        }
+    }
+
+    /// Whether this rule satisfies one `ListResolverRules` filter: whether the
+    /// value it presents for that member is among the filter's values.
+    ///
+    /// A set lookup per record and per filter key, as
+    /// [`ResolverEndpointRecord::matches_filter`] is, so a filtered page costs
+    /// O(stored rules x filter keys) and not O(values the request carried). A
+    /// member the rule does not carry matches nothing.
+    pub fn matches_filter(&self, key: RuleFilterKey, values: &HashSet<String>) -> bool {
+        match key {
+            RuleFilterKey::CreatorRequestId => values.contains(self.creator_request_id.as_str()),
+            RuleFilterKey::DomainName => self
+                .domain_name
+                .as_deref()
+                .is_some_and(|domain| values.contains(domain)),
+            RuleFilterKey::Name => self.name.as_deref().is_some_and(|name| values.contains(name)),
+            RuleFilterKey::ResolverEndpointId => self
+                .resolver_endpoint_id
+                .as_deref()
+                .is_some_and(|id| values.contains(id)),
+            RuleFilterKey::Status => values.contains(self.status.as_str()),
+            RuleFilterKey::Type => values.contains(self.rule_type.as_str()),
+        }
+    }
+}
+
+/// The member a `ListResolverRules` filter selects on.
+///
+/// The catalog is exactly the one the model documents for this operation
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverRules**): `CreatorRequestId`, `DomainName`, `Name`,
+/// `ResolverEndpointId`, `Status`, `Type`. It is a different catalog from
+/// [`FilterKey`]'s, because the valid filter names "depend on the action that
+/// you're including the filter in".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleFilterKey {
+    CreatorRequestId,
+    DomainName,
+    Name,
+    ResolverEndpointId,
+    Status,
+    Type,
+}
+
+impl RuleFilterKey {
+    /// The canonical name of this key, used to describe a filter set in a
+    /// pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::CreatorRequestId => "CreatorRequestId",
+            Self::DomainName => "DomainName",
+            Self::Name => "Name",
+            Self::ResolverEndpointId => "ResolverEndpointId",
+            Self::Status => "Status",
+            Self::Type => "Type",
+        }
+    }
+
+    /// Whether the values of this filter name a rule domain, which is matched in
+    /// the canonical fully-qualified form a rule is stored and reported in (see
+    /// [`canonical_domain_name`]): the doc asks a caller to "include a trailing
+    /// dot (.) after the domain name", and canonicalising the value makes both
+    /// spellings of one domain select the same rules.
+    pub fn selects_on_domain_name(self) -> bool {
+        matches!(self, Self::DomainName)
+    }
+
+    /// Resolve a wire filter name, or `None` when it is outside the documented
+    /// catalog. The name is folded by [`fold_filter_name`], as
+    /// [`FilterKey::parse`] folds the endpoint catalog's names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "CREATORREQUESTID" => Some(Self::CreatorRequestId),
+            "DOMAINNAME" => Some(Self::DomainName),
+            "NAME" => Some(Self::Name),
+            "RESOLVERENDPOINTID" => Some(Self::ResolverEndpointId),
+            "STATUS" => Some(Self::Status),
+            "TYPE" => Some(Self::Type),
+            _ => None,
         }
     }
 }
@@ -1458,6 +1592,17 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         all
     }
 
+    /// Every stored Resolver rule in creation order — the order
+    /// `ListResolverRules`' pages and its cursor are defined over, for the same
+    /// reason as [`Self::endpoints_in_creation_order`]: a page is cut at an
+    /// offset into this sequence, so the sequence must not depend on the hash
+    /// order of the map that holds the records.
+    pub fn rules_in_creation_order(&self) -> Vec<&ResolverRuleRecord> {
+        let mut all: Vec<&ResolverRuleRecord> = self.resolver_rules.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
     /// Whether one more Resolver on an Outpost may be stored, i.e. the store is
     /// still below [`MAX_STORED_OUTPOST_RESOLVERS`]. A create that this refuses
     /// answers `ServiceQuotaExceededException` and writes nothing.
@@ -1666,28 +1811,51 @@ fn feed_field(hasher: &mut Sha256, field: &[u8]) {
 /// is answered with `InvalidNextTokenException` rather than with a page cut at
 /// the wrong position.
 pub fn endpoint_list_scope(filters: &[(FilterKey, HashSet<String>)]) -> String {
+    filter_list_scope(
+        "ListResolverEndpoints",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    )
+}
+
+/// The cursor scope of one `ListResolverRules` query, for the same reason and in
+/// the same shape as [`endpoint_list_scope`]'s.
+pub fn rule_list_scope(filters: &[(RuleFilterKey, HashSet<String>)]) -> String {
+    filter_list_scope(
+        "ListResolverRules",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    )
+}
+
+/// The cursor scope of one filtered list query: the operation being paged, plus
+/// a digest of its filter set folded canonically, so neither the order the
+/// filters arrived in nor the order of one filter's values changes the scope.
+fn filter_list_scope<'a>(
+    operation: &str,
+    filters: impl Iterator<Item = (&'static str, &'a HashSet<String>)>,
+) -> String {
     let mut described: Vec<(&'static str, Vec<&str>)> = filters
-        .iter()
-        .map(|(key, values)| {
+        .map(|(name, values)| {
             let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
             values.sort_unstable();
-            (key.canonical_name(), values)
+            (name, values)
         })
         .collect();
     described.sort();
 
     let mut hasher = Sha256::new();
-    hasher.update(b"ListResolverEndpoints/filters/v1");
+    hasher.update(b"route53resolver/list-filters/v1");
+    feed_field(&mut hasher, operation.as_bytes());
     for (name, values) in &described {
         feed_field(&mut hasher, name.as_bytes());
         for value in values {
             feed_field(&mut hasher, value.as_bytes());
         }
     }
-    format!(
-        "ListResolverEndpoints/{}",
-        hex::encode(&hasher.finalize()[..8])
-    )
+    format!("{operation}/{}", hex::encode(&hasher.finalize()[..8]))
 }
 
 /// The cursor scope of one `ListOutpostResolvers` query.

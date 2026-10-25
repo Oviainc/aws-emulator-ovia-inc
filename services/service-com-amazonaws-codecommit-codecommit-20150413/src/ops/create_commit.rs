@@ -552,7 +552,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Entries {
             puts,
             deletes,
@@ -882,6 +881,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = std::time::SystemTime::now();
+        // The identity whose call writes the commit, which is the actor a pull
+        // request reading from this branch attributes the source update to.
+        let actor = crate::state::caller_identity_arn(ctx.parts());
         let user = UserInfo {
             name: input.author_name.clone(),
             email: input.email.clone(),
@@ -910,13 +912,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "the repository store holds a file whose blob id is not an object name",
                 )
             })?;
-        repository.branches.insert(
-            input.branch_name.clone(),
-            crate::state::Branch {
-                name: input.branch_name.clone(),
-                commit_id: commit_id.clone(),
-            },
-        );
+        // The branch moves to the new commit, through the one place a branch tip
+        // moves: every OPEN pull request reading from it follows the new tip.
+        repository.set_branch_tip(&input.branch_name, &commit_id, now, Some(&actor));
         // The first branch a repository gets is its default branch.
         if repository.default_branch.is_none() {
             repository.default_branch = Some(input.branch_name.clone());

@@ -99,46 +99,184 @@ pub const TAG_VALUE_LENGTH: std::ops::RangeInclusive<usize> = 0..=256;
 /// case-insensitively, the way the reservation is stated.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
-/// Why a tag the request carries is not one this service accepts, worded for the
-/// `ValidationException` the writes that install tags answer with.
+/// The special characters a tag may carry besides letters, numbers and spaces. Source:
+/// the documented tag rule [`TAG_CHARACTER_SET_MESSAGE`] states verbatim.
+const TAG_SPECIAL_CHARACTERS: &[char] = &['_', '.', ':', '/', '=', '+', '-', '@'];
+
+/// The sentence a tag carrying a character outside the documented set is refused with.
+/// It is a FIXED, documented rule rather than a message built from the request, so it
+/// names neither the key nor the value that broke it.
+pub const TAG_CHARACTER_SET_MESSAGE: &str =
+    "Tags can only contain letters, numbers, spaces, and the following special \
+     characters: _ . : / = + - @";
+
+/// Whether `text` is within the documented tag character set: letters, numbers, spaces
+/// and [`TAG_SPECIAL_CHARACTERS`]. "Letters" and "numbers" are NOT ASCII-only — a tag
+/// written in another script is letters and round-trips — so both are judged by unicode
+/// category rather than by byte range.
+fn within_tag_character_set(text: &str) -> bool {
+    text.chars().all(|character| {
+        character.is_alphanumeric()
+            || character == ' '
+            || TAG_SPECIAL_CHARACTERS.contains(&character)
+    })
+}
+
+/// The most characters of a tag KEY a refusal echoes back.
+///
+/// A key reaches a handler UNBOUNDED — the boundary validator walks a map's entry count
+/// and its values but not its keys — so a message that interpolated one whole would let a
+/// request be amplified into an arbitrarily long response. The same bound the framework's
+/// own validation messages elide an echoed value at. A tag VALUE needs no such bound:
+/// `TagValue`'s own `@length` is one the validator does walk.
+const MAX_ECHOED_KEY: usize = 256;
+
+/// `key` as a refusal echoes it: itself, or its first [`MAX_ECHOED_KEY`] characters with
+/// an ellipsis. Cut on a CHARACTER boundary, so a multi-byte key stays valid text.
+fn echoed_key(key: &str) -> String {
+    if key.chars().count() <= MAX_ECHOED_KEY {
+        return key.to_string();
+    }
+    let kept: String = key.chars().take(MAX_ECHOED_KEY).collect();
+    format!("{kept}...")
+}
+
+/// Why a tag the request carries is not one this service accepts.
+///
+/// Every one of these is a rule of the resource-tagging layer that fronts the pipes API,
+/// which refuses a tag breaking one with `BadRequestException` (400) rather than with the
+/// modelled `ValidationException` the service states its own refusals as — see
+/// [`tag_refusal`] for the sentence each is worded with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagViolation {
+    /// The key is outside `TagKey`'s `@length` bound ([`TAG_KEY_LENGTH`]).
+    KeyLength,
+    /// The value is outside `TagValue`'s `@length` bound ([`TAG_VALUE_LENGTH`]).
+    ValueLength,
+    /// The key uses the prefix AWS reserves for its own tags
+    /// ([`RESERVED_TAG_KEY_PREFIX`]).
+    ReservedKeyPrefix,
+    /// The key or the value carries a character outside the documented tag set
+    /// ([`TAG_CHARACTER_SET_MESSAGE`]).
+    CharacterSet,
+}
+
+/// Which rule a tag breaks, or `None` when it breaks none.
 ///
 /// `@length` counts CHARACTERS, not bytes (the framework's own constraint checker counts
 /// `chars()`), so a unicode key or value is measured the same way AWS measures it.
-pub fn tag_violation(key: &str, value: &str) -> Option<String> {
-    let key_length = key.chars().count();
-    if !TAG_KEY_LENGTH.contains(&key_length) {
-        return Some(format!(
-            "tag key must have length between {} and {} characters; got {key_length}",
-            TAG_KEY_LENGTH.start(),
-            TAG_KEY_LENGTH.end(),
-        ));
+pub fn tag_violation(key: &str, value: &str) -> Option<TagViolation> {
+    if !TAG_KEY_LENGTH.contains(&key.chars().count()) {
+        return Some(TagViolation::KeyLength);
     }
     if key
         .get(..RESERVED_TAG_KEY_PREFIX.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
     {
-        return Some(format!(
-            "tag key '{key}' uses the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'",
-        ));
+        return Some(TagViolation::ReservedKeyPrefix);
     }
-    let value_length = value.chars().count();
-    if !TAG_VALUE_LENGTH.contains(&value_length) {
-        return Some(format!(
-            "the value of tag key '{key}' must have length between {} and {} characters; \
-             got {value_length}",
-            TAG_VALUE_LENGTH.start(),
-            TAG_VALUE_LENGTH.end(),
-        ));
+    if !TAG_VALUE_LENGTH.contains(&value.chars().count()) {
+        return Some(TagViolation::ValueLength);
+    }
+    if !within_tag_character_set(key) || !within_tag_character_set(value) {
+        return Some(TagViolation::CharacterSet);
     }
     None
 }
 
-/// The refusal a write that installs tags answers with when [`tag_violation`] names one:
-/// the modelled `ValidationException`, carrying the violation as the `fieldList` entry for
-/// `member` (the input member the tags arrived on, which the operations name differently)
-/// and the message that list builds, so the two cannot drift apart.
-pub fn tag_violation_error(member: &str, violation: String) -> ValidationException {
-    validation_error(vec![validation_field(member, violation)])
+/// The member a refused tag is reported at by `TagResource`, whose request-validation
+/// name for the tags it merges is not the wire member's. Source: the recorded refusal of
+/// an over-long tag key, which names this member.
+pub const ADDED_TAGS_MEMBER: &str = "addedTags";
+
+/// The member a refused tag KEY is reported at by `UntagResource`, from the same source.
+pub const REMOVED_TAG_KEYS_MEMBER: &str = "removedTagKeys";
+
+/// The member a refused tag is reported at by `CreatePipe`. No recorded refusal names it,
+/// so it is the model's own member in the casing a validation path uses.
+pub const CREATE_TAGS_MEMBER: &str = "tags";
+
+/// Both published bounds of a `@length`-constrained member, in the order and the wording
+/// request validation states them in — the maximum first, each as one `Member must …`
+/// clause. The bounds come from the model (the constants above), never from a request.
+fn length_requirements(bound: &std::ops::RangeInclusive<usize>) -> String {
+    format!(
+        "Member must have length less than or equal to {}, \
+         Member must have length greater than or equal to {}",
+        bound.end(),
+        bound.start(),
+    )
+}
+
+/// One refused request as the validation envelope states it: how many clauses, then the
+/// clause. The writes below refuse one tag at a time, so the envelope states one clause.
+fn one_validation_error(clause: String) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
+/// The tags a request carried, as a validation message echoes the member's value: every
+/// entry in key order, `{k1=v1, k2=v2}`. What such a message echoes is the value of the
+/// MEMBER, not only the entry that broke the rule.
+///
+/// Each KEY is elided to what a refusal may echo (a key arrives unbounded); each value is
+/// interpolated as given, being already within `TagValue`'s own bound — or, when it is
+/// what broke that bound, already rendered by the validator that refused it.
+pub fn echoed_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let entries: Vec<String> = tags
+        .into_iter()
+        .map(|(key, value)| format!("{}={value}", echoed_key(key)))
+        .collect();
+    format!("{{{}}}", entries.join(", "))
+}
+
+/// The message a write that installs tags refuses `violation` with, for the `member` the
+/// tags arrived on (the operations name it differently, so the caller passes its own).
+/// `key` is the tag that broke the rule and `tags_shown` the member's value as
+/// [`echoed_tags`] renders it.
+///
+/// A violated published BOUND is stated as request validation states one — the member,
+/// its value, and the bounds that value had to satisfy, all from this request and the
+/// model. The character-set and reserved-prefix rules are not modelled constraints, so
+/// each is stated as the rule itself.
+pub fn tag_refusal(
+    member: &str,
+    violation: TagViolation,
+    key: &str,
+    tags_shown: &str,
+) -> String {
+    match violation {
+        TagViolation::KeyLength => one_validation_error(format!(
+            "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
+             Map keys must satisfy constraint: [{}]",
+            length_requirements(&TAG_KEY_LENGTH),
+        )),
+        TagViolation::ValueLength => one_validation_error(format!(
+            "Value '{tags_shown}' at '{member}' failed to satisfy constraint: \
+             Map value must satisfy constraint: [{}]",
+            length_requirements(&TAG_VALUE_LENGTH),
+        )),
+        TagViolation::ReservedKeyPrefix => format!(
+            "Tag key '{}' uses the prefix '{RESERVED_TAG_KEY_PREFIX}', which is reserved \
+             for Amazon Web Services use.",
+            echoed_key(key),
+        ),
+        TagViolation::CharacterSet => TAG_CHARACTER_SET_MESSAGE.to_string(),
+    }
+}
+
+/// The message the tagging layer refuses a tag KEY named for REMOVAL with when it is
+/// outside `TagKey`'s bound: the same envelope as [`tag_refusal`], with the key list as
+/// the value request validation echoes for a list member.
+///
+/// `key` is interpolated as given: a key named for removal travels as a list ELEMENT,
+/// which the boundary validator does walk, so it reaches this wording already bounded by
+/// that validator's own rendering.
+pub fn tag_key_refusal(member: &str, key: &str) -> String {
+    one_validation_error(format!(
+        "Value '[{key}]' at '{member}' failed to satisfy constraint: \
+         Member must satisfy constraint: [{}]",
+        length_requirements(&TAG_KEY_LENGTH),
+    ))
 }
 
 /// One entry of a [`validation_error`]'s list: the request field that was refused and why.
@@ -179,22 +317,34 @@ pub fn validation_error(fields: Vec<ValidationExceptionField>) -> ValidationExce
     }
 }
 
-/// The `NotFoundException` every operation of this service answers with for a pipe this
-/// account does not hold.
+/// The `NotFoundException` the NAME-addressed operations of this service answer with for
+/// a pipe this account does not hold.
 ///
 /// The message is built from the request — the pipe the caller named interpolated into ONE
-/// fixed sentence — so an absent pipe reads the same whichever operation was asked for it.
+/// fixed sentence — so an absent pipe reads the same whichever of those operations was
+/// asked for it. The ARN-addressed tagging operations answer [`resource_not_found`]
+/// instead.
 pub fn pipe_not_found(pipe: &str) -> NotFoundException {
     NotFoundException {
         message: Some(format!("Pipe {pipe} does not exist.")),
     }
 }
 
-/// The pipe a `PipeArn` names, for the operations that address a pipe by ARN rather than
-/// by name: the resource part after `pipe/` (see [`pipe_arn`]), or the whole identifier
-/// when it carries none, so [`pipe_not_found`] names the pipe either way.
-pub fn pipe_name_in_arn(arn: &str) -> &str {
-    arn.rsplit_once("pipe/").map_or(arn, |(_, name)| name)
+/// The sentence the ARN-addressed tagging operations report an unresolvable
+/// `resourceArn` with.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The `NotFoundException` the ARN-addressed tagging operations
+/// (`TagResource`/`UntagResource`/`ListTagsForResource`) answer with for a `resourceArn`
+/// no stored pipe carries.
+///
+/// A CONSTANT, resource-agnostic sentence: those operations are served by the generic
+/// resource-tagging layer in front of this service, which resolved no pipe and so has no
+/// name to interpolate — and echoes no part of the ARN it was given back to the caller.
+pub fn resource_not_found() -> NotFoundException {
+    NotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
 }
 
 /// The region an ARN carries when the request names none.
@@ -324,17 +474,27 @@ impl PipeRecord {
     }
 
     /// The stored tags as the modelled `TagMap`, or `None` when the pipe carries none:
-    /// `TagMap` is `@length(min: 1)`, so an empty map is not a legal value for it.
+    /// `TagMap` is `@length(min: 1)`, so an empty map is not a legal value for one SENT
+    /// to this service, and `DescribePipe` reports the member only when the pipe has tags.
     pub fn tag_map(&self) -> Option<std::collections::HashMap<String, String>> {
         if self.tags.is_empty() {
             return None;
         }
-        Some(
-            self.tags
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        )
+        Some(self.tags_reported())
+    }
+
+    /// The stored tags as the map the tagging layer ALWAYS reports, empty when the pipe
+    /// carries no tag.
+    ///
+    /// Recorded behaviour: `ListTagsForResource` answers with its `tags` member present
+    /// for a pipe with no tags, so a caller can read it without first asking whether it
+    /// is there. `TagMap`'s `@length(min: 1)` bounds what a request may SEND, which is
+    /// what the boundary validator enforces it on.
+    pub fn tags_reported(&self) -> std::collections::HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 

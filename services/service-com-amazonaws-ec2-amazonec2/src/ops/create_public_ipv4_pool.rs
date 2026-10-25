@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePublicIpv4Pool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePublicIpv4Pool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePublicIpv4Pool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints an EMPTY public IPv4 pool, persists it in [`crate::state`] and
+//! answers with the `PoolId` read back out of the store. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +137,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePublicIpv4Pool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePublicIpv4PoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, public_ipv4_pool_network_border_group, public_ipv4_pool_store_full,
+            request_region, require_service_state, tags_from_specifications,
+            PublicIpv4PoolSpec, PUBLIC_IPV4_POOL_RESOURCE_TYPE,
+        };
+
+        // The Region of the request's SigV4 credential scope: a public IPv4 pool is a
+        // Region's resource, and the network border group it is advertised from is one the
+        // Region advertises addresses from.
+        let region = request_region(ctx.parts());
+
+        // "The Availability Zone (AZ) or Local Zone (LZ) network border group ... Defaults
+        // to an AZ network border group" (`$NetworkBorderGroup`) — decided by the one rule
+        // the pool surface shares with the BYOIP provision that also creates a pool, so a
+        // group this Region does not advertise from is refused here rather than stored.
+        let border_group = public_ipv4_pool_network_border_group(
+            input.network_border_group.as_deref(),
+            &region,
+        )?;
+
+        // "The key/value combination of a tag assigned to the resource"
+        // (`$TagSpecifications`): the pool is the only resource this call creates, so a
+        // specification naming any other resource type is refused rather than accepted and
+        // discarded. The shared reader also bounds the tag count, each key and value,
+        // duplicate keys and the reserved `aws:` prefix.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            PUBLIC_IPV4_POOL_RESOURCE_TYPE,
+            Self::NAME,
+        )?;
+
+        // Everything the pool is made of, read from the request before the store is touched,
+        // so nothing is written for a request still refused below. A pool is the CONTAINER
+        // for the CIDRs a caller brings to AWS and this call provisions none — "To provision
+        // a CIDR to a public IPv4 pool" is `ProvisionPublicIpv4PoolCidr`, a separate request
+        // — so it starts with no address range, and its counts are derived from that empty
+        // list by the store's own projection rather than written here. No member of this
+        // request carries a description either, so the pool has none until something sets
+        // one.
+        let spec = PublicIpv4PoolSpec {
+            description: None,
+            network_border_group: border_group,
+            tags,
+            cidrs: Vec::new(),
+        };
+
+        // DryRun sits AFTER every parameter the request carries has been validated and
+        // BEFORE the first write: "A check for whether you have the required permissions for
+        // the action without actually making the request" (`$DryRun`), so a request whose
+        // MEMBERS AWS would have refused — a border group this Region does not advertise
+        // from, a tag outside the documented rules — is refused with that reason instead,
+        // and one AWS would have accepted leaves the store untouched. It answers BEFORE the
+        // store is reached at all, so a dry run takes no lock it would never write through.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePublicIpv4Pool"))
+        // The store's own ceilings below are deliberately NOT consulted here: how many
+        // records and how many caller-supplied bytes this process holds is an artefact of
+        // emulating the service in memory, not a quota AWS publishes for this call, so
+        // answering a dry run from them would report a refusal the real service has no
+        // reason to give.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // The pool id is the service's to mint, never the caller's: the request carries no
+        // id member at all, and the store's own monotonic source is what keeps two pools
+        // from sharing one id. The insert answers `None` only when the store has no room for
+        // the record or for the bytes it would hold, both asked before its first write.
+        let pool_id = store
+            .insert_public_ipv4_pool(spec)
+            .ok_or_else(public_ipv4_pool_store_full)?;
+
+        // Read the answer back OUT of the store, so the caller is told the id a later
+        // `DescribePublicIpv4Pools` will report rather than a value this handler held.
+        let stored = store.public_ipv4_pools.get(&pool_id).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "the newly created public IPv4 pool '{pool_id}' could not be read back"
+            ))
+        })?;
+        Ok(CreatePublicIpv4PoolOutput {
+            pool_id: Some(stored.pool_id.clone()),
+        })
     }
 }

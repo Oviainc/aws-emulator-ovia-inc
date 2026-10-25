@@ -753,9 +753,9 @@ async fn a_metric_stream_cloudwatch_refuses_fails_the_stack() {
 }
 
 /// Every output a template declares is reported with its RESOLVED `OutputValue`, whichever
-/// intrinsic it is written with and whichever resource it names — including a resource of a
-/// type no service here creates, which still carries the physical id and the attributes
-/// CloudFormation's documented naming rules give it.
+/// intrinsic it is written with and whichever resource it names — including a resource whose
+/// type publishes no `Fn::GetAtt` attribute, whose identity is the one CloudFormation's
+/// documented naming rules give it.
 ///
 /// This is the property a client reads a deployment through
 /// (`{o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}`), so it is asserted over
@@ -794,9 +794,9 @@ async fn every_declared_output_carries_its_resolved_value() {
         }),
     ))
     .expect("the template is JSON");
-    // A resource of a type this emulator creates in no service: it is DECLARED-ONLY, and
-    // the output naming it still has to resolve to the identity CloudFormation's naming
-    // rules gave it.
+    // A resource whose type publishes no `Fn::GetAtt` attribute at all: "Ref returns the
+    // dashboard name", which is the identity CloudFormation's naming rules gave it, and the
+    // output naming it has to resolve to exactly that.
     template["Resources"]["Dashboard"] = json!({
         "Type": "AWS::CloudWatch::Dashboard",
         "Properties": {

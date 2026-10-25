@@ -190,13 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to return translated title and description fields"), and a value
         // outside the enum names no language the catalog could be read in.
         let language_code = input.language_code.as_deref();
-        if let Some(language_code) = language_code {
-            if !LANGUAGE_CODE_VALUES.contains(&language_code) {
-                return Err(validation(format!(
-                    "languageCode: {language_code} is not a language code; expected one of {}",
-                    LANGUAGE_CODE_VALUES.join(", ")
-                )));
-            }
+        if let Some(message) = crate::state::language_code_refusal(language_code) {
+            return Err(validation(message));
         }
 
         let store = state.lock();

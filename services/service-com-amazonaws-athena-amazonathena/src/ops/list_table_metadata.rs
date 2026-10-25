@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTableMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTableMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTableMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Lists the metadata of the tables one database of one data catalog actually holds, in
+//! table-name order.
+//!
+//! `CatalogName` names the data catalog the metadata comes from. Athena's
+//! `AwsDataCatalog` IS the account's Glue Data Catalog
+//! ([`crate::state::GLUE_DATA_CATALOG_NAME`]), and so is a registered `GLUE` catalog
+//! naming that same catalog id, so this operation reads the databases and tables GLUE
+//! persisted and projects each one through [`crate::state::to_table_metadata`] — Athena
+//! registers no tables of its own, so a table a client created through Glue is one this
+//! listing reports, and nothing here can drift from the catalog that holds it. A
+//! registered catalog of any other type reads through an external Hive metastore or a
+//! connector function this emulator does not host, which is the METASTORE's answer and so
+//! `MetadataException`; a `CatalogName` nothing registered is refused with
+//! `InvalidRequestException`.
+//!
+//! `Expression` selects the tables whose WHOLE name matches the pattern, in the one
+//! pattern language the catalog serving these tables implements
+//! ([`::service_com_amazonaws_glue_awsglue::state::matches_name_pattern`]): `*` matches
+//! any run of characters, `|` separates alternatives, every other character is a
+//! literal. Both models' prose calls the member a regular expression; the difference
+//! shows only on a regex metacharacter, and the catalog's reading is the one a client
+//! observes — a listing of these tables through Glue's own `GetTables` and a listing
+//! through this operation select the same tables for the same pattern. Matching one name
+//! is linear in its length times the pattern's wildcards and never backtracks, and a
+//! pattern carrying more wildcards than
+//! [`::service_com_amazonaws_glue_awsglue::state::MAX_PATTERN_WILDCARDS`] is refused with
+//! `InvalidRequestException` — so the work one request can buy is that ceiling times the
+//! tables one database holds, which the catalog bounds on every create.
+//!
+//! `MaxResults` truncates the page and the returned `NextToken` is the last name on it,
+//! so the next call resumes at the first table name strictly after it.
+//!
+//! Each reported table carries its STORAGE DESCRIPTOR in `Parameters`: Athena presents a
+//! Data Catalog table as the Hive table it is, one flat property set, and
+//! `TableMetadata` models no storage descriptor of its own — see
+//! [`crate::state::hive_table_properties`] for the properties that set carries.
+//!
+//! `WorkGroup` is "the name of the workgroup for which the metadata is being fetched.
+//! Required if requesting an IAM Identity Center enabled Glue Data Catalog" — it selects
+//! the workgroup whose catalog context the read runs under. This emulator creates no
+//! Identity Center enabled catalog, and the one catalog it serves answers the same
+//! metadata under every workgroup, so the member does not change this answer.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +129,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::service_com_amazonaws_glue_awsglue::state as glue_state;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target
+/// `MaxTableMetadataCount`, whose range is 1..50.
+const MAX_PAGE_SIZE: i32 = 50;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,20 +204,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTableMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTableMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTableMetadata"))
+        // Where this read's metadata comes from is decided by the catalog the request
+        // names and the registry this account holds, not by this operation: the Glue Data
+        // Catalog is served, a registered catalog whose metastore this emulator does not
+        // host is the METASTORE's answer, and a name nothing registered is a problem with
+        // the input.
+        let catalog_id = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(ListTableMetadataErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("Athena state is not reachable on this engine".to_string()),
+                    },
+                )
+                .into());
+            };
+            // The registry's lock is taken and released here, before the catalog's own
+            // store is reached, so no two stores are ever held at once.
+            let store = state.lock();
+            let source =
+                crate::state::metadata_source(&store.data_catalogs, &input.catalog_name);
+            match source {
+                crate::state::MetadataSource::GlueDataCatalog(catalog_id) => catalog_id,
+                crate::state::MetadataSource::ExternalMetastore(catalog_type) => {
+                    return Err(metadata_exception(crate::state::metastore_unreachable(
+                        &input.catalog_name,
+                        &catalog_type,
+                    )));
+                }
+                crate::state::MetadataSource::ForeignGlueCatalog(catalog_id) => {
+                    return Err(metadata_exception(crate::state::foreign_glue_catalog(
+                        &input.catalog_name,
+                        &catalog_id,
+                    )));
+                }
+                crate::state::MetadataSource::Unregistered => {
+                    return Err(invalid_request(crate::state::data_catalog_not_found(
+                        &input.catalog_name,
+                    )));
+                }
+            }
+        };
+
+        // `Expression` is a Hive-style pattern matched against the WHOLE table name (see
+        // the module header). Every string is a valid pattern, so the only refusal is a
+        // pattern carrying more wildcards than the catalog matches against every stored
+        // name — checked BEFORE the catalog's store is reached, so a request that is
+        // going to be refused never takes its lock.
+        let filter = input.expression.as_deref();
+        if let Some(pattern) = filter {
+            let wildcards = glue_state::pattern_wildcards(pattern);
+            if wildcards > glue_state::MAX_PATTERN_WILDCARDS {
+                return Err(invalid_request(crate::state::too_many_pattern_wildcards(
+                    wildcards,
+                )));
+            }
+        }
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`MaxTableMetadataCount`, range 1..50). The clamp re-states that range in the
+        // handler so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let Some(catalog) = glue_state::service_state(&*self.engine) else {
+            return Err(ListTableMetadataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Glue Data Catalog store is not reachable on this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let catalog = catalog.lock();
+        // A database the catalog does not hold is the METASTORE's answer, so it is
+        // reported as such and not as a bad request.
+        let Some(database) = catalog.database(&catalog_id, &input.database_name) else {
+            return Err(metadata_exception(crate::state::database_not_found(
+                &input.database_name,
+            )));
+        };
+
+        let matching: Vec<&glue_state::TableEntry> = database
+            .tables_ordered()
+            .into_iter()
+            .filter(|table| {
+                filter.is_none_or(|pattern| {
+                    glue_state::matches_name_pattern(pattern, &table.name)
+                })
+            })
+            .collect();
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first stored name strictly after it — which stays correct across tables
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => matching.partition_point(|table| table.name.as_str() <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+
+        let page = &matching[start..end];
+        let table_metadata_list: Vec<TableMetadata> = page
+            .iter()
+            .map(|table| crate::state::to_table_metadata(table))
+            .collect();
+        // The token names the last entry of the page, taken from the page itself so
+        // there is no index arithmetic to underflow on an empty page.
+        let next_token = if end < matching.len() {
+            page.last().map(|table| table.name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListTableMetadataOutput {
+            table_metadata_list: Some(table_metadata_list),
+            next_token,
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400) for a request Athena itself refuses:
+/// "Indicates that something is wrong with the input to the request."
+fn invalid_request(message: String) -> ListTableMetadataError {
+    ListTableMetadataErrorModeled::InvalidRequestException(InvalidRequestException {
+        athena_error_code: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The operation's own client error (HTTP 400) for what the METASTORE answered: "An
+/// exception that Athena received when it called a custom metastore. Occurs if the error
+/// is not caused by user input (InvalidRequestException) or from the Athena platform."
+fn metadata_exception(message: String) -> ListTableMetadataError {
+    ListTableMetadataErrorModeled::MetadataException(MetadataException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -154,8 +154,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A reporting operation: it reads the store and writes nothing.
         let store = state.lock();
-        let (page, next_token) =
-            crate::state::page(&store.apis, input.next_token.as_deref(), max_results);
+        let (page, next_token) = crate::state::page(
+            &store.apis,
+            &crate::state::page_scope(&["apis"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetApisErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
 
         Ok(GetApisOutput {
             items: Some(page.into_iter().map(crate::state::Api::to_wire).collect()),

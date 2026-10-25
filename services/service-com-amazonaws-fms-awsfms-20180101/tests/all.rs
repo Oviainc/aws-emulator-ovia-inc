@@ -75,6 +75,8 @@ mod resource_set_deletion;
 mod resource_set_disassociation;
 #[path = "all/resource_set_listing.rs"]
 mod resource_set_listing;
+#[path = "all/resource_set_resources.rs"]
+mod resource_set_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_removal.rs"]

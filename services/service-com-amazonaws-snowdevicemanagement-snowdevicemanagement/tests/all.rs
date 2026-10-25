@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_device_gate.rs"]
 mod account_device_gate;
+#[path = "all/booted_inventory_precondition.rs"]
+mod booted_inventory_precondition;
 #[path = "all/cancel_task_dispatch_window.rs"]
 mod cancel_task_dispatch_window;
 #[path = "all/create_task_in_flight_quota.rs"]

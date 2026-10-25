@@ -170,8 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let (page, next_token) =
-            crate::state::page(&api.models, input.next_token.as_deref(), max_results);
+        let (page, next_token) = crate::state::page(
+            &api.models,
+            &crate::state::page_scope(&["apis", &input.api_id, "models"]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetModelsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
 
         Ok(GetModelsOutput {
             // The list the api holds, reported whether or not it is empty: an api with

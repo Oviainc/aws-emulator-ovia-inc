@@ -77,6 +77,8 @@ mod filter_id_list_maximum;
 mod get_connect_attachment;
 #[path = "all/get_connections.rs"]
 mod get_connections;
+#[path = "all/get_core_network_policy_selection.rs"]
+mod get_core_network_policy_selection;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
 #[path = "all/link_association_lifecycle.rs"]

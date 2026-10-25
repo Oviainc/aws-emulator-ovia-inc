@@ -216,6 +216,10 @@ fn stored(row: &Row, base: SystemTime) -> InsightRecord {
         created_at: raised,
         updated_at: raised,
         is_experimental: row.experimental,
+        // This suite asserts the LISTING, which reports an insight's own members and
+        // none of its detail fields; the detailed view has its own suite
+        // ([`super::insight_details`]).
+        details: Vec::new(),
     }
 }
 
@@ -285,8 +289,9 @@ fn ids(page: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// A failed listing's status and modelled error code, with the case named on failure.
-fn refused(answer: &Answer, case: &str, status: u16, code: &str) {
+/// A refused insight request's status and modelled error code, with the case named on
+/// failure. Shared with [`super::insight_details`], which refuses the same entities.
+pub(crate) fn refused(answer: &Answer, case: &str, status: u16, code: &str) {
     assert_eq!(
         answer.status, status,
         "case {case}: expected HTTP {status}, got {} {:?}",
@@ -629,6 +634,7 @@ async fn a_token_that_names_no_insight_of_the_listing_is_refused() {
         created_at: base,
         updated_at: base,
         is_experimental: false,
+        details: Vec::new(),
     };
     {
         let store = emulator.store();
@@ -770,6 +776,7 @@ async fn an_account_listing_reports_the_insights_of_the_account_and_of_its_domai
         created_at: shifted(base, 7_200),
         updated_at: shifted(base, 7_200),
         is_experimental: false,
+        details: Vec::new(),
     };
     let account_wide = InsightRecord {
         insight_id: "9bb2ce4d-3f60-4e7b-8c8d-200000000001".to_string(),
@@ -780,6 +787,7 @@ async fn an_account_listing_reports_the_insights_of_the_account_and_of_its_domai
         created_at: shifted(base, 10_800),
         updated_at: shifted(base, 10_800),
         is_experimental: false,
+        details: Vec::new(),
     };
     {
         let store = emulator.store();

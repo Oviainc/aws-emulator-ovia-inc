@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeSnapshotAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeSnapshotAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeSnapshotAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the account the request names from the stored snapshot's
+//! `AccountsWithRestoreAccess` list and reports the snapshot back, so a later
+//! read of that snapshot no longer reports the share. The inverse of
+//! `AuthorizeSnapshotAccess`, matching the grantee to release by the same rule
+//! that recorded it ([`crate::state::same_restore_account`]).
 //!
 //! ## Shape of an operation
 //!
@@ -95,13 +92,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `RevokeSnapshotAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#RevokeSnapshotAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#RevokeSnapshotAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum RevokeSnapshotAccessErrorModeled {
     AccessToSnapshotDeniedFault(AccessToSnapshotDeniedFault),
     AuthorizationNotFoundFault(AuthorizationNotFoundFault),
     ClusterSnapshotNotFoundFault(ClusterSnapshotNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,18 +159,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeSnapshotAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeSnapshotAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeSnapshotAccess"))
+        use crate::state as st;
+
+        // This operation reads and writes the store alone; nothing it reports is
+        // Region-derived, so `ctx` carries nothing it needs.
+        let _ = ctx;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                RevokeSnapshotAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // The grantee to release, in the shape the snapshot stores it in — the
+        // same rule `AuthorizeSnapshotAccess` recorded it under, so a revoke
+        // cannot fail to recognise an authorization this service granted.
+        let revoked = match st::account_with_restore_access(&input.account_with_restore_access) {
+            Ok(account) => account,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        // The snapshot is named by identifier or by ARN, exactly as
+        // `AuthorizeSnapshotAccess` names one; a request carrying neither names
+        // nothing to revoke access to.
+        let snapshot_identifier = input
+            .snapshot_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let snapshot_arn = input
+            .snapshot_arn
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        if snapshot_identifier.is_none() && snapshot_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Either SnapshotIdentifier or SnapshotArn must be supplied.",
+            ));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(index) = store.snapshot_located_position(snapshot_identifier, snapshot_arn) else {
+            return Err(
+                RevokeSnapshotAccessErrorModeled::ClusterSnapshotNotFoundFault(
+                    ClusterSnapshotNotFoundFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} not found.",
+                            snapshot_identifier.or(snapshot_arn).unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let snapshot = &store.snapshots[index].snapshot;
+        // `SnapshotClusterIdentifier` is "the identifier of the cluster the
+        // snapshot was created from", so a request naming a different cluster
+        // names no snapshot.
+        if let Some(wanted) = input
+            .snapshot_cluster_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                return Err(
+                    RevokeSnapshotAccessErrorModeled::ClusterSnapshotNotFoundFault(
+                        ClusterSnapshotNotFoundFault {
+                            message: Some(format!(
+                                "Cluster snapshot {} of cluster {wanted} not found.",
+                                snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Only an authorization the snapshot HOLDS can be released: an account
+        // that was never authorized, or whose grant an earlier revoke already
+        // released, is the modelled `AuthorizationNotFoundFault`. Unlike the
+        // grant path this operation asserts nothing about the snapshot's status —
+        // "if the account is currently restoring the snapshot, the restore will
+        // run to completion" — so the restore a revoke interrupts is the
+        // CALLER's problem, not a precondition on the snapshot.
+        let Some(position) = snapshot
+            .accounts_with_restore_access
+            .iter()
+            .flatten()
+            .position(|held| st::same_restore_account(held, &revoked))
+        else {
+            return Err(
+                RevokeSnapshotAccessErrorModeled::AuthorizationNotFoundFault(
+                    AuthorizationNotFoundFault {
+                        message: Some(format!(
+                            "Account {} is not authorized to restore cluster snapshot {}.",
+                            input.account_with_restore_access,
+                            snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let stored = &mut store.snapshots[index];
+        if let Some(authorized) = stored.snapshot.accounts_with_restore_access.as_mut() {
+            authorized.remove(position);
+            // `Snapshot$AccountsWithRestoreAccess` "returns null if no accounts
+            // are authorized", so releasing the last grant leaves the member
+            // absent — the shape a snapshot nobody shared is reported in.
+            if authorized.is_empty() {
+                stored.snapshot.accounts_with_restore_access = None;
+            }
+        }
+
+        Ok(RevokeSnapshotAccessOutput {
+            snapshot: Some(stored.snapshot.clone()),
+        })
     }
 }
