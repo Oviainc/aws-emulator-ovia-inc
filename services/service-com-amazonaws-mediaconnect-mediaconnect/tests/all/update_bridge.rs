@@ -60,7 +60,9 @@ async fn describe_bridge(emulator: &Emulator, arn: &str) -> (u16, Option<String>
         .await
 }
 
-/// One network source, so every create below carries the one source CreateBridge requires.
+/// One network source, the kind a ground-to-cloud bridge ingests ("the content originates
+/// at your premises"), so an ingress create below carries the one source CreateBridge
+/// requires.
 fn network_source(name: &str, port: i64) -> Value {
     json!({ "networkSource": {
         "multicastIp": "224.0.0.1",
@@ -68,6 +70,16 @@ fn network_source(name: &str, port: i64) -> Value {
         "networkName": "net-1",
         "port": port,
         "protocol": "rtp",
+    }})
+}
+
+/// One flow source, the kind a cloud-to-ground bridge ingests ("the content comes from an
+/// existing MediaConnect flow"), so an egress create below carries the one source
+/// CreateBridge requires.
+fn flow_source(name: &str, suffix: u64) -> Value {
+    json!({ "flowSource": {
+        "flowArn": crate::bridge_lifecycle::minted_flow_arn(suffix, "flow-updates"),
+        "name": name,
     }})
 }
 
@@ -92,7 +104,7 @@ fn update_cases() -> Vec<UpdateCase> {
             "name": name,
             "placementArn": placement,
             "egressGatewayBridge": { "maxBitrate": 80_000_000 },
-            "sources": [network_source("src", 5000)],
+            "sources": [flow_source("src", 1)],
         });
         if let Some(config) = failover {
             body["sourceFailoverConfig"] = config;
@@ -389,7 +401,7 @@ async fn an_update_bridge_request_the_bridge_cannot_satisfy_is_refused_and_write
             "name": "bridge-egress-refusals",
             "placementArn": placement,
             "egressGatewayBridge": { "maxBitrate": 40_000_000 },
-            "sources": [network_source("src", 5003)],
+            "sources": [flow_source("src", 2)],
         }),
     )
     .await;

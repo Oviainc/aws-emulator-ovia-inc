@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStorageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStorageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStorageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read side of the account-wide storage SETTING `PutStorageConfiguration`
+//! writes: it reports the configuration in force, which is what the last put
+//! stored, or the hot-tier default while nothing has configured the account.
+//! Both operations reach it through `crate::state`'s `storage_configuration` /
+//! `set_storage_configuration`, so neither keeps a copy of its own, and this
+//! one only READS — an unconfigured account is reported without being
+//! materialised.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +179,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStorageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStorageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStorageConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStorageConfigurationError::Modeled(
+                DescribeStorageConfigurationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        // The configuration is account-wide, so neither the request body (which
+        // models no members) nor its metadata selects anything.
+        let _ = (&input, ctx);
+
+        // A pure READ of the one stored setting: an account no put has
+        // configured reports the hot-tier default WITHOUT storing it, so the
+        // first read cannot change what a later caller sees, and a
+        // configuration still being applied reports that from the instant its
+        // put recorded.
+        let configuration = state
+            .lock()
+            .storage_configuration(::std::time::SystemTime::now());
+        let reported = configuration.selection;
+        Ok(DescribeStorageConfigurationOutput {
+            storage_type: reported.storage_type,
+            multi_layer_storage: reported.multi_layer_storage,
+            disassociated_data_storage: reported.disassociated_data_storage,
+            retention_period: reported.retention_period,
+            warm_tier: reported.warm_tier,
+            warm_tier_retention_period: reported.warm_tier_retention_period,
+            disallow_ingest_null_na_n: reported.disallow_ingest_null_na_n,
+            configuration_status: configuration.status,
+            last_update_date: configuration.last_update_date.map(crate::state::to_date_time),
+        })
     }
 }

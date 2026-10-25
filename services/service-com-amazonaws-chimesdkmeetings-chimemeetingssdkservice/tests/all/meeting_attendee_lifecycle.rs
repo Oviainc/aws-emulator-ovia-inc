@@ -921,9 +921,13 @@ async fn list_attendees_refuses_a_next_token_it_did_not_issue() {
     );
 }
 
-/// Every operation of the loop answers the modelled `NotFoundException` (HTTP 404) for an
+/// Every READER of the loop answers the modelled `NotFoundException` (HTTP 404) for an
 /// id that is well formed but names nothing — and an attendee is reachable only through
 /// its own meeting.
+///
+/// `DeleteMeeting` is NOT in this table: it states an outcome rather than reporting a
+/// value, so an absent meeting is a no-op for it rather than a refusal — see
+/// `tests/all/delete_meeting_idempotence.rs`, which owns that half of the rule.
 #[tokio::test]
 async fn unknown_meetings_and_attendees_are_not_found() {
     let emulator = Emulator::new();
@@ -937,13 +941,9 @@ async fn unknown_meetings_and_attendees_are_not_found() {
         .attendee_id_of_new_attendee(&meeting_id, "user-404")
         .await;
 
-    // Rows span every operation in the slice, over both kinds of unknown id.
+    // Rows span every reader in the slice, over both kinds of unknown id.
     let cases: Vec<(&str, Reply)> = vec![
         ("GetMeeting on an absent meeting", emulator.get_meeting(ABSENT_MEETING_ID).await),
-        (
-            "DeleteMeeting on an absent meeting",
-            emulator.delete_meeting(ABSENT_MEETING_ID).await,
-        ),
         (
             "ListAttendees on an absent meeting",
             emulator.list_attendees(ABSENT_MEETING_ID, "").await,
@@ -1072,7 +1072,7 @@ async fn deleting_removes_exactly_what_it_names() {
         dropped.body
     );
 
-    // The meeting took its attendees with it, so every path into it is a 404.
+    // The meeting took its attendees with it, so every READER of it is a 404.
     let after: Vec<(&str, Reply)> = vec![
         ("GetMeeting", emulator.get_meeting(&meeting_id).await),
         ("ListAttendees", emulator.list_attendees(&meeting_id, "").await),
@@ -1086,7 +1086,6 @@ async fn deleting_removes_exactly_what_it_names() {
                 .create_attendee(&meeting_id, &json!({ "ExternalUserId": "user-late" }))
                 .await,
         ),
-        ("DeleteMeeting again", emulator.delete_meeting(&meeting_id).await),
     ];
     for (case, reply) in after {
         assert_eq!(
@@ -1095,6 +1094,18 @@ async fn deleting_removes_exactly_what_it_names() {
             reply.status, reply.body
         );
     }
+
+    // Deleting it AGAIN is the no-op the operation's own rule makes it: the outcome it
+    // asks for already holds, so it answers the modelled 204 and nothing is refused.
+    let again_meeting = emulator.delete_meeting(&meeting_id).await;
+    assert_eq!(
+        (again_meeting.status, again_meeting.error_code.as_deref()),
+        (204, None),
+        "a second DeleteMeeting expected the modelled 204 no-op, got {} {:?} with {:?}",
+        again_meeting.status,
+        again_meeting.error_code,
+        again_meeting.body
+    );
 }
 
 /// The operations this slice does not implement still answer HTTP 501, never an empty

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/create_graph_using_import_task.rs"]
 mod create_graph_using_import_task;
+#[path = "all/duplicate_name_conflicts.rs"]
+mod duplicate_name_conflicts;
 #[path = "all/error_message_rendering.rs"]
 mod error_message_rendering;
 #[path = "all/export_task_cancellation.rs"]

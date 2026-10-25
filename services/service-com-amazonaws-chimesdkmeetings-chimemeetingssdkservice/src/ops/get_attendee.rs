@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(meeting) = store.meetings.get(&input.meeting_id) else {
             return Err(GetAttendeeErrorModeled::NotFoundException(
-                crate::state::meeting_not_found(&input.meeting_id),
+                store.meeting_absent(&input.meeting_id),
             )
             .into());
         };
@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never resolves through another's.
         let Some(attendee) = meeting.attendees.get(&input.attendee_id) else {
             return Err(GetAttendeeErrorModeled::NotFoundException(
-                crate::state::attendee_not_found(&input.meeting_id, &input.attendee_id),
+                crate::state::attendee_not_found(&input.attendee_id),
             )
             .into());
         };

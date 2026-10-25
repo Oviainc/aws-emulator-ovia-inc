@@ -4778,6 +4778,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateProfile`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_profile_tokens: TokenLedger<CreateProfileToken>,
+    /// `DeleteProfile`'s `ClientRequestToken` -> the delete the original request
+    /// completed, held exactly as [`Self::delete_workload_tokens`] is and for the same
+    /// reason: the deleted profile cannot serve the replay, so the completed delete does.
+    pub delete_profile_tokens: TokenLedger<CompletedDeleteToken>,
     /// `UpgradeProfileVersion`'s `ClientRequestToken` -> the upgrade the original request
     /// performed. Caller input keys it, so it is a BOUNDED [`TokenLedger`]: write it
     /// through [`TokenLedger::remember`].
@@ -5812,6 +5816,32 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         // outlive it either: the next request carrying one acts afresh.
         self.upgrade_review_template_lens_review_tokens
             .retain(|token| token.resource_id != template_arn);
+        Some(record)
+    }
+
+    /// Drop a profile and everything keyed to it: any create token that resolved to it,
+    /// so a retry of the create that minted it is no longer a replay of a profile that is
+    /// gone, and the association every workload held it by, since an association reports
+    /// the ARN and the version of a profile that has to resolve for the association to
+    /// mean anything ([`WorkloadProfileRecord`]) — the same reason a share does not
+    /// outlive the resource it shares in [`Self::remove_workload`]. The questions a
+    /// profile answers and the tags it carries live INSIDE [`ProfileRecord`], so they go
+    /// with the record itself.
+    ///
+    /// [`Self::delete_profile_tokens`] is NOT among them, exactly as in
+    /// [`Self::remove_workload`]: a token that names the delete itself has to survive the
+    /// resource the delete removed, or the retry it was issued for could not be replayed.
+    pub fn remove_profile(&mut self, profile_arn: &str) -> Option<ProfileRecord> {
+        let record = self.profiles.remove(profile_arn)?;
+        self.create_profile_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        for workload in self.workloads.values_mut() {
+            workload.disassociate_profile(profile_arn);
+        }
+        // An upgrade token resolves to the upgrade of an association OF this profile, so
+        // it goes with the associations dropped just above.
+        self.upgrade_profile_version_tokens
+            .retain(|token| token.profile_arn != profile_arn);
         Some(record)
     }
 

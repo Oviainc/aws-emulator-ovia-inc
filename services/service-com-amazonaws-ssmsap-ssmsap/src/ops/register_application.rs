@@ -207,6 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(RegisterApplicationErrorModeled::ValidationException)?;
 
+        // The bound the model declares on `ComponentInfoList`, re-stated before anything
+        // is stored so the size of what one registration writes — and of what a later
+        // `ListComponents` walks — is bounded by a check in this crate rather than by
+        // request size. Like the check above it runs before ANY state is written.
+        crate::state::components_within_bounds(input.components_info.as_deref().unwrap_or_default())
+            .map_err(RegisterApplicationErrorModeled::ValidationException)?;
+
         // An `ApplicationId` is unique within an account AND a Region, so one already
         // registered HERE conflicts while the same id in another Region does not.
         if state

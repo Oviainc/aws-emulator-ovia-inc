@@ -117,10 +117,6 @@ use super::types::*;
 /// own, so neither is interpolated into the sentence.
 const UNSUPPORTED_NETWORK_MESSAGE: &str = "Please use a blockchain network supported by this API.";
 
-/// What this operation answers an `addressIdentifierFilter` that does not name an address
-/// of the Bitcoin chain with; see [`UNSUPPORTED_NETWORK_MESSAGE`].
-const INVALID_BITCOIN_ADDRESS_MESSAGE: &str = "Please provide a valid bitcoin address.";
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -253,11 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ChainAddress`'s `^[-A-Za-z0-9]{13,74}$` is one pattern for every chain this
         // service indexes, so it admits addresses of the others; what makes a string a
         // Bitcoin address is the encodings Bitcoin itself defines
-        // (`crate::state::address`).
+        // (`crate::state::address`). The chain is this OPERATION's, not the request's:
+        // it serves the Bitcoin networks only, so the address is held to Bitcoin's
+        // encodings whatever network the request named — unlike the operations whose own
+        // `network` member picks the chain their address members are checked against
+        // (`crate::state::validation`).
         if filtered.is_some_and(|address| !crate::state::address::is_bitcoin_address(address)) {
             fields.push(crate::state::validation_field(
                 "addressIdentifierFilter",
-                INVALID_BITCOIN_ADDRESS_MESSAGE,
+                crate::state::address::INVALID_BITCOIN_ADDRESS_MESSAGE,
             ));
         }
 

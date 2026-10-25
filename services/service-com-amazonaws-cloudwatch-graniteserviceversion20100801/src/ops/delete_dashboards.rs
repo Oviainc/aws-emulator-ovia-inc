@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDashboards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDashboards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDashboards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the dashboards it names from this service's store. Implemented here, and the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +74,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DeleteDashboardsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// A name this store holds no dashboard for is NOT an error here: this operation's `errors`
+// list declares no not-found error at all, and "Deletes all dashboards that you specify"
+// (`DeleteDashboards`) is satisfied once every dashboard the request names is gone — which a
+// name nothing was ever stored under already is. So such a request is a 200 that deletes what
+// it can, which is also what "the operation attempts to delete as many dashboards as
+// possible" asks of an erroring call.
 #[smithy_macros::operation_error("com.amazonaws.cloudwatch#DeleteDashboards")]
 #[derive(Debug)]
 pub enum DeleteDashboardsErrorModeled {
@@ -140,18 +140,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDashboards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDashboardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDashboards"))
+        // A dashboard is global, so nothing here reads the Region the request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDashboardsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch dashboard store is unavailable".into()),
+            })
+        })?;
+
+        // "You can specify up to 100 dashboards to delete." (`DeleteDashboards`) — prose the
+        // model carries no `length` for, so the boundary validator cannot refuse it.
+        if input.dashboard_names.len() > MAX_NAMES_PER_REQUEST {
+            return Err(invalid_parameter_value(format!(
+                "The value for field DashboardNames is too long. It must have length less than \
+                 or equal to {MAX_NAMES_PER_REQUEST}.\n"
+            )));
+        }
+        for name in &input.dashboard_names {
+            if let Some(message) = crate::state::dashboard_name_error("DashboardNames", name) {
+                return Err(invalid_parameter_value(message));
+            }
+        }
+
+        let mut store = state.lock();
+        // Every dashboard the request names is gone afterwards, whether this store held it or
+        // not: the operation declares no not-found error, so a name nothing was stored under
+        // is already in the state the request asks for. Deleting one takes its tags with it,
+        // because they live on the stored dashboard.
+        for name in &input.dashboard_names {
+            store.dashboards.remove(name);
+        }
+
+        Ok(DeleteDashboardsOutput {})
     }
+}
+
+/// How many dashboards one request may name: "You can specify up to 100 dashboards to
+/// delete." (`DeleteDashboards`)
+const MAX_NAMES_PER_REQUEST: usize = 100;
+
+/// Refuse the request with this operation's modelled `InvalidParameterValueException`
+/// (HTTP 400): "The value of an input parameter is bad or out-of-range."
+fn invalid_parameter_value(message: String) -> DeleteDashboardsError {
+    DeleteDashboardsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(message),
+    })
+    .into()
 }

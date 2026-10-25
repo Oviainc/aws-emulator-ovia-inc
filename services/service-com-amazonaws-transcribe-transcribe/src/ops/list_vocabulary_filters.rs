@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVocabularyFiltersErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -188,8 +187,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_VOCABULARY_LIST_MAX_RESULTS,
         );
 
+        // The Region this request is served in: a regional endpoint lists only the
+        // filters created through it.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        let records = store.vocabulary_filters_newest_first();
+        let records = store.vocabulary_filters_newest_first(&region);
 
         // The paging rule itself is `state::list_page`: skip what an earlier page
         // held, keep what the filter selects, and hand out a cursor only when a

@@ -269,11 +269,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "must be unique within an Amazon Web Services account. If you try to create a
         // new custom vocabulary filter with the same name as an existing one, you get a
-        // ConflictException error." Checked and inserted under one lock, so N
-        // concurrent creates of one name have exactly one winner.
+        // ConflictException error." Unique within ONE Region of that account, as every
+        // other family here. Checked and inserted under one lock, so N concurrent
+        // creates of one name have exactly one winner.
         if store
             .vocabulary_filters
-            .contains_key(&input.vocabulary_filter_name)
+            .contains(&region, &input.vocabulary_filter_name)
         {
             return Err(CreateVocabularyFilterErrorModeled::ConflictException(
                 ConflictException {
@@ -287,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.vocabulary_filters.len() >= crate::state::MAX_VOCABULARIES {
+        if store.vocabulary_filters.len_in(&region) >= crate::state::MAX_VOCABULARIES {
             return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -295,6 +296,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          account. Delete a custom vocabulary filter you no longer need and \
                          try your request again.",
                         crate::state::MAX_VOCABULARIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope,
+        // so the per-Region quota above bounds the store only together with a cap on how
+        // many Regions it keeps filters for (see [`crate::state::MAX_REGIONS`]).
+        if store.vocabulary_filters.region_bucket_exhausted(&region) {
+            return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_VOCABULARY_FILTERS,
+                        &region,
                     )),
                 },
             )
@@ -309,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             words,
             file_uri,
             last_modified_time: now,
-            region,
+            region: region.clone(),
             data_access_role_arn: input.data_access_role_arn,
             encryption_configuration: input.encryption_configuration,
             tags: input.tags.unwrap_or_default(),
@@ -328,9 +344,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             from_file = record.file_uri.is_some(),
             "custom vocabulary filter created"
         );
-        store
-            .vocabulary_filters
-            .insert(record.name.clone(), record);
+        let name = record.name.clone();
+        store.vocabulary_filters.insert(&region, &name, record);
 
         Ok(output)
     }

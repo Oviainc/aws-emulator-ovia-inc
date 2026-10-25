@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListLanguageModelsErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -199,11 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::DEFAULT_MODEL_LIST_MAX_RESULTS,
         );
 
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Reporting only: the sole write is each model's clock-owed transition, which
-        // was due at its stored instant whether or not anybody called.
-        let records = store.language_models_newest_first(now);
+        // was due at its stored instant whether or not anybody called. A regional
+        // endpoint lists only the models created through it.
+        let records = store.language_models_newest_first(&region, now);
 
         // The paging rule itself is `state::list_page`: skip what an earlier page
         // held, keep what the filters select, and hand out a cursor only when a

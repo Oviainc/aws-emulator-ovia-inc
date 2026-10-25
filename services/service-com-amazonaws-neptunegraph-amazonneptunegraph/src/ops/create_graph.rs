@@ -243,15 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // plane, so a second graph by the same name conflicts only with a stored graph
         // of the SAME Region (including one that is still DELETING, which holds its
         // name until the deletion finishes), and the same name in another Region is
-        // another graph.
-        if let Some(existing) = store.graph_id_named(&input.graph_name, &region) {
-            return Err(CreateGraphErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "a graph named '{}' already exists with id {existing}",
-                    input.graph_name
-                ),
-                reason: None,
-            })
+        // another graph. The refusal is worded from the requested name alone by the one
+        // builder every name-uniqueness check in this service reaches
+        // (`crate::state::graph_name_conflict`), so it discloses nothing about the graph
+        // that holds the name.
+        if store.graph_id_named(&input.graph_name, &region).is_some() {
+            return Err(CreateGraphErrorModeled::ConflictException(
+                crate::state::graph_name_conflict(&input.graph_name),
+            )
             .into());
         }
 

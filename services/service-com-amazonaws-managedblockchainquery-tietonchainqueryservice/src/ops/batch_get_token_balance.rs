@@ -191,15 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // What is wrong with ONE ITEM is reported as that item's entry in `errors`, so
         // every other item in the batch is still answered. The item is checked against
-        // the same modelled constraints the single read's input carries (its members
-        // carry `skip_validation`, so the framework cannot refuse the whole request for
-        // one item's value).
+        // the same rules the single read's input is — the modelled constraints (its
+        // members carry `skip_validation`, so the framework cannot refuse the whole
+        // request for one item's value) and the chain each address has to belong to.
         let checked: Vec<(&BatchGetTokenBalanceInputItem, Option<ValidationException>)> = requested
             .iter()
             .map(|item| {
-                let violations = crate::state::validation::batch_get_token_balance_item(item);
-                let refusal = (!violations.is_empty())
-                    .then(|| crate::state::validation::constraint_exception(&violations));
+                let refusal = crate::state::validation::batch_get_token_balance_item(item);
                 (item, refusal)
             })
             .collect();

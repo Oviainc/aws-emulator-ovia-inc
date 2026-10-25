@@ -149,7 +149,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteCallAnalyticsJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -162,15 +161,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the jobs started through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The clock-owed transition is materialised FIRST (inside the family's single
         // lookup), so a job whose completion was already due is deleted rather than
         // refused for a status it had left.
-        let Some(record) = store.call_analytics_job_mut(&input.call_analytics_job_name, now) else {
+        let Some(record) =
+            store.call_analytics_job_mut(&region, &input.call_analytics_job_name, now)
+        else {
             return Err(DeleteCallAnalyticsJobErrorModeled::BadRequestException(
                 BadRequestException {
-                    // A job this account never started is this service's
+                    // A job this Region never started is this service's
                     // `BadRequestException` — the shape whose documentation covers an
                     // entity that "doesn't exist" — exactly as `GetCallAnalyticsJob`
                     // and the other job families' deletes answer.
@@ -200,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store
             .call_analytics_jobs
-            .remove(&input.call_analytics_job_name);
+            .remove(&region, &input.call_analytics_job_name);
         ::tracing::info!(
             operation = "DeleteCallAnalyticsJob",
             job = %input.call_analytics_job_name,

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMeetingWithAttendees
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMeetingWithAttendees`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMeetingWithAttendees::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a meeting and its attendees in ONE call and PERSISTS both: the meeting is minted
+//! exactly as `CreateMeeting` mints it (fresh `GuidString`, `MediaPlacement` and
+//! `MeetingArn` derived from that id), then each requested attendee is created inside it
+//! exactly as `CreateAttendee` creates one (fresh `AttendeeId`, minted `JoinToken`,
+//! capabilities from the request or the meeting's documented defaults). A request item
+//! the meeting cannot admit — capabilities its features forbid, or an attendee past the
+//! meeting's ceiling — is reported in `Errors` rather than failing the whole call, and the
+//! response is projected from the STORED record, so `GetMeeting` / `ListAttendees` read
+//! back exactly what it returned. A replayed `ClientRequestToken` returns the meeting the
+//! first call created, with its attendees, rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -191,18 +192,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMeetingWithAttendees` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMeetingWithAttendeesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; nothing about a meeting or an attendee
+        // depends on it — the Region the ARN and media endpoints are scoped to is the
+        // request's own `MediaRegion`, not the Region it was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMeetingWithAttendeesErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is `@idempotencyToken`: a replay returns the meeting the
+        // first call created — with the attendees that call created — so a client that
+        // retries does not accumulate meetings or duplicate attendees. A replay reports
+        // them in stored (`AttendeeId`) order: the request order of the FIRST call is not
+        // part of the meeting, so it is not something a later call can read back.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMeetingWithAttendees"))
+        // `Errors` is empty on a replay for the same reason. A per-item refusal is a fact
+        // about ONE request, not about the meeting — nothing of it is stored, and storing
+        // it would mean keeping a record of attendees that do not exist — so a replay
+        // reports the attendees the meeting HOLDS and refuses nothing. A caller that
+        // needs the first call's refusals reads them from the first call's answer.
+        let replayed = store
+            .meeting_by_client_request_token
+            .get(&input.client_request_token)
+            .and_then(|meeting_id| store.meetings.get(meeting_id))
+            .map(|stored| {
+                (
+                    stored.meeting.clone(),
+                    stored.attendees.values().cloned().collect::<Vec<Attendee>>(),
+                )
+            });
+        if let Some((meeting, attendees)) = replayed {
+            return Ok(CreateMeetingWithAttendeesOutput {
+                meeting: Some(meeting),
+                attendees: Some(attendees),
+                errors: Some(Vec::new()),
+            });
+        }
+
+        // The ceiling is checked BEFORE anything is minted or stored, so a refused create
+        // leaves the store exactly as it was.
+        if store.meetings.len() >= crate::state::MAX_MEETINGS {
+            return Err(CreateMeetingWithAttendeesErrorModeled::LimitExceededException(
+                crate::state::meeting_limit_reached(),
+            )
+            .into());
+        }
+
+        // The meeting's own features decide both the capability rules and the attendee
+        // ceiling for every item below, exactly as they do for `CreateAttendee` against
+        // an already-stored meeting.
+        let features = input.meeting_features.clone();
+        let ceiling = crate::state::attendee_ceiling(features.as_ref());
+
+        let meeting_id = store.mint_meeting_id();
+        let meeting = Meeting {
+            // Server-owned: the media endpoints and the ARN are DERIVED from the minted
+            // id, never taken from the request.
+            media_placement: Some(crate::state::media_placement(
+                &meeting_id,
+                &input.media_region,
+            )),
+            meeting_arn: Some(crate::state::meeting_arn(&meeting_id, &input.media_region)),
+            meeting_id: Some(meeting_id.clone()),
+            // Caller-owned: stored as supplied, so a reader reports what was asked for.
+            meeting_host_id: input.meeting_host_id,
+            external_meeting_id: Some(input.external_meeting_id),
+            media_region: Some(input.media_region),
+            meeting_features: input.meeting_features,
+            primary_meeting_id: input.primary_meeting_id,
+            tenant_ids: input.tenant_ids,
+        };
+
+        store
+            .meeting_by_client_request_token
+            .insert(input.client_request_token.clone(), meeting_id.clone());
+        store.meetings.insert(
+            meeting_id.clone(),
+            crate::state::StoredMeeting {
+                meeting,
+                attendees: ::std::collections::BTreeMap::new(),
+                notifications_configuration: input.notifications_configuration,
+                media_placement_network_type: input.media_placement_network_type,
+                tags: input.tags.unwrap_or_default(),
+                client_request_token: input.client_request_token,
+            },
+        );
+
+        // One request item at a time, into the meeting just stored. An item the meeting
+        // cannot admit does NOT fail the call: the modelled `Errors` list is what reports
+        // it, naming the `ExternalUserId` the caller sent, the error code of the modelled
+        // exception that refusal corresponds to, and why.
+        //
+        // `created` collects each attendee AS STORED, in request order: the store keys
+        // attendees by `AttendeeId` (so a later `ListAttendees` pages them in id order),
+        // while the answer to THIS call reports the items in the order they were asked
+        // for, which is the only order the caller can line its request up against.
+        let mut created: Vec<Attendee> = Vec::new();
+        let mut errors: Vec<CreateAttendeeError2> = Vec::new();
+        for item in input.attendees {
+            let capabilities = match item.capabilities {
+                Some(requested) => {
+                    match crate::state::capability_problem(&requested, features.as_ref()) {
+                        Some(problem) => {
+                            // The same payload `CreateAttendee` would have been refused
+                            // with, read as a per-item failure: its `Code` and message,
+                            // built in the one place this service words that refusal.
+                            let refusal = crate::state::bad_request(problem);
+                            errors.push(CreateAttendeeError2 {
+                                external_user_id: Some(item.external_user_id),
+                                error_code: refusal.code,
+                                error_message: refusal.message,
+                            });
+                            continue;
+                        }
+                        None => requested,
+                    }
+                }
+                None => crate::state::default_capabilities(features.as_ref()),
+            };
+
+            let admitted = store
+                .meetings
+                .get(&meeting_id)
+                .map_or(0, |stored| stored.attendees.len());
+            if admitted >= ceiling {
+                let refusal = crate::state::attendee_limit_reached(&meeting_id, ceiling);
+                errors.push(CreateAttendeeError2 {
+                    external_user_id: Some(item.external_user_id),
+                    error_code: refusal.code,
+                    error_message: refusal.message,
+                });
+                continue;
+            }
+
+            let attendee_id = store.mint_attendee_id(&meeting_id);
+            let join_token = store.mint_join_token(&meeting_id, &attendee_id);
+            let attendee = Attendee {
+                // Server-owned: the id and the join token are minted here.
+                attendee_id: Some(attendee_id.clone()),
+                join_token: Some(join_token),
+                // Caller-owned, or the documented default.
+                external_user_id: Some(item.external_user_id),
+                capabilities: Some(capabilities),
+            };
+            let Some(stored) = store.meetings.get_mut(&meeting_id) else {
+                return Err(CreateMeetingWithAttendeesErrorModeled::ServiceFailureException(
+                    crate::state::store_unavailable(),
+                )
+                .into());
+            };
+            stored.attendees.insert(attendee_id.clone(), attendee);
+            // Read back what was stored, never the value that was handed to the store, so
+            // this response cannot report an attendee the store does not hold.
+            let Some(stored_attendee) = stored.attendees.get(&attendee_id) else {
+                return Err(CreateMeetingWithAttendeesErrorModeled::ServiceFailureException(
+                    crate::state::store_unavailable(),
+                )
+                .into());
+            };
+            created.push(stored_attendee.clone());
+        }
+
+        // The meeting, too, is projected from the STORED record, so what the caller sees
+        // is exactly what a later `GetMeeting` reads back.
+        let Some(stored) = store.meetings.get(&meeting_id) else {
+            return Err(CreateMeetingWithAttendeesErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+        Ok(CreateMeetingWithAttendeesOutput {
+            meeting: Some(stored.meeting.clone()),
+            attendees: Some(created),
+            errors: Some(errors),
+        })
     }
 }

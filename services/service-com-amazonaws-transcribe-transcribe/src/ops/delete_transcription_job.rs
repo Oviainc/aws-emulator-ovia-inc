@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteTranscriptionJobErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -179,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The Region this request is served in: only the jobs started through this
+        // Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The clock-owed transitions are materialised FIRST, so a job whose completion
         // was already due is deleted rather than refused for a status it had left.
         let Some(record) = store
             .transcription_jobs
-            .get_mut(&input.transcription_job_name)
+            .get_mut(&region, &input.transcription_job_name)
         else {
             return Err(DeleteTranscriptionJobErrorModeled::BadRequestException(
                 BadRequestException {
@@ -216,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store
             .transcription_jobs
-            .remove(&input.transcription_job_name);
+            .remove(&region, &input.transcription_job_name);
         ::tracing::info!(
             operation = "DeleteTranscriptionJob",
             job = %input.transcription_job_name,

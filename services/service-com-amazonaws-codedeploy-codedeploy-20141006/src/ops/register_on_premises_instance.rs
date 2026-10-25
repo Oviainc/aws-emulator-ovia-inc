@@ -221,11 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, None) => {
                 return Err(RegisterOnPremisesInstanceErrorModeled::IamArnRequiredException(
                     IamArnRequiredException {
-                        message: Some(
-                            "No IAM ARN was included in the request. You must use an IAM session \
-                             ARN or IAM user ARN in the request"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::IAM_ARN_MISSING.to_string()),
                     },
                 )
                 .into())

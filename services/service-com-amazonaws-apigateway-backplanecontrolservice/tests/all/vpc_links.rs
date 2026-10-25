@@ -43,7 +43,10 @@ const MARGIN: Duration = Duration::from_millis(100);
 /// A network-load-balancer ARN of the shape `targetArns` documents ("The ARN of the
 /// network load balancer of the VPC targeted by the VPC link"), numbered so a row can
 /// name several distinct targets.
-fn target_arn(index: usize) -> String {
+///
+/// `pub(crate)` so a sibling suite names a link's targets the one way rather than keeping
+/// its own copy (the `update_vpc_link` suite does).
+pub(crate) fn target_arn(index: usize) -> String {
     format!(
         "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/net/nlb-{index}/\
          abc123def456789{index}"

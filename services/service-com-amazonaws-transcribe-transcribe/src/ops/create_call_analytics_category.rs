@@ -174,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCallAnalyticsCategoryErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -198,17 +197,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // The Region this request is served in: Amazon Transcribe is regional, so the
+        // category is created in — and only in — the Region the caller signed for.
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // "Category names are case sensitive and must be unique within an Amazon Web
-        // Services account" (model doc for `CategoryProperties$CategoryName`). Checked
-        // and inserted under ONE lock, so N concurrent creates of one name have
-        // exactly one winner. The store is keyed by the name as sent, so two names
-        // differing only in case are two categories.
+        // Services account" (model doc for `CategoryProperties$CategoryName`) — within
+        // one Region of it, since a regional endpoint serves only its own Region's
+        // categories. Checked and inserted under ONE lock, so N concurrent creates of
+        // one name have exactly one winner. The store is keyed by the name as sent, so
+        // two names differing only in case are two categories.
         if store
             .call_analytics_categories
-            .contains_key(&input.category_name)
+            .contains(&region, &input.category_name)
         {
             return Err(CreateCallAnalyticsCategoryErrorModeled::ConflictException(
                 ConflictException {
@@ -223,7 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if store.call_analytics_categories.len() >= crate::state::MAX_CALL_ANALYTICS_CATEGORIES {
+        if store.call_analytics_categories.len_in(&region)
+            >= crate::state::MAX_CALL_ANALYTICS_CATEGORIES
+        {
             return Err(CreateCallAnalyticsCategoryErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -231,6 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          account. Delete a category you no longer need and try your request \
                          again.",
                         crate::state::MAX_CALL_ANALYTICS_CATEGORIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The Region comes from the request's own (unauthenticated) credential scope,
+        // so the per-Region ceiling above bounds the store only together with a cap on
+        // how many Regions it keeps categories for (see [`crate::state::MAX_REGIONS`]).
+        if store
+            .call_analytics_categories
+            .region_bucket_exhausted(&region)
+        {
+            return Err(CreateCallAnalyticsCategoryErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::region_capacity_message(
+                        crate::state::FAMILY_CALL_ANALYTICS_CATEGORIES,
+                        &region,
                     )),
                 },
             )
@@ -265,9 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input_type = %record.input_type,
             "Call Analytics category created"
         );
+        let name = record.name.clone();
         store
             .call_analytics_categories
-            .insert(record.name.clone(), record);
+            .insert(&region, &name, record);
 
         Ok(output)
     }
