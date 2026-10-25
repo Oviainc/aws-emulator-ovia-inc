@@ -16,10 +16,11 @@
 //! many results of which compliance type a rule carries, which compliance types the
 //! request filters by, and how many rules the account holds.
 //!
-//! Recording an evaluation result is `PutEvaluations`' job and that operation is still
-//! a scaffold (its own stub issue), so the rows that need results already recorded
-//! seed them into the same shared state a handler reads — the state
-//! `PutEvaluations` will write once it lands. Everything else goes over the wire.
+//! Recording an evaluation result for a MANAGED rule is something Config does itself
+//! from the configuration state it recorded, which this emulator does not evaluate, so
+//! the rows that need results already recorded seed them into the same shared state a
+//! handler reads — the state `PutEvaluations` writes for a rule that delivers its own
+//! verdicts. Everything else goes over the wire.
 
 use std::time::SystemTime;
 
@@ -66,10 +67,13 @@ async fn emulator_with_rules(names: &[&str]) -> Emulator {
 /// Record one evaluation result per entry of `results` against the rule `name`, each
 /// for a distinct resource.
 ///
-/// This is the state `PutEvaluations` writes; that operation is still scaffolded, so
-/// the results are seeded into the shared store the handler reads. `pub(crate)` because
-/// every suite about what a rule's recorded results roll up to needs exactly this seed
-/// (`aggregate_config_rule_compliance_summary` is the other one).
+/// This is the state a rule's evaluation leaves behind. These rules are MANAGED ones,
+/// which Config evaluates itself from the configuration state it recorded rather than
+/// taking verdicts from a caller, so the results are seeded into the shared store the
+/// handler reads. `pub(crate)` because every suite about what a rule's recorded results
+/// roll up to needs exactly this seed (`aggregate_config_rule_compliance_summary` is the
+/// other one); a rule whose verdicts are DELIVERED is driven over the wire instead, in
+/// `put_evaluations`.
 pub(crate) fn record_results(emulator: &Emulator, name: &str, results: &[&str]) {
     let state = emulator.engine.state::<ConfigState>();
     let mut store = state.lock();

@@ -20,6 +20,10 @@
 //! whether the subscription asked for raw delivery, whether the publish carried a subject or
 //! message attributes, and whether the subscribed queue belongs to the topic published to at
 //! all.
+//!
+//! Every queue here is created WITH the queue policy an SNS subscriber needs
+//! ([`grant_to_sns`]), because a delivery SNS is not granted is withheld by the queue; which
+//! policies grant it is `sqs_delivery_authorization.rs`.
 
 use std::sync::Arc;
 
@@ -33,11 +37,11 @@ const REGION: &str = "us-east-1";
 
 /// SNS and SQS on ONE engine: a subscription's endpoint is a queue, and the delivery is
 /// asserted on the queue.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -53,7 +57,7 @@ fn emulator() -> Emulator {
 }
 
 /// One awsQuery form call against SNS.
-async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -87,7 +91,7 @@ async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> Stri
 }
 
 /// One `awsJson1_0` call against SQS.
-async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -119,7 +123,7 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
 }
 
 /// The text of the first `<tag>…</tag>` element of an awsQuery response.
-fn element(body: &str, tag: &str) -> String {
+pub(crate) fn element(body: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body
@@ -132,8 +136,19 @@ fn element(body: &str, tag: &str) -> String {
     body[start..start + end].to_string()
 }
 
-/// A queue called `name`: its url and the ARN a subscription names it by.
-async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+/// A queue called `name` an SNS topic may deliver to: its url and the ARN a subscription
+/// names it by, with the queue policy that grants SNS the send.
+pub(crate) async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+    let (url, arn) = given_queue_without_policy(emulator, name).await;
+    set_queue_policy(emulator, &url, &grant_to_sns(&arn)).await;
+    (url, arn)
+}
+
+/// A queue called `name` with NO policy of its own: its url and its ARN.
+pub(crate) async fn given_queue_without_policy(
+    emulator: &Emulator,
+    name: &str,
+) -> (String, String) {
     let created = sqs(emulator, "CreateQueue", &json!({"QueueName": name})).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -152,9 +167,35 @@ async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
     (url, arn)
 }
 
+/// Write `policy` as the `Policy` attribute of the queue at `url`.
+pub(crate) async fn set_queue_policy(emulator: &Emulator, url: &str, policy: &str) {
+    sqs(
+        emulator,
+        "SetQueueAttributes",
+        &json!({"QueueUrl": url, "Attributes": {"Policy": policy}}),
+    )
+    .await;
+}
+
+/// The queue policy AWS documents for an SQS queue subscribed to an SNS topic: the service
+/// principal `sns.amazonaws.com`, allowed `sqs:SendMessage` on that queue.
+pub(crate) fn grant_to_sns(queue_arn: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowSNSDelivery",
+            "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": queue_arn,
+        }],
+    })
+    .to_string()
+}
+
 /// Every message body waiting on the queue at `url`, as raw text, with the message
 /// attributes each one carries.
-async fn drain(emulator: &Emulator, url: &str) -> Vec<(String, Value)> {
+pub(crate) async fn drain(emulator: &Emulator, url: &str) -> Vec<(String, Value)> {
     let received = sqs(
         emulator,
         "ReceiveMessage",

@@ -298,7 +298,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::stamp_notification(&mut notification);
                     crate::state::StoredNotification {
                         notification,
-                        subscribers: supplied.subscribers,
+                        // The subscribers attached with a notification are a SET keyed by
+                        // subscription type and address, so a repeat in the supplied list
+                        // names the one subscriber it is a copy of and is collapsed into
+                        // it — exactly as `CreateNotification` establishes one.
+                        subscribers: crate::state::distinct_subscribers(supplied.subscribers),
                     }
                 })
                 .collect();

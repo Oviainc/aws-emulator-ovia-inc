@@ -44,9 +44,9 @@ pub(crate) struct Emulator {
     router: MultiServiceRouter,
     pub(crate) region: String,
     /// The SINGLE shared engine the router hands every handler of this service, kept
-    /// so a suite can reach this service's store the way a handler does — for state
-    /// no operation of this API mints yet (the evaluation results `PutEvaluations`
-    /// will record once it lands).
+    /// so a suite can reach this service's store the way a handler does — for state an
+    /// operation of this API mints but hands to nobody (the `ResultToken` Config mints
+    /// when it invokes a rule), or that another operation of the service writes.
     pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -1340,7 +1340,7 @@ async fn an_unimplemented_operation_still_answers_not_implemented() {
     // (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
     let emulator = Emulator::new();
     let (status, code) = emulator
-        .refused("DescribeRemediationExecutionStatus", &json!({ "ConfigRuleName": "rule-000" }))
+        .refused("DescribeConformancePackCompliance", &json!({ "ConformancePackName": "pack-000" }))
         .await;
     assert_eq!(
         (status, code.as_str()),

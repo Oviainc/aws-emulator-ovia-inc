@@ -15,12 +15,13 @@
 //! allows, one, two and three token domains including the longest one allowed,
 //! every page size, a scope holding no keys at all, and each refusal.
 //!
-//! `CreateAPIKey` is the one operation that mints a key, and it is still a scaffold
-//! stub with its own issue
-//! (`issues/things-that-do-not-work/20261024T065754Z-wafv2-createapikey-stub.md`),
-//! so these suites seed the keys through the state API ([`seed_api_key`], the same
-//! call that handler will make) and then drive every assertion through the router's
-//! front door, the same door an SDK uses.
+//! `CreateAPIKey` is the one operation that mints a key, and these suites are about
+//! the LISTING rather than the mint, so they seed the keys through the state API
+//! ([`seed_api_key`], the same call that handler makes) — which is also how a case
+//! pins a key value, a creation instant and a listing position the mint chooses for
+//! itself — and then drive every assertion through the router's front door, the same
+//! door an SDK uses. The mint and its round trip have their own suite
+//! (`crate::api_key_minting`).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::{

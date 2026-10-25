@@ -172,11 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
-        // `resourceArn` is documented as the ARN of the resource to remove tags from
-        // and carries no name alternative, so it resolves through the ARN alone —
-        // unlike the `{identifier}` members of the resource operations, which the model
-        // documents as a name OR an ARN.
-        let group = store.group_by_arn_mut(&input.resource_arn, &region).ok_or_else(|| {
+        // `resourceArn` is documented as the ARN of the resource to remove tags from,
+        // so it resolves through the ARN — the one address a group has in this service
+        // (`crate::state`).
+        let group = store.group_mut(&input.resource_arn, &region).ok_or_else(|| {
             // A tagging call is served by the tagging frontend, whose absent-resource
             // answer is 404 `NotFoundException` rather than this service's own
             // modelled `ResourceNotFoundException`; see
