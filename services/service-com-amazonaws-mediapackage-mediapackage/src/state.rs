@@ -1251,13 +1251,26 @@ pub fn bound_origin_endpoint_durations(
 //   `includeIframeOnlyStream` false, and a DASH package takes `profile` NONE,
 //   `minBufferTimeSeconds` 30, `segmentTemplateFormat` NUMBER_WITH_TIMELINE,
 //   `periodTriggers` [] and `includeIframeOnlyStream` false.
+// * PUBLISHED by MediaPackage as the DASH packaging configuration a live endpoint is
+//   created with, which the VOD recording above cannot speak to because the VOD packaging
+//   shape has no live-manifest members at all: in `DashPackage` `manifestLayout` FULL,
+//   `utcTiming` NONE, `manifestWindowSeconds` 60, `minUpdatePeriodSeconds` 15,
+//   `suggestedPresentationDelaySeconds` 25 and `segmentDurationSeconds` 2 — the live
+//   siblings of the same block's already-filled `minBufferTimeSeconds` and `profile`.
+//   Corroboration for that source rather than for each value alone: the four DASH defaults
+//   the VOD recording DOES carry (`minBufferTimeSeconds` 30, `profile` NONE,
+//   `segmentTemplateFormat` NUMBER_WITH_TIMELINE, `periodTriggers` []) are the entries of
+//   the same published table, so the entries only a live endpoint has are read from it too
+//   rather than being left absent. `tests/all/dash_live_manifest_defaults.rs` pins all six
+//   values on the wire, so a change to any of them is a test failure and not a silent drift.
 //
-// The defaults are keyed by MEMBER, so the same member takes the same default wherever it
-// appears (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`). A member whose
-// default neither the model nor a recording publishes is left exactly as the request sent
-// it — `SegmentDurationSeconds`, `StreamSelection`, `Encryption`, the DASH window/timing
-// members and every `MssPackage` member — because inventing a value for it would be a
-// fabrication, not a default.
+// The defaults are keyed by MEMBER, so the same member takes the same default wherever a
+// published default covers it (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`);
+// where a default belongs to one packaging format it is named for that format. A member
+// whose default neither the model, a recording nor the service's published configuration
+// publishes is left exactly as the request sent it — `StreamSelection`, `Encryption`,
+// `HlsPackage$SegmentDurationSeconds` and every `MssPackage` member — because inventing a
+// value for it would be a fabrication, not a default.
 // ---------------------------------------------------------------------------
 
 /// `Origination`'s default: a new endpoint may be requested unless the caller denies it.
@@ -1338,6 +1351,40 @@ pub const DEFAULT_DASH_SEGMENT_TEMPLATE_FORMAT: &str = "NUMBER_WITH_TIMELINE";
 /// `DashPackage.PeriodTriggers`' default: the MPD is not partitioned into periods, which
 /// the member reports as the empty list.
 pub const DEFAULT_DASH_PERIOD_TRIGGERS: &[&str] = &[];
+
+/// `DashPackage.ManifestLayout`'s default: every Representation of the MPD carries the
+/// tags the member positions, which the enum names FULL
+/// (`crate::ops::types::MANIFEST_LAYOUT_VALUES`). Source: the published live-DASH
+/// configuration table named above.
+pub const DEFAULT_DASH_MANIFEST_LAYOUT: &str = "FULL";
+
+/// `DashPackage.UtcTiming`'s default: the MPD carries no UTCTiming element, which the enum
+/// names NONE (`crate::ops::types::UTC_TIMING_VALUES`) — and why no `UtcTimingUri` is
+/// filled in beside it: the URI is only "the value attribute of the UTCTiming field when
+/// utcTiming is set to HTTP-ISO, HTTP-HEAD or HTTP-XSDATE". Source: the published
+/// live-DASH configuration table named above.
+pub const DEFAULT_DASH_UTC_TIMING: &str = "NONE";
+
+/// `DashPackage.ManifestWindowSeconds`' default: the "time window (in seconds) contained
+/// in each manifest" of a live DASH endpoint. Source: the published live-DASH
+/// configuration table named above.
+pub const DEFAULT_DASH_MANIFEST_WINDOW_SECONDS: i32 = 60;
+
+/// `DashPackage.MinUpdatePeriodSeconds`' default: the "minimum duration (in seconds)
+/// between potential changes" to the MPD. Source: the published live-DASH configuration
+/// table named above.
+pub const DEFAULT_DASH_MIN_UPDATE_PERIOD_SECONDS: i32 = 15;
+
+/// `DashPackage.SuggestedPresentationDelaySeconds`' default: the "duration (in seconds) to
+/// delay live content before presentation". Source: the published live-DASH configuration
+/// table named above.
+pub const DEFAULT_DASH_SUGGESTED_PRESENTATION_DELAY_SECONDS: i32 = 25;
+
+/// `DashPackage.SegmentDurationSeconds`' default: the "duration (in seconds) of each
+/// segment" a DASH package publishes, from the published live-DASH configuration table
+/// named above. This default belongs to the DASH block alone — the identically named
+/// `HlsPackage` member publishes none and so stays as sent.
+pub const DEFAULT_DASH_SEGMENT_DURATION_SECONDS: i32 = 2;
 
 /// An owned list for one of the `&[&str]` default lists above.
 fn default_list(values: &[&str]) -> Vec<String> {
@@ -1424,9 +1471,19 @@ fn fill_dash_package(package: &mut DashPackage) {
     package.include_iframe_only_stream = package
         .include_iframe_only_stream
         .or(Some(DEFAULT_INCLUDE_IFRAME_ONLY_STREAM));
+    package.manifest_layout = package
+        .manifest_layout
+        .take()
+        .or_else(|| Some(DEFAULT_DASH_MANIFEST_LAYOUT.to_string()));
+    package.manifest_window_seconds = package
+        .manifest_window_seconds
+        .or(Some(DEFAULT_DASH_MANIFEST_WINDOW_SECONDS));
     package.min_buffer_time_seconds = package
         .min_buffer_time_seconds
         .or(Some(DEFAULT_DASH_MIN_BUFFER_TIME_SECONDS));
+    package.min_update_period_seconds = package
+        .min_update_period_seconds
+        .or(Some(DEFAULT_DASH_MIN_UPDATE_PERIOD_SECONDS));
     package.period_triggers = package
         .period_triggers
         .take()
@@ -1435,10 +1492,20 @@ fn fill_dash_package(package: &mut DashPackage) {
         .profile
         .take()
         .or_else(|| Some(DEFAULT_DASH_PROFILE.to_string()));
+    package.segment_duration_seconds = package
+        .segment_duration_seconds
+        .or(Some(DEFAULT_DASH_SEGMENT_DURATION_SECONDS));
     package.segment_template_format = package
         .segment_template_format
         .take()
         .or_else(|| Some(DEFAULT_DASH_SEGMENT_TEMPLATE_FORMAT.to_string()));
+    package.suggested_presentation_delay_seconds = package
+        .suggested_presentation_delay_seconds
+        .or(Some(DEFAULT_DASH_SUGGESTED_PRESENTATION_DELAY_SECONDS));
+    package.utc_timing = package
+        .utc_timing
+        .take()
+        .or_else(|| Some(DEFAULT_DASH_UTC_TIMING.to_string()));
 }
 
 /// Materialise the server-filled members of an origin endpoint built from a create or
