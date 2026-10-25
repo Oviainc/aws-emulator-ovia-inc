@@ -1,28 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage of `DisassociateVPCFromHostedZone`.
+//! End-to-end coverage of `DisassociateVPCFromHostedZone`, read back through
+//! `GetHostedZone`, `ListHostedZonesByVPC` and `GetChange`.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one
 //! recorded request:
 //!
 //! 1. A private hosted zone's VPC associations are a SET keyed by VPC id, so
-//!    disassociating removes exactly the named VPC and leaves the rest in the
-//!    order they were added: `GetHostedZone` stops reporting it,
-//!    `ListHostedZonesByVPC` stops listing the zone for it, and every accepted
-//!    request answers with its own `ChangeInfo` that `GetChange` can read back.
-//!    The table spans the two VPC id forms, several regions of the modelled
-//!    `VPCRegion` enum, the position of the removed association in the list
-//!    (first, middle, last) and a shrinking association count.
-//! 2. The last association cannot be removed: a zone that holds exactly one
-//!    association answers the modelled `LastVPCAssociation` (HTTP 400) and keeps
-//!    it, however the zone came to hold just one.
-//! 3. A VPC the zone holds no association for is the modelled
-//!    `VPCAssociationNotFound` (HTTP 404) — a VPC never associated, one
-//!    associated with ANOTHER zone, one already disassociated, and any VPC
-//!    against a public zone, which holds no association at all.
-//! 4. A request has to name a VPC: an id outside the `vpc-<hex>` form is
-//!    `InvalidVPCId` (HTTP 400) and touches nothing.
+//!    disassociating a VPC takes exactly the named entry out of the list
+//!    `GetHostedZone` reports and `ListHostedZonesByVPC` searches by, leaves
+//!    every other association where it was, and answers HTTP 200 with its own
+//!    `ChangeInfo` that `GetChange` reads back. The table spans both VPC id
+//!    forms, several regions of the modelled `VPCRegion` enum, and which entry
+//!    of the set is removed (the first, one in the middle, the last).
+//! 2. A zone keeps at least one association: the request that would empty the
+//!    list is `LastVPCAssociation` (HTTP 400) and leaves the association intact,
+//!    while the identical request succeeds once a second VPC is associated. The
+//!    table spans how the zone came to hold exactly one VPC.
+//! 3. A request naming a VPC the zone does not hold asks to remove an
+//!    association that is not there, which is `VPCAssociationNotFound`
+//!    (HTTP 404): never associated, already disassociated, associated with
+//!    ANOTHER zone, or any VPC at all against a public zone — none of them
+//!    touching the set.
+//! 4. The request has to name a VPC, exactly as the association that created it
+//!    did: an id outside the `vpc-<hex>` form is `InvalidVPCId` and a region the
+//!    model does not name is `InvalidInput` (both HTTP 400), and neither touches
+//!    the zone.
 //! 5. An id that names no zone is `NoSuchHostedZone` (HTTP 404).
+//! 6. A disassociated VPC frees its place in the set, so it can be associated
+//!    again: association and disassociation are inverses.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness `hosted_zone_records` and `vpc_associations` use, so what is asserted
@@ -38,36 +44,49 @@ use crate::vpc_associations::{
     CREATION_VPC, HOME_REGION,
 };
 
-/// A `DisassociateVPCFromHostedZone` body carrying `vpc` (a [`vpc_block`]) and,
-/// when given, a `Comment`.
-fn disassociate_body(vpc: &str, comment: Option<&str>) -> String {
-    let comment = comment.map_or_else(String::new, |text| {
-        format!("<Comment>{}</Comment>", escape_xml(text))
-    });
-    format!(
-        "<DisassociateVPCFromHostedZoneRequest \
-         xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">{vpc}{comment}\
-         </DisassociateVPCFromHostedZoneRequest>"
-    )
-}
-
-/// Send one `DisassociateVPCFromHostedZone` request.
+/// Send one `DisassociateVPCFromHostedZone` request carrying `vpc` (a
+/// [`vpc_block`]) and, when given, a `Comment`.
 async fn disassociate(
     router: &MultiServiceRouter,
     zone_id: &str,
     vpc: &str,
     comment: Option<&str>,
 ) -> Reply {
+    let comment = comment.map_or_else(String::new, |text| {
+        format!("<Comment>{}</Comment>", escape_xml(text))
+    });
+    let body = format!(
+        "<DisassociateVPCFromHostedZoneRequest \
+         xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">{vpc}{comment}\
+         </DisassociateVPCFromHostedZoneRequest>"
+    );
     call(
         router,
         "POST",
         &format!("/2013-04-01/hostedzone/{zone_id}/disassociatevpc"),
-        &disassociate_body(vpc, comment),
+        &body,
     )
     .await
 }
 
-/// The hosted zones `ListHostedZonesByVPC` reports for one VPC, by bare id.
+/// Associate `vpc_id` in `region` with `zone_id` and assert it was accepted.
+async fn associate_ok(router: &MultiServiceRouter, zone_id: &str, vpc_id: &str, region: &str) {
+    let reply = associate(
+        router,
+        zone_id,
+        &vpc_block(Some(vpc_id), Some(region)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reply.status, 200,
+        "associating {vpc_id} in {region}: expected 200, got {} with body {}",
+        reply.status, reply.body
+    );
+}
+
+/// The bare zone ids `ListHostedZonesByVPC` reports for one VPC — the other
+/// read over the same association set.
 async fn zones_of_vpc(router: &MultiServiceRouter, vpc_id: &str, region: &str) -> Vec<String> {
     let reply = call(
         router,
@@ -78,11 +97,11 @@ async fn zones_of_vpc(router: &MultiServiceRouter, vpc_id: &str, region: &str) -
     .await;
     assert_eq!(
         reply.status, 200,
-        "expected 200 from ListHostedZonesByVPC, got {} with body {}",
+        "listing the zones of {vpc_id}: expected 200, got {} with body {}",
         reply.status, reply.body
     );
     reply
-        .all("HostedZoneId")
+        .all("HostedZoneSummary/HostedZoneId")
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -94,178 +113,154 @@ fn is_change_id(id: &str) -> bool {
         .is_some_and(|bare| bare.starts_with('C') && bare.len() == 15)
 }
 
-/// One VPC of the suite's association table: the id form and the region it was
-/// created in. Each region is a member of the modelled `VPCRegion` enum
-/// (smithy_query(query="shape",shape="VPCRegion")).
-struct VpcRow {
+/// The `ChangeInfo/Id` of an accepted reply, asserted to have the shape every
+/// change id has.
+fn change_id(case: &str, reply: &Reply) -> String {
+    let id = reply
+        .first("ChangeInfo/Id")
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the reply must carry ChangeInfo/Id; body {}",
+                reply.body
+            )
+        })
+        .to_string();
+    assert!(
+        is_change_id(&id),
+        "case {case:?}: expected a /change/C… id, got {id:?}"
+    );
+    id
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1: the named association, and only it, leaves the set
+// ---------------------------------------------------------------------------
+
+/// One row of the disassociation table: which member of the zone's association
+/// set is removed, named by its id form and the region it was created in.
+struct RemovalRow {
     case: &'static str,
     vpc_id: &'static str,
     region: &'static str,
 }
 
-/// The VPCs a zone is grown with before anything is removed. They span both id
-/// forms (8-character original, 17-character long) and regions from three
-/// partitions.
-const EXTRA_VPCS: &[VpcRow] = &[
-    VpcRow {
-        case: "the 17-character long id form, in ca-central-1",
-        vpc_id: "vpc-0a1b2c3d4e5f60718",
-        region: "ca-central-1",
-    },
-    VpcRow {
-        case: "the 8-character original id form, in ap-southeast-2",
-        vpc_id: "vpc-1a2b3c4d",
-        region: "ap-southeast-2",
-    },
-    VpcRow {
-        case: "a China-partition region",
-        vpc_id: "vpc-deadbeef",
-        region: "cn-north-1",
-    },
-    VpcRow {
-        case: "a GovCloud region",
-        vpc_id: "vpc-0fedcba9876543210",
-        region: "us-gov-west-1",
-    },
-    VpcRow {
-        case: "a region added late to the enum",
-        vpc_id: "vpc-00112233445566778",
-        region: "il-central-1",
-    },
-];
-
-// ---------------------------------------------------------------------------
-// Rule 1: a disassociation removes exactly the named VPC
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn disassociating_vpcs_removes_them_from_the_zone_the_read_reports() {
+async fn disassociating_a_vpc_removes_exactly_that_association() {
+    // The zone is built with associations spanning both VPC id forms (the
+    // 8-character original and the 17-character long form) and several regions
+    // of the modelled `VPCRegion` enum
+    // (smithy_query(query="shape",shape="VPCRegion")), including other
+    // partitions. The rows then remove a member from a different place in the
+    // set each time: the first, one in the middle, and the last.
+    let members = [
+        ("vpc-0a1b2c3d4e5f60718", "ca-central-1"),
+        ("vpc-1a2b3c4d", "ap-southeast-2"),
+        ("vpc-00112233445566778", "il-central-1"),
+        ("vpc-deadbeef", "cn-north-1"),
+        ("vpc-0fedcba9876543210", "us-gov-west-1"),
+    ];
+    let rows = [
+        RemovalRow {
+            case: "the first association the zone holds",
+            vpc_id: CREATION_VPC,
+            region: HOME_REGION,
+        },
+        RemovalRow {
+            case: "an association in the middle of the set",
+            vpc_id: "vpc-00112233445566778",
+            region: "il-central-1",
+        },
+        RemovalRow {
+            case: "the last association the set holds",
+            vpc_id: "vpc-0fedcba9876543210",
+            region: "us-gov-west-1",
+        },
+        RemovalRow {
+            case: "the 8-character original id form",
+            vpc_id: "vpc-1a2b3c4d",
+            region: "ap-southeast-2",
+        },
+    ];
+
     let router = router();
     let zone_id = create_private_zone(
         &router,
-        "shrinking.example.com",
+        "disassociate.example.com",
         "disassociate-table",
         CREATION_VPC,
     )
     .await;
-
-    // Grow the zone, so the table below can remove an association from every
-    // position of a list that holds several.
     let mut expected = vec![(CREATION_VPC.to_string(), HOME_REGION.to_string())];
-    for row in EXTRA_VPCS {
-        let reply = associate(
-            &router,
-            &zone_id,
-            &vpc_block(Some(row.vpc_id), Some(row.region)),
-            None,
-        )
-        .await;
-        assert_eq!(
-            reply.status, 200,
-            "case {:?}: expected 200 from AssociateVPCWithHostedZone, got {} with body {}",
-            row.case, reply.status, reply.body
-        );
-        expected.push((row.vpc_id.to_string(), row.region.to_string()));
+    for (vpc_id, region) in members {
+        associate_ok(&router, &zone_id, vpc_id, region).await;
+        expected.push((vpc_id.to_string(), region.to_string()));
     }
 
-    // Each row removes the association at a different position of the list the
-    // zone holds, and the last row names a region OTHER than the one the
-    // association was stored with: a VPC id identifies the VPC on its own, so it
-    // alone is the identity of an association (`StoredZone::vpc_position`).
-    let removals = [
-        ("a middle association", "vpc-deadbeef", "cn-north-1"),
-        (
-            "the first association, the one the zone was created with",
-            CREATION_VPC,
-            HOME_REGION,
-        ),
-        (
-            "the last association",
-            "vpc-00112233445566778",
-            "il-central-1",
-        ),
-        (
-            "an association named with another region",
-            "vpc-1a2b3c4d",
-            "eu-west-1",
-        ),
-    ];
-
     let mut change_ids = Vec::new();
-    for (case, vpc_id, region) in removals {
-        let comment = format!("disassociating {case}");
+    for row in &rows {
+        // The VPC's own listing reports the zone while the association stands.
+        let listed = zones_of_vpc(&router, row.vpc_id, row.region).await;
+        assert!(
+            listed.contains(&zone_id),
+            "case {:?}: ListHostedZonesByVPC must report the zone while the association \
+             stands, got {listed:?}",
+            row.case
+        );
+
+        let comment = format!("disassociating {}", row.case);
         let reply = disassociate(
             &router,
             &zone_id,
-            &vpc_block(Some(vpc_id), Some(region)),
+            &vpc_block(Some(row.vpc_id), Some(row.region)),
             Some(&comment),
         )
         .await;
         assert_eq!(
             reply.status, 200,
-            "case {case:?}: expected 200 from DisassociateVPCFromHostedZone, got {} with body {}",
-            reply.status, reply.body
+            "case {:?}: expected 200 from DisassociateVPCFromHostedZone, got {} with body {}",
+            row.case, reply.status, reply.body
         );
+        change_ids.push(change_id(row.case, &reply));
 
-        let change_id = reply
-            .first("ChangeInfo/Id")
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: the reply must carry ChangeInfo/Id; body {}",
-                    reply.body
-                )
-            })
-            .to_string();
-        assert!(
-            is_change_id(&change_id),
-            "case {case:?}: expected a /change/C… id, got {change_id:?}"
-        );
         let status = reply.first("ChangeInfo/Status").unwrap_or("");
         assert!(
             matches!(status, "PENDING" | "INSYNC"),
-            "case {case:?}: expected a ChangeStatus, got {status:?}; body {}",
+            "case {:?}: expected a ChangeStatus, got {status:?}; body {}",
+            row.case,
             reply.body
         );
         assert_eq!(
             reply.first("ChangeInfo/Comment"),
             Some(comment.as_str()),
-            "case {case:?}: the change must carry the Comment the request gave it; body {}",
+            "case {:?}: the change must carry the Comment the request gave it; body {}",
+            row.case,
             reply.body
         );
         assert!(
             reply.first("ChangeInfo/SubmittedAt").is_some(),
-            "case {case:?}: the change must report when it was submitted; body {}",
+            "case {:?}: the change must report when it was submitted; body {}",
+            row.case,
             reply.body
         );
-        change_ids.push(change_id);
 
-        // Exactly the named VPC left, and the rest kept their order.
-        expected.retain(|(id, _)| id != vpc_id);
+        // Exactly the named entry left, in place: every other association keeps
+        // its position and its region.
+        expected.retain(|(id, _)| id != row.vpc_id);
         let read = get_zone(&router, &zone_id).await;
         let got = associations(&read);
         assert_eq!(
             got, expected,
-            "case {case:?}: GetHostedZone must report the associations the zone still holds, \
+            "case {:?}: GetHostedZone must report the associations the zone still holds, \
              expected {expected:?}, got {got:?}; body {}",
-            read.body
+            row.case, read.body
         );
-
-        // The removed VPC no longer resolves this zone, while one the zone
-        // still holds still does.
-        let listed = zones_of_vpc(&router, vpc_id, region).await;
+        let listed = zones_of_vpc(&router, row.vpc_id, row.region).await;
         assert!(
             !listed.contains(&zone_id),
-            "case {case:?}: ListHostedZonesByVPC must stop listing {zone_id} for the \
-             disassociated VPC, got {listed:?}"
+            "case {:?}: ListHostedZonesByVPC must stop reporting the zone for the removed \
+             VPC, got {listed:?}",
+            row.case
         );
-        if let Some((kept_id, kept_region)) = expected.first() {
-            let listed = zones_of_vpc(&router, kept_id, kept_region).await;
-            assert!(
-                listed.contains(&zone_id),
-                "case {case:?}: ListHostedZonesByVPC must still list {zone_id} for the kept \
-                 VPC {kept_id}, got {listed:?}"
-            );
-        }
     }
 
     assert_eq!(
@@ -276,147 +271,122 @@ async fn disassociating_vpcs_removes_them_from_the_zone_the_read_reports() {
         change_ids.len(),
         "each disassociation must get its own change id, got {change_ids:?}"
     );
-    // The clock owes the PENDING -> INSYNC transition; nothing polls for it.
-    // A blocking sleep, because this crate's tokio does not enable the `time`
+    // The clock owes the PENDING -> INSYNC transition; nothing polls for it. A
+    // blocking sleep, because this crate's tokio does not enable the `time`
     // feature; each test owns its runtime, so nothing else is waiting on it.
     std::thread::sleep(Duration::from_millis(700));
-    for change_id in &change_ids {
-        let bare = change_id.trim_start_matches("/change/");
+    for (row, id) in rows.iter().zip(change_ids.iter()) {
+        let bare = id.trim_start_matches("/change/");
         let got = call(&router, "GET", &format!("/2013-04-01/change/{bare}"), "").await;
         assert_eq!(
             got.status, 200,
-            "change {change_id:?}: expected 200 from GetChange, got {} with body {}",
-            got.status, got.body
+            "case {:?}: expected 200 from GetChange, got {} with body {}",
+            row.case, got.status, got.body
         );
         assert_eq!(
             got.first("ChangeInfo/Id"),
-            Some(change_id.as_str()),
-            "change {change_id:?}: GetChange must return the persisted change; body {}",
+            Some(id.as_str()),
+            "case {:?}: GetChange must return the persisted change; body {}",
+            row.case,
             got.body
         );
         assert_eq!(
             got.first("ChangeInfo/Status"),
             Some("INSYNC"),
-            "change {change_id:?}: the change must have reached INSYNC; body {}",
+            "case {:?}: the change must have reached INSYNC; body {}",
+            row.case,
             got.body
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: the last association cannot be removed
+// Rule 2: a zone keeps at least one association
 // ---------------------------------------------------------------------------
 
+/// One row of the last-association table: the extra VPCs associated with the
+/// zone before it is narrowed down to the single `survivor`.
+struct LastRow {
+    case: &'static str,
+    survivor: &'static str,
+    extra: &'static [(&'static str, &'static str)],
+}
+
 #[tokio::test]
-async fn the_last_association_cannot_be_disassociated() {
-    let router = router();
-
-    // Row 1: the zone still holds only the association `CreateHostedZone` made.
-    let untouched = create_private_zone(
-        &router,
-        "single.example.com",
-        "disassociate-single",
-        CREATION_VPC,
-    )
-    .await;
-
-    // Row 2: the zone was grown and then shrunk back to one association, so the
-    // refusal depends on the count the zone holds NOW, not on how it got there.
-    let shrunk = create_private_zone(
-        &router,
-        "shrunk.example.com",
-        "disassociate-shrunk",
-        CREATION_VPC,
-    )
-    .await;
-    let extra = "vpc-0123456789abcdef0";
-    let grown = associate(
-        &router,
-        &shrunk,
-        &vpc_block(Some(extra), Some("eu-west-2")),
-        None,
-    )
-    .await;
-    assert_eq!(
-        grown.status, 200,
-        "expected 200 from AssociateVPCWithHostedZone, got {} with body {}",
-        grown.status, grown.body
-    );
-    let removed = disassociate(
-        &router,
-        &shrunk,
-        &vpc_block(Some(extra), Some("eu-west-2")),
-        None,
-    )
-    .await;
-    assert_eq!(
-        removed.status, 200,
-        "expected 200 disassociating the second VPC, got {} with body {}",
-        removed.status, removed.body
-    );
-
-    // Row 3: a zone whose one association was made by this API rather than by
-    // `CreateHostedZone`, after the creation VPC was removed.
-    let replaced = create_private_zone(
-        &router,
-        "replaced.example.com",
-        "disassociate-replaced",
-        CREATION_VPC,
-    )
-    .await;
-    let only = "vpc-00ff11ee22dd33cc4";
-    let added = associate(
-        &router,
-        &replaced,
-        &vpc_block(Some(only), Some("sa-east-1")),
-        None,
-    )
-    .await;
-    assert_eq!(
-        added.status, 200,
-        "expected 200 from AssociateVPCWithHostedZone, got {} with body {}",
-        added.status, added.body
-    );
-    let dropped = disassociate(
-        &router,
-        &replaced,
-        &vpc_block(Some(CREATION_VPC), Some(HOME_REGION)),
-        None,
-    )
-    .await;
-    assert_eq!(
-        dropped.status, 200,
-        "expected 200 disassociating the creation VPC, got {} with body {}",
-        dropped.status, dropped.body
-    );
-
+async fn the_last_association_of_a_zone_cannot_be_removed() {
+    // The rows differ along how the zone came to hold exactly ONE association:
+    // created with it, associated and then narrowed back down to one, and
+    // narrowed down from several. The refusal is about the COUNT, so the same
+    // request is refused whichever VPC the single remaining one is.
     let rows = [
-        (
-            "the association CreateHostedZone made",
-            untouched,
-            CREATION_VPC,
-            HOME_REGION,
-        ),
-        (
-            "a zone shrunk back to one association",
-            shrunk,
-            CREATION_VPC,
-            HOME_REGION,
-        ),
-        (
-            "an association this API made, now the only one",
-            replaced,
-            only,
-            "sa-east-1",
-        ),
+        LastRow {
+            case: "the VPC the zone was created with",
+            survivor: CREATION_VPC,
+            extra: &[],
+        },
+        LastRow {
+            case: "a VPC associated after creation, narrowed back to one",
+            survivor: "vpc-0123456789abcdef0",
+            extra: &[("vpc-0123456789abcdef0", "eu-west-2")],
+        },
+        LastRow {
+            case: "the survivor of a set of three",
+            survivor: "vpc-1111222233334444a",
+            extra: &[
+                ("vpc-1111222233334444a", "eu-central-1"),
+                ("vpc-2222333344445555b", "sa-east-1"),
+            ],
+        },
     ];
 
-    for (case, zone_id, vpc_id, region) in rows {
+    let router = router();
+    for (index, row) in rows.iter().enumerate() {
+        let (case, survivor) = (row.case, row.survivor);
+        let zone_id = create_private_zone(
+            &router,
+            &format!("last-vpc-{index}.example.com"),
+            &format!("last-vpc-{index}"),
+            CREATION_VPC,
+        )
+        .await;
+        for (vpc_id, region) in row.extra {
+            associate_ok(&router, &zone_id, vpc_id, region).await;
+        }
+        // Narrow the zone down to the single surviving association.
+        let read = get_zone(&router, &zone_id).await;
+        for (vpc_id, region) in associations(&read) {
+            if vpc_id == *survivor {
+                continue;
+            }
+            let reply = disassociate(
+                &router,
+                &zone_id,
+                &vpc_block(Some(&vpc_id), Some(&region)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: narrowing the set by {vpc_id}: expected 200, got {} with body {}",
+                reply.status, reply.body
+            );
+        }
+
+        let read = get_zone(&router, &zone_id).await;
+        let before = associations(&read);
+        assert_eq!(
+            before.len(),
+            1,
+            "case {case:?}: the zone must hold exactly one association here, got {before:?}"
+        );
+        let (only_id, only_region) = before[0].clone();
+
+        // The request that would empty the list.
         let reply = disassociate(
             &router,
             &zone_id,
-            &vpc_block(Some(vpc_id), Some(region)),
-            None,
+            &vpc_block(Some(&only_id), Some(&only_region)),
+            Some("removing the only association"),
         )
         .await;
         assert_eq!(
@@ -430,131 +400,123 @@ async fn the_last_association_cannot_be_disassociated() {
             "case {case:?}: expected LastVPCAssociation, got body {}",
             reply.body
         );
+        let read = get_zone(&router, &zone_id).await;
+        let after = associations(&read);
+        assert_eq!(
+            after, before,
+            "case {case:?}: the refusal must leave the association intact, expected \
+             {before:?}, got {after:?}; body {}",
+            read.body
+        );
 
-        // The refusal persisted nothing: the zone still holds the association.
+        // The identical request succeeds once a second VPC is associated.
+        let second = format!("vpc-{index:017x}");
+        associate_ok(&router, &zone_id, &second, "us-west-2").await;
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some(&only_id), Some(&only_region)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: the same request must succeed with a second VPC associated, \
+             got {} with body {}",
+            reply.status, reply.body
+        );
+        let _ = change_id(case, &reply);
         let read = get_zone(&router, &zone_id).await;
         let got = associations(&read);
         assert_eq!(
             got,
-            vec![(vpc_id.to_string(), region.to_string())],
-            "case {case:?}: a refused disassociation must leave the association in place, \
-             got {got:?}; body {}",
+            vec![(second.clone(), "us-west-2".to_string())],
+            "case {case:?}: only the second VPC must remain, got {got:?}; body {}",
             read.body
+        );
+
+        // And the zone is back to one association, so it is refused again.
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some(&second), Some("us-west-2")),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.error_code(),
+            "LastVPCAssociation",
+            "case {case:?}: the new last association must be refused too, got body {}",
+            reply.body
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: a VPC the zone holds no association for
+// Rule 3: a VPC the zone does not hold is not associated
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn disassociating_a_vpc_the_zone_does_not_hold_is_a_not_found() {
     let router = router();
-
-    // The zone under test holds two associations, so nothing below could be
-    // refused as the last one instead.
     let zone_id = create_private_zone(
         &router,
-        "held.example.com",
-        "disassociate-not-found",
+        "not-associated.example.com",
+        "disassociate-missing",
         CREATION_VPC,
     )
     .await;
-    let second = "vpc-0aa11bb22cc33dd44";
-    let grown = associate(
+    // A second association, so the zone is never refused for holding only one.
+    let spare = "vpc-00ff00ff00ff00ff0";
+    associate_ok(&router, &zone_id, spare, "eu-west-1").await;
+    // One that was associated and then removed, so its id is known to the zone's
+    // history but not to its set.
+    let removed = "vpc-0abc0abc0abc0abc0";
+    associate_ok(&router, &zone_id, removed, "ap-northeast-1").await;
+    let gone = disassociate(
         &router,
         &zone_id,
-        &vpc_block(Some(second), Some("eu-central-1")),
+        &vpc_block(Some(removed), Some("ap-northeast-1")),
         None,
     )
     .await;
     assert_eq!(
-        grown.status, 200,
-        "expected 200 from AssociateVPCWithHostedZone, got {} with body {}",
-        grown.status, grown.body
+        gone.status, 200,
+        "removing the association first: expected 200, got {} with body {}",
+        gone.status, gone.body
     );
-
-    // A VPC associated with ANOTHER zone only: the association is held BY the
-    // zone, so it is not this zone's to remove.
-    let elsewhere = "vpc-0bb22cc33dd44ee55";
+    // A VPC associated with ANOTHER zone, which is no association of this one.
+    let elsewhere = "vpc-0c0ffee0c0ffee0c0";
     let other_zone =
-        create_private_zone(&router, "other.example.com", "disassociate-other", elsewhere).await;
+        create_private_zone(&router, "elsewhere.example.com", "other-zone", elsewhere).await;
 
-    // A VPC this zone held and already gave up.
-    let gone = "vpc-0cc33dd44ee55ff66";
-    let added = associate(
-        &router,
-        &zone_id,
-        &vpc_block(Some(gone), Some("ap-northeast-1")),
-        None,
-    )
-    .await;
-    assert_eq!(
-        added.status, 200,
-        "expected 200 from AssociateVPCWithHostedZone, got {} with body {}",
-        added.status, added.body
-    );
-    let first_removal = disassociate(
-        &router,
-        &zone_id,
-        &vpc_block(Some(gone), Some("ap-northeast-1")),
-        None,
-    )
-    .await;
-    assert_eq!(
-        first_removal.status, 200,
-        "expected 200 for the first disassociation, got {} with body {}",
-        first_removal.status, first_removal.body
-    );
-
-    // A public zone, which holds no association at all — and whose associations
-    // the read must still report as none afterwards.
-    let created = create_zone(&router, "public.example.com", "disassociate-public", "").await;
-    assert_eq!(
-        created.status, 201,
-        "expected 201 from CreateHostedZone, got {} with body {}",
-        created.status, created.body
-    );
-    let public_zone = bare_zone_id(&created);
-
-    let expected_held = vec![
-        (CREATION_VPC.to_string(), HOME_REGION.to_string()),
-        (second.to_string(), "eu-central-1".to_string()),
-    ];
+    let before = associations(&get_zone(&router, &zone_id).await);
     let rows = [
         (
-            "a well-formed VPC this zone never held",
-            zone_id.clone(),
-            "vpc-0ff00112233445566",
+            "a VPC never associated with the zone",
+            "vpc-aabbccdd",
             HOME_REGION,
-            expected_held.clone(),
         ),
         (
-            "a VPC associated with another zone",
-            zone_id.clone(),
-            elsewhere,
-            HOME_REGION,
-            expected_held.clone(),
-        ),
-        (
-            "a VPC this zone already gave up",
-            zone_id.clone(),
-            gone,
+            "a VPC whose association was already removed",
+            removed,
             "ap-northeast-1",
-            expected_held.clone(),
         ),
+        ("a VPC associated with another zone", elsewhere, HOME_REGION),
         (
-            "any VPC against a public zone",
-            public_zone,
-            CREATION_VPC,
-            HOME_REGION,
-            Vec::new(),
+            "a VPC the zone never held, named in another region",
+            "vpc-11223344",
+            "ap-south-1",
         ),
     ];
-
-    for (case, zone, vpc_id, region, expected) in rows {
-        let reply = disassociate(&router, &zone, &vpc_block(Some(vpc_id), Some(region)), None).await;
+    for (case, vpc_id, region) in rows {
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some(vpc_id), Some(region)),
+            None,
+        )
+        .await;
         assert_eq!(
             reply.status, 404,
             "case {case:?}: expected 404, got {} with body {}",
@@ -566,108 +528,234 @@ async fn disassociating_a_vpc_the_zone_does_not_hold_is_a_not_found() {
             "case {case:?}: expected VPCAssociationNotFound, got body {}",
             reply.body
         );
-        // The refusal names what the request asked about: the VPC (its id and
-        // the region the request gave for it) and the hosted zone.
-        let message = reply.first("Error/Message").unwrap_or("");
-        assert_eq!(
-            message,
-            format!("No VPC association for {vpc_id}:{region} to hosted zone {zone}"),
-            "case {case:?}: the refusal must name the VPC and the zone the request asked \
-             about, got {message:?}"
-        );
-
-        let read = get_zone(&router, &zone).await;
+        let read = get_zone(&router, &zone_id).await;
         let got = associations(&read);
         assert_eq!(
-            got, expected,
-            "case {case:?}: a refused disassociation must leave the zone's associations at \
-             {expected:?}, got {got:?}; body {}",
+            got, before,
+            "case {case:?}: a refused request must leave the set at {before:?}, got \
+             {got:?}; body {}",
             read.body
         );
     }
 
-    // The zone that holds `elsewhere` kept it throughout.
+    // The other zone kept its own association throughout.
     let read = get_zone(&router, &other_zone).await;
     let got = associations(&read);
-    assert_eq!(
-        got,
-        vec![(elsewhere.to_string(), HOME_REGION.to_string())],
-        "the other zone must keep its own association, got {got:?}; body {}",
+    assert!(
+        got.iter().any(|(id, _)| id == elsewhere),
+        "the other zone must keep its association, got {got:?}; body {}",
         read.body
     );
+}
+
+#[tokio::test]
+async fn a_public_zone_holds_no_association_to_remove() {
+    // A public hosted zone holds no VPC at all, so every VPC named against one
+    // is an association that is not there. The rows differ along how the zone
+    // came to be public.
+    let rows = [
+        ("no HostedZoneConfig at all", "", "public-none.example.com"),
+        (
+            "an empty HostedZoneConfig",
+            "<HostedZoneConfig></HostedZoneConfig>",
+            "public-empty.example.com",
+        ),
+        (
+            "PrivateZone sent explicitly false",
+            "<HostedZoneConfig><PrivateZone>false</PrivateZone></HostedZoneConfig>",
+            "public-explicit.example.com",
+        ),
+    ];
+
+    let router = router();
+    for (index, (case, config, name)) in rows.iter().enumerate() {
+        let created = create_zone(
+            &router,
+            name,
+            &format!("public-disassociate-{index}"),
+            config,
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            created.status, created.body
+        );
+        let zone_id = bare_zone_id(&created);
+
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some("vpc-1a2b3c4d"), Some(HOME_REGION)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected 404 for a public zone, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "VPCAssociationNotFound",
+            "case {case:?}: expected VPCAssociationNotFound, got body {}",
+            reply.body
+        );
+        let read = get_zone(&router, &zone_id).await;
+        assert_eq!(
+            read.first("Config/PrivateZone"),
+            Some("false"),
+            "case {case:?}: the zone must still be public; body {}",
+            read.body
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Rule 4: the request has to name a VPC
 // ---------------------------------------------------------------------------
 
+/// One row of the malformed-VPC table: the `<VPC>` block sent, and the wire
+/// error code it must be refused with.
+struct BadVpcRow {
+    case: &'static str,
+    vpc_id: Option<&'static str>,
+    region: Option<&'static str>,
+    code: &'static str,
+}
+
 #[tokio::test]
 async fn a_request_that_names_no_valid_vpc_is_refused() {
     // A VPC id is `vpc-` plus 8 or 17 lowercase hexadecimal characters, so the
-    // rows walk both bounds and one past each, the case rule, the prefix and
-    // the absent member.
+    // rows walk both bounds and one past each, the case rule, the prefix and the
+    // absent member. The region rows walk the modelled `VPCRegion` enum's
+    // boundary: absent, empty, a value outside it, and one differing only in
+    // case.
     let rows = [
-        ("no VPCId member at all", None),
-        ("an empty VPCId", Some("")),
-        ("an id with no vpc- prefix", Some("1a2b3c4d")),
-        ("another resource kind's prefix", Some("subnet-1a2b3c4d")),
-        (
-            "one character short of the 8-character form",
-            Some("vpc-1a2b3c4"),
-        ),
-        (
-            "one character past the 8-character form",
-            Some("vpc-1a2b3c4d5"),
-        ),
-        (
-            "one character short of the 17-character form",
-            Some("vpc-0a1b2c3d4e5f6071"),
-        ),
-        (
-            "one character past the 17-character form",
-            Some("vpc-0a1b2c3d4e5f607182"),
-        ),
-        ("a non-hexadecimal character in the id", Some("vpc-1a2b3c4z")),
-        ("an uppercase id body", Some("vpc-1A2B3C4D")),
+        BadVpcRow {
+            case: "no VPCId member at all",
+            vpc_id: None,
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "an empty VPCId",
+            vpc_id: Some(""),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "an id with no vpc- prefix",
+            vpc_id: Some("9f8e7d6c"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "another resource kind's prefix",
+            vpc_id: Some("subnet-9f8e7d6c"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "one character short of the 8-character form",
+            vpc_id: Some("vpc-9f8e7d6"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "one character past the 8-character form",
+            vpc_id: Some("vpc-9f8e7d6c0"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "one character short of the 17-character form",
+            vpc_id: Some("vpc-0a1b2c3d4e5f6071"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "one character past the 17-character form",
+            vpc_id: Some("vpc-0a1b2c3d4e5f607182"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "a non-hexadecimal character in the id",
+            vpc_id: Some("vpc-9f8e7d6z"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "an uppercase id body",
+            vpc_id: Some("vpc-9F8E7D6C"),
+            region: Some(HOME_REGION),
+            code: "InvalidVPCId",
+        },
+        BadVpcRow {
+            case: "no VPCRegion member at all",
+            vpc_id: Some(CREATION_VPC),
+            region: None,
+            code: "InvalidInput",
+        },
+        // `VPC$VPCRegion` targets the modelled `VPCRegion` enum, so a value
+        // outside it is refused by the request boundary (which enforces every
+        // modelled constraint) before this handler runs — and Route 53 states
+        // that refusal under the one input error its model declares,
+        // `InvalidInput`, HTTP 400.
+        BadVpcRow {
+            case: "an empty VPCRegion",
+            vpc_id: Some(CREATION_VPC),
+            region: Some(""),
+            code: "InvalidInput",
+        },
+        BadVpcRow {
+            case: "a region the VPCRegion enum does not name",
+            vpc_id: Some(CREATION_VPC),
+            region: Some("mars-west-1"),
+            code: "InvalidInput",
+        },
+        BadVpcRow {
+            case: "a modelled region in the wrong case",
+            vpc_id: Some(CREATION_VPC),
+            region: Some("US-EAST-1"),
+            code: "InvalidInput",
+        },
     ];
 
     let router = router();
     let zone_id = create_private_zone(
         &router,
-        "bad-vpc.example.com",
+        "bad-vpc-disassociate.example.com",
         "disassociate-bad-vpc",
         CREATION_VPC,
     )
     .await;
-    let untouched = vec![(CREATION_VPC.to_string(), HOME_REGION.to_string())];
+    associate_ok(&router, &zone_id, "vpc-0a1b2c3d4e5f60718", "eu-north-1").await;
+    let untouched = associations(&get_zone(&router, &zone_id).await);
 
-    for (case, vpc_id) in rows {
-        let reply = disassociate(
-            &router,
-            &zone_id,
-            &vpc_block(vpc_id, Some(HOME_REGION)),
-            None,
-        )
-        .await;
+    for row in &rows {
+        let reply = disassociate(&router, &zone_id, &vpc_block(row.vpc_id, row.region), None).await;
         assert_eq!(
             reply.status, 400,
-            "case {case:?}: expected 400, got {} with body {}",
-            reply.status, reply.body
+            "case {:?}: expected 400, got {} with body {}",
+            row.case, reply.status, reply.body
         );
         assert_eq!(
             reply.error_code(),
-            "InvalidVPCId",
-            "case {case:?}: expected InvalidVPCId, got body {}",
+            row.code,
+            "case {:?}: expected {}, got body {}",
+            row.case,
+            row.code,
             reply.body
         );
-
         let read = get_zone(&router, &zone_id).await;
         let got = associations(&read);
         assert_eq!(
             got, untouched,
-            "case {case:?}: a refused request must leave the zone's associations at \
+            "case {:?}: a refused request must leave the zone's associations at \
              {untouched:?}, got {got:?}; body {}",
-            read.body
+            row.case, read.body
         );
     }
 }
@@ -677,13 +765,13 @@ async fn a_request_that_names_no_valid_vpc_is_refused() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn disassociating_a_vpc_from_an_unknown_zone_is_a_not_found() {
-    let router = router();
+async fn disassociating_from_an_unknown_zone_is_a_not_found() {
     // The rows differ along the id shape a caller might pass: the zone-id form,
     // an id of another shape entirely, and the id of a zone that was deleted.
+    let router = router();
     let doomed = create_private_zone(
         &router,
-        "deleted.example.com",
+        "deleted-disassociate.example.com",
         "disassociate-deleted",
         CREATION_VPC,
     )
@@ -726,6 +814,84 @@ async fn disassociating_a_vpc_from_an_unknown_zone_is_a_not_found() {
             "NoSuchHostedZone",
             "case {case:?}: expected NoSuchHostedZone, got body {}",
             reply.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6: association and disassociation are inverses
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_disassociated_vpc_can_be_associated_again() {
+    // The rows differ along the region the VPC is associated in the second
+    // time: the same one, and another of the modelled `VPCRegion` enum — the
+    // association is keyed by id, so the region is what the read reports back.
+    let rows = [
+        ("re-associated in the same region", "eu-west-3"),
+        ("re-associated in another region", "ap-east-1"),
+    ];
+
+    let router = router();
+    let zone_id = create_private_zone(
+        &router,
+        "inverse.example.com",
+        "disassociate-inverse",
+        CREATION_VPC,
+    )
+    .await;
+    let subject = "vpc-0f1e2d3c4b5a69788";
+
+    for (case, second_region) in rows {
+        associate_ok(&router, &zone_id, subject, "eu-west-3").await;
+        let with_subject = associations(&get_zone(&router, &zone_id).await);
+        assert!(
+            with_subject.contains(&(subject.to_string(), "eu-west-3".to_string())),
+            "case {case:?}: the subject must be associated first, got {with_subject:?}"
+        );
+
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some(subject), Some("eu-west-3")),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200, got {} with body {}",
+            reply.status, reply.body
+        );
+        let without = associations(&get_zone(&router, &zone_id).await);
+        assert_eq!(
+            without,
+            vec![(CREATION_VPC.to_string(), HOME_REGION.to_string())],
+            "case {case:?}: the set must be back to the creation association, got {without:?}"
+        );
+
+        associate_ok(&router, &zone_id, subject, second_region).await;
+        let again = associations(&get_zone(&router, &zone_id).await);
+        assert_eq!(
+            again,
+            vec![
+                (CREATION_VPC.to_string(), HOME_REGION.to_string()),
+                (subject.to_string(), second_region.to_string()),
+            ],
+            "case {case:?}: a freed place must take the VPC again, got {again:?}"
+        );
+
+        // Leave the zone as the next row expects it: only the creation VPC.
+        let reply = disassociate(
+            &router,
+            &zone_id,
+            &vpc_block(Some(subject), Some(second_region)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected 200 clearing the subject again, got {} with body {}",
+            reply.status, reply.body
         );
     }
 }
