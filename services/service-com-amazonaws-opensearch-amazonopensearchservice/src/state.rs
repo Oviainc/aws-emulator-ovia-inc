@@ -44,6 +44,8 @@ use crate::ops::types::{
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
+    PackageConfiguration, PackageDetails, PackageEncryptionOptions, PackageSource,
+    PackageVendingOptions,
     RecurringCharge, ReservedInstance,
     ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
@@ -221,8 +223,10 @@ pub const DATA_SOURCE_QUOTA: usize = 20;
 /// How long work this control plane starts takes before the clock owes its outcome:
 /// a domain stays `Processing` after the call that started it (`CreateDomain`, or an
 /// `UpdateDomainConfig` that changed something) for this long before it owes a
-/// settled, `Active` configuration, and an outbound cross-cluster connection stays
-/// `VALIDATING` for this long before it owes the next status of its lifecycle.
+/// settled, `Active` configuration, an outbound cross-cluster connection stays
+/// `VALIDATING` for this long before it owes the next status of its lifecycle, and a
+/// package stays `COPYING` for this long before it owes the status its copy left it
+/// in.
 ///
 /// OpenSearch Service takes many minutes; the emulator chooses a span, and it is
 /// deliberately NOT zero so a caller acting straight after the call still observes
@@ -493,17 +497,21 @@ pub const CONNECTION_QUOTA: usize = 20;
 /// size of that answer.
 pub const CONNECTION_STORE_QUOTA: usize = CONNECTION_QUOTA * DOMAIN_QUOTA;
 
-/// A status move the clock owes a connection: where the connection goes, what there
-/// is to say about it, and when it falls due.
+/// A status move the clock owes a record: where the record goes, what there is to
+/// say about it, and when it falls due.
 ///
 /// Stored on the record rather than waited for, so nothing sleeps: whichever later
-/// call reads the connection materialises the move if it is due by then.
+/// call reads the record materialises the move if it is due by then. Shared by every
+/// resource of this service that is minted in a transient status — a cross-cluster
+/// [`Connection`] being validated, a [`Package`] whose source is being copied — so
+/// one mechanism settles them all.
 #[derive(Debug, Clone)]
 pub struct OwedStatus {
-    /// The `OutboundConnectionStatusCode` the connection moves to.
+    /// The status value the record moves to, from whichever status enum its own
+    /// shape reports.
     pub status: String,
-    /// The `OutboundConnectionStatus$Message` that goes with it, where there is more
-    /// to say than the code itself.
+    /// What there is to say about that status beyond the code itself, where the
+    /// record's shape carries a message member and there is more to say.
     pub message: Option<String>,
     /// The instant the move falls due.
     pub due: SystemTime,
@@ -2051,6 +2059,166 @@ pub fn unknown_instance_type(member: &str, value: &str) -> ValidationException {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Packages
+//
+// A package is an ACCOUNT resource of this control plane rather than a
+// sub-resource of a domain: `CreatePackage` mints one and `DescribePackages`
+// reports it, before any domain is associated with it. [`Package`] below is the
+// ONE copy every package operation reads and writes, and [`Package::to_details`]
+// the single `PackageDetails` projection they report it through, so no two of them
+// can describe the same package differently.
+// ---------------------------------------------------------------------------
+
+/// `PackageStatus`'s `COPYING`: the package's content is being copied out of the
+/// Amazon S3 location the create named.
+pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
+
+/// `PackageStatus`'s `AVAILABLE`: the package's content is in place and the package
+/// can be associated with a domain.
+pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `PackageType`'s `ZIP-PLUGIN` value: the only type an engine version may be given
+/// for, because `CreatePackageRequest$EngineVersion` "can only be specified for
+/// package type ZIP-PLUGIN".
+pub const PACKAGE_TYPE_ZIP_PLUGIN: &str = "ZIP-PLUGIN";
+
+/// The `PackageVersion` a package's first available content carries.
+///
+/// `PackageVersion` is a plain string in the model and the version history is a
+/// SEQUENCE, so a package's versions are numbered from one and each update of its
+/// content adds the next number.
+pub const FIRST_PACKAGE_VERSION: u32 = 1;
+
+/// How many packages this account holds before `CreatePackage` refuses with the
+/// modelled `LimitExceededException`.
+///
+/// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it models
+/// neither Service Quotas nor an account's adjustments — and it is what stops a
+/// caller looping with fresh names from growing the state without end: every record
+/// it counts is released by deleting the package. Because the stored set IS what
+/// `DescribePackages` answers with, it also bounds the size of that answer.
+pub const PACKAGE_QUOTA: usize = 25;
+
+/// One custom package of this account, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct Package {
+    /// `PackageDetails$PackageID`: unique per package, so it IS the key the store
+    /// holds the record under.
+    pub package_id: String,
+    /// `PackageDetails$PackageName`: the name the create gave the package, unique
+    /// across the account's packages.
+    pub package_name: String,
+    /// `PackageDetails$PackageType`: one of `PackageType`'s values.
+    pub package_type: String,
+    /// `PackageDetails$PackageDescription`, absent when the create carried none.
+    pub description: Option<String>,
+    /// The Amazon S3 location the package's content was imported from. Stored as the
+    /// modelled shape rather than a second hand-written mirror of its members; no
+    /// read path reports it, because `PackageDetails` declares no member for it.
+    pub source: PackageSource,
+    /// Where the package is in its lifecycle: one of `PackageStatus`'s values.
+    pub status: String,
+    /// The status move the clock owes this package, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// Which numbered version of its content the package currently has, counting
+    /// from [`FIRST_PACKAGE_VERSION`].
+    pub version: u32,
+    /// `PackageDetails$EngineVersion`, absent for a package that is not tied to one.
+    pub engine_version: Option<String>,
+    /// `PackageDetails$AvailablePackageConfiguration`, absent when the create carried
+    /// no configuration.
+    pub configuration: Option<PackageConfiguration>,
+    /// `PackageDetails$PackageVendingOptions`, absent when the create carried none.
+    pub vending_options: Option<PackageVendingOptions>,
+    /// `PackageDetails$PackageEncryptionOptions`, absent when the create carried
+    /// none.
+    pub encryption_options: Option<PackageEncryptionOptions>,
+    /// The accounts the package is vended to, as `PackageUser` values. Empty until a
+    /// scope update allow-lists one.
+    pub allow_listed_users: Vec<String>,
+    /// `PackageDetails$PackageOwner`: the account the package belongs to.
+    pub owner: String,
+    /// `PackageDetails$CreatedAt`.
+    pub created_at: SystemTime,
+    /// `PackageDetails$LastUpdatedAt`: when the record last changed.
+    pub updated_at: SystemTime,
+}
+
+impl Package {
+    /// Materialise the status move the clock owes this package, if `now` is past its
+    /// due instant: a package whose content was being copied becomes one the copy has
+    /// left ready to use.
+    ///
+    /// This is the only write a reporting operation makes, and it writes only what was
+    /// already owed at the same instant had nobody called — which is also why the
+    /// record is stamped with the instant the move fell DUE rather than the instant of
+    /// the call that happened to observe it.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
+            return;
+        };
+        self.status = owed.status;
+        self.updated_at = owed.due;
+    }
+
+    /// This record as `PackageDetails` — the shape `CreatePackage` answers with and
+    /// the element shape `DescribePackages` reports, so a create's answer and a later
+    /// read of the package cannot disagree.
+    pub fn to_details(&self) -> PackageDetails {
+        PackageDetails {
+            package_id: Some(self.package_id.clone()),
+            package_name: Some(self.package_name.clone()),
+            package_type: Some(self.package_type.clone()),
+            package_description: self.description.clone(),
+            package_status: Some(self.status.clone()),
+            created_at: Some(datetime(self.created_at)),
+            last_updated_at: Some(datetime(self.updated_at)),
+            // "The package version", meaning the version a domain association would
+            // get: there is one only once the content is in place.
+            available_package_version: (self.status == PACKAGE_STATUS_AVAILABLE)
+                .then(|| self.version.to_string()),
+            // "Additional information if the package is in an error state" — this
+            // package is not, so there is nothing to report.
+            error_details: None,
+            engine_version: self.engine_version.clone(),
+            // The plugin's name, class and uncompressed size are read out of the
+            // descriptor inside the plugin's own archive, which this emulator does not
+            // fetch, so they stay absent rather than being invented.
+            available_plugin_properties: None,
+            available_package_configuration: self.configuration.clone(),
+            // "Lists the accounts that the package was shared with": reported only
+            // once the package has been shared with one.
+            allow_listed_user_list: (!self.allow_listed_users.is_empty())
+                .then(|| self.allow_listed_users.clone()),
+            package_owner: Some(self.owner.clone()),
+            package_vending_options: self.vending_options.clone(),
+            package_encryption_options: self.encryption_options.clone(),
+        }
+    }
+}
+
+/// The `PackageID` a create mints.
+///
+/// `PackageID` is pattern `^([FG][0-9]+)$|^(pkg-[a-f0-9]+)$`: the `[FG][0-9]+` form
+/// addresses a package the service itself publishes, so a package a CALLER creates
+/// takes the `pkg-` form, whose body is lowercase hexadecimal. The body is a v4 UUID
+/// in its unhyphenated rendering — the same generator as every other id this service
+/// mints ([`new_reserved_instance_id`]) in the only rendering this pattern admits —
+/// so no two packages share an id.
+pub fn new_package_id() -> String {
+    format!("pkg-{}", ::uuid::Uuid::new_v4().simple())
+}
+
+/// The `ResourceAlreadyExistsException` payload for a create naming a package the
+/// account already holds — the mirror of [`connection_alias_exists`], so one refusal
+/// reads like the other.
+pub fn package_name_exists(package_name: &str) -> ResourceAlreadyExistsException {
+    ResourceAlreadyExistsException {
+        message: Some(format!("Package already exists: {package_name}")),
+    }
+}
+
 /// Per-service state for com-amazonaws-opensearch-amazonopensearchservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -2090,6 +2258,12 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Drives
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_billing_subscription_id`].
     pub billing_subscription_seq: i64,
+    /// Every created package, keyed by its `PackageID` — unique per package, so the
+    /// id IS the key. `CreatePackage` mints one and `DescribePackages` reports it,
+    /// from THIS one record. Iterating a `BTreeMap` is order-stable, which is what
+    /// lets a paged read of the set resume where the previous page stopped without
+    /// repeating or skipping a record.
+    pub packages: BTreeMap<String, Package>,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -2107,6 +2281,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             default_application_arn: None,
             reserved_instances: BTreeMap::new(),
             billing_subscription_seq: 0,
+            packages: BTreeMap::new(),
         }
     }
 }
@@ -2200,6 +2375,32 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         for connection in self.connections.values_mut() {
             connection.settle(now);
         }
+    }
+
+    /// Materialise the status move the clock owes every stored package, for a caller
+    /// about to report on all of them.
+    pub fn settle_packages(&mut self, now: SystemTime) {
+        for package in self.packages.values_mut() {
+            package.settle(now);
+        }
+    }
+
+    /// The package `package_name` names, if the account holds one.
+    ///
+    /// The store is keyed by `PackageID`, but a package NAME is unique across the
+    /// account's packages, so this is the one lookup every operation that resolves a
+    /// name goes through.
+    pub fn package_named(&self, package_name: &str) -> Option<&Package> {
+        self.packages
+            .values()
+            .find(|package| package.package_name == package_name)
+    }
+
+    /// Store `package` and hand back the stored copy, so a create answers with the
+    /// record this service persisted rather than a copy beside it.
+    pub fn insert_package(&mut self, package: Package) -> &Package {
+        let id = package.package_id.clone();
+        self.packages.entry(id).or_insert(package)
     }
 
     /// The published offering whose `ReservedInstanceOfferingId` is `offering_id`.

@@ -934,13 +934,54 @@ fn decode_page_token(kind: PageTokenKind<'_>, token: &str) -> Option<String> {
     (page_token_tag(kind, &key) == tag).then_some(key)
 }
 
+/// The sentence every listing refuses a `NextToken` it never issued with.
+const UNISSUED_PAGE_TOKEN_MESSAGE: &str =
+    "NextToken is not a pagination token issued by this service.";
+
+/// The input member a page-token refusal names.
+const PAGE_TOKEN_MEMBER: &str = "NextToken";
+
+/// One page of `items` for the `kind` sequence, or the calling operation's own modelled
+/// `ValidationException` for a `token` that sequence never issued.
+///
+/// `wrap` is that operation's `ValidationException` variant and `token_requirement` the
+/// sentence its own `NextToken` field carries, so every paginated listing reports the
+/// unissued-token condition — the modelled 400 naming member [`PAGE_TOKEN_MEMBER`] with
+/// reason [`VALIDATION_REASON_FIELD_FAILED`] — through this ONE place and none of them can
+/// drift from the others. This is the only way to reach `page`, whose `None` is exactly
+/// that condition.
+pub fn page_or_token_refusal<T: Clone, E>(
+    kind: PageTokenKind<'_>,
+    items: &[(String, T)],
+    max_results: Option<i32>,
+    token: Option<&str>,
+    token_requirement: &str,
+    wrap: impl FnOnce(ValidationException) -> E,
+) -> Result<(Vec<T>, Option<String>), E> {
+    page(kind, items, max_results, token).ok_or_else(|| wrap(unissued_page_token(token_requirement)))
+}
+
+/// The modelled 400 a listing answers a `NextToken` it never issued with, carrying
+/// `token_requirement` as what the listing's own token must be.
+fn unissued_page_token(token_requirement: &str) -> ValidationException {
+    ValidationException {
+        message: UNISSUED_PAGE_TOKEN_MESSAGE.to_string(),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: PAGE_TOKEN_MEMBER.to_string(),
+            message: token_requirement.to_string(),
+        }]),
+    }
+}
+
 /// One page of `items` (ordered by their keys): at most `max_results` values starting at
 /// the key `token` names, plus the token that resumes immediately after the page.
 ///
-/// `None` when `token` was not issued by the `kind` sequence — the caller answers that
-/// with the modelled `ValidationException`. The returned token is `None` on the last
+/// `None` when `token` was not issued by the `kind` sequence. Private: a listing reaches
+/// it through [`page_or_token_refusal`], which turns that `None` into the one modelled
+/// refusal every listing of this service shares. The returned token is `None` on the last
 /// page, so a paginating client stops.
-pub fn page<T: Clone>(
+fn page<T: Clone>(
     kind: PageTokenKind<'_>,
     items: &[(String, T)],
     max_results: Option<i32>,

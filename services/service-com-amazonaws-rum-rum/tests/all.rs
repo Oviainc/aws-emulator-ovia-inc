@@ -19,6 +19,8 @@ mod app_monitor_lifecycle;
 mod authorization;
 #[path = "all/cw_log_delivery.rs"]
 mod cw_log_delivery;
+#[path = "all/list_app_monitors_page_size.rs"]
+mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/metric_definitions.rs"]

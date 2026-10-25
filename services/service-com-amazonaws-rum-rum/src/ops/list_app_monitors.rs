@@ -180,11 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` is modelled `range 1..100`, so the boundary validator has already
-        // refused anything outside it; an absent one pages at that maximum.
+        // refused anything outside it; an absent one pages at the documented default
+        // (`ListAppMonitorsRequest$MaxResults`: "The default is 50. The maximum that you
+        // can specify is 100.").
         let page_size = input
             .max_results
             .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
 
         let store = state.lock();
@@ -218,6 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The page this operation returns when the request names no `MaxResults`.
+/// From the model: `ListAppMonitorsRequest$MaxResults` documents "The default is 50."
+const DEFAULT_PAGE_SIZE: usize = 50;
 
 /// The largest page this operation returns: `MaxResults`' modelled maximum
 /// (`MaxResultsInteger`, range 1..100).
