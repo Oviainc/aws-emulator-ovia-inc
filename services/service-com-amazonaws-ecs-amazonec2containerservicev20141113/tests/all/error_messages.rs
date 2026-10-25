@@ -41,12 +41,21 @@ const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
 const SERVICE_NOT_FOUND: &str = "Service not found.";
 /// The fixed sentence for a `task` that names no task.
 const TASK_NOT_FOUND: &str = "The referenced task was not found";
-/// The fixed sentence for a `taskDefinition` that names no stored revision.
-const TASK_DEFINITION_NOT_FOUND: &str = "Unable to describe task definition.";
+/// The fixed sentence a READING operation answers for a `taskDefinition` that names no
+/// stored revision.
+const TASK_DEFINITION_NOT_DESCRIBABLE: &str = "Unable to describe task definition.";
+/// The fixed sentence an operation that would PUT a revision to work answers for the same
+/// condition: the sentence belongs to the call that was refused, not to the store it
+/// looked in.
+const TASK_DEFINITION_NOT_FOUND: &str = "TaskDefinition not found.";
 
 /// One row of an operation table: the operation's name and the request a row builds for
 /// it from the reference it is given.
 type OperationRow = (&'static str, fn(&str) -> Value);
+
+/// One row of the task-definition table: an [`OperationRow`] plus the sentence THAT
+/// operation answers for a reference naming no stored revision.
+type DefinitionRow = (&'static str, fn(&str) -> Value, &'static str);
 
 /// A router holding one cluster, one task-definition revision and one service.
 async fn fixture() -> MultiServiceRouter {
@@ -288,37 +297,46 @@ async fn a_task_definition_that_does_not_exist_is_refused_with_one_fixed_sentenc
             ),
         ),
     ];
-    let requests: [OperationRow; 4] = [
-        ("DescribeTaskDefinition", |reference| {
-            json!({ "taskDefinition": reference })
-        }),
-        ("RunTask", |reference| {
-            json!({ "cluster": CLUSTER, "taskDefinition": reference })
-        }),
-        ("CreateService", |reference| {
-            json!({
-                "cluster": CLUSTER,
-                "serviceName": "another-service",
-                "taskDefinition": reference,
-                "desiredCount": 1,
-            })
-        }),
-        ("UpdateService", |reference| {
-            json!({ "cluster": CLUSTER, "service": SERVICE, "taskDefinition": reference })
-        }),
+    // Each operation with the sentence IT answers: the describe reports that it cannot
+    // describe the revision, the three that would run or deploy it report that the
+    // revision was not found.
+    let requests: [DefinitionRow; 4] = [
+        (
+            "DescribeTaskDefinition",
+            |reference| json!({ "taskDefinition": reference }),
+            TASK_DEFINITION_NOT_DESCRIBABLE,
+        ),
+        (
+            "RunTask",
+            |reference| json!({ "cluster": CLUSTER, "taskDefinition": reference }),
+            TASK_DEFINITION_NOT_FOUND,
+        ),
+        (
+            "CreateService",
+            |reference| {
+                json!({
+                    "cluster": CLUSTER,
+                    "serviceName": "another-service",
+                    "taskDefinition": reference,
+                    "desiredCount": 1,
+                })
+            },
+            TASK_DEFINITION_NOT_FOUND,
+        ),
+        (
+            "UpdateService",
+            |reference| {
+                json!({ "cluster": CLUSTER, "service": SERVICE, "taskDefinition": reference })
+            },
+            TASK_DEFINITION_NOT_FOUND,
+        ),
     ];
 
-    for (operation, build) in requests {
+    for (operation, build, expected) in requests {
         for (form, reference) in &references {
             let case = format!("{operation} with an {form}");
             let answered = refusal(&router, operation, build(reference), &case).await;
-            assert_refusal(
-                answered,
-                "ClientException",
-                TASK_DEFINITION_NOT_FOUND,
-                reference,
-                &case,
-            );
+            assert_refusal(answered, "ClientException", expected, reference, &case);
         }
     }
 }

@@ -163,7 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The batch bound is a property of the REQUEST as a whole, so it is answered
         // before any name in it is looked up and before the answer allocates anything: a
         // caller that sent too many names learns that, rather than learning that one of
@@ -199,11 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // scoped to the lookups alone — bounded above by the batch bound — and the guard
         // is dropped before the answer is built.
         let (jobs, jobs_not_found) = {
+            let region = crate::state::request_region(ctx.parts());
             let store = state.lock();
             let mut jobs = Vec::new();
             let mut jobs_not_found = Vec::new();
             for name in &input.job_names {
-                match store.jobs.get(name) {
+                match store.job(&region, name) {
                     Some(entry) => jobs.push(entry.to_job()),
                     None => jobs_not_found.push(name.clone()),
                 }

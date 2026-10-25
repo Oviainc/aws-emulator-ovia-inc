@@ -50,7 +50,9 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long a status transition the clock owes takes to come due: `PENDING` ->
 /// `RUNNING` after `StartJobRun`, `CANCEL_PENDING` -> `CANCELLED` after `CancelJobRun`,
-/// `TERMINATING` -> `TERMINATED` after `DeleteVirtualCluster`.
+/// `TERMINATING` -> `TERMINATED` after `DeleteVirtualCluster`, and the terminal step each
+/// resource a torn-down cluster holds takes with it
+/// ([`ComAmazonawsEmrcontainersAwschicagowebserviceState::start_virtual_cluster_teardown`]).
 ///
 /// EMR on EKS documents no duration for any of them, so this span is the emulator's own
 /// choice. It is deliberately non-zero: a caller that reads straight after the call that
@@ -1601,6 +1603,76 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             record.state = now_state.to_string();
             record.pending = Some(PendingTransition::due(next_state));
             self.pending_job_runs.insert(id.to_string());
+        }
+    }
+
+    /// Move a stored managed endpoint of this cluster and region into `now_state` with
+    /// `next_state` owed to the clock.
+    pub fn move_managed_endpoint(
+        &mut self,
+        region: &str,
+        virtual_cluster_id: &str,
+        id: &str,
+        now_state: &'static str,
+        next_state: &'static str,
+    ) {
+        if let Some(record) = self.managed_endpoints.get_mut(id).filter(|record| {
+            record.region == region && record.virtual_cluster_id == virtual_cluster_id
+        }) {
+            record.state = now_state.to_string();
+            record.pending = Some(PendingTransition::due(next_state));
+            self.pending_managed_endpoints.insert(id.to_string());
+        }
+    }
+
+    /// Start the teardown of a stored virtual cluster of this region, CARRYING DOWN
+    /// everything that lives under it.
+    ///
+    /// The cluster moves to `TERMINATING` with `TERMINATED` owed to the clock, and in the
+    /// same step every managed endpoint and every job run it holds that has not already
+    /// reached a terminal state is given the terminal transition of its own kind: an
+    /// endpoint to `TERMINATING` with `TERMINATED` owed, a run to `CANCEL_PENDING` with
+    /// `CANCELLED` owed — the very two steps `CancelJobRun` writes. A child whose own
+    /// teardown or cancellation is already in flight keeps the transition it owes, so a
+    /// cascade never restarts one, and a child that has already finished keeps the state
+    /// (and the `finishedAt`) it finished in.
+    ///
+    /// The children go down WITH the parent because a managed endpoint is a gateway INTO a
+    /// virtual cluster and a job run runs IN one: neither can still be live in a cluster
+    /// that no longer exists to host it, which is the same premise `CreateManagedEndpoint`
+    /// and `StartJobRun` refuse new work on. It is also what lets the cluster reach the
+    /// retired form [`Self::reserve_virtual_cluster`] and [`Self::reserve_managed_endpoint`]
+    /// reclaim, rather than holding a slot for ever behind a child that never ends.
+    pub fn start_virtual_cluster_teardown(&mut self, region: &str, id: &str) {
+        // The children are read out of the store before anything is written, so the walk
+        // borrows the records it decides on and the moves below borrow them mutably.
+        let endpoints: Vec<String> = self
+            .cluster_managed_endpoints(id)
+            .filter(|record| {
+                !endpoint_state_is_terminal(&record.state) && record.state != ENDPOINT_TERMINATING
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        let runs: Vec<String> = self
+            .cluster_job_runs(id)
+            .filter(|record| {
+                !job_state_is_terminal(&record.state) && record.state != JOB_CANCEL_PENDING
+            })
+            .map(|record| record.id.clone())
+            .collect();
+
+        self.move_virtual_cluster(region, id, CLUSTER_TERMINATING, CLUSTER_TERMINATED);
+        for endpoint_id in endpoints {
+            self.move_managed_endpoint(
+                region,
+                id,
+                &endpoint_id,
+                ENDPOINT_TERMINATING,
+                ENDPOINT_TERMINATED,
+            );
+        }
+        for run_id in runs {
+            self.move_job_run(region, &run_id, JOB_CANCEL_PENDING, JOB_CANCELLED);
         }
     }
 

@@ -99,26 +99,37 @@ async fn a_catalog_this_account_does_not_hold_is_refused_and_writes_nothing() {
          with body {body}"
     );
     assert!(
-        error_code(&body).ends_with("InvalidInputException"),
-        "expected InvalidInputException, got {}",
+        error_code(&body).ends_with("AccessDeniedException"),
+        "expected AccessDeniedException, got {}",
         error_code(&body)
     );
 
-    // Nothing was written: neither that catalog nor this account's own holds it.
-    for read in [
-        json!({ "Name": "elsewhere", "CatalogId": unknown }),
-        json!({ "Name": "elsewhere" }),
-    ] {
-        let (status, body) = call(&router, "GetConnection", &read).await;
-        assert_eq!(
-            status, 400,
-            "case {read}: a refused create must have written nothing, got {status} with \
-             body {body}"
-        );
-        assert!(
-            error_code(&body).ends_with("EntityNotFoundException"),
-            "case {read}: expected EntityNotFoundException, got {}",
-            error_code(&body)
-        );
-    }
+    // Nothing was written: neither that catalog nor this account's own holds it. The
+    // read of the FOREIGN catalog is refused the same way the create was — the caller
+    // holds no grant on it — and this account's own catalog answers the miss.
+    let (status, body) = call(
+        &router,
+        "GetConnection",
+        &json!({ "Name": "elsewhere", "CatalogId": unknown }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a read of another account's catalog must be refused, got {status} with body {body}"
+    );
+    assert!(
+        error_code(&body).ends_with("AccessDeniedException"),
+        "expected AccessDeniedException, got {}",
+        error_code(&body)
+    );
+    let (status, body) = call(&router, "GetConnection", &json!({ "Name": "elsewhere" })).await;
+    assert_eq!(
+        status, 400,
+        "a refused create must have written nothing, got {status} with body {body}"
+    );
+    assert!(
+        error_code(&body).ends_with("EntityNotFoundException"),
+        "expected EntityNotFoundException, got {}",
+        error_code(&body)
+    );
 }

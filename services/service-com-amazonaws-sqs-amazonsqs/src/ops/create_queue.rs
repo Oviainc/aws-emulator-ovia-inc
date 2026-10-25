@@ -280,6 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
+        // Two attributes can each be valid and still not hold together, so the pair is
+        // judged over the set the queue would CARRY rather than over what this request
+        // supplied.
+        if let Some(error) = state::attribute_combination_refusal(&attributes) {
+            return Err(CreateQueueErrorModeled::InvalidAttributeValue(error).into());
+        }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             CreateQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
@@ -344,6 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             messages: ::std::collections::VecDeque::new(),
             handles: ::std::collections::HashMap::new(),
             deduplication: ::std::collections::BTreeMap::new(),
+            receive_attempts: ::std::collections::BTreeMap::new(),
             // Nothing has been sequenced yet, so the first message this queue
             // sequences gets the first sequence number.
             sequenced: 0,

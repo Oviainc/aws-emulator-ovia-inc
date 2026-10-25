@@ -7769,6 +7769,35 @@ pub fn resource_arn_rejection(arn: &str) -> String {
     }
 }
 
+/// The most tags one resource carries.
+///
+/// Neither the model nor this service's documentation carries a tags-per-resource
+/// figure, so — like [`PUBLISHING_DESTINATIONS_PER_DETECTOR`] — this is an
+/// EMULATOR-CHOSEN bound rather than a published quota: a 201st tag is refused
+/// here, where the real service may refuse it sooner. The number is taken from the
+/// map that both carries tags in and reports them (`TagMap` is `len 1..200` —
+/// `smithy_query(shape="TagMap")`), because a resource holding more than that
+/// could not be reported by the `Tags` member of its own read at all.
+///
+/// The same number BOUNDS the store on this path: a tag key is REQUEST-chosen, so
+/// without a ceiling a caller adding fresh keys to one resource could grow its
+/// map without limit — the hazard [`MAX_CLIENT_TOKENS`] guards for request-chosen
+/// token keys. Every other way a tag is stored is a create, whose whole `TagMap`
+/// is already bounded by the same 200.
+pub const TAGS_PER_RESOURCE: usize = 200;
+
+/// The message an add that would take a resource past [`TAGS_PER_RESOURCE`] tags
+/// is refused with. Like every other rejection here it names the limit and the
+/// resource it bounds, never the caller's keys — see
+/// [`publishing_destination_limit_message`]. The resource is named as "the
+/// resource" because `ResourceArn` reaches seven classes of them and the limit is
+/// the same for each.
+pub fn tag_limit_message() -> String {
+    format!(
+        "The request is rejected because the resource has reached the limit of {TAGS_PER_RESOURCE} tags."
+    )
+}
+
 impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// The tag map of the resource `arn` names, as `region`'s endpoint holds it,
     /// for an operation that WRITES tags.

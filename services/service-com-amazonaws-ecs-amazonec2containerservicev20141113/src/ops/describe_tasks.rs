@@ -174,10 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.tasks.len() > crate::state::MAX_DESCRIBE_BATCH {
             return Err(DescribeTasksErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "tasks must name at most {} tasks; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "tasks",
                         crate::state::MAX_DESCRIBE_BATCH,
-                        input.tasks.len()
                     )),
                 },
             )

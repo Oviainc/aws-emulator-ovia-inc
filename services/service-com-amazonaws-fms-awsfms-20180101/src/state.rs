@@ -279,6 +279,21 @@ pub const THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE: &str = "OFFBOARD_COMPLETE";
 /// [`crate::ops::types::MARKETPLACE_SUBSCRIPTION_ONBOARDING_STATUS_VALUES`].
 pub const MARKETPLACE_ONBOARDING_NO_SUBSCRIPTION: &str = "NO_SUBSCRIPTION";
 
+/// `MarketplaceSubscriptionOnboardingStatus` of an administrator whose
+/// subscription to the vendor is under way but not active yet: "in the process
+/// of subscribing to the third-party firewall service in the Amazon Web Services
+/// Marketplace, but doesn't yet have an active subscription"
+/// (`GetThirdPartyFirewallAssociationStatusResponse$MarketplaceOnboardingStatus`).
+/// One of [`crate::ops::types::MARKETPLACE_SUBSCRIPTION_ONBOARDING_STATUS_VALUES`].
+pub const MARKETPLACE_ONBOARDING_NOT_COMPLETE: &str = "NOT_COMPLETE";
+
+/// `MarketplaceSubscriptionOnboardingStatus` of an administrator that "has an
+/// active subscription to the third-party firewall service in the Amazon Web
+/// Services Marketplace"
+/// (`GetThirdPartyFirewallAssociationStatusResponse$MarketplaceOnboardingStatus`).
+/// One of [`crate::ops::types::MARKETPLACE_SUBSCRIPTION_ONBOARDING_STATUS_VALUES`].
+pub const MARKETPLACE_ONBOARDING_COMPLETE: &str = "COMPLETE";
+
 /// How long a third-party firewall association stays in a transient status
 /// (`ONBOARDING` / `OFFBOARDING`) before the clock makes the terminal one due.
 ///
@@ -516,6 +531,17 @@ impl ProtocolsListRecord {
 /// association that is onboarding or offboarding reaches its terminal status
 /// [`ASSOCIATION_SETTLE`] after the call that started it, whether or not anybody
 /// asks. Readers materialise it with [`Self::settle`]; nothing sleeps.
+///
+/// `marketplace_onboarding_status` is the vendor subscription's own status, which
+/// is reported beside the association's. The emulator holds no Marketplace, so
+/// there is no subscription state of its own to read: the value FOLLOWS the
+/// designation this record tracks — in flight while the designation is
+/// ([`MARKETPLACE_ONBOARDING_NOT_COMPLETE`]), active once it has completed
+/// ([`MARKETPLACE_ONBOARDING_COMPLETE`]) — and a vendor with no record at all
+/// has no subscription ([`MARKETPLACE_ONBOARDING_NO_SUBSCRIPTION`]). Tearing the
+/// association down does NOT touch it: removing the administrator from the
+/// vendor's tenant does not cancel a Marketplace subscription, so an offboarding
+/// or offboarded association keeps the subscription status it had.
 #[derive(Debug, Clone)]
 pub struct ThirdPartyFirewallRecord {
     pub status: String,
@@ -525,6 +551,19 @@ pub struct ThirdPartyFirewallRecord {
 }
 
 impl ThirdPartyFirewallRecord {
+    /// An association whose onboarding starts NOW: the designation is in flight,
+    /// so the status is `ONBOARDING` and the clock owes `ONBOARD_COMPLETE`
+    /// [`ASSOCIATION_SETTLE`] later. The subscription is in flight with it (see
+    /// the type's docs).
+    pub fn onboarding(now: SystemTime) -> Self {
+        Self {
+            status: THIRD_PARTY_FIREWALL_ONBOARDING.to_string(),
+            settles_to: Some(THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE.to_string()),
+            settles_at: Some(now + ASSOCIATION_SETTLE),
+            marketplace_onboarding_status: MARKETPLACE_ONBOARDING_NOT_COMPLETE.to_string(),
+        }
+    }
+
     /// Apply the clock-due transition: once `settles_at` has passed, the status
     /// IS the terminal one, because the transition was owed at that instant even
     /// if nobody had called. Materialising it is the ONLY write a reporting
@@ -536,6 +575,11 @@ impl ThirdPartyFirewallRecord {
             .then(|| self.settles_to.clone())
             .flatten();
         if let Some(status) = due {
+            if status == THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE {
+                // The designation completing is what makes the subscription
+                // active; see the type's docs.
+                self.marketplace_onboarding_status = MARKETPLACE_ONBOARDING_COMPLETE.to_string();
+            }
             self.status = status;
             self.settles_to = None;
             self.settles_at = None;
@@ -565,6 +609,32 @@ impl ThirdPartyFirewallRecord {
         self.status = THIRD_PARTY_FIREWALL_OFFBOARDING.to_string();
         self.settles_to = Some(THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE.to_string());
         self.settles_at = Some(now + ASSOCIATION_SETTLE);
+    }
+
+    /// Start designating the Firewall Manager administrator as a tenant
+    /// administrator of this vendor: the status becomes `ONBOARDING` now and the
+    /// clock owes `ONBOARD_COMPLETE` [`ASSOCIATION_SETTLE`] later. An
+    /// association that was torn down is designated again from here, which is
+    /// why this resets the record rather than only its status.
+    ///
+    /// Idempotent: an association that is already onboarding or onboarded has
+    /// nothing left to start, so its due instant is not pushed back by a second
+    /// call — the mirror of [`Self::start_offboarding`].
+    ///
+    /// A subscription that is already active is kept: re-designating the tenant
+    /// does not un-subscribe the administrator, so an active subscription never
+    /// regresses to "in the process of subscribing".
+    pub fn start_onboarding(&mut self, now: SystemTime) {
+        if self.status == THIRD_PARTY_FIREWALL_ONBOARDING
+            || self.status == THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE
+        {
+            return;
+        }
+        let subscription = self.marketplace_onboarding_status.clone();
+        *self = Self::onboarding(now);
+        if subscription == MARKETPLACE_ONBOARDING_COMPLETE {
+            self.marketplace_onboarding_status = subscription;
+        }
     }
 }
 

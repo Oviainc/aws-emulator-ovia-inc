@@ -27,6 +27,13 @@
 //! of this form, each inlined before this module existed and pinned by that service's own
 //! refusal suite; they are to be migrated onto this one rather than copied again, as
 //! `service-com-amazonaws-ses-simpleemailservice/src/state.rs` already has been.
+//!
+//! One service deliberately reads a DIFFERENT form, and is not a copy to migrate:
+//! `service-com-amazonaws-account-account` has an email-address `@pattern` in its OWN
+//! model, declared on one of its two address members and enforced there by the boundary
+//! validator, so it reads the other member against that declared expression and words
+//! both refusals with it. That is what keeps one service's two members one rule; a
+//! service whose model states no such expression reads against this module instead.
 
 /// The punctuation an ATOM of a local part may carry, beside the ASCII letters and
 /// digits: the RFC 5322 atom characters. The `.` that SEPARATES atoms is not one of

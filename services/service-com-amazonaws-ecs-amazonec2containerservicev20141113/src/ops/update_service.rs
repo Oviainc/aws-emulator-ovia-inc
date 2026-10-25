@@ -338,10 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.desired_count.is_some_and(|count| count < 0) {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "desiredCount must not be negative; got {:?}",
-                        input.desired_count
-                    )),
+                    message: Some(crate::state::DESIRED_COUNT_NEGATIVE_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -400,10 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested) = input.load_balancers.as_ref() {
             if requested.len() > crate::state::MAX_LOAD_BALANCERS {
                 return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                    message: Some(format!(
-                        "loadBalancers must name at most {} load balancers; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "load balancers",
                         crate::state::MAX_LOAD_BALANCERS,
-                        requested.len()
                     )),
                 })
                 .into());
@@ -500,23 +496,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let daemon = snapshot.scheduling_strategy == crate::state::SCHEDULING_DAEMON;
         let scheduler_owned = snapshot.places_tasks();
 
-        // "You can't change the cluster name" is the same rule for the controller: the
-        // deployment controller is chosen when the service is created.
-        if let Some(controller) = input.deployment_controller.as_ref() {
-            if controller.r#type != snapshot.controller() {
-                return Err(UpdateServiceErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "the deployment controller of service {name:?} is {} and \
-                             cannot be changed to {}",
-                            snapshot.controller(),
-                            controller.r#type
-                        )),
-                    },
-                )
-                .into());
-            }
+        // The deployment controller a service deploys through can be changed, but only on
+        // a service the new controller has something to take over: the controllers that are
+        // not the ECS scheduler deploy through a TASK SET, so the change requires the
+        // service to hold a `PRIMARY` one.
+        let requested_controller = input
+            .deployment_controller
+            .as_ref()
+            .filter(|controller| controller.r#type != snapshot.controller());
+        if requested_controller.is_some()
+            && !guard.service_has_primary_task_set(&cluster_name, &name)
+        {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::DEPLOYMENT_CONTROLLER_PRIMARY_TASK_SET_REQUIRED_MESSAGE
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
         }
+        let requested_controller = requested_controller.cloned();
 
         // "The daemon scheduling strategy deploys exactly one task on each active
         // container instance ... you don't need to specify a desired number of tasks":
@@ -629,10 +630,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        // The controller cannot be changed by an update, so a CODE_DEPLOY service that
-        // keeps its bindings stays legal; one whose update would leave it with none does
-        // not.
-        if snapshot.controller() == crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
+        // A CODE_DEPLOY-controlled service shifts traffic between two target groups, so it
+        // has to stay BEHIND a load balancer — whether it already deploys through that
+        // controller or this update moves it onto one.
+        let effective_controller = match requested_controller.as_ref() {
+            Some(controller) => controller.r#type.as_str(),
+            None => snapshot.controller(),
+        };
+        if effective_controller == crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
             && effective_bindings.is_empty()
         {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
@@ -781,6 +786,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration the NEW deployment rolls out.
         if redeploy && scheduler_owned {
             service.supersede_deployment(now);
+        }
+        if let Some(controller) = requested_controller {
+            service.deployment_controller = controller;
         }
         if let Some(count) = input.desired_count {
             service.desired_count = count;

@@ -62,24 +62,24 @@ const HOSTED: &str = "hosted";
 
 /// One AppConfig hierarchy, as its control plane minted it.
 #[derive(Debug, Clone)]
-struct Hierarchy {
-    application_id: String,
-    application_name: String,
-    environment_id: String,
-    environment_name: String,
-    profile_id: String,
-    profile_name: String,
+pub(crate) struct Hierarchy {
+    pub(crate) application_id: String,
+    pub(crate) application_name: String,
+    pub(crate) environment_id: String,
+    pub(crate) environment_name: String,
+    pub(crate) profile_id: String,
+    pub(crate) profile_name: String,
 }
 
 /// One emulator: the shared engine plus a router with the data plane and the control
 /// plane mounted.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -105,7 +105,7 @@ impl Emulator {
             .state::<ComAmazonawsAppconfigAmazonappconfigState>()
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &self,
         method: &str,
         path: &str,
@@ -126,7 +126,7 @@ impl Emulator {
         Reply::of(self.router.dispatch(request).await)
     }
 
-    async fn post_json(&self, path: &str, body: &str) -> Reply {
+    pub(crate) async fn post_json(&self, path: &str, body: &str) -> Reply {
         self.send(
             "POST",
             path,
@@ -152,14 +152,14 @@ impl Emulator {
             .await
     }
 
-    async fn get_latest_configuration(&self, token: &str) -> Reply {
+    pub(crate) async fn get_latest_configuration(&self, token: &str) -> Reply {
         self.get_configuration(Some(&format!("configuration_token={token}")))
             .await
     }
 
     /// Create an application, an environment and a hosted configuration profile
     /// through AppConfig's own operations, and answer the ids and names it minted.
-    async fn create_hierarchy(
+    pub(crate) async fn create_hierarchy(
         &self,
         application: &str,
         environment: &str,
@@ -192,7 +192,9 @@ impl Emulator {
         );
         let environment_id = created.string("Id");
 
-        let profile_id = self.create_profile(&application_id, profile).await;
+        let profile_id = self
+            .create_typed_profile(&application_id, profile, None)
+            .await;
 
         Hierarchy {
             application_id,
@@ -205,11 +207,27 @@ impl Emulator {
     }
 
     /// One more hosted configuration profile under an existing application.
-    async fn create_profile(&self, application_id: &str, profile: &str) -> String {
+    pub(crate) async fn create_profile(&self, application_id: &str, profile: &str) -> String {
+        self.create_typed_profile(application_id, profile, None)
+            .await
+    }
+
+    /// One more hosted configuration profile of a declared `Type` — `None` for a create
+    /// that declares none, which AppConfig stores as a freeform profile.
+    pub(crate) async fn create_typed_profile(
+        &self,
+        application_id: &str,
+        profile: &str,
+        profile_type: Option<&str>,
+    ) -> String {
+        let declared_type = match profile_type {
+            Some(profile_type) => format!(r#","Type":"{profile_type}""#),
+            None => String::new(),
+        };
         let created = self
             .post_json(
                 &format!("/applications/{application_id}/configurationprofiles"),
-                &format!(r#"{{"Name":"{profile}","LocationUri":"{HOSTED}"}}"#),
+                &format!(r#"{{"Name":"{profile}","LocationUri":"{HOSTED}"{declared_type}}}"#),
             )
             .await;
         assert_eq!(
@@ -225,7 +243,7 @@ impl Emulator {
     /// Write a hosted configuration version and deploy it, as a client sets a
     /// configuration up: the version number AppConfig minted is what the deployment
     /// names.
-    async fn deploy(
+    pub(crate) async fn deploy(
         &self,
         hierarchy: &Hierarchy,
         profile_id: &str,
@@ -317,7 +335,12 @@ impl Emulator {
     }
 
     /// Start a session over a triple, named however the caller spells it.
-    async fn session_token(&self, application: &str, environment: &str, profile: &str) -> String {
+    pub(crate) async fn session_token(
+        &self,
+        application: &str,
+        environment: &str,
+        profile: &str,
+    ) -> String {
         let reply = self
             .start_configuration_session(&format!(
                 r#"{{"ApplicationIdentifier":"{application}",
@@ -336,10 +359,10 @@ impl Emulator {
 }
 
 /// A dispatched response, reduced to what the assertions read.
-struct Reply {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Bytes,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Bytes,
 }
 
 impl Reply {
@@ -362,24 +385,24 @@ impl Reply {
         }
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(header, _)| header == name)
             .map(|(_, value)| value.as_str())
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("response body is not JSON ({e}): {}", self.text()))
     }
 
     /// One top-level string member of a JSON response body.
-    fn string(&self, member: &str) -> String {
+    pub(crate) fn string(&self, member: &str) -> String {
         self.json()[member]
             .as_str()
             .unwrap_or_else(|| panic!("no {member} in {}", self.text()))
@@ -390,7 +413,7 @@ impl Reply {
         self.string("InitialConfigurationToken")
     }
 
-    fn next_token(&self) -> String {
+    pub(crate) fn next_token(&self) -> String {
         self.header("next-poll-configuration-token")
             .unwrap_or_else(|| {
                 panic!(

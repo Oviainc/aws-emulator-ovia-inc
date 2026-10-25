@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, TaggedResourceKind, DEFAULT_JOB_MODE,
-    DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5,
+    DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_PYTHON_SHELL_DPUS, DEFAULT_SPARK_DPUS,
+    DEFAULT_SPARK_WORKERS, DEFAULT_SPARK_WORKER_TYPE, DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5,
     DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4, MAX_TIMEOUT_MINUTES,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -195,6 +196,12 @@ async fn an_update_overwrites_the_whole_job_definition() {
                 // "the timeout is defaulted to 2,880 minutes for Glue version 4.0 and
                 // earlier"
                 "Timeout": DEFAULT_TIMEOUT_MINUTES_THROUGH_GLUE_4,
+                // The submitted definition names no capacity, so the service fills in the
+                // documented default for its command: "When you specify a Python shell job
+                // … you can allocate either 0.0625 or 1 DPU. The default is 0.0625 DPU."
+                "MaxCapacity": DEFAULT_PYTHON_SHELL_DPUS,
+                // A fraction of a DPU is no whole DPU.
+                "AllocatedCapacity": 0,
             }),
         },
         UpdateRow {
@@ -211,6 +218,12 @@ async fn an_update_overwrites_the_whole_job_definition() {
                 "GlueVersion": "5.0",
                 // "or 480 minutes for Glue version 5.0 and later"
                 "Timeout": DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5,
+                // No capacity named on a Spark job, so the documented ten DPUs, which
+                // from Glue 2.0 on are ten G.1X workers.
+                "WorkerType": DEFAULT_SPARK_WORKER_TYPE,
+                "NumberOfWorkers": DEFAULT_SPARK_WORKERS,
+                "MaxCapacity": DEFAULT_SPARK_DPUS,
+                "AllocatedCapacity": DEFAULT_SPARK_WORKERS,
             }),
         },
         UpdateRow {
@@ -446,8 +459,7 @@ async fn an_update_keeps_what_a_job_update_cannot_carry() {
         let state = engine.state::<ComAmazonawsGlueAwsglueState>();
         let mut store = state.lock();
         let job = store
-            .jobs
-            .get_mut(name)
+            .job_mut(crate::wire::REGION, name)
             .unwrap_or_else(|| panic!("the store must hold job {name:?}"));
         job.created_on = seeded;
         job.last_modified_on = seeded;

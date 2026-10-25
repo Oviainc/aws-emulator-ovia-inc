@@ -43,6 +43,8 @@ mod capacity_providers;
 mod code_signing_config_update;
 #[path = "all/code_signing_configs.rs"]
 mod code_signing_configs;
+#[path = "all/concurrency_quota_refusal_rules.rs"]
+mod concurrency_quota_refusal_rules;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
 #[path = "all/event_source_mapping_update.rs"]

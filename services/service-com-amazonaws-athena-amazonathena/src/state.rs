@@ -270,16 +270,14 @@ pub fn table_not_found(table_name: &str) -> String {
     format!("Table does not exist: {table_name}")
 }
 
-/// The refusal message for a listing whose `Expression` carries more wildcards than the
-/// catalog matches against every stored name
-/// ([`glue_state::MAX_PATTERN_WILDCARDS`]). Beside the other refusal sentences of this
-/// slice, so a reader of the pattern language is told the same thing wherever it is
+/// The refusal message for a listing whose `Expression` is no pattern the catalog can
+/// match: a value that is not a valid regular expression, or one whose compiled matcher
+/// would be larger than the catalog compiles
+/// ([`glue_state::MAX_PATTERN_PROGRAM_BYTES`]). Beside the other refusal sentences of
+/// this slice, so a reader of the pattern language is told the same thing wherever it is
 /// matched.
-pub fn too_many_pattern_wildcards(wildcards: usize) -> String {
-    format!(
-        "Expression carries {wildcards} wildcards, more than the {} this catalog matches",
-        glue_state::MAX_PATTERN_WILDCARDS
-    )
+pub fn malformed_pattern(pattern: &str, reason: &impl ::std::fmt::Display) -> String {
+    format!("Expression {pattern:?} is not a valid regular expression: {reason}")
 }
 
 /// One stored Glue table as the `TableMetadata` Athena reports for it.

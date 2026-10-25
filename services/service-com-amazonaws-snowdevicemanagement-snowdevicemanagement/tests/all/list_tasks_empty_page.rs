@@ -38,7 +38,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::state::{
-    encode_token, service_state,
+    encode_token, service_state, CursorScope,
 };
 use service_com_amazonaws_snowdevicemanagement_snowdevicemanagement::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -105,15 +105,30 @@ struct Shape {
     uri: String,
 }
 
+/// A `ListTasks` cursor for `region` that resumes after every task id this store
+/// mints, so it is a token this service really would have issued — for the unfiltered
+/// listing of that Region — and resumes past the end of it.
+///
+/// A cursor is bound to the enumeration it was issued for (the operation, the signed
+/// Region and the filters), so it is minted through that scope rather than from a bare
+/// resume key.
+fn past_the_end_token(region: &str) -> String {
+    encode_token(
+        &CursorScope {
+            operation: "ListTasks",
+            region,
+            filters: &[None],
+        },
+        "zzzzzzzzzzzzzzzz",
+    )
+}
+
 /// The `ListTasks` request shapes every row of this suite is asked in: no filter,
 /// each `TaskState`, both modelled `maxResults` bounds and one between them, and a
 /// resume token that names a key past every task id this store mints — on its own and
 /// combined with a page size.
-fn request_shapes() -> Vec<Shape> {
-    // A resume key lexically after every task id the store mints, encoded the way this
-    // service encodes one, so the token is a well-formed `NextToken` that resumes past
-    // the end of the listing.
-    let past_the_end = encode_token("zzzzzzzzzzzzzzzz");
+fn request_shapes(region: &str) -> Vec<Shape> {
+    let past_the_end = past_the_end_token(region);
     let mut shapes = vec![Shape {
         case: "no filter".to_string(),
         uri: "/tasks".to_string(),
@@ -278,7 +293,7 @@ async fn a_region_with_devices_and_no_task_answers_every_request_shape_with_an_e
             "case {region:?}: the activation seam put {devices} devices in the Region, got \
              {activated:?}"
         );
-        for shape in request_shapes() {
+        for shape in request_shapes(region) {
             let case = format!("{} devices in {region}, {}", devices, shape.case);
             let answer = call(&router, region, "GET", &shape.uri, None).await;
             assert_empty_page(&answer, &case);
@@ -329,7 +344,7 @@ async fn a_filter_that_matches_no_stored_task_is_an_empty_page_not_a_refusal() {
     for uri in [
         "/tasks?state=CANCELED",
         "/tasks?state=CANCELED&maxResults=1",
-        &format!("/tasks?nextToken={}", encode_token("zzzzzzzzzzzzzzzz")),
+        &format!("/tasks?nextToken={}", past_the_end_token(region)),
     ] {
         let case = format!("{} stored tasks, {uri}", created.len());
         let answer = call(&router, region, "GET", uri, None).await;
@@ -391,7 +406,7 @@ async fn activating_a_device_turns_the_regions_refusal_into_the_empty_page() {
     activate_in(&engine, stocked, devices);
 
     let mut messages: Vec<String> = Vec::new();
-    for shape in request_shapes() {
+    for shape in request_shapes(gated) {
         let case = format!("{} before activation, {}", gated, shape.case);
         let answer = call(&router, gated, "GET", &shape.uri, None).await;
         messages.push(assert_gated(&answer, &case));
@@ -406,7 +421,7 @@ async fn activating_a_device_turns_the_regions_refusal_into_the_empty_page() {
 
     activate_in(&engine, gated, 1);
 
-    for shape in request_shapes() {
+    for shape in request_shapes(gated) {
         let case = format!("{} after activation, {}", gated, shape.case);
         let answer = call(&router, gated, "GET", &shape.uri, None).await;
         assert_empty_page(&answer, &case);

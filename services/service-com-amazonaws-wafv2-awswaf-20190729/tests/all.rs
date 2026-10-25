@@ -61,6 +61,8 @@ mod regex_pattern_set_updates;
 mod response_members;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
+#[path = "all/rule_group_updates.rs"]
+mod rule_group_updates;
 #[path = "all/sampled_requests.rs"]
 mod sampled_requests;
 #[path = "all/settlement_records.rs"]

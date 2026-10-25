@@ -4,8 +4,8 @@
 //!
 //! This holds the cluster lifecycle slice: `CreateCluster` and `RegisterCluster`
 //! write a [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`,
-//! `TagResource`, `ListTagsForResource` and `DeleteCluster` all compute their
-//! responses from it. Nothing in `src/ops/` keeps a second copy of a cluster.
+//! `TagResource`, `UntagResource`, `ListTagsForResource` and `DeleteCluster` all
+//! compute their responses from it. Nothing in `src/ops/` keeps a second copy of a cluster.
 //!
 //! It also holds the managed node group slice: `CreateNodegroup` writes a
 //! [`NodegroupRecord`] here and `DescribeNodegroup` computes its whole response

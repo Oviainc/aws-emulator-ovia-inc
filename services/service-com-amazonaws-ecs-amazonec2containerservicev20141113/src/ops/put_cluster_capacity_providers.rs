@@ -195,10 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the other, so the magnitudes are capped BEFORE any of that work: Amazon ECS
         // quotas the capacity providers a cluster may hold, and the default strategy
         // cannot be longer, since each of its entries must name one of them.
-        for (member, len) in [
-            ("capacityProviders", input.capacity_providers.len()),
+        for (entries, len) in [
+            ("capacity providers", input.capacity_providers.len()),
             (
-                "defaultCapacityProviderStrategy",
+                "default capacity provider strategy entries",
                 input.default_capacity_provider_strategy.len(),
             ),
         ] {
@@ -206,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
                         InvalidParameterException {
-                            message: Some(format!(
-                                "{member} must name at most {} capacity providers; got {len}",
-                                crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS
+                            message: Some(crate::state::at_most_items_message(
+                                entries,
+                                crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
                             )),
                         },
                     )

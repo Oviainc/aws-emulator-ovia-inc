@@ -495,6 +495,8 @@ async fn the_batch_follows_the_store() {
         .state::<ComAmazonawsGlueAwsglueState>()
         .lock()
         .jobs
+        .get_mut(crate::wire::REGION)
+        .expect("the Region's job definitions")
         .remove("transient");
     let (found, missing) = batch_get(&router, &["transient"]).await;
     assert!(

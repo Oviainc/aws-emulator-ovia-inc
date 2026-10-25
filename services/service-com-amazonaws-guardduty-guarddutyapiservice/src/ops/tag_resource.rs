@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the tags the request carries to the resource its `ResourceArn`
+//! names, and persists nothing else.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The map is MERGED, by key: a key the resource does not carry starts being carried,
+//! a key it already carries takes the request's value, and a key the request does not
+//! name is left exactly as it was — so adding is idempotent and a repeated call
+//! changes nothing. `UntagResource` is what removes a key.
+//!
+//! The ARN is resolved — not parsed and trusted — through
+//! [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::tagged_resource_tags_mut`],
+//! the same seam `UntagResource` writes through, which hands back the tag map on the
+//! resource's OWN record: a later
+//! `GetDetector`/`GetFilter`/`GetIPSet`/`GetThreatIntelSet`/`GetTrustedEntitySet`/
+//! `GetThreatEntitySet`/`DescribePublishingDestination` reports exactly the map this
+//! call left behind.
+//!
+//! An ARN this endpoint resolves no resource for is refused with HTTP 400 under the
+//! `InvalidInputException` class rather than answered with a hollow 204, and so is an
+//! add that would take the resource past [`crate::state::TAGS_PER_RESOURCE`] tags.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +150,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+        let Some(tags) = state.tagged_resource_tags_mut(&region, &input.resource_arn) else {
+            // Classified from the REQUEST, the way every other unresolvable
+            // reference on this service is classified, and without echoing the ARN.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::resource_arn_rejection(&input.resource_arn),
+            ));
+        };
+
+        // How many keys this request would ADD: a key the resource already carries is
+        // overwritten rather than appended, so it grows the map by nothing. Counted
+        // before anything is written, so a refused add persists none of the request's
+        // tags — not even the ones that would have fitted.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(key.as_str()))
+            .count();
+        if tags.len() + added > crate::state::TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::tag_limit_message(),
+            ));
+        }
+
+        // "Adds tags to a resource" (this operation's own documentation): `Tags` is
+        // "the tags to be added to a resource", so the request's map is merged into the
+        // resource's by key. A key already carried takes the request's value — the tags
+        // the request asks for are the tags the resource ends up with — and a key the
+        // request does not name keeps whatever it had, which is what makes this call
+        // additive rather than a replacement of the whole map.
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(TagResourceOutput {})
     }
 }

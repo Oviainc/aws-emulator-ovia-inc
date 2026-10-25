@@ -362,14 +362,14 @@ async fn an_unreadable_version_is_refused() {
             "EntityNotFoundException",
         ),
         (
-            "a catalog this emulator does not hold",
+            "a catalog of another account, which no resource policy grants",
             json!({
                 "CatalogId": "999999999999",
                 "DatabaseName": "refusing_db",
                 "TableName": TABLE,
                 "VersionId": "0",
             }),
-            "EntityNotFoundException",
+            "AccessDeniedException",
         ),
     ];
 

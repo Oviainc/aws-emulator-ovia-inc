@@ -47,6 +47,8 @@ mod get_composition;
 mod get_encoder_configuration;
 #[path = "all/get_participant.rs"]
 mod get_participant;
+#[path = "all/get_stage_session.rs"]
+mod get_stage_session;
 #[path = "all/ingest_configurations.rs"]
 mod ingest_configurations;
 #[path = "all/list_participant_replicas_paging.rs"]

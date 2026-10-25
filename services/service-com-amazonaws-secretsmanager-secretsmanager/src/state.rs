@@ -421,6 +421,29 @@ pub const REPLICAS_PER_SECRET: usize = 64;
 /// is what the service reports back in a `ReplicationStatusType`.
 pub const DEFAULT_KMS_KEY_ALIAS: &str = "alias/aws/secretsmanager";
 
+/// The key id Secrets Manager reports for a secret version encrypted under the
+/// account's default Secrets Manager key.
+///
+/// "If you don't specify this value, then Secrets Manager uses the key
+/// `aws/secretsmanager`." (`CreateSecretRequest$KmsKeyId`, this service's
+/// Smithy model.) Where the service reports the keys a version is encrypted
+/// under (`SecretVersionsListEntry$KmsKeyIds`) it does not name that key by id
+/// or by alias: it names it with this one token, so a caller can tell a version
+/// on the account default key from one on a key of the secret's own.
+pub const DEFAULT_ENCRYPTION_KEY_ID: &str = "DefaultEncryptionKey";
+
+/// Whether `kms_key_id` names the account's default Secrets Manager key —
+/// [`DEFAULT_KMS_KEY_ALIAS`] — rather than a key of the secret's own.
+///
+/// The alias prefix is optional in a request ("An alias is always prefixed by
+/// `alias/`", `CreateSecretRequest$KmsKeyId`), so both forms of that one alias
+/// name the same key, and a secret that names it is on the account default key
+/// exactly as one that names no key at all is.
+pub fn names_default_kms_key(kms_key_id: &str) -> bool {
+    let unprefixed = |key: &str| key.strip_prefix("alias/").unwrap_or(key).to_string();
+    unprefixed(kms_key_id) == unprefixed(DEFAULT_KMS_KEY_ALIAS)
+}
+
 /// `ReplicationStatusType$Status` while the replica is being created
 /// (`StatusType`, this service's Smithy model).
 pub const REPLICA_STATUS_IN_PROGRESS: &str = "InProgress";
@@ -820,6 +843,15 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+/// `at` truncated to midnight UTC, the resolution the service reports an access
+/// date at: "Note that the resolution of this field is at the date level and
+/// does not include the time." (`SecretVersionsListEntry$LastAccessedDate`,
+/// this service's Smithy model.)
+pub fn start_of_day(at: SystemTime) -> SystemTime {
+    let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    UNIX_EPOCH + Duration::from_secs(since_epoch - since_epoch % SECONDS_PER_DAY)
+}
+
 /// The instant a recovery window of `days` started at `from` elapses.
 ///
 /// TOTAL for any value a request can carry. `DeleteSecret` already refuses a
@@ -1011,6 +1043,10 @@ pub struct SecretVersion {
     pub secret_binary: Option<Vec<u8>>,
     pub version_stages: Vec<String>,
     pub created_date: SystemTime,
+    /// The date this version's value was last retrieved, at the resolution the
+    /// service reports it (see [`Secret::record_access`]); `None` while it has
+    /// never been retrieved.
+    pub last_accessed_date: Option<SystemTime>,
 }
 
 impl SecretVersion {
@@ -1032,7 +1068,33 @@ impl SecretVersion {
     /// The version's staging labels for the wire, omitted while it carries none
     /// (`SecretVersionStagesType` is modelled with a minimum length of 1).
     pub fn stages_out(&self) -> Option<Vec<String>> {
-        (!self.version_stages.is_empty()).then(|| self.version_stages.clone())
+        (!self.version_stages.is_empty()).then(|| self.stages_in_report_order())
+    }
+
+    /// The version's staging labels in the one order the service reports them:
+    /// the labels it moves itself first, in the order its own lifecycle names
+    /// them ([`STAGE_CURRENT`], then [`STAGE_PENDING`], then
+    /// [`STAGE_PREVIOUS`]), and then the labels a caller attached, in the order
+    /// they were attached.
+    ///
+    /// A version can carry several labels at once — "the AWSPENDING staging
+    /// label might be attached to the same version as the AWSCURRENT version"
+    /// (`RotateSecret`, this service's Smithy model) — and what it reports is
+    /// the same list however the labels got there, rather than the order in
+    /// which they happened to be moved onto it.
+    pub fn stages_in_report_order(&self) -> Vec<String> {
+        let mut ordered: Vec<String> = [STAGE_CURRENT, STAGE_PENDING, STAGE_PREVIOUS]
+            .into_iter()
+            .filter(|stage| self.has_stage(stage))
+            .map(str::to_string)
+            .collect();
+        ordered.extend(
+            self.version_stages
+                .iter()
+                .filter(|stage| !is_reserved_stage(stage))
+                .cloned(),
+        );
+        ordered
     }
 
     /// How many of the staging labels on this version a CALLER named: the ones
@@ -1189,6 +1251,48 @@ impl Secret {
         self.versions.iter().find(|v| v.version_id == version_id)
     }
 
+    /// The keys every version of this secret is encrypted under: the key the
+    /// secret names, or [`DEFAULT_ENCRYPTION_KEY_ID`] for a secret left on the
+    /// account's default Secrets Manager key, which is the key one that names
+    /// none is encrypted with (`CreateSecretRequest$KmsKeyId`, this service's
+    /// Smithy model). This is `SecretVersionsListEntry$KmsKeyIds`, "the KMS
+    /// keys used to encrypt the secret version", and it is never empty: every
+    /// version is encrypted under some key.
+    pub fn encryption_key_ids(&self) -> Vec<String> {
+        match self
+            .kms_key_id
+            .as_deref()
+            .filter(|key| !names_default_kms_key(key))
+        {
+            Some(key) => vec![key.to_string()],
+            None => vec![DEFAULT_ENCRYPTION_KEY_ID.to_string()],
+        }
+    }
+
+    /// Record that the value of the version `version_id` was retrieved at `at`.
+    ///
+    /// `LastAccessedDate` is "the date that the secret was last accessed in the
+    /// Region. This field is omitted if the secret has never been retrieved in
+    /// the Region." (`DescribeSecretResponse$LastAccessedDate`, this service's
+    /// Smithy model), so it is retrieving a value that sets it — on the version
+    /// whose value was read and on the secret that holds it. It is stored at
+    /// the resolution the service reports it at (see [`start_of_day`]), so
+    /// repeated retrievals on one day leave it where it is.
+    ///
+    /// Nothing else about the secret moves: a retrieval changes no value, no
+    /// staging label and no attribute, so `LastChangedDate` stays put.
+    pub fn record_access(&mut self, version_id: &str, at: SystemTime) {
+        let date = start_of_day(at);
+        if let Some(version) = self
+            .versions
+            .iter_mut()
+            .find(|version| version.version_id == version_id)
+        {
+            version.last_accessed_date = Some(date);
+        }
+        self.last_accessed_date = Some(date);
+    }
+
     /// The one version carrying `stage`.
     pub fn version_with_stage(&self, stage: &str) -> Option<&SecretVersion> {
         self.versions.iter().find(|v| v.has_stage(stage))
@@ -1211,7 +1315,7 @@ impl Secret {
             .versions
             .iter()
             .filter(|v| !v.version_stages.is_empty())
-            .map(|v| (v.version_id.clone(), v.version_stages.clone()))
+            .map(|v| (v.version_id.clone(), v.stages_in_report_order()))
             .collect();
         if let Some(reserved) = self.reserved_pending_version_id() {
             map.insert(reserved.to_string(), vec![STAGE_PENDING.to_string()]);

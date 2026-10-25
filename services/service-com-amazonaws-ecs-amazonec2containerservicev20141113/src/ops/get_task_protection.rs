@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTaskProtection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTaskProtection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retrieves the protection status of tasks in an Amazon ECS service.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTaskProtection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the protection it reports is the one the stored task holds, and the
+//! only thing the call materialises is the expiry the CLOCK had already made due (the
+//! state's clock pass), which was owed at that instant whether or not anybody read it.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTaskProtection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTaskProtectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTaskProtection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTaskProtectionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // The list is caller-supplied and every entry costs a lookup, so it is bounded
+        // before any per-entry work and before the store is locked, at the size the member
+        // documents.
+        let references = input.tasks.clone().unwrap_or_default();
+        if references.len() > crate::state::MAX_GET_TASK_PROTECTION_TASKS {
+            return Err(GetTaskProtectionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "tasks",
+                        crate::state::MAX_GET_TASK_PROTECTION_TASKS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(GetTaskProtectionErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A request that names no task asks about the whole cluster, so every task of it
+        // a protection call may act on is reported; one that names tasks is answered
+        // entry by entry, and the same id repeated names one task.
+        if references.is_empty() {
+            let mut protected_tasks: Vec<ProtectedTask> = guard
+                .tasks
+                .values()
+                .filter(|task| task.cluster_name == cluster_name && task.is_protectable())
+                .map(crate::state::TaskRecord::protection_view)
+                .collect();
+            protected_tasks.sort_by(|left, right| left.task_arn.cmp(&right.task_arn));
+            return Ok(GetTaskProtectionOutput {
+                protected_tasks: Some(protected_tasks),
+                failures: Some(Vec::new()),
+            });
+        }
+
+        let mut protected_tasks = Vec::new();
+        let mut failures = Vec::new();
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &references {
+            let task_arn =
+                crate::state::task_arn_from_reference(&region, &cluster_name, reference);
+            if !seen.insert(task_arn.clone()) {
+                continue;
+            }
+            match guard
+                .tasks
+                .get(&task_arn)
+                .filter(|task| task.cluster_name == cluster_name)
+            {
+                // "This operation is only supported for tasks belonging to an Amazon ECS
+                // service": a standalone task is a task this call cannot answer for, which
+                // is the failure reason it carries rather than a refusal of the whole call.
+                Some(task) if !task.is_protectable() => failures.push(Failure {
+                    arn: Some(task_arn.clone()),
+                    reason: Some(crate::state::FAILURE_TASK_NOT_VALID.to_string()),
+                    detail: None,
+                }),
+                Some(task) => protected_tasks.push(task.protection_view()),
+                None => failures.push(crate::state::missing_failure(&task_arn)),
+            }
+        }
+
+        Ok(GetTaskProtectionOutput {
+            protected_tasks: Some(protected_tasks),
+            failures: Some(failures),
+        })
     }
 }

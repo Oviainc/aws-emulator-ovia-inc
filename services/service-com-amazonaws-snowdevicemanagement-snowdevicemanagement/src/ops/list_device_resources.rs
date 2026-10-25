@@ -170,19 +170,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The token carries the resource id the next page resumes at; a value this
-        // service never issued is refused rather than silently serving page one.
+        // The token is an opaque cursor this operation minted for THIS enumeration:
+        // the resources of ONE device in the signed Region, narrowed by the `type` the
+        // previous page was served under. A value this service never issued — and one
+        // it issued for another operation, Region, device or filter — names no position
+        // here and is refused rather than reinterpreted as a resume key.
+        let cursor = crate::state::CursorScope {
+            operation: Self::NAME,
+            region: &region,
+            filters: &[
+                Some(input.managed_device_id.as_str()),
+                input.r#type.as_deref(),
+            ],
+        };
         let resume_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_token(token) {
+            Some(token) => match crate::state::decode_token(token, &cursor) {
                 Some(key) => Some(key),
                 None => {
                     return Err(ListDeviceResourcesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token:?} is not a token returned by ListDeviceResources"
-                            ),
-                        },
+                        crate::state::invalid_next_token(Self::NAME),
                     )
                     .into())
                 }
@@ -230,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if resources.len() == page_size {
-                next_token = Some(crate::state::encode_token(instance_id));
+                next_token = Some(crate::state::encode_token(&cursor, instance_id));
                 break;
             }
             resources.push(summary);
