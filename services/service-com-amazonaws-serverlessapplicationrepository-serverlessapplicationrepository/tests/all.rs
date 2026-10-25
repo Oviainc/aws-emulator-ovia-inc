@@ -21,6 +21,8 @@ mod application_policies;
 mod applications;
 #[path = "all/artifact_document_plane.rs"]
 mod artifact_document_plane;
+#[path = "all/change_sets.rs"]
+mod change_sets;
 #[path = "all/cloudformation_templates.rs"]
 mod cloudformation_templates;
 #[path = "all/error_bodies.rs"]

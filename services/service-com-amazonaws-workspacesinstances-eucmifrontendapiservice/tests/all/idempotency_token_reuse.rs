@@ -32,7 +32,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::workspace_instance_lifecycle::{call, error_code, harness, ok, DEFAULT_TEST_REGION};
+use crate::workspace_instance_lifecycle::{
+    call, error_code, harness, launchable_managed_instance, ok, DEFAULT_TEST_REGION,
+    TEST_IMAGE_ID, TEST_INSTANCE_TYPE,
+};
 
 /// The HTTP status the model gives `ConflictException`
 /// (`smithy_query(query="shape",shape="ConflictException")` → `httpError 409`).
@@ -254,47 +257,95 @@ fn volume_mismatch_rows() -> Vec<TokenRow> {
 fn instance_mismatch_rows() -> Vec<TokenRow> {
     vec![
         TokenRow {
-            case: "configuration added to an empty ManagedInstance",
-            first: json!({ "ManagedInstance": {} }),
-            second: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
+            case: "configuration added to the minimal launchable ManagedInstance",
+            first: json!({ "ManagedInstance": launchable_managed_instance() }),
+            second: json!({
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SubnetId": "subnet-0a1b2c3d",
+                },
+            }),
         },
         TokenRow {
             case: "a different InstanceType",
-            first: json!({ "ManagedInstance": { "InstanceType": "t3.medium" } }),
-            second: json!({ "ManagedInstance": { "InstanceType": "m5.large" } }),
+            first: json!({
+                "ManagedInstance": { "ImageId": TEST_IMAGE_ID, "InstanceType": "t3.medium" },
+            }),
+            second: json!({
+                "ManagedInstance": { "ImageId": TEST_IMAGE_ID, "InstanceType": "m5.large" },
+            }),
         },
         TokenRow {
             case: "a different ImageId",
-            first: json!({ "ManagedInstance": { "ImageId": "ami-0123456789" } }),
-            second: json!({ "ManagedInstance": { "ImageId": "ami-9876543210" } }),
+            first: json!({
+                "ManagedInstance": {
+                    "ImageId": "ami-0123456789",
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                },
+            }),
+            second: json!({
+                "ManagedInstance": {
+                    "ImageId": "ami-9876543210",
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                },
+            }),
         },
         TokenRow {
             case: "a different nested Placement",
             first: json!({
-                "ManagedInstance": { "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" } }
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
+                },
             }),
             second: json!({
-                "ManagedInstance": { "Placement": { "AvailabilityZone": "us-east-1b", "Tenancy": "default" } }
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "Placement": { "AvailabilityZone": "us-east-1b", "Tenancy": "default" },
+                },
             }),
         },
         TokenRow {
             case: "a different list-valued member",
             first: json!({
-                "ManagedInstance": { "SecurityGroupIds": ["sg-00000001"] }
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SecurityGroupIds": ["sg-00000001"],
+                },
             }),
             second: json!({
-                "ManagedInstance": { "SecurityGroupIds": ["sg-00000001", "sg-00000002"] }
+                "ManagedInstance": {
+                    "ImageId": TEST_IMAGE_ID,
+                    "InstanceType": TEST_INSTANCE_TYPE,
+                    "SecurityGroupIds": ["sg-00000001", "sg-00000002"],
+                },
             }),
         },
         TokenRow {
             case: "different Tags",
-            first: json!({ "ManagedInstance": {}, "Tags": [{ "Key": "env", "Value": "dev" }] }),
-            second: json!({ "ManagedInstance": {}, "Tags": [{ "Key": "env", "Value": "prod" }] }),
+            first: json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "Tags": [{ "Key": "env", "Value": "dev" }],
+            }),
+            second: json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "Tags": [{ "Key": "env", "Value": "prod" }],
+            }),
         },
         TokenRow {
             case: "a different BillingMode",
-            first: json!({ "ManagedInstance": {}, "BillingConfiguration": { "BillingMode": "HOURLY" } }),
-            second: json!({ "ManagedInstance": {}, "BillingConfiguration": { "BillingMode": "MONTHLY" } }),
+            first: json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "BillingConfiguration": { "BillingMode": "HOURLY" },
+            }),
+            second: json!({
+                "ManagedInstance": launchable_managed_instance(),
+                "BillingConfiguration": { "BillingMode": "MONTHLY" },
+            }),
         },
     ]
 }

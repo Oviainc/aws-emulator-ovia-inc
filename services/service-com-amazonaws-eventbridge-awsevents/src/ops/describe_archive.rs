@@ -158,17 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.archive(&input.archive_name) else {
             return Err(DescribeArchiveErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(no_such_archive(&input.archive_name)),
+                    message: Some(crate::state::no_such_archive(&input.archive_name)),
                 },
             )
             .into());
         };
         Ok(stored.to_describe_output())
     }
-}
-
-/// What a reader reports for an archive name this store holds no record of: the
-/// archive by name, built from the request.
-fn no_such_archive(archive_name: &str) -> String {
-    format!("Archive {archive_name} does not exist.")
 }

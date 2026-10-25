@@ -59,6 +59,8 @@ mod application_status;
 mod application_status_checks;
 #[path = "all/associate_address.rs"]
 mod associate_address;
+#[path = "all/associate_subnet_cidr_block.rs"]
+mod associate_subnet_cidr_block;
 #[path = "all/authorize_security_group_egress.rs"]
 mod authorize_security_group_egress;
 #[path = "all/availability_zones.rs"]

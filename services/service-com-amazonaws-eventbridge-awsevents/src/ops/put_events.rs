@@ -776,7 +776,15 @@ fn evaluate(
 ///
 /// `None` when the entry exhausted its matching budget, so the caller reports
 /// that instead of passing a half-evaluated verdict off as a real one.
-fn route(envelope: &::serde_json::Value, rules: &[CompiledRule]) -> Option<Vec<MatchedRule>> {
+///
+/// `pub(crate)` because a REPLAYED event is routed by this same code
+/// (`crate::ops::start_replay`): the rules a replay re-publishes onto a bus are
+/// that bus's own, so restating any of this there would let live routing and
+/// replay routing diverge.
+pub(crate) fn route(
+    envelope: &::serde_json::Value,
+    rules: &[CompiledRule],
+) -> Option<Vec<MatchedRule>> {
     // ONE budget for the whole entry, spent across every rule it is matched
     // against: that is what caps the (entries x rules x bytes) product rather
     // than each factor on its own.
@@ -799,9 +807,9 @@ fn route(envelope: &::serde_json::Value, rules: &[CompiledRule]) -> Option<Vec<M
 
 /// One rule that matched a published event, and the targets that event is to be
 /// delivered to.
-struct MatchedRule {
-    name: String,
-    targets: Vec<CompiledTarget>,
+pub(crate) struct MatchedRule {
+    pub(crate) name: String,
+    pub(crate) targets: Vec<CompiledTarget>,
 }
 
 /// One routed event and everything the delivery pass needs to hand it over.
@@ -816,13 +824,13 @@ struct Dispatch {
 
 /// One handover about to be made: which event, under which rule, to which
 /// target, carrying which text.
-struct Handover<'a> {
-    event_id: &'a str,
-    rule: &'a str,
-    rule_arn: &'a str,
-    target: &'a CompiledTarget,
+pub(crate) struct Handover<'a> {
+    pub(crate) event_id: &'a str,
+    pub(crate) rule: &'a str,
+    pub(crate) rule_arn: &'a str,
+    pub(crate) target: &'a CompiledTarget,
     /// The whole event envelope, rendered ONCE per event rather than per target.
-    rendered: &'a str,
+    pub(crate) rendered: &'a str,
 }
 
 /// One rule of a bus, ready to route: its name, its parsed `EventPattern`, and
@@ -830,7 +838,7 @@ struct Handover<'a> {
 ///
 /// Built once per request from the stored rule, so routing never re-parses a
 /// pattern and never holds the store's lock while matching.
-struct CompiledRule {
+pub(crate) struct CompiledRule {
     name: String,
     pattern: ::serde_json::Map<String, ::serde_json::Value>,
     targets: Vec<CompiledTarget>,
@@ -906,9 +914,9 @@ fn capturing_archives(
 /// One target of a matched rule, with what decides WHAT it receives, who it is
 /// invoked AS, and where the event goes when the invocation fails.
 #[derive(Clone)]
-struct CompiledTarget {
-    id: String,
-    arn: String,
+pub(crate) struct CompiledTarget {
+    pub(crate) id: String,
+    pub(crate) arn: String,
     /// `Target$RoleArn`: "the ARN of the IAM role to be used for this target
     /// when the rule is triggered" — the role EventBridge acts as to invoke it.
     role_arn: Option<String>,
@@ -929,7 +937,7 @@ impl CompiledRule {
     /// it: a `DISABLED` rule ("EventBridge does not match any events against
     /// the rule"), a rule carrying only a `ScheduleExpression` (it self-triggers
     /// instead), or a pattern that no longer parses.
-    fn of(rule: &crate::state::RuleRecord) -> Option<Self> {
+    pub(crate) fn of(rule: &crate::state::RuleRecord) -> Option<Self> {
         if !rule.matches_published_events() {
             return None;
         }
@@ -988,7 +996,7 @@ const MAX_DELIVERED_BYTES_PER_REQUEST: usize = 8 * 1024 * 1024;
 /// rather than each factor on its own — the same shape as the matching budget
 /// ([`crate::state::MAX_MATCH_BYTES_PER_ENTRY`]), which bounds comparison work and
 /// says nothing about delivery.
-struct DeliveryBudget {
+pub(crate) struct DeliveryBudget {
     deliveries: usize,
     bytes: usize,
 }
@@ -996,7 +1004,7 @@ struct DeliveryBudget {
 impl DeliveryBudget {
     /// A fresh budget: [`MAX_DELIVERIES_PER_REQUEST`] deliveries and
     /// [`MAX_DELIVERED_BYTES_PER_REQUEST`] bytes.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             deliveries: 0,
             bytes: 0,
@@ -1042,7 +1050,12 @@ impl DeliveryBudget {
 ///
 /// `None` once the budget is spent, so the caller stops delivering the rest of
 /// the request instead of dispatching past the cap.
-async fn deliver(
+///
+/// `pub(crate)` because a REPLAYED event is handed to a matched rule's targets
+/// by this same code (`crate::ops::start_replay`): a replay re-publishes the
+/// event onto a bus and the bus's rules deliver it, so the delivery rules above
+/// are stated ONCE and hold for a replayed event as they do for a published one.
+pub(crate) async fn deliver(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     clients: &mut Clients,
@@ -1455,7 +1468,7 @@ fn sqs_queue(arn: &str) -> Option<String> {
 /// one service rebuilds the client rather than sending the second delivery to the
 /// first Region's endpoint.
 #[derive(Default)]
-struct Clients {
+pub(crate) struct Clients {
     sqs: Option<(String, ::aws_sdk_sqs::Client)>,
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
     sns: Option<(String, ::aws_sdk_sns::Client)>,

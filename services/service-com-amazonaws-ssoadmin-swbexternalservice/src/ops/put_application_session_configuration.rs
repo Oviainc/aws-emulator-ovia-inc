@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApplicationSessionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApplicationSessionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApplicationSessionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets one application's SESSION configuration: the status of its user background
+//! sessions. The status lives on the application record
+//! ([`crate::state::ApplicationRecord::user_background_session_status`]), so the put
+//! resolves the same application every other read resolves and the next
+//! `GetApplicationSessionConfiguration` reports exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApplicationSessionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApplicationSessionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutApplicationSessionConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this write resolves the same
+        // application a read at this instant would resolve (an application whose instance
+        // the clock has already removed no longer exists).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The application being configured must exist: the configuration lives ON the
+        // application record, so an `ApplicationArn` nothing holds is the modelled
+        // `ResourceNotFoundException` rather than a status stored under an ARN no read
+        // resolves.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                PutApplicationSessionConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // This operation UPDATES the session configuration, and
+        // `UserBackgroundSessionApplicationStatus` is optional on its input, so a request
+        // that names no status asks for no change and leaves the stored one where it is;
+        // a request that names one replaces it. Either way the call is `@idempotent`:
+        // repeating it leaves the same status.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApplicationSessionConfiguration"))
+        // The omitted-member case is a CHOSEN reading, like
+        // [`crate::state::USER_BACKGROUND_SESSION_STATUS_DEFAULT`]: neither the model nor
+        // the operation's documentation says what an update that names no member does, and
+        // clearing a configuration the caller never mentioned is a change nobody asked
+        // for.
+        if let Some(status) = input.user_background_session_application_status {
+            application.user_background_session_status = Some(status);
+        }
+        Ok(PutApplicationSessionConfigurationOutput {})
     }
 }
