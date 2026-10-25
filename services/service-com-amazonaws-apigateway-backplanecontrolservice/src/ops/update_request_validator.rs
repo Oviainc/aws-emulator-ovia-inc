@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRequestValidator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRequestValidator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRequestValidator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `RequestValidator`
+//! record of the named `RestApi`, in request order, and reports the patched record — the
+//! same one a later `GetRequestValidator` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +80,62 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    patch_bool, patch_optional_string, Patch, PatchFailure, RequestValidatorEntry, MAX_STRING_CHARS,
+};
+
+/// The `path` values `UpdateRequestValidator` accepts: one per updateable member of the
+/// `RequestValidator` shape. `id` is the validator's identity — the URI label addressing
+/// this very record, and what a `Method`'s `requestValidatorId` names — so it is reported
+/// but not patchable, exactly as `UpdateAuthorizer` treats an authorizer's `id`.
+const SUPPORTED_PATHS: &[&str] = &["/name", "/validateRequestBody", "/validateRequestParameters"];
+
+/// Apply one patch to a COPY of a stored request validator.
+fn apply_patch(entry: &mut RequestValidatorEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `RequestValidator$name` is optional — a validator created without one carries
+        // none — so it can be set and also cleared.
+        "name" => patch_optional_string(&mut entry.name, patch, MAX_STRING_CHARS),
+        // Both flags are modelled with a default of `false`, so a stored validator always
+        // has both: each is replaced with one of its two values and never removed. A patch
+        // `value` is a bare string on the wire, so the boolean is read here.
+        "validateRequestBody" => patch_bool(&mut entry.validate_request_body, patch),
+        "validateRequestParameters" => patch_bool(&mut entry.validate_request_parameters, patch),
+        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+    }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateRequestValidatorError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateRequestValidatorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateRequestValidatorErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateRequestValidatorErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: String) -> UpdateRequestValidatorError {
+    UpdateRequestValidatorErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +209,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRequestValidator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRequestValidatorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRequestValidator"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored validator
+        // untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .request_validators
+            .get(&input.request_validator_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_REQUEST_VALIDATOR.to_string()))?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        api.request_validators
+            .insert(input.request_validator_id.clone(), updated.clone());
+        // Rendered through the one `RequestValidator` body this crate builds, so the update
+        // reports the record exactly as `GetRequestValidator` will read it back.
+        let body = super::create_request_validator::request_validator_body(&updated);
+        let output = UpdateRequestValidatorOutput {
+            id: body.id,
+            name: body.name,
+            validate_request_body: body.validate_request_body,
+            validate_request_parameters: body.validate_request_parameters,
+        };
+        // Everything below is owned, so the lock is released before the audit record is
+        // emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome, as
+        // `crate::state::AUDIT_TARGET` documents it. Metadata only — the identifiers the
+        // request carried and how many ops it applied, never the validator's name or its
+        // configuration.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            request_validator_id = ?input.request_validator_id,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "request validator updated",
+        );
+        Ok(output)
     }
 }

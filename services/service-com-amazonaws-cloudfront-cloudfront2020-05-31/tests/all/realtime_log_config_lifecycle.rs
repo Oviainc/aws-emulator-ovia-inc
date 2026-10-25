@@ -177,7 +177,7 @@ async fn update_config(
 
 /// One Kinesis endpoint a configuration sends records to.
 #[derive(Debug, Clone)]
-struct Endpoint {
+pub(crate) struct Endpoint {
     /// `EndPoint$StreamType`.
     stream_type: String,
     /// `KinesisStreamConfig`, or `None` for an endpoint that names no stream at all.
@@ -186,7 +186,7 @@ struct Endpoint {
 
 impl Endpoint {
     /// A well-formed Kinesis endpoint, distinguished by `label`.
-    fn kinesis(label: &str) -> Self {
+    pub(crate) fn kinesis(label: &str) -> Self {
         Self {
             stream_type: KINESIS_STREAM_TYPE.to_string(),
             stream: Some((
@@ -217,20 +217,20 @@ impl Endpoint {
 
 /// One real-time log configuration a request submits.
 #[derive(Debug, Clone)]
-struct Submitted {
+pub(crate) struct Submitted {
     /// What this row is about, named in every assertion it drives.
-    case: &'static str,
-    name: String,
-    sampling_rate: i64,
-    end_points: Vec<Endpoint>,
-    fields: Vec<String>,
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
+    pub(crate) sampling_rate: i64,
+    pub(crate) end_points: Vec<Endpoint>,
+    pub(crate) fields: Vec<String>,
 }
 
 impl Submitted {
     /// The `CreateRealtimeLogConfigRequest` document a client sends: none of the four
     /// members is bound to the URI or to a header, so each one travels in the body under
     /// the root element the API reference names.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<CreateRealtimeLogConfigRequest \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\"><EndPoints>"
@@ -253,7 +253,7 @@ impl Submitted {
 }
 
 /// A list of owned strings from string literals, for the table below.
-fn strings(values: &[&str]) -> Vec<String> {
+pub(crate) fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
@@ -307,7 +307,7 @@ fn config_table() -> Vec<Submitted> {
 // ---------------------------------------------------------------------------
 
 /// The `RealtimeLogConfig` element of an answer, wherever the operation's output wraps it.
-fn config_node<'a>(answer: &'a Answer, case: &str, context: &str) -> &'a Node {
+pub(crate) fn config_node<'a>(answer: &'a Answer, case: &str, context: &str) -> &'a Node {
     answer
         .root()
         .descendant("RealtimeLogConfig")
@@ -401,7 +401,7 @@ fn assert_reports(node: &Node, row: &Submitted, context: &str, raw: &str) {
 }
 
 /// Create `row` and report the answer, asserting it was accepted.
-async fn create_accepted(router: &MultiServiceRouter, row: &Submitted) -> Answer {
+pub(crate) async fn create_accepted(router: &MultiServiceRouter, row: &Submitted) -> Answer {
     let created = create_config(router, &row.xml()).await;
     assert_eq!(
         created.status, 201,

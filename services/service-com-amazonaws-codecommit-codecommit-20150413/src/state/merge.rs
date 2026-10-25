@@ -40,8 +40,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    blob_id, Commit, FileEntry, Repository, FILE_MODE_NORMAL, MAX_FILES_PER_TREE,
-    MAX_PROJECTION_SECONDS,
+    blob_id, normalize_path, Commit, FileEntry, PathProblem, Repository, FILE_MODE_NORMAL,
+    MAX_FILES_PER_TREE, MAX_PROJECTION_SECONDS,
+};
+use crate::ops::types::{
+    ConflictResolution, ReplaceContentEntry, FILE_MODE_TYPE_ENUM_VALUES,
+    REPLACEMENT_TYPE_ENUM_VALUES,
 };
 
 /// `MergeOptionTypeEnum` values the model declares
@@ -871,4 +875,295 @@ pub fn resolved_file_mode(
     in_destination
         .or(in_source)
         .map_or_else(|| FILE_MODE_NORMAL.to_string(), |entry| entry.file_mode.clone())
+}
+
+/// The folder of a merged tree this emulator would not write, with the bytes it
+/// holds: the first folder the merge CHANGES whose immediate entries exceed
+/// CodeCommit's documented 6 MB folder limit
+/// ([`super::MAX_FOLDER_CONTENT_BYTES`]), reported for the modelled
+/// `FolderContentSizeLimitExceededException`.
+///
+/// Charged per FOLDER of the resulting tree, not per changed path: a folder is
+/// over the limit whatever combination of paths took it there, so a folder whose
+/// growth comes from paths that are each unchanged relative to the destination is
+/// charged too. Only a folder the merge CHANGES is charged, because a folder whose
+/// immediate entries the destination already held exactly is one the merge commit
+/// writes nothing into.
+pub fn oversized_changed_folder<'tree>(
+    merged: &'tree BTreeMap<String, FileEntry>,
+    destination: &BTreeMap<String, FileEntry>,
+) -> Option<(&'tree str, i64)> {
+    /// One folder's immediate entries, as what identifies them in a git tree.
+    fn entries_by_folder(
+        tree: &BTreeMap<String, FileEntry>,
+    ) -> BTreeMap<&str, Vec<(&str, &str, &str)>> {
+        let mut folders: BTreeMap<&str, Vec<(&str, &str, &str)>> = BTreeMap::new();
+        for (path, entry) in tree {
+            folders
+                .entry(super::folder_of(path))
+                .or_default()
+                .push((
+                    path.as_str(),
+                    entry.blob_id.as_str(),
+                    entry.file_mode.as_str(),
+                ));
+        }
+        folders
+    }
+    let merged_entries = entries_by_folder(merged);
+    let destination_entries = entries_by_folder(destination);
+    super::folder_content_bytes_by_folder(merged)
+        .into_iter()
+        .filter(|(folder, _)| destination_entries.get(folder) != merged_entries.get(folder))
+        .find(|(_, bytes)| *bytes > super::MAX_FOLDER_CONTENT_BYTES)
+}
+
+/// `replacementType` values the model's `ReplacementTypeEnum` declares
+/// (`smithy_query(query="shape",shape="ReplacementTypeEnum")`): which version of a
+/// conflicting file a resolution entry keeps, or that it supplies new content.
+pub const REPLACEMENT_KEEP_BASE: &str = "KEEP_BASE";
+pub const REPLACEMENT_KEEP_SOURCE: &str = "KEEP_SOURCE";
+pub const REPLACEMENT_KEEP_DESTINATION: &str = "KEEP_DESTINATION";
+pub const REPLACEMENT_USE_NEW_CONTENT: &str = "USE_NEW_CONTENT";
+
+/// Why a `conflictResolution` cannot be honoured, read once here for every
+/// operation that accepts one.
+///
+/// Each of those operations models its OWN errors for these — they are not the
+/// same set for all of them — so this names what is wrong with the resolution and
+/// the operation chooses the modelled failure and its sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionProblem {
+    /// An entry named no path at all.
+    PathRequired,
+    /// An entry named a path no stored tree addresses.
+    InvalidPath(String),
+    /// An entry named an empty file mode.
+    FileModeRequired,
+    /// An entry named a file mode `FileModeTypeEnum` does not declare.
+    InvalidFileMode(String),
+    /// More entries than [`MAX_CONFLICT_RESOLUTION_ENTRIES`], carrying the count
+    /// the request held.
+    TooManyEntries(usize),
+    /// Two entries addressed one path: "A conflict can have only one conflict
+    /// resolution entry."
+    MultipleEntries(String),
+    /// A content replacement for this path carried no replacement type.
+    ReplacementTypeRequired(String),
+    /// A content replacement carried a type `ReplacementTypeEnum` does not
+    /// declare.
+    InvalidReplacementType(String),
+    /// `USE_NEW_CONTENT` was named for this path with no content to use.
+    ReplacementContentRequired(String),
+    /// Content was supplied for this path under a replacement type that keeps a
+    /// stored version instead.
+    InvalidReplacementContent {
+        path: String,
+        replacement_type: String,
+    },
+    /// A file mode was set for a path the resolved merge result does not hold.
+    PathNotInResult(String),
+}
+
+/// Does this `conflictResolution` ask for anything at all?
+///
+/// A resolution is "a list of inputs to use when resolving conflicts during a
+/// merge" only under `AUTOMERGE`, so an operation asks this BEFORE checking the
+/// entries themselves: a list that cannot be honoured at all is why the request
+/// fails, whatever one of its entries says.
+pub fn resolution_supplied(resolution: Option<&ConflictResolution>) -> bool {
+    resolution.is_some_and(|resolution| {
+        [
+            resolution.replace_contents.as_ref().map(Vec::len),
+            resolution.delete_files.as_ref().map(Vec::len),
+            resolution.set_file_modes.as_ref().map(Vec::len),
+        ]
+        .iter()
+        .any(|entries| entries.is_some_and(|count| count > 0))
+    })
+}
+
+/// A caller's `conflictResolution`, checked once and keyed by the path each entry
+/// addresses — "a conflict can have only one conflict resolution entry", so a
+/// path appears at most once across the content replacements, the deletions and
+/// the mode changes.
+#[derive(Debug, Default)]
+pub struct CheckedResolution {
+    /// The version (or the new content) each named path takes.
+    pub replacements: BTreeMap<String, ReplaceContentEntry>,
+    /// The paths the resolution removes from the merge result.
+    pub deletes: BTreeSet<String>,
+    /// The file mode each named path takes.
+    pub modes: BTreeMap<String, String>,
+}
+
+/// The canonical form of one `conflictResolution` path. Every path an entry names
+/// is canonicalized the way a stored tree addresses its files, so an entry
+/// addresses the merge result rather than a spelling of it.
+fn resolution_path(raw: &str) -> Result<String, ResolutionProblem> {
+    match normalize_path(raw) {
+        Ok(path) => Ok(path),
+        Err(PathProblem::Missing) => Err(ResolutionProblem::PathRequired),
+        Err(PathProblem::Invalid) => Err(ResolutionProblem::InvalidPath(raw.to_string())),
+    }
+}
+
+/// A `fileMode` this service stores. A value outside `FileModeTypeEnum` is
+/// refused at the request boundary where the member is modelled as that enum;
+/// this is the same check for a mode that reached a handler.
+fn resolution_file_mode(mode: &str) -> Result<String, ResolutionProblem> {
+    if mode.is_empty() {
+        return Err(ResolutionProblem::FileModeRequired);
+    }
+    if !FILE_MODE_TYPE_ENUM_VALUES.contains(&mode) {
+        return Err(ResolutionProblem::InvalidFileMode(mode.to_string()));
+    }
+    Ok(mode.to_string())
+}
+
+impl CheckedResolution {
+    /// The caller's `conflictResolution` with every entry checked, or the first
+    /// entry that is not usable.
+    pub fn check(resolution: Option<&ConflictResolution>) -> Result<Self, ResolutionProblem> {
+        let mut checked = Self::default();
+        let Some(resolution) = resolution else {
+            return Ok(checked);
+        };
+        let replacements = resolution.replace_contents.as_deref().unwrap_or_default();
+        let deletions = resolution.delete_files.as_deref().unwrap_or_default();
+        let mode_changes = resolution.set_file_modes.as_deref().unwrap_or_default();
+
+        let entries = replacements
+            .len()
+            .saturating_add(deletions.len())
+            .saturating_add(mode_changes.len());
+        if entries > MAX_CONFLICT_RESOLUTION_ENTRIES {
+            return Err(ResolutionProblem::TooManyEntries(entries));
+        }
+
+        for entry in replacements {
+            let path = resolution_path(&entry.file_path)?;
+            let replacement_type = entry.replacement_type.as_str();
+            if replacement_type.is_empty() {
+                return Err(ResolutionProblem::ReplacementTypeRequired(path));
+            }
+            if !REPLACEMENT_TYPE_ENUM_VALUES.contains(&replacement_type) {
+                return Err(ResolutionProblem::InvalidReplacementType(
+                    replacement_type.to_string(),
+                ));
+            }
+            // Content belongs to USE_NEW_CONTENT and to nothing else: "The
+            // base-64 encoded content to use when the replacement type is
+            // USE_NEW_CONTENT."
+            if replacement_type == REPLACEMENT_USE_NEW_CONTENT && entry.content.is_none() {
+                return Err(ResolutionProblem::ReplacementContentRequired(path));
+            }
+            if replacement_type != REPLACEMENT_USE_NEW_CONTENT && entry.content.is_some() {
+                return Err(ResolutionProblem::InvalidReplacementContent {
+                    path,
+                    replacement_type: replacement_type.to_string(),
+                });
+            }
+            let mut stored = entry.clone();
+            stored.file_path = path.clone();
+            stored.file_mode = match &entry.file_mode {
+                Some(mode) => Some(resolution_file_mode(mode)?),
+                None => None,
+            };
+            if checked.deletes.contains(&path)
+                || checked.replacements.insert(path.clone(), stored).is_some()
+            {
+                return Err(ResolutionProblem::MultipleEntries(path));
+            }
+        }
+
+        for entry in deletions {
+            let path = resolution_path(&entry.file_path)?;
+            if checked.replacements.contains_key(&path) || !checked.deletes.insert(path.clone()) {
+                return Err(ResolutionProblem::MultipleEntries(path));
+            }
+        }
+
+        for entry in mode_changes {
+            let path = resolution_path(&entry.file_path)?;
+            let mode = resolution_file_mode(&entry.file_mode)?;
+            if checked.modes.insert(path.clone(), mode).is_some() {
+                return Err(ResolutionProblem::MultipleEntries(path));
+            }
+        }
+
+        Ok(checked)
+    }
+
+    /// Apply this resolution to `merged`, the result of merging `source` into
+    /// `destination` against `base`.
+    ///
+    /// An entry is applied to the path it names whether or not the merge found
+    /// that path conflicting: `conflictResolution` names the content the merge
+    /// RESULT holds for a path, and the conflict set a merge computed is not
+    /// reported by the operations that WRITE a merge, so a caller cannot know
+    /// which paths this service found conflicting and an entry for a settled path
+    /// is honoured rather than refused.
+    ///
+    /// The file-against-folder verdict is NOT recomputed here: a resolution can
+    /// create such a collision and can equally settle one, so the caller runs
+    /// [`Merge::detect_object_type_conflicts`] over the resolved result, which is
+    /// where that walk's budget is charged.
+    pub fn apply(
+        &self,
+        merged: &mut Merge,
+        base: &BTreeMap<String, FileEntry>,
+        source: &BTreeMap<String, FileEntry>,
+        destination: &BTreeMap<String, FileEntry>,
+    ) -> Result<(), ResolutionProblem> {
+        for (path, entry) in &self.replacements {
+            let replacement_type = entry.replacement_type.as_str();
+            let resolved = if replacement_type == REPLACEMENT_USE_NEW_CONTENT {
+                let content = entry.content.clone().unwrap_or_default();
+                let file_mode = entry.file_mode.clone().unwrap_or_else(|| {
+                    resolved_file_mode(source.get(path), destination.get(path))
+                });
+                Some(MergedFile::written(content, &file_mode))
+            } else {
+                let kept = match replacement_type {
+                    REPLACEMENT_KEEP_BASE => base.get(path),
+                    REPLACEMENT_KEEP_SOURCE => source.get(path),
+                    REPLACEMENT_KEEP_DESTINATION => destination.get(path),
+                    // No other value reaches here: the type was checked against
+                    // `ReplacementTypeEnum` by [`CheckedResolution::check`].
+                    _ => None,
+                };
+                kept.map(|in_tree| {
+                    let mut file = MergedFile::stored(in_tree);
+                    // "The file mode to apply during conflict resolution."
+                    if let Some(mode) = &entry.file_mode {
+                        file.entry.file_mode = mode.clone();
+                    }
+                    file
+                })
+            };
+            match resolved {
+                Some(file) => {
+                    merged.files.insert(path.clone(), file);
+                }
+                // The version this entry keeps does not hold the path, so neither
+                // does the resolved merge.
+                None => {
+                    merged.files.remove(path);
+                }
+            }
+            merged.conflicts.remove(path);
+        }
+        for path in &self.deletes {
+            merged.files.remove(path);
+            merged.conflicts.remove(path);
+        }
+        for (path, mode) in &self.modes {
+            match merged.files.get_mut(path) {
+                Some(file) => file.entry.file_mode = mode.clone(),
+                None => return Err(ResolutionProblem::PathNotInResult(path.clone())),
+            }
+        }
+        Ok(())
+    }
 }

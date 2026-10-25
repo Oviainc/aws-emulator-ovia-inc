@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::{
+    ACCESS_CONTROL_PAGE_SIZE_WINDOW, CLUSTER_PAGE_SIZE_WINDOW,
+};
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -744,8 +746,8 @@ async fn an_update_relays_out_the_shards_it_resizes() {
     }
 }
 
-/// Every listing pages over its whole set, in name order, for any `MaxResults` the
-/// service's page-size window admits: each page is at most `MaxResults` long, the token
+/// Every listing pages over its whole set, in name order, for any `MaxResults` its own
+/// surface's page-size window admits: each page is at most `MaxResults` long, the token
 /// resumes exactly where the page ended, and the pages concatenated are the full set
 /// with nothing repeated or dropped.
 #[tokio::test]
@@ -753,9 +755,9 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
     let router = router();
     acl(&router, "page-acl").await;
 
-    // More clusters than the SMALLEST page the service serves, so a page size at the
-    // bottom of the page-size window has to walk several pages to cover the set.
-    let names: Vec<String> = (0..MIN_MAX_RESULTS + 2)
+    // More clusters than the SMALLEST page the cluster listing serves, so a page size at
+    // the bottom of its page-size window has to walk several pages to cover the set.
+    let names: Vec<String> = (0..CLUSTER_PAGE_SIZE_WINDOW.min + 2)
         .map(|index| format!("page-{index:02}"))
         .collect();
     for name in &names {
@@ -772,7 +774,11 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
         .await;
     }
 
-    for max_results in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
+    for max_results in [
+        CLUSTER_PAGE_SIZE_WINDOW.min,
+        CLUSTER_PAGE_SIZE_WINDOW.min + 1,
+        CLUSTER_PAGE_SIZE_WINDOW.max,
+    ] {
         let case = format!("MaxResults={max_results}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -810,8 +816,10 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
     }
 
     // The same rule on the other paginated listing in this slice, over a set larger than
-    // the smallest page it serves.
-    let acl_names: Vec<String> = (0..MIN_MAX_RESULTS)
+    // the smallest page it serves — the ACL listing reads the ACCESS-CONTROL surface, so
+    // it is paged at that surface's own smallest page size.
+    let acl_page_size = ACCESS_CONTROL_PAGE_SIZE_WINDOW.min;
+    let acl_names: Vec<String> = (0..4)
         .map(|index| format!("page-acl-{index:02}"))
         .collect();
     for name in &acl_names {
@@ -820,7 +828,7 @@ async fn listings_page_over_the_whole_set_for_any_page_size() {
     let mut seen: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     loop {
-        let mut request = json!({ "MaxResults": MIN_MAX_RESULTS });
+        let mut request = json!({ "MaxResults": acl_page_size });
         if let Some(token) = &token {
             request["NextToken"] = json!(token);
         }

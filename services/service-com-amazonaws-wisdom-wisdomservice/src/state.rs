@@ -119,9 +119,28 @@ pub const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exis
 ///
 /// AWS's tagging restrictions put the maximum number of tags per resource at
 /// 50, and this model declares no constraint on the `Tags` map, so without the
-/// limit one create could store an arbitrarily large tag map. A request past it
-/// is refused with the modelled `ValidationException`.
+/// limit one create could store an arbitrarily large tag map. A create past it
+/// is refused with the modelled `ValidationException`; a `TagResource` that would
+/// leave the resource holding more than this is refused the way the recorded wire
+/// answer of this endpoint refuses it (`crate::ops::tag_resource`).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The sentence a tagging operation refuses a tag set larger than
+/// [`MAX_TAGS_PER_RESOURCE`] with.
+///
+/// It states the RULE — the ceiling the RESULTING tag set must stay within — and is the
+/// sentence AWS's common tag validator words that rule with, counting the user tags a
+/// resource would be left holding (the same wording
+/// `services/service-com-amazonaws-applicationautoscaling-anyscalefrontendservice` states
+/// for its own copy of this limit). It carries nothing from the request and nothing about
+/// what the resource already holds, so a caller cannot read the stored tag count out of
+/// the wording. The Amazon Q in Connect view of this same endpoint words it from its own
+/// copy of this text
+/// (`services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`), so a client
+/// cannot get a different sentence depending on which model it addressed.
+pub fn message_too_many_tags() -> String {
+    format!("The resultant tag set must not have more than {MAX_TAGS_PER_RESOURCE} user tags.")
+}
 
 /// The sentence a tagging operation refuses an ARN this account holds no resource
 /// under with.
@@ -960,6 +979,55 @@ impl ComAmazonawsWisdomWisdomserviceState {
                 .assistant_associations
                 .get(association_id)
                 .map(|association| &association.tags);
+        }
+        None
+    }
+
+    /// The same tag map as [`Self::tags_of_resource`], for a caller that WRITES it —
+    /// the seam `TagResource` merges a request into, and `UntagResource` removes keys
+    /// through.
+    ///
+    /// It resolves the ARN exactly as the reporting path does, through the ARN index of
+    /// every family this store holds a tag map for, and hands back the map ON the stored
+    /// record: a write here is what a later `ListTagsForResource` of that resource
+    /// reports, because there is only ever one copy of a resource's tags.
+    ///
+    /// `None` means the ARN names no resource this account holds, which is the tagging
+    /// surface's modelled not-found.
+    pub fn tags_of_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(assistant_id) = self.assistant_arn_index.get(resource_arn).cloned() {
+            return self
+                .assistants
+                .get_mut(&assistant_id)
+                .map(|assistant| &mut assistant.tags);
+        }
+        if let Some(knowledge_base_id) = self.knowledge_base_arn_index.get(resource_arn).cloned() {
+            return self
+                .knowledge_bases
+                .get_mut(&knowledge_base_id)
+                .map(|knowledge_base| &mut knowledge_base.tags);
+        }
+        if let Some((assistant_id, session_id)) =
+            self.session_arn_index.get(resource_arn).cloned()
+        {
+            return self
+                .assistants
+                .get_mut(&assistant_id)
+                .and_then(|assistant| assistant.sessions.get_mut(&session_id))
+                .map(|session| &mut session.tags);
+        }
+        if let Some((_, association_id)) = self
+            .assistant_association_arn_index
+            .get(resource_arn)
+            .cloned()
+        {
+            return self
+                .assistant_associations
+                .get_mut(&association_id)
+                .map(|association| &mut association.tags);
         }
         None
     }

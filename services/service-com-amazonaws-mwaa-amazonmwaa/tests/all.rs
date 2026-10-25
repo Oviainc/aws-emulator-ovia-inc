@@ -19,6 +19,8 @@ mod env_endpoint_not_found_wording;
 mod env_endpoint_payload;
 #[path = "all/environment_business_rules.rs"]
 mod environment_business_rules;
+#[path = "all/environment_endpoint_management_lifecycle.rs"]
+mod environment_endpoint_management_lifecycle;
 #[path = "all/environment_lifecycle.rs"]
 mod environment_lifecycle;
 #[path = "all/environment_region_scoping.rs"]

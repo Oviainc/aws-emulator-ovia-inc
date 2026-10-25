@@ -26,7 +26,7 @@
 //! engine catalog.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::MAX_MAX_RESULTS;
+use service_com_amazonaws_memorydb_amazonmemorydb::state::PARAMETER_PAGE_SIZE_WINDOW;
 
 use crate::cluster_lifecycle::{ok, router};
 
@@ -79,9 +79,10 @@ async fn parameter_names(
     let body = ok(
         router,
         "DescribeParameters",
-        // A page size inside the window every listing serves, so the read is served
-        // rather than refused; the `page_size_window` suite asserts that window.
-        &json!({ "ParameterGroupName": group, "MaxResults": MAX_MAX_RESULTS }),
+        // A page size inside the window the parameter-group surface serves, so the read
+        // is served rather than refused; the `page_size_window` suite asserts that
+        // window.
+        &json!({ "ParameterGroupName": group, "MaxResults": PARAMETER_PAGE_SIZE_WINDOW.max }),
         case,
     )
     .await;
@@ -103,7 +104,7 @@ async fn an_untouched_account_reports_exactly_the_default_parameter_groups() {
     let listed = ok(
         &router,
         "DescribeParameterGroups",
-        &json!({ "MaxResults": MAX_MAX_RESULTS }),
+        &json!({ "MaxResults": PARAMETER_PAGE_SIZE_WINDOW.max }),
         case,
     )
     .await;

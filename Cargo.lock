@@ -5231,6 +5231,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-appconfig-amazonappconfig",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

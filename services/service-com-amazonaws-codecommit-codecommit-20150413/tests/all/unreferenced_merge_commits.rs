@@ -40,16 +40,16 @@ use super::repository_lifecycle::{
 
 /// The `fileMode` values used below, from the model's `FileModeTypeEnum`
 /// (`smithy_query(query="shape",shape="FileModeTypeEnum")`).
-const NORMAL: &str = "NORMAL";
-const EXECUTABLE: &str = "EXECUTABLE";
+pub(crate) const NORMAL: &str = "NORMAL";
+pub(crate) const EXECUTABLE: &str = "EXECUTABLE";
 
 /// The placeholder `keepEmptyFolders` writes into a folder a commit emptied
 /// ("a .gitkeep file is created for empty folders").
-const GITKEEP: &str = ".gitkeep";
+pub(crate) const GITKEEP: &str = ".gitkeep";
 
 /// One change a branch makes to the base tree.
 #[derive(Debug, Clone)]
-enum Change {
+pub(crate) enum Change {
     /// Write a file — adding it, or replacing its content — in `NORMAL` mode.
     Put(&'static str, &'static str),
     /// Write a file with an explicit mode, which is how a mode-only change is made.
@@ -529,7 +529,7 @@ fn rows() -> Vec<Row> {
 /// Write one commit on `branch` from `changes`, reporting its commit id. `parent`
 /// is the commit the branch is at, which `CreateCommit` requires for a branch that
 /// already has a tip.
-async fn commit(
+pub(crate) async fn commit(
     router: &MultiServiceRouter,
     repository: &str,
     branch: &str,
@@ -576,7 +576,7 @@ async fn commit(
 /// `GetFolder` from the root. Reading the tree back this way makes the assertion
 /// content-addressed: a `blobId` is the git object name of the file's bytes, which
 /// this file computes independently with `git_blob_id`.
-async fn tree_of(
+pub(crate) async fn tree_of(
     router: &MultiServiceRouter,
     repository: &str,
     specifier: &str,
@@ -649,7 +649,11 @@ fn merge_request(row: &Row, repository: &str, merge_option: &str) -> Value {
 }
 
 /// The commit a `GetCommit` of `commit_id` reports.
-async fn commit_of(router: &MultiServiceRouter, repository: &str, commit_id: &str) -> Value {
+pub(crate) async fn commit_of(
+    router: &MultiServiceRouter,
+    repository: &str,
+    commit_id: &str,
+) -> Value {
     let payload = ok(
         router,
         "GetCommit",
@@ -663,7 +667,7 @@ async fn commit_of(router: &MultiServiceRouter, repository: &str, commit_id: &st
 }
 
 /// The `parents` list of a reported commit.
-fn parents_of(commit: &Value) -> Vec<String> {
+pub(crate) fn parents_of(commit: &Value) -> Vec<String> {
     commit
         .get("parents")
         .and_then(Value::as_array)

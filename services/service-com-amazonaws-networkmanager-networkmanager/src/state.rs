@@ -2267,6 +2267,28 @@ impl AttachmentRecord {
         }
     }
 
+    /// Whether this attachment sits at the edge location `location`.
+    ///
+    /// Every kind but one sits at ONE edge ([`Self::sole_edge_location`]), so that single
+    /// edge decides it; a Direct Connect gateway attachment spans SEVERAL and sits at every
+    /// one of them, so any of them decides it. That is the same split
+    /// [`Self::to_attachment_at`] reports as `EdgeLocation` / `EdgeLocations`, so a listing
+    /// selected on a location answers the attachments whose reported edges hold it and no
+    /// other.
+    pub fn sits_at(&self, location: &str) -> bool {
+        match &self.detail {
+            AttachmentDetail::DirectConnectGateway { edge_locations } => {
+                edge_locations.iter().any(|edge| edge == location)
+            }
+            AttachmentDetail::Vpc { .. }
+            | AttachmentDetail::Connect { .. }
+            | AttachmentDetail::SiteToSiteVpn
+            | AttachmentDetail::TransitGatewayRouteTable { .. } => {
+                self.sole_edge_location() == Some(location)
+            }
+        }
+    }
+
     /// The modelled `Attachment` envelope of this record, as of `now`.
     ///
     /// `EdgeLocations` is absent because "this is returned only for Direct Connect gateway

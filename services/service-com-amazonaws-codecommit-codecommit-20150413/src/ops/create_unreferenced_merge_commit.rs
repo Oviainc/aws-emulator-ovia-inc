@@ -165,17 +165,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::state::merge;
-
-/// `replacementType` values the model's `ReplacementTypeEnum` declares
-/// (`smithy_query(query="shape",shape="ReplacementTypeEnum")`): which version of a
-/// conflicting file a resolution entry keeps, or that it supplies new content.
-const REPLACEMENT_KEEP_BASE: &str = "KEEP_BASE";
-const REPLACEMENT_KEEP_SOURCE: &str = "KEEP_SOURCE";
-const REPLACEMENT_KEEP_DESTINATION: &str = "KEEP_DESTINATION";
-const REPLACEMENT_USE_NEW_CONTENT: &str = "USE_NEW_CONTENT";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -244,14 +236,15 @@ impl From<CreateUnreferencedMergeCommitErrorModeled> for CreateUnreferencedMerge
     }
 }
 
-/// The canonical form of one `conflictResolution` path, or the refusal the
-/// operation reports for it. Every path a resolution entry names is canonicalized
-/// the same way a stored tree addresses its files, so an entry addresses the merge
-/// result rather than a spelling of it.
-fn normalized_path(raw: &str) -> Result<String, CreateUnreferencedMergeCommitError> {
-    match crate::state::normalize_path(raw) {
-        Ok(path) => Ok(path),
-        Err(crate::state::PathProblem::Missing) => Err(
+/// One `conflictResolution` problem as the errors THIS operation models for it,
+/// each with that shape's own sentence. The reading of what is wrong with a
+/// resolution is shared ([`merge::CheckedResolution`]); which modelled failure
+/// answers the caller is the operation's, because the operations that accept a
+/// resolution do not all model the same set.
+fn refused_resolution(problem: merge::ResolutionProblem) -> CreateUnreferencedMergeCommitError {
+    use merge::ResolutionProblem as Problem;
+    let modeled = match problem {
+        Problem::PathRequired => {
             CreateUnreferencedMergeCommitErrorModeled::PathRequiredException(
                 PathRequiredException {
                     message: Some(
@@ -259,24 +252,13 @@ fn normalized_path(raw: &str) -> Result<String, CreateUnreferencedMergeCommitErr
                     ),
                 },
             )
-            .into(),
-        ),
-        Err(crate::state::PathProblem::Invalid) => Err(
-            CreateUnreferencedMergeCommitErrorModeled::InvalidPathException(InvalidPathException {
+        }
+        Problem::InvalidPath(raw) => CreateUnreferencedMergeCommitErrorModeled::InvalidPathException(
+            InvalidPathException {
                 message: Some(format!("the path {raw} is not valid")),
-            })
-            .into(),
+            },
         ),
-    }
-}
-
-/// A `fileMode` this service stores, or the refusal for one it does not model. A
-/// value outside `FileModeTypeEnum` is refused at the request boundary when the
-/// member is modelled as that enum; this is the same check for a mode that
-/// reached the handler.
-fn checked_file_mode(mode: &str) -> Result<String, CreateUnreferencedMergeCommitError> {
-    if mode.is_empty() {
-        return Err(
+        Problem::FileModeRequired => {
             CreateUnreferencedMergeCommitErrorModeled::FileModeRequiredException(
                 FileModeRequiredException {
                     message: Some(
@@ -284,54 +266,15 @@ fn checked_file_mode(mode: &str) -> Result<String, CreateUnreferencedMergeCommit
                     ),
                 },
             )
-            .into(),
-        );
-    }
-    if !FILE_MODE_TYPE_ENUM_VALUES.contains(&mode) {
-        return Err(
+        }
+        Problem::InvalidFileMode(mode) => {
             CreateUnreferencedMergeCommitErrorModeled::InvalidFileModeException(
                 InvalidFileModeException {
                     message: Some(format!("the file mode {mode} is not valid")),
                 },
             )
-            .into(),
-        );
-    }
-    Ok(mode.to_string())
-}
-
-/// The caller's `conflictResolution`, checked once and keyed by the path each
-/// entry addresses — "a conflict can have only one conflict resolution entry", so
-/// a path appears at most once across the content replacements and the deletions.
-#[derive(Debug, Default)]
-struct Resolution {
-    /// The version (or the new content) each named path takes.
-    replacements: BTreeMap<String, ReplaceContentEntry>,
-    /// The paths the resolution removes from the merge result.
-    deletes: BTreeSet<String>,
-    /// The file mode each named path takes.
-    modes: BTreeMap<String, String>,
-}
-
-/// The caller's `conflictResolution` with every entry checked, or the modelled
-/// refusal for the first entry that is not usable.
-fn checked_resolution(
-    resolution: Option<&ConflictResolution>,
-) -> Result<Resolution, CreateUnreferencedMergeCommitError> {
-    let mut checked = Resolution::default();
-    let Some(resolution) = resolution else {
-        return Ok(checked);
-    };
-    let replacements = resolution.replace_contents.as_deref().unwrap_or_default();
-    let deletions = resolution.delete_files.as_deref().unwrap_or_default();
-    let mode_changes = resolution.set_file_modes.as_deref().unwrap_or_default();
-
-    let entries = replacements
-        .len()
-        .saturating_add(deletions.len())
-        .saturating_add(mode_changes.len());
-    if entries > merge::MAX_CONFLICT_RESOLUTION_ENTRIES {
-        return Err(
+        }
+        Problem::TooManyEntries(entries) => {
             CreateUnreferencedMergeCommitErrorModeled::MaximumConflictResolutionEntriesExceededException(
                 MaximumConflictResolutionEntriesExceededException {
                     message: Some(format!(
@@ -341,106 +284,66 @@ fn checked_resolution(
                     )),
                 },
             )
-            .into(),
-        );
-    }
-
-    let multiple = |path: &str| -> CreateUnreferencedMergeCommitError {
-        CreateUnreferencedMergeCommitErrorModeled::MultipleConflictResolutionEntriesException(
-            MultipleConflictResolutionEntriesException {
+        }
+        Problem::MultipleEntries(path) => {
+            CreateUnreferencedMergeCommitErrorModeled::MultipleConflictResolutionEntriesException(
+                MultipleConflictResolutionEntriesException {
+                    message: Some(format!(
+                        "more than one conflict resolution entry was provided for {path}"
+                    )),
+                },
+            )
+        }
+        Problem::ReplacementTypeRequired(path) => {
+            CreateUnreferencedMergeCommitErrorModeled::ReplacementTypeRequiredException(
+                ReplacementTypeRequiredException {
+                    message: Some(format!(
+                        "a replacement type is required for the conflict resolution entry \
+                         for {path}"
+                    )),
+                },
+            )
+        }
+        Problem::InvalidReplacementType(replacement_type) => {
+            CreateUnreferencedMergeCommitErrorModeled::InvalidReplacementTypeException(
+                InvalidReplacementTypeException {
+                    message: Some(format!(
+                        "the replacement type {replacement_type} is not valid"
+                    )),
+                },
+            )
+        }
+        Problem::ReplacementContentRequired(path) => {
+            CreateUnreferencedMergeCommitErrorModeled::ReplacementContentRequiredException(
+                ReplacementContentRequiredException {
+                    message: Some(format!(
+                        "{} was specified for {path} but no replacement content was provided",
+                        merge::REPLACEMENT_USE_NEW_CONTENT
+                    )),
+                },
+            )
+        }
+        Problem::InvalidReplacementContent {
+            path,
+            replacement_type,
+        } => CreateUnreferencedMergeCommitErrorModeled::InvalidReplacementContentException(
+            InvalidReplacementContentException {
                 message: Some(format!(
-                    "more than one conflict resolution entry was provided for {path}"
+                    "replacement content was provided for {path} with the replacement \
+                     type {replacement_type}, which keeps a stored version"
                 )),
             },
-        )
-        .into()
+        ),
+        Problem::PathNotInResult(path) => {
+            CreateUnreferencedMergeCommitErrorModeled::InvalidPathException(InvalidPathException {
+                message: Some(format!(
+                    "the merge result does not hold the path {path}, so its \
+                     file mode cannot be set"
+                )),
+            })
+        }
     };
-
-    for entry in replacements {
-        let path = normalized_path(&entry.file_path)?;
-        let replacement_type = entry.replacement_type.as_str();
-        if replacement_type.is_empty() {
-            return Err(
-                CreateUnreferencedMergeCommitErrorModeled::ReplacementTypeRequiredException(
-                    ReplacementTypeRequiredException {
-                        message: Some(format!(
-                            "a replacement type is required for the conflict resolution entry \
-                             for {path}"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        if !REPLACEMENT_TYPE_ENUM_VALUES.contains(&replacement_type) {
-            return Err(
-                CreateUnreferencedMergeCommitErrorModeled::InvalidReplacementTypeException(
-                    InvalidReplacementTypeException {
-                        message: Some(format!(
-                            "the replacement type {replacement_type} is not valid"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        // Content belongs to USE_NEW_CONTENT and to nothing else: "The base-64
-        // encoded content to use when the replacement type is USE_NEW_CONTENT."
-        if replacement_type == REPLACEMENT_USE_NEW_CONTENT && entry.content.is_none() {
-            return Err(
-                CreateUnreferencedMergeCommitErrorModeled::ReplacementContentRequiredException(
-                    ReplacementContentRequiredException {
-                        message: Some(format!(
-                            "{REPLACEMENT_USE_NEW_CONTENT} was specified for {path} but no \
-                             replacement content was provided"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        if replacement_type != REPLACEMENT_USE_NEW_CONTENT && entry.content.is_some() {
-            return Err(
-                CreateUnreferencedMergeCommitErrorModeled::InvalidReplacementContentException(
-                    InvalidReplacementContentException {
-                        message: Some(format!(
-                            "replacement content was provided for {path} with the replacement \
-                             type {replacement_type}, which keeps a stored version"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        let mut stored = entry.clone();
-        stored.file_path = path.clone();
-        stored.file_mode = match &entry.file_mode {
-            Some(mode) => Some(checked_file_mode(mode)?),
-            None => None,
-        };
-        if checked.deletes.contains(&path)
-            || checked.replacements.insert(path.clone(), stored).is_some()
-        {
-            return Err(multiple(&path));
-        }
-    }
-
-    for entry in deletions {
-        let path = normalized_path(&entry.file_path)?;
-        if checked.replacements.contains_key(&path) || !checked.deletes.insert(path.clone()) {
-            return Err(multiple(&path));
-        }
-    }
-
-    for entry in mode_changes {
-        let path = normalized_path(&entry.file_path)?;
-        let mode = checked_file_mode(&entry.file_mode)?;
-        if checked.modes.insert(path.clone(), mode).is_some() {
-            return Err(multiple(&path));
-        }
-    }
-
-    Ok(checked)
+    modeled.into()
 }
 
 /// The `CreateUnreferencedMergeCommit` operation.
@@ -592,15 +495,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than silently ignored. Checked BEFORE the entries themselves,
         // because a list that cannot be honoured at all is the primary reason the
         // request fails, whatever one of its entries says.
-        let resolution_supplied = input.conflict_resolution.as_ref().is_some_and(|resolution| {
-            [
-                resolution.replace_contents.as_ref().map(Vec::len),
-                resolution.delete_files.as_ref().map(Vec::len),
-                resolution.set_file_modes.as_ref().map(Vec::len),
-            ]
-            .iter()
-            .any(|entries| entries.is_some_and(|count| count > 0))
-        });
+        let resolution_supplied = merge::resolution_supplied(input.conflict_resolution.as_ref());
         if resolution_supplied && strategy != merge::CONFLICT_RESOLUTION_AUTOMERGE {
             return Err(
                 CreateUnreferencedMergeCommitErrorModeled::InvalidConflictResolutionException(
@@ -615,7 +510,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        let resolution = checked_resolution(input.conflict_resolution.as_ref())?;
+        let resolution =
+            merge::CheckedResolution::check(input.conflict_resolution.as_ref()).map_err(refused_resolution)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled
@@ -758,69 +654,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller cannot know which paths the emulator found conflicting and an
         // entry for a settled path is honoured rather than refused.
         if strategy == merge::CONFLICT_RESOLUTION_AUTOMERGE {
-            for (path, entry) in &resolution.replacements {
-                let replacement_type = entry.replacement_type.as_str();
-                let resolved = if replacement_type == REPLACEMENT_USE_NEW_CONTENT {
-                    let content = entry.content.clone().unwrap_or_default();
-                    let file_mode = entry.file_mode.clone().unwrap_or_else(|| {
-                        merge::resolved_file_mode(
-                            source_files.get(path),
-                            destination_files.get(path),
-                        )
-                    });
-                    Some(merge::MergedFile::written(content, &file_mode))
-                } else {
-                    let kept = match replacement_type {
-                        REPLACEMENT_KEEP_BASE => base_files.get(path),
-                        REPLACEMENT_KEEP_SOURCE => source_files.get(path),
-                        REPLACEMENT_KEEP_DESTINATION => destination_files.get(path),
-                        // No other value reaches here: the type was checked
-                        // against `ReplacementTypeEnum` above.
-                        _ => None,
-                    };
-                    kept.map(|in_tree| {
-                        let mut file = merge::MergedFile::stored(in_tree);
-                        // "The file mode to apply during conflict resolution."
-                        if let Some(mode) = &entry.file_mode {
-                            file.entry.file_mode = mode.clone();
-                        }
-                        file
-                    })
-                };
-                match resolved {
-                    Some(file) => {
-                        merged.files.insert(path.clone(), file);
-                    }
-                    // The version this entry keeps does not hold the path, so
-                    // neither does the resolved merge.
-                    None => {
-                        merged.files.remove(path);
-                    }
-                }
-                merged.conflicts.remove(path);
-            }
-            for path in &resolution.deletes {
-                merged.files.remove(path);
-                merged.conflicts.remove(path);
-            }
-            for (path, mode) in &resolution.modes {
-                match merged.files.get_mut(path) {
-                    Some(file) => file.entry.file_mode = mode.clone(),
-                    None => {
-                        return Err(
-                            CreateUnreferencedMergeCommitErrorModeled::InvalidPathException(
-                                InvalidPathException {
-                                    message: Some(format!(
-                                        "the merge result does not hold the path {path}, so its \
-                                         file mode cannot be set"
-                                    )),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
-                }
-            }
+            resolution
+                .apply(&mut merged, &base_files, &source_files, &destination_files)
+                .map_err(refused_resolution)?;
             // A resolution can write a file at a path the merged tree holds as a
             // folder, and can equally settle a collision the merge itself found,
             // so the file-against-folder verdict is recomputed over the resolved
@@ -888,53 +724,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Then CodeCommit's documented 6 MB folder limit, the other bound
-        // `CreateCommit` holds a written tree to, charged from the crate's one reading
-        // of that rule (`crate::state::folder_content_bytes_by_folder`).
-        //
-        // It is charged per FOLDER of the resulting tree, not per changed path: a
-        // folder is over the limit whatever combination of paths took it there, so a
-        // folder whose growth comes from paths that are each unchanged relative to
-        // the destination is charged too. Only a folder this merge CHANGES is
-        // charged, because a folder whose immediate entries the destination already
-        // held exactly is one this commit writes nothing into.
-        fn entries_by_folder(
-            tree: &BTreeMap<String, crate::state::FileEntry>,
-        ) -> BTreeMap<&str, Vec<(&str, &str, &str)>> {
-            let mut folders: BTreeMap<&str, Vec<(&str, &str, &str)>> = BTreeMap::new();
-            for (path, entry) in tree {
-                folders
-                    .entry(crate::state::folder_of(path))
-                    .or_default()
-                    .push((
-                        path.as_str(),
-                        entry.blob_id.as_str(),
-                        entry.file_mode.as_str(),
-                    ));
-            }
-            folders
-        }
-        let merged_entries = entries_by_folder(&files);
-        let destination_entries = entries_by_folder(&destination_files);
-        for (folder, bytes) in crate::state::folder_content_bytes_by_folder(&files) {
-            if destination_entries.get(folder) == merged_entries.get(folder) {
-                // The destination already held exactly these entries under this
-                // folder, so the commit writes nothing into it.
-                continue;
-            }
-            if bytes > crate::state::MAX_FOLDER_CONTENT_BYTES {
-                return Err(
-                    CreateUnreferencedMergeCommitErrorModeled::FolderContentSizeLimitExceededException(
-                        FolderContentSizeLimitExceededException {
-                            message: Some(format!(
-                                "the commit cannot be created because the folder {folder} \
-                                 would exceed the limit of {} bytes",
-                                crate::state::MAX_FOLDER_CONTENT_BYTES
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        // `CreateCommit` holds a written tree to, charged from the crate's one
+        // reading of that rule (`merge::oversized_changed_folder`).
+        if let Some((folder, _)) = merge::oversized_changed_folder(&files, &destination_files) {
+            return Err(
+                CreateUnreferencedMergeCommitErrorModeled::FolderContentSizeLimitExceededException(
+                    FolderContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the commit cannot be created because the folder {folder} \
+                             would exceed the limit of {} bytes",
+                            crate::state::MAX_FOLDER_CONTENT_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
         // And the bound on the STORE this commit's objects grow, charged before
         // the write exactly as `CreateCommit` charges it.

@@ -162,13 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Settling first is what keeps the stop honest: an assessment whose completion
         // was already due finished before this call, so the stop finds it terminal and
-        // leaves the status the clock gave it. The assessment is looked up in the Region
-        // this request was signed for: an id minted through another Region's endpoint
-        // names nothing here.
+        // leaves the status the clock gave it — on the servers as well. The assessment is
+        // looked up in the Region this request was signed for: an id minted through
+        // another Region's endpoint names nothing here.
+        //
+        // A stop is observable on the SERVERS too, which is what `stop_assessment` on the
+        // portfolio does: the servers the assessment was still collecting for move to the
+        // per-server face of `STOPPED`. A stop of an assessment that already reached a
+        // terminal status changes nothing, there as here; the output carries no members
+        // either way.
         let found = store
             .region_mut(&region)
-            .and_then(|portfolio| portfolio.settled_assessment_mut(&input.assessment_id, now));
-        let Some(assessment) = found else {
+            .and_then(|portfolio| portfolio.stop_assessment(&input.assessment_id, now));
+        if found.is_none() {
             // The condition is a resource that is not there, so the answer is the
             // service's not-found (HTTP 404) — widened in above, because this
             // operation's own error list omits it.
@@ -176,11 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::assessment_not_found(),
             )
             .into());
-        };
-
-        // A stop of an assessment that already reached a terminal status changes
-        // nothing; the output carries no members either way.
-        assessment.stop(now);
+        }
 
         Ok(StopAssessmentOutput {})
     }

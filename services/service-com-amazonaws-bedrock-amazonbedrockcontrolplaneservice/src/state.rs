@@ -443,13 +443,36 @@ pub const MAX_COMMITTED_MODEL_UNITS: i32 = 64;
 /// the request asked for and the region it addressed, and pointing the caller at the
 /// support case that raises the quota. So the rule is "name the model the request named,
 /// in the region it addressed", not one recorded model id.
+///
+/// The remedy clause is [`service_limit_increase_case_url`] followed by the escalation it
+/// asks for: a quota increase, which is the only way such a purchase ever succeeds.
 #[must_use]
 pub fn no_commitment_model_units_message(model_id: &str, region: &str) -> String {
     format!(
         "Your account does not currently have any no commitment model units reserved for \
-         {model_id}. Please see \
-         https://support.console.aws.amazon.com/support/home?region={region}\
-         #/case/create to request model units."
+         {model_id}. Please see {} to request a service quota increase.",
+        service_limit_increase_case_url(region)
+    )
+}
+
+/// The support-center case form a model-unit quota refusal hands the caller, for the
+/// `region` the refused request addressed.
+///
+/// A Provisioned Throughput purchase refused for want of granted model units cannot be
+/// retried into success — it can only be escalated — so the case form is the only
+/// actionable content such a refusal carries, and it is the one the model documents for
+/// `CreateProvisionedModelThroughputRequest.modelUnits`
+/// (`smithy_query(query="doc",shape="CreateProvisionedModelThroughputRequest",member="modelUnits")`:
+/// "You must first visit the ... support center to request MUs." over
+/// `.../support/home#/case/create?issueType=service-limit-increase`). The
+/// `issueType=service-limit-increase` selector is what preselects the quota-increase form,
+/// so it is part of the link rather than decoration; the region the request addressed is
+/// carried so the form opens against it.
+#[must_use]
+pub fn service_limit_increase_case_url(region: &str) -> String {
+    format!(
+        "https://support.console.aws.amazon.com/support/home?region={region}\
+         #/case/create?issueType=service-limit-increase"
     )
 }
 

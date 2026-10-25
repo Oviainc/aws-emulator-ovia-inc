@@ -179,13 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if let Some(message) = crate::state::max_results_rejection(
-            crate::state::PageSizeNoun::Records,
-            input.max_results,
-        ) {
-            // A page size outside the window names no page: refused with the service's
-            // own modelled invalid-value error, the same one every other listing in
-            // this service answers with.
+        if let Some(message) =
+            crate::state::CLUSTER_PAGE_SIZE_WINDOW.rejection(input.max_results)
+        {
+            // A page size outside the window the CLUSTER-side listings serve names no
+            // page: refused with the service's own modelled invalid-value error, the
+            // same one every other listing in this service answers with.
             return Err(invalid_value(message));
         }
         // `SourceType` is a modelled enum, and the deserializer carries its value

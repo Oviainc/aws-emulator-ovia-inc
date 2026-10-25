@@ -45,6 +45,8 @@ mod ephemeris_deletion;
 mod ephemeris_description;
 #[path = "all/ephemeris_expiration.rs"]
 mod ephemeris_expiration;
+#[path = "all/ground_station_inventory.rs"]
+mod ground_station_inventory;
 #[path = "all/ground_station_reservations.rs"]
 mod ground_station_reservations;
 #[path = "all/lifecycle_writes.rs"]

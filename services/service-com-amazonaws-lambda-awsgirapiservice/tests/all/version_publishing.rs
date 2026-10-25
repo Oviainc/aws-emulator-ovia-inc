@@ -14,7 +14,8 @@ use std::sync::Arc;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    ComAmazonawsLambdaAwsgirapiserviceState, FunctionVersionRecord, MAX_FUNCTION_VERSIONS,
+    mint_revision_id, ComAmazonawsLambdaAwsgirapiserviceState, FunctionVersionRecord,
+    MAX_FUNCTION_VERSIONS,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use sha2::Digest as _;
@@ -190,9 +191,12 @@ struct PublishCase {
     code_size: i64,
     /// The `CodeSha256` the frozen configuration must report.
     code_sha256: Option<String>,
-    /// The `Description` the frozen configuration must report.
+    /// The `Description` the frozen configuration must report. `Some("")` for a version
+    /// of a function created without one: the member is part of every
+    /// `FunctionConfiguration` AWS reports.
     description: Option<&'static str>,
-    /// The `Description` the UNPUBLISHED configuration must still report.
+    /// The `Description` the UNPUBLISHED configuration must still report, under the same
+    /// rule.
     latest_description: Option<&'static str>,
     /// The `MemorySize` the frozen configuration must report.
     memory_size: i64,
@@ -232,8 +236,8 @@ async fn publish_version_freezes_the_current_code_and_configuration() {
             version: "1",
             code_size: i64::try_from(small.len()).unwrap_or_default(),
             code_sha256: Some(expected_code_sha256(&small)),
-            description: None,
-            latest_description: None,
+            description: Some(""),
+            latest_description: Some(""),
             memory_size: 128,
             timeout: 3,
             package_type: "Zip",
@@ -301,8 +305,8 @@ async fn publish_version_freezes_the_current_code_and_configuration() {
             version: "1",
             code_size: 0,
             code_sha256: None,
-            description: None,
-            latest_description: None,
+            description: Some(""),
+            latest_description: Some(""),
             memory_size: 128,
             timeout: 3,
             package_type: "Zip",
@@ -321,8 +325,8 @@ async fn publish_version_freezes_the_current_code_and_configuration() {
             version: "1",
             code_size: 0,
             code_sha256: None,
-            description: None,
-            latest_description: None,
+            description: Some(""),
+            latest_description: Some(""),
             memory_size: 2048,
             timeout: 3,
             package_type: "Image",
@@ -344,7 +348,7 @@ async fn publish_version_freezes_the_current_code_and_configuration() {
             code_size: i64::try_from(small.len()).unwrap_or_default(),
             code_sha256: Some(expected_code_sha256(&small)),
             description: Some("the second version"),
-            latest_description: None,
+            latest_description: Some(""),
             memory_size: 128,
             timeout: 3,
             package_type: "Zip",
@@ -782,15 +786,23 @@ async fn publishing_past_the_version_ceiling_is_refused() {
             .get_mut("crowded")
             .expect("the created function must be stored");
         let created = record.config.last_modified.clone();
+        // Each snapshot is written exactly as `publish_next_version` writes one: taken
+        // FROM the revision the unpublished configuration is at, carrying a revision of
+        // its own, and freezing the package the function holds.
+        let source_revision_id = record.config.revision_id.clone();
+        let code = record.code.clone();
         let ceiling = u64::try_from(MAX_FUNCTION_VERSIONS).unwrap_or_default();
         for number in 1..=ceiling {
             let mut config = record.config.clone();
             config.description = Some(format!("version {number}"));
+            config.revision_id = mint_revision_id();
             record.versions.insert(
                 number,
                 FunctionVersionRecord {
                     version: number,
                     config,
+                    source_revision_id: source_revision_id.clone(),
+                    code: code.clone(),
                     created: created.clone(),
                 },
             );

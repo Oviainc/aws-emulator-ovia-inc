@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{SuiteDefinitionConfiguration, SuiteRunConfiguration};
+use crate::ops::types::{DeviceUnderTest, SuiteDefinitionConfiguration, SuiteRunConfiguration};
 
 /// The region an ARN or endpoint falls back to when the request carries no SigV4 scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -844,11 +844,13 @@ pub fn endpoint_for_region(region: &str) -> String {
     endpoint_host(label, host_region(label.len(), region))
 }
 
-/// The device a `GetEndpoint` request names, exactly as it names it.
+/// The device a request names, exactly as it names it.
 ///
 /// Device Advisor lets a caller name the device under test by its thing, by its
-/// certificate, or by the role it assumes; a request that names NONE of them is asking for
-/// the account-level endpoint instead.
+/// certificate, or by the role it assumes, wherever a device appears: on a `GetEndpoint`
+/// request's own members, and inside the `DeviceUnderTest` a suite definition or a suite
+/// run configuration carries. A `GetEndpoint` request that names NONE of them is asking
+/// for the account-level endpoint instead.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceIdentity<'a> {
     pub thing_arn: Option<&'a str>,
@@ -856,11 +858,176 @@ pub struct DeviceIdentity<'a> {
     pub device_role_arn: Option<&'a str>,
 }
 
-impl DeviceIdentity<'_> {
+impl<'a> DeviceIdentity<'a> {
+    /// The identity a modelled `DeviceUnderTest` names, borrowed from it.
+    pub fn of(device: &'a DeviceUnderTest) -> Self {
+        Self {
+            thing_arn: device.thing_arn.as_deref(),
+            certificate_arn: device.certificate_arn.as_deref(),
+            device_role_arn: device.device_role_arn.as_deref(),
+        }
+    }
+
     /// True when the request named no device at all.
     pub fn names_no_device(&self) -> bool {
         self.thing_arn.is_none() && self.certificate_arn.is_none() && self.device_role_arn.is_none()
     }
+
+    /// Every ARN-typed member of a device identity: its wire name, the value this identity
+    /// carries for it, and the AWS service whose ARN that member names — a thing and a
+    /// certificate are IoT resources, and the device role is the IAM role the device
+    /// assumes. The one table for the crate, so every operation that accepts a device
+    /// checks the same members against the same services.
+    fn arn_members(&self) -> [(&'static str, Option<&'a str>, &'static str); 3] {
+        [
+            ("thingArn", self.thing_arn, IOT_RESOURCE_SERVICE),
+            ("certificateArn", self.certificate_arn, IOT_RESOURCE_SERVICE),
+            ("deviceRoleArn", self.device_role_arn, DEVICE_ROLE_SERVICE),
+        ]
+    }
+}
+
+/// The AWS service whose ARNs name a thing and a certificate: both are IoT resources.
+pub const IOT_RESOURCE_SERVICE: &str = "iot";
+
+/// The AWS service whose ARNs name the role a device assumes, and the role Device Advisor
+/// assumes to reach the devices under test: both are IAM roles.
+pub const DEVICE_ROLE_SERVICE: &str = "iam";
+
+/// How a device identity has to name its device, as the member that carries it documents.
+///
+/// The requirement is stated per member: a suite run's primary device "requires a thing ARN
+/// or a certificate ARN" (`SuiteRunConfiguration$primaryDevice`), a device under test of a
+/// suite definition takes "a thing ARN, certificate ARN or device role ARN"
+/// (`DeviceUnderTest`), and a `GetEndpoint` request that names no device is asking for the
+/// account-level endpoint, so naming none is legal there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceNaming {
+    /// The device is named by its thing or by its certificate.
+    ThingOrCertificate,
+    /// The device is named by its thing, its certificate or the role it assumes.
+    AnyDeviceArn,
+    /// Naming no device at all is legal for this member.
+    Optional,
+}
+
+impl DeviceNaming {
+    /// What this member requires, worded for the refusal that names it.
+    fn requirement(self) -> &'static str {
+        match self {
+            Self::ThingOrCertificate => "a thing ARN or a certificate ARN",
+            Self::AnyDeviceArn => "a thing ARN, certificate ARN or device role ARN",
+            Self::Optional => "nothing",
+        }
+    }
+
+    /// True when `device` names the device the way this member requires.
+    fn satisfied_by(self, device: &DeviceIdentity<'_>) -> bool {
+        match self {
+            Self::ThingOrCertificate => {
+                device.thing_arn.is_some() || device.certificate_arn.is_some()
+            }
+            Self::AnyDeviceArn => !device.names_no_device(),
+            Self::Optional => true,
+        }
+    }
+}
+
+/// The violation an ARN-typed member commits when its value is not an ARN of the service
+/// that member names, worded from the request: the member's path and the form it must have.
+///
+/// The modelled length bounds (`AmazonResourceName` is `len 20..2048`) are enforced before
+/// a handler runs; the ARN FORM is not modelled, so it is checked here and refused with the
+/// operation's own client-input error.
+pub fn arn_member_violation(member: &str, value: &str, service: &str) -> Option<String> {
+    (!is_arn_of_service(value, service)).then(|| {
+        format!(
+            "{member} must be an Amazon Resource Name of the form \
+             arn:<partition>:{service}:<region>:<account>:<resource>, got {value:?}"
+        )
+    })
+}
+
+/// The violation the device identity at `path` commits, if any.
+///
+/// Two rules, both properties of the device identity rather than of one operation: every
+/// ARN it carries has to BE an Amazon Resource Name of the service that member names, and
+/// the identity has to NAME a device the way `naming` requires. `path` is where the
+/// identity sits in the request (empty for one carried by the input's own members), so the
+/// message names the member the caller actually sent.
+pub fn device_violation(
+    path: &str,
+    device: &DeviceIdentity<'_>,
+    naming: DeviceNaming,
+) -> Option<String> {
+    for (member, value, service) in device.arn_members() {
+        if let Some(value) = value {
+            let member = if path.is_empty() {
+                member.to_string()
+            } else {
+                format!("{path}.{member}")
+            };
+            if let Some(violation) = arn_member_violation(&member, value, service) {
+                return Some(violation);
+            }
+        }
+    }
+    (!naming.satisfied_by(device)).then(|| {
+        let subject = if path.is_empty() {
+            "the device under test"
+        } else {
+            path
+        };
+        format!("{subject} requires {}", naming.requirement())
+    })
+}
+
+/// Every rule the model states in prose for a `SuiteRunConfiguration`, which no modelled
+/// constraint can express: the run's primary device has to name a device, and by an ARN of
+/// the service the member naming it belongs to.
+///
+/// The rule belongs to the SHAPE, so every operation that accepts a run configuration asks
+/// here rather than restating it.
+pub fn run_configuration_violation(configuration: &SuiteRunConfiguration) -> Option<String> {
+    device_violation(
+        "suiteRunConfiguration.primaryDevice",
+        &DeviceIdentity::of(&configuration.primary_device),
+        DeviceNaming::ThingOrCertificate,
+    )
+}
+
+/// Every rule the model states in prose for a `SuiteDefinitionConfiguration`: the
+/// `rootGroup` rule ([`root_group_violation`]) and the ARNs the configuration points at —
+/// the IAM role Device Advisor assumes for the devices, and each device under test, which
+/// the shape documents as needing a thing, a certificate or a device role ARN.
+///
+/// The rule belongs to the SHAPE, so every operation that accepts a definition
+/// configuration asks here rather than restating it.
+pub fn definition_configuration_violation(
+    configuration: &SuiteDefinitionConfiguration,
+) -> Option<String> {
+    if let Some(violation) = root_group_violation(configuration) {
+        return Some(violation);
+    }
+    if let Some(violation) = arn_member_violation(
+        "suiteDefinitionConfiguration.devicePermissionRoleArn",
+        &configuration.device_permission_role_arn,
+        DEVICE_ROLE_SERVICE,
+    ) {
+        return Some(violation);
+    }
+    configuration
+        .devices
+        .iter()
+        .flatten()
+        .enumerate()
+        .find_map(|(index, device)| {
+            device_violation(
+                &format!("suiteDefinitionConfiguration.devices[{index}]"),
+                &DeviceIdentity::of(device),
+                DeviceNaming::AnyDeviceArn,
+            )
+        })
 }
 
 /// Length of the single DNS label that identifies ONE device in a device-level endpoint.

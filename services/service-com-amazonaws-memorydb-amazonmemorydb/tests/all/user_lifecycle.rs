@@ -31,7 +31,7 @@
 //! every whole-set assertion below expects that user beside the created ones.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_memorydb_amazonmemorydb::state::{MAX_MAX_RESULTS, MIN_MAX_RESULTS};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::ACCESS_CONTROL_PAGE_SIZE_WINDOW;
 use smithy_server_runtime::MultiServiceRouter;
 
 // The suite-wide harness: ONE SigV4 request builder, ONE router constructor and ONE
@@ -554,9 +554,9 @@ async fn the_listing_pages_and_filters_over_every_user() {
         // The built-in user the account already had pages with the created ones.
         .chain([DEFAULT_USER.to_string()])
         .collect();
-    // More users than the SMALLEST page the service serves, so a page size at the bottom
-    // of the page-size window has to walk several pages to cover the set.
-    for index in 0..MIN_MAX_RESULTS {
+    // More users than the SMALLEST page the user listing serves, so a page size at the
+    // bottom of its page-size window has to walk several pages to cover the set.
+    for index in 0..ACCESS_CONTROL_PAGE_SIZE_WINDOW.min + 3 {
         let name = format!("paged-user-{index:02}");
         create_user(&router, &name).await;
         sorted.push(name);
@@ -565,7 +565,11 @@ async fn the_listing_pages_and_filters_over_every_user() {
 
     // At the bottom of the page-size window, one past it, and at the top: each covers
     // the whole set, in name order, exactly once.
-    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
+    for page_size in [
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.min,
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.min + 1,
+        ACCESS_CONTROL_PAGE_SIZE_WINDOW.max,
+    ] {
         let case = format!("MaxResults {page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;

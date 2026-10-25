@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_memorydb_amazonmemorydb::state::{
-    default_parameter_groups, MAX_MAX_RESULTS, MIN_MAX_RESULTS,
+    default_parameter_groups, PARAMETER_PAGE_SIZE_WINDOW,
 };
 use service_com_amazonaws_memorydb_amazonmemorydb::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,6 +37,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the test's requests are signed for. Every ARN the emulator mints must
 /// carry it, rather than a constant baked into the service.
 const REGION: &str = "us-west-2";
+
+/// The page sizes this listing serves: `DescribeParameterGroups` reads the
+/// parameter-group surface, so its window is that surface's own.
+const WINDOW_MIN: i32 = PARAMETER_PAGE_SIZE_WINDOW.min;
+const WINDOW_MAX: i32 = PARAMETER_PAGE_SIZE_WINDOW.max;
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -375,7 +380,7 @@ async fn the_listing_pages_over_every_group_in_name_order() {
     let mut created: Vec<String> = CASES.iter().map(|case| case.name.to_string()).collect();
     // More groups than the SMALLEST page the service serves, so a page size at the bottom
     // of the page-size window has to walk several pages to cover the set.
-    for index in 0..MIN_MAX_RESULTS {
+    for index in 0..WINDOW_MIN {
         let name = format!("paged-group-{index:02}");
         ok(
             &router,
@@ -396,7 +401,7 @@ async fn the_listing_pages_over_every_group_in_name_order() {
 
     // At the bottom of the page-size window, one past it, and at the top: a size larger
     // than the set is one page with no token.
-    for page_size in [MIN_MAX_RESULTS, MIN_MAX_RESULTS + 1, MAX_MAX_RESULTS] {
+    for page_size in [WINDOW_MIN, WINDOW_MIN + 1, WINDOW_MAX] {
         let case = format!("MaxResults={page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -611,7 +616,7 @@ async fn a_request_that_names_nothing_is_refused() {
     }
 
     // A page size outside the service's window names no page.
-    for max_results in [0, -7, MIN_MAX_RESULTS - 1, MAX_MAX_RESULTS + 1] {
+    for max_results in [0, -7, WINDOW_MIN - 1, WINDOW_MAX + 1] {
         let (status, refused) = call(
             &router,
             "DescribeParameterGroups",
