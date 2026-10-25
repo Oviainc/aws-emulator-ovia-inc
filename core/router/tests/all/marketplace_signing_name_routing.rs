@@ -138,6 +138,9 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
     // created out of band of that API (a buyer accepts a seller's offer), so this
     // suite provisions the one its row writes against — otherwise the write is that
     // service's own `ResourceNotFoundException` rather than the 200 the row pins.
+    // `seed_agreements` answers how many agreements that store holds AFTERWARDS,
+    // which includes the targets it boots with, so what is asserted below is that
+    // the shared engine really is where that store lives — not a count.
     let held = service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice::state::seed_agreements(
         &*engine,
         [
@@ -147,10 +150,9 @@ async fn each_service_sharing_the_aws_marketplace_signing_name_serves_its_own_su
             .with_product("prod-1"),
         ],
     );
-    assert_eq!(
-        held,
-        Some(1),
-        "the shared engine must hold the deployment service's store"
+    assert!(
+        held.is_some_and(|held| held >= 1),
+        "the shared engine must hold the deployment service's store, got {held:?}"
     );
 
     // (case, method, uri, x-amz-target, body, expected status, expected error code)

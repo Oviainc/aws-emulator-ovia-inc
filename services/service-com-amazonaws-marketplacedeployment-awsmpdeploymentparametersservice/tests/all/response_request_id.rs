@@ -253,10 +253,10 @@ async fn every_response_names_the_request_it_answers_with_a_fresh_id() {
         )
         .with_body(json!({ "agreementId": AGREEMENT })),
         Row::new(
-            "PutDeploymentParameter against a target nothing recorded ahead of the call",
+            "PutDeploymentParameter against a target the account does not hold",
             "POST",
             put_path(CATALOG, "prod-never-provisioned"),
-            200,
+            404,
         )
         .with_body(put_body("Elsewhere", 4)),
         Row::new(
