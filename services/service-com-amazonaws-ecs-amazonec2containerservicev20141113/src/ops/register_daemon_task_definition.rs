@@ -338,7 +338,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the registering call and stored with the revision.
             registered_by: crate::state::caller_identity_arn(),
             registered_at: crate::state::now(),
+            // Nothing has asked for this revision to be deleted, so it carries neither
+            // the instant one was requested nor a delete the clock owes.
             delete_requested_at: None,
+            deleted_due_at: None,
         };
         let arn = record.arn.clone();
         guard

@@ -190,7 +190,9 @@ pub(crate) async fn get_monitor(router: &MultiServiceRouter, name: &str) -> (u16
     call(router, "GET", &format!("/monitors/{name}"), None).await
 }
 
-async fn delete_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+/// `DELETE /monitors/{monitorName}`. `pub(crate)`, so a suite that needs a
+/// monitor gone reuses this one rather than keeping a copy of its own.
+pub(crate) async fn delete_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("/monitors/{name}"), None).await
 }
 
