@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagSAMLProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagSAMLProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagSAMLProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagSAMLProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagSAMLProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagSAMLProvider"))
+        // `ctx` carries request metadata only; untagging a provider depends on nothing
+        // in it — IAM is global, and the provider is named by the ARN in the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagSAMLProviderErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the value still has to
+        // BE an ARN — one "begins with arn:" (Amazon Resource Names, Amazon Web Services
+        // General Reference) — and anything else is an "invalid … value … supplied for an
+        // input parameter". A well-formed ARN naming no held provider is the DIFFERENT
+        // answer the entity-absent error carries, the same split every other operation
+        // on this member makes.
+        if !input.saml_provider_arn.starts_with("arn:") {
+            return Err(UntagSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid SAMLProviderArn {}: the value is not an ARN",
+                        input.saml_provider_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The write is addressed exactly as a read of the same ARN is, so it reaches the
+        // one record `GetSAMLProvider` reports; an ARN the account holds no provider
+        // under "referenced a resource entity that does not exist", which IAM words for
+        // an untag call on a SAML provider by naming the ARN it found no provider
+        // manifest for.
+        let Some(provider) = store.saml_providers.get_mut(&input.saml_provider_arn) else {
+            return Err(UntagSAMLProviderErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Manifest not found for arn {}",
+                        input.saml_provider_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The tags with matching keys are removed" (`$TagKeys`): the removal, and the
+        // exact key comparison it makes, are the one shared rule in `crate::state`, so a
+        // named key the provider does not hold drops nothing rather than failing the
+        // call. It keeps the held order, which is sorted by key, so what
+        // `GetSAMLProvider` reports afterwards is still "sorted by tag key".
+        let remaining = crate::state::remove_tags(
+            provider.tags.as_ref(),
+            input.tag_keys.iter().map(String::as_str),
+        );
+
+        // An empty tag set is the same as no tags, which is how `CreateSAMLProvider`
+        // stores one: the member is reported only when the provider carries a tag.
+        provider.tags = (!remaining.is_empty()).then_some(remaining);
+        Ok(UntagSAMLProviderOutput)
     }
 }

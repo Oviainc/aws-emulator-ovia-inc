@@ -168,11 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
+        // A deleted resource leaves no tags behind, so the shared tag directory is
+        // resolved before the delete and every deleted ARN's entry dropped with it.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         // Deleting an AppInstance deletes everything it owns, so the users it holds go
         // with it and a later Describe of one of them resolves to nothing.
-        if state.remove_app_instance(&input.app_instance_arn).is_none() {
+        let Some(removed) = state.remove_app_instance(&input.app_instance_arn) else {
             return Err(DeleteAppInstanceErrorModeled::BadRequestException(
                 BadRequestException {
                     code: Some("NotFound".to_string()),
@@ -183,7 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+
+        // The cascade reaches the tags too: the instance's own and those of every user it
+        // took with it.
+        let mut tags = tag_directory.lock();
+        tags.forget(&input.app_instance_arn);
+        for user_arn in removed.users.keys() {
+            tags.forget(user_arn);
         }
+        drop(tags);
 
         Ok(DeleteAppInstanceOutput)
     }

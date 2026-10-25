@@ -71,6 +71,9 @@ mod page_size_rule;
 #[path = "all/pricing_plan.rs"]
 mod pricing_plan;
 
+#[path = "all/pricing_plan_tier_and_pending.rs"]
+mod pricing_plan_tier_and_pending;
+
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 

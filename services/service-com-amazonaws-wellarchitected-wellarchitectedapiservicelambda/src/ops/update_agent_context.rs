@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes a stored context of an agent profile: the `title` and the typed `content` the
+//! request carries replace the stored ones, every member it leaves out keeps the value the
+//! context already has, and the change is stamped with the instant and the identity it is
+//! attributed to — so `GetAgentContext` and `ListAgentContexts` report what this call
+//! left. A `clientToken` makes the update idempotent the same way `UpdateAgentGoal`'s
+//! does.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +152,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The context is named by the path the request carries and nothing here is minted,
+        // so no request metadata is read.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentContextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly, exactly as
+        // `CreateAgentContext` applies it: `ApplicationType` and `Criticality` are enums,
+        // so the boundary walk in `crate::service` already refuses a value outside their
+        // published sets with this same 400 before the handler runs. It is kept so a
+        // context is never left STORED naming a value the enums do not publish. No
+        // `contextType` is passed because this operation's input carries none — the type a
+        // context was created as is not updatable.
+        if let Some(content) = input.content.as_ref() {
+            if let Some(exception) = crate::state::unknown_context_enum_exception(None, content) {
+                return Err(UpdateAgentContextErrorModeled::ValidationException(exception).into());
+            }
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "content": input
+                .content
+                .as_ref()
+                .map(crate::state::context_content_fingerprint),
+            "id": &input.id,
+            "profileArn": &input.profile_arn,
+            "title": &input.title,
+        }));
+        // The instant this change is recorded at, read once so the record and the summary
+        // it projects carry one reading of the clock.
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: a retry carrying the token of a request that already
+        // completed answers that request's result rather than acting again. The result of
+        // an update IS the stored context, so the replay re-reads it and answers it as it
+        // stands — carrying the modification members the original update stamped rather
+        // than fresh ones, and reporting any later change to the context the way a read of
+        // it would. The token is OPTIONAL (the SDKs generate one), so a request carrying
+        // none is served on its own.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentContext"))
+        // A token re-used with DIFFERENT parameters names a different request, and this
+        // operation models no `ConflictException` to refuse one with, so it is served on
+        // its own merits and the ledger is re-pointed at it below.
+        if let Some(client_token) = input.client_token.as_deref() {
+            let replayed = store
+                .update_agent_context_tokens
+                .get(client_token)
+                .filter(|recorded| recorded.fingerprint == fingerprint)
+                .map(|recorded| (recorded.profile_arn.clone(), recorded.context_id.clone()));
+            if let Some((profile_arn, context_id)) = replayed {
+                if let Some(updated) = store.agent_context(&profile_arn, &context_id) {
+                    return Ok(UpdateAgentContextOutput {
+                        context: updated.to_summary(),
+                    });
+                }
+                // The token names a context that is no longer stored, so there is no
+                // original result to answer with: forget the token and let this request be
+                // judged on its own.
+                store.update_agent_context_tokens.forget(client_token);
+            }
+        }
+
+        // The profile a context is reached through is resolved first, so a `profileArn`
+        // that names no stored profile is reported as the MISSING PROFILE rather than as a
+        // missing context — the order `CreateAgentContext` and `UpdateAgentGoal` resolve
+        // the pair in.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(UpdateAgentContextErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // A context belongs to ONE profile, so an id that names a context of another
+        // profile is as absent here as one that names no context at all — and nothing is
+        // written for it.
+        let Some(record) = store.agent_context_mut(&input.profile_arn, &input.id) else {
+            return Err(UpdateAgentContextErrorModeled::ResourceNotFoundException(
+                crate::state::agent_context_not_found(&input.profile_arn, &input.id),
+            )
+            .into());
+        };
+
+        // "Updates an existing context associated with a profile": every updatable member
+        // is optional, so the request carries the members it changes and the STORED value
+        // stands for every member it leaves out. The context's identity — its id, the
+        // profile it belongs to, the type it was created as, and who created it when — is
+        // not updatable and is untouched.
+        if let Some(title) = input.title {
+            record.title = title;
+        }
+        // `content` is ONE typed structure and the member is "the updated typed content of
+        // the context", so a request that carries it replaces the whole content rather than
+        // merging member by member into the stored one. `applicationType` and
+        // `criticality` are projected FROM that content, so they follow it.
+        if let Some(content) = input.content {
+            record.content = content;
+        }
+        // Every request this emulator serves is attributed to its one account, so that is
+        // the identity the change is recorded under — never a value read off the request.
+        record.last_modified_by = Some(::engine::emulator_account_id().to_string());
+        record.last_modified_at = Some(now);
+        let context = record.to_summary();
+
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.update_agent_context_tokens.remember(
+                client_token,
+                crate::state::UpdateAgentContextToken {
+                    profile_arn: input.profile_arn,
+                    context_id: input.id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(UpdateAgentContextOutput { context })
     }
 }
+

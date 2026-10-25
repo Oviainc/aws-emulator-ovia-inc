@@ -9,8 +9,8 @@
 //! don't specify encryption information in your copy request, the encryption setting of
 //! the target object is set to the default encryption configuration of the destination
 //! bucket" (`CopyObjectRequest$ServerSideEncryption`). What the copy DOES carry over from
-//! the source is what `x-amz-metadata-directive` and `x-amz-tagging-directive` say it
-//! does, both `COPY` by default.
+//! the source is what `x-amz-metadata-directive`, `x-amz-tagging-directive` and
+//! `x-amz-object-annotation-directive` say it does, all `COPY` by default.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -535,6 +535,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // other value that reaches here is `REPLACE`.
         let replaces_metadata = input.metadata_directive.as_deref() == Some(DIRECTIVE_REPLACE);
         let replaces_tags = input.tagging_directive.as_deref() == Some(DIRECTIVE_REPLACE);
+        // "Specifies whether you want to copy annotations from the source object or exclude
+        // them. If this header isn't specified, COPY is the default behavior"
+        // (`CopyObjectRequest$AnnotationDirective`) — an enum member, so the only other
+        // value that reaches here is `COPY`, which is also what a request naming nothing
+        // gets.
+        let excludes_annotations = input.annotation_directive.as_deref() == Some(DIRECTIVE_EXCLUDE);
 
         let mut store = state.lock();
 
@@ -632,6 +638,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source.bucket == input.bucket && source.key == input.key && source.version_id.is_none();
         let changes_nothing = !replaces_metadata
             && !replaces_tags
+            // Excluding the source's annotations changes what the destination object
+            // carries, so a self-copy that asks for it is a copy that changes something.
+            && !excludes_annotations
             && input.storage_class.is_none()
             && input.website_redirect_location.is_none()
             && requested.names_no_member();
@@ -710,6 +719,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // had to be out of one for this copy to be served at all), so there is nothing
             // to restore; `RestoreObject` is what asks for one.
             restore: None,
+            // `COPY`, the default: the source's annotations come across with the bytes,
+            // and `EXCLUDE` leaves them behind — the destination object then carries none,
+            // which is the state a plain write leaves an object in.
+            annotations: if excludes_annotations {
+                ::std::collections::BTreeMap::new()
+            } else {
+                source_object.annotations.clone()
+            },
             body: source_object.body.clone(),
         };
         if replaces_metadata {
@@ -850,6 +867,13 @@ const ACCESS_POINT_ARN_PREFIX: &str = "arn:";
 /// (`smithy_query(query="shape",shape="MetadataDirective,TaggingDirective")`), and `COPY`
 /// is the default for each, so this is the only value that changes what is stored.
 const DIRECTIVE_REPLACE: &str = "REPLACE";
+
+/// The `AnnotationDirective` value that leaves the source's annotations behind. That enum
+/// is `COPY | EXCLUDE` (`crate::ops::types::ANNOTATION_DIRECTIVE_VALUES`) and "if this
+/// header isn't specified, COPY is the default behavior"
+/// (`CopyObjectRequest$AnnotationDirective`), so this is the only value that changes what
+/// the copy carries over.
+const DIRECTIVE_EXCLUDE: &str = "EXCLUDE";
 
 /// The source one `x-amz-copy-source` value names.
 #[derive(Debug)]

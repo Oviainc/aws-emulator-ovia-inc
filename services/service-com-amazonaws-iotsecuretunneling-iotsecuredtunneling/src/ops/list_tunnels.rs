@@ -135,7 +135,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("ListTunnels"))?;
 
@@ -163,6 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(page_size).unwrap_or(1);
 
         let now = ::std::time::SystemTime::now();
+        // The listing reports the tunnels of the account IN the Region being
+        // called, which is the only Region whose tunnels this endpoint holds.
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // Settle the transition the clock already made due before reporting.
         store.materialize_expired_tunnels(now);
@@ -175,8 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the page's own records are projected: a list call costs no deep copy of
         // the store, however many tunnels it holds.
         let mut ordered: Vec<(u64, String)> = store
-            .tunnels
-            .values()
+            .tunnels_in_region(&region)
             .filter(|tunnel| match input.thing_name.as_deref() {
                 None => true,
                 Some(thing_name) => tunnel
@@ -206,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tunnel_summaries = ordered
             .iter()
-            .filter_map(|(_, tunnel_id)| store.tunnels.get(tunnel_id))
+            .filter_map(|(_, tunnel_id)| store.tunnel(&region, tunnel_id))
             .map(|tunnel| TunnelSummary {
                 tunnel_id: Some(tunnel.tunnel_id.clone()),
                 tunnel_arn: Some(tunnel.tunnel_arn.clone()),

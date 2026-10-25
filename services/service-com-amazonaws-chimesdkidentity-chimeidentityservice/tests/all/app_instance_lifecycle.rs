@@ -352,9 +352,9 @@ async fn describe_app_instance_reports_what_create_persisted() {
         let created_at = instance["CreatedTimestamp"].as_f64();
         let updated_at = instance["LastUpdatedTimestamp"].as_f64();
         assert!(
-            created_at.is_some() && updated_at == created_at,
-            "case {case:?}: expected both timestamps populated and equal on a fresh \
-             instance, got created={created_at:?} updated={updated_at:?}"
+            created_at.is_some() && updated_at.is_none(),
+            "case {case:?}: expected a created instant and NO last-updated instant on a \
+             never-updated instance, got created={created_at:?} updated={updated_at:?}"
         );
 
         // A read must not change what the next reader sees: the same ARN describes

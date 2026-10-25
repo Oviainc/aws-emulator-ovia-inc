@@ -33,6 +33,8 @@ mod device_task_lifecycle;
 mod device_unlock_transient;
 #[path = "all/empty_inventory_refusals.rs"]
 mod empty_inventory_refusals;
+#[path = "all/list_tasks_empty_page.rs"]
+mod list_tasks_empty_page;
 #[path = "all/one_execution_per_device.rs"]
 mod one_execution_per_device;
 #[path = "all/region_gate_error_envelope.rs"]

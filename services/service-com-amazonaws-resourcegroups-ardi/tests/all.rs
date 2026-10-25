@@ -43,3 +43,5 @@ mod resource_group_lifecycle;
 mod state_roundtrip;
 #[path = "all/tag_sync_tasks.rs"]
 mod tag_sync_tasks;
+#[path = "all/ungroup_resources.rs"]
+mod ungroup_resources;

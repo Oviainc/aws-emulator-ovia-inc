@@ -170,6 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: Some(record.name.clone()),
                 metadata: record.metadata.clone(),
                 created_timestamp: Some(crate::state::wire_timestamp(record.created_timestamp)),
+                // A user is stamped from creation, so this member is always reported;
+                // every write to the user re-stamps it.
                 last_updated_timestamp: Some(crate::state::wire_timestamp(
                     record.last_updated_timestamp,
                 )),

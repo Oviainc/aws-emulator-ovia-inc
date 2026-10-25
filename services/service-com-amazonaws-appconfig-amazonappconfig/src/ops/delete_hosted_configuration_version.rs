@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are resolved outermost-first and whichever level is missing is the resource the
         // 404 names — the same order `CreateHostedConfigurationVersion` and
         // `GetHostedConfigurationVersion` resolve this path in.
-        let Some(application) = store.applications.get_mut(&input.application_id) else {
+        let Some(application) = store.application_mut(&input.application_id) else {
             return Err(not_found(
                 crate::state::application_not_found(&input.application_id),
                 input.application_id,

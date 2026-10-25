@@ -45,6 +45,8 @@ mod delivery_destinations;
 mod delivery_sources;
 #[path = "all/destination_policies.rs"]
 mod destination_policies;
+#[path = "all/destination_removal.rs"]
+mod destination_removal;
 #[path = "all/destinations.rs"]
 mod destinations;
 #[path = "all/export_tasks.rs"]

@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, IpAddressResponse,
     OutpostResolver, ResolverDnssecConfig, ResolverEndpoint, ResolverRule, ResolverRuleAssociation,
-    ResourceNotFoundException, Tag, TargetAddress, ValidationException,
+    ResourceInUseException, ResourceNotFoundException, Tag, TargetAddress, ValidationException,
 };
 
 /// The region an ARN carries when the request's SigV4 scope names none.
@@ -210,21 +210,25 @@ pub const RESOURCE_TYPE_OUTPOST_RESOLVER: &str = "OutpostResolver";
 pub const RESOURCE_TYPE_RESOLVER_RULE: &str = "ResolverRule";
 pub const RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION: &str = "ResolverRuleAssociation";
 
-/// The `ResolverRuleStatus` a stored rule reports.
+/// The `ResolverRuleStatus` values a stored rule reports.
 ///
 /// The model's enum (`smithy_query(query="shape",shape="ResolverRuleStatus")`)
 /// is `COMPLETE | DELETING | UPDATING | FAILED`: it has no provisioning value,
 /// so a created rule is settled the moment it exists and the clock owes it no
-/// transition. `DELETING`/`UPDATING`/`FAILED` describe operations this slice
-/// does not perform.
+/// transition. `DELETING` is what the rule a delete has just taken out reports,
+/// as that call's answer "including the status of the request"; `UPDATING` and
+/// `FAILED` describe operations this slice does not perform.
 pub const RULE_STATUS_COMPLETE: &str = "COMPLETE";
+pub const RULE_STATUS_DELETING: &str = "DELETING";
 
 /// `ResolverRuleAssociationStatus` values this slice reports, out of the
 /// model's enum (`smithy_query(query="shape",shape="ResolverRuleAssociationStatus")`);
-/// `DELETING`, `FAILED` and `OVERRIDDEN` describe states this slice does not
+/// `DELETING` is what the association a disassociate has just taken out
+/// reports, while `FAILED` and `OVERRIDDEN` describe states this slice does not
 /// produce.
 pub const RULE_ASSOCIATION_STATUS_CREATING: &str = "CREATING";
 pub const RULE_ASSOCIATION_STATUS_COMPLETE: &str = "COMPLETE";
+pub const RULE_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
 
 /// `ResolverRule$ShareStatus` for a rule this account owns and has not shared:
 /// a member of the model's `ShareStatus` enum
@@ -426,6 +430,39 @@ pub fn resolver_rule_association_not_found(
             r#"Resolver rule association with ID "{resolver_rule_association_id}" does not exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` `DisassociateResolverRule` answers when the
+/// store holds no association of that RULE with that VPC — the pair that call
+/// addresses an association by, rather than the association's own id. See
+/// [`resolver_rule_not_found`] on the absent service error code.
+pub fn resolver_rule_vpc_association_not_found(
+    resolver_rule_id: &str,
+    vpc_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver rule with ID "{resolver_rule_id}" is not associated with VPC with ID "{vpc_id}"."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
+    }
+}
+
+/// The `ResourceInUseException` `DeleteResolverRule` answers for a rule that is
+/// still associated with a VPC.
+///
+/// The fixed part of the sentence is the operation's own documented one —
+/// "Before you can delete a Resolver rule, you must disassociate it from all the
+/// VPCs that you associated the Resolver rule with" — and the variable parts are
+/// the rule the request named and how many associations the store still holds
+/// for it, so the message states what the caller has to undo.
+pub fn resolver_rule_in_use(resolver_rule_id: &str, associations: usize) -> ResourceInUseException {
+    ResourceInUseException {
+        message: Some(format!(
+            r#"Before you can delete a Resolver rule, you must disassociate it from all the VPCs that you associated the Resolver rule with. Resolver rule with ID "{resolver_rule_id}" is still associated with {associations} VPC(s)."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE.to_string()),
     }
 }
 
@@ -1397,6 +1434,20 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.resolver_rule_associations
             .values()
             .find(|record| record.resolver_rule_id == resolver_rule_id && record.vpc_id == vpc_id)
+    }
+
+    /// How many VPCs a rule is still associated with.
+    ///
+    /// `DeleteResolverRule` is what reads it: "Before you can delete a Resolver
+    /// rule, you must disassociate it from all the VPCs that you associated the
+    /// Resolver rule with", so a rule with any association left cannot be
+    /// deleted. The scan is over a store bounded by
+    /// [`MAX_STORED_RULE_ASSOCIATIONS`].
+    pub fn rule_association_count(&self, resolver_rule_id: &str) -> usize {
+        self.resolver_rule_associations
+            .values()
+            .filter(|record| record.resolver_rule_id == resolver_rule_id)
+            .count()
     }
 
     /// Every stored endpoint in creation order — the order both the list

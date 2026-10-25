@@ -87,8 +87,10 @@ async fn creating_channel(router: &MultiServiceRouter, case: &str, body: Value) 
         .to_string()
 }
 
-/// An input created from `body`.
+/// An input created from `body`, with the resources its configuration names put
+/// in the account first (`crate::support`).
 async fn input(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+    let body = crate::support::resolved_input_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/inputs", Some(body)).await;
     assert_eq!(
         status, 201,

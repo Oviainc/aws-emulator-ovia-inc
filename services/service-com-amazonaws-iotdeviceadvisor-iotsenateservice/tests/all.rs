@@ -38,5 +38,8 @@ mod state_roundtrip;
 #[path = "all/suite_lifecycle.rs"]
 mod suite_lifecycle;
 
+#[path = "all/suite_run_report.rs"]
+mod suite_run_report;
+
 #[path = "all/suite_runs_listing_and_update.rs"]
 mod suite_runs_listing_and_update;

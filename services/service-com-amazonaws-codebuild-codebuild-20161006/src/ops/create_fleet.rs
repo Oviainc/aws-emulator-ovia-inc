@@ -202,62 +202,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // Every `FleetCapacity` member this request carries counts machines, so a
-        // count below one describes a fleet that cannot run a build. The model puts
-        // no `@range` on `FleetCapacity`, so the boundary validator passed it
-        // through and the service refuses it here with its modelled input error,
-        // worded by the one sentence CodeBuild answers a capacity below the floor
-        // with: it names no member and echoes no value, so which capacity member
-        // carried it does not change the text.
-        if requested_capacities(&input)
-            .into_iter()
-            .any(|capacity| capacity < crate::state::MIN_FLEET_CAPACITY)
-        {
-            return Err(self.refuse(
-                ctx,
-                &input.name,
-                crate::state::capacity_below_floor_message(),
-            ));
-        }
-
-        // `maxCapacity` is the ceiling auto-scaling may grow the fleet to, so it
-        // cannot sit below the capacity the fleet is provisioned at: that range is
-        // empty, and the fleet's own `desiredCapacity` (which starts at
-        // `baseCapacity`) would be outside it. INFERRED from what the two members
-        // mean, not quoted: unlike the `computeConfiguration` rule below, AWS does
-        // not state this one in the model docs this file's header carries.
-        if let Some(max) = input
-            .scaling_configuration
-            .as_ref()
-            .and_then(|scaling| scaling.max_capacity)
-        {
-            if max < input.base_capacity {
-                return Err(self.refuse(
-                    ctx,
-                    &input.name,
-                    format!(
-                        "Invalid input: scalingConfiguration.maxCapacity must be at least \
-                         baseCapacity ({}), got {max}",
-                        input.base_capacity
-                    ),
-                ));
-            }
-        }
-
-        // AWS documents `computeConfiguration` as required exactly for the compute
-        // types whose machine is described by attributes rather than named by the
-        // compute type itself.
-        if crate::state::COMPUTE_TYPES_NEEDING_CONFIGURATION.contains(&input.compute_type.as_str())
-            && input.compute_configuration.is_none()
-        {
-            return Err(self.refuse(
-                ctx,
-                &input.name,
-                format!(
-                    "Invalid input: computeConfiguration is required when computeType is {}",
-                    input.compute_type
-                ),
-            ));
+        // What makes a compute-fleet configuration valid is one rule, stated once
+        // in `crate::state` and asked here about the fleet this request would
+        // mint: the capacity members count machines, `maxCapacity` opens a range
+        // that has to contain `baseCapacity`, and the attribute-driven compute
+        // types need a `computeConfiguration`. The model puts no `@range` on
+        // `FleetCapacity`, so the boundary validator passes those counts through
+        // and the service refuses them here with its modelled input error.
+        if let Some(message) = crate::state::fleet_configuration_violation(
+            Some(input.base_capacity),
+            input
+                .scaling_configuration
+                .as_ref()
+                .and_then(|scaling| scaling.max_capacity),
+            Some(input.compute_type.as_str()),
+            input.compute_configuration.is_some(),
+        ) {
+            return Err(self.refuse(ctx, &input.name, message));
         }
 
         let region = crate::state::request_region(ctx.parts());
@@ -398,21 +359,4 @@ impl<Eng> CreateFleet<Eng> {
         })
         .into()
     }
-}
-
-/// Every `FleetCapacity` count this request carries.
-///
-/// `baseCapacity` is required; `scalingConfiguration.maxCapacity` is present only
-/// when the request configures auto-scaling. Both target the model's
-/// `FleetCapacity`, so both answer to the same lower bound.
-fn requested_capacities(input: &CreateFleetInput) -> Vec<i32> {
-    let mut capacities = vec![input.base_capacity];
-    if let Some(max) = input
-        .scaling_configuration
-        .as_ref()
-        .and_then(|scaling| scaling.max_capacity)
-    {
-        capacities.push(max);
-    }
-    capacities
 }

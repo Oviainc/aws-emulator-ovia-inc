@@ -61,6 +61,9 @@ mod regions_indexes_and_capacity;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/restore_table_from_backup.rs"]
+mod restore_table_from_backup;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

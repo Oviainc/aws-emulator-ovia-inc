@@ -171,6 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the AppInstance store is unavailable".to_string()),
             })
         })?;
+        // A deleted resource leaves no tags behind, so the shared tag directory is
+        // resolved before the delete and the entry dropped with the resource.
+        let tag_directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            DeleteAppInstanceUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
         let mut state = state.lock();
 
         if state.remove_user(&input.app_instance_user_arn).is_none() {
@@ -185,6 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        tag_directory.lock().forget(&input.app_instance_user_arn);
 
         Ok(DeleteAppInstanceUserOutput)
     }

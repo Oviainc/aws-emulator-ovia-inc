@@ -25,3 +25,5 @@ mod tag_key_count;
 mod tunnel_lifecycle;
 #[path = "all/tunnel_refusal_rules.rs"]
 mod tunnel_refusal_rules;
+#[path = "all/tunnel_region_isolation.rs"]
+mod tunnel_region_isolation;

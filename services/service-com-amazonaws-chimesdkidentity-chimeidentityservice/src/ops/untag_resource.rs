@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +159,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The tags of any Chime resource live in the family's shared ARN-keyed directory;
+        // see `TagResource` for why they are not on this service's own records.
+        let directory = crate::state::chime_tags(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the Chime tag directory is unavailable".to_string()),
+            })
+        })?;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        if !state.lock().taggable(&input.resource_arn) {
+            // This operation models no 404 shape, so an absent resource is refused with
+            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            return Err(UntagResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    code: Some("NotFound".to_string()),
+                    message: Some(format!("resource {} does not exist", input.resource_arn)),
+                },
+            )
+            .into());
+        }
+
+        // Untagging is stated by what the resource carries AFTERWARDS: a key the
+        // resource does not have is nothing to remove, so repeating the call answers the
+        // same as making it once.
+        directory.lock().untag(&input.resource_arn, &input.tag_keys);
+
+        Ok(UntagResourceOutput)
     }
 }

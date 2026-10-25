@@ -3,9 +3,11 @@
 //! @op GetPricingPlan
 //!
 //! Reports the account's pricing plan. A REPORTING operation (`@readonly` in the
-//! model): it reads the stored plan and the stored entities and writes nothing —
-//! the plan changes only when `UpdatePricingPlan` changes it, never because
-//! somebody read it.
+//! model): it reads the stored plan and the stored entities, and the only thing
+//! it ever writes is a change the clock or the account's own entity count had
+//! ALREADY made due before the call
+//! ([`crate::state::RegionalState::settle_pricing_plan`]) — the plan a caller
+//! chooses changes only when `UpdatePricingPlan` changes it.
 //!
 //! ## What it reports
 //!
@@ -14,8 +16,9 @@
 //!   the store carries from the moment it exists
 //!   ([`crate::state::PricingPlanRecord::default_plan`]), so this read never has
 //!   to mint one and repeated reads report the same instants.
-//! * `pendingPricingPlan` — the accepted-but-not-yet-in-force plan, reported only
-//!   while the store holds one and omitted otherwise.
+//! * `pendingPricingPlan` — the accepted-but-not-yet-in-force plan, reported
+//!   until its own `effectiveDateTime` passes, at which point it IS the plan in
+//!   force and is reported as the current one instead.
 //! * `billableEntityCount`, on each reported plan — DERIVED from the entities the
 //!   service currently holds
 //!   ([`crate::state::ComAmazonawsIottwinmakerAwsiottwinmakerState::billable_entity_count`]),
@@ -163,7 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
-        let state = state.lock();
+        let mut state = state.lock();
+        // What was already owed to the plan lands BEFORE it is reported, so a
+        // caller is told what was true before it called: a change whose instant
+        // has passed is in force, and a tier the entity count has moved out from
+        // under is the band the count really sits in. Asked first and written
+        // only when something is owed, so reporting the plan of an account with
+        // nothing owed leaves the store exactly as it was found — including a
+        // Region nothing has ever been created in.
+        let now = ::std::time::SystemTime::now();
+        if state.region(&region).pricing_plan_settlement_due(now) {
+            state.region_mut(&region).settle_pricing_plan(now);
+        }
         let state = state.region(&region);
 
         // One count for both reported plans: `billableEntityCount` describes the

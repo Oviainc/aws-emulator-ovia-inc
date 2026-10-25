@@ -197,11 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store as it stands at this instant.
         store.settle(SystemTime::now());
 
-        // The listing is about ONE origin request policy, so an id the store holds no
-        // policy for is the modelled 404 rather than a page of nothing: an empty page would
-        // claim the policy exists and has no distributions.
+        // The listing is about ONE origin request policy, so an id neither source holds a
+        // policy for — the account's own records or the catalog AWS published — is the
+        // modelled 404 rather than a page of nothing: an empty page would claim the policy
+        // exists and has no distributions.
         if store
-            .origin_request_policy(&input.origin_request_policy_id)
+            .readable_origin_request_policy(&input.origin_request_policy_id)
             .is_none()
         {
             return Err(

@@ -14,6 +14,11 @@
 //!
 //! `BTreeMap` (not `HashMap`) everywhere: list operations page in key order, so the
 //! iteration order has to be stable for a `NextToken` to be resumable.
+//!
+//! Two things this service reads are NOT in the struct below, because another Chime
+//! service reads or writes them too and the engine keys state by type: the app-instance
+//! ADMIN directory ([`app_instance_admins`]) and the family's ARN-keyed TAG directory
+//! ([`chime_tags`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher as _;
@@ -73,11 +78,12 @@ pub struct AppInstanceUserRecord {
     pub name: String,
     pub metadata: Option<String>,
     pub created_timestamp: SystemTime,
+    /// When this user was last written. A user is stamped when it is CREATED (AWS
+    /// reports a last-updated instant on a user that has never been updated, equal to
+    /// its created instant), and re-stamped by every operation that changes it — unlike
+    /// an [`AppInstanceRecord`], whose stamp appears only on a real update.
     pub last_updated_timestamp: SystemTime,
     pub expiration_settings: Option<ExpirationSettings>,
-    /// Tags supplied at create time. Kept on the resource so the tagging
-    /// operations (still scaffolded) read the same copy the create wrote.
-    pub tags: BTreeMap<String, String>,
 }
 
 /// A persisted `AppInstance` and everything it owns.
@@ -87,9 +93,14 @@ pub struct AppInstanceRecord {
     pub name: String,
     pub metadata: Option<String>,
     pub created_timestamp: SystemTime,
-    pub last_updated_timestamp: SystemTime,
-    /// Tags supplied at create time; see [`AppInstanceUserRecord::tags`].
-    pub tags: BTreeMap<String, String>,
+    /// When this instance was last CHANGED, or `None` while it still carries exactly
+    /// what created it.
+    ///
+    /// On an `AppInstance` a last-updated instant reports an UPDATE, not a creation: an
+    /// instance nobody has updated has none to report, so the optional
+    /// `AppInstance$LastUpdatedTimestamp` member ("The time an AppInstance was last
+    /// updated") is left out of the response until an operation changes the instance.
+    pub last_updated_timestamp: Option<SystemTime>,
     /// This instance's users, keyed by `AppInstanceUserArn`.
     pub users: BTreeMap<String, AppInstanceUserRecord>,
 }
@@ -126,6 +137,16 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
     pub fn user(&self, user_arn: &str) -> Option<&AppInstanceUserRecord> {
         let instance_arn = self.users_by_arn.get(user_arn)?;
         self.app_instances.get(instance_arn)?.users.get(user_arn)
+    }
+
+    /// The user with this ARN, for a caller that is about to CHANGE it; resolved
+    /// through the same one-hop index as [`user`](Self::user).
+    pub fn user_mut(&mut self, user_arn: &str) -> Option<&mut AppInstanceUserRecord> {
+        let instance_arn = self.users_by_arn.get(user_arn)?.clone();
+        self.app_instances
+            .get_mut(&instance_arn)?
+            .users
+            .get_mut(user_arn)
     }
 
     /// Store a user under its parent instance and index it.
@@ -186,6 +207,21 @@ impl ComAmazonawsChimesdkidentityChimeidentityserviceState {
     /// True when `arn` still names a live resource of this service.
     pub fn resource_exists(&self, arn: &str) -> bool {
         self.app_instances.contains_key(arn) || self.users_by_arn.contains_key(arn)
+    }
+
+    /// Whether a tagging call may address `arn`.
+    ///
+    /// The ARN has to name a resource of this family at all — one in the Chime ARN
+    /// namespace ([`ARN_SERVICE`]), read through the one parse this workspace states for a
+    /// caller-supplied ARN — so a value that is no ARN, or another vendor's, names nothing
+    /// to tag. A resource THIS service mints ([`names_identity_resource`]) then has to
+    /// exist for its tags to be written or read: this store is what says whether it does.
+    /// A resource of a SIBLING Chime service cannot be checked from here — its store is
+    /// the sibling's, and this service only serves the family's shared tagging routes for
+    /// it — so such an ARN is taken at its word rather than refused as absent.
+    pub fn taggable(&self, arn: &str) -> bool {
+        ::service_common::arn::is_resource_arn_of(arn, ARN_SERVICE)
+            && (!names_identity_resource(arn) || self.resource_exists(arn))
     }
 
     /// The ARN a previous call of `operation` already minted for `token`, if that
@@ -267,6 +303,51 @@ pub fn app_instance_admins<Eng: Send + Sync + 'static>(
                 ::service_common::chime_app_instance_admins::AppInstanceAdminDirectory,
             >,
         )
+}
+
+/// The SHARED Chime TAG directory in the shared engine: call it with a handler's
+/// `&*self.engine`.
+///
+/// A resource's tags are keyed by ARN and live in ONE directory
+/// ([`::service_common::chime_tags::ChimeTagDirectory`]) rather than on the resource
+/// records of this state struct, because the family's generic tagging routes are served
+/// by one member for every member's resource: a copy inside
+/// [`ComAmazonawsChimesdkidentityChimeidentityserviceState`] would be invisible to a
+/// sibling serving a tagging call at its own endpoint.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and no
+/// reader holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` with a modelled server error, never with a fresh engine.
+pub fn chime_tags<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::chime_tags::ChimeTagDirectory>> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<::service_common::chime_tags::ChimeTagDirectory>)
+}
+
+/// Whether `arn` names a resource THIS service mints, so that this service's store is
+/// what says whether it exists.
+///
+/// The ARNs this service mints are the app instance itself
+/// (`arn:…:chime:…:app-instance/<id>`) and its identity children, which hang off it:
+/// `…/user/<id>` ([`app_instance_user_arn`]) and `…/bot/<id>`. A sibling's resource hangs
+/// off the same app instance under a segment of its own (Chime SDK Messaging's
+/// `…/channel/<id>`), and every other family member's resources carry a different resource
+/// type altogether, so neither reads as this service's.
+pub fn names_identity_resource(arn: &str) -> bool {
+    let Some(resource) = arn.splitn(6, ':').nth(5) else {
+        return false;
+    };
+    let tokens: Vec<&str> = resource.split('/').collect();
+    match tokens.as_slice() {
+        ["app-instance", id] => !id.is_empty(),
+        ["app-instance", id, child, child_id] => {
+            !id.is_empty() && !child_id.is_empty() && matches!(*child, "user" | "bot")
+        }
+        _ => false,
+    }
 }
 
 /// The region to mint an ARN in: the one the caller signed for, else

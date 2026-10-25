@@ -110,6 +110,9 @@ mod event_bridge_rule_template_not_found;
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 
+#[path = "all/input_configuration_validation.rs"]
+mod input_configuration_validation;
+
 #[path = "all/input_deletion.rs"]
 mod input_deletion;
 

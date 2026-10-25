@@ -56,7 +56,7 @@ use crate::origin_access_identity_lifecycle::{
 /// `PUT /2020-05-31/origin-access-identity/cloudfront/{Id}/config` with the
 /// `CloudFrontOriginAccessIdentityConfig` document `body` and the `If-Match` header
 /// `if_match` (left off entirely when `None`).
-async fn update_identity(
+pub(crate) async fn update_identity(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,

@@ -25,13 +25,15 @@
 //!   modelled input shape is answered by [`request_layer`]'s refusal, because
 //!   that failure is the deserialization layer's and not a handler's.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. NOT overridden here, so the framework's own
-//!   wording stands: a value that violates a MODELLED constraint (a `@length`, a
-//!   `@range`, an absent `@required` member, a value outside an enum) is refused
-//!   by the request layer, and AWS answers that class with the protocol-level
-//!   `ValidationException` envelope — HTTP 400, code `ValidationException`,
-//!   message "<N> validation error(s) detected: Value … at '<member>' failed to
-//!   satisfy constraint: …" — never with an operation's own modelled error. A
+//!   before any handler ran. Edited here: a value that violates a MODELLED
+//!   constraint (a `@length`, a `@range`, an absent `@required` member, a value
+//!   outside an enum) is refused by the request layer, and AWS answers that
+//!   class with the protocol-level `ValidationException` envelope — HTTP 400,
+//!   code `ValidationException`, message "<N> validation error(s) detected:
+//!   Value … at '<member>' failed to satisfy constraint: …" — never with an
+//!   operation's own modelled error. The framework renders that envelope
+//!   already; what this service delegates to `service-common` for is the one
+//!   thing AWS words differently, how a `@pattern` requirement is quoted. A
 //!   value the codec could not read AT ALL is a different class and is answered
 //!   `SerializationException` through `override_operation` ([`request_layer`]).
 //!   X-Ray's `InvalidRequestException` is what this SERVICE's handlers answer
@@ -55,7 +57,7 @@
 
 pub mod request_layer;
 
-use smithy_server_runtime::{http, ErasedOperation, Service};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-xray-awsxray` emulated service: the generated [`ServiceDefinition`] plus
@@ -126,6 +128,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }
         }
         None
+    }
+
+    fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
+        // The framework calls this on a refusal it made BEFORE any handler ran
+        // — a value outside a modelled constraint, an absent `@required`
+        // member, a value outside an enum. AWS answers that class as the
+        // `ValidationException` envelope the framework already renders, with
+        // one difference: a `@pattern` requirement is quoted WITHOUT the
+        // anchors a whole-value pattern wraps it in, so a client that re-applies
+        // the reported expression gets the one AWS reports. That rendering is
+        // shared by every service on a JSON protocol, so it lives in
+        // `service-common` rather than here; the CHECK still uses the model's
+        // pattern as written, and the code, the envelope, the member paths and
+        // every other requirement stay the framework's.
+        //
+        // X-Ray's own `InvalidRequestException` is unaffected: it is what this
+        // service's HANDLERS answer for a request they refuse themselves, and
+        // they return it directly.
+        service_common::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(

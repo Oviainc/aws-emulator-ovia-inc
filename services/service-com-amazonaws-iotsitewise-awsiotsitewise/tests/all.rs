@@ -320,8 +320,11 @@ mod list_asset_properties;
 #[path = "all/list_tasks.rs"]
 mod list_tasks;
 
-// Declared last, for the same reason the suites above it are. Fold it into the
-// sorted list once the churn settles.
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold them into the sorted list once the churn settles.
+#[path = "all/query_cancellation.rs"]
+mod query_cancellation;
 #[path = "all/gateway_delete.rs"]
 mod gateway_delete;
 

@@ -74,7 +74,10 @@ fn assert_publisher_id_form(case: &str, publisher_id: &str) {
 }
 
 /// Hold a refused call to the registry's modelled refusal: HTTP 400 `CFNRegistryException`.
-fn assert_registry_refusal(case: &str, status_code: u16, body: &str) {
+///
+/// Shared with `publisher_reads.rs`, the suite for what a publisher READ answers, so both
+/// hold a refusal to the same status and wire code.
+pub(crate) fn assert_registry_refusal(case: &str, status_code: u16, body: &str) {
     assert_eq!(
         status_code, 400,
         "case {case:?}: expected the call refused with 400, got {status_code} {body}"

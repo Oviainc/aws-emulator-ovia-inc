@@ -171,9 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: Some(record.name.clone()),
                 metadata: record.metadata.clone(),
                 created_timestamp: Some(crate::state::wire_timestamp(record.created_timestamp)),
-                last_updated_timestamp: Some(crate::state::wire_timestamp(
-                    record.last_updated_timestamp,
-                )),
+                // Reported only once something has updated the instance: an instance
+                // that still carries exactly what created it has no update to report.
+                last_updated_timestamp: record
+                    .last_updated_timestamp
+                    .map(crate::state::wire_timestamp),
             }),
         })
     }

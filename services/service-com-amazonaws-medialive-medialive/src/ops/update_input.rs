@@ -11,6 +11,14 @@
 //! projected from the record this call just wrote by `input_description`, never
 //! from the request in flight.
 //!
+//! The merged configuration — the stored one with the members this request names
+//! applied — is then held to the same rule `CreateInput` applies
+//! (`state::input_configuration_error`): an input may only name resources this
+//! account holds, it must carry the ingest list its `Type` ingests through, and
+//! it must keep the `Vpc` member's two cross-member rules. A merged
+//! configuration that breaks it is refused with the modelled
+//! `BadRequestException` (400) before anything is written.
+//!
 //! The id is resolved through the LIVE input lookup (`state::live_input`): a delete
 //! this service has accepted keeps the record readable in `DELETING` and then in the
 //! terminal `DELETED`, but the id names nothing a caller may still change, so such a
@@ -229,9 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let record = state
-            .inputs
-            .get_mut(&input.input_id)
+        // The record this update would leave behind, built from the stored one:
+        // the merged configuration is what the rule is applied to, so a member
+        // the request omits keeps the value the input already had and nothing is
+        // written until the whole configuration is one the service can ingest
+        // through.
+        let mut record = state
+            .live_input(&input.input_id)
+            .cloned()
             .ok_or_else(unavailable)?;
 
         // Each member the request named is stored; each one it omitted keeps the
@@ -272,6 +285,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(router_settings) = input.special_router_settings {
             record.special_router_settings = Some(router_settings);
         }
+
+        // The same rule `CreateInput` applies, to the merged record: an update
+        // may no more leave an input naming a resource this account does not
+        // hold, breaking the `Vpc` cross-member rules, or without the ingest
+        // list its `Type` ingests through, than a create may create one.
+        // Refused BEFORE the store is touched, so a rejected update leaves the
+        // input exactly as it was.
+        if let Some(message) = state.input_configuration_error(&record) {
+            return Err(UpdateInputErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        state.inputs.insert(input.input_id.clone(), record);
 
         // A destination slot this update added needs its ingest address, and one
         // that already had an address keeps it: the endpoint is fixed for the

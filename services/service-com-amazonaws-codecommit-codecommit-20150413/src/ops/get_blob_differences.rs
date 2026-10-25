@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBlobDifferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBlobDifferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBlobDifferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: computes the line-level diff between two blobs the repository holds,
+//! grouped into hunks with the requested context, out of `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +120,296 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// How many unchanged lines surround each run of changes when the caller names no
+/// `contextLines`, and the range that member accepts. Documented on it: "The number
+/// of unchanged lines of context to include before and after each block of changes
+/// in a hunk. Valid values are 0 through 20. Defaults to 3." `DiffContext` carries
+/// no modelled range, so the bound is a handler rule.
+const DEFAULT_CONTEXT_LINES: i32 = 3;
+const MIN_CONTEXT_LINES: i32 = 0;
+const MAX_CONTEXT_LINES: i32 = 20;
+
+/// How many hunks one page carries when the caller names no `MaxResults`.
+/// Documented on it: "The maximum number of DiffHunk entries to return in a single
+/// response page. Defaults to 100."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The largest page this operation answers: `DiffHunkList`'s modelled maximum
+/// (`smithy_query(query="shape",shape="DiffHunkList")` — len 0..1000), so a larger
+/// `MaxResults` is served as a page of this size. The member publishes no maximum of
+/// its own, so a larger value is not refused.
+const MAX_HUNKS_PER_PAGE: usize = 1_000;
+
+/// The most lines one hunk carries: `DiffChangeList`'s modelled maximum
+/// (`smithy_query(query="shape",shape="DiffChangeList")` — len 0..25000). A run of
+/// changes longer than that continues in the next hunk, because one hunk's list
+/// cannot carry more.
+const MAX_CHANGES_PER_HUNK: usize = 25_000;
+
+/// The largest ONE blob this operation compares line by line, in bytes, and the
+/// most lines it may hold.
+///
+/// The crate's existing bounds for exactly this cost shape
+/// ([`crate::state::merge::MAX_MERGE_FILE_BYTES`] and `MAX_MERGE_FILE_LINES`, which a
+/// three-way merge compares one version of a file within): the emulator's own, not
+/// AWS limits. Bounding the BYTES as well as the lines is what bounds a blob of few
+/// but enormous lines, which a line count alone does not. Content past either is
+/// refused with the modelled `FileTooLargeException`, the code this operation
+/// declares for a file it cannot compare.
+const MAX_COMPARED_BYTES: usize = crate::state::merge::MAX_MERGE_FILE_BYTES;
+const MAX_COMPARED_LINES: usize = crate::state::merge::MAX_MERGE_FILE_LINES;
+
+/// How many line comparisons one request may ask for: the PRODUCT the two per-side
+/// bounds leave open, since aligning two blobs costs on the order of the product of
+/// their line counts. The emulator's own bound, well above comparing two files of a
+/// few thousand lines each.
+const MAX_COMPARED_LINE_PRODUCT: usize = 16 * 1024 * 1024;
+
+/// How long one comparison may take before it is refused: the same figure, for the
+/// same reason, as the crate's other caller-driven CPU work
+/// ([`crate::state::merge::MAX_MERGE_SECONDS`]). The bounds above bound the work this
+/// request can ask for and this bounds the time it may take on any machine. The
+/// comparison also runs off the async worker — see `crate::service`'s
+/// `off_the_async_worker`.
+const MAX_COMPARISON_SECONDS: u64 = crate::state::merge::MAX_MERGE_SECONDS;
+
+/// `type` values the model's `DiffChangeType` declares
+/// (`smithy_query(query="shape",shape="DiffChangeType")`).
+const CHANGE_TYPE_CONTEXT: &str = "CONTEXT";
+const CHANGE_TYPE_ADD: &str = "ADD";
+const CHANGE_TYPE_DELETE: &str = "DELETE";
+
+/// Whether content is treated as binary, so that no line-level diff is computed for
+/// it: content carrying a NUL byte, which is what tells content apart from text, and
+/// content that is not valid UTF-8 text, whose lines a `DiffChange`'s string
+/// `content` could not carry.
+fn is_binary(content: &[u8]) -> bool {
+    content.contains(&0) || ::std::str::from_utf8(content).is_err()
+}
+
+/// A count or a 1-based line number, as the modelled `Count`/`LineNumber` integer.
+/// Saturating rather than fallible: a blob is bounded by `FileContent`'s modelled
+/// 6 MB, so a real line number is far inside the type.
+fn count(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn line_number(index: usize) -> i32 {
+    count(index.saturating_add(1))
+}
+
+/// The lines of a text blob: its content split at the line feed that terminates a
+/// line, each line without that terminator ("The text content of the line, without
+/// the trailing newline"), and no empty final line for content that ends with one.
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.last().is_some_and(|last| last.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// The text the comparison runs over: one line per line of the blob, in the form
+/// lines are compared in. With `ignoreWhitespace` that form drops every whitespace
+/// character, so two lines that differ only in whitespace are the same line ("the
+/// operation treats lines that differ only in whitespace as unchanged"); otherwise a
+/// line compares as itself.
+fn comparison_text(lines: &[&str], ignore_whitespace: bool) -> String {
+    let mut text = String::new();
+    for line in lines {
+        if ignore_whitespace {
+            text.extend(line.chars().filter(|character| !character.is_whitespace()));
+        } else {
+            text.push_str(line);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// One line of the comparison, in file order.
+#[derive(Debug, Clone)]
+struct Aligned {
+    /// Whether this line is a change rather than unchanged context: a hunk is a run
+    /// of these plus the context around it.
+    changed: bool,
+    /// Where the line sits on each side, `None` on a side that does not hold it.
+    before_number: Option<i32>,
+    after_number: Option<i32>,
+    /// How many of the before blob's lines lie ahead of this one, so a hunk made
+    /// only of additions can still report where it begins.
+    before_preceding: i32,
+    after_preceding: i32,
+    change: DiffChange,
+}
+
+/// The two blobs' lines aligned into one ordered sequence: each entry is a line the
+/// before blob holds, one the after blob holds, or one they share.
+///
+/// The alignment is the line diff `diffy` computes — the crate this service already
+/// merges with. It is asked for a context wider than both blobs together, which
+/// cannot leave a gap between two runs of changes, so the single hunk it reports is
+/// the whole comparison in file order; the grouping into `DiffHunk`s is
+/// [`hunks_of`], against the caller's `contextLines`, which is not a unified diff's
+/// context.
+///
+/// `None` where the comparison ran out of time: the bounds the handler applies make
+/// the `diffy` call itself one short synchronous unit, and the deadline is what bounds
+/// the per-line walk after it on any machine.
+fn aligned_lines(
+    before_lines: &[&str],
+    after_lines: &[&str],
+    ignore_whitespace: bool,
+    deadline: &crate::state::Deadline,
+) -> Option<Vec<Aligned>> {
+    let before_text = comparison_text(before_lines, ignore_whitespace);
+    let after_text = comparison_text(after_lines, ignore_whitespace);
+    let whole = before_lines
+        .len()
+        .saturating_add(after_lines.len())
+        .saturating_add(1);
+    let patch = ::diffy::DiffOptions::new()
+        .set_context_len(whole)
+        .create_patch(&before_text, &after_text);
+
+    let mut aligned: Vec<Aligned> = Vec::new();
+    let mut before_index = 0usize;
+    let mut after_index = 0usize;
+    for line in patch.hunks().iter().flat_map(|hunk| hunk.lines()) {
+        if deadline.passed() {
+            return None;
+        }
+        // The content comes from the ORIGINAL line, not from the form the
+        // comparison ran over, so an `ignoreWhitespace` comparison still reports the
+        // bytes the blob holds. A shared line is reported as the after blob holds it:
+        // that is the version the comparison's after side is at, and under
+        // `ignoreWhitespace` the two may differ in whitespace alone.
+        let (change_type, changed, before_number, after_number, content) = match line {
+            ::diffy::Line::Context(_) => (
+                CHANGE_TYPE_CONTEXT,
+                false,
+                Some(line_number(before_index)),
+                Some(line_number(after_index)),
+                after_lines.get(after_index).copied().unwrap_or_default(),
+            ),
+            ::diffy::Line::Delete(_) => (
+                CHANGE_TYPE_DELETE,
+                true,
+                Some(line_number(before_index)),
+                None,
+                before_lines.get(before_index).copied().unwrap_or_default(),
+            ),
+            ::diffy::Line::Insert(_) => (
+                CHANGE_TYPE_ADD,
+                true,
+                None,
+                Some(line_number(after_index)),
+                after_lines.get(after_index).copied().unwrap_or_default(),
+            ),
+        };
+        aligned.push(Aligned {
+            changed,
+            before_number,
+            after_number,
+            before_preceding: count(before_index),
+            after_preceding: count(after_index),
+            change: DiffChange {
+                r#type: Some(change_type.to_string()),
+                before_line_number: before_number,
+                after_line_number: after_number,
+                content: Some(content.to_string()),
+            },
+        });
+        if before_number.is_some() {
+            before_index = before_index.saturating_add(1);
+        }
+        if after_number.is_some() {
+            after_index = after_index.saturating_add(1);
+        }
+    }
+    Some(aligned)
+}
+
+/// One hunk from the aligned lines it covers: where it begins and how many lines it
+/// covers on each side, including the context, and the lines themselves.
+fn hunk_of(lines: &[Aligned]) -> DiffHunk {
+    // A hunk that holds no line of one side at all (an insertion into an empty
+    // before blob, or either side with no context) begins after the lines of that
+    // side that precede it, which is 0 at the start of the blob.
+    let before_start = lines
+        .iter()
+        .find_map(|line| line.before_number)
+        .unwrap_or_else(|| lines.first().map_or(0, |line| line.before_preceding));
+    let after_start = lines
+        .iter()
+        .find_map(|line| line.after_number)
+        .unwrap_or_else(|| lines.first().map_or(0, |line| line.after_preceding));
+    DiffHunk {
+        before_start_line: Some(before_start),
+        before_line_count: Some(count(
+            lines
+                .iter()
+                .filter(|line| line.before_number.is_some())
+                .count(),
+        )),
+        after_start_line: Some(after_start),
+        after_line_count: Some(count(
+            lines
+                .iter()
+                .filter(|line| line.after_number.is_some())
+                .count(),
+        )),
+        changes: Some(lines.iter().map(|line| line.change.clone()).collect()),
+    }
+}
+
+/// The hunks of an aligned comparison: every run of changed lines, each carrying
+/// `context` unchanged lines before and after it, in order from the start of the
+/// file. Runs whose context touches or overlaps are ONE hunk ("Adjacent or
+/// overlapping hunks are merged into a single hunk in the response"), and identical
+/// blobs produce none.
+///
+/// `None` where the grouping ran out of time, as in [`aligned_lines`].
+fn hunks_of(
+    aligned: &[Aligned],
+    context: usize,
+    deadline: &crate::state::Deadline,
+) -> Option<Vec<DiffHunk>> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (position, _) in aligned
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.changed)
+    {
+        if deadline.passed() {
+            return None;
+        }
+        let start = position.saturating_sub(context);
+        let end = position
+            .saturating_add(context)
+            .saturating_add(1)
+            .min(aligned.len());
+        match spans.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => spans.push((start, end)),
+        }
+    }
+
+    let mut hunks: Vec<DiffHunk> = Vec::new();
+    for (start, end) in spans {
+        let mut from = start;
+        while from < end {
+            if deadline.passed() {
+                return None;
+            }
+            let to = end.min(from.saturating_add(MAX_CHANGES_PER_HUNK));
+            hunks.push(hunk_of(&aligned[from..to]));
+            from = to;
+        }
+    }
+    Some(hunks)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -173,6 +456,22 @@ impl From<GetBlobDifferencesErrorModeled> for GetBlobDifferencesError {
     }
 }
 
+/// The object name a blob id names, lower-cased: an object name is a hexadecimal
+/// number, so its case does not change which object it names and the store writes it
+/// lowercase. Refused where the value is not an object name — the 40 hexadecimal
+/// characters a git object id is wide — at all.
+fn object_name(blob_id: &str) -> Result<String, GetBlobDifferencesError> {
+    if !crate::state::is_object_id(blob_id) {
+        return Err(GetBlobDifferencesErrorModeled::InvalidBlobIdException(
+            InvalidBlobIdException {
+                message: Some(crate::state::INVALID_BLOB_ID_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    Ok(blob_id.to_ascii_lowercase())
+}
+
 /// The `GetBlobDifferences` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -209,18 +508,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBlobDifferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBlobDifferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBlobDifferences"))
+        let _ = ctx;
+
+        // `afterBlobId` is modelled required, so it is present here — but `ObjectId`
+        // carries no length bound, so an empty (or blank) value reaches the handler
+        // and names no object at all.
+        let after_raw = input.after_blob_id.trim();
+        if after_raw.is_empty() {
+            return Err(GetBlobDifferencesErrorModeled::BlobIdRequiredException(
+                BlobIdRequiredException {
+                    message: Some(crate::state::BLOB_ID_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let after_id = object_name(after_raw)?;
+        // `beforeBlobId` is optional, and a blank one is the same as leaving it out:
+        // "If you do not specify a value, the operation returns a diff against an
+        // empty before-state."
+        let before_id = match input
+            .before_blob_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|blob_id| !blob_id.is_empty())
+        {
+            Some(blob_id) => Some(object_name(blob_id)?),
+            None => None,
+        };
+
+        let context_lines = input.context_lines.unwrap_or(DEFAULT_CONTEXT_LINES);
+        if !(MIN_CONTEXT_LINES..=MAX_CONTEXT_LINES).contains(&context_lines) {
+            return Err(GetBlobDifferencesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "The specified number of context lines is not valid. Valid values are \
+                         {MIN_CONTEXT_LINES} through {MAX_CONTEXT_LINES}."
+                    )),
+                },
+            )
+            .into());
+        }
+        let context = usize::try_from(context_lines).unwrap_or(0);
+
+        // "The maximum number of DiffHunk entries to return in a single response
+        // page": a value that is not a page size at all is refused, and one past the
+        // largest page the modelled `hunks` list can carry is served as that page.
+        let page = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) if requested > 0 => usize::try_from(requested)
+                .unwrap_or(MAX_HUNKS_PER_PAGE)
+                .min(MAX_HUNKS_PER_PAGE),
+            Some(_) => {
+                return Err(GetBlobDifferencesErrorModeled::InvalidMaxResultsException(
+                    InvalidMaxResultsException {
+                        message: Some(
+                            crate::state::NON_POSITIVE_MAX_RESULTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The two blobs are copied out of the store and the lock released, so the
+        // comparison below runs over this request's own snapshot and holds nothing
+        // another request waits on. Reading changes nothing a later caller sees.
+        let (before_content, after_content) = {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                // An unreachable store is an internal mounting fault, not a modelled
+                // CodeCommit failure; every handler in this crate refuses it this way.
+                crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+            })?;
+            let store = state.lock();
+            let repository = store
+                .repositories
+                .get(&input.repository_name)
+                .ok_or_else(|| {
+                    GetBlobDifferencesErrorModeled::RepositoryDoesNotExistException(
+                        RepositoryDoesNotExistException {
+                            message: Some(crate::state::repository_does_not_exist_message(
+                                &input.repository_name,
+                            )),
+                        },
+                    )
+                })?;
+            // A blob belongs to the repository that holds it: an object name this
+            // repository has no object for does not exist here, whatever another
+            // repository holds under it.
+            let blob = |blob_id: &str| {
+                repository
+                    .blob(blob_id)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| {
+                        GetBlobDifferencesErrorModeled::BlobIdDoesNotExistException(
+                            BlobIdDoesNotExistException {
+                                message: Some(crate::state::blob_id_does_not_exist_message(
+                                    blob_id,
+                                )),
+                            },
+                        )
+                    })
+            };
+            let after = blob(&after_id)?;
+            // No `beforeBlobId` is an empty before-state, "equivalent to treating the
+            // file as newly added", and its reported size is 0.
+            let before = match &before_id {
+                Some(blob_id) => blob(blob_id)?,
+                None => Vec::new(),
+            };
+            (before, after)
+        };
+
+        // The sizes are the stored blobs' own, whatever the comparison below reports:
+        // every stored blob was written through a `fileContent` the model bounds at
+        // 6 MB, so the size itself is never past what a read can serve.
+        let before_blob_size = i64::try_from(before_content.len()).unwrap_or(i64::MAX);
+        let after_blob_size = i64::try_from(after_content.len()).unwrap_or(i64::MAX);
+
+        // "When true, the operation does not compute a line-level diff and hunks is
+        // empty." Binary content costs no comparison at all, so the comparison bounds
+        // below are reached only where a line diff is actually computed.
+        let binary = is_binary(&before_content) || is_binary(&after_content);
+        let hunks = if binary {
+            Vec::new()
+        } else {
+            // Every bound this operation cannot compare within answers the one
+            // sentence the model documents for the code, as the size bounds do: what
+            // the caller is told is that CodeCommit does not compare a file this
+            // large, not which of the emulator's budgets the pair was past.
+            let too_large = || {
+                GetBlobDifferencesErrorModeled::FileTooLargeException(FileTooLargeException {
+                    message: Some(crate::state::FILE_TOO_LARGE_MESSAGE.to_string()),
+                })
+            };
+            if before_content.len() > MAX_COMPARED_BYTES || after_content.len() > MAX_COMPARED_BYTES
+            {
+                return Err(too_large().into());
+            }
+            let before_text = ::std::str::from_utf8(&before_content).unwrap_or_default();
+            let after_text = ::std::str::from_utf8(&after_content).unwrap_or_default();
+            let before_lines = split_lines(before_text);
+            let after_lines = split_lines(after_text);
+            if before_lines.len() > MAX_COMPARED_LINES || after_lines.len() > MAX_COMPARED_LINES {
+                return Err(too_large().into());
+            }
+            // The cost is the PRODUCT of the two sides, which the per-side bounds
+            // leave open, so it is charged here before any comparison runs.
+            if before_lines.len().saturating_mul(after_lines.len()) > MAX_COMPARED_LINE_PRODUCT {
+                return Err(too_large().into());
+            }
+
+            // The comparison is CPU-bound caller-driven work: it runs off the async
+            // worker, so the runtime keeps serving every other request while it runs,
+            // and under a wall-clock deadline, so it cannot hold a worker for an
+            // unbounded span whatever the two blobs hold.
+            let deadline = crate::state::Deadline::in_seconds(MAX_COMPARISON_SECONDS);
+            let ignore_whitespace = input.ignore_whitespace.unwrap_or(false);
+            crate::service::off_the_async_worker(|| {
+                let aligned =
+                    aligned_lines(&before_lines, &after_lines, ignore_whitespace, &deadline)?;
+                hunks_of(&aligned, context, &deadline)
+            })
+            .ok_or_else(too_large)?
+        };
+
+        // The continuation token is the offset of the next hunk in that order; the
+        // comparison is a pure function of the two stored blobs and the options the
+        // request carries, so the next page picks up exactly where this one stopped.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset <= hunks.len())
+                .ok_or_else(|| {
+                    GetBlobDifferencesErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(crate::state::invalid_continuation_token_message(token)),
+                        },
+                    )
+                })?,
+        };
+        let end = hunks.len().min(start.saturating_add(page));
+        // "null when the response contains the final page of the diff."
+        let next_token = (end < hunks.len()).then(|| end.to_string());
+
+        Ok(GetBlobDifferencesOutput {
+            hunks: hunks[start..end].to_vec(),
+            is_binary: binary,
+            before_blob_size,
+            after_blob_size,
+            next_token,
+        })
     }
 }

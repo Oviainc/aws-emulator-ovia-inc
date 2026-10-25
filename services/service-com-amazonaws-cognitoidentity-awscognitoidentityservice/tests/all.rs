@@ -21,6 +21,8 @@ mod developer_identity_tokens;
 mod identity_pool_flow;
 #[path = "all/identity_pool_roles.rs"]
 mod identity_pool_roles;
+#[path = "all/identity_pool_roles_presence.rs"]
+mod identity_pool_roles_presence;
 #[path = "all/list_identity_pools.rs"]
 mod list_identity_pools;
 #[path = "all/lookup_developer_identity.rs"]

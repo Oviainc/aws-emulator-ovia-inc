@@ -465,6 +465,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // contributor insights member, so `UpdateContributorInsights` is the only
             // way to turn them on.
             contributor_insights: crate::state::ContributorInsights::default(),
+            // This table was created, not restored, so it has no `RestoreSummary` to
+            // report: only `RestoreTableFromBackup` writes one.
+            restore: None,
         };
         let description = table.describe(now);
         store.insert_table(table);

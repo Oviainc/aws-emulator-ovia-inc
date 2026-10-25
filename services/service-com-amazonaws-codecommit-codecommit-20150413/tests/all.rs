@@ -33,6 +33,8 @@ mod batch_associate_approval_rule_template;
 mod batch_get_repositories;
 #[path = "all/blob_content.rs"]
 mod blob_content;
+#[path = "all/blob_differences.rs"]
+mod blob_differences;
 #[path = "all/branch_create.rs"]
 mod branch_create;
 #[path = "all/branch_creation.rs"]

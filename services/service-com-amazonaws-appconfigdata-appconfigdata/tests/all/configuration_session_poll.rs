@@ -303,8 +303,7 @@ impl Emulator {
         let state = self.control_plane();
         let mut store = state.lock();
         let Some(environment) = store
-            .applications
-            .get_mut(&hierarchy.application_id)
+            .application_mut(&hierarchy.application_id)
             .and_then(|application| {
                 application.environments.get_mut(&hierarchy.environment_id)
             })

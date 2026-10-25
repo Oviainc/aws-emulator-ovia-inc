@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the request's `Tags` to the Kinesis resource its `ResourceARN` names in
+//! `crate::state`'s `streams` store, and answers the modelled empty body. A key the
+//! resource already carries takes the new value and every other tag it carries stays, so
+//! the stored tag set is the union of what was there and what the request assigned;
+//! `ListTagsForStream` reports that stored set.
+//!
+//! The resource is resolved by ARN through the one lookup every operation of this service
+//! that addresses a stream shares
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream_mut`]), so an
+//! ARN this account and region hold no resource under is the modelled
+//! `ResourceNotFoundException`. A request that would take the resource past the documented
+//! ceiling of tags is refused with the modelled `LimitExceededException` BEFORE the stored
+//! map grows, and a resource that is not `ACTIVE` yet is refused with the modelled
+//! `ResourceInUseException` — the same rules `AddTagsToStream` applies, because they are one
+//! rule about one stored tag set.
 //!
 //! ## Shape of an operation
 //!
@@ -111,7 +118,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#TagResource",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `AddTagsToStream` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -119,6 +134,7 @@ pub enum TagResourceErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,6 +160,99 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 /// concrete engine where it mounts the service, not here.
 pub struct TagResource<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the resource lives in, and how the call
+/// ended. No resource ARN and no tag: a log sink needs neither to attribute the change, and
+/// a tag value is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "TagResource",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal for a request whose `ResourceARN` names no resource of this account
+/// and region, worded exactly as every other operation of this service words it: one rule,
+/// one phrasing.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    resource_arn: &str,
+) -> TagResourceError {
+    match failure {
+        // `ResourceARN` is required, so a request reaching here always names one; the arm
+        // is the modelled refusal rather than a panic.
+        crate::state::StreamLookupFailure::Unspecified
+        | crate::state::StreamLookupFailure::Mismatch => {
+            TagResourceErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(resource_arn)),
+            })
+        }
+    }
+    .into()
+}
+
+/// Assign the request's tags to the resource its ARN names, or answer the modelled refusal
+/// that stands in the way. The whole write lives here so the caller holds the store's lock
+/// for exactly this long.
+fn apply_assignment(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &TagResourceInput,
+) -> Result<(), TagResourceError> {
+    // The ARN is what this operation addresses a resource by; `StreamId` is documented
+    // "Not Implemented. Reserved for future use", so no resource carries one and it names
+    // nothing. An ARN of a resource kind this emulator holds none of resolves to no
+    // resource, which is the not-found answer below.
+    let stream = store
+        .resolve_stream_mut(region, None, Some(input.resource_arn.as_str()))
+        .map_err(|failure| lookup_refusal(failure, &input.resource_arn))?;
+
+    // "The resource is not available for this operation. For successful operation, the
+    // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream still
+    // inside the transition its create armed is not available for a write to its tags.
+    let status = stream.status(now);
+    if status != crate::state::STREAM_ACTIVE {
+        return Err(TagResourceErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_not_active_message(
+                    &input.resource_arn,
+                    status,
+                )),
+            },
+        )
+        .into());
+    }
+
+    // "You can assign up to 50 tags to a Kinesis resource" — the ceiling is on what the
+    // RESOURCE carries once the request is served, not on what the request names, and it is
+    // checked BEFORE the stored map grows. An assignment overwrites a key the resource
+    // already carries, so re-tagging a fully tagged resource stays inside the ceiling. The
+    // refusal is the one sentence this service states the ceiling in, shared with
+    // `AddTagsToStream`, which writes the same stored tag set.
+    let resulting = stream.tag_count_with(&input.tags);
+    if resulting > crate::state::MAX_STREAM_TAGS {
+        return Err(TagResourceErrorModeled::LimitExceededException(
+            LimitExceededException {
+                message: Some(crate::state::tag_ceiling_exceeded_message(resulting)),
+            },
+        )
+        .into());
+    }
+
+    stream.assign_tags(input.tags.clone());
+    Ok(())
 }
 
 impl<Eng> TagResource<Eng> {
@@ -172,18 +281,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose resources this request
+        // addresses, since a stream "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            TagResourceError::from(TagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = apply_assignment(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "tagged" } else { "refused" },
+        );
+        // `TagResource` models no output members, so a served request answers the modelled
+        // empty body.
+        outcome.map(|()| TagResourceOutput)
     }
 }

@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(application) = store.applications.get(&application_id) else {
+        let Some(application) = store.application(&application_id) else {
             return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(
@@ -307,10 +307,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // Bounded so a loop of create calls cannot grow this emulator's heap without
-        // limit; see `state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`.
-        if application.experiment_definitions.len()
-            >= crate::state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION
-        {
+        // limit; see `state::MAX_EXPERIMENT_DEFINITIONS_PER_APPLICATION`, which
+        // `Application::try_insert_experiment_definition` enforces where the record is
+        // stored. It is stated here so the refusal is the modelled quota error and nothing
+        // is minted for a create that cannot be stored.
+        if application.experiment_definition_quota_reached() {
             return Err(
                 CreateExperimentDefinitionErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -343,7 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let definition = crate::state::ExperimentDefinition {
-            id: id.clone(),
+            id,
             application_id: application_id.clone(),
             configuration_profile_id,
             environment_id,
@@ -375,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_run_number: 1,
         };
 
-        let Some(application) = store.applications.get_mut(&application_id) else {
+        let Some(application) = store.application_mut(&application_id) else {
             return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
                 InternalServerException {
                     message: Some(
@@ -389,19 +390,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `mint_id` rejects every id any resource already holds, so the slot is vacant.
         // An occupied one is refused rather than answered from: reporting 201 with
-        // another definition's record would describe a resource this call never made.
-        let stored = match application.experiment_definitions.entry(id) {
-            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(definition),
-            std::collections::hash_map::Entry::Occupied(_) => {
-                return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some(
-                            "The minted experiment definition id was already in use".to_string(),
-                        ),
-                    },
-                )
-                .into())
-            }
+        // another definition's record would describe a resource this call never made. The
+        // same call is what bounds the map, so a create past the quota stores nothing even
+        // if the check above were ever bypassed.
+        let Some(stored) = application.try_insert_experiment_definition(definition) else {
+            return Err(CreateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The minted experiment definition id was already in use".to_string(),
+                    ),
+                },
+            )
+            .into());
         };
 
         // Answered from the stored record, so `GetExperimentDefinition` reports the same

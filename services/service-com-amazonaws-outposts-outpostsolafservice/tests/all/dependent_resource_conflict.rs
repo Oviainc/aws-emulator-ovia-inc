@@ -17,6 +17,11 @@
 //!   dependent resource, and the call changes nothing. Once no dependent is left, the
 //!   same request succeeds.
 //!
+//! `DeleteSite` is the one call a site's Outposts hold back that AWS does NOT classify
+//! that way — it answers 400 `ValidationException` with a published sentence, which is
+//! [`crate::site_delete_refusal`]'s rule — so this suite drives it alongside the
+//! conflict rows to pin the boundary between the two classifications on one workflow.
+//!
 //! The rows differ along the operation the dependent holds back (`DeleteSite`,
 //! `UpdateSiteAddress` on the operating address), how many dependents the resource has
 //! (one, two, three, and several after some have gone), the identifier form the request
@@ -43,6 +48,14 @@ const RESOURCE_TYPE_OUTPOST: &str = "OUTPOST";
 /// been deactivated").
 const OPERATING: &str = "OPERATING_ADDRESS";
 
+/// How the refusal of a call held back by a site's Outposts is classified.
+enum Refusal {
+    /// The dependent-naming conflict the rule above states.
+    Conflict,
+    /// The published validation refusal `DeleteSite` answers instead.
+    Validation,
+}
+
 /// One call a site's dependents hold back: the case name, the HTTP method, the path
 /// around the site identifier, and the body (absent for `DeleteSite`, which binds its
 /// only member to the URI).
@@ -52,6 +65,8 @@ struct HeldBack {
     /// The path the site identifier is substituted into, `{site}` marking the slot.
     path: &'static str,
     body: Option<Value>,
+    /// Which refusal this call's dependents hold it back with.
+    refusal: Refusal,
 }
 
 /// Both calls a site's Outposts hold back, so the rule is asserted across the whole
@@ -63,6 +78,7 @@ fn held_back_calls() -> Vec<HeldBack> {
             method: "DELETE",
             path: "/sites/{site}",
             body: None,
+            refusal: Refusal::Validation,
         },
         HeldBack {
             case: "UpdateSiteAddress on the operating address",
@@ -72,6 +88,7 @@ fn held_back_calls() -> Vec<HeldBack> {
                 "AddressType": OPERATING,
                 "Address": address("IE", "Leinster", "Dublin"),
             })),
+            refusal: Refusal::Conflict,
         },
     ]
 }
@@ -116,6 +133,23 @@ async fn a_call_held_back_by_a_dependent_resource_is_a_conflict_naming_that_depe
                     let refused = outposts
                         .call_in(region, call.method, &path, call.body.as_ref())
                         .await;
+                    if matches!(call.refusal, Refusal::Validation) {
+                        // The one call of the class AWS refuses as a bad parameter;
+                        // its own suite states the sentence.
+                        assert_eq!(
+                            (
+                                refused.status,
+                                refused.error_code.as_str(),
+                                refused.errortype_header.as_str()
+                            ),
+                            (400, "ValidationException", "ValidationException"),
+                            "case {case}: this call's dependent refusal is the published \
+                             validation refusal, got {} {:?}",
+                            refused.status,
+                            refused.body
+                        );
+                        continue;
+                    }
                     assert_eq!(
                         (
                             refused.status,

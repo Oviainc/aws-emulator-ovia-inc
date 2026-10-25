@@ -16,7 +16,9 @@
 //! A registration the store does not hold is answered with the registry's own modelled
 //! `CFNRegistryException` (400) rather than a publisher nothing stands behind: an account
 //! that has not registered has no record, and a `PublisherId` that is not the one it
-//! registered under names none either. Nothing is written: this is a reporting operation.
+//! registered under names none either. A request that named no id was asking about the
+//! ACCOUNT, so that refusal names the account it was signed under (see
+//! [`publisher_not_found`]). Nothing is written: this is a reporting operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -184,15 +186,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The registry's own modelled refusal, for a publisher this store holds no registration
 /// for: HTTP 400 `CFNRegistryException`, "an error occurred during a CloudFormation
 /// registry operation".
+///
+/// A request that named NO `PublisherId` means this account's own registration, so the
+/// refusal is about the ACCOUNT and names it: the wording is fixed and the only part taken
+/// from the caller is the 12-digit account id the request was signed under
+/// ([`emulator_server::emulator_account_id`]), which is also what tells the caller which
+/// account it is that has not registered.
 fn publisher_not_found(publisher_id: Option<&str>) -> DescribePublisherError {
     let message = match publisher_id {
         Some(publisher_id) => format!(
             "Publisher {publisher_id} is not registered as a CloudFormation extension \
              publisher"
         ),
-        None => "This account is not registered as a CloudFormation extension publisher: \
-                 register it with RegisterPublisher, or name a PublisherId"
-            .to_string(),
+        None => format!(
+            "The account [{account_id}] is not registered as a publisher, if you want to \
+             describe a specific publisher, please specify the publisherID",
+            account_id = ::emulator_server::emulator_account_id()
+        ),
     };
     DescribePublisherErrorModeled::CFNRegistryException(CFNRegistryException {
         message: Some(message),

@@ -222,15 +222,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An identity's caller reference identifies it for its whole life, so an update
-        // that moves it onto another value is not a modification CloudFront allows.
+        // that moves it onto another value is not a modification CloudFront allows. The
+        // refusal states that RULE and nothing else: the one fixed sentence this service
+        // refuses a caller-reference change with, carrying no value from the request or
+        // from the stored record.
         if config.caller_reference != current_caller_reference {
             return Err(
-                UpdateCloudFrontOriginAccessIdentityErrorModeled::IllegalUpdate(IllegalUpdate {
-                    message: Some(format!(
-                        "The CallerReference of an origin access identity cannot be changed; \
-                         it is {current_caller_reference}"
-                    )),
-                })
+                UpdateCloudFrontOriginAccessIdentityErrorModeled::IllegalUpdate(
+                    crate::state::illegal_update_caller_reference(),
+                )
                 .into(),
             );
         }

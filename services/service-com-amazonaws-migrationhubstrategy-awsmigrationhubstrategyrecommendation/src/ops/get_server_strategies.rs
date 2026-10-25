@@ -8,10 +8,12 @@
 //! service holds for the server — each reported with whether it is the preferred one
 //! ([`crate::state::ServerRecord::to_server_strategies`]).
 //!
-//! A read: it computes its answer from the record and writes nothing, so a server nothing
-//! recommended and nobody chose a preference for reports an empty list rather than a
-//! canned strategy, and a `serverId` naming no server of the portfolio is refused with the
-//! modelled 404 `ResourceNotFoundException`.
+//! A read: it computes its answer from the record, writing only what the clock already
+//! owed this portfolio (the completion of an assessment that was due at this same instant,
+//! and the analysis that completion stands for), so a server nothing recommended and
+//! nobody chose a preference for reports an empty list rather than a canned strategy, and
+//! a `serverId` naming no server of the portfolio is refused with the modelled 404
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,12 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A read: the store is only looked at here, so running GetServerStrategies
-        // changes nothing a later caller sees. The server is looked up in the inventory
-        // of the Region this request was signed for.
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio — an assessment whose completion was due at this same instant
+        // even if nobody had called, and the analysis that completion stands for — so the
+        // strategies reported are the ones the clock has reached. The server is looked up
+        // in the inventory of the Region this request was signed for.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
-        let Some(server) = store.region(&region).servers.get(&input.server_id) else {
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
+        let portfolio = store.region(&region);
+        let Some(server) = portfolio.servers.get(&input.server_id) else {
             return Err(
                 GetServerStrategiesErrorModeled::ResourceNotFoundException(server_not_found())
                     .into(),
@@ -173,7 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetServerStrategiesOutput {
-            server_strategies: Some(server.to_server_strategies()),
+            // The strategies are the server's own, and the components running on it are
+            // what `numberOfApplicationComponents` is counted off.
+            server_strategies: Some(
+                server.to_server_strategies(&portfolio.application_components),
+            ),
         })
     }
 }

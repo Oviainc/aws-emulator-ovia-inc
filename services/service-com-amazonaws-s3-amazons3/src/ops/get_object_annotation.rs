@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetObjectAnnotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetObjectAnnotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetObjectAnnotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the annotation one name addresses on the stored object version this
+//! request names: the payload `PutObjectAnnotation` recorded, with the entity tag, the
+//! size and the last-modified time of those stored bytes.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -190,17 +185,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetObjectAnnotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetObjectAnnotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetObjectAnnotation"))
+        // request metadata only, and this read needs nothing from it.
+        let _ = ctx;
+
+        // "If the bucket is owned by a different account, the request fails with an HTTP
+        // 403 (Access Denied) error" (`GetObjectAnnotationRequest$ExpectedBucketOwner`),
+        // judged the way every other handler here judges it: this emulator serves one
+        // account, so the owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version — the way `GetObject`
+        // answers the same argument.
+        if let Some(version_id) = input.version_id.as_deref() {
+            if !crate::state::version_id_is_well_formed(version_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::INVALID_VERSION_ID_MESSAGE,
+                ));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store there is nothing to read the annotation out of, and none of
+            // the modelled errors says that, so the scaffold's 501 carries what is true.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetObjectAnnotation",
+            ));
+        };
+        let store = state.lock();
+
+        // The ADDRESS first, so a read naming a bucket, a key or a version this emulator
+        // does not hold answers that rather than "no such annotation" on an object that is
+        // not there. With no `versionId` it is the key's current object, which is what every
+        // reader naming no version answers from.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(GetObjectAnnotationErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
+            return Err(match input.version_id.as_deref() {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => GetObjectAnnotationErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        // The annotation the name addresses, or the modelled `NoSuchAnnotation` (404) —
+        // "The specified annotation does not exist on this object" — which is also what a
+        // name no write could have recorded (one past the documented bounds, or under a
+        // reserved prefix) answers, since no object can be carrying it.
+        let Some(annotation) = object.annotation(&input.annotation_name) else {
+            return Err(
+                GetObjectAnnotationErrorModeled::NoSuchAnnotation(NoSuchAnnotation {}).into(),
+            );
+        };
+
+        Ok(GetObjectAnnotationOutput {
+            // The stored bytes, with the size and the entity tag OF those bytes: "The size
+            // of the annotation payload, in bytes" and "The entity tag of the annotation",
+            // both read off the stored record rather than re-derived here.
+            annotation_payload: annotation.payload.clone(),
+            content_length: Some(annotation.size()),
+            e_tag: Some(annotation.etag.clone()),
+            // "The date and time the annotation was last modified" — when the write that
+            // recorded this payload was made, so every read of it answers the same instant.
+            last_modified: Some(::aws_smithy_types::DateTime::from(annotation.last_modified)),
+            // "The version ID of the object that the annotation is attached to", read off
+            // the stored version: reported exactly when that version has an id of its own.
+            object_version_id: object.version_id.clone(),
+            // "Annotations inherit the encryption of their parent object"
+            // (`PutObjectAnnotation`), so the algorithm reported here is that object's, and
+            // nothing is reported for an object stored under none.
+            server_side_encryption: object.encryption.sse_algorithm.clone(),
+            // Everything else this output can carry describes something no stored annotation
+            // here has, so none of it is reported rather than being invented. The
+            // `Checksum*` members and `ChecksumType` are the case `ChecksumMode` asks about
+            // — "If checksum mode is enabled … Amazon S3 returns the STORED checksum" — and
+            // no checksum was stored with the annotation, so an enabled mode is answered the
+            // way a read of an annotation recorded without one is: with none of them.
+            // `ReplicationStatus` describes a replication rule nothing here runs, and
+            // `RequestCharged` a Requester Pays charge this emulator does not model.
+            ..GetObjectAnnotationOutput::default()
+        })
     }
 }

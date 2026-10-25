@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DashboardReference, DateTimeRange, HealthStatus, ResourceTag, ScheduleConfig, ScheduledReport,
-    ScheduledReportSummary, Widget,
+    ScheduledReportInput, ScheduledReportSummary, Widget,
 };
 
 /// The only `DashboardType` the model declares (`DASHBOARD_TYPE_VALUES`), and the
@@ -295,6 +295,155 @@ impl ScheduledReportRecord {
     }
 }
 
+/// How long a `CreateScheduledReport` call's creation counts as still IN PROGRESS, so
+/// a duplicate-token call racing it is refused with the modelled `ConflictException`
+/// ("attempting to create a resource that already exists or is being created") while a
+/// retry that arrives after it — what an SDK resends once its transport has timed out —
+/// is answered with the first call's outcome.
+///
+/// The real service creates the report over some interval and refuses a duplicate token
+/// for its duration; this emulator stores a record under one lock, so the interval would
+/// otherwise be zero and no caller could ever observe the conflict the service answers.
+/// The length is CHOSEN, not cited — the model states none — and kept short: long
+/// enough that the calls of one racing client fall inside it, short enough that a
+/// client's next retry does not.
+pub const SCHEDULED_REPORT_CREATION_WINDOW: Duration = Duration::from_millis(500);
+
+/// The outcome one `CreateScheduledReport` call recorded under the `clientToken` it
+/// presented, so a RETRY of that same call answers that same outcome — the ARN the
+/// first call minted — instead of creating a second report or being refused.
+///
+/// `request_fingerprint` is what tells a retry from a different request that happens to
+/// reuse the token: it is a canonical rendering of the create request
+/// ([`scheduled_report_creation_fingerprint`]), compared only against another rendering
+/// built by that same function and never parsed.
+///
+/// `in_progress_until` is the instant the creation this record describes stops counting
+/// as in flight ([`SCHEDULED_REPORT_CREATION_WINDOW`] past the call that made it). It is
+/// read, never slept on, so nothing waits for it.
+#[derive(Debug, Clone)]
+pub struct ScheduledReportCreation {
+    pub arn: String,
+    pub request_fingerprint: String,
+    pub in_progress_until: SystemTime,
+}
+
+impl ScheduledReportCreation {
+    /// Whether the creation this record describes is still in flight at `now`.
+    pub fn in_progress_at(&self, now: SystemTime) -> bool {
+        now < self.in_progress_until
+    }
+}
+
+/// A canonical rendering of a `CreateScheduledReport` request, so two calls can be
+/// compared for "the same request" when they present the same `clientToken`.
+///
+/// It renders exactly the members that decide which resource the call creates — the
+/// submitted `scheduledReport` and the `resourceTags` — one line per member, in a fixed
+/// order, and NORMALISED the way the create itself normalises them: the schedule's
+/// `state` resolved through [`resolve_schedule_config`] and the tags resolved by key
+/// through [`merge_resource_tags`] and then ordered by key. Two requests that would store
+/// the same record therefore render alike, whatever order their tags arrived in and
+/// whether they spelled the default schedule state out.
+///
+/// Every member is rendered from its own value rather than through a derived formatter,
+/// so what counts as "the same request" is this function's list and nothing else: a
+/// string is quoted (so a value holding a separator cannot look like one, and an empty
+/// string cannot look like an absent member), a timestamp is its seconds and nanoseconds,
+/// and an absent optional member is a marker no rendered value can equal.
+///
+/// The rendering is OPAQUE: it is only ever compared to another rendering this function
+/// produced, never parsed, and never put on the wire.
+pub fn scheduled_report_creation_fingerprint(
+    report: &ScheduledReportInput,
+    resource_tags: &[ResourceTag],
+) -> String {
+    /// The marker for an optional member the request left out.
+    const ABSENT: &str = "~absent~";
+
+    fn text(value: Option<&str>) -> String {
+        value.map_or_else(|| ABSENT.to_string(), |value| format!("{value:?}"))
+    }
+
+    fn instant(value: Option<&::aws_smithy_types::DateTime>) -> String {
+        value.map_or_else(
+            || ABSENT.to_string(),
+            |value| format!("{}.{:09}", value.secs(), value.subsec_nanos()),
+        )
+    }
+
+    fn date_time_value(value: &crate::ops::types::DateTimeValue) -> String {
+        format!("{} {}", text(Some(&value.r#type)), text(Some(&value.value)))
+    }
+
+    let schedule = resolve_schedule_config(report.schedule_config.clone());
+    let period = schedule.schedule_period.as_ref();
+    let mut lines = vec![
+        format!("name={}", text(Some(&report.name))),
+        format!("dashboardArn={}", text(Some(&report.dashboard_arn))),
+        format!(
+            "executionRoleArn={}",
+            text(Some(&report.scheduled_report_execution_role_arn))
+        ),
+        format!(
+            "scheduleExpression={}",
+            text(schedule.schedule_expression.as_deref())
+        ),
+        format!(
+            "scheduleTimeZone={}",
+            text(schedule.schedule_expression_time_zone.as_deref())
+        ),
+        format!(
+            "schedulePeriod={}",
+            if period.is_some() { "present" } else { ABSENT }
+        ),
+        format!(
+            "schedulePeriodStart={}",
+            instant(period.and_then(|period| period.start_time.as_ref()))
+        ),
+        format!(
+            "schedulePeriodEnd={}",
+            instant(period.and_then(|period| period.end_time.as_ref()))
+        ),
+        format!("scheduleState={}", text(schedule.state.as_deref())),
+        format!("description={}", text(report.description.as_deref())),
+    ];
+    match &report.widget_ids {
+        None => lines.push(format!("widgetIds={ABSENT}")),
+        Some(ids) => {
+            lines.push(format!("widgetIdCount={}", ids.len()));
+            lines.extend(ids.iter().map(|id| format!("widgetId={}", text(Some(id)))));
+        }
+    }
+    match &report.widget_date_range_override {
+        None => lines.push(format!("widgetDateRangeOverride={ABSENT}")),
+        Some(range) => {
+            lines.push(format!(
+                "widgetDateRangeStart={}",
+                date_time_value(&range.start_time)
+            ));
+            lines.push(format!(
+                "widgetDateRangeEnd={}",
+                date_time_value(&range.end_time)
+            ));
+        }
+    }
+    let mut tags: Vec<(String, String)> = merge_resource_tags(Vec::new(), resource_tags.to_vec())
+        .into_iter()
+        .map(|tag| (tag.key, tag.value))
+        .collect();
+    tags.sort();
+    lines.push(format!("tagCount={}", tags.len()));
+    lines.extend(tags.iter().map(|(key, value)| {
+        format!(
+            "tag={} {}",
+            text(Some(key.as_str())),
+            text(Some(value.as_str()))
+        )
+    }));
+    lines.join("\n")
+}
+
 /// The outcome one `ExecuteScheduledReport` call recorded under the report it executed
 /// and the `clientToken` it presented, so a RETRY of that same call inside
 /// [`EXECUTION_IDEMPOTENCY_WINDOW`] answers that same outcome rather than triggering a
@@ -330,10 +479,16 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// Monotonic counter behind every minted scheduled-report resource id.
     pub next_scheduled_report_seq: u64,
     /// The `clientToken` of every `CreateScheduledReport` that has created a report,
-    /// mapped to the ARN it minted. A token is an at-most-once create key: the first
-    /// caller presenting it wins and every later one is refused with the modelled
-    /// `ConflictException`, so a retried token can never mint a second report.
-    pub scheduled_report_client_tokens: BTreeMap<String, String>,
+    /// mapped to that call's outcome. A token makes the create IDEMPOTENT: a later call
+    /// presenting the same token for the same request answers the recorded ARN and
+    /// creates nothing, one presenting it while that create is still in flight
+    /// ([`SCHEDULED_REPORT_CREATION_WINDOW`]) or for a materially different request is
+    /// refused with the modelled `ConflictException` — so a retried token can never mint
+    /// a second LIVE report. A record whose report is no longer stored is dropped
+    /// ([`Self::forget_creations_of_removed_reports`]), which is what keeps the map
+    /// bounded by [`MAX_SCHEDULED_REPORTS`] — one record per stored report at most — and
+    /// what stops a retry from being answered with an ARN that resolves to nothing.
+    pub scheduled_report_client_tokens: BTreeMap<String, ScheduledReportCreation>,
     /// Every `ExecuteScheduledReport` call that has triggered (or declined to trigger)
     /// an execution under a `clientToken`, keyed by the pair (the executed report's ARN,
     /// that token) and mapped to that call's outcome — the scope an idempotency token
@@ -548,6 +703,22 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
             // UNHEALTHY", so a healthy report carries none rather than an empty list.
             status_reasons: (!healthy).then_some(status_reasons),
         }
+    }
+
+    /// Drop every create idempotency record whose scheduled report this service no
+    /// longer stores.
+    ///
+    /// A record exists to answer the retry of the create it describes with that create's
+    /// outcome; once the report it minted is gone, that outcome is gone with it, so the
+    /// record would otherwise have a retry answered with an ARN nothing resolves to. The
+    /// removal of the report is what makes the record due for dropping — it was owed at
+    /// that moment, whether or not anybody called afterwards — and dropping it is also
+    /// what bounds the map by the reports actually stored
+    /// ([`MAX_SCHEDULED_REPORTS`]) rather than by every token ever presented.
+    pub fn forget_creations_of_removed_reports(&mut self) {
+        let reports = &self.scheduled_reports;
+        self.scheduled_report_client_tokens
+            .retain(|_, creation| reports.contains_key(&creation.arn));
     }
 
     /// Drop every execution idempotency record whose [`EXECUTION_IDEMPOTENCY_WINDOW`]
