@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! IMPLEMENTED: reports exactly the tags the stored workspace the `resourceArn` names
-//! currently carries. @readonly — the only write it makes is
+//! IMPLEMENTED: reports exactly the tags the stored resource the `resourceArn` names
+//! currently carries — whatever kind of taggable resource that is
+//! (`crate::state::TaggedResource`). @readonly — the only write it makes is
 //! [`crate::state::ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`],
 //! which applies the lifecycle transitions the clock already owed at this instant. An
 //! ARN that resolves to no live resource is refused with `NotFoundException` (404), the
@@ -163,16 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
-        let resolved = store.workspace_id_of_arn(&input.resource_arn);
-        let Some(workspace) = resolved.and_then(|workspace_id| store.workspaces.get(&workspace_id))
-        else {
+        let Some(tags) = store.tags_of_arn(&input.resource_arn) else {
             // The same refusal `TagResource` answers for an ARN that resolves to no live
             // resource — one composition for all three tagging operations.
             return Err(crate::state::arn_not_found());
         };
 
         Ok(ListTagsForResourceOutput {
-            tags: crate::state::tag_map(&workspace.tags),
+            tags: crate::state::tag_map(tags),
         })
     }
 }

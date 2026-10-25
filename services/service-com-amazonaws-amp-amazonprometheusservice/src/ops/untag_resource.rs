@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! IMPLEMENTED: removes the given `tagKeys` from the stored workspace the
-//! `resourceArn` names, and refuses an ARN that resolves to no live resource with
-//! `NotFoundException` (404), the code aps answers on this ARN-addressed path
-//! (`crate::state::arn_not_found`).
+//! IMPLEMENTED: removes the given `tagKeys` from the stored resource the
+//! `resourceArn` names — whatever kind of taggable resource that is
+//! (`crate::state::TaggedResource`) — and refuses an ARN that resolves to no live
+//! resource with `NotFoundException` (404), the code aps answers on this
+//! ARN-addressed path (`crate::state::arn_not_found`).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -156,10 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
-        let resolved = store.workspace_id_of_arn(&input.resource_arn);
-        let Some(workspace) =
-            resolved.and_then(|workspace_id| store.workspaces.get_mut(&workspace_id))
-        else {
+        let Some(tags) = store.tags_of_arn_mut(&input.resource_arn) else {
             // The same refusal `TagResource` answers for an ARN that resolves to no live
             // resource — one composition for all three tagging operations.
             return Err(crate::state::arn_not_found());
@@ -168,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@idempotent`: a key the resource does not carry is simply not there
         // afterwards either, so removing it again is not an error.
         for key in &input.tag_keys {
-            workspace.tags.remove(key);
+            tags.remove(key);
         }
 
         Ok(UntagResourceOutput {})

@@ -292,8 +292,8 @@ pub const QUERY_LOGGING_NOT_FOUND_MESSAGE: &str = "Workspace logging configurati
 /// account's adjustments — so this is the emulator's OWN bound on the store, not a
 /// claim about any account's limit. It sits far above any workflow an emulator serves,
 /// and it is what stops the state growing without end: every record it bounds is
-/// released by `DeleteWorkspace`, which also drops that workspace's ARN index entry
-/// and forgets its client tokens, so neither of those maps can outgrow it either.
+/// released by `DeleteWorkspace`, which also forgets that workspace's client tokens, so
+/// that map cannot outgrow it either.
 pub const WORKSPACE_QUOTA: usize = 1_000;
 
 /// How many rule groups namespaces ONE workspace holds before
@@ -761,9 +761,6 @@ pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// Each workspace's query logging configuration, keyed by `workspaceId`. A
     /// workspace holds at most one, and it is dropped with the workspace.
     pub query_logging: HashMap<String, QueryLoggingConfiguration>,
-    /// `workspaceArn -> workspaceId`, so the `/tags/{resourceArn}` operations
-    /// resolve an ARN without scanning every workspace.
-    pub arn_index: HashMap<String, String>,
     /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
     /// idempotent per its `@idempotencyToken`.
     pub client_tokens: HashMap<String, String>,
@@ -865,9 +862,7 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
             }
         }
         for workspace_id in deleted {
-            if let Some(workspace) = self.workspaces.remove(&workspace_id) {
-                self.arn_index.remove(&workspace.arn);
-            }
+            self.workspaces.remove(&workspace_id);
             self.client_tokens.retain(|_, id| id != &workspace_id);
             // A query logging configuration belongs to its workspace, so it goes when
             // the workspace does.
@@ -910,10 +905,117 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
         });
     }
 
-    /// The `workspaceId` the stored ARN `resource_arn` belongs to, if any.
-    pub fn workspace_id_of_arn(&self, resource_arn: &str) -> Option<String> {
-        self.arn_index.get(resource_arn).cloned()
+    /// The taggable resource the ARN `resource_arn` names, when this store holds one.
+    ///
+    /// `TagResource` enumerates the kinds there are — "The only resources that can be
+    /// tagged are rule groups namespaces, scrapers, and workspaces" — and an anomaly
+    /// detector is one as well: `CreateAnomalyDetector` accepts `tags` and every
+    /// detector reader reports them, while `PutAnomalyDetector` carries no `tags` at
+    /// all, so the ARN-addressed tagging operations are the only way a detector's tags
+    /// ever change — exactly as they are for a rule groups namespace, whose
+    /// `PutRuleGroupsNamespace` carries none either.
+    ///
+    /// Resolved by looking at the stored records, so there is no index that can
+    /// disagree with them about which resource an ARN names, miss a kind, or outlive
+    /// the resource it named.
+    pub fn taggable_of_arn(&self, resource_arn: &str) -> Option<TaggedResource> {
+        for (workspace_id, workspace) in &self.workspaces {
+            if workspace.arn == resource_arn {
+                return Some(TaggedResource::Workspace(workspace_id.clone()));
+            }
+            if let Some(namespace) = workspace
+                .rule_groups_namespaces
+                .values()
+                .find(|namespace| namespace.arn == resource_arn)
+            {
+                return Some(TaggedResource::RuleGroupsNamespace(
+                    workspace_id.clone(),
+                    namespace.name.clone(),
+                ));
+            }
+            if let Some(detector) = workspace
+                .anomaly_detectors
+                .values()
+                .find(|detector| detector.arn == resource_arn)
+            {
+                return Some(TaggedResource::AnomalyDetector(
+                    workspace_id.clone(),
+                    detector.anomaly_detector_id.clone(),
+                ));
+            }
+        }
+        self.scrapers
+            .values()
+            .find(|scraper| scraper.arn == resource_arn)
+            .map(|scraper| TaggedResource::Scraper(scraper.scraper_id.clone()))
     }
+
+    /// The tag map the resource `resource_arn` names CARRIES, for a reader to report —
+    /// `None` when the ARN names no resource this store holds.
+    pub fn tags_of_arn(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        match self.taggable_of_arn(resource_arn)? {
+            TaggedResource::Workspace(workspace_id) => {
+                self.workspaces.get(&workspace_id).map(|w| &w.tags)
+            }
+            TaggedResource::RuleGroupsNamespace(workspace_id, name) => self
+                .workspaces
+                .get(&workspace_id)?
+                .rule_groups_namespaces
+                .get(&name)
+                .map(|namespace| &namespace.tags),
+            TaggedResource::AnomalyDetector(workspace_id, anomaly_detector_id) => self
+                .workspaces
+                .get(&workspace_id)?
+                .anomaly_detectors
+                .get(&anomaly_detector_id)
+                .map(|detector| &detector.tags),
+            TaggedResource::Scraper(scraper_id) => {
+                self.scrapers.get(&scraper_id).map(|scraper| &scraper.tags)
+            }
+        }
+    }
+
+    /// The same tag map, for a writer to merge into or remove from — so `TagResource`
+    /// and `UntagResource` change the record every reader reports, whatever kind of
+    /// resource the ARN names.
+    pub fn tags_of_arn_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        match self.taggable_of_arn(resource_arn)? {
+            TaggedResource::Workspace(workspace_id) => {
+                self.workspaces.get_mut(&workspace_id).map(|w| &mut w.tags)
+            }
+            TaggedResource::RuleGroupsNamespace(workspace_id, name) => self
+                .workspaces
+                .get_mut(&workspace_id)?
+                .rule_groups_namespaces
+                .get_mut(&name)
+                .map(|namespace| &mut namespace.tags),
+            TaggedResource::AnomalyDetector(workspace_id, anomaly_detector_id) => self
+                .workspaces
+                .get_mut(&workspace_id)?
+                .anomaly_detectors
+                .get_mut(&anomaly_detector_id)
+                .map(|detector| &mut detector.tags),
+            TaggedResource::Scraper(scraper_id) => self
+                .scrapers
+                .get_mut(&scraper_id)
+                .map(|scraper| &mut scraper.tags),
+        }
+    }
+}
+
+/// One resource the `/tags/{resourceArn}` operations can address, as the store reaches
+/// it: a child resource is named by its parent workspace too, because that is where the
+/// record lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// A workspace, by `workspaceId`.
+    Workspace(String),
+    /// A rule groups namespace, by its workspace's `workspaceId` and its own name.
+    RuleGroupsNamespace(String, String),
+    /// An anomaly detector, by its workspace's `workspaceId` and its own id.
+    AnomalyDetector(String, String),
+    /// A scraper, by `scraperId`.
+    Scraper(String),
 }
 
 /// Whether a workspace and its rules-and-alerting logging configuration are in the state
