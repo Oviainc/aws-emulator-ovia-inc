@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The operation models no input members, so there is nothing a caller could have
         // sent wrongly and no validation refusal to reach.
-        let _ = (&input, ctx);
+        let _ = &input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPortfolioPreferencesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -162,14 +162,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A read, and only a read: the answer is the record `PutPortfolioPreferences`
-        // stored, reported through that record's own conversion so the two operations
-        // cannot drift apart.
-        let saved = state.lock().portfolio_preferences.clone();
+        // stored in the Region this request was signed for, reported through that
+        // record's own conversion so the two operations cannot drift apart.
+        let region = crate::state::request_region(ctx.parts());
+        let saved = state.lock().region(&region).portfolio_preferences.clone();
         match saved {
             Some(preferences) => Ok(preferences.to_output()),
-            // Nothing has been saved for this account, so there is no preferences record
-            // to report: the absent resource is answered with this operation's modelled
-            // not-found (HTTP 404) rather than with empty fields.
+            // Nothing has been saved for this account in this Region, so there is no
+            // preferences record to report: the absent resource is answered with this
+            // operation's modelled not-found (HTTP 404) rather than with empty fields.
             None => Err(GetPortfolioPreferencesErrorModeled::ResourceNotFoundException(
                 crate::state::no_portfolio_preferences(),
             )

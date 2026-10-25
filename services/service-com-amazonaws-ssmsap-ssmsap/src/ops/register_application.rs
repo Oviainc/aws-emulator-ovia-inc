@@ -256,12 +256,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // components an application has are the ones the registration described. A
         // component is identified by the SID and type it was declared with, so two
         // entries describing the same component are one component.
-        let mut components: Vec<String> = Vec::new();
+        let mut components: Vec<crate::state::StoredComponent> = Vec::new();
         for component in input.components_info.into_iter().flatten() {
             let id = crate::state::component_id(&component.sid, &component.component_type);
-            if !components.contains(&id) {
-                components.push(id);
+            if components.iter().any(|stored| stored.id == id) {
+                continue;
             }
+            components.push(crate::state::StoredComponent {
+                id,
+                component_type: component.component_type,
+                sid: component.sid,
+                ec2_instance_id: component.ec2_instance_id,
+            });
         }
 
         let application = crate::state::StoredApplication {

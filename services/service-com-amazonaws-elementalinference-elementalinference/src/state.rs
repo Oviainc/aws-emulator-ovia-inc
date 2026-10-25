@@ -100,8 +100,9 @@ const DICTIONARY_ID_LEN: usize = 19;
 const DICTIONARY_ID_ALPHABET: &[u8; 62] =
     b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
-/// How long a clock-owed transition takes: a feed's `DELETING` -> gone, and a
-/// dictionary's `CREATING` -> `AVAILABLE` and `DELETING` -> gone.
+/// How long a clock-owed transition takes: a feed's `DELETING` -> gone and its
+/// `UPDATING` -> the status it was reconfigured from, and a dictionary's `CREATING` ->
+/// `AVAILABLE` and `DELETING` -> gone.
 ///
 /// AWS documents no duration for these, so this span is chosen rather than
 /// specified: it is non-zero, so a caller that reads a resource straight after
@@ -170,15 +171,11 @@ pub const MAX_COMPLETED_DELETIONS: usize = 100;
 
 /// The `FeedStatus` values this slice of the service produces.
 ///
-/// The model's enum also carries `CREATING` and `UPDATING`, and neither is ever
-/// reported. `CREATING` is not: the recorded service hands back a feed
-/// that is immediately usable, so `CreateFeed` stores it `AVAILABLE` and there is no
-/// window in which a caller is told to wait ("After creation of the feed has succeeded,
-/// the status will be AVAILABLE", `CreateFeedResponse$status`). `UpdateFeed` answers HTTP
-/// 200 rather than 202 — "UpdateFeed is a PUT operation, which means that the payload
-/// that you specify completely overwrites the existing payload" and that overwrite is
-/// done when the call returns — so the update reports the feed's SETTLED status, as
-/// `AssociateFeed` (also 200) already does.
+/// The model's enum also carries `CREATING`, and it is never reported: the recorded
+/// service hands back a feed that is immediately usable, so `CreateFeed` stores it
+/// `AVAILABLE` and there is no window in which a caller is told to wait ("After creation
+/// of the feed has succeeded, the status will be AVAILABLE",
+/// `CreateFeedResponse$status`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedStatus {
     /// The feed is settled and serviceable, with no resource associated.
@@ -186,6 +183,10 @@ pub enum FeedStatus {
     /// A resource (the source media) is associated with the feed: `AssociateFeed`
     /// claims the feed for one resource, and that claim is what `ACTIVE` reports.
     Active,
+    /// The feed is being reconfigured in place: `UpdateFeed` has replaced its payload
+    /// and the reconfiguration is in flight. Transient — the clock moves the feed back
+    /// into the status it was reconfigured from ([`Feed::settles_into`]).
+    Updating,
     /// A `DeleteFeed` has been accepted; the deletion completes when it falls due.
     Deleting,
     /// The accepted deletion has COMPLETED ("When deletion of the feed has succeeded,
@@ -205,6 +206,7 @@ impl FeedStatus {
         match self {
             Self::Available => "AVAILABLE",
             Self::Active => "ACTIVE",
+            Self::Updating => "UPDATING",
             Self::Deleting => "DELETING",
             Self::Deleted => "DELETED",
             Self::Archived => "ARCHIVED",
@@ -645,6 +647,16 @@ pub struct Feed {
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this feed's transient status its next move, if any.
     pub transition_due_at: Option<Instant>,
+    /// The status this feed goes back into when the in-flight reconfiguration it is
+    /// carrying falls due, and `None` while no reconfiguration is in flight.
+    ///
+    /// A reconfiguration does not CHANGE which lifecycle status a feed is in — it
+    /// suspends it for the span of the work — so the status the feed was reconfigured
+    /// from has to be remembered somewhere for the settle pass to put it back. It is
+    /// kept on the feed record beside [`Self::transition_due_at`], so the instant the
+    /// move falls due and the status it moves to are one fact about one feed and cannot
+    /// drift apart.
+    pub settles_into: Option<FeedStatus>,
     /// When this feed's accepted deletion COMPLETED, and `None` while the feed holds a
     /// status of a live feed.
     ///
@@ -694,6 +706,27 @@ impl Feed {
         let due = now + TRANSITION_SPAN;
         self.status = status;
         self.transition_due_at = Some(due);
+        // Whatever this feed was going to settle back into, it is this transition's
+        // outcome that decides where the feed goes now.
+        self.settles_into = None;
+        due
+    }
+
+    /// Put this feed into `UPDATING` for the span of a reconfiguration of its payload,
+    /// remembering the status the clock settles it back into, and return the instant
+    /// that move falls due (handed to
+    /// [`ComAmazonawsElementalinferenceElementalinferenceState::note_due`] exactly as
+    /// [`Self::enter_transient`]'s is).
+    ///
+    /// A reconfiguration that arrives while another is still in flight restarts the
+    /// span and keeps the SETTLED status already remembered: the status to go back to is
+    /// the one the feed held before any of the work started, never the transient one it
+    /// is carrying now.
+    #[must_use]
+    pub fn begin_reconfiguration(&mut self, now: Instant) -> Instant {
+        let settled = self.settles_into.unwrap_or(self.status);
+        let due = self.enter_transient(FeedStatus::Updating, now);
+        self.settles_into = Some(settled);
         due
     }
 
@@ -1203,6 +1236,15 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 // reports it to a retry of that delete while no longer being a feed
                 // GetFeed reports or ListFeeds lists.
                 FeedStatus::Deleting => feed.retire(now),
+                // A feed whose reconfiguration has completed goes back into the status
+                // it was reconfigured from ([`Feed::settles_into`]): the work suspended
+                // that status, it did not replace it.
+                FeedStatus::Updating => {
+                    if let Some(settled) = feed.settles_into.take() {
+                        feed.status = settled;
+                    }
+                    feed.transition_due_at = None;
+                }
                 // A settled status owes the clock nothing; clear the stale instant.
                 FeedStatus::Available
                 | FeedStatus::Active

@@ -507,9 +507,9 @@ async fn update_feed_overwrites_the_stored_feed() {
         );
         assert_eq!(
             updated["status"],
-            json!("AVAILABLE"),
-            "case {label:?}: UpdateFeed answers 200, so the settled feed it reconfigured still \
-             reports AVAILABLE, got {:?}",
+            json!("UPDATING"),
+            "case {label:?}: the reconfiguration is in flight, so the update reports \
+             UPDATING, got {:?}",
             updated["status"]
         );
         assert_eq!(
@@ -553,7 +553,7 @@ async fn update_feed_overwrites_the_stored_feed() {
         assert_eq!(
             settled["status"],
             json!("AVAILABLE"),
-            "case {label:?}: the updated feed stays AVAILABLE, got {:?}",
+            "case {label:?}: the reconfigured feed settles back into AVAILABLE, got {:?}",
             settled["status"]
         );
     }

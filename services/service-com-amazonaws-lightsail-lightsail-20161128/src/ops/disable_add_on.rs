@@ -221,12 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `NotFoundException`, body `code` `DoesNotExist`, and a message built from the
 /// request.
 ///
-/// The message names the request's own member rather than one resource type,
+/// The sentence is the shared one every operation that resolves an
+/// add-on-carrying resource refuses with, so the one resolution rule answers one
+/// refusal. It names the request's own member rather than one resource type,
 /// because the request names a resource without saying what kind it is.
 fn not_found(name: &str) -> DisableAddOnError {
-    crate::scaffolded::Scaffolded::does_not_exist(format!(
-        "resourceName '{name}' does not name a resource of this account that carries add-ons"
-    ))
+    crate::scaffolded::Scaffolded::does_not_exist(crate::state::add_on_resource_not_found(name))
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

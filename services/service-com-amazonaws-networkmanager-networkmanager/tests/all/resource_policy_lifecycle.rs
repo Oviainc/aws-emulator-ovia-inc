@@ -39,7 +39,7 @@
 
 use serde_json::{json, Value};
 
-use crate::global_network_lifecycle::{error_code, expected_arn, Emulator};
+use crate::global_network_lifecycle::{error_code, expected_arn, expected_scoped_arn, Emulator};
 use crate::resource_tagging::escape;
 
 /// The `/resource-policy/{ResourceArn}` URI of `arn`.
@@ -443,14 +443,17 @@ async fn a_resource_that_cannot_carry_a_policy_is_refused_and_keeps_reporting_no
             "a stored global network".to_string(),
             expected_arn("global-network", &global_network),
         ),
-        ("a stored site".to_string(), expected_arn("site", &site)),
+        (
+            "a stored site".to_string(),
+            expected_scoped_arn("site", &global_network, &site),
+        ),
         (
             "a device ARN naming nothing stored".to_string(),
-            expected_arn("device", "device-0000000000000beef"),
+            expected_scoped_arn("device", &global_network, "device-0000000000000beef"),
         ),
         (
             "a link ARN naming nothing stored".to_string(),
-            expected_arn("link", "link-0000000000000beef"),
+            expected_scoped_arn("link", &global_network, "link-0000000000000beef"),
         ),
         (
             "an attachment ARN naming nothing stored".to_string(),

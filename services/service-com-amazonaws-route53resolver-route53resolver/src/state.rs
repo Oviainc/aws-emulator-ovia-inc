@@ -171,6 +171,17 @@ const PAGE_TOKEN_DOMAIN: &str = "route53resolver/page-token/v1";
 /// endpoint operations that raise `ResourceNotFoundException`.
 pub const RSLVR_CODE_ENDPOINT_NOT_FOUND: &str = "RSLVR-00501";
 
+/// The Route 53 Resolver service error code reported when a request asks for a
+/// rule of a type Resolver answers itself, yet still names where the rule should
+/// forward queries to (a Resolver endpoint, target IP addresses, or both).
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes from
+/// the recorded responses of the rule operation that raises
+/// `InvalidRequestException` for it.
+pub const RSLVR_CODE_SYSTEM_RULE_FORWARDING_TARGET: &str = "RSLVR-00707";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -331,6 +342,26 @@ pub fn resolver_rule_association_not_found(
             r#"Resolver rule association with ID "{resolver_rule_association_id}" does not exist."#
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
+    }
+}
+
+/// Canonicalise the domain name a Resolver rule selects on to a fully-qualified
+/// DNS name: the name followed by exactly one root label, written as a trailing
+/// dot (RFC 1035 §3.1 — the final zero-length label of a name relative to the
+/// root).
+///
+/// Resolver reports a rule's `DomainName` in that canonical form whatever form
+/// the request wrote it in, so `example.com` and `example.com.` name one domain
+/// and a read of either rule reports the same member. The modelled `DomainName`
+/// length (1..256) leaves room for the root label on a name at the 255-octet DNS
+/// limit.
+pub fn canonical_domain_name(domain_name: &str) -> String {
+    let relative = domain_name.trim_end_matches('.');
+    if relative.is_empty() {
+        // Nothing but root labels names the root itself.
+        ".".to_string()
+    } else {
+        format!("{relative}.")
     }
 }
 

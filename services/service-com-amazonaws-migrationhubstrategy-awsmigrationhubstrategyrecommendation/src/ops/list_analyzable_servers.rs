@@ -254,7 +254,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAnalyzableServersErrorModeled::InternalServerException(
                 InternalServerException {
@@ -276,12 +275,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = page_of(input.max_results, input.next_token, order)?;
 
         // A read: the store is only looked at here, so running ListAnalyzableServers
-        // changes nothing a later caller sees.
+        // changes nothing a later caller sees. The inventory is the one of the Region
+        // this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // The servers a collector fetched, each beside the inventory id that orders it: a
         // server the service holds no discovery data for is not an analyzable server and
         // is left out rather than reported as an empty summary.
         let discovered: Vec<(&str, AnalyzableServerSummary)> = store
+            .region(&region)
             .servers
             .values()
             .filter_map(|server| {

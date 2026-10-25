@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDistributionWithStagingConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDistributionWithStagingConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDistributionWithStagingConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Promotes a staging distribution's persisted configuration onto its primary
+//! distribution: the primary's stored configuration becomes the STAGING distribution's,
+//! except for the members that belong to the primary's own identity and deployment
+//! workflow (`CallerReference`, `Aliases`, `ContinuousDeploymentPolicyId`, `Staging`),
+//! which it retains; the continuous deployment policy the primary names is then disabled,
+//! the primary re-enters propagation, and the call hands back a fresh version token. The
+//! staging distribution itself is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +207,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -302,6 +305,59 @@ impl From<UpdateDistributionWithStagingConfigErrorModeled> for UpdateDistributio
     }
 }
 
+/// Why a request that names no staging distribution, and whose primary names none
+/// either, is refused.
+///
+/// `StagingDistributionId` is "the identifier of the staging distribution whose
+/// configuration you are copying to the primary distribution", and the model leaves it
+/// optional: a request that omits it is promoting the staging distribution its primary is
+/// already paired with, which is the one the primary's continuous deployment policy routes
+/// traffic to. When there is no such pairing to read, the request names no configuration
+/// to copy at all.
+const NO_STAGING_DISTRIBUTION_TO_PROMOTE: &str =
+    "An argument is invalid: StagingDistributionId is required unless the primary \
+     distribution names a continuous deployment policy that routes traffic to a staging \
+     distribution this account holds.";
+
+/// What the request's `If-Match` says about the two distributions this call reads.
+///
+/// `IfMatch` is "the current versions (ETag values) of BOTH primary and staging
+/// distributions. Provide these in the following format: `<primary ETag>, <staging
+/// ETag>`" — so the header states one version token per distribution this call reads, in
+/// that order, and each is checked against the distribution it names
+/// ([`crate::state::check_if_match`]). A header that does not state both — none, one, or
+/// more tokens than there are distributions — answers the same way a missing header does,
+/// because `InvalidIfMatchVersion` is "the `If-Match` version is missing or not valid"; a
+/// token that is well formed but not current is a failed precondition instead, and a
+/// malformed token outranks a stale one, since a header this operation cannot read is a bad
+/// request whatever the versions behind it are.
+fn check_if_match_pair(primary_etag: &str, staging_etag: &str, if_match: Option<&str>) -> IfMatch {
+    let Some(raw) = if_match else {
+        return IfMatch::Invalid;
+    };
+    let stated: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    // Both versions, or this is not the version list this request takes.
+    let [stated_primary, stated_staging] = stated.as_slice() else {
+        return IfMatch::Invalid;
+    };
+    let mut outcome = IfMatch::Current;
+    for (token, current) in [
+        (*stated_primary, primary_etag),
+        (*stated_staging, staging_etag),
+    ] {
+        match crate::state::check_if_match(current, Some(token)) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => return IfMatch::Invalid,
+            IfMatch::Stale => outcome = IfMatch::Stale,
+        }
+    }
+    outcome
+}
+
 /// The `UpdateDistributionWithStagingConfig` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -338,18 +394,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDistributionWithStagingConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDistributionWithStagingConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDistributionWithStagingConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The primary is "the primary distribution to which you are copying a staging
+        // distribution's configuration", so one the store does not hold is the modelled
+        // 404 and nothing is written for it.
+        let Some(primary) = store
+            .distribution(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.clone()))
+        else {
+            return Err(
+                UpdateDistributionWithStagingConfigErrorModeled::NoSuchDistribution(
+                    crate::state::no_such_distribution(),
+                )
+                .into(),
+            );
+        };
+        let (primary_etag, primary_config) = primary;
+        // The policy this promotion disables: the one the PRIMARY's stored configuration
+        // names. An empty value is what "associated with no policy" is.
+        let policy_id = primary_config
+            .continuous_deployment_policy_id
+            .clone()
+            .unwrap_or_default();
+
+        // The staging distribution whose configuration is copied. The request names it
+        // outright; a request that leaves the member out promotes the staging
+        // distribution the primary is already paired with, which its continuous
+        // deployment policy names by domain name.
+        let staging_id = match input.staging_distribution_id.clone() {
+            Some(id) => id,
+            None => {
+                let dns_names = store
+                    .continuous_deployment_policy(&policy_id)
+                    .map(|policy| policy.staging_distribution_dns_names().to_vec())
+                    .unwrap_or_default();
+                let resolved = dns_names
+                    .iter()
+                    .find_map(|name| store.distribution_by_domain_name(name))
+                    .map(|stored| stored.id.clone());
+                match resolved {
+                    Some(id) => id,
+                    None => {
+                        return Err(
+                            UpdateDistributionWithStagingConfigErrorModeled::InvalidArgument(
+                                InvalidArgument {
+                                    message: Some(
+                                        NO_STAGING_DISTRIBUTION_TO_PROMOTE.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+        };
+
+        let Some(staging) = store
+            .distribution(&staging_id)
+            .map(|stored| (stored.etag.clone(), stored.config.clone()))
+        else {
+            return Err(
+                UpdateDistributionWithStagingConfigErrorModeled::NoSuchDistribution(
+                    crate::state::no_such_distribution(),
+                )
+                .into(),
+            );
+        };
+        let (staging_etag, staging_config) = staging;
+
+        // What is promoted is a STAGING distribution's configuration, and a
+        // distribution's own configuration says whether it is one: a distribution that is
+        // not a staging distribution has no staging configuration to copy, so naming one
+        // is an invalid argument rather than a promotion of something else.
+        if staging_config.staging != Some(true) {
+            return Err(
+                UpdateDistributionWithStagingConfigErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "An argument is invalid: the distribution {staging_id} is not a \
+                             staging distribution, so it has no staging configuration to \
+                             promote."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both preconditions are checked against the STORED versions, so a promotion
+        // lands only on the primary and from the staging configuration their caller
+        // actually read.
+        match check_if_match_pair(&primary_etag, &staging_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateDistributionWithStagingConfigErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    UpdateDistributionWithStagingConfigErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The primary distribution retains its Aliases … and ContinuousDeploymentPolicyId
+        // value, but otherwise its configuration is overwritten to match the staging
+        // distribution." Two more members stay the primary's for the same reason they are
+        // not part of a configuration a caller can rewrite: `CallerReference` "uniquely
+        // identifies a request to create a resource" and cannot be changed for the life of
+        // the distribution, and `Staging` says which KIND of distribution this record is —
+        // a promotion moves a configuration onto the primary, it does not turn the primary
+        // into a staging distribution.
+        let mut promoted = staging_config;
+        promoted.caller_reference = primary_config.caller_reference.clone();
+        promoted.aliases = primary_config.aliases.clone();
+        promoted.continuous_deployment_policy_id =
+            primary_config.continuous_deployment_policy_id.clone();
+        promoted.staging = primary_config.staging;
+
+        // The merged configuration is what gets stored, so it is held to the same rule
+        // every other path that stores one is: an alternate domain name is served only
+        // under a certificate that covers it, and the primary keeps its aliases while
+        // taking the staging distribution's certificate.
+        if let Some(message) = crate::state::alias_certificate_mismatch(&promoted) {
+            return Err(
+                UpdateDistributionWithStagingConfigErrorModeled::InvalidViewerCertificate(
+                    InvalidViewerCertificate {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The same write `UpdateDistribution` performs: the stored configuration becomes
+        // this one, the version token is freshly minted and the distribution re-enters
+        // propagation, because the configuration it now runs under has to reach the edge
+        // locations.
+        let Some(stored) = store.apply_config(&input.id, promoted, now) else {
+            return Err(
+                UpdateDistributionWithStagingConfigErrorModeled::NoSuchDistribution(
+                    crate::state::no_such_distribution(),
+                )
+                .into(),
+            );
+        };
+        let distribution = stored.to_distribution();
+        let etag = stored.etag.clone();
+
+        // "This action will disable the continuous deployment policy and move your
+        // domain's traffic back to the primary distribution." The policy keeps everything
+        // else it was created with — the staging domain names it routes to, its traffic
+        // configuration — so only its `Enabled` flag changes, and a policy that is already
+        // disabled is left untouched rather than given a new version.
+        let policy_config = store
+            .continuous_deployment_policy(&policy_id)
+            .map(|policy| policy.config.clone());
+        if let Some(policy_config) = policy_config.filter(|config| config.enabled) {
+            store.apply_continuous_deployment_policy_config(
+                &policy_id,
+                ContinuousDeploymentPolicyConfig {
+                    enabled: false,
+                    ..policy_config
+                },
+                now,
+            );
+        }
+
+        Ok(UpdateDistributionWithStagingConfigOutput {
+            // The record just written, so what this answer reports is what a later read
+            // of the primary answers with.
+            distribution: Some(distribution),
+            // "The current version of the primary distribution (after it's updated)."
+            e_tag: Some(etag),
+        })
     }
 }

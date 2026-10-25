@@ -8,6 +8,11 @@
 //! with the same list changes nothing. The tags are persisted on the stored export, which
 //! is what `ListTagsForResource` reports.
 //!
+//! A `ResourceTags` claiming the reserved `aws:` namespace
+//! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is refused
+//! with the modelled `ValidationException` and stores nothing — that namespace holds the
+//! tags Amazon Web Services generates, which a caller cannot set.
+//!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
 //!
@@ -166,7 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(TagResourceErrorModeled::AccessDeniedException)?;
 
         // The request is read before the resource is looked up: a list that cannot be
-        // read as a tag set at all is a bad request whatever ARN it was sent to.
+        // read as a tag set at all — one key named twice, or a key in the reserved
+        // namespace a caller may not write — is a bad request whatever ARN it was sent to.
+        // Both halves are decided in `crate::state` so this operation and `CreateExport`
+        // cannot drift apart on either.
         let submitted = crate::state::tag_map(input.resource_tags)
             .map_err(TagResourceErrorModeled::ValidationException)?;
 
