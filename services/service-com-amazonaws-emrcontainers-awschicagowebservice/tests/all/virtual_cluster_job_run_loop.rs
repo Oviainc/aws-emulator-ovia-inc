@@ -96,19 +96,32 @@ impl Emr {
     }
 
     pub(crate) async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+        self.send_in(REGION, method, path, body).await
+    }
+
+    /// The same call, signed for `region`: the regional endpoint it is addressed to and
+    /// the region of its SigV4 credential scope. `crate::region_isolation` drives more
+    /// than one region through this one request path.
+    pub(crate) async fn send_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = match &body {
             Some(value) => serde_json::to_vec(value).expect("a JSON request body serializes"),
             None => Vec::new(),
         };
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://emr-containers.{REGION}.amazonaws.com{path}"))
-            .header("host", format!("emr-containers.{REGION}.amazonaws.com"))
+            .uri(format!("https://emr-containers.{region}.amazonaws.com{path}"))
+            .header("host", format!("emr-containers.{region}.amazonaws.com"))
             .header("content-type", "application/json")
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/emr-containers/aws4_request, SignedHeaders=host, Signature=abc"
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/emr-containers/aws4_request, SignedHeaders=host, Signature=abc"
                 ),
             )
             .body(Bytes::from(payload))

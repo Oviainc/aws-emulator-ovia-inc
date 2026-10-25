@@ -160,6 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in is refused before the addressed device id is
+        // resolved and before the `nextToken` and `type` filter are looked at.
+        if !store.has_devices_in(&region) {
+            return Err(ListDeviceResourcesErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         // The token carries the resource id the next page resumes at; a value this
         // service never issued is refused rather than silently serving page one.
         let resume_at = match input.next_token.as_deref() {

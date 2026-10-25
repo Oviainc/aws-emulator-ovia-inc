@@ -17,6 +17,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_memorydb_amazonmemorydb::state::MIN_MAX_RESULTS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{call, error_code, ok, router};
@@ -205,7 +206,9 @@ async fn every_catalog_family_has_a_default_parameter_group_nobody_created() {
             names, sorted,
             "case {case:?}: the baseline must be listed in name order, got {names:?}"
         );
-        let paged = parameters(&router, &name, Some(3), &case).await;
+        // Paged at the smallest page size the service serves, which is smaller than the
+        // baseline, so the walk really covers several pages.
+        let paged = parameters(&router, &name, Some(i64::from(MIN_MAX_RESULTS)), &case).await;
         assert_eq!(
             paged, baseline,
             "case {case:?}: paging the baseline must yield the same parameters"

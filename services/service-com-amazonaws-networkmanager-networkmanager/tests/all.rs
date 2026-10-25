@@ -21,6 +21,8 @@ mod attachment_lifecycle;
 mod attachment_routing_policy_associations;
 #[path = "all/connect_peer_association_lifecycle.rs"]
 mod connect_peer_association_lifecycle;
+#[path = "all/connect_peer_delete.rs"]
+mod connect_peer_delete;
 #[path = "all/connect_peer_lifecycle.rs"]
 mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]

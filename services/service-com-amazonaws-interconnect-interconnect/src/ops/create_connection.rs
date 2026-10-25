@@ -329,9 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             location: environment.location.clone(),
             r#type: environment.r#type.clone(),
             // "requested: the initial state of a connection. The state will remain
-            // here until the Connection is accepted on the Partner portal" — so no
-            // transition is owed: the move out of `requested` is the partner's, not
-            // the clock's.
+            // here until the Connection is accepted on the Partner portal" — the
+            // state every new connection is returned in, and the first leg of the
+            // progression the clock owes it below.
             state: "requested".to_string(),
             shared_id: crate::state::new_shared_id(),
             // `billingTier` is OPTIONAL and the rule AWS assigns it by is not
@@ -358,7 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::StoredConnection {
                 connection: connection.clone(),
                 remote_account: input.remote_account.clone(),
-                pending_transition: None,
+                // A connection is returned in a non-terminal state, so the clock
+                // owes it the rest of the documented progression: accepted
+                // (`pending`), then fully provisioned (`available`). The due
+                // instant is stored and materialised by whichever call comes next;
+                // this one never waits for it.
+                pending_transition: crate::state::owed_progression(&connection.state, now),
                 evict_due: None,
             },
         );

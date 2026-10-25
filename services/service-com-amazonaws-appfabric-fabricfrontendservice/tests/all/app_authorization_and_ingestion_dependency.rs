@@ -204,7 +204,7 @@ async fn create_ingestion_unauthorized(
         .await
 }
 
-async fn stop_ingestion(emulator: &Emulator, bundle: &str, ingestion: &str) -> Answer {
+pub(crate) async fn stop_ingestion(emulator: &Emulator, bundle: &str, ingestion: &str) -> Answer {
     emulator
         .call(
             "POST",
@@ -262,7 +262,12 @@ async fn list_destinations(
 /// A bundle holding one CONNECTED authorization for (`app`, `tenant`) and one
 /// ingestion of that pair — the chain AppFabric requires (authorize → connect →
 /// ingest), each step driven through its own operation.
-async fn bundle_with_ingestion(emulator: &Emulator, app: &str, tenant: &str, case: &str) -> (String, String) {
+pub(crate) async fn bundle_with_ingestion(
+    emulator: &Emulator,
+    app: &str,
+    tenant: &str,
+    case: &str,
+) -> (String, String) {
     let bundle = arn_of(
         &emulator.create_app_bundle(json!({})).await.body,
         "appBundle",
@@ -785,10 +790,10 @@ async fn an_ingestion_requires_a_connected_authorization_for_its_pair() {
 
 /// Put the stored ingestion into one `IngestionState`.
 ///
-/// `StartIngestion` is still scaffolded (HTTP 501), so the store is the only way
-/// to reach `enabled` — and it is the SAME store the handlers read
+/// The state is written straight into the SAME store the handlers read
 /// (`state::service_state` on the engine this emulator was mounted on), so the
-/// set-up is the real record rather than a double of one.
+/// set-up is the real record rather than a double of one, and the call under
+/// test is the only operation these rows exercise.
 fn set_ingestion_state(
     engine: &engine::InMemoryEngine,
     bundle: &str,
@@ -807,7 +812,7 @@ fn set_ingestion_state(
 }
 
 /// The `state` `GetIngestion` reports for one stored ingestion.
-async fn ingestion_state(emulator: &Emulator, bundle: &str, ingestion: &str) -> String {
+pub(crate) async fn ingestion_state(emulator: &Emulator, bundle: &str, ingestion: &str) -> String {
     let read = emulator.get_ingestion(bundle, ingestion).await;
     read.body
         .get("ingestion")

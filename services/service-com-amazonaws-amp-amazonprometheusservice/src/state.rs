@@ -529,6 +529,10 @@ pub struct RuleGroupsNamespace {
     /// [`materialize_namespaces_due`]), so a later call reusing the token is a new
     /// request.
     pub update_token: Option<String>,
+    /// The `clientToken` of the `DeleteRuleGroupsNamespace` call that started a pending
+    /// deletion, so replaying that exact call stays idempotent rather than conflicting
+    /// with the deletion it already started.
+    pub delete_token: Option<String>,
 }
 
 /// One entry of a configuration's `limitsPerLabelSet`: a label set and the active time

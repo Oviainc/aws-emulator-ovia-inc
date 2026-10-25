@@ -11,7 +11,9 @@
 //! tunnel that is not `OPEN` — one `CloseTunnel` closed, or one the expiry sweep
 //! closed — with HTTP 400 `ValidationException`, before any token is minted or
 //! stored. A `destinationConfig` configures the destination end, so it is refused
-//! the same way when the requested `clientMode` does not rotate that end.
+//! the same way when the requested `clientMode` does not rotate that end, and
+//! when its `services` list names more streams than a tunnel is multiplexed
+//! over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]).
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A tunnel carries at most `MAX_SERVICES_PER_TUNNEL` service names,
+        // whichever call writes the field, so an oversized list is refused here
+        // — before the tunnel is resolved, so a refused rotate mints no token
+        // and leaves the stored record exactly as it was.
+        let destination_config = input
+            .destination_config
+            .as_ref()
+            .map(|config| crate::state::stored_destination_config("destinationConfig", config))
+            .transpose()
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialize_expired_tunnels(now);
@@ -217,11 +230,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = destination_access_token.as_ref() {
             tunnel.destination_access_token = token.clone();
         }
-        if let Some(config) = input.destination_config.as_ref() {
-            tunnel.destination_config = Some(crate::state::StoredDestinationConfig {
-                thing_name: config.thing_name.clone(),
-                services: config.services.clone(),
-            });
+        if let Some(config) = destination_config {
+            tunnel.destination_config = Some(config);
         }
         tunnel.last_updated_at = now;
         let tunnel_arn = tunnel.tunnel_arn.clone();

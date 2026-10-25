@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Reporting only. `settle` writes nothing of its own: it materialises the status
         // transitions the clock already owed OTHER resources, which were due at this
@@ -157,7 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so this call never changes one.
         state.settle();
 
-        let Some(view) = state.security_configuration_view(&input.id) else {
+        // Resolved in the region this request is signed for: a configuration created at
+        // another region's endpoint does not exist here.
+        let Some(view) = state.security_configuration_view(&region, &input.id) else {
             return Err(
                 DescribeSecurityConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

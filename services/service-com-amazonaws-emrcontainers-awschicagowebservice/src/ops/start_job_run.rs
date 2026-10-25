@@ -179,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle();
 
         // A job run runs IN a virtual cluster, so the cluster is resolved out of state
-        // first: a cluster that was never created, or one that is no longer RUNNING
-        // because it was deleted, cannot accept work.
+        // first, in the region this request is signed for: a cluster that was never
+        // created here, or one that is no longer RUNNING because it was deleted, cannot
+        // accept work.
         let cluster_running = state
-            .virtual_clusters
-            .get(&input.virtual_cluster_id)
+            .virtual_cluster(&region, &input.virtual_cluster_id)
             .is_some_and(|cluster| cluster.state == crate::state::CLUSTER_RUNNING);
         if !cluster_running {
             return Err(StartJobRunErrorModeled::ResourceNotFoundException(
@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // idempotency replay, so which requests this operation refuses does not depend
         // on whether one of them was retried.
         if let Some(template_id) = input.job_template_id.as_deref() {
-            if !state.job_templates.contains_key(template_id) {
+            if state.job_template(&region, template_id).is_none() {
                 return Err(StartJobRunErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(format!("Job Template {template_id} doesn't exist.")),
@@ -262,8 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` is `@idempotencyToken`: the same token replayed names the job
         // run the first call minted rather than submitting the work twice.
-        let replayed = state.replayed_idempotency(&scope, &input.client_token).cloned();
-        if let Some(existing) = replayed.and_then(|id| state.job_runs.get(&id)) {
+        let replayed = state
+            .replayed_idempotency(&region, &scope, &input.client_token)
+            .cloned();
+        if let Some(existing) =
+            replayed.and_then(|id| state.job_run(&region, &input.virtual_cluster_id, &id))
+        {
             return Ok(StartJobRunOutput {
                 id: Some(existing.id.clone()),
                 name: existing.name.clone(),
@@ -306,6 +310,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::job_run_arn(&region, &input.virtual_cluster_id, &id);
         let record = crate::state::JobRunRecord {
             id: id.clone(),
+            // The region this request was signed for — the region of the cluster resolved
+            // above — so the run exists at that endpoint and nowhere else.
+            region: region.clone(),
             name: input.name.clone(),
             virtual_cluster_id: input.virtual_cluster_id.clone(),
             arn: arn.clone(),

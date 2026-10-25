@@ -170,11 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource.
         let replayed = state
             .replayed_idempotency(
+                &region,
                 crate::state::CREATE_SECURITY_CONFIGURATION_SCOPE,
                 &input.client_token,
             )
             .cloned();
-        if let Some(existing) = replayed.and_then(|id| state.security_configurations.get(&id)) {
+        if let Some(existing) = replayed.and_then(|id| state.security_configuration(&region, &id)) {
             return Ok(CreateSecurityConfigurationOutput {
                 id: Some(existing.id.clone()),
                 name: Some(existing.name.clone()),
@@ -207,6 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is usable as soon as it is created and owes the clock no later transition.
         let record = crate::state::SecurityConfigurationRecord {
             id: id.clone(),
+            // The region this request was signed for: the configuration exists at that
+            // endpoint and nowhere else, which is what every later read resolves against.
+            region: region.clone(),
             name: input.name.clone(),
             arn: arn.clone(),
             created_at_millis: crate::state::now_millis(),

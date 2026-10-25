@@ -1302,6 +1302,43 @@ impl UserPoolClient {
         self.prevent_user_existence_errors == "ENABLED"
     }
 
+    /// Whether `presented` is the `SecretHash` a request for `username` has to
+    /// carry to be accepted by this app client.
+    ///
+    /// `SecretHash` is "a keyed-hash message authentication code (HMAC)
+    /// calculated using the secret key of a user pool client and username plus
+    /// the client ID in the message" (`SignUp.SecretHash` in this service's
+    /// model), carried base64-encoded as the modelled `SecretHashType` pattern
+    /// `^[\w+=/]+$` admits.
+    ///
+    /// A client with NO stored secret has no such secret key, so there is
+    /// nothing to verify and every request to it is accepted. A client that
+    /// HOLDS a secret accepts only the tag THAT secret produces over
+    /// [`secret_hash_message`]: a request that carries none, or one computed
+    /// from another secret, another username or another client, proves nothing
+    /// about holding the secret.
+    ///
+    /// The check is `ring`'s own tag verification, so a rejected hash tells a
+    /// caller nothing about how much of the expected one it got right.
+    pub fn accepts_secret_hash(&self, username: &str, presented: Option<&str>) -> bool {
+        let Some(secret) = self.client_secret.as_deref() else {
+            return true;
+        };
+        let Some(presented) = presented else {
+            return false;
+        };
+        let Ok(tag) = ::aws_smithy_types::base64::decode(presented) else {
+            return false;
+        };
+        let key = ::ring::hmac::Key::new(::ring::hmac::HMAC_SHA256, secret.as_bytes());
+        ::ring::hmac::verify(
+            &key,
+            secret_hash_message(username, &self.client_id).as_bytes(),
+            &tag,
+        )
+        .is_ok()
+    }
+
     /// The access token lifetime this client issues.
     pub fn access_token_ttl(&self) -> Duration {
         token_ttl(
@@ -2265,6 +2302,14 @@ pub fn new_client_id() -> String {
 /// satisfying `^[\w+]+$`.
 pub fn new_client_secret() -> String {
     random_token(51)
+}
+
+/// The message a `SecretHash` authenticates: "username plus the client ID in
+/// the message" (`SignUp.SecretHash` in this service's model), in that order, so
+/// the hash of one username is not the hash of another and the hash for one app
+/// client is not the hash for another.
+fn secret_hash_message(username: &str, client_id: &str) -> String {
+    format!("{username}{client_id}")
 }
 
 /// A fresh user `sub`: a v4 UUID, as Amazon Cognito's `sub` attribute is.

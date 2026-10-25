@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,7 +149,7 @@ impl<Eng> UpdateLink<Eng> {
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for UpdateLink<Eng>
 {
-    type Input = UpdateLinkInput;
+    type Input = UpdateLinkRequest;
     type Output = UpdateLinkOutput;
     type Error = UpdateLinkError;
 
@@ -172,18 +163,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `Identifier`'s presence and its `ResourceIdentifier` pattern are modelled
+        // constraints, already refused by the centralized walk before this body runs.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLink"))
+        // THE AUTHORIZATION DECISION COMES FIRST, before anything else this request
+        // carries is judged: this operation changes what a source account shares with a
+        // monitoring account, and the permission to do that is granted on the link
+        // resource kind of this account and Region rather than on one named link — so
+        // the decision is taken, and reported, on that whole kind, and an identifier
+        // naming no link this caller owns is refused by it. Nothing of the rest of the
+        // request takes part, which is why `ResourceTypes` is read as an optional member
+        // here and enforced below (see `super::types::UpdateLinkRequest`): a caller
+        // probing what it may do learns the authorization outcome rather than something
+        // about the shape of its own request.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateLinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let parts = ctx.parts();
+        let region = crate::state::request_region(parts);
+        let source_account = crate::state::caller_source_account(parts);
+        let mut store = state.lock();
+
+        // A link belongs to the source account that created it, and only that account
+        // may change what it shares. Resolved ONCE, to the id of the record the update
+        // below is applied to; anything else — an identifier naming no stored link, a
+        // link of another source account, a link of another Region, an ARN of the other
+        // resource kind — is the one refusal above, which names the link kind and so
+        // discloses nothing about which of those it was.
+        let resolved = store.resolve_link_id(&region, &input.identifier);
+        let id = resolved
+            .filter(|id| {
+                store
+                    .links
+                    .get(id)
+                    .is_some_and(|link| link.source_account == source_account)
+            })
+            .ok_or_else(|| {
+                crate::state::explicit_deny(
+                    Self::NAME,
+                    &crate::state::resource_kind_wildcard(&region, crate::state::ResourceKind::Link),
+                )
+            })?;
+
+        // Only now is the rest of the request judged. `ResourceTypes` is `@required`
+        // with `@length(1..50)` and `@uniqueItems`, and this operation enforces all of
+        // them HERE rather than in the centralized pre-handler walk, because the
+        // decision above comes first (see `super::types::UpdateLinkRequest`). An absent
+        // member is worded exactly as that walk words one. The resource-type catalog is
+        // checked too, so no update ever stores a type the model does not declare.
+        let resource_types = input.resource_types.ok_or_else(|| {
+            UpdateLinkErrorModeled::MissingRequiredParameterException(
+                MissingRequiredParameterException {
+                    message: Some(crate::state::missing_member_message("ResourceTypes")),
+                    ..Default::default()
+                },
+            )
+        })?;
+        if let Some(why) = crate::state::resource_types_rejection(&resource_types) {
+            return Err(UpdateLinkErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let link = store.links.get_mut(&id).ok_or_else(|| {
+            UpdateLinkErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the link could not be read for update".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // "Your input here replaces the current set of data types that are shared"
+        // (the `ResourceTypes` member's own documentation): the request STATES the
+        // link's data types rather than adding to them, so the stored list is replaced
+        // and a type the request leaves out stops being shared. `LinkConfiguration` is
+        // the same kind of member of the same request — the filters that apply to what
+        // is now shared — so it is replaced too, and a request that carries none
+        // leaves the link sharing everything its types cover. Neither the link's sink,
+        // its label nor its tags can be changed here: this operation models no member
+        // for them ("You can't change the sink or change the monitoring account with
+        // this operation").
+        link.resource_types = resource_types;
+        link.link_configuration = input.link_configuration;
+
+        // Reported from the STORED record rather than from the request, so what this
+        // update answers is exactly what a later `GetLink` reads back.
+        Ok(UpdateLinkOutput {
+            arn: Some(link.arn.clone()),
+            id: Some(link.id.clone()),
+            label: Some(link.label.clone()),
+            label_template: Some(link.label_template.clone()),
+            resource_types: Some(link.resource_types.clone()),
+            sink_arn: Some(link.sink_arn.clone()),
+            // "Specifies whether to include the tags associated with the link in the
+            // response after the update operation" — absent is false.
+            tags: link.tags_output(input.include_tags.unwrap_or(false)),
+            link_configuration: link.link_configuration.clone(),
+        })
     }
 }

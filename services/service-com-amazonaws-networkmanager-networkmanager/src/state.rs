@@ -32,7 +32,9 @@
 //! `attachment-policies` rules decide what becomes of each attachment created on the core
 //! network — which segment or network function group it joins, and whether its attachment
 //! request has to be ACCEPTED first, which is what holds it in
-//! `PENDING_ATTACHMENT_ACCEPTANCE` until `AcceptAttachment` grants that acceptance.
+//! `PENDING_ATTACHMENT_ACCEPTANCE` until `AcceptAttachment` grants that acceptance. A
+//! Connect attachment in turn owns the CONNECT PEERS built on it: each is one BGP peering
+//! between that attachment's edge of the core network and an appliance.
 //! Beside that tree a global network holds the telemetry-bearing connections registered
 //! with it (a Connect peer of either kind, a VPN connection), whose session health is what
 //! `GetNetworkTelemetry` reports.
@@ -527,6 +529,12 @@ pub fn is_network_resource_type(resource_type: &str) -> bool {
 /// gateway Connect peer, and a Site-to-Site VPN connection. The modelled
 /// `ConstrainedString` carries only a length and a permissive pattern, so a value outside
 /// this set is refused by the handler rather than by the schema.
+///
+/// [`CONNECT_PEER_TYPE`] doubles as the id prefix and the ARN resource type of the Cloud
+/// WAN Connect PEER this slice mints, the way [`GLOBAL_NETWORK_KIND`] does for a global
+/// network: the model constrains that id itself with `pattern
+/// ^connect-peer-([0-9a-f]{8,17})$` (`smithy_query shape=ConnectPeerId`), which the 17 hex
+/// digits of [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
 pub const CONNECT_PEER_TYPE: &str = "connect-peer";
 /// See [`CONNECT_PEER_TYPE`].
 pub const TRANSIT_GATEWAY_CONNECT_PEER_TYPE: &str = "transit-gateway-connect-peer";
@@ -2431,12 +2439,20 @@ impl ConnectPeerRecord {
 
     /// The modelled `ConnectPeer` for this record, as of `now`.
     pub fn to_shape(&self, now: SystemTime) -> ConnectPeer {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `ConnectPeer` for this record in `state`: what a DELETE reports for the
+    /// record it has just removed, which is no longer stored and so has no state the clock
+    /// could compute. The same shape every other read of a peer answers, so a delete
+    /// reports the configuration the peer was stored with rather than an empty shell.
+    pub fn to_shape_with_state(&self, state: &str) -> ConnectPeer {
         ConnectPeer {
             core_network_id: Some(self.core_network_id.clone()),
             connect_attachment_id: Some(self.connect_attachment_id.clone()),
             connect_peer_id: Some(self.id.clone()),
             edge_location: Some(self.edge_location.clone()),
-            state: Some(self.state_at(now).to_string()),
+            state: Some(state.to_string()),
             created_at: Some(epoch_seconds(self.created_at)),
             configuration: Some(self.configuration()),
             tags: Some(self.tags.clone()),

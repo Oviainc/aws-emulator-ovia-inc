@@ -21,6 +21,8 @@ mod data_sources;
 mod environment_variables;
 #[path = "all/error_contract.rs"]
 mod error_contract;
+#[path = "all/event_api.rs"]
+mod event_api;
 #[path = "all/graphql_api_create_rules.rs"]
 mod graphql_api_create_rules;
 #[path = "all/graphql_api_lifecycle.rs"]

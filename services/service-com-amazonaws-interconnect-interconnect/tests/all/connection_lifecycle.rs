@@ -1231,18 +1231,29 @@ async fn update_connection_changes_only_the_members_it_is_given() {
             }
 
             // The clock settles the transient state back, without anybody polling
-            // in between. Checked once \u2014 the span is the same for every row.
+            // in between. Checked once — the span is the same for every row. The
+            // connection was created in `requested`, which the clock also carries
+            // along the provisioning progression (`requested` -> `pending` ->
+            // `available`), so what the settle must show is that `updating` is over
+            // and the connection is somewhere on that progression — never behind
+            // where it was.
             if changed_bandwidth && !settle_checked {
                 settle_checked = true;
                 tokio::time::sleep(SETTLE_WAIT).await;
                 let settled = emulator
                     .ok("GetConnection", json!({ "identifier": id }))
                     .await;
-                assert_eq!(
-                    text(&settled["connection"], "state"),
-                    text(&before, "state"),
-                    "case {label:?}: expected the connection to settle back into its prior state, got {:?}",
-                    settled["connection"]["state"]
+                let state = text(&settled["connection"], "state");
+                let progression = ["requested", "pending", "available"];
+                let was = progression
+                    .iter()
+                    .position(|known| *known == text(&before, "state"))
+                    .expect("a created connection is on the provisioning progression");
+                let reached = progression.iter().position(|known| *known == state);
+                assert!(
+                    reached.is_some_and(|reached| reached >= was),
+                    "case {label:?}: expected the connection to settle out of 'updating' onto {progression:?} at or past {:?}, got {state:?}",
+                    before["state"]
                 );
                 assert_eq!(
                     text(&settled["connection"], "bandwidth"),
