@@ -729,11 +729,14 @@ async fn a_put_appends_once_per_request_and_is_guarded_by_its_version_check() {
         "a reused token must read as a conflict, got {conflict}"
     );
 
-    // `LatestVersionId` names the version the caller believes is newest: a stale one is
-    // refused and appends nothing, the current one is accepted.
+    // `LatestVersionId` is the request's own guard on the version the history ends at: a
+    // value that is not the stored latest fails it, appends nothing and is refused as a
+    // failure of that input member; the stored latest is accepted. The whole class of
+    // failing values is tabled in
+    // `a_put_guard_refuses_every_version_id_that_is_not_the_stored_latest`.
     for (case, named, expected_status) in [
-        ("stale version", 1, 409),
-        ("a version that was never minted", 42, 409),
+        ("stale version", 1, 400),
+        ("a version that was never minted", 42, 400),
         ("the current latest version", 2, 200),
     ] {
         let (status, body) = put_policy(
@@ -749,11 +752,11 @@ async fn a_put_appends_once_per_request_and_is_guarded_by_its_version_check() {
             status, expected_status,
             "case {case:?}: expected {expected_status}, got {status} with {body}"
         );
-        if expected_status == 409 {
+        if expected_status == 400 {
             assert_eq!(
                 error_code(&body),
-                "ConflictException",
-                "case {case:?}: expected a conflict, got {body}"
+                "ValidationException",
+                "case {case:?}: expected a validation failure, got {body}"
             );
         } else {
             assert_eq!(
@@ -935,5 +938,204 @@ async fn the_policy_version_history_is_capped_and_a_delete_frees_room_but_never_
         policy(&accepted)["PolicyVersionId"],
         json!(MAX_POLICY_VERSIONS + 1),
         "the freed version id must not be reused, got {accepted}"
+    );
+}
+
+/// The input member a put's version guard is carried in, as the refusal names it.
+const GUARD_MEMBER: &str = "latestVersionId";
+
+/// Assert that `body` is the refusal a failed version guard answers: HTTP 400 with
+/// `ValidationException`, a field-level `Reason` and one `Fields` entry naming
+/// [`GUARD_MEMBER`].
+fn assert_guard_refusal(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: a failed version guard must answer 400, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "ValidationException",
+        "case {case:?}: a failed version guard must read as a validation failure, got {body}"
+    );
+    assert_eq!(
+        body["Reason"],
+        json!("FieldValidationFailed"),
+        "case {case:?}: the refusal must blame the input member, got {body}"
+    );
+    assert_eq!(
+        body["Fields"][0]["Name"],
+        json!(GUARD_MEMBER),
+        "case {case:?}: the refusal must name the member at fault, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_put_guard_refuses_every_version_id_that_is_not_the_stored_latest() {
+    let emulator = Emulator::new();
+    let live_document = policy_document(&["live"], &["us-west-2"]);
+    let core_network_id = core_network_with_policy(&emulator, "guard", &live_document).await;
+    // A history of three versions: version 1 from the create, two appended, so the stored
+    // latest is 3 and a guard value may sit below it, on it, or above it.
+    let minted = append_versions(&emulator, "guard", &core_network_id, 2).await;
+    assert_eq!(
+        minted,
+        vec![2, 3],
+        "the history must end at version 3, got {minted:?}"
+    );
+
+    // Every value that is not the stored latest fails the guard the same way, whatever
+    // side of it it sits on and whether the history ever held it: the rows differ in that,
+    // and in magnitude down to the modelled `Integer`'s own bounds.
+    for (case, named) in [
+        ("the oldest version held", 1),
+        ("the version one behind the latest", 2),
+        ("the next version id, not minted yet", 4),
+        ("a version far past the latest", 42),
+        ("zero", 0),
+        ("a negative version id", -7),
+        ("the largest integer", i32::MAX),
+        ("the smallest integer", i32::MIN),
+    ] {
+        let (status, body) = put_policy(
+            &emulator,
+            &core_network_id,
+            json!({
+                "PolicyDocument": document_of_version(4),
+                "LatestVersionId": named,
+            }),
+        )
+        .await;
+        assert_guard_refusal(case, status, &body);
+        // A refused put appends nothing, so the history still ends where it did.
+        let (status, latest) = get_policy(&emulator, &core_network_id, "?alias=LATEST").await;
+        assert_eq!(
+            (status, &policy(&latest)["PolicyVersionId"]),
+            (200, &json!(3)),
+            "case {case:?}: a refused put must append nothing, got {status} with {latest}"
+        );
+    }
+
+    // The stored latest passes the guard, and the version it appended becomes the value the
+    // guard now demands: the same number that was accepted a moment ago is refused next.
+    let (status, accepted) = put_policy(
+        &emulator,
+        &core_network_id,
+        json!({ "PolicyDocument": document_of_version(4), "LatestVersionId": 3 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: the stored latest must pass the guard, got {status} with {accepted}",
+        "the stored latest"
+    );
+    assert_eq!(
+        policy(&accepted)["PolicyVersionId"],
+        json!(4),
+        "case {:?}: the accepted put must append the next version, got {accepted}",
+        "the stored latest"
+    );
+    let (status, superseded) = put_policy(
+        &emulator,
+        &core_network_id,
+        json!({ "PolicyDocument": document_of_version(5), "LatestVersionId": 3 }),
+    )
+    .await;
+    assert_guard_refusal("a guard the preceding put superseded", status, &superseded);
+
+    // The guard is an equality against the version the history ENDS at, not against the
+    // highest id ever minted: deleting the newest version moves it back, so the id that
+    // just passed now fails and the one below it passes.
+    let (status, deleted) = delete_version(&emulator, &core_network_id, 4).await;
+    assert_eq!(
+        status, 200,
+        "deleting the newest version expected 200, got {status} with {deleted}"
+    );
+    let (status, stale) = put_policy(
+        &emulator,
+        &core_network_id,
+        json!({ "PolicyDocument": document_of_version(5), "LatestVersionId": 4 }),
+    )
+    .await;
+    assert_guard_refusal("the deleted newest version", status, &stale);
+    let (status, after_delete) = put_policy(
+        &emulator,
+        &core_network_id,
+        json!({ "PolicyDocument": document_of_version(5), "LatestVersionId": 3 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: the version the history ends at must pass the guard, got {status} with {after_delete}",
+        "the latest after a delete"
+    );
+    assert_eq!(
+        policy(&after_delete)["PolicyVersionId"],
+        json!(5),
+        "case {:?}: the accepted put must append the next version, got {after_delete}",
+        "the latest after a delete"
+    );
+    // Round-tripped through the reader: the accepted put stored the document it carried.
+    let (status, read_back) = get_policy(&emulator, &core_network_id, "?policyVersionId=5").await;
+    assert_eq!(
+        (status, &policy(&read_back)["PolicyDocument"]),
+        (200, &json!(document_of_version(5))),
+        "the accepted put must be readable back as the version it minted, got {status} with {read_back}"
+    );
+
+    // A core network that holds no policy version at all has nothing a guard can match, so
+    // every value fails it — including the id the first put would mint — while a put
+    // carrying no guard appends unconditionally.
+    let bare_global_network = emulator.create_global_network("guard, no policy").await;
+    let (status, created) = emulator
+        .post(
+            "/core-networks",
+            json!({ "GlobalNetworkId": bare_global_network }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateCoreNetwork without a policy expected 200, got {status} with {created}"
+    );
+    let bare_id = created["CoreNetwork"]["CoreNetworkId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no CoreNetworkId in {created}"))
+        .to_string();
+    for (case, named) in [
+        ("the id the first put would mint, on an empty history", 1),
+        ("zero, on an empty history", 0),
+        ("a version far past an empty history", 99),
+    ] {
+        let (status, body) = put_policy(
+            &emulator,
+            &bare_id,
+            json!({
+                "PolicyDocument": document_of_version(1),
+                "LatestVersionId": named,
+            }),
+        )
+        .await;
+        assert_guard_refusal(case, status, &body);
+        let (status, nothing) = get_policy(&emulator, &bare_id, "?alias=LATEST").await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused put must leave the history empty, got {status} with {nothing}"
+        );
+    }
+    let (status, first) = put_policy(
+        &emulator,
+        &bare_id,
+        json!({ "PolicyDocument": document_of_version(1) }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: a put carrying no guard must append, got {status} with {first}",
+        "no guard on an empty history"
+    );
+    assert_eq!(
+        policy(&first)["PolicyVersionId"],
+        json!(1),
+        "case {:?}: the first put must mint version 1, got {first}",
+        "no guard on an empty history"
     );
 }
