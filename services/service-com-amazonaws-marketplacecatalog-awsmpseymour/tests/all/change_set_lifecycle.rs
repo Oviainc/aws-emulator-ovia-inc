@@ -959,8 +959,8 @@ async fn an_entity_reports_the_visibility_its_details_named() {
     );
 }
 
-/// `EntitySummary` carries the per-type summary of the type the entity is, and none for a
-/// type whose summary this slice does not fill.
+/// `EntitySummary` carries the per-type summary of the type the entity is, and none
+/// belonging to another type.
 #[tokio::test]
 async fn an_entity_summary_carries_its_own_types_summary() {
     // The member each product type's summary lands in, as `EntitySummary` names them.
@@ -1010,9 +1010,14 @@ async fn an_entity_summary_carries_its_own_types_summary() {
         }
     }
 
-    // A type outside that set reports its common members and no per-type summary.
+    // A type outside that set reports its common members and the per-type summary its own
+    // type names — `OfferSummary` for an `Offer`, whose members the entity's details carry.
     let router = emulator();
-    let entity_id = created_entity(&router, create_change("Offer", json!({"Name": "an offer"}))).await;
+    let entity_id = created_entity(
+        &router,
+        create_change("Offer", json!({"Name": "an offer", "State": "Released"})),
+    )
+    .await;
     let listed = list_entities(&router, json!({"Catalog": CATALOG, "EntityType": "Offer"})).await;
     let summary = listed.list("/EntitySummaryList")[0].clone();
     assert_eq!(
@@ -1024,9 +1029,19 @@ async fn an_entity_summary_carries_its_own_types_summary() {
         "an Offer's Name comes from its details' Name member, got {summary:?}"
     );
     assert_eq!(
-        summary.get("OfferSummary"), None,
-        "no per-type summary is reported for a type this slice does not fill, got {summary:?}"
+        summary["OfferSummary"]["Name"], json!("an offer"),
+        "OfferSummary must carry the offer's name, got {summary:?}"
     );
+    assert_eq!(
+        summary["OfferSummary"]["State"], json!("Released"),
+        "OfferSummary must carry the state the details named, got {summary:?}"
+    );
+    for (_, other) in &members {
+        assert_eq!(
+            summary.get(*other), None,
+            "{other} belongs to another type, got {summary:?}"
+        );
+    }
 }
 
 /// Both lists page: each page holds at most `MaxResults` items, the token resumes exactly
@@ -1544,8 +1559,8 @@ async fn filters_select_from_state() {
             refused.body
         );
     }
-    // The type-specific filter and sort select on members this slice does not store, so
-    // each is refused naming the member that was actually supplied.
+    // The type-specific filter and sort surfaces select and order the same entities the
+    // generic ones do, so each is served rather than refused.
     let type_specific: Vec<(&str, Value)> = vec![
         (
             "EntityTypeFilters",
@@ -1559,22 +1574,20 @@ async fn filters_select_from_state() {
     for (member, value) in type_specific {
         let mut request = json!({"Catalog": CATALOG, "EntityType": "AmiProduct"});
         request[member] = value;
-        let refused = list_entities(&router, request).await;
+        let served = list_entities(&router, request).await;
         assert_eq!(
-            refused.status, 422,
-            "case {member:?}: must be refused rather than silently ignored, got {} with {:?}",
-            refused.status, refused.body
+            served.status, 200,
+            "case {member:?}: the per-type surface must be served, got {} with {:?}",
+            served.status, served.body
         );
-        assert_eq!(
-            refused.error_code(),
-            "ValidationException",
-            "case {member:?}: must answer ValidationException, got {:?}",
-            refused.body
-        );
+        let ids: Vec<Value> = served
+            .list("/EntitySummaryList")
+            .iter()
+            .map(|item| item["EntityId"].clone())
+            .collect();
         assert!(
-            refused.text("/Message").contains(member),
-            "case {member:?}: the refusal must name the member supplied, got {:?}",
-            refused.body
+            ids.contains(&json!(first_entity)),
+            "case {member:?}: the AmiProduct entity must be listed, got {ids:?}"
         );
     }
 

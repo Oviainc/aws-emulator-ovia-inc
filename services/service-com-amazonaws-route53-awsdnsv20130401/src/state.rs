@@ -717,6 +717,86 @@ pub fn health_check_config_with_defaults(config: &HealthCheckConfig) -> HealthCh
     filled
 }
 
+/// Whether a string member of a `HealthCheckConfig` carries a value at all.
+///
+/// Every one of those members is modelled with a minimum length of 0, so an
+/// empty (or whitespace-only) value reaches a handler; it names no endpoint, no
+/// path and no string to search for, so it counts as absent wherever a rule asks
+/// whether the member was given. The ONE predicate every health-check rule asks
+/// that question through, so the create that persists a configuration and the
+/// update that changes one cannot disagree about what "given" means.
+pub fn health_check_member_given(member: Option<&str>) -> bool {
+    member.map(str::trim).is_some_and(|value| !value.is_empty())
+}
+
+/// Why `config` could not be used, or `None` when it holds together.
+///
+/// `HealthCheckConfig`'s members are conditional on its `Type`: the model
+/// constrains each member on its own, so the rules that relate them — an
+/// endpoint type needs an endpoint to check, a string-match type needs the
+/// string to search for, an alarm-backed type needs the alarm, a
+/// routing-control type needs the routing control, and the two types that check
+/// no endpoint take no port — are the service's to enforce, under the
+/// `InvalidInput` its model declares.
+///
+/// Shared by every operation that persists a configuration, so a configuration
+/// an update leaves behind holds together exactly as one a create persisted
+/// does.
+pub fn health_check_config_problem(config: &HealthCheckConfig) -> Option<String> {
+    let given = |member: &Option<String>| health_check_member_given(member.as_deref());
+    let kind = config.r#type.as_str();
+    if ENDPOINT_HEALTH_CHECK_TYPES.contains(&kind) {
+        // `IPAddress`: "If you don't specify a value for IPAddress, Route 53
+        // sends a DNS request to resolve the domain name that you specify in
+        // FullyQualifiedDomainName" — so one of the two has to be there for
+        // there to be an endpoint at all.
+        if !given(&config.ip_address) && !given(&config.fully_qualified_domain_name) {
+            return Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.IPAddress or \
+                 HealthCheckConfig.FullyQualifiedDomainName"
+            ));
+        }
+        // `SearchString`: "If the value of Type is HTTP_STR_MATCH or
+        // HTTPS_STR_MATCH, the string that you want Amazon Route 53 to search
+        // for in the response body".
+        if STRING_MATCH_HEALTH_CHECK_TYPES.contains(&kind) && !given(&config.search_string) {
+            return Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.SearchString"
+            ));
+        }
+        return None;
+    }
+    // "Don't specify a value for Port when you specify a value for Type of
+    // CLOUDWATCH_METRIC or CALCULATED."
+    if matches!(
+        kind,
+        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC | HEALTH_CHECK_TYPE_CALCULATED
+    ) && config.port.is_some()
+    {
+        return Some(format!(
+            "HealthCheckConfig.Port cannot be specified for a {kind} health check"
+        ));
+    }
+    match kind {
+        // `AlarmIdentifier` "identifies the CloudWatch alarm that you want
+        // Amazon Route 53 health checkers to use to determine whether the
+        // specified health check is healthy", which is the whole of a
+        // CLOUDWATCH_METRIC check's input.
+        HEALTH_CHECK_TYPE_CLOUDWATCH_METRIC if config.alarm_identifier.is_none() => Some(format!(
+            "a {kind} health check must specify HealthCheckConfig.AlarmIdentifier"
+        )),
+        // "The Amazon Resource Name (ARN) for the Route 53 Application Recovery
+        // Controller routing control", which is what a RECOVERY_CONTROL check
+        // follows.
+        HEALTH_CHECK_TYPE_RECOVERY_CONTROL if !given(&config.routing_control_arn) => {
+            Some(format!(
+                "a {kind} health check must specify HealthCheckConfig.RoutingControlArn"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// One version of a traffic policy: the document that version holds, and the
 /// values read off it.
 ///
@@ -857,6 +937,26 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 return id;
             }
         }
+    }
+
+    /// The first `ChildHealthChecks` entry of `config` that names no health
+    /// check in this store, or `None` when every entry names one.
+    ///
+    /// A CALCULATED health check is "healthy" as a function of its children
+    /// (`HealthCheckConfig$ChildHealthChecks`), so a child it names has to be a
+    /// health check the account holds — the same rule on the create that
+    /// persists the list and on the update that replaces it. A configuration of
+    /// any other type names no children, so there is nothing to resolve.
+    pub fn missing_child_health_check(&self, config: &HealthCheckConfig) -> Option<String> {
+        if config.r#type != HEALTH_CHECK_TYPE_CALCULATED {
+            return None;
+        }
+        config
+            .child_health_checks
+            .iter()
+            .flatten()
+            .find(|child| !self.health_checks.contains_key(child.as_str()))
+            .cloned()
     }
 
     /// The traffic policy carrying `name`, if the account holds one.

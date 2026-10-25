@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalFailureException(
                 InternalFailureException {
@@ -174,8 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
+        // The Region this request is served in: with the emulator's partition and
+        // account, what the ARN's own qualifiers have to name for it to name a resource
+        // this call may write to.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
-        let Some(tags) = store.tags_mut(&resource) else {
+        let Some(tags) = store.tags_mut(&resource, &region) else {
             return Err(not_found(&resource));
         };
 
@@ -223,12 +227,15 @@ fn bad_request(message: &str) -> TagResourceError {
     .into()
 }
 
-/// This service's refusal for an ARN that names no resource this account holds.
+/// This service's refusal for an ARN that names no resource this account holds in the
+/// Region the request is served in.
 ///
 /// `BadRequestException`, not the modelled `NotFoundException`: that is the shape
 /// this service's recorded not-found responses carry, and the shape whose own
 /// documentation covers an entity that "doesn't exist". The message names the KIND of
-/// resource the ARN's type segment denotes.
+/// resource the ARN's type segment denotes, and says no more for an ARN qualified for
+/// another partition, Region or account than for one naming nothing: what another
+/// account holds is not this caller's to learn.
 fn not_found(resource: &crate::state::ResourceRef) -> TagResourceError {
     bad_request(&crate::state::not_found_message(
         crate::state::resource_kind(&resource.resource_type),

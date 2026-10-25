@@ -315,8 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            duplicate_tag_key, packed_policy_size, parse_role_arn, policy_document_error, sts_arn,
-            Identity, NewSession, SessionKind, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+            caller_may_call, duplicate_tag_key, inherited_transitive_tags, long_term_identity,
+            not_authorized_message, packed_policy_size, parse_role_arn, policy_document_error,
+            resolve_request_caller, sts_arn, Identity, NewSession, SessionKind,
+            ASSUME_ROLE_ACTION, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+            MAX_MANAGED_SESSION_POLICIES, MAX_SESSION_TAGS, ROLE_CHAINING_MAX_DURATION_SECONDS,
+            SET_SOURCE_IDENTITY_ACTION, TAG_SESSION_ACTION,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -331,13 +335,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The role ARN decides the account the session belongs to and the role name
         // the assumed-role ARN carries. Its length and character set are modeled, but
         // being an IAM role ARN of an account is not, so it is refused here.
-        let Some(role) = parse_role_arn(&input.role_arn) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+        if parse_role_arn(&input.role_arn).is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "RoleArn '{}' is not an IAM role ARN of the form \
                  arn:<partition>:iam::<account>:role/<name>",
                 input.role_arn
             )));
-        };
+        }
 
         // A trusted context assertion is "signed and encrypted by Amazon Web Services
         // STS" (ProvidedContexts, this service's model). This emulator issues none, so
@@ -365,9 +369,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(duplicate) = duplicate_tag_key(input.tags.as_deref()) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Tags carries the session tag key '{duplicate}' more than once"
+        if duplicate_tag_key(input.tags.as_deref()).is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                "Duplicate tag keys found. Please note that Tag keys are case insensitive.",
+            ));
+        }
+
+        // The model's own constraints on a session tag's key and value, which sit on
+        // members nested inside `tagListType` and so are checked here; see
+        // `invalid_session_tag`.
+        if let Some(violated) = crate::state::invalid_session_tag(input.tags.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(violated));
+        }
+
+        // The managed session policies a mint may name are capped by the operation's
+        // documentation, not by the model's list shape.
+        let named_policy_arns = crate::state::policy_arns(input.policy_arns.as_deref());
+        if named_policy_arns.len() > MAX_MANAGED_SESSION_POLICIES {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "1 validation error detected: Value '[{}]' at 'policyArns' failed to satisfy \
+                 constraint: Member must have length less than or equal to \
+                 {MAX_MANAGED_SESSION_POLICIES}",
+                named_policy_arns.join(", ")
             )));
         }
 
@@ -375,7 +398,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the budget AWS reports; over 100 percent the request does not fit.
         let packed_policy = packed_policy_size(
             input.policy.as_deref(),
-            &crate::state::policy_arns(input.policy_arns.as_deref()),
+            &named_policy_arns,
             input.tags.as_deref().unwrap_or(&[]),
         );
         if let Some(percent) = packed_policy.filter(|percent| *percent > 100) {
@@ -391,31 +414,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        // The IAM store is read FIRST, and only the two facts this decision needs are
+        // copied out, so this handler never holds the IAM lock and the session lock at
+        // once. A router without IAM mounted holds no role at all, which is the same
+        // answer as a role the account does not hold.
+        let iam = crate::state::iam_state(&*self.engine);
+        let (long_term, role) = match iam.as_ref() {
+            Some(iam) => {
+                let iam = iam.lock();
+                (
+                    long_term_identity(Some(&iam), &access_key_id),
+                    crate::state::resolve_role(&iam, &input.role_arn),
+                )
+            }
+            None => (long_term_identity(None, &access_key_id), None),
+        };
+
         let mut registry = state.lock();
         // A caller presenting an expired session credential is refused, never served
         // as another identity.
-        if let Err(expired) = crate::state::resolve_caller(&mut registry, &access_key_id, now, store)
-        {
-            return Err(AssumeRoleErrorModeled::ExpiredTokenException(
-                ExpiredTokenException {
-                    message: Some(expired.message()),
-                },
-            )
-            .into());
+        let caller = match resolve_request_caller(
+            &mut registry,
+            &access_key_id,
+            now,
+            store,
+            long_term,
+        ) {
+            Ok(caller) => caller,
+            Err(expired) => {
+                return Err(AssumeRoleErrorModeled::ExpiredTokenException(
+                    ExpiredTokenException {
+                        message: Some(expired.message()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Which STS operations a temporary credential may call is documented per kind;
+        // see `caller_may_call`.
+        if !caller_may_call(caller.kind, Self::NAME) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::session_credentials_message(Self::NAME),
+            ));
         }
 
-        // SerialNumber and TokenCode name the caller's MFA device. They gate the call
-        // only through an MFA condition in the role's trust policy, which this
-        // emulator holds no roles and so no trust policies for; they are recorded
-        // nowhere and change nothing about the session.
+        // What this mint WOULD set on the new session, which is what the trust-policy
+        // decision is made about: the tags the request names plus the transitive tags the
+        // calling session carries forward, and the source identity the request names or
+        // — "the source identity value persists across chained role sessions"
+        // (`AssumeRoleRequest$SourceIdentity`) — the one the calling session carries.
+        let requested_tags = crate::state::tag_pairs(input.tags.as_deref());
+
+        // A tag the calling session carries forward is already set on the session this
+        // mint continues, so the request cannot set it again: "if you used temporary
+        // credentials to perform this operation, the new session inherits any transitive
+        // session tags from the calling session. If you pass a session tag with the same
+        // key as an inherited tag, the operation fails" (`AssumeRoleRequest$Tags`). Tag
+        // keys "are not case sensitive, but case is preserved" (same member), so the
+        // collision is found without case, exactly as a repeat WITHIN the request is.
+        if let Some(inherited) = crate::state::inherited_tag_key_collision(&caller, &requested_tags)
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                "Tag key '{inherited}' is an inherited transitive session tag of the calling \
+                 session and cannot be passed again."
+            )));
+        }
+
+        let inherited_tags = inherited_transitive_tags(&caller, &requested_tags);
+        let mut tags = requested_tags.clone();
+        let inherited_keys: Vec<String> =
+            inherited_tags.iter().map(|(key, _)| key.clone()).collect();
+        tags.extend(inherited_tags);
+        let mut transitive_tag_keys = input.transitive_tag_keys.clone().unwrap_or_default();
+        for key in inherited_keys {
+            if !transitive_tag_keys
+                .iter()
+                .any(|named| named.eq_ignore_ascii_case(&key))
+            {
+                transitive_tag_keys.push(key);
+            }
+        }
+        let source_identity = input
+            .source_identity
+            .clone()
+            .or_else(|| caller.source_identity.clone());
+
+        // The session a chain carries tags INTO holds at most what one session may hold:
+        // "You can pass up to 50 session tags" (`AssumeRoleRequest$Tags`, and the model's
+        // own `tagListType` / `tagKeyListType` length 0..50). The boundary walk bounds
+        // only the list the REQUEST carries, so the bound is restated here over the
+        // EFFECTIVE set — request tags plus the tags the calling session carries forward
+        // — and refused BEFORE anything is minted. Without it each step of a role chain
+        // would store its predecessor's accumulated set plus its own, so one stored
+        // session record would grow without limit as the chain is extended.
+        for (member, held) in [
+            ("tags", tags.len()),
+            ("transitiveTagKeys", transitive_tag_keys.len()),
+        ] {
+            if held > MAX_SESSION_TAGS {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "1 validation error detected: Value at '{member}' failed to satisfy \
+                     constraint: Member must have length less than or equal to \
+                     {MAX_SESSION_TAGS}"
+                )));
+            }
+        }
+
+        // Nothing is assumed that the account does not hold and no trust policy admits.
+        // STS does not disclose non-existence, so a role this account holds no record of
+        // — including every role of ANOTHER account — is refused exactly as one whose
+        // trust policy withholds the grant.
+        let principals = caller.trust_policy_principals();
+        let condition_context = crate::state::assume_role_condition_context(
+            &caller,
+            &input.role_session_name,
+            input.external_id.as_deref(),
+            source_identity.as_deref(),
+            &tags,
+            &transitive_tag_keys,
+        );
+        let refused = |action: &str| -> Self::Error {
+            crate::scaffolded::Scaffolded::access_denied(not_authorized_message(
+                &caller.identity.arn,
+                action,
+                &input.role_arn,
+            ))
+        };
+        let Some(role) = role else {
+            return Err(refused(ASSUME_ROLE_ACTION));
+        };
+        if !role.trust_policy_allows(ASSUME_ROLE_ACTION, &principals, &condition_context) {
+            return Err(refused(ASSUME_ROLE_ACTION));
+        }
+
+        // Carrying session tags is a SEPARATE grant: "an administrator must grant you the
+        // permissions necessary to pass session tags" (`AssumeRole`), and the mint that
+        // SETS tags on the new session is what needs it — so a tag carried FORWARD by role
+        // chaining needs the grant on the TARGET role just as a request-supplied one does.
+        // The recorded behaviour is explicit about that leg: a chained assume carrying
+        // transitive tags forward against a role that trusts only `sts:AssumeRole` is
+        // refused. Naming a transitive tag KEY is part of the same act, so it needs the
+        // grant too even when the request names no tag of its own.
+        if (!tags.is_empty() || !transitive_tag_keys.is_empty())
+            && !role.trust_policy_allows(TAG_SESSION_ACTION, &principals, &condition_context)
+        {
+            return Err(refused(TAG_SESSION_ACTION));
+        }
+
+        // SETTING a source identity on the new session is what its own grant is about, and
+        // a chained mint sets the value the calling session carries just as a request that
+        // names one does: "the source identity value persists across chained role sessions"
+        // (`AssumeRoleRequest$SourceIdentity`) is a value THIS mint writes onto the session
+        // it creates. The recorded behaviour of that leg is explicit — an assume made from
+        // a session that already carries a source identity, against a role whose trust
+        // policy does not allow `sts:SetSourceIdentity`, is refused.
+        if source_identity.is_some()
+            && !role.trust_policy_allows(
+                SET_SOURCE_IDENTITY_ACTION,
+                &principals,
+                &condition_context,
+            )
+        {
+            return Err(refused(SET_SOURCE_IDENTITY_ACTION));
+        }
+
+        // SerialNumber and TokenCode name the caller's MFA device. A trust policy's MFA
+        // condition is not a string condition, so the shared evaluator leaves such a
+        // statement undecided and withholds the grant; nothing here reads the two
+        // members as evidence of an MFA-authenticated session.
+        //
+        // The duration ceiling is the lower of the role's own maximum and — when this
+        // assume is itself made from a role session, which is role chaining — one hour.
         let duration_seconds = input
             .duration_seconds
             .unwrap_or(ASSUME_ROLE_DEFAULT_DURATION_SECONDS);
-        let role_id = crate::state::role_id(&input.role_arn);
-        let assumed_role_id = format!("{role_id}:{}", input.role_session_name);
+        if duration_seconds > role.max_session_duration {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The requested DurationSeconds exceeds the MaxSessionDuration set for this role.",
+            ));
+        }
+        let chaining = caller.kind == Some(SessionKind::AssumedRole);
+        if chaining && duration_seconds > ROLE_CHAINING_MAX_DURATION_SECONDS {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The requested DurationSeconds exceeds the 1 hour session limit for roles \
+                 assumed by role chaining.",
+            ));
+        }
+
+        // `AssumedRoleId` is "<RoleId>:<RoleSessionName>", built from the role id IAM
+        // issued for this role, so `GetCallerIdentity` under the session reports the same
+        // UserId and anything correlating a session back to its role matches.
+        let assumed_role_id = format!("{}:{}", role.role_id, input.role_session_name);
         let assumed_role_arn = sts_arn(
             &role.account,
-            &format!("assumed-role/{}/{}", role.name, input.role_session_name),
+            &format!("assumed-role/{}/{}", role.role_name, input.role_session_name),
         );
         let identity = Identity {
             user_id: assumed_role_id.clone(),
@@ -428,11 +621,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut registry,
             now,
             NewSession {
-                source_identity: input.source_identity.clone(),
-                tags: crate::state::tag_pairs(input.tags.as_deref()),
-                transitive_tag_keys: input.transitive_tag_keys.clone().unwrap_or_default(),
+                source_identity: source_identity.clone(),
+                tags,
+                transitive_tag_keys,
                 packed_policy_size: packed_policy,
                 external_id: input.external_id.clone(),
+                role_arn: Some(role.arn.clone()),
                 ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)
             },
         );
@@ -461,7 +655,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: assumed_role_arn,
             }),
             packed_policy_size: packed_policy,
-            source_identity: input.source_identity,
+            source_identity,
             session_token_utilization: Some(session_token_utilization),
             session_token_size: Some(session_token_size),
         })

@@ -177,6 +177,81 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic refusal shape [`ServiceRefusal`] renders with.
+static SERVICE_REFUSAL_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ServiceRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic refusal shape: one `message` member, exactly the body an
+/// STS error carries.
+///
+/// In the `smithy.framework` namespace for the same reason as the two above — the shape
+/// is in no service's model, so it cannot collide with a modelled one. The wire error
+/// code does NOT come from this schema: it comes from [`OperationError::shape_name`],
+/// which reports the code the refusal itself carries, so ONE schema serves every code.
+pub static SERVICE_REFUSAL_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ServiceRefusal",
+        "smithy.framework",
+        "ServiceRefusal",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_REFUSAL_MESSAGE],
+);
+
+/// A refusal the real service answers with an error code and status its MODEL does not
+/// declare.
+///
+/// STS answers several refusals through codes that appear in no operation's error list:
+/// `AccessDenied` (HTTP 403) when no trust policy authorizes the caller,
+/// `InvalidParameterValue` (HTTP 400) for a parameter value it rejects, and
+/// `ValidationError` (HTTP 400) for a value outside a bound the service enforces beyond
+/// the model's own constraints. A client branches on the CODE, so the code travels with
+/// the refusal rather than being fixed per variant.
+#[derive(Debug, Clone)]
+pub struct ServiceRefusal {
+    /// The wire error code (`<Code>` on awsQuery, `__type` on JSON/CBOR).
+    pub code: &'static str,
+    /// The HTTP status the real service answers this code with.
+    pub status: u16,
+    /// Why the request was refused, for the caller to act on.
+    pub message: String,
+}
+
+impl ServiceRefusal {
+    /// A refusal carrying `code`, `status` and `message`.
+    pub fn new(code: &'static str, status: u16, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServiceRefusal {}
+
+impl SerializableStruct for ServiceRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_REFUSAL_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -196,6 +271,10 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request was refused with an error code this service's model does not declare
+    /// (`AccessDenied`, `InvalidParameterValue`, `ValidationError`). See
+    /// [`ServiceRefusal`].
+    Refused(ServiceRefusal),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,7 +300,57 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request the way AWS STS refuses an unauthorized one: HTTP 403 with the
+    /// error code `AccessDenied`.
+    ///
+    /// Reach for this only where the SERVICE decides authorization — a role's trust
+    /// policy that does not admit the caller, or an operation a credential of the
+    /// caller's class may not call. Request AUTHENTICATION is the emulator's, never a
+    /// service's.
+    pub fn access_denied(message: impl Into<String>) -> Self {
+        Self::Refused(ServiceRefusal::new(
+            ACCESS_DENIED_CODE,
+            ACCESS_DENIED_STATUS,
+            message,
+        ))
+    }
+
+    /// Refuse a parameter value the service rejects: HTTP 400 with the error code
+    /// `InvalidParameterValue`.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::Refused(ServiceRefusal::new(
+            INVALID_PARAMETER_VALUE_CODE,
+            CLIENT_REFUSAL_STATUS,
+            message,
+        ))
+    }
+
+    /// Refuse a value outside a bound the service enforces beyond the model's own
+    /// constraints: HTTP 400 with the error code `ValidationError`.
+    pub fn validation_error(message: impl Into<String>) -> Self {
+        Self::Refused(ServiceRefusal::new(
+            VALIDATION_ERROR_CODE,
+            CLIENT_REFUSAL_STATUS,
+            message,
+        ))
+    }
 }
+
+/// The error code AWS answers an authorization refusal with, on every protocol.
+pub const ACCESS_DENIED_CODE: &str = "AccessDenied";
+
+/// The status an authorization refusal carries.
+pub const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The error code AWS answers a rejected parameter VALUE with.
+pub const INVALID_PARAMETER_VALUE_CODE: &str = "InvalidParameterValue";
+
+/// The error code AWS answers a value outside a service-enforced bound with.
+pub const VALIDATION_ERROR_CODE: &str = "ValidationError";
+
+/// The status a client-input refusal carries.
+pub const CLIENT_REFUSAL_STATUS: u16 = 400;
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,6 +358,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::Refused(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +371,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::Refused(e) => e.source(),
         }
     }
 }
@@ -255,6 +386,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::Refused(e) => e,
         }
     }
 
@@ -263,6 +395,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::Refused(_) => &SERVICE_REFUSAL_SCHEMA,
         }
     }
 
@@ -275,6 +408,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            // The code the refusal itself carries, so one variant serves every code
+            // AWS answers a service-decided refusal with.
+            Self::Refused(e) => e.code,
         }
     }
 
@@ -287,6 +423,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::Refused(e) => e.status,
         }
     }
 
@@ -299,6 +436,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // The code is already the one AWS names on every protocol, including the
+            // query ones, so there is no separate legacy code to report.
+            Self::Refused(_) => None,
         }
     }
 }

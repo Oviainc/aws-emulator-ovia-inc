@@ -177,9 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = std::time::SystemTime::now();
+        // An onboarding job belongs to the region it was started in, so the delete
+        // resolves it in the region this request was signed for and never removes
+        // another region's record.
+        let region = crate::state::request_region(ctx);
         let outcome = state
             .lock()
-            .delete_instance_onboarding(&input.connect_instance_id, now);
+            .delete_instance_onboarding(&region, &input.connect_instance_id, now);
 
         match outcome {
             crate::state::DeleteOnboardingOutcome::Deleted => {

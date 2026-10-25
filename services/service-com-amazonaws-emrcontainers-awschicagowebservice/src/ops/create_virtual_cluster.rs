@@ -260,6 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = state.mint_id();
+        // The minting counter doubles as the creation sequence, so two clusters created in
+        // the same millisecond still have a total order for `ListVirtualClusters` to page
+        // through.
+        let sequence = state.id_counter;
         let arn = crate::state::virtual_cluster_arn(&region, &id);
         // EMR on EKS creates a virtual cluster ready: it is a mapping onto an existing
         // Kubernetes namespace and consumes no resource of its own, so it is RUNNING at
@@ -288,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             client_token: input.client_token.clone(),
             update_client_tokens: Vec::new(),
+            sequence,
             pending: None,
         };
         state.insert_virtual_cluster(record);

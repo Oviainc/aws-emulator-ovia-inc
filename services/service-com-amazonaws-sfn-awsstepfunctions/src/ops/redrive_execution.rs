@@ -204,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Phase 1, under the lock: resolve the execution, refuse what cannot be
         // redriven, and read what the re-run needs. The lock is released before the
         // walk, so no other request waits on an interpretation.
-        let (definition, execution_input, previous_event_id, machine_arn, machine_name, context) = {
+        let (definition, execution_input, previous_event_id, machine_arn, machine_name, context, redrive_step) = {
             let mut store = state.lock();
             // Settle first: an execution whose terminal status the clock already owed
             // is terminal when this call decides whether it can be redriven.
@@ -292,6 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state_machine_arn: machine.arn.clone(),
                 state_machine_name: machine.name.clone(),
                 role_arn: machine.role_arn.clone(),
+                // This call begins the NEXT attempt, so the states it runs read the
+                // count this redrive takes the record to — the same one
+                // `DescribeExecution` projects once it is recorded below.
+                redrive_count: execution.redrive_count.saturating_add(1),
             };
             // "Redriven executions use the same state machine definition" — which for
             // an execution started through a version ARN, or through an alias that
@@ -309,27 +313,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 machine.arn.clone(),
                 machine.name.clone(),
                 context,
+                execution.redrive_step.clone(),
             )
         };
 
-        // Phase 2, OUTSIDE the lock: the re-run is INTERPRETED here, from the
-        // execution's own stored input — "when you redrive an execution, it continues
-        // the failed execution from the unsuccessful step and uses the same input".
-        // The walk has no side effects and the states this emulator executes are
-        // deterministic, so re-walking the definition reaches the same values the
-        // successful steps produced the first time and then runs on; nothing about the
-        // outcome is assumed. That outcome is owed to the clock, so the execution
-        // reports `RUNNING` until then.
+        // Phase 2, OUTSIDE the lock: the re-run is INTERPRETED here — "when you
+        // redrive an execution, it continues the failed execution from the unsuccessful
+        // step and uses the same input. Step Functions preserves the results and
+        // execution history of the successful steps, and doesn't rerun these steps" — so
+        // the walk begins at the step the last attempt stopped at, with the data that
+        // step saw, and the steps before it are not run a second time. The walk has no
+        // side effects, and its outcome is owed to the clock, so the execution reports
+        // `RUNNING` until then.
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
             tokio::task::spawn_blocking(move || {
-                crate::state::plan_run(
+                crate::state::plan_redrive(
                     &definition,
                     &execution_input,
                     now,
                     &context,
-                    crate::state::EVENT_EXECUTION_REDRIVEN,
+                    redrive_step.as_ref(),
                     previous_event_id,
                 )
             })

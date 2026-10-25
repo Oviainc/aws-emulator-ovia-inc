@@ -17,29 +17,16 @@
 //! is recorded behaviour: the corpus reports these settings ascending. The absence
 //! of `@uniqueItems` is why a member named twice stays twice.
 //!
-//! Service identifiers here are drawn from the catalog `ListServices` pages over
-//! as well as written out by hand; which of the two a value comes from makes no
-//! difference to acceptance (`visible_services_round_trip` owns that rule).
+//! Service identifiers here are drawn from the catalog `ListServices` pages over,
+//! which is what `visibleServices` admits
+//! (`visible_service_catalog_membership` owns that rule); this suite is about the
+//! ORDER a settable list is reported in.
 
 use crate::support::{members, reported};
-use crate::wire::{build_router, get_customizations, strings, update_customizations, whole_catalog};
+use crate::wire::{
+    build_router, catalog_services, get_customizations, strings, update_customizations,
+};
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
-
-/// `count` catalog service identifiers, spread across the catalog rather than
-/// taken from its head, so the rows are not all near-neighbours in its order.
-async fn catalog_services(router: &MultiServiceRouter, count: usize) -> Vec<String> {
-    let catalog = whole_catalog(router).await;
-    assert!(
-        catalog.len() >= count,
-        "the catalog must hold at least {count} entries to draw rows from, got {}",
-        catalog.len()
-    );
-    let stride = catalog.len() / count;
-    (0..count)
-        .map(|n| catalog[(n * stride).min(catalog.len() - 1)].clone())
-        .collect()
-}
 
 /// The two halves of the rule that do not depend on WHICH order is canonical: the
 /// answer holds exactly the members the request supplied (as a multiset, so a
@@ -173,7 +160,7 @@ async fn a_list_setting_reads_back_in_the_canonical_sequence() {
 #[tokio::test]
 async fn the_canonical_sequence_is_the_one_written_out_in_each_row() {
     // (member, supplied sequence, the exact answer) — the service identifiers are
-    // legal under `Service`'s pattern, the Region codes under `Region`'s.
+    // entries of the catalog, the Region codes legal under `Region`'s pattern.
     let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
         ("visibleServices", vec!["s3", "ec2"], vec!["ec2", "s3"]),
         (
@@ -187,12 +174,12 @@ async fn the_canonical_sequence_is_the_one_written_out_in_each_row() {
             vec!["account-access", "acm"],
             vec!["account-access", "acm"],
         ),
-        // A hyphen (0x2D) sorts before a letter, and a digit (0x30-0x39) between
-        // the two: `s3-outposts` < `s3control` < `s3outposts`.
+        // A hyphen (0x2D) sorts before a letter, and a digit (0x30-0x39) before
+        // both: `network-firewall` < `networkmanager`, and `s3` < `sagemaker`.
         (
             "visibleServices",
-            vec!["s3outposts", "s3control", "s3-outposts"],
-            vec!["s3-outposts", "s3control", "s3outposts"],
+            vec!["sagemaker", "networkmanager", "s3", "network-firewall"],
+            vec!["network-firewall", "networkmanager", "s3", "sagemaker"],
         ),
         (
             "visibleRegions",

@@ -1,34 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterTransitGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterTransitGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Registers one transit gateway of Amazon VPC with one global network, in the one
+//! registration map the three registration operations share
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::transit_gateway_registrations`).
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterTransitGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `RegisterTransitGateway::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! The registration is the global network / gateway PAIR
+//! (`crate::state::transit_gateway_registration_key`): it carries no id and no ARN of its
+//! own, so a repeat of the same request reports the stored registration instead of minting
+//! a second one, and "You cannot register a transit gateway in more than one global
+//! network" (`smithy_query query="doc" shape="RegisterTransitGateway"`) makes the same
+//! gateway offered to another global network the modelled conflict. The transit gateway
+//! itself belongs to Amazon VPC, of which this service holds no inventory, so what is
+//! stored is the reference the request carried, once its form is established
+//! (`crate::state::ec2_resource_region`).
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::service_state`] and read and write it through the guard
+//! it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -156,17 +148,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterTransitGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTransitGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterTransitGateway"))
+        // request metadata.
+        let _ = ctx;
+
+        // `TransitGatewayArn` carries only a length and the permissive pattern `^[\s\S]*$`
+        // (`smithy_query shape=TransitGatewayArn`), so establishing that the string names a
+        // transit gateway at all is the handler's — judged before the store is locked,
+        // since nothing stored bears on it, exactly as the other operations of this service
+        // that take a transit gateway ARN judge it.
+        if crate::state::ec2_resource_region(
+            &input.transit_gateway_arn,
+            crate::state::TRANSIT_GATEWAY_TYPE,
+        )
+        .is_none()
+        {
+            return Err(RegisterTransitGatewayErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "must name a transit gateway and the Region it is in".to_string(),
+                ),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterTransitGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The registration ties a gateway to a global network that already exists rather
+        // than minting a resource of its own, so a global network the path names and the
+        // store does not hold is the missing-resource answer.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(RegisterTransitGatewayErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+
+        // The registration's identity is the global network / gateway pair, so a repeat of
+        // the same request has nothing left to create: it reports the stored registration as
+        // of now and writes nothing, which keeps a retried call from restarting the settle
+        // span of a registration that is already AVAILABLE.
+        let key = crate::state::transit_gateway_registration_key(
+            &input.global_network_id,
+            &input.transit_gateway_arn,
+        );
+        if let Some(existing) = store.transit_gateway_registrations.get(&key) {
+            return Ok(RegisterTransitGatewayOutput {
+                transit_gateway_registration: Some(existing.to_shape(now)),
+            });
+        }
+
+        // "You cannot register a transit gateway in more than one global network"
+        // (`smithy_query query="doc" shape="RegisterTransitGateway"`), so the same gateway
+        // offered to a SECOND global network is the conflict this operation models —
+        // "Updating or deleting the resource can cause an inconsistent state" — rather than
+        // a second registration of it.
+        if let Some(existing) = store
+            .transit_gateway_registrations
+            .values()
+            .find(|registration| registration.transit_gateway_arn == input.transit_gateway_arn)
+        {
+            return Err(RegisterTransitGatewayErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "transit gateway {} is already registered with global network {}",
+                        existing.transit_gateway_arn, existing.global_network_id
+                    ),
+                    resource_id: crate::state::transit_gateway_registration_key(
+                        &existing.global_network_id,
+                        &existing.transit_gateway_arn,
+                    ),
+                    resource_type: crate::state::TRANSIT_GATEWAY_REGISTRATION_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A global network holds at most so many registrations, so a register past that
+        // bound is refused and stores nothing: this operation models no quota error, so the
+        // refusal is the `ValidationException` it does model, naming the member that asked.
+        if store.transit_gateway_registration_count_of(&input.global_network_id)
+            >= crate::state::MAX_TRANSIT_GATEWAY_REGISTRATIONS_PER_GLOBAL_NETWORK
+        {
+            return Err(RegisterTransitGatewayErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "global network {} already holds the maximum of {} transit gateway registrations",
+                        input.global_network_id,
+                        crate::state::MAX_TRANSIT_GATEWAY_REGISTRATIONS_PER_GLOBAL_NETWORK
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // Like every other record this service stores, the registration waits out the
+        // transition the clock owes: it reads `PENDING` until `available_at` falls due and
+        // `AVAILABLE` after it, with no handler sleeping for it.
+        let record = crate::state::TransitGatewayRegistrationRecord {
+            global_network_id: input.global_network_id,
+            transit_gateway_arn: input.transit_gateway_arn,
+            available_at: now + crate::state::SETTLE_DELAY,
+        };
+        let registration = record.to_shape(now);
+        store.transit_gateway_registrations.insert(key, record);
+
+        Ok(RegisterTransitGatewayOutput {
+            transit_gateway_registration: Some(registration),
+        })
     }
 }

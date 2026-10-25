@@ -2,8 +2,24 @@
 
 //! @op DeleteFunctionConcurrency
 //!
-//! Removes the reserved-concurrency setting [`crate::state`] holds for one function, so
-//! the function goes back to drawing on the account's unreserved capacity.
+//! Clears the function's reserved concurrency on the function record [`crate::state`]
+//! holds — the operation "Removes a concurrent execution limit from a function" — so the
+//! function goes back to drawing on the account's unreserved capacity and
+//! `GetFunctionConcurrency`, `GetFunction` and `GetAccountSettings` all report it as
+//! holding no reservation at all, which is the state a function nobody configured is in.
+//!
+//! The reservation is FUNCTION-LEVEL: "Concurrency settings apply to the function as a
+//! whole, including all published versions and the unpublished version", so one function
+//! holds one reservation and removing it removes the function's only one. The documented
+//! `FunctionName` forms for this operation are the name, the function ARN and the partial
+//! ARN — none of them qualified — so a name that qualifies a version or an alias names a
+//! resource this setting does not live on and is refused with the modelled 400, exactly
+//! as `PutFunctionConcurrency` and `GetFunctionConcurrency` refuse it.
+//!
+//! Removing a limit describes the state it leaves behind rather than consuming anything,
+//! so it is IDEMPOTENT: a function that reserves nothing is left reserving nothing and
+//! still answers the modelled 204. The function itself must exist, though — a name that
+//! resolves to no function is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -187,8 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The reservation belongs to the function as a whole, so a qualified name names
-        // no resource that carries one — the same refusal `GetFunctionConcurrency` and
-        // `PutFunctionConcurrency` give it.
+        // no resource whose limit can be removed — the same refusal
+        // `GetFunctionConcurrency` and `PutFunctionConcurrency` give it.
         if let Some(qualifier) = reference
             .qualifier
             .as_deref()
@@ -204,25 +220,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let (record, _version) = crate::state::resolve_function(
-            &mut store,
-            &input.function_name,
-            None,
-            &region,
-            now,
-        )
-        .map_err(|failure| match failure {
-            crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
-            crate::state::ResolveFailure::NotFound(message) => {
-                DeleteFunctionConcurrencyErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        r#type: None,
-                        message: Some(message),
-                    },
-                )
-                .into()
-            }
-        })?;
+
+        // The function has to exist before its limit can be removed, and resolution is
+        // what brings the record up to whatever the clock already made due.
+        let (record, _version) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                    crate::state::ResolveFailure::NotFound(message) => {
+                        DeleteFunctionConcurrencyErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                r#type: None,
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                })?;
 
         // "Removes a concurrent execution limit from a function": the function goes back
         // to holding none, which is the state it was created in, so every reader reports

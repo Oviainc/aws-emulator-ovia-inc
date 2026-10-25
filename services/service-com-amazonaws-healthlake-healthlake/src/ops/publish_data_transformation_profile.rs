@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishDataTransformationProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishDataTransformationProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishDataTransformationProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Snapshots one version of a data transformation profile
+//! `CreateDataTransformationProfile` persisted in [`crate::state`] into a NEW
+//! published version of that profile, and reports the version it created — so
+//! `GetDataTransformationProfile` reads that version's content back, and an omitted
+//! `ProfileVersion` resolves to it as the profile's latest published version.
+//!
+//! Which version is snapshotted is what `FromExistingVersion` chooses: omitted, the
+//! call publishes the current DRAFT (version 0); given, it republishes a version the
+//! profile already holds, which is the rollback case. Either way the new version is a
+//! COPY, so the version it was taken from is left exactly as it was — a published
+//! version is immutable, and a later `UpdateDataTransformationProfile` of the DRAFT
+//! cannot change one.
+//!
+//! The new version number is one past the profile's latest published version, so the
+//! first publish is version 1 and a profile's versions never repeat or go backwards.
+//! A profile no record holds, and a version it does not hold, are refused with
+//! `ResourceNotFoundException`; a profile that has run out of the modelled
+//! `ProfileVersion` range, or whose content would pass the bytes this emulator
+//! retains, is refused with `ServiceQuotaExceededException` BEFORE anything is
+//! written, so a refused publish leaves the profile exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +180,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishDataTransformationProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishDataTransformationProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishDataTransformationProfile"))
+        // A profile's versions are the same for every caller, so `ctx` carries nothing
+        // this write needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data transformation profile registry is unavailable",
+            ));
+        };
+
+        // `SourceFormat` is a modelled enum, so the boundary validator has already
+        // refused anything else; this re-states the rule for the reason the create
+        // re-states it, because a format this service cannot convert from must never
+        // name a version it publishes.
+        if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
+            return Err(validation(format!(
+                "SourceFormat must be one of {}, got '{}'",
+                SOURCE_FORMAT_VALUES.join(", "),
+                input.source_format
+            )));
+        }
+
+        let mut store = state.lock();
+        // What the whole store retains, read before the profile this call writes is
+        // borrowed from it, so the ceiling below is charged against every profile
+        // together and not just this one.
+        let retained_total = store.profile_retained_bytes_total();
+        let Some(profile) = store.profiles.get_mut(&input.profile_id) else {
+            return Err(not_found(crate::state::PROFILE_NOT_FOUND_MESSAGE));
+        };
+
+        // `SourceFormat` is "the source data format of the profile", so a call naming
+        // a format other than the one the stored profile converts from does not
+        // describe this profile and publishes nothing.
+        if profile.source_format != input.source_format {
+            return Err(validation(format!(
+                "SourceFormat must be the source data format of the profile, '{}'",
+                profile.source_format
+            )));
+        }
+
+        // Which version's content this call promotes: "If you omit this parameter, the
+        // service publishes the current DRAFT version", and `FromExistingVersion` names
+        // "a previously published version to republish as the new latest version" — the
+        // rollback case. The content is COPIED either way, so the version it came from
+        // is left exactly as it was.
+        let from_version = input
+            .from_existing_version
+            .unwrap_or(crate::state::DRAFT_PROFILE_VERSION);
+        let Some(source) = profile.version(from_version) else {
+            return Err(not_found(crate::state::PROFILE_VERSION_NOT_FOUND_MESSAGE));
+        };
+        let mapping = source.mapping.clone();
+
+        // "A new immutable published version": the DRAFT is version 0, so the first
+        // publish is version 1 and each one after it is one past the latest published
+        // version. The modelled `ProfileVersion` range (0..99) is what a profile runs
+        // out of, and running out is refused as the quota it is.
+        let version = profile
+            .latest_published()
+            .map_or(crate::state::DRAFT_PROFILE_VERSION, |latest| latest.version)
+            + 1;
+        if version > crate::state::MAX_PROFILE_VERSION {
+            return Err(quota_exceeded(format!(
+                "The profile already holds the maximum number of published versions ({})",
+                crate::state::MAX_PROFILE_VERSION
+            )));
+        }
+
+        // A published version is retained ALONGSIDE every other version of its
+        // profile, so the bytes it adds are charged against what this profile retains
+        // and against what the store retains, before it is written: a publish past
+        // either ceiling stores nothing.
+        let bytes = crate::state::mapping_bytes(&mapping);
+        if profile.retained_bytes().saturating_add(bytes)
+            > crate::state::MAX_PROFILE_RETAINED_BYTES
+        {
+            return Err(quota_exceeded(format!(
+                "Publishing this version would pass the {} bytes of profile content one \
+                 profile retains",
+                crate::state::MAX_PROFILE_RETAINED_BYTES
+            )));
+        }
+        if retained_total.saturating_add(bytes) > crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL {
+            return Err(quota_exceeded(format!(
+                "Publishing this version would pass the {} bytes of profile content every \
+                 profile retains together",
+                crate::state::MAX_PROFILE_RETAINED_BYTES_TOTAL
+            )));
+        }
+
+        // The snapshot exists from this instant — nothing here outlives its own call —
+        // so the profile owes the clock no transition and the new version is readable
+        // immediately.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        profile.published.insert(
+            version,
+            crate::state::ProfileVersionRecord {
+                version,
+                mapping,
+                // `ChangeDescription` describes "what changed or why this version is
+                // being published", so it belongs to the version this call created
+                // rather than to the one whose content it copied.
+                change_description: input.change_description,
+                last_updated_at: now,
+            },
+        );
+
+        Ok(PublishDataTransformationProfileOutput {
+            profile_id: profile.id.clone(),
+            version,
+            source_format: profile.source_format.clone(),
+            target_format: profile.target_format.clone(),
+            profile_name: Some(profile.name.clone()),
+            last_updated_at: now,
+        })
     }
+}
+
+/// This operation's 400 refusal, as the modelled `ValidationException` it declares.
+fn validation(message: impl Into<String>) -> PublishDataTransformationProfileError {
+    PublishDataTransformationProfileErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's 404, worded without quoting the requested identifier — the
+/// wording this service's not-found text uses.
+fn not_found(message: &str) -> PublishDataTransformationProfileError {
+    PublishDataTransformationProfileErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's quota refusal, as the modelled `ServiceQuotaExceededException` it
+/// declares — for a profile that has run out of versions or of retained bytes.
+fn quota_exceeded(message: impl Into<String>) -> PublishDataTransformationProfileError {
+    PublishDataTransformationProfileErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> PublishDataTransformationProfileError {
+    PublishDataTransformationProfileErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
