@@ -106,6 +106,9 @@ pub(crate) fn seed_image_set_with_frames(
             ImageFrame {
                 image_frame_id: frame_id.clone(),
                 transfer_syntax_uid: frame.transfer_syntax_uid.map(str::to_string),
+                // These suites are about the pixel data itself, which is reached by its
+                // image frame id alone, so no case records the instance it came from.
+                sop_instance_uid: None,
                 pixel_data: frame.pixel_data.clone(),
             },
         );
