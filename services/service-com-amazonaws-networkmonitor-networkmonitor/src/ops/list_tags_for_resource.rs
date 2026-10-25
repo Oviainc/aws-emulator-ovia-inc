@@ -160,8 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only the resources of the region this request was signed for are
         // reachable.
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A probe whose teardown has run its course is not a resource any more,
+        // so the removal the clock already made due is materialised before an
+        // ARN is resolved against the store — the write a reporting operation of
+        // this service performs for a change the clock had already made.
+        store.settle_monitors_in(&region, now);
         // An ARN that names no stored monitor and no stored probe names nothing
         // whose tags could be reported — a deleted resource, or a well-formed
         // ARN of another region, account or service.
