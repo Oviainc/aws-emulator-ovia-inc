@@ -477,15 +477,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             server_side_encryption: object.encryption.sse_algorithm.clone(),
             ssekms_key_id: object.encryption.kms_key_id.clone(),
             bucket_key_enabled: object.encryption.bucket_key_enabled,
+            // "If the object expiration is configured (see PutBucketLifecycleConfiguration
+            // ), the response includes this header" (`HeadObjectOutput$Expiration`): the
+            // bucket's lifecycle configuration applied to THIS version, matched against
+            // the tag set and size it carries right now, so a later tagging call moves the
+            // object into or out of a tag-filtered rule.
+            expiration: store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.object_expiration_header(&input.key, object)),
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
-            // (`DeleteMarker`, which a delete records none of), a lifecycle rule has it
-            // expiring (`Expiration`), it is archived (`Restore`, `ArchiveStatus`), a
-            // checksum was uploaded with it (`Checksum*`, `ChecksumType`), metadata could
-            // not be decoded (`MissingMeta`), the read was partial (`ContentRange`,
-            // `PartsCount`), a customer-provided key encrypted it (`SSECustomer*`, which
-            // `PutObject` refuses), it is replicated (`ReplicationStatus`), it is locked
-            // (`ObjectLock*`) or the bucket is Requester Pays (`RequestCharged`).
+            // (`DeleteMarker`, which a delete records none of), it is archived (`Restore`,
+            // `ArchiveStatus`), a checksum was uploaded with it (`Checksum*`,
+            // `ChecksumType`), metadata could not be decoded (`MissingMeta`), the read was
+            // partial (`ContentRange`, `PartsCount`), a customer-provided key encrypted it
+            // (`SSECustomer*`, which `PutObject` refuses), it is replicated
+            // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
+            // Requester Pays (`RequestCharged`).
             ..HeadObjectOutput::default()
         })
     }
