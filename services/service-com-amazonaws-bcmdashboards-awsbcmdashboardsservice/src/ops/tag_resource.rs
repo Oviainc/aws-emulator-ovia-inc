@@ -206,23 +206,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // Merge, keyed by tag key: a key the resource already carries is UPDATED where it
-        // already sits, so the order the tagging read reports stays stable across a
-        // re-tag, and a key it does not carry yet is APPENDED in the order the request
-        // listed it. Every key the request does not name is left alone. The entries are
-        // applied in request order, so a key the request repeats settles on its last
-        // value — the same answer as sending those entries as separate requests.
+        // Merge, keyed by tag key, through the resolution every tagging path shares
+        // ([`crate::state::merge_resource_tags`]): a key the resource already carries is
+        // UPDATED where it already sits, so the order the tagging read reports stays
+        // stable across a re-tag, a key it does not carry yet is APPENDED in the order
+        // the request listed it, every key the request does not name is left alone, and a
+        // key the request repeats settles on its last value — the same answer as sending
+        // those entries as separate requests.
         //
         // The merged list is computed beside the stored one and only then stored, so a
         // merge that would carry the resource past the bound below is refused without
         // having applied half of itself.
-        let mut merged = tags.clone();
-        for tag in input.resource_tags {
-            match merged.iter_mut().find(|stored| stored.key == tag.key) {
-                Some(stored) => stored.value = tag.value,
-                None => merged.push(tag),
-            }
-        }
+        let merged = crate::state::merge_resource_tags(tags.clone(), input.resource_tags);
 
         // The modelled `resourceTags` length (0..200) bounds ONE REQUEST, not the stored
         // list a merge grows: without this ceiling a caller could repeat `TagResource`

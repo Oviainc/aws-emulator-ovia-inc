@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStorageLensGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStorageLensGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces the document of a Storage Lens group the account the request names
+//! already owns, so every later `GetStorageLensGroup` of that name reports
+//! exactly the members the submitted document carried.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStorageLensGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The URI's `Name` and the document's `Name` both name the group, and that name
+//! is the group's identity — the key a record is held under and what its ARN is
+//! built from — so a request whose two names disagree is refused rather than
+//! renaming the group.
+//!
+//! `StorageLensGroupArn` is documented read-only, so this handler assigns it
+//! from the group's own identity ([`crate::state::storage_lens_group_arn`]),
+//! exactly as `CreateStorageLensGroup` does, rather than keeping whatever a
+//! request submitted in that member.
+//!
+//! This operation updates an EXISTING group: a name the account owns no group of
+//! is refused as a missing resource rather than created, which is
+//! `CreateStorageLensGroup`'s job. The group's Amazon Web Services resource tags
+//! are a separate resource this request carries no member for, so an update
+//! leaves them untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +168,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStorageLensGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStorageLensGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStorageLensGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let mut group = input.storage_lens_group;
+        // The URI's `Name` and the document's `Name` are both documented as the
+        // name of the Storage Lens group, which is the group's identity: a
+        // request naming two different names names no one group, and an update
+        // of an existing group is not a rename.
+        if group.name != input.name {
+            return Err(crate::state::storage_lens_group_name_mismatch(
+                &input.name,
+                &group.name,
+            ));
+        }
+
+        // `StorageLensGroupArn` is read-only: the service assigns it from the
+        // group's identity and the Region the request was signed for, so
+        // whatever the request carried in that member is replaced rather than
+        // stored — exactly as a create assigns it.
+        let region = crate::state::signing_region(ctx.parts());
+        group.storage_lens_group_arn =
+            Some(crate::state::storage_lens_group_arn(&region, &input.name));
+
+        // This operation updates an EXISTING group, so it never adds a record:
+        // a name the account owns no group of is a missing resource, and the
+        // store cannot grow past the bound `CreateStorageLensGroup` holds it to.
+        let key = (input.account_id, input.name);
+        let mut store = state.lock();
+        let Some(record) = store.storage_lens_groups.get_mut(&key) else {
+            return Err(crate::state::no_such_storage_lens_group(&key.1));
+        };
+        // The whole document is replaced. The group's resource tags are a
+        // separate resource this request carries no member for, so they are
+        // left as they are.
+        record.group = group;
+
+        Ok(UpdateStorageLensGroupOutput)
     }
 }

@@ -187,7 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let store = crate::state::store_at(&state, now);
         let stored = store
             .budgets
             .get(&(input.account_id.clone(), input.budget_name.clone()))

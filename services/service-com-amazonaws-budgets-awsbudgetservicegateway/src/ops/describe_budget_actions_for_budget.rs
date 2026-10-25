@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        let mut store = crate::state::store_at(&state, now);
         // An action is a resource OF the budget it names (`Action$BudgetName`), so a
         // budget this account does not hold holds no actions either — which is the
         // resource `NotFoundException` says cannot be located, not an empty list.

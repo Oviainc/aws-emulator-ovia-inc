@@ -27,6 +27,8 @@ mod host_reads;
 mod host_reference_resolution;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
+#[path = "all/repository_link_listing.rs"]
+mod repository_link_listing;
 #[path = "all/repository_link_reads.rs"]
 mod repository_link_reads;
 #[path = "all/sdk_target_dispatch.rs"]

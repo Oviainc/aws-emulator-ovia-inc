@@ -23,21 +23,21 @@ use super::agreement_lifecycle::{agreement_over, call, emulator, term, Answer};
 
 /// The one catalog AWS Marketplace exposes, and so the only value a `catalog`
 /// selector admits.
-const CATALOG: &str = "AWSMarketplace";
+pub(crate) const CATALOG: &str = "AWSMarketplace";
 
 /// Every `agreementType` the model documents: "The type of agreement. Values are
 /// `PurchaseAgreement` or `VendorInsightsAgreement`" (`smithy_query(query="doc",
 /// shape="DescribeAgreementOutput", member="agreementType")`). No operation of
 /// this crate mints the second one, so it is a value the member admits that
 /// selects nothing.
-const AGREEMENT_TYPES: &[&str] = &["PurchaseAgreement", "VendorInsightsAgreement"];
+pub(crate) const AGREEMENT_TYPES: &[&str] = &["PurchaseAgreement", "VendorInsightsAgreement"];
 
 /// Catalog names outside the single published one. `Catalog` is
 /// `@length(1, 64)` with `^[a-zA-Z0-9.-]+$`, so each of these reaches a handler
 /// rather than the boundary validator: a qualified name, a suffixed one, a
 /// differently cased one, a hyphenated one, one a single character long, and one
 /// with a trailing digit.
-const OTHER_CATALOGS: &[&str] = &[
+pub(crate) const OTHER_CATALOGS: &[&str] = &[
     "AWSMarketplace.Other",
     "AWSMarketplaceStaging",
     "awsmarketplace",
@@ -50,7 +50,7 @@ const OTHER_CATALOGS: &[&str] = &[
 /// `@length(1, 64)` with `^[A-Za-z]+$`, so each is a bare word the boundary
 /// validator admits: an unrelated word, the right word differently cased, a
 /// prefix of each documented value, and a pluralised one.
-const OTHER_AGREEMENT_TYPES: &[&str] = &[
+pub(crate) const OTHER_AGREEMENT_TYPES: &[&str] = &[
     "NotAType",
     "purchaseagreement",
     "Purchase",
@@ -63,7 +63,11 @@ const OTHER_AGREEMENT_TYPES: &[&str] = &[
 /// agreement REQUEST id, the known id with a character appended, and the known
 /// id with its first character dropped. `AgreementId` is `@length(1, 64)` with
 /// `^[A-Za-z0-9_/-]+$`, which every row satisfies.
-fn unknown_agreement_ids(known: &str) -> Vec<String> {
+pub(crate) fn unknown_agreement_ids(known: &str) -> Vec<String> {
+    assert!(
+        known.len() > 1,
+        "a minted agreement id is longer than one character, got {known:?}"
+    );
     vec![
         "agmt-does-not-exist".to_string(),
         "agreement/0000000000000001".to_string(),
@@ -135,7 +139,7 @@ async fn listed(router: &MultiServiceRouter, listing: &Listing, selector: &Value
 }
 
 /// Assert that `selector` is refused with `reason`, naming `member`.
-fn assert_refused(case: &str, member: &str, reason: &str, answer: &Answer) {
+pub(crate) fn assert_refused(case: &str, member: &str, reason: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
         "case {case:?}: expected 400, got {} with {:?}",

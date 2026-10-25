@@ -71,6 +71,8 @@ mod folder_listing;
 mod git_object_ids;
 #[path = "all/git_transport.rs"]
 mod git_transport;
+#[path = "all/git_transport_body_bound.rs"]
+mod git_transport_body_bound;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/merge_branches_fast_forward.rs"]
@@ -97,5 +99,7 @@ mod repository_rename;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unreferenced_merge_commits.rs"]
+mod unreferenced_merge_commits;
 #[path = "all/wire.rs"]
 mod wire;

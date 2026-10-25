@@ -575,17 +575,27 @@ async fn the_flow_is_keyed_by_the_resolved_account() {
          passcode for it"
     );
 
-    // The caller's own account, reached both ways, is ONE record: the passcode
-    // sent without an `AccountId` verifies through the explicit id.
+    // The caller's own account is reached by the standalone call: naming its own
+    // id is the authorization refusal, and the outstanding passcode is still the
+    // one the standalone call can submit.
     let sent = emulator.send_phone_number_verification(json!({})).await;
     assert_status("the caller's own account, unnamed", &sent, PENDING);
     let passcode = emulator
         .outstanding_passcode(&own)
         .expect("sending a passcode stores one");
-    let verified = emulator
-        .verify_phone_number(json!({"AccountId": own, "Otp": passcode}))
+    let refused = emulator
+        .verify_phone_number(json!({"AccountId": own, "Otp": passcode.clone()}))
         .await;
-    assert_status("the caller's own account, named explicitly", &verified, VERIFIED);
+    assert_refused(
+        "the caller's own account, named explicitly",
+        &refused,
+        403,
+        "AccessDeniedException",
+    );
+    let verified = emulator
+        .verify_phone_number(json!({"Otp": passcode}))
+        .await;
+    assert_status("the caller's own account, unnamed", &verified, VERIFIED);
     assert_reported_status(
         "the caller's own account, unnamed",
         &emulator,

@@ -427,6 +427,36 @@ pub const DELETION_PROTECTION_PARAMETER: &str = "deletion-protection";
 /// unprotected.
 pub const DELETION_PROTECTION_UNLESS_EMPTY: &str = "UNLESS_EMPTY";
 
+/// The group service-configuration types a STATIC-MEMBERSHIP operation works
+/// with.
+///
+/// `GroupResources` documents the whole list of groups it can be used with —
+/// "You can only use this operation with the following groups: … Other resource
+/// group types and resource types are not currently supported by this
+/// operation" (`smithy_query(query="doc",shape="GroupResources")`) — so a group
+/// whose stored configuration declares none of these is not one such an
+/// operation serves. Sorted, and compared exactly: the modelled
+/// `GroupConfigurationType` pattern `^AWS::[a-zA-Z0-9]+::[a-zA-Z0-9]+$` admits
+/// one spelling of each.
+pub const STATIC_MEMBERSHIP_CONFIGURATION_TYPES: &[&str] = &[
+    "AWS::EC2::CapacityReservationPool",
+    "AWS::EC2::HostManagement",
+    "AWS::ResourceGroups::ApplicationGroup",
+];
+
+/// The message a static-membership operation reports for a group whose stored
+/// configuration declares none of [`STATIC_MEMBERSHIP_CONFIGURATION_TYPES`].
+///
+/// Built from the request's own operation name and the catalog above, so the
+/// refusal says which operation was refused and which groups it serves.
+pub fn unsupported_group_message(operation: &str) -> String {
+    format!(
+        "{operation} can only be used with a group whose configuration is one of {}; \
+         other resource group types are not supported by this operation",
+        STATIC_MEMBERSHIP_CONFIGURATION_TYPES.join(", "),
+    )
+}
+
 /// One persisted resource group: its identity, its describable attributes, the
 /// query or the service configuration it was created with, its tags, and its
 /// static members.
@@ -575,6 +605,23 @@ impl GroupRecord {
                 DELETION_PROTECTION_PARAMETER,
                 DELETION_PROTECTION_UNLESS_EMPTY,
             )
+    }
+
+    /// The stored service-configuration type that makes this group one a
+    /// static-membership operation serves, or `None` when its configuration
+    /// declares none of [`STATIC_MEMBERSHIP_CONFIGURATION_TYPES`].
+    ///
+    /// Read across every configuration item the group holds, because a
+    /// configuration is one document and the supported type can be any item of
+    /// it. A group created with a resource query is populated from that query
+    /// rather than configured, and a group created with neither carries no
+    /// configuration, so both answer `None`.
+    pub fn static_membership_configuration_type(&self) -> Option<&str> {
+        self.configuration
+            .iter()
+            .flatten()
+            .map(|item| item.r#type.as_str())
+            .find(|declared| STATIC_MEMBERSHIP_CONFIGURATION_TYPES.contains(declared))
     }
 
     /// The modelled `ResourceQuery` for this record, if it was created with one.
