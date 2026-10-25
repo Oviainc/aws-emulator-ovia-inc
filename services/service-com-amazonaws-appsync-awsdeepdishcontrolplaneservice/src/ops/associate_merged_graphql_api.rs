@@ -13,6 +13,11 @@
 //! `ConcurrentModificationException` while that merge is still owed, and with
 //! `BadRequestException` once it has been performed.
 //!
+//! AppSync creates ONE link from either side, so the rule itself lives in
+//! [`crate::state::create_source_api_association`], which `AssociateSourceGraphqlApi`
+//! (the same create addressed by the Merged API) reaches with the same request; this
+//! handler only lifts its refusals into this operation's modelled errors.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,172 +178,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An identifier that is neither an API id nor an ARN names no API at all, so
-        // the request is malformed rather than pointed at a missing resource (see
-        // `crate::state::is_api_identifier`). Checked on BOTH sides, since either can
-        // carry either form.
-        for identifier in [&input.source_api_identifier, &input.merged_api_identifier] {
-            if !crate::state::is_api_identifier(identifier) {
-                return Err(AssociateMergedGraphqlApiErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(crate::state::invalid_api_id_message(identifier)),
-                        ..Default::default()
-                    },
-                )
-                .into());
-            }
-        }
-
-        let region = crate::state::request_region(ctx);
-        let now = std::time::SystemTime::now();
-        let mut guard = state.lock();
-
-        // Materialise every merge the clock already owes first, so the decision below
-        // is taken against the association state of THIS instant rather than the one
-        // the last caller left behind.
-        guard.settle_associations(now);
-
-        // Both sides are resolved from the store, in either identifier form, so the
-        // association records the APIs' own ids and ARNs rather than whatever the
-        // request happened to name them by.
-        let Some(merged) =
-            crate::state::api_by_identifier(&guard.graphql_apis, &input.merged_api_identifier)
-        else {
-            return Err(api_not_found());
-        };
-        let merged_api_id = merged.api_id.clone();
-        let merged_api_arn = merged.arn.clone();
-        let merged_api_type = merged.api_type.clone();
-
-        let Some(source) =
-            crate::state::api_by_identifier(&guard.graphql_apis, &input.source_api_identifier)
-        else {
-            return Err(api_not_found());
-        };
-        let source_api_id = source.api_id.clone();
-        let source_api_arn = source.arn.clone();
-        let source_api_type = source.api_type.clone();
-
-        // An association links a standard GraphQL API (the source) to a Merged API:
-        // "A source API is a GraphQL API that is linked to a merged API"
-        // (`SourceApiAssociation`). An API on the wrong side of that sentence exists
-        // and is named well, so the request is a bad one rather than a not-found.
-        if merged_api_type != crate::state::MERGED_API_TYPE {
-            return Err(AssociateMergedGraphqlApiErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "API {merged_api_id} is not a Merged API; only an API of type {} can be \
-                         associated with source APIs",
-                        crate::state::MERGED_API_TYPE
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-        if source_api_type != crate::state::GRAPHQL_API_TYPE {
-            return Err(AssociateMergedGraphqlApiErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "API {source_api_id} is not a source API; only an API of type {} can be \
-                         associated with a Merged API",
-                        crate::state::GRAPHQL_API_TYPE
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
-        // A source API is linked to a Merged API at most once, so a pair that is
-        // already associated leaves this call nothing to create. While the existing
-        // association's merge is still owed, that is the modelled "another
-        // modification is in progress at this time" (409); once the merge has been
-        // performed, the pair is simply already associated (400).
-        if let Some(existing) = guard.association_for_pair(&merged_api_id, &source_api_id) {
-            if existing.merge_pending() {
-                return Err(
-                    AssociateMergedGraphqlApiErrorModeled::ConcurrentModificationException(
-                        ConcurrentModificationException {
-                            message: Some(
-                                crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            return Err(AssociateMergedGraphqlApiErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(format!(
-                        "Source API {source_api_id} is already associated with Merged API \
-                         {merged_api_id}"
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-
-        // The id is drawn from the state's own counter, never from the request, so
-        // associating two different pairs can never collide on it.
-        let mut association_id = guard.mint_id();
-        while guard.source_api_associations.contains_key(&association_id) {
-            association_id = guard.mint_id();
-        }
-        let seq = guard.next_seq();
-
-        let record = crate::state::SourceApiAssociationRecord {
-            seq,
-            association_arn: ::engine::emulator_arn(
-                crate::state::ARN_SERVICE,
-                &region,
-                &format!("apis/{merged_api_id}/sourceApiAssociations/{association_id}"),
-            ),
-            association_id: association_id.clone(),
-            source_api_id,
-            source_api_arn,
-            merged_api_id,
-            merged_api_arn,
+        // The request this create makes, in the form both association creates share:
+        // this operation takes the source API from the path and the Merged API from the
+        // body, and that is the only way it differs from the other one.
+        let request = crate::state::SourceApiAssociationRequest {
+            merged_api_identifier: input.merged_api_identifier,
+            source_api_identifier: input.source_api_identifier,
             description: input.description,
             merge_type: input
                 .source_api_association_config
-                .and_then(|config| config.merge_type)
-                .unwrap_or_else(|| crate::state::DEFAULT_MERGE_TYPE.to_string()),
-            // Creating the association SCHEDULES the merge; the clock owes its
-            // outcome, so nothing here performs it or waits for it.
-            status: crate::state::MERGE_SCHEDULED.to_string(),
-            status_detail: crate::state::MERGE_SCHEDULED_DETAIL.to_string(),
-            last_successful_merge_date: None,
-            merge_due_at: Some(now + crate::state::MERGE_SPAN),
+                .and_then(|config| config.merge_type),
+            region: crate::state::request_region(ctx),
         };
 
-        guard
-            .source_api_associations
-            .insert(association_id.clone(), record);
+        let created = crate::state::create_source_api_association(
+            &mut state.lock(),
+            request,
+            std::time::SystemTime::now(),
+        );
 
-        // Answer from the STORED record, so this body is the one
-        // `GetSourceApiAssociation` answers with later.
-        let source_api_association = guard
-            .source_api_associations
-            .get(&association_id)
-            .map(crate::state::SourceApiAssociationRecord::to_source_api_association);
-
-        Ok(AssociateMergedGraphqlApiOutput {
-            source_api_association,
-        })
+        match created {
+            Ok(source_api_association) => Ok(AssociateMergedGraphqlApiOutput {
+                source_api_association: Some(source_api_association),
+            }),
+            Err(refusal) => Err(refuse(refusal)),
+        }
     }
 }
 
-/// AppSync's refusal for an identifier that names no API this account holds: the
-/// modelled `NotFoundException` (HTTP 404) carrying the service's fixed absent-API
-/// text.
+/// This operation's modelled error for a refusal the shared association rule states.
 ///
-/// Both sides of the association answer it the same way, and neither echoes the
-/// identifier: which of the two was missing is not reported.
-fn api_not_found() -> AssociateMergedGraphqlApiError {
-    AssociateMergedGraphqlApiErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
-    })
+/// Each variant keeps the status the model gives its shape, and carries the rule's own
+/// text: a not-found names no identifier, so which side was missing is not reported.
+fn refuse(refusal: crate::state::AssociationRefusal) -> AssociateMergedGraphqlApiError {
+    match refusal {
+        crate::state::AssociationRefusal::BadRequest(message) => {
+            AssociateMergedGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationRefusal::NotFound(message) => {
+            AssociateMergedGraphqlApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        crate::state::AssociationRefusal::ConcurrentModification(message) => {
+            AssociateMergedGraphqlApiErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
     .into()
 }

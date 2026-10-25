@@ -2017,20 +2017,30 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
             .filter(|environment| environment.region == region)
     }
 
-    /// The environment an ARN names, if this service holds it. The tag operations
-    /// address an environment by ARN rather than by id; the ARN carries the Region, so
-    /// matching it is already Region-scoped.
-    pub fn environment_by_arn(&self, resource_arn: &str) -> Option<&StoredEnvironment> {
-        self.environments
-            .values()
-            .find(|environment| environment.environment_arn == resource_arn)
+    /// The environment an ARN names, if this service holds it IN `region`. The tag
+    /// operations address an environment by ARN rather than by id, but the resource is
+    /// regional either way ([`Self::environment_in_region`]): an ARN is resolvable only
+    /// at the endpoint of the Region it names, so an ARN minted in another Region
+    /// resolves to nothing here rather than reaching across endpoints.
+    pub fn environment_by_arn(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&StoredEnvironment> {
+        self.environments.values().find(|environment| {
+            environment.region == region && environment.environment_arn == resource_arn
+        })
     }
 
     /// Mutable form of [`Self::environment_by_arn`].
-    pub fn environment_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut StoredEnvironment> {
-        self.environments
-            .values_mut()
-            .find(|environment| environment.environment_arn == resource_arn)
+    pub fn environment_by_arn_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<&mut StoredEnvironment> {
+        self.environments.values_mut().find(|environment| {
+            environment.region == region && environment.environment_arn == resource_arn
+        })
     }
 
     /// Whether some environment IN `region` already carries `name`. `CreateEnvironment`

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListShards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListShards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListShards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the shard map `CreateStream` laid down, resolving the request's `StreamName` /
+//! `StreamARN` pair — or the stream its `NextToken` names — against `crate::state`'s
+//! `streams` store, selecting the shards the request's `ShardFilter` asks for and serving
+//! them one `MaxResults`-sized page at a time. Reporting only: the page token a truncated
+//! listing hands back carries where to resume INSIDE the token, so no read writes anything
+//! a later caller could see.
 //!
 //! ## Shape of an operation
 //!
@@ -149,7 +147,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListShardsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListShards")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListShards",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it, the operation shape does not list it, and it is the only honest answer for a
+    // service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListShardsErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -158,6 +162,7 @@ pub enum ListShardsErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -183,6 +188,192 @@ impl From<ListShardsErrorModeled> for ListShardsError {
 /// concrete engine where it mounts the service, not here.
 pub struct ListShards<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// The `ShardFilterType` values the model declares
+/// (`smithy_query(query="shape",shape="ShardFilterType")`), each naming the shards it
+/// selects.
+const AFTER_SHARD_ID: &str = "AFTER_SHARD_ID";
+const AT_TRIM_HORIZON: &str = "AT_TRIM_HORIZON";
+const FROM_TRIM_HORIZON: &str = "FROM_TRIM_HORIZON";
+const AT_LATEST: &str = "AT_LATEST";
+const AT_TIMESTAMP: &str = "AT_TIMESTAMP";
+const FROM_TIMESTAMP: &str = "FROM_TIMESTAMP";
+
+/// Which shards of a stream's map a request asks for: the `ShardFilter` it carries, or the
+/// documented default for a request carrying none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShardSelection {
+    /// "FROM_TRIM_HORIZON - (default), the response includes all the shards within the
+    /// retention period of the data stream (trim to tip)."
+    FromTrimHorizon,
+    /// "AFTER_SHARD_ID - the response includes all the shards, starting with the shard
+    /// whose ID immediately follows the ShardId that you provided": the retention-window
+    /// shards, started after one of them.
+    AfterShardId(String),
+    /// "AT_TRIM_HORIZON - the response includes all the shards that were open at
+    /// TRIM_HORIZON."
+    AtTrimHorizon,
+    /// "AT_LATEST - the response includes only the currently open shards of the data
+    /// stream."
+    AtLatest,
+    /// "AT_TIMESTAMP - the response includes all shards whose start timestamp is less than
+    /// or equal to the given timestamp and end timestamp is greater than or equal to the
+    /// given timestamp or still open."
+    AtTimestamp(::std::time::SystemTime),
+    /// "FROM_TIMESTAMP - the response incldues all closed shards whose end timestamp is
+    /// greater than or equal to the given timestamp and also all open shards. Corrected to
+    /// TRIM_HORIZON of the data stream if FROM_TIMESTAMP is less than the TRIM_HORIZON
+    /// value."
+    FromTimestamp(::std::time::SystemTime),
+}
+
+impl ShardSelection {
+    /// What `filter` selects, refusing a filter whose properties its own type does not
+    /// admit: "If you use the ShardFilter parameter when invoking the ListShards API, the
+    /// Type is the required property and must be specified", `ShardId` "can only be used if
+    /// the AFTER_SHARD_ID shard type is specified" and `Timestamp` "can only be used if
+    /// FROM_TIMESTAMP or AT_TIMESTAMP shard types are specified".
+    fn of(filter: Option<&ShardFilter>) -> Result<Self, ListShardsError> {
+        let Some(filter) = filter else {
+            return Ok(Self::FromTrimHorizon);
+        };
+        let filter_type = filter.r#type.as_str();
+        // `ShardFilterType` is a modelled enum, so the request walk refuses an unknown
+        // value before this handler runs; this states the same refusal for a caller that
+        // reaches the handler another way.
+        if !SHARD_FILTER_TYPE_VALUES.contains(&filter_type) {
+            return Err(invalid_argument(format!(
+                "ShardFilter.Type {filter_type} is not supported; the supported values are {}",
+                SHARD_FILTER_TYPE_VALUES.join(" | ")
+            )));
+        }
+        if filter.shard_id.is_some() && filter_type != AFTER_SHARD_ID {
+            return Err(invalid_argument(format!(
+                "ShardFilter.ShardId can only be used with the {AFTER_SHARD_ID} shard \
+                 type, not with {filter_type}"
+            )));
+        }
+        if filter.timestamp.is_some()
+            && filter_type != AT_TIMESTAMP
+            && filter_type != FROM_TIMESTAMP
+        {
+            return Err(invalid_argument(format!(
+                "ShardFilter.Timestamp can only be used with the {AT_TIMESTAMP} or \
+                 {FROM_TIMESTAMP} shard types, not with {filter_type}"
+            )));
+        }
+        match filter_type {
+            AFTER_SHARD_ID => filter
+                .shard_id
+                .clone()
+                .map(Self::AfterShardId)
+                .ok_or_else(|| {
+                    invalid_argument(format!(
+                        "ShardFilter.ShardId is required with the {AFTER_SHARD_ID} shard type"
+                    ))
+                }),
+            AT_TRIM_HORIZON => Ok(Self::AtTrimHorizon),
+            AT_LATEST => Ok(Self::AtLatest),
+            AT_TIMESTAMP => filter_instant(filter, AT_TIMESTAMP).map(Self::AtTimestamp),
+            FROM_TIMESTAMP => filter_instant(filter, FROM_TIMESTAMP).map(Self::FromTimestamp),
+            FROM_TRIM_HORIZON => Ok(Self::FromTrimHorizon),
+            // Every value `SHARD_FILTER_TYPE_VALUES` holds is named above, so a value that
+            // reaches here is one this emulator has no selection rule for yet: refused,
+            // never answered with another type's shards.
+            _ => Err(invalid_argument(format!(
+                "ShardFilter.Type {filter_type} is not supported; the supported values are {}",
+                SHARD_FILTER_TYPE_VALUES.join(" | ")
+            ))),
+        }
+    }
+
+    /// The shard this selection starts AFTER, when its type names one.
+    fn after_shard_id(&self) -> Option<&str> {
+        match self {
+            Self::AfterShardId(shard_id) => Some(shard_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether `shard` is one of the shards this selection asks for, in a stream whose
+    /// retention window begins at `trim_horizon`.
+    fn selects(&self, shard: &crate::state::ShardRecord, trim_horizon: ::std::time::SystemTime) -> bool {
+        match self {
+            // The retention window: a shard closed before the horizon holds nothing that
+            // is still retained, so it is not "within the retention period".
+            Self::FromTrimHorizon | Self::AfterShardId(_) => {
+                shard.open_or_closed_since(trim_horizon)
+            }
+            Self::AtTrimHorizon => shard.was_open_at(trim_horizon),
+            Self::AtLatest => shard.is_open(),
+            Self::AtTimestamp(at) => shard.spans(*at),
+            // "Corrected to TRIM_HORIZON of the data stream if FROM_TIMESTAMP is less than
+            // the TRIM_HORIZON value."
+            Self::FromTimestamp(from) => shard.open_or_closed_since((*from).max(trim_horizon)),
+        }
+    }
+}
+
+/// The instant a `FROM_TIMESTAMP` / `AT_TIMESTAMP` filter names: "A timestamp is a Unix
+/// epoch date with precision in milliseconds" (`ShardFilter$Timestamp`), so one that names
+/// no instant of that epoch is refused rather than read as another.
+fn filter_instant(
+    filter: &ShardFilter,
+    filter_type: &str,
+) -> Result<::std::time::SystemTime, ListShardsError> {
+    filter
+        .timestamp
+        .and_then(|at| ::std::time::SystemTime::try_from(at).ok())
+        .ok_or_else(|| {
+            invalid_argument(format!(
+                "ShardFilter.Timestamp is required with the {filter_type} shard type, as a \
+                 Unix epoch date"
+            ))
+        })
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> ListShardsError {
+    ListShardsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no
+/// stream of this account and region: the rule the operation's own doc publishes for a
+/// request that names neither ("you must use either the StreamARN or the StreamName
+/// parameter, or both"), and `ResourceNotFoundException` for one that names a stream
+/// nothing created.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &ListShardsInput,
+) -> ListShardsError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => not_found(
+            input
+                .stream_name
+                .as_deref()
+                .or(input.stream_arn.as_deref())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// The modelled refusal for an identifier this account and region hold no stream under.
+fn not_found(identifier: &str) -> ListShardsError {
+    ListShardsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::stream_not_found_message(identifier)),
+    })
+    .into()
 }
 
 impl<Eng> ListShards<Eng> {
@@ -211,18 +402,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListShards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListShardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListShards"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListShardsError::from(ListShardsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // What the request asks for is checked before the store is read, so a filter whose
+        // properties its own type does not admit is refused whatever stream it names.
+        let selection = ShardSelection::of(input.shard_filter.as_ref())?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Which stream, and where in its shard map to carry on: a `NextToken`
+        // "unambiguously identifies the stream", so a request carrying one takes both from
+        // the token and names neither the stream nor a starting shard itself; a request
+        // carrying none resolves the identifier pair the way every stream operation does.
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no
+        // stream carries one and a request naming only that member names no stream.
+        let (stream, resume_at) = match input.next_token.as_deref() {
+            None => (
+                store
+                    .resolve_stream(
+                        &region,
+                        input.stream_name.as_deref(),
+                        input.stream_arn.as_deref(),
+                    )
+                    .map_err(|failure| lookup_refusal(failure, &input))?,
+                None,
+            ),
+            Some(token) => {
+                for (member, named) in [
+                    ("StreamName", input.stream_name.is_some()),
+                    (
+                        "StreamCreationTimestamp",
+                        input.stream_creation_timestamp.is_some(),
+                    ),
+                    (
+                        "ExclusiveStartShardId",
+                        input.exclusive_start_shard_id.is_some(),
+                    ),
+                ] {
+                    if named {
+                        return Err(invalid_argument(
+                            crate::state::next_token_conflict_message(member),
+                        ));
+                    }
+                }
+                // A token this service never issued names no page, and one past its
+                // lifetime names no page any more: both are the modelled expiry refusal,
+                // which is what keeps a caller from constructing a cursor of its own.
+                let resume = crate::state::ShardPageToken::decode(token)
+                    .filter(|resume| !resume.is_expired(now))
+                    .ok_or_else(|| {
+                        ListShardsError::from(
+                            ListShardsErrorModeled::ExpiredNextTokenException(
+                                ExpiredNextTokenException {
+                                    message: Some(crate::state::next_token_expired_message()),
+                                },
+                            ),
+                        )
+                    })?;
+                // A `StreamARN` the request carries beside the token has to name the
+                // stream the token names, or the two name different streams.
+                if input
+                    .stream_arn
+                    .as_deref()
+                    .is_some_and(|arn| arn != resume.stream_arn)
+                {
+                    return Err(invalid_argument(
+                        crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string(),
+                    ));
+                }
+                let stream = store
+                    .stream_by_arn(&region, &resume.stream_arn)
+                    .filter(|stream| resume.names(stream))
+                    .ok_or_else(|| not_found(&resume.stream_arn))?;
+                (stream, Some(resume.next_shard_id))
+            }
+        };
+
+        // "Specify this input parameter to distinguish data streams that have the same
+        // name" (`ListShardsInput$StreamCreationTimestamp`): a timestamp that is not this
+        // stream's names another stream, which this account and region do not hold.
+        let identifier = input
+            .stream_name
+            .as_deref()
+            .or(input.stream_arn.as_deref())
+            .unwrap_or(&stream.name);
+        if let Some(asked) = input.stream_creation_timestamp {
+            let created = crate::state::timestamp(stream.created_at);
+            if asked.to_millis().ok() != created.to_millis().ok() {
+                return Err(not_found(identifier));
+            }
+        }
+
+        // "The resource is not available for this operation. For successful operation, the
+        // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream whose
+        // creation has not fallen due yet has no shard map to serve.
+        let status = stream.status(now);
+        if status != crate::state::STREAM_ACTIVE {
+            return Err(ListShardsErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(crate::state::stream_not_active_message(identifier, status)),
+                },
+            )
+            .into());
+        }
+
+        // "The ShardId property is identical in fuctionality to the ExclusiveStartShardId
+        // parameter of the ListShards API" (`ShardFilter$ShardId`) — each names a shard the
+        // listing starts AFTER, so a request carrying both starts after the later of the
+        // two, and either one has to name a shard of this stream.
+        let mut exclusive_start: Option<&str> = None;
+        for candidate in [
+            selection.after_shard_id(),
+            input.exclusive_start_shard_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !stream
+                .shards
+                .iter()
+                .any(|shard| shard.shard_id == candidate)
+            {
+                return Err(invalid_argument(format!(
+                    "shard {candidate} is not a shard of stream {}",
+                    stream.name
+                )));
+            }
+            if exclusive_start.is_none_or(|current| current < candidate) {
+                exclusive_start = Some(candidate);
+            }
+        }
+
+        // "The maximum number of shards to return in a single call. The default value is
+        // 1000. If you specify a value greater than 1000, at most 1000 results are
+        // returned" (`ListShardsInput$MaxResults`) — a caller-chosen page size is clamped
+        // server-side before it sizes anything.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_LIST_SHARDS_LIMIT)
+            .clamp(1, crate::state::MAX_LIST_SHARDS_LIMIT);
+        let page_size = usize::try_from(page_size).unwrap_or(1);
+
+        // The shard map is ordered by shard index and a shard id is that index in a
+        // fixed-width form, so the ids compare in map order: a cursor can name the shard a
+        // page stopped at and be honoured even once that shard is gone.
+        let trim_horizon = stream.trim_horizon(now);
+        let mut shards: Vec<Shard> = Vec::new();
+        let mut next_token = None;
+        for shard in stream
+            .shards
+            .iter()
+            .filter(|shard| selection.selects(shard, trim_horizon))
+            .filter(|shard| {
+                exclusive_start.is_none_or(|start| shard.shard_id.as_str() > start)
+            })
+            .filter(|shard| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|from| shard.shard_id.as_str() >= from)
+            })
+        {
+            if shards.len() == page_size {
+                next_token = Some(
+                    crate::state::ShardPageToken::new(
+                        &stream.arn,
+                        stream.created_at,
+                        &shard.shard_id,
+                        now,
+                    )
+                    .encode(),
+                );
+                break;
+            }
+            shards.push(shard.to_shape());
+        }
+
+        Ok(ListShardsOutput {
+            shards: Some(shards),
+            next_token,
+        })
     }
 }
