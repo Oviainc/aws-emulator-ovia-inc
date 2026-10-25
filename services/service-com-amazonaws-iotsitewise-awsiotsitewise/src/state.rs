@@ -400,6 +400,18 @@ pub const ENCRYPTION_TYPE_KMS_BASED: &str = "KMS_BASED_ENCRYPTION";
 /// (`smithy_query(query="shape", shape="PipelineExecutionState,ComputeNodeExecutionState")`).
 pub const EXECUTION_STATE_NOT_STARTED: &str = "NOT_STARTED";
 
+/// The `PipelineExecutionState` values an execution STAYS in once it reaches
+/// one: the states in which the execution is over and nothing it does can move
+/// it again.
+///
+/// Source: `smithy_query(query="shape", shape="PipelineExecutionState")` — the
+/// enum holds `NOT_STARTED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLING` and
+/// `CANCELLED`; the three below are the ones an execution does not leave, and
+/// the other three are stages on the way to them. This is what
+/// [`PipelineExecutionRecord::is_active`] reads, so "an execution that has not
+/// finished" is one rule in one place.
+pub const EXECUTION_TERMINAL_STATES: &[&str] = &["SUCCEEDED", "FAILED", "CANCELLED"];
+
 /// The `executionPriority` an execution that named none runs at, as
 /// `StartPipelineExecution`'s own member documents it: "Lower values indicate
 /// higher priority. Defaults to 2 when not specified."
@@ -1298,6 +1310,14 @@ impl PipelineExecutionRecord {
             state: self.state.clone(),
             state_details: None,
         }
+    }
+
+    /// Whether this execution is still ACTIVE: in a `PipelineExecutionState`
+    /// that is not one of [`EXECUTION_TERMINAL_STATES`], so the execution has
+    /// not finished. An execution waiting to begin counts as active — it has
+    /// not completed either.
+    pub fn is_active(&self) -> bool {
+        !EXECUTION_TERMINAL_STATES.contains(&self.state.as_str())
     }
 }
 
@@ -3310,6 +3330,54 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .retain(|_, children| !children.is_empty());
         self.asset_hierarchy_settles_at
             .retain(|(asset, _, child), _| asset != asset_id && child != asset_id);
+        Some(record)
+    }
+
+    /// How many executions of `(workspace_name, pipeline_name)` have not
+    /// finished, as [`PipelineExecutionRecord::is_active`] decides it.
+    ///
+    /// A count rather than a list: the executions are held in a hash map, so
+    /// any order this reported would be the map's, not the service's.
+    pub fn active_pipeline_execution_count(
+        &self,
+        workspace_name: &str,
+        pipeline_name: &str,
+    ) -> usize {
+        self.pipeline_executions
+            .values()
+            .filter(|execution| {
+                execution.workspace_name == workspace_name
+                    && execution.pipeline_name == pipeline_name
+                    && execution.is_active()
+            })
+            .count()
+    }
+
+    /// Forget a pipeline and everything keyed off it: every version it holds and
+    /// its tags (both on the record), the executions recorded against it, and
+    /// the client-token entries those executions are indexed under — so no later
+    /// read resolves to a pipeline this service no longer holds.
+    pub fn forget_pipeline(
+        &mut self,
+        workspace_name: &str,
+        pipeline_name: &str,
+    ) -> Option<PipelineRecord> {
+        let record = self
+            .pipelines
+            .remove(&pipeline_key(workspace_name, pipeline_name))?;
+        let forgotten: HashSet<String> = self
+            .pipeline_executions
+            .values()
+            .filter(|execution| {
+                execution.workspace_name == workspace_name
+                    && execution.pipeline_name == pipeline_name
+            })
+            .map(|execution| execution.id.clone())
+            .collect();
+        self.pipeline_executions
+            .retain(|id, _| !forgotten.contains(id));
+        self.pipeline_execution_tokens
+            .retain(|_, id| !forgotten.contains(id));
         Some(record)
     }
 
