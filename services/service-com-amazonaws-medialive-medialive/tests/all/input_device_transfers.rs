@@ -29,10 +29,14 @@ const TRANSFERS: &str = "/prod/inputDeviceTransfers";
 /// An account id that is not this emulator's own, so a transfer addressed to it
 /// is one this account sends OUT and never one it receives. Twelve digits, the
 /// form `TargetCustomerId` documents.
-const OTHER_ACCOUNT: &str = "123456789012";
+///
+/// `pub(crate)` so the suite that ENDS a transfer
+/// ([`crate::input_device_transfer_accept`]) asks for the same request helpers
+/// and the same non-local account rather than keeping a second copy of them.
+pub(crate) const OTHER_ACCOUNT: &str = "123456789012";
 
 /// `ClaimDevice` on one device id, asserting the claim succeeded.
-async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
+pub(crate) async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
     let (status, body) = call(router, "POST", "/prod/claimDevice", Some(json!({ "id": id }))).await;
     assert_eq!(
         status, 200,
@@ -41,7 +45,7 @@ async fn claim_device(router: &MultiServiceRouter, case: &str, id: &str) {
 }
 
 /// `TransferInputDevice` on one device with `body` as the request payload.
-async fn transfer(router: &MultiServiceRouter, id: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn transfer(router: &MultiServiceRouter, id: &str, body: Value) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -59,7 +63,7 @@ async fn list(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
 
 /// The transfers the listing reports for one direction, asserting the 200 a
 /// well-formed listing answers with.
-async fn listed(
+pub(crate) async fn listed(
     router: &MultiServiceRouter,
     case: &str,
     transfer_type: &str,
@@ -79,7 +83,7 @@ async fn listed(
 
 /// The reported transfer of the device `id` in one direction, or `None` when the
 /// listing does not report it.
-async fn reported(
+pub(crate) async fn reported(
     router: &MultiServiceRouter,
     case: &str,
     transfer_type: &str,
@@ -92,7 +96,7 @@ async fn reported(
 }
 
 /// `DescribeInputDevice` on one device.
-async fn describe_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe_device(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/inputDevices/{id}"), None).await
 }
 

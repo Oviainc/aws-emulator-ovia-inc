@@ -57,6 +57,11 @@ mod cfn_provisions_declared_resources;
 mod cloudformation_provisions_cognito_user_pool_groups;
 #[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
 mod cloudformation_provisions_sagemaker_model_package_group;
+// Declared in this span of the sorted list rather than appended at the end of this file,
+// for the reason the notes above give: the tail is where every concurrently landing router
+// suite appends, so a line added there conflicts with all of them.
+#[path = "all/cloudformation_provisions_scheduler_schedules.rs"]
+mod cloudformation_provisions_scheduler_schedules;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
