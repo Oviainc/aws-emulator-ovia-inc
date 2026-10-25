@@ -71,5 +71,7 @@ mod peer_resolution_is_grounded;
 mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/wire.rs"]
 mod wire;
