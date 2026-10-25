@@ -350,6 +350,12 @@ pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
 /// select within the order rather than changing it.
 pub const MARKER_SCOPE_ENTITIES_FOR_POLICY: &str = "entities-for-policy";
 
+/// The marker scope of the versions of ONE managed policy, which
+/// `ListPolicyVersions` pages over. The policy's ARN follows it, so a marker
+/// issued while paging one policy's versions does not name a position among
+/// another's: see [`policy_versions_marker_scope`].
+pub const MARKER_SCOPE_POLICY_VERSIONS: &str = "policy-versions";
+
 /// The marker scope of the account's alias collection, which
 /// `ListAccountAliases` pages over. It is its OWN scope, exactly as the user and
 /// role collections are, so a marker issued while paging another collection is
@@ -1656,6 +1662,41 @@ pub fn role_policies_marker_scope(role_key: &str) -> String {
 pub fn entities_for_policy_marker_scope(policy_arn: &str) -> String {
     format!("{MARKER_SCOPE_ENTITIES_FOR_POLICY}:{policy_arn}")
 }
+
+/// The marker scope of the version collection of the managed policy `policy_arn`
+/// names. See [`MARKER_SCOPE_POLICY_VERSIONS`].
+pub fn policy_versions_marker_scope(policy_arn: &str) -> String {
+    format!("{MARKER_SCOPE_POLICY_VERSIONS}:{policy_arn}")
+}
+
+/// The page key of ONE policy version in the order a reader of a managed policy's
+/// versions enumerates them: the version NUMBER, zero padded, followed by the
+/// version identifier itself.
+///
+/// A version identifier is `v` then a number then an optional dotted suffix
+/// (`policyVersionIdType`'s pattern `^v[1-9][0-9]*(\.[A-Za-z0-9-]*)?$`), so the
+/// identifiers alone do not sort in version order — `v10` precedes `v2` byte by
+/// byte. Padding the number to [`POLICY_VERSION_KEY_DIGITS`] digits makes the byte
+/// order of these keys the numeric order, which is the order the versions were
+/// created in, and appending the identifier keeps the key unique when two
+/// identifiers carry the same number with different suffixes. The byte order IS the
+/// enumeration order, which is what lets a reader resume strictly after the key a
+/// `Marker` names even when the version it named has since been deleted.
+pub fn policy_version_page_key(version_id: &str) -> String {
+    let digits: String = version_id
+        .trim_start_matches('v')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    // An identifier the model's pattern admits always carries a number; one that
+    // somehow does not sorts first rather than being dropped from the order.
+    let number: u64 = digits.parse().unwrap_or(0);
+    format!("{number:0width$}:{version_id}", width = POLICY_VERSION_KEY_DIGITS)
+}
+
+/// How many digits [`policy_version_page_key`] pads a version number to: enough
+/// for every `u64`, so no number can overflow the padding and sort out of order.
+const POLICY_VERSION_KEY_DIGITS: usize = 20;
 
 /// The marker scope of the tag set of the entity `entity_handle` names — an ARN or
 /// an entity key, whichever handle the tag-listing operation takes. See
