@@ -414,6 +414,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the version number. Route 53 does not update the health check, and it
         // returns a HealthCheckVersionMismatch error." A request that carries no
         // version asks for no such guard, so the update proceeds.
+        //
+        // The comparison and the write below are one compare-and-set: the store
+        // guard taken above is held across both, so two requests presenting the
+        // same version cannot both observe it as current — one is applied and
+        // the other is refused here, and the counter moves once. Never read the
+        // version, drop the guard and write under a second one.
         if input
             .health_check_version
             .is_some_and(|requested| requested != existing.version)
