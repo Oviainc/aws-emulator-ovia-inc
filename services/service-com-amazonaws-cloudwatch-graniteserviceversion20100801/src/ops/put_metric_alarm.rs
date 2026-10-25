@@ -451,12 +451,6 @@ const EXPRESSION_REFUSAL_ENVELOPE: &str = " (Service: AmazonCloudWatch; Status C
                                            Error Code: ValidationException; Request ID: ; \
                                            Proxy: null)";
 
-/// The metric math functions whose value is MORE than one time series: `METRICS()` returns
-/// every metric the request retrieves (`MetricDataQuery$Expression`, "Metric Math Syntax and
-/// Functions"), so an expression that is one is not the single series an alarm watches unless
-/// a function around it reduces it to one.
-const MULTI_SERIES_FUNCTIONS: [&str; 1] = ["METRICS"];
-
 /// The refusal for an alarm configuration CloudWatch would not create, or `None` when this
 /// request is one it would.
 ///
@@ -531,27 +525,43 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
         // "This field can contain either a Metrics Insights query, or a metric math
         // expression": an Insights query is SQL-like and refers to metrics by name rather
         // than to the ids of other queries, so neither id rule below speaks about it.
-        if !is_metrics_insights_query(expression) {
-            if let Some(unknown) = referenced_ids(expression)
-                .into_iter()
-                .find(|referenced| !defined.contains(referenced.as_str()))
-            {
-                // Built from the request: the expression that could not be resolved, and the
-                // id in it that names no query of this request.
-                return Some(format!(
-                    "Error in expression '{}': ID '{unknown}' not \
-                     found{EXPRESSION_REFUSAL_ENVELOPE}",
-                    query.id
-                ));
-            }
+        if crate::state::metric_math::is_metrics_insights_query(expression) {
+            continue;
         }
-        if calls_function(expression, SEARCH_FUNCTION) {
+        // The one reader of this language: the same parse `GetMetricData` evaluates the
+        // expression through, so the two cannot disagree about which ids it refers to, which
+        // functions it calls or how many series its value is. An expression the parse refuses
+        // is one the metrics query service this operation calls would refuse too.
+        let parsed = match crate::state::metric_math::parse(expression) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Some(format!(
+                    "Error in expression '{}': {}{EXPRESSION_REFUSAL_ENVELOPE}",
+                    query.id, error.message
+                ))
+            }
+        };
+        if let Some(unknown) = crate::state::metric_math::references(&parsed)
+            .into_iter()
+            .find(|referenced| !defined.contains(referenced.as_str()))
+        {
+            // Built from the request: the expression that could not be resolved, and the
+            // id in it that names no query of this request.
+            return Some(format!(
+                "Error in expression '{}': ID '{unknown}' not \
+                 found{EXPRESSION_REFUSAL_ENVELOPE}",
+                query.id
+            ));
+        }
+        if crate::state::metric_math::calls_function(&parsed, SEARCH_FUNCTION) {
             return Some(SEARCH_REFUSAL.to_string());
         }
         // "When used in PutMetricAlarm, specify true for the one expression result to use as
         // the alarm." … "If you omit this, the default of true is used."
         // (`MetricDataQuery$ReturnData`)
-        if query.return_data != Some(false) && returns_many_series(expression) {
+        if query.return_data != Some(false)
+            && crate::state::metric_math::returns_many_series(&parsed)
+        {
             return Some(format!(
                 "the Expression of query {} returns more than one time series, and the \
                  expression an alarm watches must return a single time series",
@@ -560,164 +570,6 @@ fn unresolvable_metrics(input: &PutMetricAlarmInput) -> Option<String> {
         }
     }
     None
-}
-
-/// Whether `expression` is a Metrics Insights query rather than a metric math expression: a
-/// Metrics Insights query is a SELECT statement ("Metrics Insights query components and
-/// syntax", `MetricDataQuery$Expression`).
-fn is_metrics_insights_query(expression: &str) -> bool {
-    expression
-        .trim_start()
-        .get(..SELECT_KEYWORD.len())
-        .is_some_and(|start| start.eq_ignore_ascii_case(SELECT_KEYWORD))
-}
-
-/// The keyword a Metrics Insights query opens with.
-const SELECT_KEYWORD: &str = "SELECT";
-
-/// The query ids a metric math expression refers to.
-///
-/// A reference is a word that is not a function call, spelled the way a query id is: "The
-/// valid characters are letters, numbers, and underscore. The first character must be a
-/// lowercase letter." (`MetricDataQuery$Id`) — which is also what tells a reference from a
-/// metric math function name, and from a number. Quoted literals carry a search query or a
-/// label rather than ids, so they are skipped.
-///
-/// Metric math is CloudWatch's own expression language and no published grammar for it exists
-/// outside the service, so the words are read here rather than through a parser crate.
-fn referenced_ids(expression: &str) -> Vec<String> {
-    let mut referenced = Vec::new();
-    let characters: Vec<char> = expression.chars().collect();
-    let mut index = 0;
-    while let Some(&current) = characters.get(index) {
-        if current == '\'' || current == '"' {
-            index = end_of_literal(&characters, index, current);
-            continue;
-        }
-        if !is_word_character(current) {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while characters.get(index).copied().is_some_and(is_word_character) {
-            index += 1;
-        }
-        if !opens_call(&characters, index) && current.is_ascii_lowercase() {
-            referenced.push(word(&characters, start, index));
-        }
-    }
-    referenced
-}
-
-/// The functions `expression` CALLS, each with the number of function calls enclosing it: a
-/// call at zero is the value of the expression itself, and one at a positive depth is an
-/// argument of the function around it (whose own value is what the expression returns).
-///
-/// Plain parentheses GROUP rather than call, so a call inside them is still unenclosed.
-fn called_functions(expression: &str) -> Vec<(String, usize)> {
-    let mut called: Vec<(String, usize)> = Vec::new();
-    let characters: Vec<char> = expression.chars().collect();
-    let mut index = 0;
-    // One entry per open parenthesis: whether it opened a FUNCTION CALL rather than grouped a
-    // sub-expression.
-    let mut open: Vec<bool> = Vec::new();
-    let mut enclosing_calls = 0usize;
-    let mut after_word = false;
-    while let Some(&current) = characters.get(index) {
-        match current {
-            '\'' | '"' => {
-                index = end_of_literal(&characters, index, current);
-                after_word = false;
-            }
-            '(' => {
-                open.push(after_word);
-                if after_word {
-                    enclosing_calls += 1;
-                }
-                after_word = false;
-                index += 1;
-            }
-            ')' => {
-                if open.pop() == Some(true) {
-                    enclosing_calls = enclosing_calls.saturating_sub(1);
-                }
-                after_word = false;
-                index += 1;
-            }
-            current if is_word_character(current) => {
-                let start = index;
-                while characters.get(index).copied().is_some_and(is_word_character) {
-                    index += 1;
-                }
-                if opens_call(&characters, index) {
-                    called.push((word(&characters, start, index), enclosing_calls));
-                }
-                after_word = true;
-            }
-            current if current.is_whitespace() => index += 1,
-            _ => {
-                after_word = false;
-                index += 1;
-            }
-        }
-    }
-    called
-}
-
-/// Whether `expression` calls `function`, at any depth.
-fn calls_function(expression: &str, function: &str) -> bool {
-    called_functions(expression)
-        .iter()
-        .any(|(called, _)| called.eq_ignore_ascii_case(function))
-}
-
-/// Whether the value of `expression` is more than one time series: it calls one of
-/// [`MULTI_SERIES_FUNCTIONS`] with no enclosing function call to reduce the result to a single
-/// series.
-fn returns_many_series(expression: &str) -> bool {
-    called_functions(expression)
-        .iter()
-        .any(|(called, enclosing_calls)| {
-            *enclosing_calls == 0
-                && MULTI_SERIES_FUNCTIONS
-                    .iter()
-                    .any(|function| called.eq_ignore_ascii_case(function))
-        })
-}
-
-/// Whether `character` may appear in a metric math word (a query id or a function name).
-fn is_word_character(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
-}
-
-/// The word `characters[start..end]` spells.
-fn word(characters: &[char], start: usize, end: usize) -> String {
-    characters
-        .get(start..end)
-        .unwrap_or_default()
-        .iter()
-        .collect()
-}
-
-/// The index just past the `quote`d literal that starts at `index`, whose opening quote is
-/// also its closing one. An unclosed literal runs to the end of the expression.
-fn end_of_literal(characters: &[char], index: usize, quote: char) -> usize {
-    let mut end = index + 1;
-    while characters.get(end).is_some_and(|current| *current != quote) {
-        end += 1;
-    }
-    end.saturating_add(1)
-}
-
-/// Whether the word ending at `index` is a function call: the next character that is not
-/// whitespace opens an argument list.
-fn opens_call(characters: &[char], index: usize) -> bool {
-    characters
-        .get(index..)
-        .unwrap_or_default()
-        .iter()
-        .find(|current| !current.is_whitespace())
-        == Some(&'(')
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
