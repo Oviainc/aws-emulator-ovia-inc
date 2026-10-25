@@ -5274,10 +5274,15 @@ impl MetricTransformationRecord {
 /// metric per value found for the dimension fields, so there is no dimension value to
 /// publish a "value to emit when a filter pattern does not match a log event" under — AWS
 /// states the rule as "you can't specify a default value for the metric" when publishing
-/// dimensions with metrics from log events. The sentence is the service's fixed wording for
-/// the constraint and names both members; it carries nothing of the request.
+/// dimensions with metrics from log events.
+///
+/// This is the whole message the service answers for the error class: fixed text that
+/// interpolates nothing from the request or from state — no filter name, no log group, no
+/// metric name, no dimension name and no default value — so every transformation that
+/// trips the rule is refused with exactly this sentence.
 pub const METRIC_FILTER_DEFAULT_VALUE_WITH_DIMENSIONS: &str =
-    "defaultValue cannot be specified for a metric transformation that declares dimensions";
+    "Invalid metric transformation: dimensions and default value are mutually exclusive \
+     properties";
 
 /// The refusal for a dimension value that is not a field of the log event. See
 /// [`is_log_event_field_reference`].

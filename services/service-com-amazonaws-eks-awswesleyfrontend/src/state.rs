@@ -1520,8 +1520,9 @@ pub struct UpdateRecord {
     /// `InProgress` to `Successful`. Cleared once the move is materialised.
     pub succeeds_at: Option<SystemTime>,
     /// The change this update puts on its cluster when it completes — the
-    /// `encryptionConfig` an `AssociateEncryptionConfig` carries, or the
-    /// configuration members an `UpdateClusterConfig` carries. Taken when
+    /// `encryptionConfig` an `AssociateEncryptionConfig` carries, the
+    /// configuration members an `UpdateClusterConfig` carries, or the signer
+    /// promotion an `ActivateCertificateAuthority` carries. Taken when
     /// applied. `None` on an update whose work is not a change to the cluster
     /// record itself (associating an identity provider, appending a certificate
     /// authority), which writes its own resource instead.
@@ -1614,6 +1615,11 @@ pub struct PendingClusterConfig {
     /// (`UpdateClusterVersionRequest$version`), so the cluster reports the new
     /// version only once the clock completes the update.
     pub version: Option<String>,
+    /// The certificate-authority promotion an `ActivateCertificateAuthority`
+    /// update makes when it completes. It is a change to the cluster's CA
+    /// records rather than to a configuration member of the cluster itself, so it
+    /// carries its own structure; see [`CertificateAuthorityActivation`].
+    pub certificate_authority_activation: Option<CertificateAuthorityActivation>,
 }
 
 impl PendingClusterConfig {
@@ -1666,6 +1672,9 @@ impl PendingClusterConfig {
         }
         if let Some(version) = self.version {
             record.version = Some(version);
+        }
+        if let Some(activation) = self.certificate_authority_activation {
+            activation.apply(record);
         }
     }
 }
@@ -1818,7 +1827,16 @@ impl ClusterRecord {
             logging: self.logging.clone(),
             identity: self.identity.clone(),
             status: Some(self.status.clone()),
-            certificate_authority: self.certificate_authority.clone(),
+            certificate_authority: self.certificate_authority.clone().map(|certificate| {
+                Certificate {
+                    // "An object identifying the certificate authority that is
+                    // currently signing certificates for the cluster" is derived
+                    // from the CA records, so it follows an activation without a
+                    // second copy of the signer's identity.
+                    active: self.active_certificate_authority(),
+                    ..certificate
+                }
+            }),
             client_request_token: self.client_request_token.clone(),
             platform_version: self.platform_version.clone(),
             tags: Some(
@@ -3852,19 +3870,21 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // ---------------------------------------------------------------------------
 
 use crate::ops::types::{
-    CertificateAuthority, CertificateAuthorityScheduledEvents, CertificateAuthoritySummary,
-    CertificateAuthorityValidity,
+    ActiveCertificateAuthority, CertificateAuthority, CertificateAuthorityScheduledEvents,
+    CertificateAuthoritySummary, CertificateAuthorityValidity,
 };
 
 /// The `CertificateAuthoritySigningStatus` members this slice uses. The model's
 /// enum (`smithy_query query="shape" shape="CertificateAuthoritySigningStatus"`)
 /// is `NOT_USED | ACTIVATING | IN_USE`; `CertificateAuthority$signingStatus` is a
 /// plain string member, so the status is stored as the wire token. `ACTIVATING`
-/// belongs to `ActivateCertificateAuthority`, which is still a 501 with its own
-/// gap issue, so nothing here writes it.
+/// is the status a CA reports while the activation update that promotes it to
+/// the cluster's signer is in flight.
 pub const CA_SIGNING_NOT_USED: &str = "NOT_USED";
 /// See [`CA_SIGNING_NOT_USED`].
 pub const CA_SIGNING_IN_USE: &str = "IN_USE";
+/// See [`CA_SIGNING_NOT_USED`].
+pub const CA_SIGNING_ACTIVATING: &str = "ACTIVATING";
 
 /// The `CertificateAuthorityDistributionStatus` members this slice uses, from
 /// `smithy_query query="shape" shape="CertificateAuthorityDistributionStatus"`
@@ -3932,6 +3952,22 @@ pub const UPDATE_TYPE_CERTIFICATE_AUTHORITY: &str = "CertificateAuthorityUpdate"
 /// The `UpdateParamType` member that names the certificate authority an update
 /// is about, from `smithy_query query="shape" shape="UpdateParamType"`.
 pub const UPDATE_PARAM_CERTIFICATE_AUTHORITY_ID: &str = "CertificateAuthorityId";
+/// The `UpdateParamType` member that names the signing status an update moves a
+/// certificate authority to, from the same enum. It is what distinguishes an
+/// activation update from the append update that put the CA on the cluster:
+/// both carry the one certificate-authority `UpdateType`.
+pub const UPDATE_PARAM_SIGNING_STATUS: &str = "SigningStatus";
+
+/// How long after an activation reverting to the outgoing certificate authority
+/// is still available.
+///
+/// "For a limited period after activation, CA rollback is available to revert to
+/// the outgoing CA if needed" (`ActivateCertificateAuthority`) — no length is
+/// published for that period, so this span is CHOSEN rather than cited: non-zero,
+/// so a caller reading the retired CA straight after the activation still sees
+/// `rollbackAvailable` true, and in the same band as the other chosen spans here.
+/// The closing instant is stored on the record; nothing sleeps for it.
+pub const CA_ROLLBACK_WINDOW: Duration = Duration::from_millis(750);
 
 /// The id of the `seq`th certificate authority of the cluster `cluster_arn`
 /// identifies.
@@ -3979,10 +4015,10 @@ pub struct CertificateAuthorityRecord {
     /// Until when reverting to this CA is still possible: "After you activate a
     /// successor CA, rollback lets you revert to the outgoing CA for a limited"
     /// period (`CertificateAuthority$rollbackAvailable`). Only an activation
-    /// retires an outgoing CA, and `ActivateCertificateAuthority` is still a 501
-    /// with its own gap issue, so no implemented operation sets this yet — a CA
-    /// that nothing has superseded reports `rollbackAvailable` false, which is
-    /// what this `None` means.
+    /// retires an outgoing CA, so this is set on the CA an activation RETIRED,
+    /// [`CA_ROLLBACK_WINDOW`] past the instant the activation was owed. A CA that
+    /// nothing has superseded reports `rollbackAvailable` false, which is what
+    /// this `None` means.
     pub rollback_available_until: Option<SystemTime>,
     /// The Base64-encoded public certificate of this CA
     /// (`CertificateAuthority$data`), written once and read back unchanged.
@@ -4155,10 +4191,76 @@ impl CertificateAuthorityRecord {
     }
 }
 
+/// The promotion an in-flight activation update makes when it completes: which
+/// certificate authority becomes the cluster's signer, when, and at whose
+/// request.
+///
+/// It is held on the update ([`PendingClusterConfig::certificate_authority_activation`])
+/// rather than written straight away because "this is an asynchronous operation
+/// that returns an update object you can track with DescribeUpdate"
+/// (`ActivateCertificateAuthority`): the promotion is owed at the instant the
+/// update is owed its `Successful` status. `activated_at` is that DUE instant
+/// rather than the instant of the call that noticed it, so every caller reading
+/// the promoted CA sees the same activation time.
+#[derive(Debug, Clone)]
+pub struct CertificateAuthorityActivation {
+    /// The certificate authority being promoted to signer.
+    pub certificate_authority_id: String,
+    /// The instant the promotion is owed, which is what the promoted CA reports
+    /// as `activatedAt`.
+    pub activated_at: SystemTime,
+    /// A `CertificateAuthorityActivatedBy` wire token: who asked for it.
+    pub activated_by: String,
+}
+
+impl CertificateAuthorityActivation {
+    /// Promote the named certificate authority to the cluster's signer and retire
+    /// whichever certificate authority was signing, which is what completing an
+    /// activation update does: "Amazon EKS promotes it to be the cluster's signer
+    /// (its signingStatus becomes IN_USE) and the outgoing CA is retired
+    /// (NOT_USED). The outgoing CA remains in the cluster's trust bundle but no
+    /// longer signs certificates" — so the retired record stays on the cluster,
+    /// with the rollback window the activation opens on it.
+    pub fn apply(self, record: &mut ClusterRecord) {
+        for (id, authority) in record.certificate_authorities.iter_mut() {
+            if *id == self.certificate_authority_id {
+                authority.signing_status = CA_SIGNING_IN_USE.to_string();
+                authority.activated_at = Some(self.activated_at);
+                authority.activated_by = Some(self.activated_by.clone());
+                // The CA that signs now is not one to revert TO: a rollback
+                // window belongs to the CA this promotion retires.
+                authority.rollback_available_until = None;
+            } else if authority.signing_status != CA_SIGNING_NOT_USED {
+                authority.signing_status = CA_SIGNING_NOT_USED.to_string();
+                authority.rollback_available_until =
+                    self.activated_at.checked_add(CA_ROLLBACK_WINDOW);
+            }
+        }
+    }
+}
+
 impl ClusterRecord {
     /// This cluster's certificate authority with `id`, if it holds one.
     pub fn certificate_authority(&self, id: &str) -> Option<&CertificateAuthorityRecord> {
         self.certificate_authorities.get(id)
+    }
+
+    /// "An object identifying the certificate authority that is currently signing
+    /// certificates for the cluster" (`Certificate$active`).
+    ///
+    /// DERIVED from the certificate-authority records rather than stored beside
+    /// them, so the cluster and `DescribeCertificateAuthority` can never disagree
+    /// about which CA signs: an activation moves the signing status on the records
+    /// and this follows. `None` while no record signs, which is what a cluster
+    /// with no Amazon EKS control plane behind it reports.
+    pub fn active_certificate_authority(&self) -> Option<ActiveCertificateAuthority> {
+        self.certificate_authorities
+            .values()
+            .find(|authority| authority.signing_status == CA_SIGNING_IN_USE)
+            .map(|authority| ActiveCertificateAuthority {
+                id: Some(authority.id.clone()),
+                activated_by: authority.activated_by.clone(),
+            })
     }
 
     /// The same record, mutably, so the operation that reports a CA can first

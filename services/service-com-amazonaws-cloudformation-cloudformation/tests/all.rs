@@ -61,6 +61,8 @@ mod iam_capability_gate;
 mod include_transform;
 #[path = "all/list_change_sets.rs"]
 mod list_change_sets;
+#[path = "all/list_stack_instances.rs"]
+mod list_stack_instances;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
 #[path = "all/list_types.rs"]
