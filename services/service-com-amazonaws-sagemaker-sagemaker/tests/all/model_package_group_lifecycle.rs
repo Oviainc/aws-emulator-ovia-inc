@@ -13,8 +13,8 @@
 //! optional member, `ArnOrName` addressing for the reader, the refusal of a name already
 //! in use, the refusal of a name no group is stored under, the stability of a read, and
 //! — for the delete — that it removes exactly the group it names, refuses a group that
-//! still holds registered model package versions, and refuses a name no group is stored
-//! under.
+//! still holds registered model package versions, succeeds once `DeleteModelPackage` has
+//! removed them, and refuses a name no group is stored under.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -695,6 +695,18 @@ async fn deleting_a_group_that_still_holds_model_package_versions_is_refused() {
                 "case {case}: the refusal must name the group, got {:?}",
                 message(&refused)
             );
+            // The whole message, which is the same for every row: the resolved group ARN
+            // and the fixed clause. The number of versions the group holds differs across
+            // the rows and appears in none of them — a count is not part of this refusal,
+            // and the group's contents are what the model package readers report.
+            assert_eq!(
+                message(&refused),
+                format!(
+                    "Model Package Group {arn} cannot be deleted because it still contains \
+                     Model Packages."
+                ),
+                "case {case}: the refusal's message, got {refused:?}"
+            );
 
             let after = emulator
                 .ok(
@@ -721,6 +733,58 @@ async fn deleting_a_group_that_still_holds_model_package_versions_is_refused() {
                     "case {case}: version {version} must still be registered, got {package:?}"
                 );
             }
+
+            // What blocked the delete was the versions, so the SAME call succeeds once
+            // they are deleted — and the last version is what releases the group, so the
+            // delete is retried after each one rather than only at the end.
+            for version in 1..=versions {
+                emulator
+                    .ok(
+                        "DeleteModelPackage",
+                        &json!({ "ModelPackageName": format!("versioned/{version}") }),
+                    )
+                    .await;
+                // The version is really gone: its reader refuses it.
+                let (status, gone) = emulator
+                    .call(
+                        "DescribeModelPackage",
+                        &json!({ "ModelPackageName": format!("versioned/{version}") }),
+                    )
+                    .await;
+                assert_eq!(
+                    (status, error_code(&gone).as_str()),
+                    (400, "ValidationException"),
+                    "case {case}: version {version} must be gone, got {status} with {gone}"
+                );
+
+                let (status, answer) = emulator
+                    .call(
+                        "DeleteModelPackageGroup",
+                        &json!({
+                            "ModelPackageGroupName": address.identifier("versioned", &arn),
+                        }),
+                    )
+                    .await;
+                let last = version == versions;
+                assert_eq!(
+                    status == 200,
+                    last,
+                    "case {case}: after deleting {version} of {versions} versions the group \
+                     delete must {} , got {status} with {answer}",
+                    if last { "succeed" } else { "still be refused" }
+                );
+            }
+            let (status, gone) = emulator
+                .call(
+                    "DescribeModelPackageGroup",
+                    &json!({ "ModelPackageGroupName": "versioned" }),
+                )
+                .await;
+            assert_eq!(
+                (status, error_code(&gone).as_str()),
+                (400, "ValidationException"),
+                "case {case}: the emptied group is deleted, got {status} with {gone}"
+            );
         }
     }
 }
