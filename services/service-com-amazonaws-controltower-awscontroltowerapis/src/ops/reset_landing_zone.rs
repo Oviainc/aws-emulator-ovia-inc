@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetLandingZone
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetLandingZone`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetLandingZone::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ResetLandingZone` re-deploys the landing zone's own configuration, exactly as its
+//! manifest already describes it, through an asynchronous operation the caller tracks by
+//! the `operationIdentifier` this call returns.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetLandingZone` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetLandingZoneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetLandingZone"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResetLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(arn) = store.resolve_landing_zone_arn(&input.landing_zone_identifier) else {
+            return Err(ResetLandingZoneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no landing zone matches landingZoneIdentifier {}",
+                        input.landing_zone_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Resetting a landing zone whose own asynchronous operation has not finished would
+        // leave it in an inconsistent state, which is what `ConflictException` reports —
+        // the same rule an update and a delete are held to, because it is a property of
+        // the landing zone rather than of one call.
+        if store.has_operation_in_flight(&arn) {
+            return Err(ResetLandingZoneErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "landing zone {arn} has an operation in progress; resetting it now \
+                         would leave it in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `resolve_landing_zone_arn` only answers with a key this map holds, so the lookup
+        // cannot miss; the modelled server error stands in for a panic.
+        let Some(landing_zone) = store.landing_zones.get_mut(&arn) else {
+            return Err(ResetLandingZoneErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("landing zone {arn} resolved to no stored record"),
+                },
+            )
+            .into());
+        };
+
+        // A reset re-deploys the configuration the landing zone's manifest already
+        // describes and changes nothing in it, so the configuration this operation queues
+        // is the DEPLOYED one: `version`, `manifest` and `remediationTypes` read the same
+        // before and after. What the deployment settles is drift — once the configuration
+        // the manifest describes is deployed again, the landing zone matches it — and the
+        // deployment is asynchronous, so that is due only when the clock makes it due,
+        // exactly as the configuration an update queues is.
+        landing_zone.pending_configuration = Some(crate::state::PendingLandingZoneConfiguration {
+            version: landing_zone.version.clone(),
+            manifest: landing_zone.manifest.clone(),
+            remediation_types: landing_zone.remediation_types.clone(),
+            drift_status: Some(crate::state::LandingZoneDriftStatus::InSync),
+            due_at: now + crate::state::OPERATION_SETTLE_AFTER,
+        });
+        // The landing zone is PROCESSING until the operation recorded below is due; the
+        // status is derived from the log by `settle`, and seeded to match here.
+        landing_zone.status = crate::state::LandingZoneStatus::Processing;
+
+        let operation_identifier =
+            store.record_operation(crate::state::LandingZoneOperationType::Reset, &arn, now);
+
+        Ok(ResetLandingZoneOutput {
+            operation_identifier,
+        })
     }
 }

@@ -324,8 +324,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             map_run_arn: None,
             error: execution.error.clone(),
             cause: execution.cause.clone(),
-            state_machine_version_arn: None,
-            state_machine_alias_arn: None,
+            // The alias and version the start was made through, which the execution
+            // record carries: "the alias ARN is a combination of state machine ARN
+            // and the alias name" and the version ARN "a combination of state machine
+            // ARN and the version number", and each is null for an execution started
+            // without one.
+            state_machine_version_arn: execution.state_machine_version_arn.clone(),
+            state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
             redrive_count: Some(execution.redrive_count),
             redrive_date: execution.redrive_date.map(crate::state::to_date_time),
             redrive_status: Some(redrive_status),

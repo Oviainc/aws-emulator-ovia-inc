@@ -220,18 +220,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone with it — the same step every handler that touches `workflows` takes.
         store.reap_deleted_workflows(now);
 
-        // The cursor is the `WorkflowVersion` of the last item on the previous page.
-        // Decoded BEFORE the workflow lookup so a foreign token is one refusal whatever
-        // the ARN resolves to.
-        let after = match input.next_token.as_deref() {
+        // The cursor is the APPEND POSITION of the last item on the previous page
+        // (`crate::state::WorkflowVersionRecord::sequence`) scoped to the workflow it was
+        // issued for, not the identifier of the version that sat there: a version removed
+        // between pages therefore leaves the cursor resolving to the same place in the
+        // remaining history instead of nowhere. Decoded BEFORE the workflow lookup so a
+        // foreign token is one refusal whatever the ARN resolves to.
+        let after: Option<u64> = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(
-                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+            Some(token) => {
+                let refused = || {
                     ListWorkflowVersionsErrorModeled::ValidationException(
                         crate::state::invalid_page_token("ListWorkflowVersions"),
                     )
-                })?,
-            ),
+                };
+                let key = crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(refused)?;
+                let (sequence, scope) =
+                    crate::state::parse_version_listing_key(&key).ok_or_else(refused)?;
+                // A cursor minted while walking ANOTHER workflow's versions was not issued
+                // for this walk: its position means nothing in this history, so honouring
+                // it would silently restart or truncate the listing.
+                if scope != input.workflow_arn {
+                    return Err(refused().into());
+                }
+                Some(sequence)
+            }
         };
 
         // The entity this listing walks is the workflow its `@httpLabel` names: one the
@@ -260,39 +273,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(0)
             .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
 
-        // A version is immutable and is never removed on its own — it goes only with the
-        // workflow that holds it — so the cursor's version still occupies the same place
-        // in the history on the next call, and resuming just after it neither repeats nor
-        // skips an entry. A cursor naming a version THIS workflow does not hold was
-        // therefore not issued for this listing, and is refused like any other foreign
-        // token rather than silently restarting or truncating the walk.
-        let start = match after.as_deref() {
+        // The versions are held in append order, which is also increasing `sequence`
+        // order, so the walk resumes at the first version appended AFTER the cursor's
+        // position. Resuming by position rather than by locating the cursor's own entry is
+        // what keeps a token the service issued usable over the versions that REMAIN: a
+        // version deleted between pages simply no longer appears, and none of the others
+        // is repeated or skipped. A cursor past every remaining version is the end of the
+        // walk — an empty page, not a refusal.
+        let start = match after {
             None => 0,
-            Some(last) => workflow
+            Some(cursor) => workflow
                 .versions
                 .iter()
-                .position(|record| record.version == last)
-                .map(|index| index + 1)
-                .ok_or_else(|| {
-                    ListWorkflowVersionsErrorModeled::ValidationException(
-                        crate::state::invalid_page_token("ListWorkflowVersions"),
-                    )
-                })?,
+                .position(|record| record.sequence > cursor)
+                .unwrap_or(workflow.versions.len()),
         };
 
         let remaining = &workflow.versions[start..];
-        let workflow_versions: Vec<WorkflowVersionSummary> = remaining
-            .iter()
-            .take(page_size)
-            .map(|record| summarize(workflow, record))
-            .collect();
+        let page = &remaining[..page_size.min(remaining.len())];
+        let workflow_versions: Vec<WorkflowVersionSummary> =
+            page.iter().map(|record| summarize(workflow, record)).collect();
 
         // A token only when a further page exists, so a client stops without an extra
-        // empty round trip.
-        let next_token = match workflow_versions.last() {
-            Some(last) if remaining.len() > workflow_versions.len() => Some(
-                crate::state::encode_page_token(PAGE_KIND, &last.workflow_version),
-            ),
+        // empty round trip. It carries the position of the last version on this page, so
+        // the next page resumes immediately after it.
+        let next_token = match page.last() {
+            Some(last) if remaining.len() > page.len() => Some(crate::state::encode_page_token(
+                PAGE_KIND,
+                &crate::state::format_version_listing_key(&workflow.arn, last.sequence),
+            )),
             _ => None,
         };
 

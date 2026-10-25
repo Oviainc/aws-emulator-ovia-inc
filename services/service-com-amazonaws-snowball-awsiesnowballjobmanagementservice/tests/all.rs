@@ -29,6 +29,8 @@ mod cluster_updates;
 mod export_job_parts;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_manifest.rs"]
+mod job_manifest;
 #[path = "all/job_order_validation.rs"]
 mod job_order_validation;
 #[path = "all/job_unlock_code.rs"]

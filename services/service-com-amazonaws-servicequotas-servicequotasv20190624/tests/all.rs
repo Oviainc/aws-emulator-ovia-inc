@@ -29,6 +29,8 @@ mod quota_workflow;
 mod quotas_catalog;
 #[path = "all/requested_change_history.rs"]
 mod requested_change_history;
+#[path = "all/resource_quota_context.rs"]
+mod resource_quota_context;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

@@ -47,3 +47,5 @@ mod onboarding_job_deletion;
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_rules.rs"]
+mod tag_key_rules;

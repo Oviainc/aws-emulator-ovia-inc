@@ -39,6 +39,8 @@ mod list_devices;
 mod list_user_pools;
 #[path = "all/resource_server_lifecycle.rs"]
 mod resource_server_lifecycle;
+#[path = "all/self_service_sign_up.rs"]
+mod self_service_sign_up;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]

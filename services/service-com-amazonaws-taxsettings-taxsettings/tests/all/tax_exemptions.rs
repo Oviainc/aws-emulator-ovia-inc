@@ -770,7 +770,7 @@ async fn reading_exemptions_changes_nothing() {
 
 /// A certificate file to submit: `documentFile` is a blob, which restJson1
 /// carries base64-encoded.
-fn certificate(document_name: &str) -> Value {
+pub(crate) fn certificate(document_name: &str) -> Value {
     json!({
         "documentName": document_name,
         "documentFile": ::aws_smithy_types::base64::encode("%PDF-1.4 exemption certificate"),

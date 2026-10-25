@@ -70,7 +70,10 @@ fn text(case: &str, body: &Value, member: &str) -> String {
 /// The message an error body carries. The framework's own refusal envelope spells the
 /// member `message`; this service's modelled errors spell it `Message` — both are read,
 /// so a refusal cannot hide from these tests by travelling through the other channel.
-fn message_of(body: &Value) -> String {
+///
+/// Shared with `tests/all/amend_terminal_refusal.rs`, which reads an amendment refusal's
+/// message the same way.
+pub(crate) fn message_of(body: &Value) -> String {
     body["message"]
         .as_str()
         .or(body["Message"].as_str())

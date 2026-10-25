@@ -23,6 +23,9 @@ mod application_component_details;
 #[path = "all/assessment_error_paths.rs"]
 mod assessment_error_paths;
 
+#[path = "all/declared_error_surface.rs"]
+mod declared_error_surface;
+
 #[path = "all/enum_membership.rs"]
 mod enum_membership;
 

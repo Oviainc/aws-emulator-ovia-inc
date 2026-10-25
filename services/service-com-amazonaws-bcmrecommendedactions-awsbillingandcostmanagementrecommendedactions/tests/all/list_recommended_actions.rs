@@ -747,46 +747,32 @@ async fn every_refused_member_is_stated_with_a_reason_and_a_field_list() {
     emulator.seed(fixture());
 
     // Each row is a refused input and the member path(s) the refusal must name.
-    // The class spans every way one request member can be refused — a value outside
-    // the enum its filter key names (near-misses in case, spelling and
-    // pluralisation), an unmodelled `key` or `matchOption`, a `values` list shorter
-    // than its modelled minimum, a `maxResults` outside its modelled range, and an
-    // absent required member — found at the constraint boundary or in the handler
-    // alike. Paths are the dotted, 1-based spelling the service's validator uses
+    // The class spans every way one request member can be refused — an unmodelled
+    // `key` or `matchOption` (both target enum shapes, so the model closes their
+    // value sets), a `values` list shorter than its modelled minimum, a `values`
+    // ELEMENT outside the modelled length of `FilterValue` (1..1024), a `maxResults`
+    // outside its modelled range, and an absent required member — found at the
+    // constraint boundary or in the handler alike. A `values` element that is simply
+    // not a value any record carries is NOT in this class: it is compared, not
+    // validated (see
+    // `a_filter_value_outside_a_records_value_set_matches_nothing_rather_than_failing`).
+    // Paths are the dotted, 1-based spelling the service's validator uses
     // (`filter.actions.1.member.key`).
+    let too_long = "x".repeat(1025);
     let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        // `FilterValue` is modelled `length: {min: 1, max: 1024}`
+        // (`smithy_query(query="shape", shape="FilterValue")`).
         (
-            "FEATURE with a lowercase member",
+            "a values element past the modelled maximum length",
             json!({"filter": {"actions": [
-                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["budgets"]}
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": [too_long]}
             ]}}),
             vec!["filter.actions.1.member.values.1.member"],
         ),
         (
-            "FEATURE with a value from another enum",
+            "an empty values element",
             json!({"filter": {"actions": [
-                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["CRITICAL"]}
-            ]}}),
-            vec!["filter.actions.1.member.values.1.member"],
-        ),
-        (
-            "SEVERITY with an unmodelled level",
-            json!({"filter": {"actions": [
-                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["SEVERE"]}
-            ]}}),
-            vec!["filter.actions.1.member.values.1.member"],
-        ),
-        (
-            "TYPE with a pluralised member",
-            json!({"filter": {"actions": [
-                {"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGETS"]}
-            ]}}),
-            vec!["filter.actions.1.member.values.1.member"],
-        ),
-        (
-            "one bad value beside a good one",
-            json!({"filter": {"actions": [
-                {"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGET", "CREATE_BUDGETS"]}
+                {"key": "TYPE", "matchOption": "EQUALS", "values": ["CREATE_BUDGET", ""]}
             ]}}),
             vec!["filter.actions.1.member.values.2.member"],
         ),
@@ -931,30 +917,212 @@ async fn a_refusal_names_at_most_the_capped_number_of_members() {
     // so a request-chosen list length must not grow the response without bound. The
     // ceiling is the boundary validator's own (`MAX_VIOLATIONS` = 100 in
     // vendor/smithy-schema-server/src/constraints.rs), so both refusal paths bound
-    // alike.
+    // alike. `ActionFilterList` is modelled with no maximum length
+    // (`smithy_query(query="shape", shape="ActionFilterList")`), so a list of filters
+    // each naming an unmodelled `key` is the length a caller can grow freely.
     const MAX_VIOLATIONS: usize = 100;
     for count in [1_usize, 2, 99, 100, 101, 500] {
-        let values: Vec<String> = (0..count).map(|i| format!("NOT_A_MEMBER_{i}")).collect();
+        let filters: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({
+                    "key": format!("NOT_A_FILTER_KEY_{index}"),
+                    "matchOption": "EQUALS",
+                    "values": ["BUDGETS"],
+                })
+            })
+            .collect();
         let (status, body) = emulator
-            .list(&json!({"filter": {"actions": [
-                {"key": "TYPE", "matchOption": "EQUALS", "values": values}
-            ]}}))
+            .list(&json!({"filter": {"actions": filters}}))
             .await;
         assert_eq!(
             status, 400,
-            "case {count} bad values: expected HTTP 400, got {status} with {body}"
+            "case {count} bad keys: expected HTTP 400, got {status} with {body}"
         );
         let fields = body
             .get("fieldList")
             .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("case {count} bad values: expected a fieldList, got {body}"));
+            .unwrap_or_else(|| panic!("case {count} bad keys: expected a fieldList, got {body}"));
         assert_eq!(
             fields.len(),
             count.min(MAX_VIOLATIONS),
-            "case {count} bad values: expected at most {MAX_VIOLATIONS} named members, got {}",
+            "case {count} bad keys: expected at most {MAX_VIOLATIONS} named members, got {}",
             fields.len()
         );
     }
+}
+
+#[tokio::test]
+async fn a_filter_value_outside_a_records_value_set_matches_nothing_rather_than_failing() {
+    let emulator = Emulator::empty();
+    emulator.seed(fixture());
+    let all = fixture_ids();
+
+    // `ActionFilter$values` targets `FilterValues`, whose member `FilterValue` is a
+    // plain string (`length {min:1,max:1024}`, pattern `[\S\s]*`) —
+    // `smithy_query(query="shape", shape="ActionFilter,FilterValues,FilterValue")`.
+    // The model closes no value set over it, so a value is COMPARED against each
+    // record's field: one no record carries keeps nothing under `EQUALS` and
+    // excludes nothing under `NOT_EQUALS`. The rows vary along what the rule
+    // generalises over: the filter key (every `FilterName` member), the form of the
+    // unmatched value (a near-miss in case, a value drawn from another of this
+    // service's enums, a typo, a pluralisation, whitespace, a maximum-length
+    // string), and how many values one filter carries.
+    let at_max_length = "D".repeat(1024);
+    let unmatched: Vec<(&str, &str, Vec<String>)> = vec![
+        (
+            "a severity no record has",
+            "SEVERITY",
+            vec!["EXTREME".to_string()],
+        ),
+        (
+            "a lower-cased severity",
+            "SEVERITY",
+            vec!["critical".to_string()],
+        ),
+        (
+            "a mixed-case severity",
+            "SEVERITY",
+            vec!["Critical".to_string()],
+        ),
+        (
+            "a feature spelled with spaces",
+            "FEATURE",
+            vec!["COST ANOMALY DETECTION".to_string()],
+        ),
+        (
+            "a feature value drawn from another enum",
+            "FEATURE",
+            vec!["CRITICAL".to_string()],
+        ),
+        (
+            "a pluralised action type",
+            "TYPE",
+            vec!["CREATE_BUDGETS".to_string()],
+        ),
+        (
+            "an action type as a bare word",
+            "TYPE",
+            vec!["budget".to_string()],
+        ),
+        ("a single space", "TYPE", vec![" ".to_string()]),
+        (
+            "a value at the modelled maximum length",
+            "FEATURE",
+            vec![at_max_length],
+        ),
+        (
+            "several unmatched values at once",
+            "SEVERITY",
+            vec![
+                "EXTREME".to_string(),
+                "severe".to_string(),
+                "0".to_string(),
+            ],
+        ),
+        (
+            "a feature the model publishes that no stored record carries",
+            "FEATURE",
+            vec!["TAX_SETTINGS".to_string()],
+        ),
+    ];
+
+    for (case, key, values) in unmatched {
+        // EQUALS over values nothing carries keeps no record, and says so with 200.
+        let (status, body) = emulator
+            .list(&json!({"filter": {"actions": [
+                {"key": key, "matchOption": "EQUALS", "values": values}
+            ]}}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} EQUALS: expected HTTP 200, got {status} with {body}"
+        );
+        let kept = ids_of(case, &body);
+        assert!(
+            kept.is_empty(),
+            "case {case:?} EQUALS: expected no record kept, got {kept:?}"
+        );
+        assert!(
+            body.get("nextToken").is_none(),
+            "case {case:?} EQUALS: an empty page owes no nextToken, got {body}"
+        );
+
+        // NOT_EQUALS is its complement: every stored record, since none matched.
+        let (status, body) = emulator
+            .list(&json!({"filter": {"actions": [
+                {"key": key, "matchOption": "NOT_EQUALS", "values": values}
+            ]}}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} NOT_EQUALS: expected HTTP 200, got {status} with {body}"
+        );
+        let excluded = ids_of(case, &body);
+        assert_eq!(
+            excluded, all,
+            "case {case:?} NOT_EQUALS: expected every stored record {all:?}, got {excluded:?}"
+        );
+    }
+
+    // An unmatched value contributes no match; it does not poison the filter it sits
+    // in nor the conjunction the filter sits in.
+    let mixed: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "one filter mixing a matched and an unmatched value",
+            json!([{"key": "SEVERITY", "matchOption": "EQUALS", "values": ["CRITICAL", "EXTREME"]}]),
+            vec!["ra-budget-exceeded", "ra-payment-due"],
+        ),
+        (
+            "NOT_EQUALS over a matched and an unmatched value",
+            json!([{"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["CRITICAL", "EXTREME"]}]),
+            vec![
+                "ra-budget-create",
+                "ra-freetier-usage",
+                "ra-iam-granular",
+                "ra-anomaly-review",
+            ],
+        ),
+        (
+            "an unmatched EQUALS filter ANDed with a matching one",
+            json!([
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]},
+                {"key": "SEVERITY", "matchOption": "EQUALS", "values": ["EXTREME"]},
+            ]),
+            vec![],
+        ),
+        (
+            "an unmatched NOT_EQUALS filter ANDed with a matching one",
+            json!([
+                {"key": "FEATURE", "matchOption": "EQUALS", "values": ["BUDGETS"]},
+                {"key": "SEVERITY", "matchOption": "NOT_EQUALS", "values": ["EXTREME"]},
+            ]),
+            vec!["ra-budget-create", "ra-budget-exceeded"],
+        ),
+    ];
+
+    for (case, filters, expected) in mixed {
+        let (status, body) = emulator
+            .list(&json!({"filter": {"actions": filters}}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        let kept = ids_of(case, &body);
+        assert_eq!(
+            kept, expected,
+            "case {case:?}: expected exactly {expected:?}, got {kept:?}"
+        );
+    }
+
+    // A listing stays a pure read: no row above added, dropped or rewrote a record.
+    let held = emulator.stored_count();
+    assert_eq!(
+        held,
+        all.len(),
+        "case \"unmatched filter values\": expected the store to still hold {} records, got {held}",
+        all.len()
+    );
 }
 
 #[tokio::test]

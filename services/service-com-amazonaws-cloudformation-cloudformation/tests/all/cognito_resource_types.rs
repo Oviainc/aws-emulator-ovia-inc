@@ -27,10 +27,14 @@
 //! model's own namespace spelling — so admitting the published set is not admitting
 //! `AWS::Cognito::<anything>`.
 //!
-//! None of these types has a provisioner, so each is declared-only
+//! Most of these types have no provisioner, so each is declared-only
 //! (`unprovisioned_resources.rs` pins that: nothing is called in the owning service and the
-//! stack completes). What this suite asserts is only what the rule is about — that a
-//! template may DECLARE the type at all.
+//! stack completes). The one that DOES — `AWS::Cognito::UserPoolGroup`, which is created
+//! through the owning service's own `CreateGroup` — cannot be created from a declaration
+//! that states none of its properties, because the pool a group belongs to is one of them:
+//! such a row's stack FAILS, naming the property the type requires. What this suite asserts
+//! either way is only what the rule is about — that a template may DECLARE the type at all,
+//! and that the declared resource is recorded under the type it declared.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
@@ -89,6 +93,24 @@ const PUBLISHED: &[&str] = &[
     // AdminAddUserToGroup (cognito-idp)
     "AWS::Cognito::UserPoolUserToGroupAttachment",
 ];
+
+/// The published types this emulator PROVISIONS in their owning service, each with the
+/// property its create cannot be made without — the reason a property-free declaration of
+/// one fails rather than completing.
+///
+/// A group is identified by the pair `(UserPoolId, GroupName)`, so a declaration naming no
+/// pool describes no group `CreateGroup` could make: the provisioner refuses it, naming
+/// that property, rather than sending a request the owning service would reject.
+const REQUIRES_A_PROPERTY: &[(&str, &str)] = &[("AWS::Cognito::UserPoolGroup", "UserPoolId")];
+
+/// The property a property-free declaration of `resource_type` cannot be created without,
+/// or `None` for a type this emulator leaves declared-only.
+fn required_property_of(resource_type: &str) -> Option<&'static str> {
+    REQUIRES_A_PROPERTY
+        .iter()
+        .find(|(declared, _)| *declared == resource_type)
+        .map(|(_, property)| *property)
+}
 
 /// The stack name a one-resource stack for `resource_type` is created under: the type's
 /// last segment, lower-cased, which is inside a stack name's own alphabet.
@@ -168,12 +190,37 @@ async fn every_published_cognito_type_may_be_declared_and_is_recorded() {
             "case {resource_type:?}: expected DescribeStacks to report the created stack, \
              got {status_code} with body {body}"
         );
-        assert_eq!(
-            xml_text(&body, "StackStatus").as_deref(),
-            Some(status::CREATE_COMPLETE),
-            "case {resource_type:?}: expected the stack to reach {:?}, got body {body}",
-            status::CREATE_COMPLETE
-        );
+        match required_property_of(resource_type) {
+            // A type this emulator really creates, declared with none of its properties:
+            // the owning service's create cannot be made, so the stack fails naming the
+            // property the type requires rather than reporting a resource nothing created.
+            Some(property) => {
+                assert_eq!(
+                    xml_text(&body, "StackStatus").as_deref(),
+                    Some(status::CREATE_FAILED),
+                    "case {resource_type:?}: expected the stack to reach {:?}, got body {body}",
+                    status::CREATE_FAILED
+                );
+                let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+                assert!(
+                    reason.contains(property),
+                    "case {resource_type:?}: expected the failure to name the required \
+                     property {property:?}, got {reason:?}"
+                );
+                // Nothing was created for it, and a stack whose deployment did not
+                // complete installs no resource records, so there is no resource to read
+                // back here — the admitting half of the rule (the submission was accepted
+                // and the deployment named this very type) is what the assertions above
+                // carry for such a row.
+                continue;
+            }
+            None => assert_eq!(
+                xml_text(&body, "StackStatus").as_deref(),
+                Some(status::CREATE_COMPLETE),
+                "case {resource_type:?}: expected the stack to reach {:?}, got body {body}",
+                status::CREATE_COMPLETE
+            ),
+        }
 
         let (status_code, body) = resources_of(&router, &stack_name).await;
         assert_eq!(

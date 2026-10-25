@@ -8,8 +8,10 @@
 //!
 //! * an unknown `ServiceCode`, or a `QuotaCode` the service has no quota for, is
 //!   `NoSuchResourceException`;
-//! * `QuotaAppliedAtLevel` keeps the quotas applied at that level — `ALL` keeps every
-//!   one, since a quota applied at any level is applied at all of them;
+//! * `QuotaAppliedAtLevel` picks the plane the listing reports: `ACCOUNT` (the
+//!   default when the caller names none) lists one account-wide record per quota,
+//!   `RESOURCE` lists one record per resource context a value has been applied to,
+//!   and `ALL` lists both;
 //! * `MaxResults` / `NextToken` page the listing, and a token this service did not
 //!   issue is `InvalidPaginationTokenException`. `MaxResults` "defaults to a value
 //!   appropriate to the operation", so a caller that names none is served
@@ -149,13 +151,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            codes
-                .into_iter()
-                .filter_map(|code| {
-                    quotas_state.applied_quota_view(&region, &input.service_code, &code)
-                })
-                .filter(|quota| applied_at_level(quota, input.quota_applied_at_level.as_deref()))
-                .collect::<Vec<_>>()
+            let level = input.quota_applied_at_level.as_deref();
+            let mut quotas: Vec<ServiceQuota> = Vec::new();
+            // ACCOUNT is the level this listing reports when the caller names none.
+            if level.is_none_or(|level| {
+                level == crate::state::LEVEL_ACCOUNT || level == crate::state::LEVEL_ALL
+            }) {
+                quotas.extend(codes.iter().filter_map(|code| {
+                    quotas_state.applied_quota_view(&region, &input.service_code, code, None)
+                }));
+            }
+            if level.is_some_and(|level| {
+                level == crate::state::LEVEL_RESOURCE || level == crate::state::LEVEL_ALL
+            }) {
+                for code in &codes {
+                    for context in
+                        quotas_state.applied_contexts(&region, &input.service_code, code)
+                    {
+                        quotas.extend(quotas_state.applied_quota_view(
+                            &region,
+                            &input.service_code,
+                            code,
+                            Some(&context),
+                        ));
+                    }
+                }
+            }
+            quotas
         };
 
         let page = crate::state::paginate(
@@ -178,17 +200,5 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quotas: Some(page.items),
             next_token: page.next_token,
         })
-    }
-}
-
-/// Whether a quota belongs in a listing filtered to `requested` level.
-///
-/// `ALL` is the level that covers every other one, so it keeps the whole listing; any
-/// other value keeps the quotas applied at exactly that level.
-fn applied_at_level(quota: &ServiceQuota, requested: Option<&str>) -> bool {
-    match requested {
-        None => true,
-        Some(level) if level == crate::state::LEVEL_ALL => true,
-        Some(level) => quota.quota_applied_at_level.as_deref() == Some(level),
     }
 }

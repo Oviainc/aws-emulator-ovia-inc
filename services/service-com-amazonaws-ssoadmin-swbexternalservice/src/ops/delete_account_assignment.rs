@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccountAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccountAssignment`'s real behaviour — EXCEPT on an
-//! account instance of IAM Identity Center, where account assignments do not exist at
-//! all and the handler answers the modelled `ValidationException` (400) that AWS refuses
-//! the whole permission-set / account-assignment surface with. Implement the rest here
-//! — this is
+//! Deletes a principal's access to one account through one permission set: the
+//! assignment the request's (instance, account, permission set, principal type,
+//! principal id) tuple names is removed from state and the deletion's status is stored
+//! under a freshly minted `RequestId`, which
+//! [`crate::ops::describe_account_assignment_deletion_status`] reads back. On an account
+//! instance of IAM Identity Center, where account assignments do not exist at all, the
+//! handler answers the modelled `ValidationException` (400) that AWS refuses the whole
+//! permission-set / account-assignment surface with. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccountAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,13 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ONE answer of this operation is real: the ACCOUNT-INSTANCE restriction. Account
-        // assignments are a feature of an organization instance, so on an account
-        // instance this call can never do anything and AWS refuses it with the modelled
-        // `ValidationException` (400) — a 501 would claim "nobody has written this yet"
-        // about a request that is permanently refused. Everything else about
-        // `DeleteAccountAssignment` IS still unwritten, so it keeps the SCAFFOLDED
-        // marker and its 501 below.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteAccountAssignmentErrorModeled::InternalServerException(
                 InternalServerException {
@@ -193,19 +182,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let withdrawn = {
-            let mut store = state.lock();
-            // The account's ambient instance if nothing has enabled one yet, and what the
-            // clock already owes, so this call resolves the same instance a read at this
-            // instant would resolve.
-            store.on_request(
-                &crate::state::request_region(ctx.parts()),
-                ::std::time::SystemTime::now(),
-            );
-            store.permission_set_surface_withdrawn(&input.instance_arn)
-        };
-        if withdrawn
-        {
+        let region = crate::state::request_region(ctx.parts());
+        // ONE instant for the whole call: the instance resolution below and the deletion's
+        // own `CreatedDate` are the same moment, so the stored status cannot be dated
+        // before or after the state it describes.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, plus the account's ambient instance
+        // if nothing has enabled one yet, so this delete resolves the same instance a read
+        // at this instant would resolve.
+        store.on_request(&region, now);
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
+        // assignments are a feature of an organization instance, so on an account
+        // instance none can ever exist and the refusal does not depend on whether this
+        // request's assignment does. An ARN this account holds no instance for is NOT
+        // this refusal — it falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
             return Err(DeleteAccountAssignmentErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(
@@ -218,15 +211,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // Implement `DeleteAccountAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccountAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccountAssignment"))
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No instance found with the ARN {}",
+                        input.instance_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        if store
+            .permission_set(&input.instance_arn, &input.permission_set_arn)
+            .is_none()
+        {
+            return Err(DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No permission set found with the ARN {}",
+                        input.permission_set_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The assignment's identity is the whole (instance, account, permission set,
+        // principal type, principal id) tuple, and a delete is not idempotent on a
+        // resource that is not there: an access that was never granted has nothing to
+        // withdraw, so it is the same 404 a second delete of the same tuple gets, never a
+        // 200 claiming an access was removed.
+        let Some(position) = store.assignment_position(
+            &input.instance_arn,
+            &input.target_id,
+            &input.permission_set_arn,
+            &input.principal_type,
+            &input.principal_id,
+        ) else {
+            return Err(DeleteAccountAssignmentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::account_assignment_not_found_message(
+                        &input.target_id,
+                        &input.permission_set_arn,
+                        &input.principal_type,
+                        &input.principal_id,
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        // A freshly minted `RequestId` cannot already belong to another assignment
+        // operation, creation or deletion. Minted and checked BEFORE anything is removed,
+        // so every fallible step of this handler runs while the store is still
+        // unmodified: a failure here cannot leave an access withdrawn with no deletion
+        // status to read.
+        let request_id = crate::state::mint_request_id();
+        if store.assignment_request_id_taken(&request_id) {
+            return Err(DeleteAccountAssignmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the minted RequestId collided with a stored one".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The status this deletion reports is built from the REMOVED record, so what the
+        // call answers describes the access that was actually withdrawn rather than the
+        // request's own members.
+        let removed = store.account_assignments.remove(position);
+        // The creation status of that assignment goes with it: a status record reports on
+        // one assignment, so keeping it after the assignment is gone would report work on
+        // a resource no reader can see — the same rule `DeletePermissionSet` applies to
+        // the assignments it removes.
+        store.assignment_operations.remove(&removed.request_id);
+        store.record_assignment_deletion(crate::state::AssignmentOperationRecord {
+            request_id: request_id.clone(),
+            instance_arn: input.instance_arn.clone(),
+            // Nothing fails an assignment operation here, so the status walks
+            // `IN_PROGRESS` to `SUCCEEDED` and never carries a failure message.
+            failure_reason: None,
+            target_id: removed.account_id,
+            target_type: removed.target_type,
+            permission_set_arn: removed.permission_set_arn,
+            principal_type: removed.principal_type,
+            principal_id: removed.principal_id,
+            // When this deletion operation was accepted, which is what
+            // `AccountAssignmentOperationStatus$CreatedDate` reports of it.
+            created_date: ::aws_smithy_types::DateTime::from(now),
+            // The operation is accepted NOW and completes one span from now — the same
+            // span a creation operation takes, since the status walk is the API's, not
+            // this operation's; the status is DERIVED from this instant, so no later call
+            // has to write to move it on.
+            succeeded_due: now + crate::state::ASSIGNMENT_OPERATION_SPAN,
+        });
+        // Answer from the STORED status record, so a later
+        // `DescribeAccountAssignmentDeletionStatus` of this `RequestId` cannot disagree
+        // with what this call reported. The TRACKING view, as `CreateAccountAssignment`
+        // answers with: a caller holding the whole request already knows the assignment
+        // it asked to withdraw, and what it does not yet know is the handle to poll.
+        let stored = store
+            .assignment_deletion(&input.instance_arn, &request_id)
+            .ok_or_else(|| {
+                DeleteAccountAssignmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the stored deletion-status record could not be read".to_string(),
+                        ),
+                    },
+                )
+            })?;
+        Ok(DeleteAccountAssignmentOutput {
+            account_assignment_deletion_status: Some(stored.to_tracking_shape(now)),
+        })
     }
 }

@@ -31,8 +31,9 @@ use crate::ops::types::{
     AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
-    NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet,
-    SupportedOperation, SupportedPlatform, UpdateTarget, VpcEndpoint, VpcSecurityGroupMembership,
+    NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
+    ReservedNodeOffering, Snapshot, Subnet, SupportedOperation, SupportedPlatform, UpdateTarget,
+    VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -848,6 +849,216 @@ pub fn published_account_attributes() -> Vec<AccountAttribute> {
     )]
 }
 
+/// The currency every price in the reserved-node catalog is quoted in.
+pub const RESERVED_NODE_CURRENCY_CODE: &str = "USD";
+
+/// The `RecurringChargeFrequency` a reserved node offering's recurring charge is
+/// applied at: once per hour of the term.
+pub const RECURRING_CHARGE_FREQUENCY_HOURLY: &str = "Hourly";
+
+/// Every term a reserved node offering is published for, as
+/// `(duration in seconds, share of the on-demand rate the term is charged at)`,
+/// shortest term first.
+///
+/// `Duration` is "The duration, in seconds, for which the offering will reserve
+/// the node" (`smithy_query(query="shape", shape="ReservedNodeOffering")`), and
+/// a term is one dimension of a reservation's configuration — "(term, payment
+/// type, or number of nodes)" (`smithy_query(query="doc",
+/// shape="AcceptReservedNodeExchange")`). The two terms are a one-year and a
+/// three-year commitment of 365-day years, and the longer commitment is charged
+/// at the lower share; both the terms and the shares are this emulator's own
+/// published catalog, the model publishing no list of either.
+pub const RESERVED_NODE_TERMS: [(i32, f64); 2] = [(31_536_000, 0.70), (94_608_000, 0.45)];
+
+/// Every offering type a reserved node offering is published under, as
+/// `(name, share of the term's cost charged upfront)`, in catalog order.
+///
+/// `OfferingType` is "The anticipated utilization of the reserved node, as
+/// defined in the reserved node offering" (`smithy_query(query="shape",
+/// shape="ReservedNodeOffering")`), so the catalog publishes one offering per
+/// utilization level, and the levels are ordered by how much of the term they
+/// charge upfront. The names and the shares are this emulator's own published
+/// catalog; the model publishes no value list for the member, naming only
+/// [`HEAVY_UTILIZATION_OFFERING_TYPE`].
+pub const RESERVED_NODE_OFFERING_TYPES: [(&str, f64); 3] = [
+    ("Light Utilization", 0.25),
+    ("Medium Utilization", 0.50),
+    ("Heavy Utilization", 0.75),
+];
+
+/// The one offering type whose remaining term cost is charged as a RECURRING
+/// charge rather than per running hour.
+///
+/// Source: `smithy_query(query="doc", shape="ReservedNodeOffering",
+/// member="RecurringCharges")` — "The charge to your account regardless of
+/// whether you are creating any clusters using the node offering. Recurring
+/// charges are only in effect for heavy-utilization reserved nodes."
+pub const HEAVY_UTILIZATION_OFFERING_TYPE: &str = "Heavy Utilization";
+
+/// The modelled `ReservedNodeOfferingType` of an offering an existing
+/// reservation can be exchanged onto (a value of
+/// `RESERVED_NODE_OFFERING_TYPE_VALUES`).
+pub const RESERVED_NODE_OFFERING_TYPE_UPGRADABLE: &str = "Upgradable";
+
+/// The modelled `ReservedNodeOfferingType` of an offering that is only ever
+/// purchased outright (a value of `RESERVED_NODE_OFFERING_TYPE_VALUES`).
+pub const RESERVED_NODE_OFFERING_TYPE_REGULAR: &str = "Regular";
+
+/// The node-type prefix of an offering an existing reservation can be exchanged
+/// onto.
+///
+/// Source: `smithy_query(query="doc", shape="GetReservedNodeExchangeOfferings")`
+/// — "Returns an array of DC2 ReservedNodeOfferings that matches the payment
+/// type, term, and usage price of the given DC1 reserved node": the offerings an
+/// exchange can target are the DC2 ones, so those are the offerings the catalog
+/// publishes as [`RESERVED_NODE_OFFERING_TYPE_UPGRADABLE`].
+pub const EXCHANGE_TARGET_NODE_TYPE_PREFIX: &str = "dc2.";
+
+/// The hourly on-demand rate, in [`RESERVED_NODE_CURRENCY_CODE`], this emulator
+/// publishes for one node of each offered node type — the rate every price in
+/// that node type's offerings is derived from.
+///
+/// Listed in the order of [`ORDERABLE_NODE_TYPES`], and covering every node type
+/// in it, so the catalog publishes an offering for every node type a cluster can
+/// be created with. The rates rise with the size of the node and are this
+/// emulator's own published catalog: the model publishes no price for any node
+/// type.
+const NODE_TYPE_HOURLY_RATE: [(&str, f64); 10] = [
+    ("dc2.large", 0.25),
+    ("dc2.8xlarge", 4.80),
+    ("rg.large", 0.36),
+    ("rg.xlarge", 0.72),
+    ("rg.4xlarge", 2.88),
+    ("rg.12xlarge", 8.64),
+    ("ra3.large", 0.52),
+    ("ra3.xlplus", 1.09),
+    ("ra3.4xlarge", 3.26),
+    ("ra3.16xlarge", 13.04),
+];
+
+/// The hourly on-demand rate [`NODE_TYPE_HOURLY_RATE`] publishes for this node
+/// type, if the catalog offers it.
+pub fn node_type_hourly_rate(node_type: &str) -> Option<f64> {
+    NODE_TYPE_HOURLY_RATE
+        .into_iter()
+        .find(|(offered, _)| *offered == node_type)
+        .map(|(_, rate)| rate)
+}
+
+/// `value` rounded to `places` decimal places, so a published price carries only
+/// the digits a currency amount has.
+fn round_to(value: f64, places: i32) -> f64 {
+    let scale = 10f64.powi(places);
+    (value * scale).round() / scale
+}
+
+/// The offering identifier of the one offering for this node type, term and
+/// offering type: a lowercase-hex 8-4-4-4-12 value.
+///
+/// Derived from the offering's OWN three dimensions, so the same offering always
+/// carries the same id — the id a caller passes to `PurchaseReservedNodeOffering`
+/// ("you then use the unique offering ID in you call to
+/// PurchaseReservedNodeOffering", `smithy_query(query="doc",
+/// operation="DescribeReservedNodeOfferings")`) names the same offering on every
+/// read and is not a per-run value.
+pub fn reserved_node_offering_id(node_type: &str, duration: i32, offering_type: &str) -> String {
+    content_uuid(&format!(
+        "reservednodeoffering/{node_type}/{duration}/{offering_type}"
+    ))
+}
+
+/// One published reserved node offering: what it reserves, for how long, and how
+/// the term's cost is charged.
+///
+/// The whole term costs the node type's hourly rate
+/// ([`NODE_TYPE_HOURLY_RATE`]) at the term's share ([`RESERVED_NODE_TERMS`]) for
+/// every hour of the term, and the offering type splits that cost in two: the
+/// share it charges upfront becomes the `FixedPrice`, and the remainder is spread
+/// evenly over the term's hours — charged per hour the cluster using the offering
+/// RUNS as the `UsagePrice` ("The rate you are charged for each hour the cluster
+/// that is using the offering is running"), except for
+/// [`HEAVY_UTILIZATION_OFFERING_TYPE`], where it is charged for every hour
+/// regardless as a `RecurringCharges` entry instead.
+fn reserved_node_offering(node_type: &str, duration: i32, offering_type: &str) -> ReservedNodeOffering {
+    let hourly_rate = node_type_hourly_rate(node_type).unwrap_or_default();
+    let term_share = RESERVED_NODE_TERMS
+        .into_iter()
+        .find(|(offered, _)| *offered == duration)
+        .map(|(_, share)| share)
+        .unwrap_or_default();
+    let upfront_share = RESERVED_NODE_OFFERING_TYPES
+        .into_iter()
+        .find(|(offered, _)| *offered == offering_type)
+        .map(|(_, share)| share)
+        .unwrap_or_default();
+
+    let hours = f64::from(duration) / 3600.0;
+    let reserved_hourly_rate = hourly_rate * term_share;
+    let fixed_price = round_to(reserved_hourly_rate * hours * upfront_share, 2);
+    let hourly_remainder = round_to(reserved_hourly_rate * (1.0 - upfront_share), 3);
+    let heavy = offering_type == HEAVY_UTILIZATION_OFFERING_TYPE;
+
+    ReservedNodeOffering {
+        reserved_node_offering_id: Some(reserved_node_offering_id(
+            node_type,
+            duration,
+            offering_type,
+        )),
+        node_type: Some(node_type.to_string()),
+        duration: Some(duration),
+        fixed_price: Some(fixed_price),
+        usage_price: Some(if heavy { 0.0 } else { hourly_remainder }),
+        currency_code: Some(RESERVED_NODE_CURRENCY_CODE.to_string()),
+        offering_type: Some(offering_type.to_string()),
+        recurring_charges: Some(if heavy {
+            vec![RecurringCharge {
+                recurring_charge_amount: Some(hourly_remainder),
+                recurring_charge_frequency: Some(RECURRING_CHARGE_FREQUENCY_HOURLY.to_string()),
+            }]
+        } else {
+            Vec::new()
+        }),
+        reserved_node_offering_type: Some(
+            if node_type.starts_with(EXCHANGE_TARGET_NODE_TYPE_PREFIX) {
+                RESERVED_NODE_OFFERING_TYPE_UPGRADABLE.to_string()
+            } else {
+                RESERVED_NODE_OFFERING_TYPE_REGULAR.to_string()
+            },
+        ),
+    }
+}
+
+/// Every reserved node offering this service publishes, in the order
+/// `DescribeReservedNodeOfferings` reports them: node type (as
+/// [`ORDERABLE_NODE_TYPES`] offers them), then term (shortest first), then
+/// offering type.
+///
+/// The catalog is the full product of those three dimensions — "a list of the
+/// available reserved node offerings … including the node type, the fixed and
+/// recurring costs of reserving the node and duration the node will be reserved
+/// for you" (`smithy_query(query="doc",
+/// operation="DescribeReservedNodeOfferings")`) — so a node type a cluster can be
+/// created with can be reserved for either term under any offering type. Seeded
+/// into
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::reserved_node_offerings`]
+/// when the store is created, exactly like the engine-version and
+/// maintenance-track catalogs: an offering exists before anybody reserves
+/// anything, and no operation adds to or removes from the list.
+pub fn published_reserved_node_offerings() -> Vec<ReservedNodeOffering> {
+    let mut offerings = Vec::new();
+    for node_type in ORDERABLE_NODE_TYPES {
+        if node_type_hourly_rate(node_type).is_none() {
+            continue;
+        }
+        for (duration, _) in RESERVED_NODE_TERMS {
+            for (offering_type, _) in RESERVED_NODE_OFFERING_TYPES {
+                offerings.push(reserved_node_offering(node_type, duration, offering_type));
+            }
+        }
+    }
+    offerings
+}
+
 /// The default number of days automated snapshots are retained.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
@@ -1390,18 +1601,7 @@ pub const QEV2_IDC_APPLICATION_NOT_MODIFIABLE: &str =
 /// the resource's own identity, exactly as [`cluster_arn`] and
 /// [`subnet_group_arn`] are, and a name is all an application's identity is.
 pub fn qev2_idc_application_arn(application_name: &str, region: &str) -> String {
-    let hexed = short_digest(
-        &format!("qev2idcapplication/{application_name}/{region}"),
-        32,
-    );
-    let uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &hexed[0..8],
-        &hexed[8..12],
-        &hexed[12..16],
-        &hexed[16..20],
-        &hexed[20..32]
-    );
+    let uuid = content_uuid(&format!("qev2idcapplication/{application_name}/{region}"));
     engine::emulator_arn("redshift", region, &format!("qev2idcapplication:{uuid}"))
 }
 
@@ -1653,6 +1853,13 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// an attribute is an allowance the account already has before it creates
     /// anything, and no operation adds to or removes from the list.
     pub account_attributes: Vec<AccountAttribute>,
+    /// The reserved node offerings this service publishes, in catalog order.
+    /// SEEDED when the store is created, exactly like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::account_attributes`]:
+    /// an offering is purchasable before the account reserves anything, and no
+    /// operation adds to or removes from the list (see
+    /// [`published_reserved_node_offerings`]).
+    pub reserved_node_offerings: Vec<ReservedNodeOffering>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -1692,6 +1899,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
             account_attributes: published_account_attributes(),
+            reserved_node_offerings: published_reserved_node_offerings(),
         }
     }
 }
@@ -1804,6 +2012,14 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             })
             .cloned()
             .collect()
+    }
+
+    /// The published reserved node offering with this `ReservedNodeOfferingId`,
+    /// if the catalog has one.
+    pub fn reserved_node_offering(&self, offering_id: &str) -> Option<&ReservedNodeOffering> {
+        self.reserved_node_offerings
+            .iter()
+            .find(|offering| offering.reserved_node_offering_id.as_deref() == Some(offering_id))
     }
 
     /// The published maintenance track with this name, if the catalog has one.
@@ -2710,6 +2926,23 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 fn short_digest(seed: &str, n: usize) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     hex::encode(digest).chars().take(n).collect()
+}
+
+/// The SHA-256 of `seed` rendered in the 8-4-4-4-12 lowercase-hex form AWS
+/// identifies a reserved node offering and a namespace by.
+///
+/// Content-addressed from the resource's own identity, so the same resource
+/// always renders the same value and nothing here is a per-run value.
+fn content_uuid(seed: &str) -> String {
+    let hexed = short_digest(seed, 32);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hexed[0..8],
+        &hexed[8..12],
+        &hexed[12..16],
+        &hexed[16..20],
+        &hexed[20..32]
+    )
 }
 
 /// The first byte of the SHA-256 of `seed`, for picking a stable default out of

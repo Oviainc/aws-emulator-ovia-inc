@@ -31,6 +31,45 @@ pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = 20;
 /// operation's modelled `ValidationException`.
 pub const MAX_SLACK_WORKSPACE_CONFIGURATIONS: usize = 5;
 
+/// The longest Slack workspace name this API can report.
+///
+/// `teamName` is `len 1..256, pattern ^.+$` on both
+/// `RegisterSlackWorkspaceForOrganizationResult` and `SlackWorkspaceConfiguration`
+/// (`smithy_query(query="shape",shape="teamName")`), so a name this service stores is
+/// clipped to it: a longer one could not go on the wire.
+pub const MAX_TEAM_NAME_LEN: usize = 256;
+
+/// What a workspace's stored name says it is, after the team id that identifies it.
+///
+/// A Slack workspace's name lives in Slack, which this emulator cannot ask, so the name
+/// it records is built from the one thing the registration carries about the workspace —
+/// its team id — plus this. See [`derived_slack_workspace_name`].
+const SLACK_WORKSPACE_NAME_SUFFIX: &str = "Slack workspace";
+
+/// The name recorded for the Slack workspace `team_id` identifies.
+///
+/// A registered workspace HAS a name, which both `RegisterSlackWorkspaceForOrganization`
+/// and `ListSlackWorkspaceConfigurations` report in `teamName`. The name is a property of
+/// the workspace in Slack, which this emulator cannot query and which no request carries,
+/// so it is derived from the workspace's own identifier: one workspace therefore has one
+/// name, the same one every time it is reported, and two different workspaces have
+/// different names. The result is clipped to [`MAX_TEAM_NAME_LEN`] characters so even the
+/// longest legal `teamId` yields a name the model lets this service put on the wire, and
+/// it is never empty: `teamId` is itself `len 1..256` and leads the name, and the trim
+/// that drops what the clip may leave dangling in the suffix never empties a name it
+/// would otherwise be the whole of.
+pub fn derived_slack_workspace_name(team_id: &str) -> String {
+    let clipped: String = format!("{team_id} {SLACK_WORKSPACE_NAME_SUFFIX}")
+        .chars()
+        .take(MAX_TEAM_NAME_LEN)
+        .collect();
+    let trimmed = clipped.trim_end();
+    if trimmed.is_empty() {
+        clipped
+    } else {
+        trimmed.to_string()
+    }
+}
 /// Whether the single account this emulator presents is an organization's management
 /// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
 /// `accountType`.
@@ -81,7 +120,11 @@ impl SlackChannelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackWorkspaceConfig {
     pub team_id: String,
-    pub team_name: Option<String>,
+    /// The workspace's name, recorded when it was registered (see
+    /// [`derived_slack_workspace_name`]). A registered workspace always has one, so this
+    /// is not optional even though the modelled member is: every report of this record
+    /// carries the same name.
+    pub team_name: String,
     pub allow_organization_member_account: Option<bool>,
 }
 
@@ -90,7 +133,7 @@ impl SlackWorkspaceConfig {
     pub fn to_modeled(&self) -> SlackWorkspaceConfiguration {
         SlackWorkspaceConfiguration {
             team_id: self.team_id.clone(),
-            team_name: self.team_name.clone(),
+            team_name: Some(self.team_name.clone()),
             allow_organization_member_account: self.allow_organization_member_account,
         }
     }

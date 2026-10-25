@@ -14,6 +14,9 @@
 #[path = "all/decode_authorization_message.rs"]
 mod decode_authorization_message;
 
+#[path = "all/malformed_session_policy.rs"]
+mod malformed_session_policy;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

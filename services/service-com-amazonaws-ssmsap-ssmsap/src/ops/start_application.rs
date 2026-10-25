@@ -179,10 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         application.last_updated = now;
         application.pending = Some(crate::state::PendingTransition {
             due_at: now + crate::state::TRANSITION_SPAN,
-            status: crate::state::APPLICATION_STATUS_ACTIVATED.to_string(),
-            // Starting an application does not re-run discovery, so the discovery
-            // status it already reached is the one it keeps.
-            discovery_status: application.discovery_status.clone(),
+            change: crate::state::PendingChange::Status {
+                status: crate::state::APPLICATION_STATUS_ACTIVATED.to_string(),
+                // Starting an application does not re-run discovery, so the discovery
+                // status it already reached is the one it keeps.
+                discovery_status: application.discovery_status.clone(),
+            },
         });
 
         // The application was just found in this Region, so reaching for the partition

@@ -42,7 +42,7 @@ use crate::distribution_lifecycle::{call, emulator, Answer, Node, API_VERSION, H
 
 /// `POST /2020-05-31/origin-access-identity/cloudfront` with the configuration document
 /// `body`.
-async fn create_identity(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_identity(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -54,7 +54,7 @@ async fn create_identity(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/origin-access-identity/cloudfront/{Id}`.
-async fn get_identity(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_identity(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -66,7 +66,7 @@ async fn get_identity(router: &MultiServiceRouter, id: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/origin-access-identity/cloudfront/{Id}/config`.
-async fn get_identity_config(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_identity_config(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -84,16 +84,16 @@ async fn get_identity_config(router: &MultiServiceRouter, id: &str) -> Answer {
 /// One `CloudFrontOriginAccessIdentityConfig` a client submits. Both members are required
 /// on the wire, so every row carries both.
 #[derive(Debug, Clone)]
-struct Config {
-    case: &'static str,
-    caller_reference: String,
-    comment: String,
+pub(crate) struct Config {
+    pub(crate) case: &'static str,
+    pub(crate) caller_reference: String,
+    pub(crate) comment: String,
 }
 
 impl Config {
     /// The `CloudFrontOriginAccessIdentityConfig` XML a client sends: the operation's
     /// `httpPayload` member, so the configuration IS the request document.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         format!(
             "<CloudFrontOriginAccessIdentityConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -123,7 +123,7 @@ fn escape(text: &str) -> String {
 /// on `CloudFrontOriginAccessIdentityConfig`); neither member carries a modelled
 /// constraint, so the rows span the forms a caller actually sends and sit at the
 /// documented comment bound.
-fn config_table() -> Vec<Config> {
+pub(crate) fn config_table() -> Vec<Config> {
     vec![
         Config {
             case: "a date-time stamp reference, the empty comment",
@@ -161,7 +161,7 @@ fn config_table() -> Vec<Config> {
 /// — `E` followed by 13 uppercase alphanumerics, as `CloudFrontOriginAccessIdentity$Id`'s
 /// own example (`E74FTE3AJFJ256A`) takes, and the shape this service's version tokens take
 /// too.
-fn is_cloudfront_token(value: &str) -> bool {
+pub(crate) fn is_cloudfront_token(value: &str) -> bool {
     match value.strip_prefix('E') {
         Some(body) => {
             body.len() == 13
@@ -191,7 +191,7 @@ fn member(root: &Node, path: &str, case: &str, raw: &str) -> String {
 
 /// Assert the `CloudFrontOriginAccessIdentity` document `answer` carries is the record
 /// `config` asked for, and answer its `(Id, S3CanonicalUserId)`.
-fn assert_identity(answer: &Answer, config: &Config, context: &str) -> (String, String) {
+pub(crate) fn assert_identity(answer: &Answer, config: &Config, context: &str) -> (String, String) {
     let case = config.case;
     let root = answer.root();
     let raw = answer.raw.as_str();
@@ -224,7 +224,7 @@ fn assert_identity(answer: &Answer, config: &Config, context: &str) -> (String, 
 
 /// Assert the `CloudFrontOriginAccessIdentityConfig` element `stored` is the one `config`
 /// submitted, member for member.
-fn assert_config(stored: &Node, config: &Config, context: &str, raw: &str) {
+pub(crate) fn assert_config(stored: &Node, config: &Config, context: &str, raw: &str) {
     let case = config.case;
 
     let caller_reference = member(stored, "CallerReference", case, raw);

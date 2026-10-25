@@ -6,7 +6,10 @@
 //! Manager: a global network owns sites, a site owns links, and a global network owns
 //! devices (each optionally assigned to one of its sites). A device and a link that sit at
 //! the same site can be tied together by a LINK ASSOCIATION, which has no id of its own
-//! and is therefore keyed by that pair. Two devices of one global network can instead be
+//! and is therefore keyed by that pair. A device can likewise be tied to a CUSTOMER
+//! GATEWAY of Amazon VPC — and, when the request names one, to a link of that device — by a
+//! CUSTOMER GATEWAY ASSOCIATION, which has no id either and is keyed by the global network
+//! plus the gateway's ARN. Two devices of one global network can instead be
 //! tied together by a CONNECTION, which unlike that association IS a resource of its own,
 //! with an id, an ARN and tags. A global network also owns its
 //! CORE network — the Cloud WAN managed network
@@ -45,6 +48,7 @@ use crate::ops::types::{
     ConnectAttachment, ConnectAttachmentOptions,
     ConnectPeer, ConnectPeerBgpConfiguration, ConnectPeerConfiguration, ConnectPeerSummary,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
+    CustomerGatewayAssociation,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
     NetworkResource, NetworkTelemetry, OrganizationStatus, Peering,
@@ -111,6 +115,15 @@ pub const CONNECTION_KIND: &str = "connection";
 /// ([`link_association_key`]) and this name is only how a not-found refusal spells the
 /// resource type.
 pub const LINK_ASSOCIATION_KIND: &str = "link-association";
+/// The resource kind a CUSTOMER GATEWAY association reports in a refusal that names it.
+///
+/// Like [`LINK_ASSOCIATION_KIND`] this is not an ARN resource type and no id is minted for
+/// it: "Describes the association between a customer gateway, a device, and a link"
+/// (`smithy_query shape=CustomerGatewayAssociation`) carries no id, so the global network
+/// plus the customer gateway ARN is its identity
+/// ([`customer_gateway_association_key`]) and this name is only how a not-found refusal
+/// spells the resource type.
+pub const CUSTOMER_GATEWAY_ASSOCIATION_KIND: &str = "customer-gateway-association";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -232,6 +245,10 @@ pub const LIMIT_CONNECTIONS_PER_GLOBAL_NETWORK: &str = "connections-per-global-n
 /// [`MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK`] bounds.
 pub const LIMIT_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: &str =
     "prefix-list-associations-per-core-network";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK`] bounds.
+pub const LIMIT_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK: &str =
+    "customer-gateway-associations-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
@@ -288,6 +305,9 @@ pub const FIELD_ADD_SUBNET_ARNS: &str = "addSubnetArns";
 pub const FIELD_REMOVE_SUBNET_ARNS: &str = "removeSubnetArns";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_VPN_CONNECTION_ARN: &str = "vpnConnectionArn";
+/// See [`FIELD_CORE_NETWORK_ID`]: the member carrying the ARN of the customer gateway a
+/// global network's customer gateway association names.
+pub const FIELD_CUSTOMER_GATEWAY_ARN: &str = "customerGatewayArn";
 /// See [`FIELD_CORE_NETWORK_ID`]: the member carrying the ARN of the managed prefix list a
 /// core network's prefix-list association names.
 pub const FIELD_PREFIX_LIST_ARN: &str = "prefixListArn";
@@ -446,7 +466,7 @@ pub const NETWORK_RESOURCE_TYPES: [&str; 17] = [
     "connect-peer",
     "connection",
     "core-network",
-    "customer-gateway",
+    CUSTOMER_GATEWAY_KIND,
     "device",
     "dx-gateway",
     "dx-vif",
@@ -627,6 +647,17 @@ pub const MAX_PEERINGS_PER_CORE_NETWORK: usize = 100;
 /// operation="CreateCoreNetworkPrefixListAssociation"`), so reaching it is answered with
 /// that modelled error (HTTP 402) and stores nothing.
 pub const MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK: usize = 100;
+
+/// How many customer gateways one global network may be associated with here.
+///
+/// CHOSEN, like [`MAX_PREFIX_LIST_ASSOCIATIONS_PER_CORE_NETWORK`] and for the same reason:
+/// no published number bounds it and the model carries none, so this bound exists only so
+/// that repeated associates — each naming a customer gateway of Amazon VPC, of which this
+/// service holds no inventory — cannot grow the store without end.
+/// `AssociateCustomerGateway` DOES model a `ServiceQuotaExceededException` (`smithy_query
+/// query="operation" operation="AssociateCustomerGateway"`), so reaching it is answered
+/// with that modelled error (HTTP 402) and stores nothing.
+pub const MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK: usize = 100;
 
 /// How many Connect peers one Connect attachment may hold here, and how many inside CIDR
 /// blocks one Connect peer may peer over.
@@ -1098,6 +1129,79 @@ impl LinkAssociationRecord {
 /// in a not-found refusal, where no single resource id would.
 pub fn link_association_key(device_id: &str, link_id: &str) -> String {
     format!("{device_id}/{link_id}")
+}
+
+/// A stored customer gateway association: the tie between one customer gateway of Amazon
+/// VPC and one device — and optionally one link — of a global network.
+///
+/// Like [`LinkAssociationRecord`] this is NOT a resource of its own: the modelled
+/// `CustomerGatewayAssociation` carries no id and no ARN of its own (`smithy_query
+/// shape=CustomerGatewayAssociation`), so the global network plus the customer gateway ARN
+/// is its identity and the store keys it by [`customer_gateway_association_key`]. Its
+/// state is a function of the clock rather than a field, so reading one never writes.
+#[derive(Debug, Clone)]
+pub struct CustomerGatewayAssociationRecord {
+    pub global_network_id: String,
+    /// The ARN of the customer gateway, as the request carried it: the gateway belongs to
+    /// Amazon VPC, so this service stores the reference and holds no record of the gateway
+    /// itself (see [`parse_customer_gateway_arn`]).
+    pub customer_gateway_arn: String,
+    pub device_id: String,
+    /// The link the association names, or `None` when the associate did not name one —
+    /// `LinkId` is the one optional member of the request (`smithy_query
+    /// query="operation" operation="AssociateCustomerGateway"`).
+    pub link_id: Option<String>,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+}
+
+impl CustomerGatewayAssociationRecord {
+    /// This association's state as of `now`.
+    ///
+    /// `CustomerGatewayAssociationState` carries PENDING, AVAILABLE, DELETING and DELETED
+    /// (`smithy_query shape=CustomerGatewayAssociationState`, mirrored in
+    /// `ops::types::CUSTOMER_GATEWAY_ASSOCIATION_STATE_VALUES`); the first three are
+    /// spelled exactly as [`STATE_PENDING`], [`STATE_AVAILABLE`] and [`STATE_DELETING`],
+    /// so this slice reuses those constants.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `CustomerGatewayAssociation` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> CustomerGatewayAssociation {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `CustomerGatewayAssociation` for this record, forcing `state` — used by
+    /// `DisassociateCustomerGateway`, which reports the association it just removed as
+    /// `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> CustomerGatewayAssociation {
+        CustomerGatewayAssociation {
+            customer_gateway_arn: Some(self.customer_gateway_arn.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            device_id: Some(self.device_id.clone()),
+            link_id: self.link_id.clone(),
+            state: Some(state.to_string()),
+        }
+    }
+}
+
+/// The key the store holds a customer gateway association under: the global network it was
+/// made in, then the ARN of the customer gateway it ties to one of that network's devices.
+///
+/// The ARN alone is not the key: the association is addressed THROUGH the global network in
+/// every one of the three operations' URIs (`smithy_query query="operation"
+/// operation="AssociateCustomerGateway,DisassociateCustomerGateway,GetCustomerGatewayAssociations"`),
+/// so a pair made in a DIFFERENT global network is not addressable here — exactly as
+/// [`prefix_list_association_key`] scopes a prefix list to its core network. The same
+/// string identifies the association in a not-found refusal, where no single resource id
+/// would.
+pub fn customer_gateway_association_key(global_network_id: &str, customer_gateway_arn: &str) -> String {
+    format!("{global_network_id}/{customer_gateway_arn}")
 }
 
 /// A stored connection: the tie between two devices of one global network.
@@ -2755,6 +2859,16 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// link that are both stored and sit at the same site, so the per-global-network
     /// device quota and the per-site link quota already bound how many pairs can exist.
     pub link_associations: BTreeMap<String, LinkAssociationRecord>,
+    /// Customer gateway associations by [`customer_gateway_association_key`], each tying a
+    /// customer gateway of Amazon VPC to one stored device, and optionally one stored link,
+    /// of the global network the key names.
+    ///
+    /// Bounded per global network by
+    /// [`MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK`] — unlike the link
+    /// associations above, the subject is a gateway of another service rather than a stored
+    /// resource, so no existing quota bounds how many distinct ARNs a caller can name — and
+    /// only ever holding a pair once.
+    pub customer_gateway_associations: BTreeMap<String, CustomerGatewayAssociationRecord>,
     /// Connections by `ConnectionId`, each carrying the `GlobalNetworkId` that owns it and
     /// the two devices of that global network it ties together.
     pub connections: BTreeMap<String, ConnectionRecord>,
@@ -2809,8 +2923,8 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     ///
     /// A connection is registered here by the operation that ties it to the global network
     /// — `AssociateTransitGatewayConnectPeer` and `AssociateConnectPeer` for a Connect peer
-    /// of either kind, `RegisterTransitGateway` / `AssociateCustomerGateway` for the VPN
-    /// connections of a gateway — each still a scaffold stub with its own issue, so an
+    /// of either kind, `RegisterTransitGateway` for the VPN connections a registered
+    /// gateway brings with it — each still a scaffold stub with its own issue, so an
     /// emulator nobody has registered a connection with reports the empty telemetry it
     /// really holds rather than a placeholder. No quota of its own bounds the map: a
     /// registration exists only for a stored global network, which the per-account global
@@ -2980,6 +3094,15 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         self.peerings
             .values()
             .filter(|peering| peering.core_network_id == core_network_id)
+            .count()
+    }
+
+    /// How many customer gateways `global_network_id` is associated with, for the
+    /// per-global-network quota.
+    pub fn customer_gateway_association_count_of(&self, global_network_id: &str) -> usize {
+        self.customer_gateway_associations
+            .values()
+            .filter(|association| association.global_network_id == global_network_id)
             .count()
     }
 
@@ -3522,8 +3645,9 @@ pub fn network_resource_key(resource_type: &str, resource_id: &str) -> String {
 ///   whose Region is known but unreported would be silently under-selected by that filter
 ///   (an attachment, for one, knows the edge location it sits at).
 /// * `RegisteredGatewayArn` — only a resource reached through a registered gateway carries
-///   one, and the registering operations (`RegisterTransitGateway`,
-///   `AssociateCustomerGateway`) are still scaffold stubs.
+///   one, and the registering operation (`RegisterTransitGateway`) is still a scaffold
+///   stub. Associating a customer gateway with a device does not register one: it ties a
+///   gateway the global network already holds to a device of it.
 /// * `Metadata` — "The resource metadata" (`smithy_query shape=NetworkResource`) is what
 ///   `UpdateNetworkResourceMetadata` stores, which is still a scaffold stub, so no resource
 ///   has any.
@@ -3673,10 +3797,13 @@ pub fn field_rejection(member: &str, reason: &str, message: String) -> Validatio
 /// more global networks. The maximum is 10." on
 /// `DescribeGlobalNetworksRequest$GlobalNetworkIds`, and the same sentence on
 /// `GetSitesRequest$SiteIds` ("One or more site IDs. The maximum is 10."),
-/// `GetLinksRequest$LinkIds` and `GetDevicesRequest$DeviceIds` (`smithy_query query="doc"
+/// `GetLinksRequest$LinkIds`, `GetDevicesRequest$DeviceIds` and
+/// `GetCustomerGatewayAssociationsRequest$CustomerGatewayArns` ("One or more customer
+/// gateway Amazon Resource Names (ARNs). The maximum is 10.": `smithy_query query="doc"
 /// shape="<Request>" member="<Member>"`). The modelled list shapes do NOT express it as
-/// `@length` — `smithy_query shape=GlobalNetworkIdList,SiteIdList,LinkIdList,DeviceIdList`
-/// carries a length on the member STRING only (0..50) — so the pre-handler constraint walk
+/// `@length` — `smithy_query
+/// shape=GlobalNetworkIdList,SiteIdList,LinkIdList,DeviceIdList,CustomerGatewayArnList`
+/// carries a length on the member STRING only — so the pre-handler constraint walk
 /// cannot enforce it and [`check_filter_ids`] does, exactly as the device and link
 /// descriptor maxima ([`MAX_DEVICE_DESCRIPTOR_CHARS`]) are enforced in handler code.
 pub const MAX_FILTER_IDS: usize = 10;
@@ -3806,17 +3933,23 @@ pub const PREFIX_LIST_KIND: &str = "prefix-list";
 /// See [`PREFIX_LIST_KIND`].
 const PREFIX_LIST_ID_PREFIX: &str = "pl-";
 
-/// Whether `id` reads as a managed prefix list id: the `pl-` prefix plus the 8 to 17
-/// lowercase hex digits every EC2 resource id the model DOES type carries (`vpc-[0-9a-f]{8,17}`
-/// in `VpcArn`'s pattern, see [`parse_prefix_list_arn`]).
-fn is_prefix_list_id(id: &str) -> bool {
-    /// The width an EC2 resource id's hex suffix may have, from that pattern.
+/// Whether `id` reads as an EC2 resource id of the type `prefix` names: that prefix plus
+/// the 8 to 17 lowercase hex digits every EC2 resource id the model DOES type carries
+/// (`vpc-[0-9a-f]{8,17}` in `VpcArn`'s pattern, `vpn-[0-9a-f]{8,17}` in
+/// `VpnConnectionArn`'s).
+fn is_ec2_hex_id(id: &str, prefix: &str) -> bool {
+    /// The width an EC2 resource id's hex suffix may have, from those patterns.
     const WIDTHS: ::std::ops::RangeInclusive<usize> = 8..=17;
 
-    match id.strip_prefix(PREFIX_LIST_ID_PREFIX) {
+    match id.strip_prefix(prefix) {
         Some(digits) => WIDTHS.contains(&digits.len()) && is_lowercase_hex(digits),
         None => false,
     }
+}
+
+/// Whether `id` reads as a managed prefix list id (see [`is_ec2_hex_id`]).
+fn is_prefix_list_id(id: &str) -> bool {
+    is_ec2_hex_id(id, PREFIX_LIST_ID_PREFIX)
 }
 
 /// Split a managed prefix list ARN into its kind and id, or `None` when the string is not
@@ -3858,6 +3991,62 @@ pub fn malformed_prefix_list_arn(member: &str) -> ValidationException {
             name: member.to_string(),
             message: format!(
                 "must read arn:<partition>:{EC2_NAMESPACE}:<region>:<account>:{PREFIX_LIST_KIND}/{PREFIX_LIST_ID_PREFIX}<8 to 17 hex digits>"
+            ),
+        }]),
+    }
+}
+
+/// The ARN resource type of a CUSTOMER GATEWAY, and the prefix of its id — the `cgw-` of
+/// `customer-gateway/cgw-0123456789abcdef1`. An Amazon VPC (EC2) resource, like the managed
+/// prefix list above, and one of [`NETWORK_RESOURCE_TYPES`].
+pub const CUSTOMER_GATEWAY_KIND: &str = "customer-gateway";
+/// See [`CUSTOMER_GATEWAY_KIND`].
+const CUSTOMER_GATEWAY_ID_PREFIX: &str = "cgw-";
+
+/// Whether `id` reads as a customer gateway id (see [`is_ec2_hex_id`]).
+fn is_customer_gateway_id(id: &str) -> bool {
+    is_ec2_hex_id(id, CUSTOMER_GATEWAY_ID_PREFIX)
+}
+
+/// Split a customer gateway ARN into its kind and id, or `None` when the string is not one
+/// at all — the caller refuses that as a `ValidationException` on the ARN member
+/// ([`malformed_customer_gateway_arn`]).
+///
+/// `CustomerGatewayArn` is modelled free-form (len 0..500, pattern `^[\s\S]*$`:
+/// `smithy_query shape=CustomerGatewayArn`), like `PrefixListArn`, so the form is judged
+/// here rather than by the pre-handler constraint walk. A customer gateway is an Amazon VPC
+/// resource, so its ARN is the EC2 skeleton [`parse_foreign_arn`] walks — the one
+/// `VpnConnectionArn` spells out, `^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpn-connection\/vpn-[0-9a-f]{8,17}$`
+/// (`smithy_query shape=VpnConnectionArn`) — with the `customer-gateway` resource type and
+/// a `cgw-` id.
+///
+/// Whether the gateway EXISTS is not judged: it belongs to Amazon VPC, which this service
+/// holds no record of, so a well-formed ARN is stored as the association's subject.
+pub fn parse_customer_gateway_arn(arn: &str) -> Option<ArnParts<'_>> {
+    parse_foreign_arn(
+        arn,
+        EC2_NAMESPACE,
+        ArnRegion::Any,
+        CUSTOMER_GATEWAY_KIND,
+        is_customer_gateway_id,
+    )
+}
+
+/// The modelled `ValidationException` (HTTP 400) a customer gateway association operation
+/// answers when the string in its member `member` is not a customer gateway ARN at all
+/// (see [`parse_customer_gateway_arn`]).
+///
+/// Like [`malformed_prefix_list_arn`]: a string that names no customer gateway is a FIELD
+/// failure on the member that carried it, a different answer from a well-formed ARN that
+/// names no association this global network holds.
+pub fn malformed_customer_gateway_arn(member: &str) -> ValidationException {
+    ValidationException {
+        message: format!("{member} is not a customer gateway ARN"),
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "must read arn:<partition>:{EC2_NAMESPACE}:<region>:<account>:{CUSTOMER_GATEWAY_KIND}/{CUSTOMER_GATEWAY_ID_PREFIX}<8 to 17 hex digits>"
             ),
         }]),
     }

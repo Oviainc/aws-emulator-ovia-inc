@@ -33,10 +33,13 @@
 //! * **Filtering.** `filter.actions` is a list of `ActionFilter`s, each naming a
 //!   record field (`FEATURE` / `SEVERITY` / `TYPE`), a `matchOption` (`EQUALS`
 //!   keeps the records whose field is one of `values`, `NOT_EQUALS` excludes them)
-//!   and the `values` to compare against. Several filters are ANDed. A filter
-//!   value that is not a member of the enum its `key` names is refused with
-//!   `ValidationException`, and so is an empty `values` list, whose modelled
-//!   minimum length is 1.
+//!   and the `values` to compare against. Several filters are ANDed. `values` is a
+//!   list of strings COMPARED against a record's field, not an enumerated member of
+//!   the request shape: a value no record carries simply matches no record, so an
+//!   `EQUALS` filter over it keeps nothing and a `NOT_EQUALS` filter over it keeps
+//!   everything. Only the members the model types as enums (`key`, `matchOption`)
+//!   and the modelled constraints on `values` itself (an empty list fails its
+//!   minimum length of 1) are refused with `ValidationException`.
 //! * **How a refusal is stated.** Every refusal of this operation's input is one
 //!   `ValidationException` (400) carrying the modelled `reason` and one `fieldList`
 //!   entry per offending member, built from [`Violation`]s by
@@ -238,15 +241,6 @@ fn filter_member_path(index: usize, member: &str) -> String {
     ])
 }
 
-/// The dotted path of one element of that filter's `values` list:
-/// `filter.actions.1.member.values.2.member`.
-fn filter_value_path(index: usize, value_index: usize) -> String {
-    constraints::path::join(&[
-        filter_member_path(index, "values"),
-        constraints::path::element(value_index + 1),
-    ])
-}
-
 /// One violation of an enumerated value set, stated the way the boundary validator
 /// states one.
 fn enum_violation(path: String, value: &str, allowed: Vec<String>) -> Violation {
@@ -261,8 +255,8 @@ fn enum_violation(path: String, value: &str, allowed: Vec<String>) -> Violation 
 /// amplify an arbitrarily long request value into the response. Both the cap
 /// (`MAX_ECHOED_VALUE` = 256) and the elision text are the boundary validator's own
 /// (`vendor/smithy-schema-server/src/constraints.rs`), so a long value refused here
-/// reads exactly as the same value refused there. The ORIGINAL value is what
-/// `accepts_value` checks; this is rendering only.
+/// reads exactly as the same value refused there. This is rendering only: the
+/// ORIGINAL value is what the membership test above reads.
 fn echoed(value: &str) -> String {
     const MAX_ECHOED_VALUE: usize = 256;
     if value.len() <= MAX_ECHOED_VALUE {
@@ -340,8 +334,9 @@ impl CompiledFilter {
     }
 }
 
-/// Validate the request's filters, refusing a key, match option or value the model
-/// does not declare.
+/// Validate the request's filters, refusing only what the model does not declare:
+/// a `key` or `matchOption` outside its enum, and a `values` list shorter than its
+/// modelled minimum.
 ///
 /// EVERY offending member is reported in one refusal, the way the boundary
 /// validator reports one: a violation per member, rendered by
@@ -351,8 +346,11 @@ impl CompiledFilter {
 /// member of either is normally refused before this handler runs (by the
 /// constraint boundary, whose violations this service answers in the same modelled
 /// shape); the checks here are the backstop that turns such a value into the same
-/// refusal rather than a silent default. `ActionFilter$values` is a list of plain
-/// strings, so the enum its `key` names is enforced ONLY here.
+/// refusal rather than a silent default. The ELEMENTS of `ActionFilter$values` are
+/// plain strings (`FilterValue`, length 1..1024, pattern `[\S\s]*`) whose only
+/// value set is whatever the records happen to hold, so they are compared, never
+/// validated: an element outside every candidate value set is a comparison that
+/// matches nothing, not a bad request.
 fn compile_filters(
     filter: Option<&RequestFilter>,
 ) -> Result<Vec<CompiledFilter>, ListRecommendedActionsError> {
@@ -394,24 +392,11 @@ fn compile_filters(
                 value: Some(format!("{} items", action_filter.values.len())),
             });
         }
-        // The values of a filter are members of the enum its KEY names (a `FEATURE`
-        // filter compares `Feature` members, and so on), which the model cannot
-        // express — `FilterValues` is a list of plain strings — so this is the only
-        // place that value set is enforced.
-        if let Some(key) = key {
-            for (value_index, value) in action_filter.values.iter().enumerate() {
-                if violations.len() >= MAX_VIOLATIONS {
-                    break;
-                }
-                if !key.accepts_value(value) {
-                    violations.push(enum_violation(
-                        filter_value_path(index, value_index),
-                        value,
-                        key.value_members(),
-                    ));
-                }
-            }
-        }
+        // The ELEMENTS of `values` are NOT validated here: the model closes no value
+        // set over them, so each one is a string compared against a record's field by
+        // `CompiledFilter::keeps`. An element no record carries keeps no record under
+        // `EQUALS` and excludes none under `NOT_EQUALS`; its modelled length and
+        // pattern are enforced at the constraint boundary.
         if let (Some(key), Some(match_option)) = (key, match_option) {
             compiled.push(CompiledFilter {
                 key,

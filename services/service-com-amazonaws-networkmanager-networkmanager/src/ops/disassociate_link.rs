@@ -178,13 +178,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds no association — one never made, or one already removed — is the
         // missing-resource answer, naming the pair as the resource because an association
         // carries no id of its own.
-        //
-        // "You must first disassociate any customer gateways that are associated with the
-        // link." (`smithy_query query="doc" shape="DisassociateLink"`) is not checked
-        // here: no operation of this emulator can store a customer-gateway association
-        // yet (`AssociateCustomerGateway` still answers 501), so the store holds none and
-        // the check would always pass. It belongs with that operation's own issue.
         let key = crate::state::link_association_key(&input.device_id, &input.link_id);
+
+        // "You must first disassociate any customer gateways that are associated with the
+        // link." (`smithy_query query="doc" shape="DisassociateLink"`) — a customer gateway
+        // association names the device and the link this call would untie
+        // (`AssociateCustomerGateway`), so the device/link pair stays associated until that
+        // association is removed. Like every other dependency refusal of this service this
+        // is a VALIDATION failure of the request against stored state: no input field is at
+        // fault, so it carries no `Fields` entry and the catch-all `Reason`. The pair is
+        // known to be associated whenever one is found, since a customer gateway can only
+        // be associated with a link already associated with its device.
+        let blocking: Option<String> = store
+            .customer_gateway_associations
+            .values()
+            .find(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.device_id == input.device_id
+                    && association.link_id.as_deref() == Some(input.link_id.as_str())
+            })
+            .map(|association| association.customer_gateway_arn.clone());
+        if let Some(customer_gateway_arn) = blocking {
+            return Err(DisassociateLinkErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "customer gateway {customer_gateway_arn} must be disassociated before device {} is disassociated from link {}",
+                        input.device_id, input.link_id
+                    ),
+                    reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                    fields: None,
+                },
+            )
+            .into());
+        }
+
         let removed = store.link_associations.remove(&key).ok_or_else(|| {
             DisassociateLinkErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(crate::state::LINK_ASSOCIATION_KIND, &key),

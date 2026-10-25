@@ -349,6 +349,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::mint_workflow_arn(&region, &input.name, &nonce);
         let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
         let revision_id = crate::state::mint_revision_id(&arn, &version);
+        // The append position this version keeps: the mint counter the nonce above
+        // just advanced, which is what a version listing pages over.
+        let sequence = store.mint_seq;
 
         // The definition snapshot the docs describe: "takes a snapshot of the definition
         // at creation time, so subsequent changes to the S3 object will not affect the
@@ -384,6 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 created_at: now,
                 is_latest: true,
                 snapshot,
+                sequence,
             }],
             tags: input
                 .tags
