@@ -421,15 +421,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // SNS defines a closed set of subscription attribute names and refuses any
         // other; the closed set is also what keeps one subscription record from
         // growing for ever.
-        if let Some(unknown) = attributes
+        if attributes
             .keys()
-            .find(|name| !state::is_subscription_attribute(name))
+            .any(|name| !state::is_subscription_attribute(name))
         {
             return Err(SubscribeErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "Invalid parameter: Attributes Reason: unknown attribute name: {unknown}"
-                    )),
+                    message: Some(state::INVALID_ATTRIBUTE_NAME_REFUSAL.to_string()),
                 },
             )
             .into());
@@ -441,12 +439,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // VALUE names the member whose constraint it failed; the protocol-scope
         // refusal is SNS's own whole sentence, so it is not framed again here.
         for (name, value) in &attributes {
-            let message = state::subscription_attribute_value_reason(name, value)
-                .map(|reason| format!("Invalid parameter: Attributes Reason: {reason}"))
-                .or_else(|| {
-                    state::subscription_attribute_protocol_refusal(name, value, &protocol)
-                });
-            if let Some(message) = message {
+            let refusal = state::subscription_attribute_refusal(name, value).or_else(|| {
+                state::subscription_attribute_protocol_refusal(name, value, &protocol)
+            });
+            if let Some(message) = refusal {
                 return Err(SubscribeErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),
@@ -454,6 +450,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+        // And the filter policy and its scope are judged against EACH OTHER, which
+        // neither per-attribute rule above can do on its own.
+        if let Some(message) = state::filter_policy_pair_refusal(&attributes) {
+            return Err(SubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         let (arn, pending_confirmation) = match existing {
