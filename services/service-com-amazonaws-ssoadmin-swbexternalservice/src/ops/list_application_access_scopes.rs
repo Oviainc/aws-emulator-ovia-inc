@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationAccessScopes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationAccessScopes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the access scopes `PutApplicationAccessScope` stored on an
+//! application in this service's state (`crate::state`), each with its authorized
+//! targets. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationAccessScopes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure REPORT: it answers from the application record and writes nothing beyond the
+//! instance transitions the clock already owes. The page walks the scopes in `Scope`
+//! order and carries a `NextToken` only when items were left over; a token this service
+//! did not issue FOR THIS enumeration is refused the modelled `ValidationException`
+//! rather than answered with an empty page. An `ApplicationArn` this account holds no
+//! application for is refused the modelled `ResourceNotFoundException`, which an
+//! application that exists and carries no scope (an empty page) is never confused with.
+//!
+//! `MaxResults`' member on this operation narrows the `MaxResults` shape's range to a
+//! maximum of ten — the bound the response's `Scopes` list carries too — and the
+//! validating walk checks the shape's range, so this handler refuses a value past the
+//! member's own maximum with the same clause that walk would have stated.
 //!
 //! ## Shape of an operation
 //!
@@ -56,7 +63,10 @@
 //! * `ApplicationArn` (ApplicationArn, len 10..1224, pattern
 //!   ^arn:aws(-[a-z]{1,5}){0,3}:sso::\d{12}:application/(sso)?ins-[a-zA-Z0-9-.]{16}/apl-[a-zA-Z0-9]{16}$)
 //!   **required** — Specifies the ARN of the application.
-//! * `MaxResults` (MaxResults, range 1..100, default 10) **required** — Specifies the total
+//! * `MaxResults` (MaxResults, range 1..100, default 10) **required** — NOTE: the range
+//!   quoted here is the TARGET SHAPE's; this operation's own member narrows it to
+//!   `range(min: 1, max: 10)`, which is the bound a request must satisfy and which the
+//!   handler below enforces. Specifies the total
 //!   number of results that you want included in each response. If additional items exist
 //!   beyond the number you specify, the NextToken response element is returned with a value
 //!   (not null). Include the specified value as the NextToken request parameter in the next
@@ -167,18 +177,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationAccessScopes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationAccessScopesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationAccessScopes"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationAccessScopesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `MaxResults`' own member narrows the `MaxResults` shape's `range(min: 1,
+        // max: 100)` to a maximum of ten — the same bound the response's `Scopes` list
+        // carries — and the validating walk checks the shape's, so a value past the
+        // member's own maximum is refused here, with the clause that walk would state.
+        if input.max_results > crate::state::MAX_ACCESS_SCOPES_PER_PAGE {
+            return Err(ListApplicationAccessScopesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::refusal::value_above_maximum(
+                        "maxResults",
+                        crate::state::MAX_ACCESS_SCOPES_PER_PAGE,
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The cursor is scoped to THIS enumeration: the operation and the application
+        // whose scopes it walks. A token issued for another enumeration decodes to
+        // nothing and is refused rather than silently resuming somewhere else, which
+        // would end a caller's enumeration early.
+        let scope = crate::state::cursor_access_scopes(&input.application_arn);
+        let after =
+            crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(|message| {
+                ListApplicationAccessScopesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                })
+            })?;
+
+        let ordered: Vec<(String, ScopeDetails)> = {
+            let region = crate::state::request_region(ctx.parts());
+            let mut store = state.lock();
+            // A REPORT, so the only thing it writes is what the CLOCK already owes every
+            // instance at this instant — the same transitions a read made a moment later
+            // would have applied anyway (an application whose instance the clock has
+            // already removed no longer exists).
+            store.on_request(&region, ::std::time::SystemTime::now());
+
+            // The scopes live ON the application record, so an `ApplicationArn` nothing
+            // holds is the modelled `ResourceNotFoundException`. An EMPTY page is what an
+            // application that exists and carries no scope answers, so the two are never
+            // confused.
+            let application = store.application(&input.application_arn).ok_or_else(|| {
+                ListApplicationAccessScopesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+            // Exactly the scopes this application currently carries, in the `Scope` order
+            // that is both the page order and the cursor order.
+            application.access_scope_details()
+        };
+
+        // `MaxResults` carries its modelled default when the request sent none, and
+        // "if additional items exist beyond the number you specify, the NextToken
+        // response element is returned with a value (not null)" — so the token is issued
+        // only when this page left something over.
+        // The limit passed is already bounded at `MAX_ACCESS_SCOPES_PER_PAGE` by the
+        // refusal above, and clamped again here, so the page cannot exceed the ten
+        // entries `Scopes` admits even if that refusal were ever removed.
+        let (scopes, next_token) = crate::state::page(
+            &scope,
+            ordered,
+            after.as_deref(),
+            Some(input.max_results.min(crate::state::MAX_ACCESS_SCOPES_PER_PAGE)),
+        );
+        Ok(ListApplicationAccessScopesOutput { scopes, next_token })
     }
 }

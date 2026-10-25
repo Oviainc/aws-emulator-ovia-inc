@@ -9,8 +9,9 @@
 //! operation answers only the errors it declares. The only writes are the changes the
 //! clock already owed — the teardown of a workflow past its `DELETING` span and each
 //! run's own status schedule — so a read never changes what a later caller sees. The
-//! `NextToken` this operation returns is the only one it accepts back; anything else is
-//! refused as a `ValidationException`.
+//! `NextToken` this operation returns for THIS workflow's run history is the only one it
+//! accepts back; anything else — a cursor of another list, of another workflow's runs, or
+//! one this service never issued — is refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -216,12 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page (`crate::state::WorkflowRun::listing_key`), not the identifier that run
         // is stored under: a run created between pages therefore sorts after the cursor
         // and is still reached by a later page, and a run removed between pages cannot
-        // restart the walk. Decoded BEFORE the workflow lookup so a foreign token is one
-        // refusal whatever the ARN resolves to.
+        // restart the walk. It is also SCOPED to the workflow whose run history it was
+        // issued on: a cursor minted while walking another workflow's runs is not a
+        // position in this history, so honouring it would silently truncate or restart
+        // the listing — it is refused, exactly like a cursor issued for another of this
+        // service's lists or one this service never issued. Decoded BEFORE the workflow
+        // lookup so a cursor that is not this walk's is one refusal whatever the ARN
+        // resolves to.
         let after: Option<crate::state::RunListingKey> = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(PAGE_KIND, token)
+                crate::state::parse_scoped_page_token(PAGE_KIND, token, &input.workflow_arn)
                     .as_deref()
                     .and_then(crate::state::parse_run_listing_key)
                     .ok_or_else(|| {
@@ -280,12 +286,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let workflow_runs: Vec<WorkflowRunSummary> = page.iter().copied().map(summarize).collect();
 
         // A token only when a further MATCHING page exists, so a client stops without an
-        // extra empty round trip. It carries the position of the last run on this page,
-        // so the next page resumes immediately after it.
+        // extra empty round trip. It carries the position of the last run on this page
+        // and the workflow this walk is over, so the next page resumes immediately after
+        // it and only on this workflow's runs.
         let next_token = match page.last() {
             Some(last) if remaining.len() > page.len() => Some(crate::state::encode_page_token(
                 PAGE_KIND,
-                &crate::state::format_run_listing_key(last.listing_key()),
+                &crate::state::format_run_listing_key(&input.workflow_arn, last.listing_key()),
             )),
             _ => None,
         };

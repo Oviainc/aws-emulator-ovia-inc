@@ -437,15 +437,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An attribute carries only the values SNS documents for it, and only on a
         // subscription of a protocol SNS documents it for — the SAME two rules
         // `SetSubscriptionAttributes` holds a write to, so an attribute this call
-        // accepts is one that call accepts too.
+        // accepts is one that call accepts too, refused with the same message. A bad
+        // VALUE names the member whose constraint it failed; the protocol-scope
+        // refusal is SNS's own whole sentence, so it is not framed again here.
         for (name, value) in &attributes {
-            let reason = state::subscription_attribute_value_reason(name, value).or_else(|| {
-                state::subscription_attribute_protocol_reason(name, value, &protocol)
-            });
-            if let Some(reason) = reason {
+            let message = state::subscription_attribute_value_reason(name, value)
+                .map(|reason| format!("Invalid parameter: Attributes Reason: {reason}"))
+                .or_else(|| {
+                    state::subscription_attribute_protocol_refusal(name, value, &protocol)
+                });
+            if let Some(message) = message {
                 return Err(SubscribeErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!("Invalid parameter: Attributes Reason: {reason}")),
+                        message: Some(message),
                     },
                 )
                 .into());

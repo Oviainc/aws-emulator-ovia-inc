@@ -178,8 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let name = input.name.trim().to_string();
-        if name.is_empty() {
+        // The `Name` is the resource's KEY, so it is stored and echoed back exactly as the
+        // caller sent it — never normalised: nothing in the model or in AWS's
+        // documentation normalises it, so the queue a later Get/Update/Delete, or a job's
+        // `Queue` reference, addresses is the one whose name matches byte for byte. The
+        // trim is only the test for a name that carries no characters at all, which the
+        // model's bare `__string` does not refuse before this handler runs.
+        let name = input.name;
+        if name.trim().is_empty() {
             return Err(CreateQueueErrorModeled::BadRequestException(BadRequestException {
                 message: Some("Name must not be empty.".to_string()),
             })

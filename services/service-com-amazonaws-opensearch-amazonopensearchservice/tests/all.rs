@@ -41,6 +41,8 @@ mod package_registry;
 mod reserved_instance_offerings;
 #[path = "all/reserved_instances.rs"]
 mod reserved_instances;
+#[path = "all/scheduled_actions.rs"]
+mod scheduled_actions;
 #[path = "all/service_software_rollback.rs"]
 mod service_software_rollback;
 #[path = "all/shared_es_signing_name_claim.rs"]
