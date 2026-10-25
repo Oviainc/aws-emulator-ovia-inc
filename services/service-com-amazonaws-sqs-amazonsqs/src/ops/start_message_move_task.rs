@@ -15,7 +15,9 @@
 //! start call answers sees none of them yet. What this does NOT model is a source queue
 //! that drains gradually — the messages leave it when the task starts, so a future
 //! `CancelMessageMoveTask` can return the ones not yet delivered but cannot leave them
-//! where they were.
+//! where they were. `CancelMessageMoveTask` puts the ones it has not delivered yet back
+//! in the source queue, so a cancelled move leaves the pair of queues holding every
+//! message it held before the task started.
 //!
 //! Two documented shapes this store cannot answer faithfully are refused rather than
 //! guessed: a blank `DestinationArn` for a dead-letter queue with several source queues
@@ -378,6 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             max_number_of_messages_per_second: input.max_number_of_messages_per_second,
             started_at: now,
             message_count: u64::try_from(moving_count).unwrap_or(u64::MAX),
+            cancelled_at: None,
         };
 
         // Take the messages out of the source queue, with the receipt handles it minted
@@ -416,6 +419,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sent_at: now,
                 available_at: task.delivery_instant(u64::try_from(index).unwrap_or(u64::MAX)),
                 invisible_until: None,
+                // Until its slot comes round the message is one this task still owes the
+                // destination queue, which is what a cancellation of this task takes back.
+                moved_by_task: Some(task.task_handle.clone()),
                 ..message
             });
         }

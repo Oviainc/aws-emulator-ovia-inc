@@ -21,7 +21,11 @@
 //! report.
 //!
 //! A request that names NO updatable member at all is refused as a `ValidationException`
-//! before any of that: it is permanently invalid rather than a transient conflict.
+//! before any of that: it is permanently invalid rather than a transient conflict. So is
+//! an on-demand capacity ceiling named for a table the update leaves in the PROVISIONED
+//! capacity mode — the two capacity models have no setting in common, so that
+//! contradiction is refused ahead of the scaffold refusal below, and the stored table is
+//! left as it was.
 //!
 //! A `StreamSpecification` enables or disables the table's DynamoDB Streams stream,
 //! which lives in the streams service's own store: enabling registers a stream and
@@ -290,11 +294,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 empty_update_message(),
             ));
         }
-        if let Some(member) = unsupported_member(&input) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "UpdateTable with {member}"
-            )));
-        }
         let index_updates = validated_index_updates(&input).map_err(lift)?;
         // What the request's `StreamSpecification` asks for, resolved before the
         // store lock is taken: a specification that cannot hold together refuses the
@@ -309,7 +308,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         // The table has to exist and be settled before anything is changed, so a
         // refused update leaves the stored table exactly as it was.
-        match store.table(&region, &name).map_err(lift)?.status(now) {
+        let stored = store.table(&region, &name).map_err(lift)?;
+        let stored_billing_mode = stored.billing_mode.clone();
+        match stored.status(now) {
             crate::state::TableStatus::Active => {}
             crate::state::TableStatus::Creating => {
                 return Err(UpdateTableErrorModeled::ResourceInUseException(
@@ -351,16 +352,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the update resolves to is computed against the STORED table, so a
         // request that only names an index update leaves the table's own mode and
         // throughput alone.
-        let table = store.table_mut(&region, &name).map_err(lift)?;
-        let billing_mode = input
-            .billing_mode
-            .clone()
-            .unwrap_or_else(|| table.billing_mode.clone());
+        let billing_mode = input.billing_mode.clone().unwrap_or(stored_billing_mode);
         if !matches!(billing_mode.as_str(), "PROVISIONED" | "PAY_PER_REQUEST") {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "Invalid BillingMode: {billing_mode} must be PROVISIONED or PAY_PER_REQUEST"
             )));
         }
+        // An on-demand capacity ceiling cannot hold on a table the update leaves in the
+        // PROVISIONED capacity mode, whichever resource it was named for
+        // ([`crate::state::check_on_demand_ceilings`]). That contradiction is in the
+        // REQUEST, so it is refused here — ahead of the scaffold's 501 for the members
+        // this slice does not store, and before anything is written, so the stored
+        // throughput is left exactly as it was.
+        crate::state::check_on_demand_ceilings(&billing_mode, requested_on_demand_ceilings(&input))
+            .map_err(lift)?;
+        if let Some(member) = unsupported_member(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "UpdateTable with {member}"
+            )));
+        }
+        let table = store.table_mut(&region, &name).map_err(lift)?;
         let table_throughput = resolve_table_throughput(table, &billing_mode, &input)
             .map_err(lift)?;
         // A warm-throughput change is reported `UPDATING` for the same span as the rest
@@ -681,6 +692,34 @@ fn asks_to_move_capacity(input: &UpdateTableInput) -> bool {
         || input.warm_throughput.is_some()
         || input.table_class.is_some()
         || list_named(input.global_secondary_index_updates.as_ref())
+}
+
+/// Every on-demand capacity ceiling this request names: the table's own, and the one
+/// each index create or index update carries — an index's capacity mode is the table's,
+/// so the same rule holds for all of them.
+fn requested_on_demand_ceilings(
+    input: &UpdateTableInput,
+) -> impl Iterator<Item = &OnDemandThroughput> {
+    ::std::iter::once(input.on_demand_throughput.as_ref())
+        .chain(
+            input
+                .global_secondary_index_updates
+                .iter()
+                .flatten()
+                .flat_map(|update| {
+                    [
+                        update
+                            .create
+                            .as_ref()
+                            .and_then(|create| create.on_demand_throughput.as_ref()),
+                        update
+                            .update
+                            .as_ref()
+                            .and_then(|change| change.on_demand_throughput.as_ref()),
+                    ]
+                }),
+        )
+        .flatten()
 }
 
 /// The first input member present that this slice does not store, if any.
@@ -1027,16 +1066,19 @@ fn resolve_indexes(
                 // An index added to a table that already holds items is metered on the
                 // same schedule as every other one, starting from zero.
                 reported_counters: crate::state::MeteredCounters::new(now),
+                // Contributor insights are off on a new index, as they are on a new
+                // table: only `UpdateContributorInsights` turns them on.
+                contributor_insights: crate::state::ContributorInsights::default(),
             });
         }
         if let Some(delete) = &update.delete {
             let before = indexes.len();
             indexes.retain(|index| index.name != delete.index_name);
             if indexes.len() == before {
-                return Err(crate::state::RequestError::NotFound(format!(
-                    "Requested resource not found: Index not found for table {}: {}",
-                    table.name, delete.index_name
-                )));
+                return Err(crate::state::index_not_found(
+                    &table.name,
+                    &delete.index_name,
+                ));
             }
         }
         if let Some(change) = &update.update {
@@ -1044,10 +1086,10 @@ fn resolve_indexes(
                 .iter_mut()
                 .find(|index| index.name == change.index_name)
             else {
-                return Err(crate::state::RequestError::NotFound(format!(
-                    "Requested resource not found: Index not found for table {}: {}",
-                    table.name, change.index_name
-                )));
+                return Err(crate::state::index_not_found(
+                    &table.name,
+                    &change.index_name,
+                ));
             };
             if change.on_demand_throughput.is_some() || change.warm_throughput.is_some() {
                 // Refused up front by `unsupported_member`, which answers the

@@ -398,20 +398,30 @@ async fn the_built_in_system_queue_cannot_be_modified() {
 /// The accepted rows span both `RenewalType` values
 /// (`smithy_query(query="shape",shape="RenewalType")`: AUTO_RENEW, EXPIRE) and more than
 /// one reserved-slot count; the refused rows differ in what else the request asked for.
+///
+/// Every accepted row states at least the slot count the fixture queue already reserves,
+/// because `ReservationPlanSettings$ReservedSlots` is one-way ("You can't decrease the
+/// number of RTS in your reserved queue") — the rule the sibling suite
+/// `queue_capacity_validation` covers in both directions.
 #[tokio::test]
 async fn a_reservation_plan_applies_only_to_a_reserved_queue() {
     // `Commitment`'s only modelled value is ONE_YEAR
     // (`smithy_query(query="shape",shape="Commitment")`).
     let plans = [
-        ("auto-renewing, one slot", json!({
+        ("auto-renewing, three slots", json!({
             "commitment": "ONE_YEAR",
             "renewalType": "AUTO_RENEW",
-            "reservedSlots": 1
+            "reservedSlots": 3
         })),
         ("expiring, four slots", json!({
             "commitment": "ONE_YEAR",
             "renewalType": "EXPIRE",
             "reservedSlots": 4
+        })),
+        ("auto-renewing, the slot count the queue already reserves", json!({
+            "commitment": "ONE_YEAR",
+            "renewalType": "AUTO_RENEW",
+            "reservedSlots": 2
         })),
     ];
 

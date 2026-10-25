@@ -186,6 +186,15 @@ fn reference_cases() -> Vec<ReferenceCase> {
             foreign: ForeignAnswer::LookupMiss,
         },
         ReferenceCase {
+            case: "UntagResource removes tags from it",
+            body: |arn, _run, _task| serde_json::json!({
+                "ResourceArn": arn,
+                "TagKeys": ["env"],
+            }),
+            operation: "UntagResource",
+            foreign: ForeignAnswer::LookupMiss,
+        },
+        ReferenceCase {
             case: "ListWorkflowRuns pages over its runs",
             operation: "ListWorkflowRuns",
             body: |arn, _run, _task| serde_json::json!({"WorkflowArn": arn}),

@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_schema::{Schema, ShapeType};
-use aws_smithy_schema_server::Violation;
+use aws_smithy_schema_server::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -107,15 +107,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // framework's own wording, which names the member and the constraint it
         // failed, so the clause a caller has to act on is single-homed there — with
         // the offending value re-rendered in its member's own wire form by
-        // [`rendered_in_member_type`].
+        // [`rendered_in_member_type`]. The exception is the one member CodeBuild
+        // refuses with a sentence of its own, below.
         match refusal {
             Refusal::Invalid(violations) => {
-                let stated: Vec<Violation> =
-                    violations.iter().map(rendered_in_member_type).collect();
+                // One member is CodeBuild's own to refuse rather than the shared
+                // constraint walk's: a sort order outside its enum is answered by the
+                // sentence the service states for it ([`INVALID_SORT_ORDER_MESSAGE`]),
+                // so no caller is told its list request failed generic request
+                // validation. That sentence is the whole answer whenever such a
+                // violation is among the ones found — the service refuses the sort order
+                // it was handed rather than reporting a constraint envelope beside it —
+                // and every other violation keeps the framework's wording.
+                let message = if violations.iter().any(is_sort_order_violation) {
+                    INVALID_SORT_ORDER_MESSAGE.to_string()
+                } else {
+                    let stated: Vec<Violation> =
+                        violations.iter().map(rendered_in_member_type).collect();
+                    aws_smithy_schema_server::envelope(&stated)
+                        .unwrap_or_else(|| "Invalid input".to_string())
+                };
                 Some(Refused {
                     code: "InvalidInputException".to_string(),
-                    message: aws_smithy_schema_server::envelope(&stated)
-                        .unwrap_or_else(|| "Invalid input".to_string()),
+                    message,
                 })
             }
             // Authentication is the framework's answer to give, not this service's.
@@ -305,3 +319,32 @@ fn member_path_of(path: &str) -> String {
 /// The segment a validation path puts between a collection and its element, as
 /// `aws_smithy_schema_server::constraints::path` spells it.
 const COLLECTION_STEP: &str = "member";
+
+/// What CodeBuild states as the reason a list request asked for a sort order it does
+/// not define, carried by the modelled `InvalidInputException`.
+///
+/// The sentence is FIXED: it quotes neither the rejected value, the member path nor the
+/// permitted set, so it is the same on every request and every operation that takes a
+/// sort order. Recorded behaviour — the model states no message for the error.
+const INVALID_SORT_ORDER_MESSAGE: &str = "Invalid sort order specified";
+
+/// `true` when `violation` is a value outside the model's `SortOrderType` value set.
+///
+/// A violation carries the value set from the schema of the member that failed, so the
+/// comparison is against the MODEL rather than against a member name: every operation
+/// whose input models a sort order is covered, including the ones whose handlers are
+/// still scaffolded, and no other enum of this service declares the same values.
+fn is_sort_order_violation(violation: &Violation) -> bool {
+    let declared = crate::ops::types::SORT_ORDER_TYPE_VALUES;
+    match &violation.kind {
+        // Set equality, so the order codegen happens to list an enum's values in is
+        // not part of the test.
+        ViolationKind::EnumValue(allowed) => {
+            allowed.len() == declared.len()
+                && allowed
+                    .iter()
+                    .all(|value| declared.contains(&value.as_str()))
+        }
+        _ => false,
+    }
+}

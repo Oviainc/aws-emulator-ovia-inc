@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContributorInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContributorInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one `ContributorInsightsSummary` per resource whose setting this
+//! store holds — "a list of ContributorInsightsSummary for a table and all its global
+//! secondary indexes" (the doc below) — each read from
+//! [`crate::state::ContributorInsights`], so a summary reports what the last
+//! `UpdateContributorInsights` wrote and the status the clock has made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContributorInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `TableName` narrows the listing to that one table and its indexes, and a name that
+//! resolves to no stored table is the modelled `ResourceNotFoundException`; a request
+//! that names none lists every table of the region it was signed for. The page is taken
+//! in ascending summary order ([`crate::state::contributor_insights_key`]) and `NextToken`
+//! resumes strictly after the summary the previous page stopped on, by the same rule as
+//! this service's other listings.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContributorInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContributorInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContributorInsights"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "You can also provide the Amazon Resource Name (ARN) of the table in this
+        // parameter" (`ListContributorInsights$TableName`), so either form resolves to
+        // the stored name.
+        let requested = input
+            .table_name
+            .as_deref()
+            .map(crate::state::resolve_table_name)
+            .transpose()
+            .map_err(lift)?;
+
+        let mut store = state.lock();
+        // Finish what the clock has already made due before reporting: a table whose
+        // DeleteTable span has elapsed is gone, and has no summary. This is a read, so
+        // that is the only write it makes.
+        store.apply_due_transitions(now);
+        let summaries = match requested.as_deref() {
+            // A listing narrowed to one table is refused when that table is not there:
+            // the request named a resource whose summaries cannot be read.
+            Some(name) => store
+                .table(&region, name)
+                .map_err(lift)?
+                .contributor_insights_summaries(now),
+            // A table name is unique within one region, so a listing that names no table
+            // reports the tables of the region this request was signed for.
+            None => store
+                .tables_in(&region)
+                .map(|tables| {
+                    tables
+                        .values()
+                        .flat_map(|table| table.contributor_insights_summaries(now))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        // One page, taken in ascending summary order so `NextToken` resumes strictly
+        // after the summary the previous page stopped on — the paging rule every listing
+        // of this service follows, applied by the one helper they share.
+        let mut entries: Vec<(String, ContributorInsightsSummary)> = summaries
+            .into_iter()
+            .map(|summary| {
+                (
+                    crate::state::contributor_insights_key(
+                        summary.table_name.as_deref().unwrap_or_default(),
+                        summary.index_name.as_deref(),
+                    ),
+                    summary,
+                )
+            })
+            .collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let next_token = crate::state::page_by_name(
+            &mut entries,
+            input.next_token.as_deref(),
+            // "Maximum number of results to return per page"
+            // (`ListContributorInsights$MaxResults`), whose default is 0: a request that
+            // asks for no page size at all is served the whole page below.
+            (input.max_results > 0).then_some(input.max_results),
+            DEFAULT_MAX_RESULTS,
+            |(key, _)| key.as_str(),
+        );
+
+        Ok(ListContributorInsightsOutput {
+            contributor_insights_summaries: Some(
+                entries.into_iter().map(|(_, summary)| summary).collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` is served: the largest the member
+/// allows (`ListContributorInsightsLimit`, range ..100), so a caller that asks for no
+/// page size pages as rarely as the API permits.
+const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListContributorInsightsError {
+    ListContributorInsightsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table that is not there
+/// is the `ResourceNotFoundException` this operation models, and a member the service
+/// itself refuses is the 400 `ValidationException`.
+fn lift(error: crate::state::RequestError) -> ListContributorInsightsError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            ListContributorInsightsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

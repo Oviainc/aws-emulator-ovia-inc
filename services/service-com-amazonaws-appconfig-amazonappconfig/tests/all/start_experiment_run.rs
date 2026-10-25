@@ -59,7 +59,7 @@ const SNAPSHOT_MEMBERS: &[&str] = &[
 ];
 
 /// `POST /applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns`.
-async fn start_run(
+pub(crate) async fn start_run(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,
@@ -79,7 +79,7 @@ async fn start_run(
 }
 
 /// `GET .../experimentruns/{Run}`.
-async fn get_run(
+pub(crate) async fn get_run(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,
@@ -100,7 +100,7 @@ async fn get_run(
 
 /// Create one experiment definition under `scope` and answer the create's document, which
 /// carries both its minted `Id` and the record every run's snapshot is taken from.
-async fn create_test_definition(
+pub(crate) async fn create_test_definition(
     router: &MultiServiceRouter,
     scope: &Scope,
     name: &str,
@@ -131,7 +131,7 @@ async fn create_test_definition(
 }
 
 /// A definition document's minted id.
-fn id_of(case: &str, definition: &Value) -> String {
+pub(crate) fn id_of(case: &str, definition: &Value) -> String {
     definition
         .get("Id")
         .and_then(Value::as_str)
@@ -141,7 +141,7 @@ fn id_of(case: &str, definition: &Value) -> String {
 
 /// A JSON object from `(key, value)` pairs — the wire form of `TagMap` and of the inline
 /// `TreatmentOverrides`.
-fn string_map<'pair>(pairs: impl IntoIterator<Item = (&'pair str, &'pair str)>) -> Value {
+pub(crate) fn string_map<'pair>(pairs: impl IntoIterator<Item = (&'pair str, &'pair str)>) -> Value {
     Value::Object(
         pairs
             .into_iter()
@@ -152,7 +152,12 @@ fn string_map<'pair>(pairs: impl IntoIterator<Item = (&'pair str, &'pair str)>) 
 
 /// Assert a started run: 201, the expected run number, `Status` `RUNNING`, no end instant
 /// while it runs, and a snapshot of the definition it was started from.
-fn assert_running(case: &str, created: &Answer, expected_run: i64, definition: &Value) -> Value {
+pub(crate) fn assert_running(
+    case: &str,
+    created: &Answer,
+    expected_run: i64,
+    definition: &Value,
+) -> Value {
     assert_eq!(
         created.status,
         201,
@@ -212,7 +217,7 @@ fn assert_running(case: &str, created: &Answer, expected_run: i64, definition: &
 }
 
 /// Assert that reading the run back reports byte for byte what the start answered.
-async fn assert_reads_back(
+pub(crate) async fn assert_reads_back(
     router: &MultiServiceRouter,
     case: &str,
     application: &str,
@@ -240,7 +245,12 @@ async fn assert_reads_back(
 }
 
 /// Assert a refusal: the status the operation models for it and its wire error code.
-fn assert_refused(case: &str, refused: &Answer, expected_status: u16, expected_code: &str) {
+pub(crate) fn assert_refused(
+    case: &str,
+    refused: &Answer,
+    expected_status: u16,
+    expected_code: &str,
+) {
     assert_eq!(
         refused.status,
         expected_status,

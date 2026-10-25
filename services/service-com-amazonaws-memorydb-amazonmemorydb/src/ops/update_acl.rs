@@ -305,10 +305,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // An addition names a user the ACL does not list yet. Whether that user EXISTS
-        // is not resolved here, exactly as `CreateACL` does not resolve its
-        // `UserNames`: the two write paths of one membership must agree about what a
-        // member is.
+        // An addition names a user the ACL does not list yet, and a member IS a user:
+        // the name is resolved against the user store through the one rule `CreateACL`
+        // resolves its `UserNames` with, so the two write paths of one membership agree
+        // about what a member is.
+        if let Some(message) = state.absent_member_rejection(to_add.iter().map(String::as_str)) {
+            return Err(UpdateACLErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(message),
+            })
+            .into());
+        }
         // A name added that the ACL ALREADY lists is a delta that cannot hold against
         // the membership it is applied to — the modelled COMBINATION fault, which is
         // what AWS answers for it. `DuplicateUserNameFault` ("A user with the specified

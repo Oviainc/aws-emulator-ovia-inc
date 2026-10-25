@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeContributorInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeContributorInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the contributor insights setting stored on the table the request
+//! names, or on the global secondary index it names beside it — the status, the mode in
+//! force and when that status was last reached, all read from
+//! [`crate::state::ContributorInsights`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeContributorInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A table (or index) no `UpdateContributorInsights` has ever named reports `DISABLED`
+//! with no timestamp: the feature is off until that operation turns it on. A table name
+//! that resolves to no stored table, and an `IndexName` the stored table does not carry,
+//! are both the modelled `ResourceNotFoundException` — "the operation tried to access a
+//! nonexistent table or index".
+//!
+//! `ContributorInsightsRuleList` is reported by no read here: the member lists the
+//! CloudWatch Contributor Insights rules AWS creates for the resource, and this emulator
+//! creates none, so naming rules nothing runs would be a fabrication rather than a
+//! report.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +170,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeContributorInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeContributorInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeContributorInsights"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "You can also provide the Amazon Resource Name (ARN) of the table in this
+        // parameter" (`DescribeContributorInsights$TableName`), so either form resolves
+        // to the stored name.
+        let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
+        let index_name = input.index_name.as_deref();
+
+        let mut store = state.lock();
+        // Finish what the clock has already made due before reporting: a table whose
+        // DeleteTable span has elapsed is gone. This is a read, so that is the only write
+        // it makes.
+        store.apply_due_transitions(now);
+        let table = store.table(&region, &name).map_err(lift)?;
+        let insights = table.contributor_insights(index_name).map_err(lift)?;
+
+        Ok(DescribeContributorInsightsOutput {
+            table_name: Some(table.name.clone()),
+            // The index is echoed only where the request named one: the setting reported
+            // is then that index's rather than the table's.
+            index_name: index_name.map(str::to_string),
+            contributor_insights_status: Some(insights.status(now).to_string()),
+            last_update_date_time: insights
+                .last_update(now)
+                .map(::aws_smithy_types::DateTime::from),
+            contributor_insights_mode: insights.mode(),
+            // This emulator creates no CloudWatch rule, so there is none to name, and a
+            // setting that cannot fail has no failure to report.
+            contributor_insights_rule_list: None,
+            failure_exception: None,
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> DescribeContributorInsightsError {
+    DescribeContributorInsightsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel: a table or index that is
+/// not there is the `ResourceNotFoundException` this operation models, and a member the
+/// service itself refuses is the 400 `ValidationException`.
+fn lift(error: crate::state::RequestError) -> DescribeContributorInsightsError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            DescribeContributorInsightsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

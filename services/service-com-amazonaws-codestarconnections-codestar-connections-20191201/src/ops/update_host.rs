@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves `HostArn` against the hosts in [`crate::state`] and writes the
+//! configurations the request supplied back onto that record. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -87,10 +81,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `UpdateHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#UpdateHost")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#UpdateHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateHostErrorModeled {
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
     UnsupportedOperationException(UnsupportedOperationException),
@@ -147,18 +149,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // An ARN that resolves to no host this service holds names a resource that is
+        // ABSENT, reported with the modeled `ResourceNotFoundException` and a message
+        // naming the ARN that was supplied — the same answer, at the same status this
+        // service answers every absent resource with
+        // (`crate::state::RESOURCE_NOT_FOUND_STATUS`), that `GetHost` and `DeleteHost`
+        // give an unresolvable `HostArn`. The operation's other modeled refusals report
+        // a host that IS there (see below), so they are never used for an absence.
+        // Nothing is written on this path, so a refused update leaves state untouched.
+        let Some(host) = store.hosts.get_mut(&input.host_arn) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UpdateHostErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::host_not_found_message(&input.host_arn)),
+                }),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
+        };
+
+        // "Updates a specified host with the provided configurations": each optional
+        // member REPLACES the stored one when the request carries it and is left as it
+        // was when the request omits it, so an update never silently clears a
+        // configuration the caller did not mention. `Name`, `ProviderType` and `Status`
+        // are not updatable — `UpdateHost` models no member for them — and the host keeps
+        // its ARN, so the update is observable through `GetHost` on the same ARN.
+        if let Some(provider_endpoint) = input.provider_endpoint {
+            host.provider_endpoint = provider_endpoint;
+        }
+        if let Some(vpc_configuration) = input.vpc_configuration {
+            host.vpc_configuration = Some(vpc_configuration);
+        }
+        // `Status` stays where it is, and no status move is scheduled: this operation
+        // models no status member, and the statuses a VPC configuration passes through
+        // on the real service (`VPC_CONFIG_INITIALIZING`,
+        // `VPC_CONFIG_FAILED_INITIALIZATION`) are reached by provisioning that this
+        // emulator does not perform and that no recorded unit of this service shows an
+        // update entering, so the clock owes nothing here. A recorded fixture that shows
+        // the transition is what would put it in this handler.
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged — the access key id is
+        // the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "UpdateHost",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            host_arn = %input.host_arn,
+            outcome = "updated",
+            "host updated"
+        );
+
+        // The remaining modeled errors describe conditions this emulator never reaches:
+        // `ConflictException` is for two conflicting operations on one host (the store
+        // lock serialises every call, so no second operation is ever in flight here),
+        // and `UnsupportedOperationException` / `ResourceUnavailableException` report a
+        // host whose provider or status cannot take an update — this emulator mints a
+        // host only in `PENDING`, which is updatable.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateHost"))
+        // `UpdateHostOutput` models no member, so the answer to an accepted update is
+        // the empty 200 the model states; what changed is read back through `GetHost`.
+        Ok(UpdateHostOutput::default())
     }
 }

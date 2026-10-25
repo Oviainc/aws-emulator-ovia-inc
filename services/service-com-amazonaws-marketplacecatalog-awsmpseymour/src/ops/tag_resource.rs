@@ -3,6 +3,10 @@
 //! @op TagResource
 //! Adds tags to the resource a resource ARN names.
 //!
+//! A key inside the namespace [`crate::state::RESERVED_TAG_KEY_PREFIX`] keeps (matched
+//! however it is cased) is one Amazon Web Services owns, so such a request is refused
+//! with `ValidationException` and nothing is stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -158,6 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The `aws:` namespace holds the tags Amazon Web Services creates, and a
+        // caller may not put a key there: the key syntax admits the colon, so
+        // this is a rule about the REQUEST, judged before the store is read.
+        if let Some(reserved) = crate::state::first_reserved_tag(&input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_key("Tags", reserved),
+            )
+            .into());
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

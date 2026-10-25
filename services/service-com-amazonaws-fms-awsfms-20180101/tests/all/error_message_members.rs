@@ -136,6 +136,9 @@ fn not_found_without_administrator() -> Vec<Row> {
             body: json!({}),
             lookup: None,
         },
+        // A policy lookup is decided by the policy store alone, and a resource-level
+        // tagging lookup by the `ResourceArn` it names, so neither waits on an
+        // administrator association.
         Row {
             case: "ListTagsForResource with a policy ARN naming no policy",
             operation: "ListTagsForResource",
@@ -349,6 +352,9 @@ async fn resource_not_found_answers_one_constant_message_everywhere() {
 #[tokio::test]
 async fn resource_not_found_message_does_not_vary_with_the_region() {
     let router = emulator();
+    // The policy read is organisation-scoped, so the administrator association
+    // is what lets the lookup reach the store at all.
+    associate_admin(&router).await;
     for region in REGIONS {
         let (status, body) = call_in(
             &router,
