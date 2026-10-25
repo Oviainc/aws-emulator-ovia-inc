@@ -212,7 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The namespaces AWS owns are not writable by a publisher: a datapoint in one would
+        // be a service-authored series a client forged. Refused before anything is read or
+        // written, so the store is untouched whatever else the request carries.
+        //
+        // The refusal names the RESERVED PREFIX rather than the namespace the request
+        // carried, because that is what the rule is about and what the service's own answer
+        // reports ("The value AWS/ for parameter Namespace is invalid." for a publish into
+        // `AWS/ES`); the status and the error code are what a client branches on.
+        if input.namespace.starts_with(RESERVED_NAMESPACE_PREFIX) {
+            return Err(invalid_value(format!(
+                "The value {RESERVED_NAMESPACE_PREFIX} for parameter Namespace is invalid."
+            )));
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutMetricDataErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the CloudWatch metric store is unavailable".into()),
@@ -430,22 +443,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let mut store = state.lock();
-        for (key, observations) in ingest {
-            if store.append_datapoints(key, observations).is_err() {
-                return Err(PutMetricDataErrorModeled::LimitExceededFault(LimitExceededFault {
-                    message: Some(format!(
-                        "this emulator holds at most {} metric time series",
-                        crate::state::MAX_SERIES
-                    )),
-                })
-                .into());
+        // The lock is taken for the ingest only: an alarm evaluation takes it itself, and the
+        // notifications it owes are delivered with it released.
+        {
+            let mut store = state.lock();
+            for (key, observations) in ingest {
+                if store.append_datapoints(key, observations).is_err() {
+                    return Err(PutMetricDataErrorModeled::LimitExceededFault(
+                        LimitExceededFault {
+                            message: Some(format!(
+                                "this emulator holds at most {} metric time series",
+                                crate::state::MAX_SERIES
+                            )),
+                        },
+                    )
+                    .into());
+                }
             }
         }
+
+        // These datapoints are what every metric alarm over them is evaluated from, so the
+        // evaluations this write made due are materialised now and the action notifications
+        // the resulting transitions owe go out, rather than waiting for whatever call reads
+        // the alarm next.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
 
         Ok(PutMetricDataOutput)
     }
 }
+
+/// The namespace prefix AWS reserves for its own services' metrics.
+///
+/// "You can use ASCII characters for the namespace, except for control characters which are
+/// not supported. To avoid conflicts with Amazon Web Services service namespaces, you should
+/// not specify a namespace that begins with AWS/" (`PutMetricDataInput$Namespace`) — the
+/// reserved space is not merely discouraged on the write path: CloudWatch refuses a publish
+/// into it with `InvalidParameterValue`, so a client cannot forge a series an AWS service is
+/// supposed to own. The match is exact, because an AWS namespace is written in exactly this
+/// case (`AWS/ES`, `AWS/EC2`): a namespace differing in case is a customer namespace and is
+/// accepted.
+const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
 
 /// Refuse an input value outside what this operation documents.
 fn invalid_value(message: String) -> PutMetricDataError {

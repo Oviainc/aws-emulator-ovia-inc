@@ -478,152 +478,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_secs();
-        let mut store = state.lock();
-
-        // An alarm name names ONE alarm whatever kind it is ("This name must be unique within
-        // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name
-        // another kind of alarm already holds, exactly as the other alarm writers refuse one a
-        // metric alarm holds. Without every half the store could hold two alarms under one
-        // name.
-        if let Some(kind) = store
-            .alarm_kind(&input.alarm_name)
-            .filter(|kind| *kind != crate::state::ALARM_TYPE_METRIC)
+        // The store's lock is held for the write only, and released before the alarms are
+        // settled below: an alarm evaluation takes it itself, and the notifications it owes
+        // are delivered with it released.
         {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "a {kind} named {} already exists in this Region",
-                input.alarm_name
-            )));
+            let mut store = state.lock();
+            write_alarm(&mut store, &input, &region, now)?;
         }
-
-        // "When this operation creates an alarm, the alarm state is immediately set to
-        // INSUFFICIENT_DATA. For PromQL alarms, the alarm state is instead immediately set
-        // to OK." … "When you update an existing alarm, its state is left unchanged, but
-        // the update completely overwrites the previous configuration of the alarm."
-        // The alarm this call replaces, when it replaces one: its state carries over (below)
-        // and its configuration is what the history document records as the configuration
-        // this write replaced.
-        let previous = store
-            .alarms
-            .get(&input.alarm_name)
-            .map(|stored| stored.alarm.clone());
-        let existing = previous.as_ref().map(|alarm| {
-            (
-                alarm.state_value.clone(),
-                alarm.state_reason.clone(),
-                alarm.state_reason_data.clone(),
-                alarm.state_updated_timestamp,
-                alarm.state_transitioned_timestamp,
-            )
-        });
-        let is_update = existing.is_some();
-        // "The quota for alarms for this customer has already been reached." — CloudWatch's
-        // published quota is 5,000 alarms per Region per account, which is also this
-        // in-memory store's capacity bound. Replacing an alarm that already exists does not
-        // add one, so it is never refused here.
-        if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
-            return Err(PutMetricAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
-                message: Some(format!(
-                    "the quota of {} alarms has already been reached",
-                    crate::state::MAX_ALARMS
-                )),
-            })
-            .into());
-        }
-        let initial_state = if matches!(
-            input.evaluation_criteria,
-            Some(EvaluationCriteria::PromQLCriteria(_))
-        ) {
-            "OK"
-        } else {
-            "INSUFFICIENT_DATA"
-        };
-        let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
-            existing.unwrap_or_else(|| {
-                (
-                    Some(initial_state.to_string()),
-                    Some("Unchecked: initial alarm creation".to_string()),
-                    None,
-                    Some(crate::state::to_timestamp(now)),
-                    Some(crate::state::to_timestamp(now)),
-                )
-            });
-
-        let alarm = MetricAlarm {
-            alarm_name: Some(input.alarm_name.clone()),
-            alarm_arn: Some(crate::state::alarm_arn(&region, &input.alarm_name)),
-            alarm_description: input.alarm_description.clone(),
-            alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
-            // "Indicates whether actions should be executed during any changes to the alarm
-            // state. The default is TRUE." (PutMetricAlarmInput$ActionsEnabled)
-            actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
-            ok_actions: input.ok_actions.clone(),
-            alarm_actions: input.alarm_actions.clone(),
-            insufficient_data_actions: input.insufficient_data_actions.clone(),
-            state_value,
-            state_reason,
-            state_reason_data,
-            state_updated_timestamp: state_updated,
-            metric_name: input.metric_name.clone(),
-            namespace: input.namespace.clone(),
-            statistic: input.statistic.clone(),
-            extended_statistic: input.extended_statistic.clone(),
-            dimensions: input.dimensions.clone(),
-            period: input.period,
-            unit: input.unit.clone(),
-            evaluation_periods: input.evaluation_periods,
-            datapoints_to_alarm: input.datapoints_to_alarm,
-            threshold: input.threshold,
-            comparison_operator: input.comparison_operator.clone(),
-            treat_missing_data: input.treat_missing_data.clone(),
-            evaluate_low_sample_count_percentile: input
-                .evaluate_low_sample_count_percentile
-                .clone(),
-            metrics: input.metrics.clone(),
-            threshold_metric_id: input.threshold_metric_id.clone(),
-            // No evaluation engine runs in this slice, so nothing has produced an
-            // evaluation state for this alarm.
-            evaluation_state: None,
-            state_transitioned_timestamp: state_transitioned,
-            evaluation_window: input.evaluation_window.clone(),
-            warm_up_configuration: input.warm_up_configuration.clone(),
-            evaluation_criteria: input.evaluation_criteria.clone(),
-            evaluation_interval: input.evaluation_interval,
-            action_configuration: input.action_configuration.clone(),
-        };
-
-        // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — for a
-        // configuration update, the configuration this call stored, and the one it replaced
-        // when it replaced an alarm. Built from the alarm the store now holds, so it records
-        // what was written rather than what the request happened to name.
-        let history_data =
-            crate::state::configuration_update_history_data(previous.as_ref(), &alarm);
-
-        store.alarms.insert(
-            input.alarm_name.clone(),
-            crate::state::StoredAlarm {
-                alarm,
-                tags: input.tags.clone().unwrap_or_default(),
-            },
-        );
-        store.record_history(
-            &input.alarm_name,
-            now,
-            AlarmHistoryItem {
-                alarm_name: Some(input.alarm_name.clone()),
-                alarm_contributor_id: None,
-                alarm_type: Some("MetricAlarm".to_string()),
-                timestamp: Some(crate::state::to_timestamp(now)),
-                history_item_type: Some("ConfigurationUpdate".to_string()),
-                history_summary: Some(if is_update {
-                    "Alarm updated from configuration".to_string()
-                } else {
-                    "Alarm created".to_string()
-                }),
-                history_data: Some(history_data),
-                alarm_contributor_attributes: None,
-            },
-        );
+        // Every alarm evaluation the clock has already made due is materialised, and the
+        // notifications the resulting transitions owe are delivered. This alarm's own first
+        // evaluation is not among them: it becomes due a span after this write, so a caller
+        // reading straight after it still sees the state this write left behind.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
 
         Ok(PutMetricAlarmOutput)
     }
+}
+
+/// Store the alarm this request configures, and record the history item for the write.
+///
+/// The whole write, so the one place that holds the store's lock is the caller's block: the
+/// alarm either replaces the alarm of its name or is added, and a refusal leaves the store
+/// exactly as it was.
+fn write_alarm(
+    store: &mut crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
+    input: &PutMetricAlarmInput,
+    region: &str,
+    now: f64,
+) -> Result<(), PutMetricAlarmError> {
+    // An alarm name names ONE alarm whatever kind it is ("This name must be unique within
+    // the Region." — `PutCompositeAlarmInput$AlarmName`), so this writer refuses a name
+    // another kind of alarm already holds, exactly as the other alarm writers refuse one a
+    // metric alarm holds. Without every half the store could hold two alarms under one name.
+    if let Some(kind) = store
+        .alarm_kind(&input.alarm_name)
+        .filter(|kind| *kind != crate::state::ALARM_TYPE_METRIC)
+    {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "a {kind} named {} already exists in this Region",
+            input.alarm_name
+        )));
+    }
+
+    // "When this operation creates an alarm, the alarm state is immediately set to
+    // INSUFFICIENT_DATA. For PromQL alarms, the alarm state is instead immediately set
+    // to OK." … "When you update an existing alarm, its state is left unchanged, but
+    // the update completely overwrites the previous configuration of the alarm."
+    // The alarm this call replaces, when it replaces one: its state carries over (below)
+    // and its configuration is what the history document records as the configuration
+    // this write replaced.
+    let previous = store
+        .alarms
+        .get(&input.alarm_name)
+        .map(|stored| stored.alarm.clone());
+    let existing = previous.as_ref().map(|alarm| {
+        (
+            alarm.state_value.clone(),
+            alarm.state_reason.clone(),
+            alarm.state_reason_data.clone(),
+            alarm.state_updated_timestamp,
+            alarm.state_transitioned_timestamp,
+        )
+    });
+    let is_update = existing.is_some();
+    // "The quota for alarms for this customer has already been reached." — CloudWatch's
+    // published quota is 5,000 alarms per Region per account, which is also this
+    // in-memory store's capacity bound. Replacing an alarm that already exists does not
+    // add one, so it is never refused here.
+    if !is_update && store.alarm_count() >= crate::state::MAX_ALARMS {
+        return Err(PutMetricAlarmErrorModeled::LimitExceededFault(LimitExceededFault {
+            message: Some(format!(
+                "the quota of {} alarms has already been reached",
+                crate::state::MAX_ALARMS
+            )),
+        })
+        .into());
+    }
+    let initial_state = if matches!(
+        input.evaluation_criteria,
+        Some(EvaluationCriteria::PromQLCriteria(_))
+    ) {
+        "OK"
+    } else {
+        "INSUFFICIENT_DATA"
+    };
+    let (state_value, state_reason, state_reason_data, state_updated, state_transitioned) =
+        existing.unwrap_or_else(|| {
+            (
+                Some(initial_state.to_string()),
+                Some("Unchecked: initial alarm creation".to_string()),
+                None,
+                Some(crate::state::to_timestamp(now)),
+                Some(crate::state::to_timestamp(now)),
+            )
+        });
+
+    let alarm = MetricAlarm {
+        alarm_name: Some(input.alarm_name.clone()),
+        alarm_arn: Some(crate::state::alarm_arn(region, &input.alarm_name)),
+        alarm_description: input.alarm_description.clone(),
+        alarm_configuration_updated_timestamp: Some(crate::state::to_timestamp(now)),
+        // "Indicates whether actions should be executed during any changes to the alarm
+        // state. The default is TRUE." (PutMetricAlarmInput$ActionsEnabled)
+        actions_enabled: Some(input.actions_enabled.unwrap_or(true)),
+        ok_actions: input.ok_actions.clone(),
+        alarm_actions: input.alarm_actions.clone(),
+        insufficient_data_actions: input.insufficient_data_actions.clone(),
+        state_value,
+        state_reason,
+        state_reason_data,
+        state_updated_timestamp: state_updated,
+        metric_name: input.metric_name.clone(),
+        namespace: input.namespace.clone(),
+        statistic: input.statistic.clone(),
+        extended_statistic: input.extended_statistic.clone(),
+        dimensions: input.dimensions.clone(),
+        period: input.period,
+        unit: input.unit.clone(),
+        evaluation_periods: input.evaluation_periods,
+        datapoints_to_alarm: input.datapoints_to_alarm,
+        threshold: input.threshold,
+        comparison_operator: input.comparison_operator.clone(),
+        treat_missing_data: input.treat_missing_data.clone(),
+        evaluate_low_sample_count_percentile: input
+            .evaluate_low_sample_count_percentile
+            .clone(),
+        metrics: input.metrics.clone(),
+        threshold_metric_id: input.threshold_metric_id.clone(),
+        // No evaluation has run for this alarm yet: its state is the one this write left
+        // it in until the first evaluation becomes due.
+        evaluation_state: None,
+        state_transitioned_timestamp: state_transitioned,
+        evaluation_window: input.evaluation_window.clone(),
+        warm_up_configuration: input.warm_up_configuration.clone(),
+        evaluation_criteria: input.evaluation_criteria.clone(),
+        evaluation_interval: input.evaluation_interval,
+        action_configuration: input.action_configuration.clone(),
+    };
+
+    // "Data about the alarm, in JSON format." (`AlarmHistoryItem$HistoryData`) — for a
+    // configuration update, the configuration this call stored, and the one it replaced
+    // when it replaced an alarm. Built from the alarm the store now holds, so it records
+    // what was written rather than what the request happened to name.
+    let history_data = crate::state::configuration_update_history_data(previous.as_ref(), &alarm);
+
+    store.alarms.insert(
+        input.alarm_name.clone(),
+        crate::state::StoredAlarm {
+            alarm,
+            tags: input.tags.clone().unwrap_or_default(),
+            // "When this operation creates an alarm, the alarm state is immediately set
+            // to INSUFFICIENT_DATA. The alarm is then evaluated and its state is set
+            // appropriately." — so this write starts the span during which the alarm
+            // still reports the state it left behind, and the first evaluation against
+            // the stored metric data becomes due at its end.
+            evaluation_due_secs: now + crate::state::alarm_evaluation::EVALUATION_DELAY_SECS,
+        },
+    );
+    store.record_history(
+        &input.alarm_name,
+        now,
+        AlarmHistoryItem {
+            alarm_name: Some(input.alarm_name.clone()),
+            alarm_contributor_id: None,
+            alarm_type: Some("MetricAlarm".to_string()),
+            timestamp: Some(crate::state::to_timestamp(now)),
+            history_item_type: Some("ConfigurationUpdate".to_string()),
+            history_summary: Some(if is_update {
+                "Alarm updated from configuration".to_string()
+            } else {
+                "Alarm created".to_string()
+            }),
+            history_data: Some(history_data),
+            alarm_contributor_attributes: None,
+        },
+    );
+    Ok(())
 }
