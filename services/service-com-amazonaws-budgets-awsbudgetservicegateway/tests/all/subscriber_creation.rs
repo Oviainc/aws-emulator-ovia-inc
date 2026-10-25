@@ -220,10 +220,13 @@ struct Row {
 }
 
 /// The persistence table. The rows differ along what rule 1 generalises over: the
-/// subscription type (both values the model lists), the address form (an email, an SNS
-/// topic ARN, the one-character address `SubscriberAddress`'s `@length(min: 1)` allows,
-/// and one carrying the space its `@pattern` allows) and the number of subscribers added
-/// to one notification.
+/// subscription type (both values the model lists), the address form (an email, an email
+/// with a tag and a subdomain chain, the shortest address the email form admits, and an
+/// SNS topic ARN) and the number of subscribers added to one notification.
+///
+/// Every address is in the form its own `SubscriptionType` names — "either an Amazon SNS
+/// topic or an email address" (`Subscriber`) — which is what a write accepts at all;
+/// `subscriber_address_validation.rs` spans the addresses that are not.
 fn persistence_rows() -> Vec<Row> {
     let of_each_type: Vec<Value> = SUBSCRIPTION_TYPE_VALUES
         .iter()
@@ -260,12 +263,15 @@ fn persistence_rows() -> Vec<Row> {
             added: of_each_type,
         },
         Row {
-            case: "the shortest address the model allows",
-            added: vec![json!({"SubscriptionType": "EMAIL", "Address": "a"})],
+            case: "the shortest address the email form admits",
+            added: vec![json!({"SubscriptionType": "EMAIL", "Address": "a@b.co"})],
         },
         Row {
-            case: "an address carrying the space its pattern allows",
-            added: vec![json!({"SubscriptionType": "EMAIL", "Address": "ops team@example.com"})],
+            case: "an address with a tag and a subdomain chain",
+            added: vec![json!({
+                "SubscriptionType": "EMAIL",
+                "Address": "ops+monthly@team.example.co.uk"
+            })],
         },
     ]
 }
@@ -351,7 +357,12 @@ async fn a_created_subscriber_is_persisted_on_its_notification() {
 /// stored beside it.
 ///
 /// The rows differ along which member differs and how: the subscription type alone, the
-/// address alone, the letter case of the address, and trailing whitespace.
+/// address alone, the letter case of the address, and the domain it names.
+///
+/// A row differing in the subscription type alone carries the address form THAT type
+/// names ("either an Amazon SNS topic or an email address"), since an address in the
+/// other type's form is refused before identity is ever compared
+/// (`subscriber_address_validation.rs`).
 #[tokio::test]
 async fn a_subscriber_is_identified_by_its_type_and_its_address() {
     let (router, engine) = router_with_engine();
@@ -378,13 +389,19 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
             true,
         ),
         (
-            "the same address over the other subscription type",
-            json!({"SubscriptionType": "SNS", "Address": "seed@example.com"}),
+            "a subscriber of the other subscription type",
+            json!({
+                "SubscriptionType": "SNS",
+                "Address": "arn:aws:sns:us-east-1:111122223333:identity"
+            }),
             false,
         ),
         (
             "that SNS subscriber a second time",
-            json!({"SubscriptionType": "SNS", "Address": "seed@example.com"}),
+            json!({
+                "SubscriptionType": "SNS",
+                "Address": "arn:aws:sns:us-east-1:111122223333:identity"
+            }),
             true,
         ),
         (
@@ -393,13 +410,13 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
             false,
         ),
         (
-            "the same type with an address differing only in trailing space",
-            json!({"SubscriptionType": "EMAIL", "Address": "seed@example.com "}),
+            "the same type with an address differing only in its domain",
+            json!({"SubscriptionType": "EMAIL", "Address": "seed@example.net"}),
             false,
         ),
         (
-            "that trailing-space address a second time",
-            json!({"SubscriptionType": "EMAIL", "Address": "seed@example.com "}),
+            "that other-domain address a second time",
+            json!({"SubscriptionType": "EMAIL", "Address": "seed@example.net"}),
             true,
         ),
     ];

@@ -209,6 +209,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // "Either an Amazon SNS topic or an email address" (`Subscriber`), and "the value
+        // of `Address` can't contain line breaks" (`Subscriber$Address`) — the form of
+        // every address attached with the notifications this call creates, checked over
+        // all of them at once because the budget this request would create is created
+        // whole or not at all.
+        crate::state::subscriber_address_violation(
+            input
+                .notifications_with_subscribers
+                .iter()
+                .flatten()
+                .flat_map(|supplied| &supplied.subscribers),
+        )
+        .map_err(|message| {
+            CreateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+        })?;
+
         // "A budget can have up to ten notifications, and each notification can have
         // one SNS subscriber and up to 10 email subscribers" — the capacity limits of
         // the BUDGET this call creates, which the modelled `@length(1, 11)` on
