@@ -286,6 +286,8 @@ mod cloudtrail_sdk_target_routing;
 mod eks_cluster_inputs_resolve;
 #[path = "all/cloudformation_provisions_ecr_public_repository.rs"]
 mod cloudformation_provisions_ecr_public_repository;
+#[path = "all/cloudformation_provisions_elastic_beanstalk_resources.rs"]
+mod cloudformation_provisions_elastic_beanstalk_resources;
 #[path = "all/cloudformation_provisions_sqs_queues.rs"]
 mod cloudformation_provisions_sqs_queues;
 #[path = "all/opensearchserverless_cloudformation_resources.rs"]

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIpamByoasn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIpamByoasn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIpamByoasn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Autonomous System Numbers this account has brought to IPAM out of
+//! [`crate::state`], one `MaxResults`-sized page at a time, in the order the store keys
+//! them by. A reporting operation — the only write it makes is to materialise the state
+//! transitions the clock has ALREADY made due (an ASN's `pending-provision` ->
+//! `provisioned`), which were owed at the same instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +137,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIpamByoasn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIpamByoasnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIpamByoasn"))
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — an ASN is
+        // named by itself and this store holds the account's ASNs, not a Region's. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DescribeIpamByoasnRequest$DryRun`). Every caller of this emulator is permitted,
+        // so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The token for the next page of results" (`DescribeIpamByoasnRequest$NextToken`) —
+        // anything this service did not mint is refused rather than read as a position, and
+        // it is refused before the store is reached at all, so whether a bogus token is
+        // caught never depends on what the account holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeIpamByoasnRequest$MaxResults`). The member is OPTIONAL for this
+        // operation, so a request naming no page size gets the largest page it serves — the
+        // maximum of the modelled `DescribeIpamByoasnMaxResults` `@range`, so the unpaged and
+        // the paged path agree with the model. The boundary validator has already refused
+        // every value outside that range; the size is still held inside it here, so no value
+        // that got past the boundary can make this handler answer an EMPTY page carrying a
+        // token that names the item it did not report — a walk that would never end.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_RESULTS_CEILING)
+            .clamp(1, MAX_RESULTS_CEILING);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call the BYOIP
+        // address-range describe makes: an ASN a provision left in `pending-provision` is
+        // provisioned once its due instant has passed, whether or not anybody called, so
+        // applying it here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "ASN and BYOIP CIDR associations" (`DescribeIpamByoasnResult$Byoasns`): every ASN
+        // the account has brought to IPAM, in the store's own key order — the lexicographic
+        // order of the ASN as the API spells it (`Byoasn$Asn`), which is both the stable
+        // paging order and what the cursor names a position in, so a token always advances.
+        let ordered: Vec<(&String, &state::ByoasnRecord)> = store.byoasns.iter().collect();
+
+        // The page and its token come from the crate's ONE paging definition rather than a
+        // second copy of the cursor semantics. A token only when an ASN follows this page —
+        // "This value is null when there are no more results to return"
+        // (`DescribeIpamByoasnResult$NextToken`) — which is
+        // [`state::PageTokenRule::WhenAnotherItemFollows`].
+        let (page, next_token) = state::page_from_cursor(
+            &ordered,
+            start_at.as_deref(),
+            Some(limit),
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |(asn, _)| asn.as_str(),
+        );
+
+        Ok(DescribeIpamByoasnOutput {
+            byoasns: Some(
+                page.iter()
+                    .map(|(_, record)| record.byoasn.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The largest page this operation serves, and the page size a request that names none
+/// gets: the maximum of the modelled `DescribeIpamByoasnMaxResults` `@range`
+/// (`smithy_query(query="operation",operation="DescribeIpamByoasn")` reports
+/// `range {min: 1, max: 100}`). Serving a bigger unpaged page than the operation's own
+/// documented maximum is what this avoids.
+const MAX_RESULTS_CEILING: usize = 100;

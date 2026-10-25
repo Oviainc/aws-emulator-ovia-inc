@@ -78,8 +78,8 @@ async fn list_operations(router: &MultiServiceRouter) -> Vec<ListOperation> {
         ListOperation {
             case: "ListEventActions",
             path: "/v1/event-actions".to_string(),
-            served: 501,
-            enforces_range: false,
+            served: 200,
+            enforces_range: true,
         },
         ListOperation {
             case: "ListRevisionAssets",

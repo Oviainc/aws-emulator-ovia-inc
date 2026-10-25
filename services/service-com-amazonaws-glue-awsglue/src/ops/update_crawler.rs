@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCrawler
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCrawler`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCrawler::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates a crawler this service's store holds: the request names the crawler by
+//! `Name` and carries the members to change, each of which replaces what is stored
+//! while every member it omits is preserved, and a later `GetCrawler` reports the
+//! merged record. The write also moves the crawler's `Version` and `LastUpdated`.
+//!
+//! A crawler with a crawl in progress is not updatable ("if a crawler is running, you
+//! must stop it using StopCrawler before updating it"), which is this operation's
+//! `CrawlerRunningException`. Its `VersionMismatchException` is not reachable: the
+//! request carries no version for the service to compare against the stored one.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +176,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCrawler` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCrawlerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCrawler"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is
+            // reported as the operation's own timeout error rather than invented as a
+            // shape the model does not declare for it — the same way `GetCrawler` and
+            // `CreateCrawler` report it.
+            return Err(UpdateCrawlerErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The crawler this request addresses is resolved FIRST: a name no crawler in
+        // this account has is a miss whatever else the request carries, so identity is
+        // settled before the members are judged.
+        let mut store = state.lock();
+        let Some(entry) = store.crawlers.get_mut(&input.name) else {
+            return Err(UpdateCrawlerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::crawler_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "If a crawler is running, you must stop it using StopCrawler before updating
+        // it." `READY` is the one modelled `CrawlerState` with no run in progress, so
+        // every other state refuses the write.
+        if entry.state != crate::state::CRAWLER_STATE_READY {
+            return Err(UpdateCrawlerErrorModeled::CrawlerRunningException(
+                CrawlerRunningException {
+                    message: Some(crate::state::messages::crawler_running(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        // Every check below is on the crawler this update would LEAVE BEHIND, so each
+        // one looks at the member the request carries and ignores the ones it omits.
+
+        // "At least one crawl target must be specified, in the s3Targets field, the
+        // jdbcTargets field, or the DynamoDBTargets field" (`CreateCrawler`): a crawler
+        // naming no data store has nothing to crawl, so a `Targets` that would replace
+        // the stored one with none is refused rather than stored.
+        if input
+            .targets
+            .as_ref()
+            .is_some_and(|targets| !crate::state::has_crawl_target(targets))
+        {
+            return Err(invalid_input(
+                "Targets must specify at least one crawl target".to_string(),
+            ));
+        }
+
+        // A `Schedule` is "a cron expression used to specify the schedule", whose
+        // documented form is `cron(<six fields>)`. Anything else is not a schedule this
+        // service can run, so it is refused rather than stored and reported back.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(invalid_input(format!(
+                    "Schedule {schedule} is not a cron expression of the form \
+                     cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
+                )));
+            }
+        }
+
+        // `Role` is "the IAM role or Amazon Resource Name (ARN) of an IAM role that is
+        // used by the crawler to access customer resources" and is required on the
+        // create, so a crawler cannot be left without one: a blank role names none.
+        if input
+            .role
+            .as_deref()
+            .is_some_and(|role| role.trim().is_empty())
+        {
+            return Err(invalid_input(
+                "Role is required and cannot be blank".to_string(),
+            ));
+        }
+
+        // "The ID of the Data Catalog in which to store the crawler's output. If you omit
+        // this value, the existing value on the crawler is preserved" — so only a request
+        // that NAMES a catalog moves the crawler's output, and the catalog it names must
+        // be one this emulator holds rather than another account's or one no create made.
+        let catalog_id = match input.catalog_id.as_ref() {
+            Some(requested) => {
+                let resolved = crate::state::resolve_catalog_id(Some(requested));
+                if !crate::state::is_known_catalog(&resolved) {
+                    return Err(invalid_input(format!(
+                        "CatalogId {resolved} is not a Data Catalog in this account"
+                    )));
+                }
+                Some(resolved)
+            }
+            None => None,
+        };
+
+        // A request that names no member to change asks for no change: nothing is
+        // written, so the crawler's `Version` and `LastUpdated` are left where the last
+        // write that did change something put them.
+        if crate::state::crawler_update_names_a_change(&input) {
+            entry.apply_update(&input, catalog_id, ::std::time::SystemTime::now());
+            ::tracing::info!(
+                operation = "UpdateCrawler",
+                crawler = %input.name,
+                version = entry.version,
+                "updated a Glue crawler"
+            );
+        }
+
+        Ok(UpdateCrawlerOutput {})
     }
+}
+
+/// This operation's modelled refusal for a request it cannot serve: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> UpdateCrawlerError {
+    UpdateCrawlerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

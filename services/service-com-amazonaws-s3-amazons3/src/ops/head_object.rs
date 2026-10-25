@@ -500,10 +500,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             expiration: store
                 .bucket(&input.bucket)
                 .and_then(|bucket| bucket.object_expiration_header(&input.key, object)),
+            // "If the object is an archived object …, the response includes this header if
+            // either the archive restoration is in progress … or an archive copy is already
+            // restored" (`HeadObjectOutput$Restore`): the state of the restore
+            // `RestoreObject` initiated on THIS version, computed against the clock, so a
+            // retrieval that has not fallen due yet reports as ongoing and one whose
+            // temporary copy has expired reports nothing at all.
+            restore: object
+                .restore
+                .as_ref()
+                .and_then(|restore| restore.header_value(::std::time::SystemTime::now())),
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
-            // (`DeleteMarker`, which a delete records none of), it is archived (`Restore`,
-            // `ArchiveStatus`), a checksum was uploaded with it (`Checksum*`,
+            // (`DeleteMarker`, which a delete records none of), it is in an
+            // S3 Intelligent-Tiering archive tier (`ArchiveStatus`, which no stored object
+            // here is: a restore is asked for on a storage CLASS), a checksum was uploaded
+            // with it (`Checksum*`,
             // `ChecksumType`), metadata could not be decoded (`MissingMeta`), the read was
             // partial (`ContentRange`, `PartsCount`), a customer-provided key encrypted it
             // (`SSECustomer*`, which `PutObject` refuses), it is replicated

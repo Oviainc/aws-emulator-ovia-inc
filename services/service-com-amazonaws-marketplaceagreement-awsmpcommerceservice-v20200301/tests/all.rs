@@ -29,6 +29,8 @@ mod agreement_parties;
 mod billing_adjustments;
 #[path = "all/cancellation_request_decisions.rs"]
 mod cancellation_request_decisions;
+#[path = "all/cancellation_request_rejection.rs"]
+mod cancellation_request_rejection;
 #[path = "all/charge_amounts.rs"]
 mod charge_amounts;
 #[path = "all/error_bodies.rs"]

@@ -4,10 +4,12 @@
 //!
 //! Reads back the configuration check operation `StartConfigurationChecks` filed under
 //! the given `OperationId`, with the terminal status the clock already owes it
-//! materialised (see [`crate::state::StoredConfigurationCheckOperation::settle`]). This
-//! operation models no `ResourceNotFoundException`, so an id that names no record is
-//! refused with the modelled `ValidationException` rather than answered with an
-//! invented one.
+//! materialised (see [`crate::state::StoredConfigurationCheckOperation::settle`]), so the
+//! record reports the check's catalogue prose, the status its run reached and the tally
+//! of the rule results that run produced
+//! ([`crate::state::StoredConfigurationCheckOperation::view`]). This operation models no
+//! `ResourceNotFoundException`, so an id that names no record is refused with the modelled
+//! `ValidationException` rather than answered with an invented one.
 //!
 //! ## Shape of an operation
 //!

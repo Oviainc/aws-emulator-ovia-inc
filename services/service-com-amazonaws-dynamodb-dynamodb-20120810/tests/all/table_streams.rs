@@ -58,6 +58,16 @@ fn create_body(name: &str, with_sort_key: bool, stream: Option<Value>) -> Value 
     body
 }
 
+/// The key of the item the readiness test writes, for a table with or without a
+/// sort key — the same shape `create_body` declared the key schema as.
+fn item_key(with_sort_key: bool, id: &str) -> Value {
+    let mut key = json!({"Id": {"S": id}});
+    if with_sort_key {
+        key["Seq"] = json!({"N": "1"});
+    }
+    key
+}
+
 /// Send one DynamoDB operation in [`REGION`].
 async fn ddb(router: &smithy_server_runtime::MultiServiceRouter, op: &str, body: Value) -> (u16, Value) {
     call_in(router, REGION, op, body).await
@@ -248,6 +258,136 @@ async fn enabling_a_stream_registers_it_and_every_consumer_sees_it() {
         assert!(
             status == "ENABLING" || status == "ENABLED",
             "case {case:?}: a freshly enabled stream is ENABLING then ENABLED, got {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stream_is_readable_only_once_the_table_behind_it_takes_writes() {
+    // The rule: a table's stream is the table's own change feed, so it reports
+    // `ENABLING` and serves no shard until the asynchronous enable is due, which is
+    // not before the table it captures is `ACTIVE`. The consequence a consumer
+    // depends on: once `DescribeStream` lists shards and `GetShardIterator` serves
+    // them, the stream is `ENABLED` and the table takes item writes — a client that
+    // waited for the stream is never told the table does not exist.
+    //
+    // One row per `StreamViewType` the model declares, over tables with and without
+    // a sort key: the readiness rule is the same whatever the stream captures and
+    // whatever the item is keyed by.
+    for (position, view_type) in STREAM_VIEW_TYPES.iter().enumerate() {
+        let with_sort_key = position % 2 == 1;
+        let case = format!("{view_type} (sort key: {with_sort_key})");
+        let router = emulator_with_streams();
+        let name = "capture";
+
+        let created = ddb_ok(
+            &router,
+            &case,
+            "CreateTable",
+            create_body(
+                name,
+                with_sort_key,
+                Some(json!({"StreamEnabled": true, "StreamViewType": view_type})),
+            ),
+        )
+        .await;
+        let stream_arn = text(&created, "/TableDescription/LatestStreamArn");
+
+        // The table is registered from the instant the create returns: the control
+        // plane resolves it by name while it is still coming up.
+        let described = ddb_ok(&router, &case, "DescribeTable", json!({"TableName": name})).await;
+        assert_eq!(
+            text(&described, "/Table/TableName"),
+            name,
+            "case {case:?}: DescribeTable must resolve the table it just created, got {described}"
+        );
+
+        // The consumer's readiness loop: poll until the stream has shards to read.
+        // Bounded, so a stream that never serves one fails instead of hanging.
+        let mut description = Value::Null;
+        let mut shards = Vec::new();
+        for poll in 0..400 {
+            description = streams_ok(
+                &router,
+                &case,
+                "DescribeStream",
+                json!({"StreamArn": stream_arn.clone()}),
+            )
+            .await["StreamDescription"]
+                .clone();
+            shards = description["Shards"].as_array().cloned().unwrap_or_default();
+            if !shards.is_empty() {
+                break;
+            }
+            // A stream with nothing to read is still being enabled, and says so.
+            assert_eq!(
+                text(&description, "/StreamStatus"),
+                "ENABLING",
+                "case {case:?}: a stream serving no shard is still enabling, got {description}"
+            );
+            assert!(
+                poll < 399,
+                "case {case:?}: the stream never served a shard, got {description}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !shards.is_empty(),
+            "case {case:?}: the readiness loop must end with a shard to read"
+        );
+        assert_eq!(
+            text(&description, "/StreamStatus"),
+            "ENABLED",
+            "case {case:?}: a stream that serves shards must report ENABLED, got {description}"
+        );
+
+        // Every shard it listed hands out a usable iterator.
+        for shard in &shards {
+            let shard_id = text(shard, "/ShardId");
+            let minted = streams_ok(
+                &router,
+                &case,
+                "GetShardIterator",
+                json!({
+                    "StreamArn": stream_arn.clone(),
+                    "ShardId": shard_id.clone(),
+                    "ShardIteratorType": "TRIM_HORIZON",
+                }),
+            )
+            .await;
+            assert!(
+                !text(&minted, "/ShardIterator").is_empty(),
+                "case {case:?}: shard {shard_id} must hand out an iterator, got {minted}"
+            );
+        }
+
+        // ... and the table behind that readable stream takes the write a consumer
+        // would be capturing, which is the half the refusal used to deny.
+        let key = item_key(with_sort_key, "iter-item");
+        let mut item = key.clone();
+        item["Payload"] = json!({"N": "42"});
+        let (status, body) = ddb(
+            &router,
+            "PutItem",
+            json!({"TableName": name, "Item": item.clone()}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: PutItem on the table of a readable stream must be accepted, got \
+             {status} with {body}"
+        );
+        // Read back through GetItem: the write landed in the table's own item store.
+        let read = ddb_ok(
+            &router,
+            &case,
+            "GetItem",
+            json!({"TableName": name, "Key": key}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"], item,
+            "case {case:?}: GetItem must report the item the write stored, got {read}"
         );
     }
 }

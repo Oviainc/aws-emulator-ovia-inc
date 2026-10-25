@@ -175,20 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let all: Vec<Subscription> = store
             .subscriptions_of(&input.topic_arn)
             .into_iter()
-            .map(|sub| Subscription {
-                // A subscription that is not confirmed yet has no ARN SNS publishes:
-                // the listing carries the pending-confirmation sentinel in its place
-                // until the subscriber calls ConfirmSubscription.
-                subscription_arn: Some(if sub.pending_confirmation {
-                    state::PENDING_CONFIRMATION_LISTED.to_string()
-                } else {
-                    sub.arn.clone()
-                }),
-                owner: Some(sub.owner.clone()),
-                protocol: Some(sub.protocol.clone()),
-                endpoint: sub.endpoint.clone(),
-                topic_arn: Some(sub.topic_arn.clone()),
-            })
+            .map(state::listed_subscription)
             .collect();
 
         let Some((page, next_token)) =

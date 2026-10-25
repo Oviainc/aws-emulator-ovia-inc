@@ -32,7 +32,10 @@ use crate::transcription_jobs::{Reply, Transcribe};
 /// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`,
 /// `rt` and `rt-multi-thread` features only, so `tokio::time::sleep` is not
 /// available here.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)` because the reader suite (`crate::get_medical_vocabulary_reads`) waits
+/// out the same transition, and one spelling of the span is better than two.
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The region every row of this suite is served in (the rows are unsigned, and this
 /// is the region this emulator serves a request carrying no SigV4 credential scope

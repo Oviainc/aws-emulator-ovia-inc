@@ -19,6 +19,8 @@ mod admin_group_listing;
 mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
+#[path = "all/admin_user_enabled_state.rs"]
+mod admin_user_enabled_state;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
 #[path = "all/clock_dependent_state.rs"]
