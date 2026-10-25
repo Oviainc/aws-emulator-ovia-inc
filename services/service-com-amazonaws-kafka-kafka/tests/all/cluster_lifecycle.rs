@@ -458,9 +458,17 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
     ];
 
     let emulator = Emulator::new();
-    for (row, expected) in &rows {
-        let arn = emulator.create_ok(row).await;
-        let reply = emulator.bootstrap_brokers(&arn).await;
+    // Every row's cluster is created first and the suite waits ONE activation span:
+    // a cluster still `CREATING` has no brokers to bootstrap against, so the reader
+    // refuses it (see `cluster_delete_state_guard`), and these rows are about which
+    // access paths a SETTLED cluster reports.
+    let mut minted = Vec::new();
+    for (row, _) in &rows {
+        minted.push(emulator.create_ok(row).await);
+    }
+    sleep_past_activation();
+    for ((row, expected), arn) in rows.iter().zip(&minted) {
+        let reply = emulator.bootstrap_brokers(arn).await;
         assert_eq!(
             reply.status, 200,
             "case {row:?}: expected GetBootstrapBrokers to return 200, got {} {}",
@@ -771,6 +779,10 @@ async fn delete_is_observable_by_every_later_reader() {
         ..ClusterRequest::named("doomed")
     };
     let arn = emulator.create_ok(&request).await;
+    // A cluster is deletable once it has finished provisioning: a delete asked for
+    // while the cluster is still `CREATING` is refused on its state, which
+    // `cluster_delete_state_guard` is the suite for.
+    sleep_past_activation();
     let current_version = emulator.describe(&arn).await.at("/clusterInfo/currentVersion")
         .as_str()
         .expect("a stored cluster has a currentVersion")

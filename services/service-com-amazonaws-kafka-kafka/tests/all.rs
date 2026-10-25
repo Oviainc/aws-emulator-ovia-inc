@@ -17,6 +17,8 @@ mod broker_storage_update;
 mod broker_type_update;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/cluster_delete_state_guard.rs"]
+mod cluster_delete_state_guard;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
 #[path = "all/compatible_kafka_versions.rs"]
