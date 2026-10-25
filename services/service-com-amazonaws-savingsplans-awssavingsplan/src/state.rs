@@ -413,6 +413,9 @@ pub fn paginate<T: Clone>(
 /// `@default: 0` and a `PageSize` range of 0..1000, so 0 is "no size asked for"
 /// and the service picks one: a search of a catalog the service owns comes back
 /// as one page of it, resumable through `nextToken`, never as the whole catalog.
+/// `DescribeSavingsPlanRates$maxResults` is optional rather than defaulted, and
+/// an absent one says the same thing about the same catalog, so the plan-rate
+/// search serves this page too.
 ///
 /// A chosen bound, not a documented one: AWS publishes no default page size for
 /// this search. What the recorded answers show is only that a search WAS
@@ -1086,32 +1089,51 @@ fn payment_option_discount_percent(payment_option: &str) -> i128 {
     }
 }
 
-/// The discount `offering` earns, in basis points: its plan type's base
-/// discount, deepened by 30 percent of itself for each year of term past the
-/// first and by the payment option's share, and capped at
-/// [`MAX_DISCOUNT_BASIS_POINTS`].
+/// The discount a commitment of `plan_type`, sold for `duration_seconds` under
+/// `payment_option`, earns in basis points: the plan type's base discount,
+/// deepened by 30 percent of itself for each year of term past the first and by
+/// the payment option's share, and capped at [`MAX_DISCOUNT_BASIS_POINTS`].
 ///
 /// Strictly increasing in the term and in how much is paid up front, so two
-/// offerings of one plan type never price the same usage at the same rate unless
-/// they sell the same term and payment option.
-pub fn offering_discount_basis_points(offering: &Offering) -> i128 {
-    let years = i128::from(offering.duration_seconds / SECONDS_PER_YEAR).max(1);
+/// commitments of one plan type never price the same usage at the same rate
+/// unless they carry the same term and payment option.
+///
+/// Asked of the same three attributes whether the commitment is still on sale as
+/// an offering or has already been bought as a plan, so a plan is priced by the
+/// ladder the offering it was bought from is priced by.
+pub fn discount_basis_points(plan_type: &str, duration_seconds: i64, payment_option: &str) -> i128 {
+    let years = i128::from(duration_seconds / SECONDS_PER_YEAR).max(1);
     let term_percent = 100 + 30 * (years - 1);
-    let base = plan_type_discount_basis_points(&offering.plan_type);
-    let laddered = base * term_percent / 100 * payment_option_discount_percent(&offering.payment_option)
-        / 100;
+    let base = plan_type_discount_basis_points(plan_type);
+    let laddered =
+        base * term_percent / 100 * payment_option_discount_percent(payment_option) / 100;
     laddered.min(MAX_DISCOUNT_BASIS_POINTS)
 }
 
-/// What `offering` charges for usage whose on-demand price is
-/// `on_demand_units`: the on-demand price less the discount the offering earns.
+/// The discount `offering` earns, in basis points: see [`discount_basis_points`].
+pub fn offering_discount_basis_points(offering: &Offering) -> i128 {
+    discount_basis_points(
+        &offering.plan_type,
+        offering.duration_seconds,
+        &offering.payment_option,
+    )
+}
+
+/// What a commitment earning `discount_basis_points` charges for usage whose
+/// on-demand price is `on_demand_units`: the on-demand price less that discount.
 ///
 /// Never zero — a discounted price is still a price — so a unit billed at a
 /// fraction of the service's scale is reported at the smallest amount the scale
 /// can spell rather than as free.
-pub fn discounted_rate_units(offering: &Offering, on_demand_units: i128) -> i128 {
-    let retained = BASIS_POINTS - offering_discount_basis_points(offering);
+pub fn discounted_units(discount_basis_points: i128, on_demand_units: i128) -> i128 {
+    let retained = BASIS_POINTS - discount_basis_points;
     divide_rounded(on_demand_units.saturating_mul(retained), BASIS_POINTS).max(1)
+}
+
+/// What `offering` charges for usage whose on-demand price is
+/// `on_demand_units`. See [`discounted_units`].
+pub fn discounted_rate_units(offering: &Offering, on_demand_units: i128) -> i128 {
+    discounted_units(offering_discount_basis_points(offering), on_demand_units)
 }
 
 /// The instance sizes the catalog prices in every EC2 family, with the vCPUs of
@@ -1317,6 +1339,30 @@ impl RateLineItem {
     pub fn instance_family(&self) -> Option<&str> {
         self.property(PROPERTY_INSTANCE_FAMILY)
     }
+
+    /// Whether a `SavingsPlanRateFilter` admits this line item. `name` is a
+    /// `SavingsPlanRateFilterName`; a filter with no values constrains nothing.
+    ///
+    /// A filter names either one of the line item's own billing dimensions —
+    /// the product, the service that bills it, its usage type or its billing
+    /// operation — or one of the properties the item is priced along, and a line
+    /// item that is not dimensioned by the property a filter names cannot
+    /// satisfy it.
+    pub fn matches_filter(&self, name: &str, values: Option<&Vec<String>>) -> bool {
+        let field = match name {
+            "productType" => Some(self.product_type.as_str()),
+            "serviceCode" => Some(self.service_code.as_str()),
+            "usageType" => Some(self.usage_type.as_str()),
+            "operation" => Some(self.operation.as_str()),
+            property => self.property(property),
+        };
+        match (values, field) {
+            (Some(values), _) if values.is_empty() => true,
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(values), Some(field)) => values.iter().any(|value| value == field),
+        }
+    }
 }
 
 /// Every usage line item the catalog prices, in a stable order.
@@ -1413,25 +1459,38 @@ fn build_rate_line_items() -> Vec<RateLineItem> {
     items
 }
 
-/// Whether `offering` prices `item`: it covers the item's product, and the scope
-/// it is sold for admits the item's region and instance family.
+/// Whether a commitment that covers `product_types` and is scoped to `region`
+/// and `instance_family` prices `item`: it covers the item's product, and its
+/// scope admits the item's region and instance family.
 ///
-/// An offering scoped to neither (a Compute Savings Plan) prices the product
+/// A commitment scoped to neither (a Compute Savings Plan) prices the product
 /// wherever it is billed; one scoped to a region prices it in that region; one
 /// scoped to an instance family as well prices only that family. So a client
 /// comparing what each offering charges for the usage it runs sees every
-/// offering that would cover that usage.
-pub fn offering_prices(offering: &Offering, item: &RateLineItem) -> bool {
-    offering
-        .product_types
+/// offering that would cover that usage, and the rates of a plan already bought
+/// are the line items its own scope covers.
+pub fn scope_prices(
+    product_types: &[String],
+    region: Option<&str>,
+    instance_family: Option<&str>,
+    item: &RateLineItem,
+) -> bool {
+    product_types
         .iter()
         .any(|covered| covered.as_str() == item.product_type)
-        && offering
-            .property(PROPERTY_REGION)
-            .is_none_or(|region| Some(region) == item.region())
-        && offering
-            .property(PROPERTY_INSTANCE_FAMILY)
-            .is_none_or(|family| Some(family) == item.instance_family())
+        && region.is_none_or(|region| Some(region) == item.region())
+        && instance_family.is_none_or(|family| Some(family) == item.instance_family())
+}
+
+/// Whether `offering` prices `item`, by the scope it is sold for. See
+/// [`scope_prices`].
+pub fn offering_prices(offering: &Offering, item: &RateLineItem) -> bool {
+    scope_prices(
+        &offering.product_types,
+        offering.property(PROPERTY_REGION),
+        offering.property(PROPERTY_INSTANCE_FAMILY),
+        item,
+    )
 }
 
 /// One line item of the rate catalog.
@@ -1556,6 +1615,37 @@ impl SavingsPlanRecord {
         } else {
             self.start_millis
         }
+    }
+
+    /// Whether this plan's commitment prices `item` — one of the line items its
+    /// rates cover.
+    ///
+    /// Asked of the scope the plan was BOUGHT with, so a plan's rate card covers
+    /// the line items the offering it was bought from prices. See
+    /// [`scope_prices`].
+    pub fn prices(&self, item: &RateLineItem) -> bool {
+        scope_prices(
+            &self.product_types,
+            self.region.as_deref(),
+            self.ec2_instance_family.as_deref(),
+            item,
+        )
+    }
+
+    /// What this plan charges for usage whose on-demand price is
+    /// `on_demand_units`: that price less the discount the plan's type, term and
+    /// payment option earn — the ladder the offering it was bought from is
+    /// priced by, so a plan's rate for a line item is that offering's rate for
+    /// it.
+    pub fn rate_units(&self, on_demand_units: i128) -> i128 {
+        discounted_units(
+            discount_basis_points(
+                &self.savings_plan_type,
+                self.term_duration_in_seconds,
+                &self.payment_option,
+            ),
+            on_demand_units,
+        )
     }
 
     /// Record that this plan's return was accepted at `now_millis`: it leaves the
