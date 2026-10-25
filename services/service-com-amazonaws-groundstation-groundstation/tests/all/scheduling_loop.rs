@@ -1317,7 +1317,8 @@ async fn reserve_contact_enforces_the_window_the_mission_profile_requires() {
 
     // Rows differ along the window's length relative to the profile's minimum viable
     // contact duration, including both sides of that bound and a window that runs
-    // backwards.
+    // backwards. Each row books a day of its own, because an antenna serves one pass at a
+    // time and the accepted rows would otherwise be two passes over one window.
     let rows: Vec<(&str, i64, u16)> = vec![
         ("window-runs-backwards", -1, 431),
         ("empty-window", 0, 431),
@@ -1326,7 +1327,8 @@ async fn reserve_contact_enforces_the_window_the_mission_profile_requires() {
         ("longer-than-the-minimum", minimum * 4, 200),
     ];
 
-    for (case, length, expected_status) in rows {
+    for (slot, (case, length, expected_status)) in rows.into_iter().enumerate() {
+        let start = start + i64::try_from(slot).expect("a row index fits in i64") * 86_400;
         let reply = send(
             &router,
             "POST",
