@@ -227,32 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The page size served. THIS member's documentation publishes no default
-        // and no minimum, so a zero is served as what it says — a page of no rows
-        // — rather than refused, and a request naming no `maxResults` is served
-        // this service's own default instead of the whole workspace. Whatever is
-        // asked for, the service serves at most `crate::state::MAX_PAGE_SIZE`, so
-        // the page this call BUILDS is bounded by this code and not only by the
-        // boundary validator. The token a zero-row page answers names the
-        // position the call STARTED from — a page of no rows consumed none — so a
-        // generated paginator must not be driven at zero: it would ask again from
-        // the same place forever.
-        let page_size = match input.max_results {
-            None => crate::state::DEFAULT_PAGE_SIZE,
-            // The conversion can only fail on a NEGATIVE value, which the
-            // modelled range refuses before this handler runs — so this arm is
-            // belt-and-braces. It fails CLOSED (the modelled refusal, naming the
-            // member and the published range) rather than falling back to the
-            // largest page, so a page size nothing could have asked for can never
-            // resolve to the most permissive answer.
-            Some(requested) => usize::try_from(requested)
-                .map_err(|_| {
-                    invalid(format!(
-                        "maxResults must be between 0 and {MODELLED_MAX_RESULTS}, got {requested}"
-                    ))
-                })?
-                .min(crate::state::MAX_PAGE_SIZE),
-        };
+        // The page size served, under the rule every paginated operation of this
+        // service shares (`crate::state::page_size`): THIS member's
+        // documentation publishes no default and no minimum, so a zero is served
+        // as what it says — a page of no rows — rather than refused, and a
+        // request naming no `maxResults` is served this service's own default
+        // instead of the whole workspace. Whatever is asked for, the service
+        // serves at most `crate::state::MAX_PAGE_SIZE`, so the page this call
+        // BUILDS is bounded by that code and not only by the boundary validator.
+        // The token a zero-row page answers names the position the call STARTED
+        // from — a page of no rows consumed none — so a generated paginator must
+        // not be driven at zero: it would ask again from the same place forever.
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::PageSizeRule::minimum_zero(crate::state::DEFAULT_PAGE_SIZE),
+        )
+        .map_err(invalid)?;
 
         // `scenes` is keyed by `sceneId`, so iterating the map IS id order and
         // resuming is a `range` from the token's key: the page starts at the
