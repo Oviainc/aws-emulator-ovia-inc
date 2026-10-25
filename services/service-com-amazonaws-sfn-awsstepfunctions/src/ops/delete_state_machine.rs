@@ -180,16 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // A version or alias qualifier names a resource this emulator cannot hold —
-        // versions and aliases are not implemented and still answer 501 — so such an
-        // ARN names nothing it could delete, and a success would be
-        // indistinguishable from one.
+        // A version or alias qualifier names a REFERENCE to a state machine rather
+        // than a state machine of its own, and each of those two resources has its
+        // own delete operation (`DeleteStateMachineVersion`,
+        // `DeleteStateMachineAlias`), so a qualified ARN here would otherwise delete
+        // the whole state machine the caller only named one reference to.
         if parsed.qualifier.is_some() {
             return Err(DeleteStateMachineErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
                         "'{}' is a qualified ARN, naming a version or an alias, which this \
-                         emulator cannot hold",
+                         operation does not delete",
                         input.state_machine_arn
                     )),
                     reason: None,
