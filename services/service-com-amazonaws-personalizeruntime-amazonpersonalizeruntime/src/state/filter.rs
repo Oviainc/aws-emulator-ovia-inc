@@ -33,6 +33,13 @@
 //! A categorical attribute may hold several values separated by `|`, the separator
 //! Personalize's own Items CSV uses, so `IN` matches when ANY of the attribute's
 //! values matches.
+//!
+//! # What a request binds a `$placeholder` to
+//!
+//! A request's `filterValues` entry holds the value(s) of ONE placeholder, separated by
+//! commas, with a string value enclosed in double quotes and a numeric or timestamp
+//! value written bare: the quotes delimit the value, so a clause compares the stored
+//! attribute against the text between them. [`split_values`] is where that is read.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -604,14 +611,91 @@ fn resolve(operand: &Operand, filter_values: Option<&HashMap<String, String>>) -
         Operand::Literal(literal) => Some(vec![literal.clone()]),
         Operand::Parameter(name) => {
             let raw = filter_values?.get(name)?;
-            Some(
-                raw.split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-                    .collect(),
-            )
+            Some(split_values(raw))
         }
+    }
+}
+
+/// The character that delimits a STRING value in a `filterValues` entry. The documented
+/// request format writes it escaped for JSON (`"GENRES": "\"Comedy\",\"Drama\""`), so
+/// what reaches a handler is the quote character itself.
+const VALUE_QUOTE: char = '"';
+
+/// The separator between the values of one `filterValues` entry.
+const VALUE_SEPARATOR: char = ',';
+
+/// The values one `filterValues` entry carries, with the delimiters removed.
+///
+/// "Provide the parameter name (in matching case) as a key and the filter value(s) as
+/// the corresponding value. Separate multiple values for one parameter with a comma."
+/// A string value is written enclosed in double quotes; a numeric or timestamp value is
+/// written bare. The quotes DELIMIT the value and are not part of it, so what a clause
+/// compares against a stored attribute is the text BETWEEN them — a separator between
+/// them belongs to the value — while a bare value stands for itself, without the
+/// whitespace that surrounds a separator.
+fn split_values(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut values: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    loop {
+        while chars.get(at).is_some_and(|ch| ch.is_whitespace()) {
+            at += 1;
+        }
+        let mut value = String::new();
+        let quoted = starts_quote(&chars, at);
+        if quoted {
+            at += quote_width(&chars, at);
+            while let Some(&ch) = chars.get(at) {
+                if starts_quote(&chars, at) {
+                    break;
+                }
+                value.push(ch);
+                at += 1;
+            }
+            at += quote_width(&chars, at);
+            // Whatever sits between the closing quote and the separator is not part of
+            // the value either.
+            while chars.get(at).is_some_and(|&ch| ch != VALUE_SEPARATOR) {
+                at += 1;
+            }
+        } else {
+            while let Some(&ch) = chars.get(at) {
+                if ch == VALUE_SEPARATOR {
+                    break;
+                }
+                value.push(ch);
+                at += 1;
+            }
+            value = value.trim().to_string();
+        }
+        // A quoted value is kept even when it is empty — the caller wrote it — but an
+        // entry that holds nothing between two separators names no value at all.
+        if quoted || !value.is_empty() {
+            values.push(value);
+        }
+        if chars.get(at).is_none() {
+            return values;
+        }
+        // Step over the separator and read the next value.
+        at += 1;
+    }
+}
+
+/// Whether position `at` begins a value delimiter: the quote character, or the
+/// backslash-escaped quote of a caller that passed the documented request format
+/// through without undoing its JSON escaping.
+fn starts_quote(chars: &[char], at: usize) -> bool {
+    chars.get(at) == Some(&VALUE_QUOTE)
+        || (chars.get(at) == Some(&'\\') && chars.get(at + 1) == Some(&VALUE_QUOTE))
+}
+
+/// How many characters the delimiter at `at` occupies. One, unless it still carries the
+/// backslash of its JSON escaping.
+fn quote_width(chars: &[char], at: usize) -> usize {
+    if chars.get(at) == Some(&'\\') {
+        2
+    } else {
+        1
     }
 }
 
