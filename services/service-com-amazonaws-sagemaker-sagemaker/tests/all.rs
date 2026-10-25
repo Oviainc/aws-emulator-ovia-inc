@@ -95,6 +95,8 @@ mod list_model_packages;
 mod list_pipeline_execution_steps;
 #[path = "all/list_training_jobs.rs"]
 mod list_training_jobs;
+#[path = "all/list_trial_components.rs"]
+mod list_trial_components;
 #[path = "all/mlflow_app_lifecycle.rs"]
 mod mlflow_app_lifecycle;
 #[path = "all/mlflow_app_presigned_url.rs"]
