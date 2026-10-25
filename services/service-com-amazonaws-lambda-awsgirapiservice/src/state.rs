@@ -867,10 +867,24 @@ pub fn is_function_url_qualifier(qualifier: &str) -> bool {
 /// message built from the request, naming the member and the constraint it failed.
 #[must_use]
 pub fn function_url_qualifier_message(qualifier: &str) -> String {
+    pattern_violation_message("qualifier", qualifier, FUNCTION_URL_QUALIFIER_PATTERN)
+}
+
+/// The refusal for a value that does not satisfy the `@pattern` its member carries: the
+/// clause the framework's own constraint walk states, built from the request — the value,
+/// the member path, and the expression the value has to satisfy.
+///
+/// The expression is stated the way the same refusal states it when the walk catches it
+/// at the boundary: without the `^`/`$` a whole-value Smithy pattern is wrapped in
+/// (`service_common::validation::unanchored`, which `service::override_refusal` already
+/// routes every boundary clause through), so one request cannot be told the expression
+/// two ways depending on which of the two checks refused it.
+#[must_use]
+pub fn pattern_violation_message(path: &str, value: &str, pattern: &str) -> String {
     format!(
-        "1 validation error detected: Value '{qualifier}' at 'qualifier' failed to satisfy \
-         constraint: Member must satisfy regular expression pattern: \
-         {FUNCTION_URL_QUALIFIER_PATTERN}"
+        "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: {}",
+        ::service_common::validation::unanchored(pattern)
     )
 }
 
@@ -1217,12 +1231,12 @@ pub fn is_alias_name(name: &str) -> bool {
 
 /// The refusal for a name no alias may carry: a validation message built from the
 /// request, naming the member and the constraint it failed.
+///
+/// Both operations that take an `Alias`-targeted member spell the member `Name`, which
+/// a message states as `name`.
 #[must_use]
 pub fn alias_name_message(name: &str) -> String {
-    format!(
-        "1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: \
-         Member must satisfy regular expression pattern: {ALIAS_NAME_PATTERN}"
-    )
+    pattern_violation_message("name", name, ALIAS_NAME_PATTERN)
 }
 
 /// One alias of a function: "a function identifier that you can update to invoke a
