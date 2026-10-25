@@ -25,6 +25,8 @@ mod code_bindings;
 mod describe_discoverer;
 #[path = "all/discovered_schema_inference.rs"]
 mod discovered_schema_inference;
+#[path = "all/discoverer_deletion.rs"]
+mod discoverer_deletion;
 #[path = "all/discoverer_state.rs"]
 mod discoverer_state;
 #[path = "all/duplicate_create_refusals.rs"]
