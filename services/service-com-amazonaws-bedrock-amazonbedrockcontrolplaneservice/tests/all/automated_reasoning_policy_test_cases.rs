@@ -19,9 +19,13 @@
 //! 3. **A test belongs to the policy it was created under**, so a policy ARN this account
 //!    holds no policy under is 404 on both operations, and a `testCaseId` minted under
 //!    another policy names no test of this one.
+//! 4. **A listing reports every test of its policy and none of another's**, each item the
+//!    SAME object the read of that one test reports, and its pages partition the listing:
+//!    the rows span policies holding none, one and several tests, and page sizes of one,
+//!    two and the whole listing.
 //!
 //! Every expectation is derived from the model, cited per row
-//! (`smithy_query(query="operation",operation="CreateAutomatedReasoningPolicyTestCase,GetAutomatedReasoningPolicyTestCase")`
+//! (`smithy_query(query="operation",operation="CreateAutomatedReasoningPolicyTestCase,GetAutomatedReasoningPolicyTestCase,ListAutomatedReasoningPolicyTestCases")`
 //! / `query="shape",shape="AutomatedReasoningPolicyTestCase,AutomatedReasoningCheckResult"`).
 //! The requests go through `crate::support` — the ONE harness every suite in this crate
 //! drives the emulator with.
@@ -53,7 +57,12 @@ const CHECK_RESULTS: &[&str] = &[
     "NO_TRANSLATION",
 ];
 
-async fn create_policy(emu: &Emulator, name: &str) -> String {
+/// A policy created through `CreateAutomatedReasoningPolicy`, as its `policyArn`.
+///
+/// `pub(crate)` so the sibling suite that drives this operation's `@range`-constrained
+/// member (`range_refusal_wording.rs`) reaches a policy the SAME way rather than carrying
+/// a second copy of this request.
+pub(crate) async fn create_policy(emu: &Emulator, name: &str) -> String {
     let reply = emu
         .call(
             "POST",
@@ -79,6 +88,19 @@ async fn create_test_case(emu: &Emulator, policy_arn: &str, body: Value) -> Repl
         Some(body),
     )
     .await
+}
+
+async fn list_test_cases(emu: &Emulator, policy_arn: &str, query: &str) -> Reply {
+    let path = format!(
+        "/automated-reasoning-policies/{}/test-cases",
+        label(policy_arn)
+    );
+    let path = if query.is_empty() {
+        path
+    } else {
+        format!("{path}?{query}")
+    };
+    emu.call("GET", &path, None).await
 }
 
 async fn get_test_case(emu: &Emulator, policy_arn: &str, test_case_id: &str) -> Reply {
@@ -500,4 +522,228 @@ async fn a_test_is_addressed_by_its_policy_and_its_id() {
         "case the minted pair: the read must answer 200, got {} {:?}",
         read.status, read.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 4. The listing.
+// ---------------------------------------------------------------------------------------
+
+/// Create `count` tests under `policy_arn`, each with its own content, and hand back the
+/// ids the creates minted in ASCENDING order — the order a listing walks.
+async fn minted_tests(emu: &Emulator, policy_arn: &str, count: usize) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for index in 0..count {
+        let reply = create_test_case(
+            emu,
+            policy_arn,
+            json!({
+                "guardContent": format!("claim {index}"),
+                "queryContent": format!("query {index}"),
+                "expectedAggregatedFindingsResult": CHECK_RESULTS[index % CHECK_RESULTS.len()],
+                "confidenceThreshold": (index as f64) / (count as f64),
+            }),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "case test {index}: the create must answer 200, got {} {:?}",
+            reply.status, reply.body
+        );
+        ids.push(reply.text("testCaseId"));
+    }
+    ids.sort();
+    ids
+}
+
+/// The `testCaseId` of every item a listing reply carries, in the order it carries them.
+fn listed_ids(reply: &Reply) -> Vec<String> {
+    reply
+        .get("testCases")
+        .as_array()
+        .unwrap_or_else(|| panic!("testCases is modelled @required, got {:?}", reply.body))
+        .iter()
+        .map(|test_case| {
+            member(test_case, "testCaseId")
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_listing_reports_every_test_of_its_policy_and_none_of_anothers() {
+    let emu = emulator();
+    // Policies holding a different NUMBER of tests, which is what the rule generalises
+    // over: none, one, and several.
+    let empty = create_policy(&emu, "listing empty policy").await;
+    let single = create_policy(&emu, "listing single policy").await;
+    let several = create_policy(&emu, "listing several policy").await;
+    let one = minted_tests(&emu, &single, 1).await;
+    let many = minted_tests(&emu, &several, 5).await;
+
+    for (case, policy_arn, expected) in [
+        ("a policy holding no test", &empty, Vec::new()),
+        ("a policy holding one test", &single, one.clone()),
+        ("a policy holding several tests", &several, many.clone()),
+    ] {
+        let listing = list_test_cases(&emu, policy_arn, "").await;
+        assert_eq!(
+            listing.status, 200,
+            "case {case:?}: the listing must answer 200, got {} {:?}",
+            listing.status, listing.body
+        );
+        assert_eq!(
+            listed_ids(&listing),
+            expected,
+            "case {case:?}: the listing reports every test of its policy and none of \
+             another's, got {:?}",
+            listing.body
+        );
+        assert_eq!(
+            listing.get("nextToken"),
+            Value::Null,
+            "case {case:?}: a listing that fits one page carries no nextToken, got {:?}",
+            listing.body
+        );
+
+        // Each listed item is the SAME object the read of that one test reports, member
+        // for member — one mapping, two operations.
+        let items = listing.get("testCases");
+        for id in &expected {
+            let read = get_test_case(&emu, policy_arn, id).await;
+            let listed = items
+                .as_array()
+                .expect("testCases is a list")
+                .iter()
+                .find(|item| member(item, "testCaseId") == json!(id))
+                .unwrap_or_else(|| panic!("case {case:?}: {id:?} must be listed"));
+            assert_eq!(
+                *listed,
+                read.get("testCase"),
+                "case {case:?}: the listed test {id:?} must match the read, got {listed:?}"
+            );
+        }
+    }
+
+    // A listing changes nothing a later caller sees.
+    let again = list_test_cases(&emu, &several, "").await;
+    assert_eq!(
+        listed_ids(&again),
+        many,
+        "case \"a second listing\": a read reports the same tests, got {:?}",
+        again.body
+    );
+}
+
+#[tokio::test]
+async fn the_pages_of_a_listing_partition_its_tests() {
+    let emu = emulator();
+    let policy_arn = create_policy(&emu, "listing pages policy").await;
+    let minted = minted_tests(&emu, &policy_arn, 5).await;
+
+    // Page sizes differing along what the rule generalises over: one test per page, two
+    // (so the last page is short), and the whole listing in one page.
+    for page_size in [1_usize, 2, minted.len()] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let query = match &token {
+                Some(token) => format!("maxResults={page_size}&nextToken={token}"),
+                None => format!("maxResults={page_size}"),
+            };
+            let page = list_test_cases(&emu, &policy_arn, &query).await;
+            assert_eq!(
+                page.status, 200,
+                "case page size {page_size}: a page must answer 200, got {} {:?}",
+                page.status, page.body
+            );
+            let ids = listed_ids(&page);
+            assert!(
+                ids.len() <= page_size,
+                "case page size {page_size}: a page holds at most {page_size} tests, got \
+                 {ids:?}"
+            );
+            walked.extend(ids);
+            pages += 1;
+            assert!(
+                pages <= minted.len() + 1,
+                "case page size {page_size}: the walk must terminate, got {walked:?}"
+            );
+            match page.get("nextToken").as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, minted,
+            "case page size {page_size}: the pages partition the listing with neither a gap \
+             nor a repeat, got {walked:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_listing_of_a_policy_this_account_holds_none_of_is_not_found() {
+    let emu = emulator();
+    let policy_arn = create_policy(&emu, "listing owner policy").await;
+    minted_tests(&emu, &policy_arn, 2).await;
+
+    // The same rows the single read refuses on: a policy nothing minted, one of another
+    // region, and a version nothing minted.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a policy id nothing minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:automated-reasoning-policy/00000000000z"),
+        ),
+        (
+            "a policy ARN of another region",
+            policy_arn.replace(REGION, "eu-west-1"),
+        ),
+        ("a version nothing minted", format!("{policy_arn}:1")),
+    ];
+
+    for (case, arn) in rows {
+        let listing = list_test_cases(&emu, &arn, "").await;
+        assert_eq!(
+            listing.status, 404,
+            "case {case:?}: {arn:?} names no policy of this account, so the listing must \
+             answer 404, got {} {:?}",
+            listing.status, listing.body
+        );
+        assert_eq!(
+            listing.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            listing.error
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_next_token_outside_the_cursor_form_is_refused() {
+    let emu = emulator();
+    let policy_arn = create_policy(&emu, "listing token policy").await;
+    minted_tests(&emu, &policy_arn, 3).await;
+
+    // Rows differing along what a cursor is NOT: too short, too long, lower case (outside
+    // `AutomatedReasoningPolicyTestCaseId`'s `^[0-9A-Z]{12}$`), and a token shaped like
+    // another listing's cursor. A token this listing could never have issued is refused;
+    // a WELL-FORMED one names a position in the id order, which the pagination test walks.
+    for (case, token) in [
+        ("too short", "AAAA"),
+        ("too long", "AAAAAAAAAAAAA"),
+        ("lower case", "aaaaaaaaaaaa"),
+        ("another listing's cursor", "abc123/00000000"),
+    ] {
+        let listing = list_test_cases(&emu, &policy_arn, &format!("nextToken={token}")).await;
+        assert_eq!(
+            (listing.status, listing.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: a token outside the cursor form is refused, got {} {:?}",
+            listing.status,
+            listing.body
+        );
+    }
 }

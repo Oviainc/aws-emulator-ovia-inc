@@ -59,9 +59,10 @@
 //! that document is caller-sized as well as caller-counted),
 //! [`PAGE_SIZE`] items per paginated response and [`MAX_DESCRIBED_STACK_RESOURCES`]
 //! resources per `DescribeStackResources` response (the documented cap on that
-//! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results
-//! and [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change
-//! set.
+//! unpaginated read), [`hook_results::MAX_HOOK_RESULTS`] recorded Hook invocation results,
+//! [`change_set_hooks::MAX_CHANGE_SET_HOOKS`] Hook invocations planned for one change set,
+//! and [`stack_sets::MAX_STACK_SETS`] stack sets with
+//! [`stack_sets::MAX_INSTANCES_PER_STACK_SET`] stack instances each (both oldest-first).
 //!
 //! Reading a stack's template body and evaluating what it declares is bounded by the
 //! [`template`] module's own caps (nodes, depth, the documented per-template quotas and
@@ -244,6 +245,10 @@ pub mod generated_template;
 /// `AWS::CloudFormation::WaitCondition` puts in a create or an update, and the signals
 /// `SignalResource` releases it with.
 pub mod wait_conditions;
+
+/// The stack sets this account and Region holds, and the stack instances each one carries,
+/// which `ListStackInstances` reports summaries of.
+pub mod stack_sets;
 
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
@@ -2642,6 +2647,11 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// what [`Self::settle`] advances, and
     /// [`generated_template::MAX_GENERATED_TEMPLATES`] is what bounds the list.
     pub generated_templates: Vec<generated_template::StoredGeneratedTemplate>,
+    /// Every stack set this account holds, in creation order, so a read of one stack set's
+    /// instances is deterministic (see [`stack_sets`]). A stack set is a record of its own
+    /// rather than a stack's, so it is neither settled on the stack clock nor reclaimed
+    /// with a stack; [`stack_sets::MAX_STACK_SETS`] is what bounds the list.
+    pub stack_sets: Vec<stack_sets::StoredStackSet>,
 }
 
 impl ComAmazonawsCloudformationCloudformationState {
@@ -2796,6 +2806,41 @@ impl ComAmazonawsCloudformationCloudformationState {
             self.hook_results.remove(0);
         }
         self.hook_results.push(result);
+    }
+
+    /// The stack set `name_or_id` addresses in the request's Region, if this store holds it:
+    /// `StackSetName` is "the name or unique ID of the StackSet", and nothing outside that
+    /// Region is addressable (see [`stack_sets`]).
+    pub fn resolve_stack_set(
+        &self,
+        region: &str,
+        name_or_id: &str,
+    ) -> Option<&stack_sets::StoredStackSet> {
+        self.stack_sets
+            .iter()
+            .find(|stack_set| stack_set.is_addressed_by(region, name_or_id))
+    }
+
+    /// Record one stack set, replacing the stack set of the same name in the same Region if
+    /// this store already holds one — a stack set's name is unique within the administrator
+    /// account and Region. The oldest record is reclaimed past
+    /// [`stack_sets::MAX_STACK_SETS`], so the store cannot grow without limit.
+    ///
+    /// This is the ONLY way a stack set enters the store, and [`stack_sets`] is where what
+    /// writes one is written down.
+    pub fn record_stack_set(&mut self, stack_set: stack_sets::StoredStackSet) {
+        if let Some(held) = self.stack_sets.iter_mut().find(|held| {
+            held.region == stack_set.region && held.stack_set_name == stack_set.stack_set_name
+        }) {
+            *held = stack_set;
+            return;
+        }
+        // Reclaim enough of the oldest records to leave room for this one.
+        if self.stack_sets.len() >= stack_sets::MAX_STACK_SETS {
+            let excess = self.stack_sets.len() - stack_sets::MAX_STACK_SETS + 1;
+            self.stack_sets.drain(..excess);
+        }
+        self.stack_sets.push(stack_set);
     }
 
     /// The drift detection with this `StackDriftDetectionId`, if this store still holds it.
@@ -3559,6 +3604,16 @@ pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
 }
 
+/// The `StackSetNotFoundException` message CloudFormation answers when a request names a
+/// stack set this administrator account and Region does not hold — an unknown name, an
+/// unknown id, or a stack set another Region holds.
+///
+/// Built from what the request named, the way [`stack_does_not_exist`] is, and within the
+/// modelled `ErrorMessage` length (1..255) for any `StackSetName` a caller can send.
+pub fn stack_set_does_not_exist(name_or_id: &str) -> String {
+    format!("StackSet {name_or_id} not found")
+}
+
 /// The message answered when a request names a `LogicalResourceId` the stack it selected
 /// has not deployed: the stack is addressable, so what does not exist is the resource
 /// under that logical id in that stack. Built from what the request named, the way
@@ -3627,6 +3682,8 @@ pub enum PageOf {
     AccountLimits,
     /// `ListTypes`'s `TypeSummaries`.
     TypeSummaries,
+    /// `ListStackInstances`'s `Summaries`.
+    StackInstanceSummaries,
 }
 
 impl PageOf {
@@ -3645,6 +3702,7 @@ impl PageOf {
             Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
+            Self::StackInstanceSummaries => "stack-instance-summaries",
         }
     }
 }

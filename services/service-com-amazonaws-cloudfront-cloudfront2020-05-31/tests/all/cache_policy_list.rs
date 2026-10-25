@@ -57,7 +57,10 @@ use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, AP
 
 /// `GET /2020-05-31/cache-policy`, with `query` appended verbatim (`?Type=managed&MaxItems=2`),
 /// from the operation's `http` binding.
-async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that reads the collection back goes over the same wire
+/// path rather than growing a copy of this.
+pub(crate) async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
     call(
         router,
         "GET",
@@ -113,7 +116,10 @@ fn page_summaries(answer: &Answer) -> Vec<Summary> {
 }
 
 /// The ids a page reports, in the order the page carries them.
-fn page_ids(answer: &Answer) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite that checks WHICH policies a listing still reports uses
+/// this scanner rather than growing a copy of it.
+pub(crate) fn page_ids(answer: &Answer) -> Vec<String> {
     page_summaries(answer)
         .into_iter()
         .map(|summary| summary.id)

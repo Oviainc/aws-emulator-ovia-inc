@@ -22,10 +22,10 @@
 //! whether the request repeats an item or names one the set never held, and in
 //! whether the batch carries items that cannot be members.
 //!
-//! The membership itself is read back through the store the handlers share,
-//! because the operation that reports a resource set's members on the wire
-//! (`ListResourceSetResources`) is still a scaffold tracked by its own issue —
-//! the same seam the `BatchAssociateResource` suite asserts membership through.
+//! The membership itself is read back through the store the handlers share, the
+//! same seam the `BatchAssociateResource` suite asserts membership through; what
+//! the modelled reader (`ListResourceSetResources`) reports for the same store is
+//! the `resource_set_resources` suite's business.
 
 use std::collections::BTreeSet;
 
