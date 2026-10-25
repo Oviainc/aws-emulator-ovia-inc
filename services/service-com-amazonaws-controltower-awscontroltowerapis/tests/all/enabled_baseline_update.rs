@@ -185,7 +185,10 @@ async fn get_enabled_baseline(
 }
 
 /// POST `/get-baseline-operation` and hand back its `baselineOperation` member.
-async fn get_operation(
+///
+/// Shared with `crate::enabled_baseline_update_validation`, which reads back the operation
+/// an accepted update mints, so the two suites cannot disagree about that call.
+pub(crate) async fn get_operation(
     router: &MultiServiceRouter,
     operation_identifier: &str,
 ) -> (Answer, serde_json::Value) {

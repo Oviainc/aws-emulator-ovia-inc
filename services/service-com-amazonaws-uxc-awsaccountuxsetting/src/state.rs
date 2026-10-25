@@ -36,6 +36,23 @@ impl AccountUxCustomization {
         self.visible_regions = Some(canonical_members(supplied));
     }
 
+    /// Return the visible-service setting to its DEFAULT: unconfigured, which is
+    /// what an account that never set it carries and what a read reports as an
+    /// absent member ("visible Regions and visible services return null") — "all
+    /// services visible", a state no stored list can express.
+    ///
+    /// Distinct from storing an EMPTY list, which is the setting configured to
+    /// name no service: that is a present, empty array to every reader.
+    pub fn reset_visible_services(&mut self) {
+        self.visible_services = None;
+    }
+
+    /// Return the visible-Region setting to its default, under the same rule as
+    /// [`AccountUxCustomization::reset_visible_services`].
+    pub fn reset_visible_regions(&mut self) {
+        self.visible_regions = None;
+    }
+
     /// The `accountColor` this record is REPORTED with: the stored value, or
     /// [`ACCOUNT_COLOR_NONE`] while the account never configured one — "a value of
     /// `none` indicates that you have not set a color", so an unconfigured colour

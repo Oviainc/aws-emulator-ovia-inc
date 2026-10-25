@@ -21,6 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The `Expression` filter of `GetTables` is a regular expression, matched here by the
+# regex crate rather than by a hand-rolled matcher.
+regex = "1.13"
+# The shared IAM policy evaluator and IAM-ARN reading, for the crawler-role checks.
+service-common = { path = "../common" }
+# The account's own IAM records, read through the same shared engine, so a crawler's
+# `Role` is resolved against the roles `CreateRole`/`PutRolePolicy` wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

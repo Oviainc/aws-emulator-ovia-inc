@@ -65,6 +65,8 @@ mod quote_listing;
 mod quote_update;
 #[path = "all/regional_scope.rs"]
 mod regional_scope;
+#[path = "all/renewal_contract.rs"]
+mod renewal_contract;
 #[path = "all/renewal_pricing.rs"]
 mod renewal_pricing;
 #[path = "all/resource_tagging.rs"]

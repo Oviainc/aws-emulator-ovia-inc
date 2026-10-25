@@ -256,7 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // An unreachable store is an internal mounting fault, and this operation
             // DOES model a server fault — so it is reported as that, the same shape
@@ -367,9 +366,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // "It must be unique in your account."
-        if store.jobs.contains_key(&input.name) {
+        // "It must be unique in your account." Glue is regional, so the name has to be
+        // free in THIS Region: the same name in another Region names another job.
+        if store.job(&region, &input.name).is_some() {
             return Err(CreateJobErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
                     message: Some(format!("Job already exists: {}", input.name)),
@@ -396,10 +397,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let entry =
             crate::state::JobEntry::from_create_input(&input, ::std::time::SystemTime::now());
-        store.jobs.insert(input.name.clone(), entry);
+        store.insert_job(&region, entry);
         ::tracing::info!(
             operation = "CreateJob",
             job = %input.name,
+            region = %region,
             command = %command_name,
             "created a Glue job definition"
         );

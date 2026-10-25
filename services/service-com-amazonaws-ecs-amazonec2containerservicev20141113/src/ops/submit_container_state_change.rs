@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitContainerStateChange
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitContainerStateChange`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The ECS AGENT reporting that one container of one task changed state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitContainerStateChange::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The agent retries, so the same report can arrive twice or behind a later one. What
+//! this handler stores is therefore the FURTHEST point the container has been reported
+//! at: a report naming a stage at or before the one already stored is acknowledged and
+//! changes nothing (see `crate::state::container_stage_rank`), which is what keeps a
+//! stale replay from moving a stopped container back to running. The outcome the report
+//! carries — the runtime id, the exit code, the reason, the network bindings — is stored
+//! with the stage that carried it and reads back through `DescribeTasks`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitContainerStateChange` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitContainerStateChangeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitContainerStateChange"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SubmitContainerStateChangeErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // Both members the report carries into the store are caller-sized, so each is
+        // bounded at the size its own doc states — before the store is locked, and before
+        // anything is stored.
+        if input
+            .network_bindings
+            .as_ref()
+            .is_some_and(|bindings| bindings.len() > crate::state::MAX_NETWORK_BINDINGS)
+        {
+            return Err(
+                SubmitContainerStateChangeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::at_most_items_message(
+                            "network bindings",
+                            crate::state::MAX_NETWORK_BINDINGS,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.reason.as_ref().is_some_and(|reason| {
+            reason.chars().count() > crate::state::MAX_CONTAINER_REASON_LENGTH
+        }) {
+            return Err(
+                SubmitContainerStateChangeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::at_most_characters_message(
+                            "reason",
+                            crate::state::MAX_CONTAINER_REASON_LENGTH,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        // The agent plane states a missing cluster with the same fixed sentence every
+        // cluster-resolving operation does, under the error code this operation answers
+        // it with.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(SubmitContainerStateChangeErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "The task ID or full Amazon Resource Name (ARN) of the task that hosts the
+        // container", scoped by the cluster the report named.
+        let task_reference = input.task.clone().unwrap_or_default();
+        let task_arn =
+            crate::state::task_arn_from_reference(&region, &cluster_name, &task_reference);
+        let hosts_the_task = guard
+            .tasks
+            .get(&task_arn)
+            .is_some_and(|task| task.cluster_name == cluster_name);
+        if !hosts_the_task {
+            return Err(
+                SubmitContainerStateChangeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::TASK_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let reported_status = input.status.clone();
+        let reported_rank = reported_status
+            .as_deref()
+            .and_then(crate::state::container_stage_rank);
+        let task = guard
+            .tasks
+            .get_mut(&task_arn)
+            .expect("the task was just found in this cluster");
+        // "The name of the container": a report that names none names the task's only
+        // container, the same way every other container-scoped member of this service
+        // resolves one.
+        let container = match input.container_name.as_deref() {
+            Some(requested) => task
+                .containers
+                .iter_mut()
+                .find(|container| container.name.as_deref() == Some(requested)),
+            None => task.containers.first_mut(),
+        };
+        let Some(container) = container else {
+            return Err(
+                SubmitContainerStateChangeErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::CONTAINER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A report of a stage the container has already passed is a RETRY of a report
+        // that landed, or one overtaken by a later one: it is acknowledged, and nothing
+        // it carries replaces what the later stage recorded. A stage this service's own
+        // lifecycle does not name is not ranked against the stored one, so the agent's
+        // word on it stands.
+        let stored_rank = crate::state::container_stage_rank(&container.last_status);
+        let stale = match (reported_rank, stored_rank) {
+            (Some(reported), Some(stored)) => reported <= stored,
+            _ => false,
+        };
+        if !stale {
+            if let Some(status) = reported_status {
+                container.last_status = status;
+            }
+            if let Some(runtime_id) = input.runtime_id.clone() {
+                container.runtime_id = Some(runtime_id);
+            }
+            if let Some(exit_code) = input.exit_code {
+                container.exit_code = Some(exit_code);
+            }
+            if let Some(reason) = input.reason.clone() {
+                container.reason = Some(reason);
+            }
+            if let Some(bindings) = input.network_bindings.clone() {
+                container.network_bindings = bindings;
+            }
+            // `Task$version`: "Every time a task experiences a change ... the version
+            // counter is incremented" — and a container of it changing is such a change.
+            task.version += 1;
+        }
+
+        Ok(SubmitContainerStateChangeOutput {
+            acknowledgment: Some(crate::state::STATE_CHANGE_ACKNOWLEDGMENT.to_string()),
+        })
     }
 }

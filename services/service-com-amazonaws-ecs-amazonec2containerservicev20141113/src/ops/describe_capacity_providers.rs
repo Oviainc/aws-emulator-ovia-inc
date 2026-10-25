@@ -185,11 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeCapacityProvidersErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "capacityProviders must name at most {} capacity providers; \
-                             got {}",
+                        message: Some(crate::state::at_most_items_message(
+                            "capacity providers",
                             crate::state::MAX_DESCRIBE_BATCH,
-                            requested.len()
                         )),
                     },
                 )

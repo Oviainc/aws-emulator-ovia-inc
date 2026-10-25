@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -199,9 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Modelled constraints (the name's pattern and length, the domain's pattern, the
-        // domain list's 1..5 length) are refused before this handler runs. What is left
-        // are the rules the model states in prose only.
+        // Most modelled constraints (the name's pattern and length, the domain's pattern,
+        // the domain list's 1..5 length, a tag VALUE's length) are refused before this
+        // handler runs. What is left are the rules the model states in prose only, and the
+        // constraints on a tag KEY, which the boundary validator leaves unapplied (applied
+        // with the tag rules below).
         //
         // `AppMonitorDomainList`: "The CreateAppMonitor requires either the domain or the
         // domain list." A monitor's domain authority is held in at most ONE of the two
@@ -237,6 +239,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is readable from.
         let region = crate::state::request_region(ctx.parts());
         let resource_arn = crate::state::app_monitor_arn(&region, &input.name);
+
+        // The tag map this create would seed the monitor with. A `BTreeMap`, which is the
+        // form the record holds and which drops the duplicate keys a JSON object cannot
+        // carry anyway, so the count checked below is the number of tags the resource would
+        // end up with.
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.take().unwrap_or_default().into_iter().collect();
+        // `Tags` targets the same `TagMap` the sibling `TagResource` merges onto, so a
+        // create is subject to that map's two rules and not only to the modelled
+        // constraints the boundary applies: every key satisfies the constraints `TagKey`
+        // declares (which the boundary validator leaves unapplied for a map key), and the
+        // map the write leaves behind stays inside the documented per-resource ceiling.
+        // Both are refused before anything is written, under the modelled
+        // `ValidationException` an app-monitor call answers with.
+        if let Some(message) = crate::state::tag_keys_refusal(tags.keys().map(String::as_str)) {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        if let Some(message) = crate::state::tag_count_refusal(tags.len(), &resource_arn) {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
 
         // May this caller create an app monitor under this name? A monitor that does not
         // exist yet carries no resource policy, so the decision is the caller's
@@ -367,7 +395,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deobfuscation_configuration: input
                 .deobfuscation_configuration
                 .unwrap_or_else(crate::state::default_deobfuscation_configuration),
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags,
             // No telemetry has arrived for a monitor this call just created.
             events: ::std::collections::VecDeque::new(),
             // A monitor sends extended metrics nowhere until a

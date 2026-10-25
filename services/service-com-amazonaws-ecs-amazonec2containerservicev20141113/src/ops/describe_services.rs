@@ -162,10 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.services.len() > crate::state::MAX_DESCRIBE_SERVICES {
             return Err(DescribeServicesErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "services must name at most {} services; got {}",
+                    message: Some(crate::state::at_most_items_message(
+                        "service names",
                         crate::state::MAX_DESCRIBE_SERVICES,
-                        input.services.len()
                     )),
                 },
             )

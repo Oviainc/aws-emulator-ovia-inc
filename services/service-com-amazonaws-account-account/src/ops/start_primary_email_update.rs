@@ -6,7 +6,12 @@
 //! names the caller's own account is refused with the modelled 403
 //! `AccessDeniedException` before the address is acted on: per the model's own
 //! `AccountId` documentation, the management account can't specify its own
-//! `AccountId`. A request on an account whose previous update has been accepted
+//! `AccountId`. A `PrimaryEmail` that is not an email address is refused with
+//! the modelled 400 `ValidationException` and records nothing: the address
+//! becomes the root user email address of the account, and the syntax it is held
+//! to is the email-address expression this service's model declares
+//! ([`crate::state::validated_email_address`]). A request on an account whose
+//! previous update has been accepted
 //! and whose address change the clock has not applied yet is refused with the
 //! modelled 409 `ConflictException`, rather than replacing a record and dropping
 //! a change that is already owed.
@@ -191,8 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PrimaryEmail` carries `@length(min: 5, max: 64)` and no `@pattern`, and
         // `AccountId` carries `^\d{12}$`, so the boundary already refused anything
         // outside those with HTTP 400 `ValidationException` before this handler
-        // ran. The model constrains the address no further, so no address format
-        // is invented here.
+        // ran. WHICH strings of that size are addresses the boundary cannot say,
+        // and this one becomes the root user email address of the member account,
+        // so a value that is not an email address is refused here rather than
+        // recorded: the syntax is this model's own email-address expression, the
+        // `@pattern` it declares for an email-address member.
+        if let Err(refusal) = crate::state::validated_email_address(
+            crate::state::PRIMARY_EMAIL_MEMBER,
+            &input.primary_email,
+        ) {
+            return Err(StartPrimaryEmailUpdateErrorModeled::ValidationException(refusal).into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(account) = store.account_mut(&input.account_id, now) else {

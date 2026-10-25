@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRenewal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRenewal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: buys a renewal contract for the subscription behind the Outpost the
+//! `OutpostIdentifier` names, resolved from either the bare id or the full ARN the
+//! modelled pattern accepts, under the payment option and payment term the request
+//! asks for — and answers what that renewal costs.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRenewal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A CREATE, so it writes: the contract is recorded on the Outpost's own record
+//! ([`crate::state::OutpostRecord::renewals`]) and priced by the ONE rule this
+//! service prices a renewal by
+//! ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::renewal_price`]),
+//! the same rule `GetRenewalPricing` reports the options of — so what a caller is
+//! quoted and what it buys cannot disagree. The modelled `@idempotencyToken` makes a
+//! repeat of the same request the same contract rather than a second one: a request
+//! naming a `ClientToken` the Outpost already holds a renewal under is answered that
+//! stored contract, at the price it was bought at.
+//!
+//! An Outpost with no subscribed hardware has no subscription a contract could
+//! renew, which is the request this operation refuses (400 `ValidationException`) —
+//! it has no "could not price" outcome to report, the one `GetRenewalPricing`
+//! answers such a request with.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +97,25 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// This operation's answer for the renewal `pricing` records on the Outpost
+/// `outpost_id`: the contract's own payment option, term and price, reported from
+/// what is persisted for it.
+///
+/// One projection, so the renewal a request bought and the one an idempotent repeat
+/// of that request is answered are reported field for field the same.
+fn answer(outpost_id: &str, pricing: &SubscriptionPricingDetails) -> CreateRenewalOutput {
+    CreateRenewalOutput {
+        // `OutpostId` is modelled `OutpostIdOnly`, so it is the bare id whichever
+        // identifier form the request named the Outpost by.
+        outpost_id: Some(outpost_id.to_string()),
+        payment_option: pricing.payment_option.clone(),
+        payment_term: pricing.payment_term.clone(),
+        upfront_price: pricing.upfront_price,
+        monthly_recurring_price: pricing.monthly_recurring_price,
+        currency: pricing.currency.clone(),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +187,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRenewal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRenewalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRenewal"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRenewalErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved and where the contract is recorded.
+        let region = crate::state::request_region(ctx.parts());
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost, and the modelled `OutpostId` this operation
+        // answers with is the bare id either way (`OutpostIdOnly`,
+        // `^op-[a-f0-9]{17}$`).
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                CreateRenewalErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+        // A token is what identifies one request; the empty string carries no value,
+        // so a request that sent one names no token at all.
+        let client_token = crate::state::non_empty(input.client_token);
+
+        let mut store = state.lock();
+        // A renewal is bought FOR an Outpost, so an identifier the store holds no
+        // Outpost for cannot take one: the not-found error this operation models,
+        // worded as the identifier echo of the value AS SUPPLIED — not of the bare id
+        // an ARN resolved to.
+        if store.outpost(&region, &outpost_id).is_none() {
+            return Err(CreateRenewalErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+        // The repeat of a request this Outpost already holds a renewal for: the
+        // modelled `@idempotencyToken` makes it that one contract again, answered at
+        // the price it was bought at rather than re-priced or recorded twice. A
+        // request that reuses the token on other terms is not a repeat of it, and is
+        // refused rather than answered a contract it did not ask for.
+        let recorded = client_token.as_deref().and_then(|token| {
+            store
+                .outpost(&region, &outpost_id)?
+                .renewals
+                .iter()
+                .find(|renewal| renewal.client_token.as_deref() == Some(token))
+                .map(|renewal| renewal.pricing.clone())
+        });
+        if let Some(pricing) = recorded {
+            if pricing.payment_option.as_deref() != Some(input.payment_option.as_str())
+                || pricing.payment_term.as_deref() != Some(input.payment_term.as_str())
+            {
+                return Err(CreateRenewalErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::renewal_token_report()),
+                    },
+                )
+                .into());
+            }
+            return Ok(answer(&outpost_id, &pricing));
+        }
+        // What a renewal of this Outpost's subscription costs under the option and
+        // term asked for, from the hardware its own orders subscribe to. An Outpost
+        // that subscribes none has no subscription to renew, which is the request
+        // this operation refuses.
+        let pricing = store
+            .renewal_price(
+                &region,
+                &outpost_id,
+                &input.payment_option,
+                &input.payment_term,
+            )
+            .ok_or_else(|| {
+                CreateRenewalErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::renewal_subscription_report()),
+                })
+            })?;
+        // See `MAX_RESOURCES`: a renewal is never released, so what this contract
+        // grows is capped. `CreateRenewal` models no quota error, so the cap is
+        // reported as what it is from the caller's side — a request this service will
+        // not accept (400 `ValidationException`) — exactly as `CreateQuote` reports
+        // its own, and never as a 501 or an invented error code.
+        if store.renewals_held() >= crate::state::MAX_RESOURCES {
+            return Err(CreateRenewalErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::store_full("renewal contracts")),
+                },
+            )
+            .into());
+        }
+        store
+            .outpost_mut(&region, &outpost_id)
+            .ok_or_else(|| {
+                CreateRenewalErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the Outpost this renewal is for is no longer held".to_string()),
+                })
+            })?
+            .renewals
+            .push(crate::state::RenewalRecord {
+                client_token,
+                pricing: pricing.clone(),
+            });
+
+        Ok(answer(&outpost_id, &pricing))
     }
 }

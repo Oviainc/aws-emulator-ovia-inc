@@ -140,7 +140,7 @@ async fn update_node_state(
 ///
 /// `201 Created` is the status the model gives this operation
 /// (`smithy_query(query="operation", operation="UpdateNodeState")`: code 201).
-async fn state_updated(
+pub(crate) async fn state_updated(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -1058,7 +1058,10 @@ async fn a_nodes_placement_groups_are_the_groups_that_name_it() {
 
 /// The members of a node-shaped response that `UpdateNodeState` must leave
 /// exactly as it found them: everything the node carries except its `State`.
-const MEMBERS_BESIDE_STATE: [&str; 9] = [
+///
+/// One list, shared with the describe suite, so the two cannot drift from the
+/// node output shape.
+pub(crate) const MEMBERS_BESIDE_STATE: [&str; 9] = [
     "id",
     "arn",
     "clusterId",

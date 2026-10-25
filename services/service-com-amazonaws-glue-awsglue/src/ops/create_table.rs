@@ -109,9 +109,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `CreateTableError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#CreateTable")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#CreateTable",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateTableErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     AlreadyExistsException(AlreadyExistsException),
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
@@ -237,6 +241,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // entity lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(CreateTableErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let folded_table = crate::state::fold_name(&table_input.name);
         // `CreatedBy` is "the person or entity who created the table": the identity this
         // request speaks for. The emulator publishes one long-term identity, the one STS
@@ -244,7 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name built out of the request's access key id, which is a credential id and not
         // a principal any AWS rule renders into an IAM ARN.
         let created_by = crate::state::request_principal();
-        let _ = ctx;
 
         let mut store = state.lock();
         // The store is resident memory and this create is reachable by any caller, so

@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_secretsmanager_secretsmanager::state::FORCE_DELETE_PURGE_DELAY;
+use service_com_amazonaws_secretsmanager_secretsmanager::state::{
+    DEFAULT_ENCRYPTION_KEY_ID, DEFAULT_KMS_KEY_ALIAS, FORCE_DELETE_PURGE_DELAY,
+};
 use service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -460,21 +462,40 @@ async fn a_secret_id_that_names_nothing_is_a_resource_not_found() {
 
 #[tokio::test]
 async fn every_version_reports_the_kms_key_the_secret_was_created_with() {
-    // "The KMS keys used to encrypt the secret version." The key is reported in
-    // the form the caller gave it, so the rows are the forms `KmsKeyId` accepts
-    // (KmsKeyIdType, this service's model: "the ARN, key ID, or alias"), plus a
-    // secret left on the Amazon-managed key, which records no key of its own.
+    // "The KMS keys used to encrypt the secret version." A key of the secret's
+    // own is reported in the form the caller gave it, so the rows are the forms
+    // `KmsKeyId` accepts (KmsKeyIdType, this service's model: "the ARN, key ID,
+    // or alias"); a secret on the account's default Secrets Manager key — the
+    // one it is encrypted with when it names no key, and the same key whether it
+    // is named or left out — reports that key's own id instead.
     let router = emulator();
-    for (case, kms_key_id) in [
-        ("no key given", None),
-        ("a bare key id", Some("1234abcd-12ab-34cd-56ef-1234567890ab".to_string())),
-        ("an alias", Some("alias/my-secrets".to_string())),
+    for (case, kms_key_id, expected) in [
+        ("no key given", None, vec![DEFAULT_ENCRYPTION_KEY_ID.to_string()]),
+        (
+            "the default key named by its alias",
+            Some(DEFAULT_KMS_KEY_ALIAS.to_string()),
+            vec![DEFAULT_ENCRYPTION_KEY_ID.to_string()],
+        ),
+        (
+            "a bare key id",
+            Some("1234abcd-12ab-34cd-56ef-1234567890ab".to_string()),
+            vec!["1234abcd-12ab-34cd-56ef-1234567890ab".to_string()],
+        ),
+        (
+            "an alias",
+            Some("alias/my-secrets".to_string()),
+            vec!["alias/my-secrets".to_string()],
+        ),
         (
             "a full key ARN",
             Some(format!(
                 "arn:aws:kms:{REGION}:{}:key/1234abcd-12ab-34cd-56ef-1234567890ab",
                 engine::EMULATOR_ACCOUNT_ID
             )),
+            vec![format!(
+                "arn:aws:kms:{REGION}:{}:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+                engine::EMULATOR_ACCOUNT_ID
+            )],
         ),
     ] {
         let name = format!("versions/kms-{}", case.replace(' ', "-"));
@@ -505,9 +526,9 @@ async fn every_version_reports_the_kms_key_the_secret_was_created_with() {
                         .map(|key| key.as_str().unwrap_or_default().to_string())
                         .collect()
                 });
-            let expected = kms_key_id.clone().map(|key| vec![key]);
             assert_eq!(
-                reported, expected,
+                reported,
+                Some(expected.clone()),
                 "case {case:?}: expected KmsKeyIds {expected:?}, got {entry}"
             );
         }
@@ -524,16 +545,19 @@ async fn listing_the_versions_changes_nothing_a_later_caller_sees() {
     }
     // The rows are the listings a caller can ask for; none of them may move a
     // label, drop a version or change what Describe/Get reports afterwards.
-    let before_describe = ok(
+    // Retrieving a value records the date of that retrieval (the one thing
+    // `LastAccessedDate` reports), so the baselines are taken after it: what no
+    // listing may change is everything else.
+    let before_value = ok(
         &router,
-        "DescribeSecret",
+        "GetSecretValue",
         json!({"SecretId": name}),
         "before",
     )
     .await;
-    let before_value = ok(
+    let before_describe = ok(
         &router,
-        "GetSecretValue",
+        "DescribeSecret",
         json!({"SecretId": name}),
         "before",
     )

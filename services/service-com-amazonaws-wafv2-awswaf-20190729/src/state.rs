@@ -1069,6 +1069,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
         (entry.rule_group.name == name).then_some(entry)
     }
 
+    /// [`Self::rule_group`], mutably.
+    pub fn rule_group_mut(
+        &mut self,
+        scope: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&mut RuleGroupEntry> {
+        let entry = self
+            .rule_groups
+            .get_mut(&(scope.to_string(), id.to_string()))?;
+        (entry.rule_group.name == name).then_some(entry)
+    }
+
     /// How many rule groups this scope already holds. See
     /// [`MAX_RULE_GROUPS_PER_SCOPE`].
     pub fn rule_groups_in_scope(&self, scope: &str) -> usize {

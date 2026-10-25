@@ -109,8 +109,7 @@ pub(crate) fn stored_runs(
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let store = state.lock();
     store
-        .jobs
-        .get(job_name)
+        .job(crate::wire::REGION, job_name)
         .map(|job| job.runs.clone())
         .unwrap_or_else(|| panic!("the store must hold job {job_name:?}"))
 }
@@ -125,8 +124,7 @@ pub(crate) fn set_due_instant(
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let job = store
-        .jobs
-        .get_mut(job_name)
+        .job_mut(crate::wire::REGION, job_name)
         .unwrap_or_else(|| panic!("the store must hold job {job_name:?}"));
     for run in &mut job.runs {
         if run.settles_at.is_some() {

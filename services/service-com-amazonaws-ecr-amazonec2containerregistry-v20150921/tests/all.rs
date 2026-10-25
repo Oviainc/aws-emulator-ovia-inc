@@ -29,6 +29,8 @@ mod image_replication_status;
 mod image_scan;
 #[path = "all/image_scan_outcome.rs"]
 mod image_scan_outcome;
+#[path = "all/image_storage_class_identification.rs"]
+mod image_storage_class_identification;
 #[path = "all/image_storage_class_transitions.rs"]
 mod image_storage_class_transitions;
 #[path = "all/image_tag_mutability.rs"]

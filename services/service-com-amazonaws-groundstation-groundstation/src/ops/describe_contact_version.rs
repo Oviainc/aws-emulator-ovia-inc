@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeContactVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeContactVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeContactVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,23 +166,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_CONTACT_VERSION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Describe the contact `{contactId}` names AS OF the version `{versionId}` names.
+    ///
+    /// A REPORTING operation (`@readonly`, per `smithy_query(query="operation",
+    /// operation="DescribeContactVersion")`): it persists nothing of its own. The one
+    /// write it makes is `settle_due_contacts`, which materialises the moves the clock
+    /// already owed at this instant — a reservation's `SCHEDULING` -> `SCHEDULED`, the
+    /// steps of the pass lifecycle a contact's own window owes it and an update's
+    /// `UPDATING` -> `ACTIVE` — each owed whether or not anybody called, so it changes
+    /// nothing a later caller could otherwise have seen.
+    ///
+    /// What it reports splits in two. The contact-level facts — the window, the ground
+    /// station, the status, the region, the mission profile and its dataflows, the tags —
+    /// are the contact's own and read the same for every version of it. The version-scoped
+    /// facts are the named version's: the satellite that version flies the contact
+    /// against, the tracking overrides it flies it with ("for the initial version, these
+    /// are the overrides specified when the contact was reserved. For subsequent versions,
+    /// these are the overrides associated with that specific version update" —
+    /// `smithy_query(query="doc", shape="DescribeContactVersionResponse",
+    /// member="trackingOverrides")`) and the version record itself. So this read answers
+    /// what `DescribeContact` answers only for the contact's NEWEST version; for an older
+    /// one it answers the configuration that version carried.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeContactVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeContactVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeContactVersion"))
+        /// What this operation answers when the contact holds no version with the
+        /// `{versionId}` the request addressed.
+        ///
+        /// This service's not-found texts for a resource whose id it does not disclose
+        /// name the resource as the model's own shape spells it — `DescribeContact`'s
+        /// "Contact not found", `crate::state::MISSION_PROFILE_NOT_FOUND`,
+        /// `crate::state::EPHEMERIS_NOT_FOUND` — and the resource missing here is the
+        /// `ContactVersion` the second label names.
+        const CONTACT_VERSION_NOT_FOUND: &str = "ContactVersion not found";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeContactVersionErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // Apply every move the clock already owes a contact at this instant, so both the
+        // status reported for the contact and the status reported for the version are the
+        // ones in force now.
+        guard.settle_due_contacts();
+
+        let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
+            DescribeContactVersionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The `{contactId}` label resolves first, and it answers what this
+                    // service's other reads of a contact by that label answer: a fixed
+                    // literal, which discloses no id.
+                    message: Some("Contact not found".to_string()),
+                },
+            )
+        })?;
+
+        // The version the second label names, out of the history the store holds for this
+        // contact. A `versionId` inside the modelled range that this contact never
+        // reached — including one it has not reached YET — names no version of it.
+        let version = contact
+            .versions
+            .iter()
+            .find(|version| version.version_id == input.version_id)
+            .ok_or_else(|| {
+                DescribeContactVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CONTACT_VERSION_NOT_FOUND.to_string()),
+                    },
+                )
+            })?;
+
+        Ok(DescribeContactVersionOutput {
+            contact_id: Some(contact.contact_id.clone()),
+            mission_profile_arn: Some(contact.mission_profile_arn.clone()),
+            start_time: Some(contact.start_time),
+            end_time: Some(contact.end_time),
+            pre_pass_start_time: Some(contact.pre_pass_start_time),
+            post_pass_end_time: Some(contact.post_pass_end_time),
+            ground_station: Some(contact.ground_station.clone()),
+            contact_status: Some(contact.contact_status.clone()),
+            region: Some(contact.region.clone()),
+            tags: contact.response_tags(),
+            dataflow_list: guard
+                .contact_dataflow_list(&contact.mission_profile_arn, &contact.region),
+            // The version-scoped facts: what THIS version flies the contact with, and the
+            // version record itself.
+            satellite_arn: version.satellite_arn.clone(),
+            tracking_overrides: version.tracking_overrides.clone(),
+            version: Some(contact.version_record(version)),
+            // No contact has failed and no antenna has tracked a pass in this emulator, so
+            // the members reporting those carry nothing. `maximumElevation`,
+            // `visibilityStartTime` and `visibilityEndTime` are the pass GEOMETRY — where
+            // in the sky the satellite rises above the receive mask, peaks and sets,
+            // "based on the satellite's current active ephemeris" — and nothing this
+            // service holds determines it: a ground station records no coordinates and no
+            // ephemeris here is propagated. `ephemeris` is the trajectory the antenna was
+            // pointed by, which is that same unflown geometry. All of them are therefore
+            // reported absent rather than invented, exactly as `DescribeContact` reports
+            // them.
+            error_message: None,
+            maximum_elevation: None,
+            visibility_start_time: None,
+            visibility_end_time: None,
+            ephemeris: None,
+        })
     }
 }

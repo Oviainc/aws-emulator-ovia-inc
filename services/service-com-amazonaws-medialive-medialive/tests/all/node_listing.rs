@@ -42,7 +42,11 @@ use crate::wire::{call, error_code, medialive};
 
 /// `ListNodes` on `cluster_id`, with `query` appended verbatim (`MaxResults` and
 /// `NextToken` are both `@httpQuery`).
-async fn list(router: &MultiServiceRouter, cluster_id: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn list(
+    router: &MultiServiceRouter,
+    cluster_id: &str,
+    query: &str,
+) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -55,7 +59,7 @@ async fn list(router: &MultiServiceRouter, cluster_id: &str, query: &str) -> (u1
 /// The `nodes` member as a list, whatever its length. An empty list and an absent
 /// member both mean "no entries" to a client, and which of the two the restJson1
 /// codec writes is the serializer's choice, so both read here as the empty list.
-fn summaries(case: &str, body: &Value) -> Vec<Value> {
+pub(crate) fn summaries(case: &str, body: &Value) -> Vec<Value> {
     match body.get("nodes") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(entries)) => entries.clone(),

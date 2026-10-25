@@ -19,6 +19,8 @@ mod api_cache_create_rules;
 mod api_key_update;
 #[path = "all/data_source_delete.rs"]
 mod data_source_delete;
+#[path = "all/data_source_list.rs"]
+mod data_source_list;
 #[path = "all/data_source_service_role.rs"]
 mod data_source_service_role;
 #[path = "all/data_source_update.rs"]

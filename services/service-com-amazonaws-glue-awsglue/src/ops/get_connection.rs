@@ -96,9 +96,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetConnection")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetConnection",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetConnectionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     GlueEncryptionException(GlueEncryptionException),
     InvalidInputException(InvalidInputException),
@@ -156,7 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetConnectionErrorModeled::InvalidInputException(
                 InvalidInputException {
@@ -168,6 +171,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may read this catalog at all is decided BEFORE the entity
+        // lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(GetConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // Read-only: the stored definition is projected out and nothing is written.
         let store = state.lock();
         let Some(entry) = store.connection(&catalog_id, &input.name) else {

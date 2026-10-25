@@ -230,6 +230,11 @@ mod execute_query_follows_the_store;
 mod gateway_lifecycle;
 #[path = "all/hierarchies_etags_and_refusals.rs"]
 mod hierarchies_etags_and_refusals;
+// In its alphabetical place inside the sorted list, rather than appended after
+// it: the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and each append there collided with this one.
+#[path = "all/list_asset_model_composite_models.rs"]
+mod list_asset_model_composite_models;
 #[path = "all/list_asset_models.rs"]
 mod list_asset_models;
 #[path = "all/list_pipelines.rs"]

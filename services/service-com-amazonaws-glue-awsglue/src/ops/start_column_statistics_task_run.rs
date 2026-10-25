@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models no server fault, so an unreachable store is reported
             // as the operation's own timeout error, the same way `GetCrawler` reports it.
@@ -192,6 +191,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // only questions are whether the catalog holds that table and whether a run of it
         // is already in flight.
         let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the
+        // entity lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(
+                StartColumnStatisticsTaskRunErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Everything the clock already owed the stored runs is materialised before they

@@ -4,8 +4,10 @@
 //! IMPLEMENTED: this operation hands out the queue's currently visible messages from
 //! [`crate::state`], makes each one invisible for the effective visibility timeout and
 //! mints a receipt handle per delivery. On a FIFO queue it hands a message group's
-//! messages over in strict send order, one group member in flight at a time. It is the
-//! ONLY file to touch for `ReceiveMessage`.
+//! messages over in strict send order, one group member in flight at a time, and a
+//! receive carrying a `ReceiveRequestAttemptId` is idempotent: a retry under the same
+//! token hands the identical batch and receipt handles back. It is the ONLY file to
+//! touch for `ReceiveMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -330,6 +332,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         check_system_attribute_names(&system_requested)?;
         let attribute_requested: Vec<String> = input.message_attribute_names.unwrap_or_default();
 
+        // "The token used for deduplication of ReceiveMessage calls", bounded exactly as
+        // its own documentation bounds it: "the maximum length of ReceiveRequestAttemptId
+        // is 128 characters. ReceiveRequestAttemptId can contain alphanumeric characters
+        // ... and punctuation".
+        let attempt_id = input.receive_request_attempt_id;
+        if let Some(given) = &attempt_id {
+            if let Some(reason) = sqs::message_token_refusal("ReceiveRequestAttemptId", given) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(reason));
+            }
+        }
+
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             ReceiveMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -346,7 +359,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 };
                 // Retention lapses and visibility timeouts are owed by the clock: this
-                // materialises what was already due, it does not consume anything.
+                // materialises what was already due, it does not consume anything. It
+                // also forgets the receive attempts whose retry window has run out.
                 queue.materialise_due(now);
 
                 let visibility_timeout = input
@@ -356,6 +370,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     || queue.integer(sqs::RECEIVE_MESSAGE_WAIT_TIME_SECONDS),
                     i64::from,
                 ));
+                let invisible_until = sqs::after(now, visibility_timeout);
+
+                // "This parameter applies only to FIFO (first-in-first-out) queues": a
+                // standard queue keeps no receive attempts, because nothing there is
+                // ordered or deduplicated, so the token names no batch to replay. It is
+                // taken and left unused rather than refused: no recorded call shows a
+                // standard-queue receive being turned away for carrying it, and the
+                // member's own documentation states only which queue type it applies to.
+                let attempt_id = attempt_id.as_ref().filter(|_| queue.is_fifo());
+
+                // "It is possible to retry the same action with an identical
+                // ReceiveRequestAttemptId to retrieve the same set of messages, even if
+                // their visibility timeout has not yet expired ... subsequent calls with
+                // the same ReceiveRequestAttemptId return the same messages and receipt
+                // handles. If a retry occurs within the deduplication interval, it resets
+                // the visibility timeout."
+                if let Some((attempt_id, attempt)) = attempt_id.and_then(|given| {
+                    queue
+                        .receive_attempts
+                        .get(given)
+                        .cloned()
+                        .map(|attempt| (given, attempt))
+                }) {
+                    // The retry is served only "if none of the messages have been
+                    // modified (deleted or had their visibility changes)". The refusal
+                    // carries the sender fault Amazon SQS answers a refused parameter
+                    // with, worded in that fault's own fixed text with the token this
+                    // request supplied.
+                    if queue.receive_attempt_was_modified(&attempt) {
+                        return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                            format!(
+                                "Value {attempt_id} for parameter ReceiveRequestAttemptId is \
+                                 invalid."
+                            ),
+                        ));
+                    }
+                    let mut delivered = Vec::with_capacity(attempt.delivered.len());
+                    for handed in &attempt.delivered {
+                        let Some(message) = queue
+                            .messages
+                            .iter_mut()
+                            .find(|message| message.message_id == handed.message_id)
+                        else {
+                            continue;
+                        };
+                        // The retry is the same receive, so it hands the message over
+                        // again without counting as another delivery — it only resets the
+                        // visibility timeout.
+                        message.invisible_until = Some(invisible_until);
+                        delivered.push(wire_message(
+                            message,
+                            handed.receipt_handle.clone(),
+                            &system_requested,
+                            &attribute_requested,
+                        ));
+                    }
+                    // What this retry left the batch at, so a further one still
+                    // recognises it as unmodified. The window keeps running from the
+                    // receive that minted the token, which is the action it is "5 minutes
+                    // after". Written through the recording method, like the first
+                    // receive's, so the bound on what a queue remembers stays in one place.
+                    queue.record_receive_attempt(
+                        attempt_id.clone(),
+                        sqs::ReceiveAttempt {
+                            served_at: attempt.served_at,
+                            delivered: attempt
+                                .delivered
+                                .iter()
+                                .map(|handed| sqs::DeliveredMessage {
+                                    invisible_until,
+                                    ..handed.clone()
+                                })
+                                .collect(),
+                        },
+                    );
+                    return Ok(ReceiveMessageOutput {
+                        messages: Some(delivered),
+                    });
+                }
 
                 let taking: Vec<usize> =
                     queue.delivery_order(now, usize::try_from(max_messages).unwrap_or(1));
@@ -369,37 +462,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if message.first_received_at.is_none() {
                         message.first_received_at = Some(now);
                     }
-                    message.invisible_until = Some(sqs::after(now, visibility_timeout));
+                    message.invisible_until = Some(invisible_until);
                     minted.push((receipt_handle.clone(), message.message_id.clone()));
-
-                    let attributes = system_attributes(message, &system_requested);
-                    // The digest covers the attributes this answer RETURNS, which is what
-                    // an SDK verifies it against; a request that selects a subset therefore
-                    // gets the digest of that subset, not of the stored set.
-                    let message_attributes: BTreeMap<String, MessageAttributeValue> = message
-                        .message_attributes
-                        .iter()
-                        .filter(|(name, _)| selects(&attribute_requested, name))
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect();
-                    delivered.push(Message {
-                        message_id: Some(message.message_id.clone()),
-                        receipt_handle: Some(receipt_handle),
-                        md5_of_body: Some(message.md5_of_body.clone()),
-                        body: Some(message.body.clone()),
-                        attributes: (!attributes.is_empty())
-                            .then(|| attributes.into_iter().collect()),
-                        md5_of_message_attributes: sqs::md5_of_message_attributes(
-                            &message_attributes,
-                        ),
-                        message_attributes: (!message_attributes.is_empty())
-                            .then(|| message_attributes.into_iter().collect()),
-                    });
+                    delivered.push(wire_message(
+                        message,
+                        receipt_handle,
+                        &system_requested,
+                        &attribute_requested,
+                    ));
                 }
-                for (receipt_handle, message_id) in minted {
+                for (receipt_handle, message_id) in &minted {
                     // Replaces the handle an earlier receive minted for this message, so
                     // re-receiving cannot accumulate handles.
-                    queue.record_receipt_handle(receipt_handle, &message_id);
+                    queue.record_receipt_handle(receipt_handle.clone(), message_id);
+                }
+                // The batch this attempt token handed over, so the retry the token exists
+                // for finds it. A receive that handed nothing over names no batch, so it
+                // remembers nothing and a retry polls the queue afresh.
+                if let Some(attempt_id) =
+                    attempt_id.filter(|_| !minted.is_empty()).cloned()
+                {
+                    queue.record_receive_attempt(
+                        attempt_id,
+                        sqs::ReceiveAttempt {
+                            delivered: minted
+                                .into_iter()
+                                .map(|(receipt_handle, message_id)| sqs::DeliveredMessage {
+                                    message_id,
+                                    receipt_handle,
+                                    invisible_until,
+                                })
+                                .collect(),
+                            served_at: now,
+                        },
+                    );
                 }
                 (delivered, wait)
             };
@@ -438,6 +534,40 @@ fn check_system_attribute_names(requested: &[String]) -> Result<(), ReceiveMessa
         }
     }
     Ok(())
+}
+
+/// One stored message as this operation hands it over, under the receipt handle
+/// `receipt_handle` and filtered to what the request selects.
+///
+/// Both ways a message is handed over — a fresh delivery and a retry replaying the batch
+/// one `ReceiveRequestAttemptId` already served — project the wire message from the
+/// stored one here, so the two cannot drift on what a receive reports.
+fn wire_message(
+    message: &sqs::StoredMessage,
+    receipt_handle: String,
+    system_requested: &[String],
+    attribute_requested: &[String],
+) -> Message {
+    let attributes = system_attributes(message, system_requested);
+    // The digest covers the attributes this answer RETURNS, which is what an SDK
+    // verifies it against; a request that selects a subset therefore gets the digest of
+    // that subset, not of the stored set.
+    let message_attributes: BTreeMap<String, MessageAttributeValue> = message
+        .message_attributes
+        .iter()
+        .filter(|(name, _)| selects(attribute_requested, name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    Message {
+        message_id: Some(message.message_id.clone()),
+        receipt_handle: Some(receipt_handle),
+        md5_of_body: Some(message.md5_of_body.clone()),
+        body: Some(message.body.clone()),
+        attributes: (!attributes.is_empty()).then(|| attributes.into_iter().collect()),
+        md5_of_message_attributes: sqs::md5_of_message_attributes(&message_attributes),
+        message_attributes: (!message_attributes.is_empty())
+            .then(|| message_attributes.into_iter().collect()),
+    }
 }
 
 /// The message system attributes this emulator holds, filtered to the ones `requested`
