@@ -145,12 +145,6 @@ impl From<GetProtectionStatusErrorModeled> for GetProtectionStatusError {
     }
 }
 
-/// The largest page `GetProtectionStatus` serves, which is the maximum the
-/// model's `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults`
-/// (range 1..100). It bounds the response for EVERY caller, including one that
-/// sends no `MaxResults` at all.
-const MAX_PAGE_SIZE: usize = 100;
-
 /// The `GetProtectionStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -283,12 +277,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that period; an absent bound leaves that side unbounded.
             .filter(|attack| attack.overlaps(input.start_time, input.end_time));
 
-        // Bounded whether or not the caller asked for a bound, and clamped
-        // rather than only capped, for the reasons `ListPolicies` states.
-        let page_size = input
-            .max_results
-            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
-            .clamp(1, MAX_PAGE_SIZE);
+        // Bounded whether or not the caller asked for a bound, by the one
+        // page-size rule every paginated operation of this service shares.
+        let page_size = crate::state::page_size(input.max_results);
         // `Data` is the documented JSON document: one entry per reported attack,
         // in the order the page is served. With no attack in the period it is an
         // empty JSON array rather than an absent member, so a client parses the

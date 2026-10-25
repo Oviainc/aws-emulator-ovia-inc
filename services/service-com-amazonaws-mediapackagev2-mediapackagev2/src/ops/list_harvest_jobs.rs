@@ -243,15 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(ListHarvestJobsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                "The pagination token is not one this service issued"
-                                    .to_string(),
-                            ),
-                            validation_exception_type: Some(
-                                crate::state::VALIDATION_INVALID_PAGINATION_TOKEN.to_string(),
-                            ),
-                        },
+                        crate::state::validation_failed(
+                            "nextToken",
+                            crate::state::INVALID_PAGINATION_TOKEN_DETAIL,
+                            crate::state::VALIDATION_INVALID_PAGINATION_TOKEN,
+                        ),
                     )
                     .into());
                 }

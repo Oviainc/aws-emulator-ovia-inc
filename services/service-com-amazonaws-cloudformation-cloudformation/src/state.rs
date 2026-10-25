@@ -2163,6 +2163,21 @@ impl ComAmazonawsCloudformationCloudformationState {
         })
     }
 
+    /// Every registry record of ONE Region, in the order the records entered the registry.
+    ///
+    /// `ListTypes` reports the extensions of "your current account and Region", so the
+    /// listing is namespaced exactly as a single read is: a record another Region's
+    /// registry holds is not among them — the same gate [`Self::extension_by_name`]
+    /// applies to the name form.
+    pub fn extensions_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a registry::StoredExtension> {
+        self.extensions
+            .iter()
+            .filter(move |extension| extension.region == region)
+    }
+
     /// The registry record an `Arn` request names, in the Region the request was signed
     /// for. An extension's ARN carries its Region and its kind already, and the registry
     /// is regional like the records it holds, so an ARN minted for another Region names no
@@ -2663,8 +2678,12 @@ pub enum PageOf {
     ChangeSetSummaries,
     /// `ListHookResults`'s `HookResults`.
     HookResults,
+    /// `ListExports`'s `Exports`.
+    Exports,
     /// `DescribeAccountLimits`'s `AccountLimits`.
     AccountLimits,
+    /// `ListTypes`'s `TypeSummaries`.
+    TypeSummaries,
 }
 
 impl PageOf {
@@ -2678,7 +2697,9 @@ impl PageOf {
             Self::Changes => "changes",
             Self::ChangeSetSummaries => "change-set-summaries",
             Self::HookResults => "hookresults",
+            Self::Exports => "exports",
             Self::AccountLimits => "account-limits",
+            Self::TypeSummaries => "type-summaries",
         }
     }
 }
@@ -2715,6 +2736,25 @@ pub fn paginate<T>(
     items: Vec<T>,
     token: Option<&str>,
 ) -> Result<(Vec<T>, Option<String>), String> {
+    paginate_at_most(page_of, items, token, None)
+}
+
+/// [`paginate`], for a read whose request CHOOSES how large a page is: `MaxResults` is
+/// "the maximum number of results to be returned with a single call", so a request that
+/// names one gets at most that many items and the `NextToken` that resumes just past
+/// them.
+///
+/// A request that names none gets this service's own page size ([`PAGE_SIZE`]), which is
+/// also the ceiling: one response carries one bounded page whatever maximum is asked for.
+/// The cursor counts ITEMS, not pages, so a caller may ask for a different maximum on
+/// every call and still walk the collection exactly once.
+pub fn paginate_at_most<T>(
+    page_of: PageOf,
+    items: Vec<T>,
+    token: Option<&str>,
+    max_results: Option<usize>,
+) -> Result<(Vec<T>, Option<String>), String> {
+    let page_size = max_results.unwrap_or(PAGE_SIZE).clamp(1, PAGE_SIZE);
     let offset = match token {
         None => 0,
         Some(token) => decode_next_token(page_of, token)
@@ -2723,8 +2763,8 @@ pub fn paginate<T>(
     };
     let remaining = items.len() - offset;
     let next_token =
-        (remaining > PAGE_SIZE).then(|| encode_next_token(page_of, offset + PAGE_SIZE));
-    let page = items.into_iter().skip(offset).take(PAGE_SIZE).collect();
+        (remaining > page_size).then(|| encode_next_token(page_of, offset + page_size));
+    let page = items.into_iter().skip(offset).take(page_size).collect();
     Ok((page, next_token))
 }
 

@@ -19,10 +19,12 @@
 //!    its expression, bound to `filterValues`, decides which stored catalog entries
 //!    come back — not what any of them scores.
 //! 4. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
-//!    of its STORED `base_score` and the request's `userId`/`itemId`/`context`, so an
-//!    identical request returns an identical ordering (the operation is
-//!    `@idempotent`). The list is reported "sorted in descending order by prediction
-//!    score". The scores are normalized across the whole stored catalog BEFORE the
+//!    of its STORED `base_score`, the request's `context` and only the ONE
+//!    personalization input the resolved resource uses (see
+//!    [`crate::state::RequiredInput::personalization`]), so an identical request
+//!    returns an identical ordering (the operation is `@idempotent`) and the input the
+//!    resource does not use is ignored. The list is reported "sorted in descending
+//!    order by prediction score". The scores are normalized across the whole stored catalog BEFORE the
 //!    request's filter, `numResults` and any promotion decide which candidates come
 //!    back, so one item's score is the same whatever the request asked for.
 //! 5. **Promote.** A `promotions` entry takes `percentPromotedItems` of the returned
@@ -254,6 +256,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    share of the certainty over it. `RELATED_ITEMS` recommends items related
         //    to `itemId`, never the queried item itself, so that item is no candidate
         //    at all — `itemId` is a personalization input, not a selection member.
+        //
+        //    Only the personalization input the resolved resource USES reaches the
+        //    score: "USER_PERSONALIZATION - userId required, itemId not used
+        //    RELATED_ITEMS - itemId required, userId not used". So a spurious `itemId`
+        //    on a user-personalization request, or a spurious `userId` on a
+        //    related-items one, leaves the scored catalog — and therefore the items
+        //    returned and their order — exactly as it was.
+        let personalization = resolved.required_input.personalization(user_id, item_id);
         let context_seed = scoring::context_seed(input.context.as_ref());
         let mut candidates: Vec<(usize, f64)> = resolved
             .items
@@ -267,8 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     item.base_score,
                     &[
                         &resolved.scope,
-                        user_id,
-                        item_id,
+                        personalization,
                         &context_seed,
                         &item.item_id,
                     ],

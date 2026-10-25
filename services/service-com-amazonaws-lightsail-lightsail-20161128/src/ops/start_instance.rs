@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartInstance
-//! Moves the stored instance back towards `running` and appends the operation
+//! Moves the stored instance back towards `running` — assigning it a new public
+//! IP address, unless a static IP is attached to it — and appends the operation
 //! that records it.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -169,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
-            let (location, settles_at_ms) = {
+            let (location, ip_address_type, settles_at_ms, starting) = {
                 let Some(instance) = store.instance_mut(&name) else {
                     return Err(not_found(&name));
                 };
@@ -192,8 +193,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     instance.due = Some(due);
                     Some(due.at_ms)
                 };
-                (instance.location.clone(), settles_at_ms)
+                (
+                    instance.location.clone(),
+                    instance.ip_address_type.clone(),
+                    settles_at_ms,
+                    !already_up,
+                )
             };
+            // "When you start a stopped instance, Lightsail assigns a new public
+            // IP address to the instance. To use the same IP address after
+            // stopping and starting an instance, create a static IP address and
+            // attach it to the instance" (this operation's own modelled
+            // documentation). The assignment is part of STARTING the instance, so
+            // it happens exactly where the start does: an instance that was
+            // already running, or already coming up, is not started again by this
+            // call and keeps the addresses it is serving on — which is also what
+            // separates a stop and start from a reboot, which re-provisions
+            // nothing. See [`assign_addresses_for_start`] for which addresses
+            // that is, and for the static IP that keeps one.
+            if starting {
+                assign_addresses_for_start(store, &name, &ip_address_type)?;
+            }
             let operation = store.start_operation(
                 now,
                 crate::state::OPERATION_TYPE_START_INSTANCE,
@@ -208,6 +228,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// Assign the instance `name` the PUBLIC addresses starting it gives it, where
+/// `ip_address_type` is that instance's own modelled `ipAddressType`.
+///
+/// “When you start a stopped instance, Lightsail assigns a new public IP address
+/// to the instance. To use the same IP address after stopping and starting an
+/// instance, create a static IP address and attach it to the instance” (this
+/// operation's modelled documentation). A start therefore re-provisions the
+/// instance's public addressing from the same allocator a create draws from
+/// (`fresh_addresses`, so an address is handed out once in this process):
+///
+/// * the public IPv4 address is drawn afresh — unless a static IP is attached to
+///   the instance, whose reserved address is kept, which is the whole reason a
+///   static IP exists;
+/// * the IPv6 address is drawn afresh too: a static IP reserves one public IPv4
+///   address (the modelled `StaticIp$ipAddress`), so nothing can pin an IPv6
+///   address;
+/// * each only where the instance's address type gives it that kind of address,
+///   which is what `fresh_addresses` already decides; and
+/// * the PRIVATE address is left where it is — it is the address the instance
+///   holds in the Region's VPC, which a stop does not give up.
+///
+/// This is the write of a MUTATING call: it consumes the store's address
+/// allocator, so it belongs here, on the path that starts the instance, and never
+/// in the clock a reporting read advances.
+///
+/// Drawing the addresses needs the store itself, so the instance is reached again
+/// to be written: an instance that is not there answers the same rejection a
+/// request naming no stored instance gets, rather than letting the write be
+/// dropped on the floor.
+fn assign_addresses_for_start(
+    store: &mut crate::state::ComAmazonawsLightsailLightsail20161128State,
+    name: &str,
+    ip_address_type: &str,
+) -> Result<(), StartInstanceError> {
+    // The attachment lives on the STATIC IP record — the address is what is
+    // attached, exactly as a disk names the instance it is attached to — so the
+    // kept address is that record's own. A static IP IS a public IPv4 address, so
+    // it pins one only on an instance whose address type gives it a public IPv4
+    // address at all.
+    let attached_static_ip = if crate::state::ip_address_type_has_ipv4(ip_address_type) {
+        store
+            .static_ips
+            .values()
+            .find(|static_ip| static_ip.attached_to.as_deref() == Some(name))
+            .map(|static_ip| static_ip.ip_address.clone())
+    } else {
+        None
+    };
+    // ONE draw per start, from the one allocator every address in this store comes
+    // out of. The private address it also yields is deliberately dropped, so the
+    // offset it consumed is spent rather than wasted: that is what keeps a redrawn
+    // address one no resource in this process has held.
+    let (_private, public, ipv6) = store.fresh_addresses(ip_address_type);
+    let Some(instance) = store.instance_mut(name) else {
+        return Err(not_found(name));
+    };
+    // An attached static IP is never discarded: a reservation the account holds
+    // cannot be dropped by starting the instance it is attached to.
+    instance.public_ip_address = attached_static_ip.or(public);
+    instance.ipv6_addresses = ipv6;
+    Ok(())
 }
 
 /// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —

@@ -12,9 +12,12 @@
 //! The rules under test, each stated once and then exercised over a SET of inputs:
 //!
 //! 1. A delete this service refuses because its target still has dependent resources is
-//!    a refusal of the REQUEST, so it answers the modelled `ValidationException` (HTTP
-//!    400) naming the target — not `ConflictException` (409), which tells an SDK retry
-//!    policy and a client's conflict branch that the same request might later succeed.
+//!    a refusal about the STATE of the resource — every parameter of the request is
+//!    valid — so it answers the modelled `ConflictException` (HTTP 409), naming the
+//!    dependent in `ResourceId` / `ResourceType`, not `ValidationException` (400),
+//!    which tells an SDK retry policy and a client's conflict branch that the request
+//!    is permanently malformed. (The same rule across every call a dependent holds
+//!    back is [`crate::dependent_resource_conflict`].)
 //! 2. A `ResourceArn` that is not an Outposts resource ARN is an ARN-syntax failure: the
 //!    tagging operations answer HTTP 400 with the error code `BadRequestException`, for
 //!    every operation that binds that member and every way a value can fail to be such
@@ -65,7 +68,7 @@ pub(crate) fn reported_tags(body: &Value) -> BTreeMap<String, String> {
 /// `SiteId` accepts, and the site is still there afterwards — a refused delete that
 /// deleted anything would show up on the read-back.
 #[tokio::test]
-async fn deleting_a_site_with_dependents_is_refused_as_a_bad_request() {
+async fn deleting_a_site_with_dependents_is_refused_as_a_conflict() {
     let outposts = Outposts::new();
     let site = outposts
         .create_site(&json!({ "Name": "site with dependents" }))
@@ -91,10 +94,26 @@ async fn deleting_a_site_with_dependents_is_refused_as_a_bad_request() {
                     refused.error_code.as_str(),
                     refused.errortype_header.as_str()
                 ),
-                (400, "ValidationException", "ValidationException"),
-                "case {case}: a site that still has Outposts is refused as a bad request, \
+                (409, "ConflictException", "ConflictException"),
+                "case {case}: a site that still has Outposts is refused as a conflict, \
                  got {:?}",
                 refused.body
+            );
+            // The modelled `ConflictException` carries the resource the conflict is
+            // about: here the Outpost that still belongs to the site, which is what
+            // the caller has to clear before the delete can go through.
+            assert_eq!(
+                text(&refused.body, "ResourceType"),
+                "OUTPOST",
+                "case {case}: the conflict names the type of the blocking resource, \
+                 got {:?}",
+                refused.body
+            );
+            let named = text(&refused.body, "ResourceId");
+            assert!(
+                dependents.contains(&named),
+                "case {case}: ResourceId must name one of the site's Outposts \
+                 {dependents:?}, got {named:?}"
             );
             assert!(
                 text(&refused.body, "Message").contains(&site_id),

@@ -24,8 +24,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent, Monitor, Parameter,
-    Treatment, TreatmentInput, Validator, VendedMetricsSettings,
+    Action, AppliedExtension, DeletionProtectionSettings, DeploymentEvent,
+    ExperimentDefinitionSnapshot, ExperimentRunResult, Monitor, Parameter, Treatment,
+    TreatmentInput, TreatmentOverrides, Validator, VendedMetricsSettings,
 };
 
 pub mod feature_flags;
@@ -88,6 +89,16 @@ pub const EXPERIMENT_DEFINITION_IDLE: &str = "IDLE";
 pub const EXPERIMENT_DEFINITION_ACTIVE: &str = "ACTIVE";
 /// See [`EXPERIMENT_DEFINITION_IDLE`].
 pub const EXPERIMENT_DEFINITION_ARCHIVED: &str = "ARCHIVED";
+
+/// `ExperimentRunStatus` values this service reports for an experiment run, from
+/// `EXPERIMENT_RUN_STATUS_VALUES` in `crate::ops::types` (the model's
+/// `ExperimentRunStatus` enum: `RUNNING` | `DONE`).
+///
+/// A started run delivers treatments to its audience until something stops it, so a run
+/// a start has just written is `RUNNING`; `DONE` is where the end of the run leaves it.
+pub const EXPERIMENT_RUN_RUNNING: &str = "RUNNING";
+/// See [`EXPERIMENT_RUN_RUNNING`].
+pub const EXPERIMENT_RUN_DONE: &str = "DONE";
 
 /// `DeleteType` values a `DeleteExperimentDefinition` request may ask for, from
 /// `DELETE_TYPE_VALUES` in `crate::ops::types` (the model's `DeleteType` enum:
@@ -204,6 +215,14 @@ pub const CONTENT_SIZE_LIMIT_EXCEEDED_MESSAGE: &str = "Content size limit exceed
 /// environment deployed into in a loop cannot grow without limit. The bound is the
 /// emulator's, not an AppConfig quota.
 pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
+
+/// How many experiment-run records one experiment definition keeps.
+///
+/// The same bound as the deployment history above and for the same reason: a definition
+/// started in a loop keeps the most recent runs and drops the oldest records the
+/// experiment has already finished with, never one that is still running. The bound is
+/// the emulator's, not an AppConfig quota.
+pub const MAX_RETAINED_EXPERIMENT_RUNS_PER_DEFINITION: usize = 200;
 
 /// The `LocationUri` that selects AppConfig's own hosted configuration store: "For the
 /// AppConfig hosted configuration store and for feature flags, specify `hosted`", as the
@@ -425,17 +444,21 @@ pub fn first_tag_key_rejection(tags: &HashMap<String, String>) -> Option<String>
 /// can't be marked `Required`"
 /// (`smithy_query(query="doc",shape="Parameter",member="Dynamic")`). Every operation that
 /// writes a `ParameterMap` refuses through this one function, so the create side and the
-/// update side cannot drift apart. The names are sorted, so a request carrying two
-/// unacceptable parameters is refused with the same wording whichever order the map
-/// happened to iterate in.
-pub fn first_parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<String> {
-    let mut names: Vec<&String> = parameters.keys().collect();
-    names.sort();
-    names.into_iter().find_map(|name| {
-        let parameter = parameters.get(name)?;
-        (parameter.dynamic && parameter.required).then(|| {
-            format!("Parameter {name} is Dynamic, so it cannot also be marked Required.")
-        })
+/// update side cannot drift apart. The refusal NAMES the parameters that broke the rule,
+/// sorted, so a request carrying two unacceptable parameters is refused with the same
+/// wording whichever order the map happened to iterate in.
+pub fn parameter_rejection(parameters: &HashMap<String, Parameter>) -> Option<String> {
+    let mut offending: Vec<&str> = parameters
+        .iter()
+        .filter(|(_, parameter)| parameter.dynamic && parameter.required)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    offending.sort_unstable();
+    (!offending.is_empty()).then(|| {
+        format!(
+            "Extension parameters {} can not be both required and dynamic",
+            offending.join(",")
+        )
     })
 }
 
@@ -900,6 +923,111 @@ pub struct ExperimentDefinition {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub tags: HashMap<String, String>,
+    /// The experiment runs started from this definition, by run number. The definition
+    /// OWNS its run history — nothing else in this service holds a run — so a delete of
+    /// the definition takes its runs with it, and a run is only ever reached through the
+    /// definition it belongs to.
+    pub runs: BTreeMap<i32, ExperimentRun>,
+    /// The run number the next start issues. AppConfig numbers a definition's runs from
+    /// 1, and a number is never reissued: dropping an old record (see
+    /// [`MAX_RETAINED_EXPERIMENT_RUNS_PER_DEFINITION`]) does not free its number.
+    pub next_run_number: i32,
+}
+
+impl ExperimentDefinition {
+    /// The run of this definition that is still delivering treatments, if any.
+    ///
+    /// At most one run of a definition is ever active, so a start that finds one here is
+    /// a duplicate of the start that wrote it.
+    pub fn active_run(&self) -> Option<&ExperimentRun> {
+        self.runs.values().find(|run| run.is_active())
+    }
+
+    /// This definition as it stands, for a run to carry: a run reports the definition it
+    /// was started from as it was AT THE START, so a later update of the definition does
+    /// not rewrite what an earlier run ran.
+    pub fn snapshot(&self) -> ExperimentDefinitionSnapshot {
+        ExperimentDefinitionSnapshot {
+            application_id: Some(self.application_id.clone()),
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            hypothesis: self.hypothesis.clone(),
+            configuration_profile_id: Some(self.configuration_profile_id.clone()),
+            environment_id: Some(self.environment_id.clone()),
+            flag_key: Some(self.flag_key.clone()),
+            audience_rule: Some(self.audience_rule.clone()),
+            audience_description: self.audience_description.clone(),
+            launch_criteria: self.launch_criteria.clone(),
+            treatments: Some(self.treatments.clone()),
+            control: Some(self.control.clone()),
+        }
+    }
+
+    /// Store a new run and answer the stored record, or `None` when the number is already
+    /// held — the caller then refuses rather than reporting another run's record.
+    ///
+    /// Only [`MAX_RETAINED_EXPERIMENT_RUNS_PER_DEFINITION`] records are kept: the oldest
+    /// beyond that bound are dropped first, and only ones the experiment has already
+    /// finished with — a run that is still running is the one a caller is watching, so it
+    /// is never evicted.
+    pub fn record_run(&mut self, run: ExperimentRun) -> Option<&ExperimentRun> {
+        let number = run.run;
+        while self.runs.len() >= MAX_RETAINED_EXPERIMENT_RUNS_PER_DEFINITION {
+            let Some(oldest_finished) = self
+                .runs
+                .values()
+                .filter(|held| !held.is_active())
+                .map(|held| held.run)
+                .min()
+            else {
+                break;
+            };
+            self.runs.remove(&oldest_finished);
+        }
+        match self.runs.entry(number) {
+            std::collections::btree_map::Entry::Vacant(slot) => Some(slot.insert(run)),
+            std::collections::btree_map::Entry::Occupied(_) => None,
+        }
+    }
+}
+
+/// One experiment run: a delivery of a definition's treatments to its audience, numbered
+/// within the definition that owns it.
+///
+/// `started_at` is the instant the run was started and `updated_at` the instant the
+/// record was last written; `ended_at` is set only once the run is over, which is also
+/// what moves `status` to [`EXPERIMENT_RUN_DONE`]. A run that is RUNNING stays running
+/// until a call ends it — nothing about it is owed by the clock, so there is nothing to
+/// materialize. `definition_snapshot` is the definition as it stood when the run started.
+#[derive(Debug, Clone)]
+pub struct ExperimentRun {
+    /// The run number, unique within the definition and counted from 1.
+    pub run: i32,
+    pub application_id: String,
+    pub experiment_definition_id: String,
+    pub description: Option<String>,
+    /// [`EXPERIMENT_RUN_RUNNING`] or [`EXPERIMENT_RUN_DONE`].
+    pub status: String,
+    /// The share of the audience this run exposes to treatments, exactly as the request
+    /// that started the run wrote it: the model gives the member no default, so a start
+    /// that named none leaves none to report.
+    pub exposure_percentage: Option<f32>,
+    pub treatment_overrides: Option<TreatmentOverrides>,
+    /// The experiment's conclusions, which only the end of the run supplies.
+    pub result: Option<ExperimentRunResult>,
+    pub started_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub ended_at: Option<SystemTime>,
+    pub definition_snapshot: ExperimentDefinitionSnapshot,
+    pub tags: HashMap<String, String>,
+}
+
+impl ExperimentRun {
+    /// Whether this run is still delivering treatments. A second start on the same
+    /// definition conflicts with it.
+    pub fn is_active(&self) -> bool {
+        self.status == EXPERIMENT_RUN_RUNNING
+    }
 }
 
 /// A deployment group within an application, and the deployments made into it.
@@ -1908,6 +2036,42 @@ pub fn experiment_definition_not_found(
     )
 }
 
+/// `Message` for a run number the named experiment definition never issued, or no longer
+/// holds a record for.
+///
+/// Labelled like [`experiment_definition_not_found`]: the two identifiers are echoed as
+/// the caller wrote them, and the run number as the request carried it.
+pub fn experiment_run_not_found(
+    application_identifier: &str,
+    experiment_definition_identifier: &str,
+    run: i32,
+) -> String {
+    not_found_message(
+        "Experiment Run",
+        &[
+            ("Application Identifier", application_identifier),
+            (
+                "Experiment Definition Identifier",
+                experiment_definition_identifier,
+            ),
+            ("Run", &run.to_string()),
+        ],
+        AccountClause::Reported,
+        NOT_FOUND_FULL_STOP,
+    )
+}
+
+/// `Message` for a start refused because the definition already has a run in flight.
+///
+/// Derived from the state that refused it — the definition the start addressed and the
+/// run of it that is still running — so the caller can address the run it lost to.
+pub fn experiment_run_already_active(experiment_definition_id: &str, active_run: i32) -> String {
+    format!(
+        "Experiment definition {experiment_definition_id} already has an active experiment \
+         run: run {active_run} is {EXPERIMENT_RUN_RUNNING}."
+    )
+}
+
 /// `Message` for a hosted configuration version the named profile does not hold.
 pub fn hosted_configuration_version_not_found(
     application_id: &str,
@@ -2410,6 +2574,25 @@ impl ComAmazonawsAppconfigAmazonappconfigState {
         }
         extension.versions.insert(version.version_number, version);
         true
+    }
+
+    /// The stored version `version_number` of the extension `extension_id` names, for a
+    /// caller that EDITS that version in place rather than appending another one.
+    ///
+    /// `UpdateExtension` is the caller this exists for: it updates the extension version
+    /// a request names, so the version number, the ARN that names it and the tags it
+    /// carries all stay as they are and only the definition members the request carried
+    /// change. Answers `None` when no extension answers to `extension_id` or it holds no
+    /// such version.
+    pub fn extension_version_mut(
+        &mut self,
+        extension_id: &str,
+        version_number: i32,
+    ) -> Option<&mut ExtensionVersion> {
+        self.extensions
+            .get_mut(extension_id)?
+            .versions
+            .get_mut(&version_number)
     }
 
     /// Forget an extension this account created, with every version it holds.

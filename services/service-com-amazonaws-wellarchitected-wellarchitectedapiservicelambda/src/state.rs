@@ -34,7 +34,8 @@
 //! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
 //! exactly like the goals, keyed under the profile they belong to. The recommendation
 //! generations of a profile (`StartAgentRecommendationGeneration`,
-//! `GetAgentRecommendationGeneration`) are held the same way; a generation is a JOB, so
+//! `GetAgentRecommendationGeneration`, `ListAgentRecommendationGenerations`) are held the
+//! same way; a generation is a JOB, so
 //! its status, progress and transition timestamps are DERIVED from the instants the
 //! clock owes its transitions at ([`AgentGenerationRecord`]) rather than stored, and no
 //! read has to write. The recommendations a COMPLETED generation produced
@@ -83,17 +84,12 @@ pub use official_lenses::{
 };
 
 use crate::ops::types::{
-    AgentProfileSummary, AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer,
-    ConflictException,
-    ContextContent,
-    ContextSummary,
-    GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary, Milestone,
-    MilestoneSummary, PillarReviewSummary,
-    Profile, ProfileQuestion, ProfileSummary, Progress,
-    ResourceNotFoundException,
-    ReviewTemplate, ReviewTemplateAnswer, ReviewTemplateLensReview,
-    ReviewTemplatePillarReviewSummary,
-    ReviewTemplateSummary, Scope,
+    AgentProfileSummary, AgentRecommendationGenerationSummary, AgentRecommendationSummary,
+    AggregationConfiguration, Choice, ChoiceAnswer, ConflictException, ContextContent,
+    ContextSummary, GoalSummary, JiraSelectedQuestionConfiguration, LensReview, LensSummary,
+    Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion, ProfileSummary,
+    Progress, ResourceNotFoundException, ReviewTemplate, ReviewTemplateAnswer,
+    ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary, ReviewTemplateSummary, Scope,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
@@ -4055,6 +4051,17 @@ pub fn unpublished_pillar_exception(
 /// it.
 pub const CONTEXT_TYPE_MEMBER: &str = "contextType";
 
+/// The modelled input member a finding about the agent profile a request names names
+/// (`…Request$profileArn`), as `ValidationExceptionField$Name` reports it.
+pub const PROFILE_ARN_MEMBER: &str = "profileArn";
+
+/// The modelled input member a finding about one recommendation type names
+/// (`ListAgentRecommendationGenerationsRequest$recommendationType`, the optional filter,
+/// which travels as the `RecommendationType` query parameter). Named apart from the
+/// `types` LIST member a start request carries, because a field finding must name the
+/// member the request actually carried.
+pub const RECOMMENDATION_TYPE_MEMBER: &str = "recommendationType";
+
 /// The member an application-type finding of a context's content names
 /// (`ContextContent$applicationType`, reached through `…Request$content`), as the path
 /// `ValidationExceptionField$Name` reports for a member inside a structure.
@@ -4386,11 +4393,10 @@ pub struct AgentGenerationRecord {
     pub name: Option<String>,
     /// `StartAgentRecommendationGenerationRequest$types` — the kinds of recommendation
     /// this generation was started for. Stored because it is what a listing's
-    /// `recommendationType` filter selects on and what the recommendations a generation
-    /// produces are of; neither response shape projects it
-    /// (`smithy_query(query="operation", operation="StartAgentRecommendationGeneration")`),
-    /// and `ListAgentRecommendationGenerations` — the operation that filters on it — is
-    /// still a stub with its own issue.
+    /// `recommendationType` filter selects on ([`Self::covers_type`], which
+    /// `ListAgentRecommendationGenerations` pages with) and what the recommendations a
+    /// generation produces are of; no response shape projects it
+    /// (`smithy_query(query="operation", operation="StartAgentRecommendationGeneration")`).
     pub types: Vec<String>,
     pub scope: Scope,
     pub additional_context: Option<::aws_smithy_types::Document>,
@@ -4485,6 +4491,44 @@ impl AgentGenerationRecord {
             } else {
                 f64::from(completed) * 100.0 / f64::from(total)
             },
+        }
+    }
+
+    /// Whether this generation was started for recommendations of `recommendation_type` —
+    /// what `ListAgentRecommendationGenerations`'s optional `recommendationType` filter
+    /// selects on.
+    ///
+    /// Asked of the stored list rather than of one value, so the filter keeps working
+    /// whatever the modelled `RecommendationTypes` `@length(min: 1, max: 1)` grows to.
+    pub fn covers_type(&self, recommendation_type: &str) -> bool {
+        self.types.iter().any(|kind| kind == recommendation_type)
+    }
+
+    /// The `AgentRecommendationGenerationSummary` projection a listing reports this
+    /// generation as, so `ListAgentRecommendationGenerations` and
+    /// `GetAgentRecommendationGeneration` cannot disagree about a generation: every
+    /// member comes from the same record and the same clock-derived transitions
+    /// ([`Self::status`], [`Self::last_modified`]).
+    ///
+    /// `estimatedCompletionTime` — "the estimated time for the generation to complete" —
+    /// is the instant the clock owes the analysis its end, which is also the `endedAt`
+    /// the generation reports once that instant has passed, so the estimate never
+    /// contradicts the outcome.
+    pub fn to_summary(&self, now: SystemTime) -> AgentRecommendationGenerationSummary {
+        let last_modified = self.last_modified(now);
+        AgentRecommendationGenerationSummary {
+            id: self.id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            name: self.name.clone(),
+            status: self.status(now).to_string(),
+            estimated_completion_time: Some(::aws_smithy_types::DateTime::from(self.ends_at)),
+            created_by: self.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_by: last_modified
+                .as_ref()
+                .map(|(identity, _)| identity.clone()),
+            last_modified_at: last_modified
+                .map(|(_, at)| ::aws_smithy_types::DateTime::from(at)),
         }
     }
 }
@@ -6263,6 +6307,20 @@ pub fn encode_agent_context_next_token(context_id: &str) -> String {
 /// the token is not one this service issued.
 pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("x")?.as_str()?.to_string())
+}
+
+/// Encode a `ListAgentRecommendationGenerations` cursor: the generation `UUID` last
+/// served, in the same opaque scheme as [`encode_next_token`]. Generations are
+/// enumerated in id order, so that id is the whole cursor. Its own key, so a cursor
+/// issued by another paginated operation is not a cursor here.
+pub fn encode_agent_generation_next_token(generation_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "j": generation_id }))
+}
+
+/// The generation `UUID` a `ListAgentRecommendationGenerations` `NextToken` points just
+/// past, or `None` when the token is not one this service issued.
+pub fn decode_agent_generation_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("j")?.as_str()?.to_string())
 }
 
 /// Encode a `ListAgentGoals` cursor: the goal `UUID` last served, in the same opaque

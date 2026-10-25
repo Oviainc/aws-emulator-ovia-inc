@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_key_listing.rs"]
 mod api_key_listing;
+#[path = "all/api_key_minting.rs"]
+mod api_key_minting;
 #[path = "all/check_capacity.rs"]
 mod check_capacity;
 #[path = "all/exception_messages.rs"]
@@ -21,6 +23,8 @@ mod exception_messages;
 mod firewall_manager_rule_groups;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
+#[path = "all/list_resources_for_web_acl.rs"]
+mod list_resources_for_web_acl;
 #[path = "all/list_rule_groups.rs"]
 mod list_rule_groups;
 #[path = "all/managed_products.rs"]

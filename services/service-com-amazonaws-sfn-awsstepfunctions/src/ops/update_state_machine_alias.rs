@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStateMachineAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStateMachineAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStateMachineAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: modifies the description or the routing configuration of an existing
+//! state machine alias in place, idempotently, and answers the instant the record
+//! reports as its `updateDate`; this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStateMachineAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStateMachineAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStateMachineAlias"))
+        // `stateMachineAliasArn` (len 1..256), `description` (0..256) and the routing
+        // configuration's length (1..2) and weights (0..100) are modelled, so the
+        // centralized walk has already refused anything outside them. What the model
+        // does NOT enforce is checked here: "you must specify at least one of the
+        // description or routingConfiguration parameters", and every rule about what a
+        // routing configuration may point at.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE the store is consulted, exactly as the describe
+        // judges it: text that is not an alias ARN of this service in the endpoint's
+        // region is a defect in the REQUEST, which `InvalidArn` reports, and not an
+        // alias that is absent.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_state_machine_alias_arn(
+            &input.state_machine_alias_arn,
+            &endpoint_region,
+        ) {
+            return Err(
+                UpdateStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        // "You must specify at least one of the description or routingConfiguration
+        // parameters to update a state machine alias": a request that names neither
+        // asks for no change at all, which this operation's own rule refuses.
+        if input.description.is_none() && input.routing_configuration.is_none() {
+            return Err(
+                UpdateStateMachineAliasErrorModeled::ValidationException(ValidationException {
+                    message: Some(
+                        "At least one of the description or routingConfiguration parameters \
+                         must be specified"
+                            .to_string(),
+                    ),
+                    reason: None,
+                })
+                .into(),
+            );
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // Materialise what the clock already owes before anything is read: an alias of
+        // a state machine whose deletion has already happened is gone.
+        store.settle(now);
+
+        let Some(alias) = store
+            .state_machine_aliases
+            .get(&input.state_machine_alias_arn)
+        else {
+            return Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.state_machine_alias_arn,
+                    )),
+                    resource_name: Some(input.state_machine_alias_arn.clone()),
+                },
+            )
+            .into());
+        };
+        let state_machine_arn = alias.state_machine_arn.clone();
+
+        // An alias belongs to ONE state machine, and a state machine whose deletion has
+        // been started takes its aliases with it, so neither the versions this update
+        // points at nor the record it writes may be of one that is being deleted.
+        if store
+            .state_machines
+            .get(&state_machine_arn)
+            .is_none_or(crate::state::StateMachine::is_deleting)
+        {
+            return Err(UpdateStateMachineAliasErrorModeled::StateMachineDeleting(
+                StateMachineDeleting {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DELETING,
+                        &state_machine_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The routing configuration is judged by the ONE rule every operation that
+        // takes one judges it by, and then by the rule that is this operation's own: an
+        // alias points at versions of the state machine it belongs to, so an update may
+        // not repoint it at another state machine's versions.
+        if let Some(routing_configuration) = &input.routing_configuration {
+            let pointed_at =
+                match store.read_routing_configuration(routing_configuration, &endpoint_region) {
+                    Ok(arn) => arn,
+                    Err(crate::state::RoutingRejection::InvalidArn(message)) => {
+                        return Err(UpdateStateMachineAliasErrorModeled::InvalidArn(InvalidArn {
+                            message: Some(message),
+                        })
+                        .into())
+                    }
+                    Err(crate::state::RoutingRejection::InvalidRouting(message)) => {
+                        return Err(invalid_routing(message))
+                    }
+                    Err(crate::state::RoutingRejection::VersionNotFound(version_arn)) => {
+                        return Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
+                            ResourceNotFound {
+                                message: Some(
+                                    crate::state::ROUTING_CONFIGURATION_VERSION_NOT_FOUND
+                                        .to_string(),
+                                ),
+                                resource_name: Some(version_arn),
+                            },
+                        )
+                        .into())
+                    }
+                    Err(crate::state::RoutingRejection::Deleting(machine_arn)) => {
+                        return Err(
+                            UpdateStateMachineAliasErrorModeled::StateMachineDeleting(
+                                StateMachineDeleting {
+                                    message: Some(crate::state::resource_error_message(
+                                        crate::state::STATE_MACHINE_DELETING,
+                                        &machine_arn,
+                                    )),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                };
+            if pointed_at != state_machine_arn {
+                return Err(invalid_routing(format!(
+                    "the routing configuration names versions of state machine {pointed_at}, \
+                     and alias {} points at versions of {state_machine_arn}",
+                    input.state_machine_alias_arn
+                )));
+            }
+        }
+
+        match store.update_state_machine_alias(
+            &input.state_machine_alias_arn,
+            input.description,
+            input.routing_configuration,
+            now,
+        ) {
+            Ok(update_date) => Ok(UpdateStateMachineAliasOutput {
+                update_date: crate::state::to_date_time(update_date),
+            }),
+            // The alias was read under this same lock, so the store still holds it;
+            // this answers what a request naming an absent alias answers either way.
+            Err(crate::state::AliasUpdateRejection::NotFound) => {
+                Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
+                    ResourceNotFound {
+                        message: Some(crate::state::resource_not_found_message(
+                            &input.state_machine_alias_arn,
+                        )),
+                        resource_name: Some(input.state_machine_alias_arn.clone()),
+                    },
+                )
+                .into())
+            }
+            // This operation models no quota error, so an update the store has no room
+            // for is refused through the crate's one non-modelled channel rather than
+            // retained past the ceiling.
+            Err(crate::state::AliasUpdateRejection::NoRoom) => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "updating state machine alias {} would take the store past the {} bytes \
+                     this emulator retains",
+                    input.state_machine_alias_arn,
+                    crate::state::MAX_STORE_BYTES
+                )))
+            }
+        }
     }
+}
+
+/// A routing configuration that cannot be applied: the modelled `ValidationException`
+/// with the reason member that names this class of rejection, stated the same way
+/// `CreateStateMachineAlias` states it.
+fn invalid_routing(message: String) -> UpdateStateMachineAliasError {
+    UpdateStateMachineAliasErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(crate::state::VALIDATION_REASON_INVALID_ROUTING_CONFIGURATION.to_string()),
+    })
+    .into()
 }

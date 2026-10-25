@@ -311,6 +311,71 @@ pub(crate) async fn seeded_instance_arn(router: &MultiServiceRouter) -> String {
         .to_string()
 }
 
+/// Grant ONE direct application assignment, the way a client does.
+///
+/// Shared by every suite of the application-assignment slice, so they all send the same
+/// request for the (application, principal type, principal id) tuple that identifies an
+/// assignment.
+pub(crate) async fn create_application_assignment(
+    router: &MultiServiceRouter,
+    application_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "CreateApplicationAssignment",
+        &json!({
+            "ApplicationArn": application_arn,
+            "PrincipalType": principal_type,
+            "PrincipalId": principal_id,
+        }),
+    )
+    .await
+}
+
+/// Describe one direct application assignment, signed for `region`.
+///
+/// An `ApplicationArn` carries no Region segment, so the Region is a property of the CALL
+/// rather than of the assignment: a suite that asserts the report is the same from
+/// anywhere names the Region here.
+pub(crate) async fn describe_application_assignment_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    application_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+) -> (u16, Value) {
+    call_in_region(
+        router,
+        region,
+        "DescribeApplicationAssignment",
+        &json!({
+            "ApplicationArn": application_arn,
+            "PrincipalType": principal_type,
+            "PrincipalId": principal_id,
+        }),
+    )
+    .await
+}
+
+/// The same describe, signed for [`TEST_REGION`] like every other call of this harness.
+pub(crate) async fn describe_application_assignment(
+    router: &MultiServiceRouter,
+    application_arn: &str,
+    principal_type: &str,
+    principal_id: &str,
+) -> (u16, Value) {
+    describe_application_assignment_in_region(
+        router,
+        TEST_REGION,
+        application_arn,
+        principal_type,
+        principal_id,
+    )
+    .await
+}
+
 /// Whether `arn` has the shape the model's `InstanceArn` pattern requires:
 /// `arn:aws:sso:::instance/` then `ins-` or `ssoins-` then 16 of `[a-zA-Z0-9-.]`.
 pub(crate) fn is_instance_arn(arn: &str) -> bool {

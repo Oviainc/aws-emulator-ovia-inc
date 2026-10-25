@@ -51,7 +51,9 @@ async fn get_before_any_update_returns_the_documented_defaults() {
 /// re-applying the same request changes neither (`@idempotent`).
 ///
 /// Rows differ along colour value, list size (0, 1, 3, 10), element form and
-/// ordering, which is what the rule generalises over.
+/// ordering, which is what the rule generalises over. Every service identifier is
+/// an entry of the catalog `ListServices` enumerates, which is what the setting
+/// admits (`visible_service_catalog_membership`).
 #[tokio::test]
 async fn update_persists_and_get_reads_back_every_shape_of_setting() {
     struct Case {
@@ -77,7 +79,7 @@ async fn update_persists_and_get_reads_back_every_shape_of_setting() {
         Case {
             name: "hyphenated identifiers, several Region forms",
             color: "darkBlue",
-            services: vec!["cognito-idp", "access-analyzer", "xray"],
+            services: vec!["pca-connector-ad", "network-firewall", "xray"],
             regions: vec!["eu-west-3", "ap-southeast-2", "us-gov-west-1"],
         },
         Case {

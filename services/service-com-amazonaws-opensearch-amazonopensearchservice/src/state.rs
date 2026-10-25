@@ -28,7 +28,8 @@ use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
-    AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
+    AdvancedSecurityOptionsStatus, AuthorizedPrincipal,
+    AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
@@ -511,6 +512,45 @@ impl DataSource {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// VPC endpoint access
+//
+// An authorization is a principal's access to ONE domain through an interface
+// VPC endpoint: `AuthorizeVpcEndpointAccess` grants it, `ListVpcEndpointAccess`
+// reports every principal that holds one and `RevokeVpcEndpointAccess` takes it
+// away. The set lives on the domain itself ([`Domain::vpc_endpoint_access`]).
+// ---------------------------------------------------------------------------
+
+/// `PrincipalType`'s `AWS_ACCOUNT` value: the authorized principal is an Amazon Web
+/// Services account, named by its account id.
+pub const PRINCIPAL_TYPE_AWS_ACCOUNT: &str = "AWS_ACCOUNT";
+
+/// `PrincipalType`'s `AWS_SERVICE` value — the other member of that same two-value
+/// enum: the authorized principal is a service, named by its service principal.
+pub const PRINCIPAL_TYPE_AWS_SERVICE: &str = "AWS_SERVICE";
+
+/// How many principals ONE domain's VPC endpoint access set holds before
+/// `AuthorizeVpcEndpointAccess` refuses with the modelled `LimitExceededException`.
+///
+/// Like [`DATA_SOURCE_QUOTA`] this is the emulator's OWN bound on the store — it
+/// models neither Service Quotas nor an account's adjustments — and it is what stops
+/// a caller looping with fresh principals from growing the state without end: every
+/// record it counts is released when `DeleteDomain` releases the domain that holds it
+/// (`RevokeVpcEndpointAccess`, which releases one on its own, is still a stub).
+/// Because the per-domain set IS what `ListVpcEndpointAccess` answers with, and that
+/// set is held on the domain, with [`DOMAIN_QUOTA`] it also bounds the whole
+/// authorization store.
+pub const VPC_ENDPOINT_ACCESS_QUOTA: usize = 50;
+
+/// How many authorized principals ONE page of `ListVpcEndpointAccess` carries.
+///
+/// That operation takes a `NextToken` and its response declares one as REQUIRED, so
+/// the listing is paged; the model gives it no page-size member, so the page size is
+/// the service's to pick and this is the emulator's choice of it. It is smaller than
+/// [`VPC_ENDPOINT_ACCESS_QUOTA`], so a domain's set can span more than one page and a
+/// caller that ignores the token cannot mistake a first page for the whole set.
+pub const VPC_ENDPOINT_ACCESS_PAGE: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Indexes
@@ -1243,6 +1283,22 @@ pub struct Domain {
     /// domain, so the name IS the key. Iterating a `BTreeMap` is order-stable, which
     /// is what lets `ListDataSources` report the same order twice.
     pub data_sources: BTreeMap<String, DataSource>,
+    /// Every principal allowed to reach this domain through an interface VPC
+    /// endpoint, keyed by the principal itself — an account id or a service
+    /// principal, which is what identifies it, so one principal holds at most one
+    /// authorization however many times it is authorized. Bounded by
+    /// [`VPC_ENDPOINT_ACCESS_QUOTA`].
+    ///
+    /// `AuthorizeVpcEndpointAccess` mints an entry, `ListVpcEndpointAccess` reports
+    /// the set and `RevokeVpcEndpointAccess` removes one — all from THIS map, so the
+    /// grant's own answer and a later listing cannot disagree. Held on the domain
+    /// rather than beside it, because an authorization is access TO a domain: the
+    /// record goes when `DeleteDomain` releases the domain it belongs to.
+    ///
+    /// Iterating a `BTreeMap` is order-stable, which is what lets a paged listing
+    /// resume where the previous page stopped without repeating or skipping a
+    /// principal.
+    pub vpc_endpoint_access: BTreeMap<String, AuthorizedPrincipal>,
     /// This domain's OpenSearch indexes, keyed by their `IndexName` — unique per
     /// domain, so the name IS the key. `CreateIndex` mints one and `GetIndex`
     /// reports it, from THIS one record, and deleting the domain releases every

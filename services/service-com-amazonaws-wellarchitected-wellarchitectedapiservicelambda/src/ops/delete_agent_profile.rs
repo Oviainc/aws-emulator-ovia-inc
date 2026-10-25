@@ -187,9 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "This action cannot be undone": the profile and its configuration go, together
-        // with the goals and contexts recorded against it and every create token that
-        // resolved to any of them, so the ARN resolves to nothing afterwards and a create
-        // replaying that token acts afresh.
+        // with the goals, contexts and recommendation generations recorded against it and
+        // every create token that resolved to any of them, so the ARN resolves to nothing
+        // afterwards and a create replaying that token acts afresh.
         // The lookup above already proved the profile is there, so the removed record is
         // deliberately discarded: this operation answers with nothing.
         let _ = store.remove_agent_profile(&input.profile_arn);

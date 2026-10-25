@@ -1,30 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for WHAT a group's NAME addresses when it travels as an
-//! `{identifier}`.
+//! `{identifier}`: nothing.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: a group's name addresses the group RECORD that currently carries
-//! that name in the Region the request was signed for, matched character for character —
-//! so the stored name resolves the same record its ARN does, any other label (a different
-//! case, a longer or shorter label, a name no group carries any more) resolves nothing,
-//! a name reused by a later create resolves the NEW record, and addressing a reporting
-//! operation by name changes nothing a later caller sees.
+//! The rule under test: a group is addressed by its ARN alone, so a bare label — the
+//! label a stored group carries as its name included — is a well-formed identifier that
+//! resolves no group and is answered with the modelled `ResourceNotFoundException`
+//! (404). The modelled pattern
+//! (`smithy_query(query="shape",shape="InvestigationGroupIdentifier")`) admits the bare
+//! label beside the ARN (`^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`),
+//! which is a well-formedness rule and not an address.
 //!
-//! The member's documentation is
-//! `smithy_query(query="doc",shape="com.amazonaws.aiops#GetInvestigationGroupRequest",member="identifier")`:
-//! "Specify either the name or the ARN of the investigation group that you want to
-//! view." — the same sentence on `Update`, `Delete` and the three policy operations;
-//! `smithy_query(query="shape",shape="InvestigationGroupIdentifier")` spells the
-//! alternation out as
-//! `^(?:[\-_A-Za-z0-9]{1,512}|arn:...:investigation-group\/[A-Za-z0-9]{16})$`.
-//!
-//! The equivalence of the two forms across all six identifier operations is tabulated in
-//! `investigation_group_identifier_forms.rs`; this suite pins the IDENTITY the name
-//! stands for: exactness, currency, and purity of the read.
+//! The rule is tabulated across the six identifier operations in
+//! `investigation_group_identifier_forms.rs`; this suite pins the IDENTITY side of it:
+//! no label addresses the record however it is derived from the name, the ARN addresses
+//! the record that carries it NOW, and a refused label lookup changes nothing a later
+//! caller sees.
 
 use std::sync::Arc;
 
@@ -170,47 +165,66 @@ async fn get_group(router: &MultiServiceRouter, region: &str, identifier: &str) 
         router,
         region,
         "GET",
-        &format!("/investigationGroups/{identifier}"),
+        &format!("/investigationGroups/{}", urlencode(identifier)),
         None,
     )
     .await
 }
 
+/// Percent-encode everything a URI component may not carry literally — what an SDK does
+/// for a non-greedy `@httpLabel` path segment (a bare label carries no reserved
+/// character, so this only matters for the ARN form).
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 /// The names the rows span, each inside the bare-label alternative of
 /// `InvestigationGroupIdentifier` (`[\-_A-Za-z0-9]{1,512}`) so it can travel as the
-/// `{identifier}` path segment: the recorded hyphenated label, a mixed-case label, an
+/// `{identifier}` path segment: a hyphenated label, a mixed-case label, an
 /// underscore-and-digit label, and the shortest label the class admits.
 const NAMES: &[&str] = &["my-group", "MyGroup", "group_42_prod", "a"];
 
-/// A label the stored name is NOT: how a failure names the row, and how to derive it
-/// from the group's own name. Each derived label still satisfies the bare-label class,
-/// so it reaches the handler as a well-formed identifier and the answer is the
-/// resolver's, not the constraint walk's.
-struct NearMiss {
+/// A label derived from the group's own name: how a failure names the row, and how to
+/// derive it. Each derived label still satisfies the bare-label class, so it reaches the
+/// handler as a well-formed identifier and the answer is the resolver's, not the
+/// constraint walk's.
+struct Label {
     case: &'static str,
     derive: fn(&str) -> String,
 }
 
-/// The near misses every row is probed with: a name differs from another name in any
-/// character, case included.
-const NEAR_MISSES: &[NearMiss] = &[
-    NearMiss {
+/// The labels every row is probed with: the stored name itself and the neighbours of it
+/// a caller might try instead. None of them is an ARN, so none addresses the group.
+const LABELS: &[Label] = &[
+    Label {
+        case: "the stored name itself",
+        derive: |name| name.to_string(),
+    },
+    Label {
         case: "the name upper-cased",
         derive: |name| name.to_uppercase(),
     },
-    NearMiss {
+    Label {
         case: "the name lower-cased",
         derive: |name| name.to_lowercase(),
     },
-    NearMiss {
+    Label {
         case: "the name with one more character",
         derive: |name| format!("{name}X"),
     },
-    NearMiss {
+    Label {
         case: "the name with one more leading character",
         derive: |name| format!("X{name}"),
     },
-    NearMiss {
+    Label {
         case: "the name with its last character dropped",
         derive: |name| {
             let mut shorter = name.to_string();
@@ -224,36 +238,31 @@ const NEAR_MISSES: &[NearMiss] = &[
             }
         },
     },
-    NearMiss {
+    Label {
         case: "the name with its separators removed",
         derive: |name| name.replace(['-', '_'], ""),
     },
 ];
 
-/// A name addresses a group by exact match: the stored name reports the group, and a
-/// label differing from it in any character — case included — reports no group.
+/// No bare label addresses a group, however it relates to the group's own name: the
+/// stored name and every neighbour of it report the modelled 404, while the group's ARN
+/// reports the group throughout.
 #[tokio::test]
-async fn a_name_addresses_a_group_only_on_an_exact_match() {
+async fn a_name_addresses_no_group_however_it_is_formed() {
     for (index, name) in NAMES.iter().enumerate() {
         let router = emulator();
         let region = region(index);
         let arn = create_ok(&router, &region, name).await;
 
-        let (status, body) = get_group(&router, &region, name).await;
+        let (status, body) = get_group(&router, &region, &arn).await;
         assert_eq!(
             (status, body.get("arn").and_then(Value::as_str)),
             (200, Some(arn.as_str())),
-            "case {name:?}: the stored name must address the group, got {status} / {body:?}"
+            "case {name:?}: the ARN must address the group, got {status} / {body:?}"
         );
 
-        for NearMiss { case, derive } in NEAR_MISSES {
+        for Label { case, derive } in LABELS {
             let probe = derive(name);
-            if probe == *name {
-                // This row's name is unchanged by this transformation (a lower-case
-                // name has no upper-case neighbour to miss on), so it is not a near
-                // miss here.
-                continue;
-            }
             let case = format!("{name:?} probed by {case} ({probe:?})");
             let (status, answer) = get_group(&router, &region, &probe).await;
             assert_eq!(
@@ -264,21 +273,21 @@ async fn a_name_addresses_a_group_only_on_an_exact_match() {
         }
 
         // The probes above left the group exactly where it was.
-        let (status, body) = get_group(&router, &region, name).await;
+        let (status, after) = get_group(&router, &region, &arn).await;
         assert_eq!(
-            (status, body.get("arn").and_then(Value::as_str)),
-            (200, Some(arn.as_str())),
-            "case {name:?}: the refused probes must leave the group addressable by name, \
-             got {status} / {body:?}"
+            (status, &after),
+            (200, &body),
+            "case {name:?}: the refused probes must leave the group as it was, \
+             got {status} / {after:?}"
         );
     }
 }
 
-/// A name addresses the record that carries it NOW: once the group is deleted the name
-/// addresses nothing, and a group created afterwards with the same name is addressed by
-/// it — as the NEW record, never the old ARN.
+/// A group's ARN addresses the record that carries it NOW: once the group is deleted the
+/// ARN addresses nothing, and a group created afterwards with the same name is a new
+/// record with a new ARN — which the old ARN, and the name, do not address.
 #[tokio::test]
-async fn a_name_addresses_the_record_that_carries_it_now() {
+async fn an_arn_addresses_the_record_that_carries_it_now() {
     for (index, name) in NAMES.iter().enumerate() {
         let router = emulator();
         let region = region(index);
@@ -288,20 +297,21 @@ async fn a_name_addresses_the_record_that_carries_it_now() {
             &router,
             &region,
             "DELETE",
-            &format!("/investigationGroups/{name}"),
+            &format!("/investigationGroups/{}", urlencode(&first)),
             None,
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {name:?}: a delete addressed by name must succeed, got {status} / {deleted:?}"
+            "case {name:?}: a delete addressed by the ARN must succeed, \
+             got {status} / {deleted:?}"
         );
 
-        let (status, absent) = get_group(&router, &region, name).await;
+        let (status, absent) = get_group(&router, &region, &first).await;
         assert_eq!(
             (status, error_code(&absent).as_str()),
             (404, RESOURCE_NOT_FOUND),
-            "case {name:?}: the name of a deleted group addresses nothing, \
+            "case {name:?}: the deleted group's ARN addresses nothing, \
              got {status} / {absent:?}"
         );
 
@@ -311,74 +321,66 @@ async fn a_name_addresses_the_record_that_carries_it_now() {
             "case {name:?}: the group created after the delete is a new resource, \
              got the old ARN {second}"
         );
-        let (status, body) = get_group(&router, &region, name).await;
+        let (status, body) = get_group(&router, &region, &second).await;
         assert_eq!(
-            (status, body.get("arn").and_then(Value::as_str)),
-            (200, Some(second.as_str())),
-            "case {name:?}: the reused name must address the new record, got {status} / {body:?}"
+            (status, body.get("name").and_then(Value::as_str)),
+            (200, Some(*name)),
+            "case {name:?}: the new ARN must address the new record, got {status} / {body:?}"
         );
-        let (status, old) = get_group(&router, &region, &urlencode(&first)).await;
+        let (status, old) = get_group(&router, &region, &first).await;
         assert_eq!(
             (status, error_code(&old).as_str()),
             (404, RESOURCE_NOT_FOUND),
-            "case {name:?}: the deleted group's ARN addresses nothing, got {status} / {old:?}"
+            "case {name:?}: the old ARN still addresses nothing, got {status} / {old:?}"
+        );
+        let (status, by_name) = get_group(&router, &region, name).await;
+        assert_eq!(
+            (status, error_code(&by_name).as_str()),
+            (404, RESOURCE_NOT_FOUND),
+            "case {name:?}: the reused name addresses nothing either, \
+             got {status} / {by_name:?}"
         );
     }
 }
 
-/// Percent-encode everything a URI component may not carry literally — what an SDK does
-/// for a non-greedy `@httpLabel` path segment, needed only for the ARN form (a bare label
-/// carries no reserved character).
-fn urlencode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-/// Reading a group by name is a pure read: repeated reads report the identical body, the
-/// stored modification stamp does not move, and the Region still holds exactly the one
-/// group it held before — whichever form addressed the read.
+/// A refused label lookup changes nothing a later caller sees: the group still reads
+/// back byte for byte through its ARN, the Region still holds exactly the one group it
+/// held, and the Region's single group slot is still taken — so nothing was minted,
+/// moved or reclaimed by the refusals.
 #[tokio::test]
-async fn reading_a_group_by_name_changes_nothing_a_later_caller_sees() {
+async fn a_refused_name_lookup_changes_nothing_a_later_caller_sees() {
     for (index, name) in NAMES.iter().enumerate() {
         let router = emulator();
         let region = region(index);
         let arn = create_ok(&router, &region, name).await;
-        let encoded_arn = urlencode(&arn);
 
-        let (status, first) = get_group(&router, &region, name).await;
+        let (status, first) = get_group(&router, &region, &arn).await;
         assert_eq!(
             status, 200,
-            "case {name:?}: the name must read the group, got {status} / {first:?}"
+            "case {name:?}: the ARN must read the group, got {status} / {first:?}"
         );
 
-        // Four reads alternating between the two forms: every one reports the same
-        // record, byte for byte.
+        // Four refused reads through the name, each interleaved with a read through the
+        // ARN that must report the same record, byte for byte.
         for round in 0..2 {
-            for (form, identifier) in [
-                ("the name", (*name).to_string()),
-                ("the ARN", encoded_arn.clone()),
-            ] {
-                let (status, again) = get_group(&router, &region, &identifier).await;
-                assert_eq!(
-                    (status, &again),
-                    (200, &first),
-                    "case {name:?} round {round} via {form}: a read must report the identical \
-                     record, got {status} / {again:?}"
-                );
-            }
+            let (status, refused) = get_group(&router, &region, name).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (404, RESOURCE_NOT_FOUND),
+                "case {name:?} round {round}: the name must resolve nothing, \
+                 got {status} / {refused:?}"
+            );
+            let (status, again) = get_group(&router, &region, &arn).await;
+            assert_eq!(
+                (status, &again),
+                (200, &first),
+                "case {name:?} round {round}: a read must report the identical record, \
+                 got {status} / {again:?}"
+            );
         }
 
-        // The listing still reports exactly that one group, so no read minted, moved or
-        // reclaimed anything.
-        let (status, listing) =
-            call_in(&router, &region, "GET", "/investigationGroups", None).await;
+        // The listing still reports exactly that one group.
+        let (status, listing) = call_in(&router, &region, "GET", "/investigationGroups", None).await;
         let listed: Vec<&str> = listing
             .get("investigationGroups")
             .and_then(Value::as_array)
