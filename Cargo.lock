@@ -811,6 +811,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudformation"
+version = "1.133.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00a855ab97825da2316daccbe34fc19da2f4541fe302c9c31b6159d448b2b9d9"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-cloudwatchlogs"
 version = "1.160.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13687,6 +13713,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-cloudformation",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -13694,6 +13721,8 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-cloudformation-cloudformation",
+ "service-com-amazonaws-sqs-amazonsqs",
  "sha2 0.10.9",
  "tokio",
  "tracing",
