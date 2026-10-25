@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagGlobalResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagGlobalResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagGlobalResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MERGES the request's tag pairs into the tags of the GLOBAL resource `ResourceArn`
+//! addresses in [`crate::state`] — a router input, a router output or a router network
+//! interface ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::global_resource_tags_mut`]):
+//! a key the request names is set or overwritten, a key it does not name keeps the value
+//! it had, and the resource afterwards reports the union of the two sets.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +68,28 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]), as TagResource's refusal does.
+fn bad_request(detail: impl Into<String>) -> TagGlobalResourceError {
+    TagGlobalResourceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `ResourceArn` that addresses no global resource this service
+/// holds: `NotFoundException`, "one or more of the resources in the request does not exist
+/// in the system". The wording is the one every MediaConnect lookup refuses an
+/// unresolvable identifier with ([`crate::state::not_found_message`]).
+fn not_found(resource_arn: &str) -> TagGlobalResourceError {
+    TagGlobalResourceErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(resource_arn),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,20 +183,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagGlobalResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagGlobalResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagGlobalResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                TagGlobalResourceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect global resource store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The model bounds neither a tag key nor a tag value, so the pairs reach this
+        // handler unchecked; the service's own bounds live in `crate::state`, where every
+        // operation that writes tags is checked against the same function. The whole
+        // request is checked before anything is resolved or written, so a refused call
+        // stores none of its pairs.
+        if let Some(reason) = crate::state::tag_pairs_rejection(&input.tags) {
+            return Err(bad_request(reason));
+        }
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let Some(resource) = store.global_resource_tags_mut(&input.resource_arn, now) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // The tags-per-resource bound applies to the MERGED set this write would leave, so
+        // it is read from `crate::state` like every other tag rule.
+        if let Some(reason) = crate::state::tag_capacity_rejection(
+            resource.tags,
+            input.tags.keys(),
+            &input.resource_arn,
+        ) {
+            return Err(bad_request(reason));
+        }
+
+        if crate::state::merge_tags(resource.tags, input.tags) {
+            // The tags are a member of the resource (`RouterInput$Tags` and its output and
+            // interface counterparts), so a write that changed them changed the record and
+            // its `UpdatedAt` moves with it — and a write that left every pair as it was
+            // changed nothing, so it does not, the same reading
+            // UpdateRouterNetworkInterface applies to its own optional members.
+            *resource.updated_at = now;
+        }
+
+        Ok(TagGlobalResourceOutput)
     }
 }

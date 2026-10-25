@@ -1374,9 +1374,9 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
             vec![&first, &second],
         ),
         (
-            "and the proposer of none",
+            "and their proposer too",
             json!([{"name": "PartyType", "values": ["Proposer"]}]),
-            vec![],
+            vec![&first, &second],
         ),
         (
             "the acceptor account",

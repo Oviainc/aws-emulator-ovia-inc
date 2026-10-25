@@ -32,6 +32,15 @@
 //! And it holds the evaluation jobs `ops/create_evaluation_job.rs` mints and
 //! `ops/get_evaluation_job.rs` reads back.
 //!
+//! And it holds the model customization jobs `ops/create_model_customization_job.rs`
+//! mints, `ops/get_model_customization_job.rs` reads back and
+//! `ops/stop_model_customization_job.rs` winds down, together with the instant each job's
+//! non-terminal `status` is owed its move to a terminal one. A job that reaches
+//! `Completed` is what brings the custom model it was customizing into being, so the
+//! completion registers that model in the custom models below rather than holding a second
+//! copy of it: the model a job produced is the model `ops/get_custom_model.rs` and
+//! `ops/list_custom_models.rs` report.
+//!
 //! And it holds the Bedrock Marketplace model endpoints
 //! `ops/create_marketplace_model_endpoint.rs` mints,
 //! `ops/update_marketplace_model_endpoint.rs` reconfigures and
@@ -53,6 +62,11 @@
 //! mints, `ops/get_custom_model_deployment.rs` reads back and
 //! `ops/list_custom_model_deployments.rs` reports, together with the instant each
 //! deployment's non-terminal `status` is owed its move to `Active`.
+//!
+//! And it holds the Automated Reasoning policies `ops/create_automated_reasoning_policy.rs`
+//! mints and `ops/get_automated_reasoning_policy.rs` reads back, each with the draft
+//! definition it was created with and the hash of that definition, so the hash the create
+//! answered is the hash the read reports.
 //!
 //! And it holds the account's acknowledged use case for model access — the single form
 //! `ops/put_use_case_for_model_access.rs` submits and `ops/get_use_case_for_model_access.rs`
@@ -89,10 +103,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CustomModelDataSource, CustomModelDeploymentSummary, CustomModelSummary, EndpointConfig,
-    EvaluationConfig, EvaluationInferenceConfig, EvaluationOutputDataConfig,
-    FoundationModelDetails, FoundationModelLifecycle, FoundationModelSummary,
-    GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
+    AutomatedReasoningPolicyDefinition, CustomModelDataSource, CustomModelDeploymentSummary,
+    CustomModelSummary, CustomizationConfig, EndpointConfig, EvaluationConfig,
+    EvaluationInferenceConfig, EvaluationOutputDataConfig, FoundationModelDetails,
+    FoundationModelLifecycle, FoundationModelSummary, GuardrailAutomatedReasoningPolicy,
+    GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
     GuardrailContextualGroundingFilter, GuardrailContextualGroundingFilterConfig,
@@ -105,12 +120,20 @@ use crate::ops::types::{
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
     GuardrailWordPolicyConfig, InferenceProfileModel, LoggingConfig, MarketplaceModelEndpoint,
-    ModelDataSource, ModelEnforcement, PromptRouterTargetModel, ProvisionedModelSummary,
-    RoutingCriteria, SelectiveContentGuarding, Tag, VpcConfig,
+    ModelDataSource, ModelEnforcement, OutputDataConfig, PromptRouterTargetModel,
+    ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
+    ValidationDataConfig, VpcConfig,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
 /// (`^DRAFT$`) spells it.
+///
+/// An Automated Reasoning policy carries the same spelling for its own working version:
+/// `CreateAutomatedReasoningPolicyResponse$version` documents "The initial version is
+/// always DRAFT"
+/// (`smithy_query(query="operation",operation="CreateAutomatedReasoningPolicy")`), so the
+/// two resources name their draft with ONE constant rather than two spellings that could
+/// drift.
 pub const DRAFT_VERSION: &str = "DRAFT";
 
 /// `GuardrailStatus` — a guardrail that is serving. The status every revision this
@@ -564,6 +587,77 @@ pub const CUSTOM_MODEL_IMPORTED_BASE: &str = "imported";
 /// model names, or with fresh regions, which is why the bound is over the whole store
 /// rather than per region.
 pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
+
+/// `ModelCustomizationJobStatus` — the customization job Amazon Bedrock accepted is
+/// training.
+///
+/// The enum is `[InProgress, Completed, Failed, Stopping, Stopped]`
+/// (`crate::ops::types::MODEL_CUSTOMIZATION_JOB_STATUS_VALUES`), and
+/// `CreateModelCustomizationJob` documents that "model-customization jobs are asynchronous
+/// and the completion time depends on the base model and the training/validation data
+/// size" (`smithy_query(query="doc",shape="CreateModelCustomizationJob")`) — so this is
+/// the status a job carries from the call that starts it.
+pub const MODEL_CUSTOMIZATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// `ModelCustomizationJobStatus` once the customization has finished — the terminal status
+/// the one above is owed its move to.
+///
+/// "After the model-customization job completes successfully, your custom model resource
+/// will be ready to use" (`smithy_query(query="doc",shape="CreateModelCustomizationJob")`),
+/// so reaching this status is what brings the job's output model into being.
+/// `Failed` names a job whose customization did not finish; nothing here makes an accepted
+/// job fail, so no call mints it.
+pub const MODEL_CUSTOMIZATION_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// `ModelCustomizationJobStatus` — the job is winding down because a caller stopped it.
+///
+/// The status `StopModelCustomizationJob` moves a running job to: stopping a job is
+/// asynchronous, so this is the non-terminal status the job carries from the call that asks
+/// for the stop until the stop has taken effect.
+pub const MODEL_CUSTOMIZATION_JOB_STATUS_STOPPING: &str = "Stopping";
+
+/// `ModelCustomizationJobStatus` once the stop has taken effect — the terminal status the
+/// non-terminal one above is owed its move to, after
+/// [`MODEL_CUSTOMIZATION_JOB_STOPPED_AFTER`].
+pub const MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED: &str = "Stopped";
+
+/// How long after `CreateModelCustomizationJob` a job's non-terminal `status` is owed its
+/// move to [`MODEL_CUSTOMIZATION_JOB_STATUS_COMPLETED`].
+///
+/// CHOSEN, not documented: the model says the completion time "depends on the base model
+/// and the training/validation data size", so AWS publishes no duration and this is the
+/// emulator's span. It is non-zero, so a caller that reads or stops the job straight after
+/// creating it still observes the `InProgress` status the real service reports; and it is
+/// materialised from the stored due instant on the next call that touches the record rather
+/// than waited on, so no handler sleeps.
+pub const MODEL_CUSTOMIZATION_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after `StopModelCustomizationJob` a job's `Stopping` status is owed its move to
+/// [`MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for stopping a customization job (the
+/// real stop has to wind down training that is already running), so this is the emulator's
+/// span — materialised from the stored due instant, exactly as the completion one is.
+pub const MODEL_CUSTOMIZATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
+
+/// `CustomizationType` — tuning a base model on labelled data, and the customization a
+/// create that names none runs.
+///
+/// `CreateModelCustomizationJob` "creates a FINE-TUNING job to customize a base model"
+/// (`smithy_query(query="doc",shape="CreateModelCustomizationJob")`), while
+/// `customizationType` is optional and the model declares no default for it — so a request
+/// that names none asks for the job that operation is documented to create. See
+/// [`CUSTOMIZATION_TYPE_IMPORTED`] for the value list.
+pub const CUSTOMIZATION_TYPE_FINE_TUNING: &str = "FINE_TUNING";
+
+/// The most model customization jobs this account may hold at once, past which a create is
+/// refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS publishes a quota for
+/// CONCURRENT customization jobs, not for the jobs an account's history holds): without a
+/// server-side cap a caller could grow this part of the store with nothing but fresh job
+/// names.
+pub const MAX_MODEL_CUSTOMIZATION_JOBS_PER_ACCOUNT: usize = 100;
 
 /// `InferenceProfileStatus` — the only status an inference profile reports.
 ///
@@ -1176,6 +1270,15 @@ pub struct CustomModelRecord {
     /// or `None` when it descends from none \u2014 which is what `ListCustomModels`'
     /// `foundationModelArnEquals` filters on, as distinct from `baseModelArnEquals`.
     pub foundation_model_arn: Option<String>,
+    /// `jobArn` — the `ModelCustomizationJobArn` of the customization job that PRODUCED
+    /// this model, or `None` for a model that no job produced.
+    ///
+    /// "For models that you create with the CreateCustomModel API operation, this is NULL"
+    /// (`smithy_query(query="operation",operation="GetCustomModel")`), so this is also what
+    /// says which of the members a read reports are the JOB's: the job this names is where
+    /// the hyperparameters, the datasets and the output location live, so there is only ever
+    /// one copy of them.
+    pub job_arn: Option<String>,
     /// `CustomizationType`.
     pub customization_type: &'static str,
     /// `modelSourceConfig`, as the create request carried it (absent when the request
@@ -1222,6 +1325,182 @@ impl CustomModelRecord {
             self.active_due_at = None;
         }
     }
+}
+
+/// One stored model customization job: the identity `CreateModelCustomizationJob` minted,
+/// the request that minted it, the custom model it is customizing, and the job's own
+/// lifecycle status.
+///
+/// `status` and `customization_type` are `&'static str` for the same reason
+/// [`ModelImportJobRecord::status`] is: the statuses are the ones this emulator's lifecycle
+/// passes through, and the customization type is resolved against the modelled enum
+/// ([`customization_type_of`]) rather than kept as whatever text arrived.
+#[derive(Debug, Clone)]
+pub struct ModelCustomizationJobRecord {
+    /// The `ModelCustomizationJobArn` this job is addressed by, minted by
+    /// [`model_customization_job_arn`].
+    pub arn: String,
+    /// `jobName`, as the create request spelled it — the other spelling a
+    /// `ModelCustomizationJobIdentifier` may carry.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index and the uniqueness checks are per region without re-parsing an
+    /// ARN, exactly as [`ModelImportJobRecord::region`] is.
+    pub region: String,
+    /// `clientRequestToken`, as the create request carried it — a member the read reports
+    /// back.
+    pub client_request_token: Option<String>,
+    /// `roleArn` — the service role Amazon Bedrock assumes to read the training data and
+    /// write the model artifacts.
+    pub role_arn: String,
+    /// `customModelName` — the name of the model this job is customizing, which the read
+    /// reports as its `outputModelName`.
+    pub output_model_name: String,
+    /// The `CustomModelArn` of the model this job is customizing, minted by
+    /// [`custom_model_arn`] when the job is accepted: it is the job's target, so it is
+    /// fixed from that call onwards, exactly as [`ModelImportJobRecord::imported_model_arn`]
+    /// is.
+    pub output_model_arn: String,
+    /// `baseModelArn` — the `FoundationModelArn` of the base model being customized, as
+    /// [`foundation_model_arn`] spells it for the catalog row the request's
+    /// `baseModelIdentifier` resolved to.
+    pub base_model_arn: String,
+    /// `CustomizationType` — the customization this job runs.
+    pub customization_type: &'static str,
+    /// The `outputModelKmsKeyArn` a read reports for the request's `customModelKmsKeyId`,
+    /// as [`kms_key_arn`] completes it.
+    pub output_model_kms_key_arn: Option<String>,
+    /// `hyperParameters`, as the create request carried them (absent when it carried none).
+    pub hyper_parameters: Option<HashMap<String, String>>,
+    /// `trainingDataConfig` — where the training data is read from.
+    pub training_data_config: TrainingDataConfig,
+    /// `validationDataConfig` — the validators the job runs.
+    ///
+    /// Stored as the shape rather than as an `Option` of it: the member is optional in the
+    /// request and REQUIRED in the read
+    /// (`smithy_query(query="operation",operation="GetModelCustomizationJob")`), and its
+    /// own `validators` list admits zero entries, so a create that named no validation data
+    /// is the job with no validators.
+    pub validation_data_config: ValidationDataConfig,
+    /// `outputDataConfig` — where the job writes its output.
+    pub output_data_config: OutputDataConfig,
+    /// `vpcConfig`, as the create request carried it (absent when it carried none).
+    pub vpc_config: Option<VpcConfig>,
+    /// `customizationConfig`, as the create request carried it (absent when it carried
+    /// none).
+    pub customization_config: Option<CustomizationConfig>,
+    /// `jobTags` — the tags attached to the job itself.
+    ///
+    /// Kept for the reason [`ProvisionedModelThroughputRecord::tags`] is: it is part of the
+    /// request that minted the record, and the job's own read reports no tag member.
+    pub job_tags: Vec<Tag>,
+    /// `customModelTags` — the tags attached to the model this job is customizing, which
+    /// become that model's tags when the job completes.
+    pub custom_model_tags: Vec<Tag>,
+    /// `ModelCustomizationJobStatus`.
+    pub status: &'static str,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_CUSTOMIZATION_JOB_STATUS_COMPLETED`], or `None` once the job is terminal or
+    /// a stop has been asked for.
+    ///
+    /// The due INSTANT, not a timer, for the same reason
+    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    pub completed_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED`], or `None` while no stop is in flight.
+    pub stopped_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+    /// When the job last changed: the creation instant until something changes it, and the
+    /// instant a transition was owed once the status has moved.
+    pub last_modified_at: SystemTime,
+    /// When the job reached a terminal status, or `None` while it is still running.
+    pub ended_at: Option<SystemTime>,
+}
+
+impl ModelCustomizationJobRecord {
+    /// Whether this job is still running, so a stop has something to wind down.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.status == MODEL_CUSTOMIZATION_JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Whether a stop has already taken this job over: it is winding down, or it has
+    /// wound down.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.status == MODEL_CUSTOMIZATION_JOB_STATUS_STOPPING
+            || self.status == MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED
+    }
+
+    /// Move this job to [`MODEL_CUSTOMIZATION_JOB_STATUS_STOPPING`] and record when the
+    /// stop is owed its move to [`MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED`].
+    ///
+    /// The caller's own write, asked for by `StopModelCustomizationJob` — not a clock
+    /// transition. The training it was running is being wound down, so the job is owed no
+    /// completion any more and mints no custom model.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.status = MODEL_CUSTOMIZATION_JOB_STATUS_STOPPING;
+        self.stopped_due_at = Some(now + MODEL_CUSTOMIZATION_JOB_STOPPED_AFTER);
+        self.completed_due_at = None;
+        self.last_modified_at = now;
+    }
+}
+
+/// The most Automated Reasoning policies this account may hold at once, across every
+/// region it has created one in, past which a create is refused with
+/// `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota: without a server-side cap a
+/// caller could grow this part of the store with nothing but fresh policy names, or with
+/// fresh regions, which is why the bound is over the whole store rather than per region.
+pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
+
+/// `AutomatedReasoningPolicyDefinition$version` when the request carried no version of
+/// its own — the member's modelled `@default("1")`
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
+pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
+
+/// A stored Automated Reasoning policy: the identity `CreateAutomatedReasoningPolicy`
+/// minted, and the draft definition every later read of that policy reports.
+///
+/// The `definitionHash` is held beside the definition rather than recomputed per read, so
+/// the hash the create answered is the hash the read reports; it is a function of the
+/// DEFINITION alone ([`policy_definition_hash`]), which is what makes it usable as the
+/// concurrency token its member documents.
+#[derive(Debug, Clone)]
+pub struct AutomatedReasoningPolicyRecord {
+    /// The `AutomatedReasoningPolicyArn` this policy is addressed by, minted by
+    /// [`automated_reasoning_policy_arn`] — also the key this family's store is keyed by.
+    pub arn: String,
+    /// `policyId` — the resource half of [`Self::arn`] (`^[a-z0-9]{12}$`), which
+    /// `GetAutomatedReasoningPolicy` reports beside it.
+    pub id: String,
+    /// `name`, as the create request spelled it.
+    pub name: String,
+    /// The region the create addressed, which [`Self::arn`] also carries. Kept beside it
+    /// so the name index is per region without re-parsing an ARN, exactly as
+    /// [`CustomModelRecord::region`] is.
+    pub region: String,
+    /// `description`, as the create request carried it (absent when it carried none).
+    pub description: Option<String>,
+    /// `policyDefinition`, as the create request carried it (absent when it carried none,
+    /// which is how a policy whose rules a build workflow is to extract starts out).
+    pub definition: Option<AutomatedReasoningPolicyDefinition>,
+    /// `definitionHash` — [`policy_definition_hash`] of [`Self::definition`].
+    pub definition_hash: String,
+    /// `kmsKeyArn` — the customer managed key the create named, completed to a `KmsKeyArn`
+    /// by [`kms_key_arn`], or `None` when the create named none (Amazon Bedrock then uses
+    /// an AWS managed key, which is no key of this account to report).
+    pub kms_key_arn: Option<String>,
+    /// `tags` — the tags the create request attached to the policy.
+    ///
+    /// Kept for the reason [`CustomModelRecord::tags`] is: it is part of the request that
+    /// minted the record, and the policy's own reads report no tag member.
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    /// When the policy was last written. The creation instant until an update rewrites
+    /// the draft.
+    pub updated_at: SystemTime,
 }
 
 /// One stored application inference profile: the identity `CreateInferenceProfile`
@@ -1366,6 +1645,13 @@ pub struct EnforcedGuardrailConfiguration {
 ///   `CreateCustomModelDeployment` enforces, and
 ///   `custom_model_deployment_create_tokens` holds at most one entry per live deployment
 ///   for the same reason `create_tokens` does.
+///
+/// * `automated_reasoning_policies` and `automated_reasoning_policy_names` hold one entry
+///   per live Automated Reasoning policy, capped at
+///   [`MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT`] by the quota
+///   `CreateAutomatedReasoningPolicy` enforces, and
+///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
+///   the same reason `create_tokens` does.
 ///
 /// * `inference_profiles` holds one entry per live application inference profile, capped
 ///   at [`MAX_INFERENCE_PROFILES_PER_ACCOUNT`] by the quota `CreateInferenceProfile`
@@ -1537,6 +1823,38 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many custom model ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_custom_models: u64,
+    /// Every stored model customization job, keyed by its `ModelCustomizationJobArn` — one
+    /// of the two spellings a `ModelCustomizationJobIdentifier` carries.
+    pub model_customization_jobs: HashMap<String, ModelCustomizationJobRecord>,
+    /// `(region, jobName)` -> `ModelCustomizationJobArn`, so a duplicate job name is a
+    /// `ConflictException` and the other `ModelCustomizationJobIdentifier` spelling — the
+    /// bare job name — resolves to the job it names.
+    pub model_customization_job_names: HashMap<(String, String), String>,
+    /// `CreateModelCustomizationJob` idempotency: `(region, clientRequestToken)` -> the
+    /// `jobArn` that token minted. Scoped to that one operation, and to the region the
+    /// request addressed, the way the model import job index is.
+    pub model_customization_job_create_tokens: HashMap<(String, String), String>,
+    /// How many model customization job ids this store has minted; the uniqueness half of
+    /// a minted id.
+    pub minted_model_customization_jobs: u64,
+    /// Every stored Automated Reasoning policy, keyed by its
+    /// `AutomatedReasoningPolicyArn` — the one identifier
+    /// `GetAutomatedReasoningPolicy` addresses a policy by, which carries the region too,
+    /// so the same id in another region is another key.
+    pub automated_reasoning_policies: HashMap<String, AutomatedReasoningPolicyRecord>,
+    /// `(region, name)` -> `AutomatedReasoningPolicyArn`, so a duplicate name is a
+    /// `ConflictException`.
+    ///
+    /// Keyed by the region too because the ARN carries one, so the same name in another
+    /// region names another policy.
+    pub automated_reasoning_policy_names: HashMap<(String, String), String>,
+    /// `CreateAutomatedReasoningPolicy` idempotency: `(region, clientRequestToken)` -> the
+    /// `policyArn` that token minted. Scoped to that one operation, and to the region the
+    /// request addressed, the way the custom model index is.
+    pub automated_reasoning_policy_create_tokens: HashMap<(String, String), String>,
+    /// How many Automated Reasoning policy ids this store has minted; the uniqueness half
+    /// of a minted id.
+    pub minted_automated_reasoning_policies: u64,
     /// Every stored application inference profile, keyed by its `InferenceProfileArn` —
     /// one of the two spellings an `InferenceProfileIdentifier` carries.
     pub inference_profiles: HashMap<String, InferenceProfileRecord>,
@@ -1621,6 +1939,32 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_prompt_router_id(&mut self, now: SystemTime) -> String {
         self.minted_prompt_routers += 1;
         minted_id(self.minted_prompt_routers, now)
+    }
+
+    /// Mint a fresh Automated Reasoning policy id: the resource half of an
+    /// `automated-reasoning-policy/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons;
+    /// `AutomatedReasoningPolicyArn` admits exactly `[a-z0-9]{12}` there, which is what
+    /// two [`ID_HALF_WIDTH`] base-36 halves spell, and `AutomatedReasoningPolicyId` is
+    /// that same `^[a-z0-9]{12}$`.
+    pub fn mint_automated_reasoning_policy_id(&mut self, now: SystemTime) -> String {
+        self.minted_automated_reasoning_policies += 1;
+        minted_id(self.minted_automated_reasoning_policies, now)
+    }
+
+    /// The Automated Reasoning policy an `AutomatedReasoningPolicyArn` names.
+    ///
+    /// The lookup is EXACT, so the ARN's region and its optional `:<version>` suffix both
+    /// select: the base ARN names the draft this store holds, and a versioned ARN names a
+    /// version, of which this store holds none until `CreateAutomatedReasoningPolicyVersion`
+    /// mints one.
+    #[must_use]
+    pub fn automated_reasoning_policy(
+        &self,
+        policy_arn: &str,
+    ) -> Option<&AutomatedReasoningPolicyRecord> {
+        self.automated_reasoning_policies.get(policy_arn)
     }
 
     /// Mint a fresh inference profile id: the resource half of an
@@ -1921,6 +2265,11 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         region: &str,
         now: SystemTime,
     ) -> Option<&mut CustomModelRecord> {
+        // A customization job the clock has already completed is what brings its output
+        // model into being, so those completions are materialised before a model is looked
+        // up: such a model was owed at its job's due instant even if nobody had read the
+        // job.
+        self.settle_model_customization_jobs(now);
         let arn = self.custom_model_arn_of(identifier, region)?;
         let record = self.custom_models.get_mut(&arn)?;
         record.settle(now);
@@ -1931,9 +2280,142 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// so a LISTING reports — and filters on — the status each record holds at `now`
     /// exactly as a read of that one model would.
     pub fn settle_custom_models(&mut self, now: SystemTime) {
+        // Including the models whose customization job the clock has completed, for the
+        // reason [`Self::custom_model`] materialises those first.
+        self.settle_model_customization_jobs(now);
         for record in self.custom_models.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// Mint a fresh model customization job id: the resource half of a
+    /// `model-customization-job/<base model>/<id>` ARN, unique within this store.
+    ///
+    /// Built like a guardrail id, and for the same two reasons;
+    /// `ModelCustomizationJobArn` admits exactly `[a-z0-9]{12}` there, which is what two
+    /// [`ID_HALF_WIDTH`] base-36 halves spell.
+    pub fn mint_model_customization_job_id(&mut self, now: SystemTime) -> String {
+        self.minted_model_customization_jobs += 1;
+        minted_id(self.minted_model_customization_jobs, now)
+    }
+
+    /// The `ModelCustomizationJobArn` a `ModelCustomizationJobIdentifier` names: the
+    /// identifier itself when it is the ARN of a stored job, otherwise the ARN the job of
+    /// that NAME in `region` carries.
+    ///
+    /// The identifier's pattern is that ARN OR a bare `JobName`
+    /// (`smithy_query(query="operation",operation="GetModelCustomizationJob")`), so both
+    /// spellings address the same job — resolved exactly as
+    /// [`Self::model_import_job_arn_of`] resolves an import job's two spellings.
+    #[must_use]
+    pub fn model_customization_job_arn_of(&self, identifier: &str, region: &str) -> Option<String> {
+        if self.model_customization_jobs.contains_key(identifier) {
+            return Some(identifier.to_string());
+        }
+        self.model_customization_job_names
+            .get(&(region.to_string(), identifier.to_string()))
+            .cloned()
+    }
+
+    /// The model customization job a `ModelCustomizationJobIdentifier` names, with any
+    /// status transition the clock has made due at `now` materialised first — so every
+    /// caller reads the status the job holds at `now`, whichever operation asked.
+    pub fn model_customization_job(
+        &mut self,
+        identifier: &str,
+        region: &str,
+        now: SystemTime,
+    ) -> Option<&mut ModelCustomizationJobRecord> {
+        let arn = self.model_customization_job_arn_of(identifier, region)?;
+        self.settle_model_customization_job(&arn, now);
+        self.model_customization_jobs.get_mut(&arn)
+    }
+
+    /// Materialise the transition the clock has already made due at `now` for the job
+    /// `arn` names: the stop a caller asked for, or the completion that brings the custom
+    /// model the job was customizing into being.
+    ///
+    /// The only write a reporting operation on this resource makes, and it was owed at the
+    /// due instant even if nobody had called — which is why that instant, not `now`, is the
+    /// one the job reports as its end and the one the model it produced reports as its
+    /// creation. The stop takes precedence because [`ModelCustomizationJobRecord::stop`]
+    /// drops the completion the job was owed: a job that was stopped produces no model.
+    fn settle_model_customization_job(&mut self, arn: &str, now: SystemTime) {
+        let completed = {
+            let Some(job) = self.model_customization_jobs.get_mut(arn) else {
+                return;
+            };
+            if let Some(due) = job.stopped_due_at.filter(|due| now >= *due) {
+                job.status = MODEL_CUSTOMIZATION_JOB_STATUS_STOPPED;
+                job.stopped_due_at = None;
+                job.ended_at = Some(due);
+                job.last_modified_at = due;
+                return;
+            }
+            let Some(due) = job.completed_due_at.filter(|due| now >= *due) else {
+                return;
+            };
+            job.status = MODEL_CUSTOMIZATION_JOB_STATUS_COMPLETED;
+            job.completed_due_at = None;
+            job.ended_at = Some(due);
+            job.last_modified_at = due;
+            CustomModelRecord {
+                arn: job.output_model_arn.clone(),
+                name: job.output_model_name.clone(),
+                region: job.region.clone(),
+                base_model_arn: job.base_model_arn.clone(),
+                base_model_name: base_model_id_of(&job.base_model_arn).to_string(),
+                // This model descends from the foundation model the job customized, which
+                // is what `ListCustomModels`' `foundationModelArnEquals` filters on.
+                foundation_model_arn: Some(job.base_model_arn.clone()),
+                job_arn: Some(job.arn.clone()),
+                customization_type: job.customization_type,
+                // The artifacts were produced by the customization rather than named by a
+                // request, so the model carries neither source.
+                model_source_config: None,
+                custom_model_data_source: None,
+                model_kms_key_arn: job.output_model_kms_key_arn.clone(),
+                role_arn: Some(job.role_arn.clone()),
+                tags: job.custom_model_tags.clone(),
+                // "After the model-customization job completes successfully, your custom
+                // model resource will be ready to use", so the model this registers is
+                // ready and the clock owes it no further transition.
+                status: CUSTOM_MODEL_STATUS_ACTIVE,
+                active_due_at: None,
+                created_at: due,
+            }
+        };
+        self.custom_model_names.insert(
+            (completed.region.clone(), completed.name.clone()),
+            completed.arn.clone(),
+        );
+        self.custom_models.insert(completed.arn.clone(), completed);
+    }
+
+    /// Materialise every model customization job transition the clock has made due at
+    /// `now`, so a reader of the resources those jobs PRODUCE sees the same jobs a read of
+    /// each one would.
+    ///
+    /// Lives beside the per-job materialisation because a completion brings a custom model
+    /// into being: a caller that reads only the model never touches the job, and the model
+    /// was owed at the job's due instant even so.
+    pub fn settle_model_customization_jobs(&mut self, now: SystemTime) {
+        let arns: Vec<String> = self.model_customization_jobs.keys().cloned().collect();
+        for arn in arns {
+            self.settle_model_customization_job(&arn, now);
+        }
+    }
+
+    /// Whether a stored job in `region` is already customizing a model under
+    /// `custom_model_name`.
+    ///
+    /// A job that was stopped is not: it produces no model, so the name it was going to
+    /// give one is free again.
+    #[must_use]
+    pub fn customizes_model_named(&self, region: &str, custom_model_name: &str) -> bool {
+        self.model_customization_jobs.values().any(|job| {
+            job.region == region && job.output_model_name == custom_model_name && !job.is_stopped()
+        })
     }
 
     /// Forget the Provisioned Throughput `arn` names, together with its name index entry
@@ -1979,9 +2461,10 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// read back to the first — the one the store is keyed by — in the region the ARN
     /// itself carries, so neither spelling reaches another region's resource.
     ///
-    /// The families this service holds no record of (a custom model, an automated reasoning
-    /// policy, a model invocation job, an async invoke) resolve to `None`: nothing creates
-    /// one yet, so this account holds no such resource to tag.
+    /// The families this resolution does not reach (a custom model, an Automated Reasoning
+    /// policy, a model invocation job, an async invoke) resolve to `None`, so a tagging
+    /// call that names one is answered as naming no taggable resource of this account;
+    /// wiring a family in is that family's own work, not a create's.
     pub fn tagged_resource(
         &mut self,
         resource_arn: &str,
@@ -2483,6 +2966,110 @@ pub fn application_inference_profile_arn(region: &str, id: &str) -> String {
 /// endpoint that already exists — so the `endpointArn` every marketplace endpoint
 /// operation carries is that SageMaker endpoint's ARN, whose resource id is the endpoint
 /// name. `Arn` declares no pattern (`@length(max: 2048)` only), so nothing in the model
+/// The `AutomatedReasoningPolicyArn` of the policy `id` names in `region`:
+/// `arn:aws:bedrock:<region>:<account>:automated-reasoning-policy/<id>`, which is the
+/// form `AutomatedReasoningPolicyArn` spells without its optional version suffix.
+#[must_use]
+pub fn automated_reasoning_policy_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("automated-reasoning-policy/{id}"),
+    )
+}
+
+/// The `definitionHash` of an Automated Reasoning policy definition: 128 digits of
+/// `[0-9a-z]`, as `AutomatedReasoningPolicyHash` requires.
+///
+/// A function of the DEFINITION alone, so two policies whose definitions agree report one
+/// hash and any change to a definition changes it — which is what the member documents it
+/// for ("used as a concurrency token for creating policy versions"). The digest is SHA-512
+/// hex, whose 128 lowercase hex digits are exactly the width and alphabet the shape
+/// admits, taken over a canonical rendering of the definition rather than over the request
+/// bytes, so the same definition written two ways hashes alike.
+///
+/// An ABSENT definition hashes as the empty definition the shape's own defaults spell: a
+/// policy created without one still reports a hash, and reports the same one until a
+/// definition is written to it.
+#[must_use]
+pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefinition>) -> String {
+    use ::sha2::{Digest, Sha512};
+
+    let canonical = canonical_policy_definition(definition).to_string();
+    ::hex::encode(Sha512::digest(canonical.as_bytes()))
+}
+
+/// A policy definition as the one JSON value [`policy_definition_hash`] digests: every
+/// member of every element in a fixed order, with an absent list rendered as the empty
+/// list and an absent definition as the empty definition, so the rendering depends on the
+/// definition's CONTENT and on nothing else.
+fn canonical_policy_definition(
+    definition: Option<&AutomatedReasoningPolicyDefinition>,
+) -> ::serde_json::Value {
+    let format_version = definition
+        .map(|definition| definition.version.as_str())
+        .filter(|version| !version.is_empty())
+        .unwrap_or(POLICY_DEFINITION_FORMAT_VERSION);
+    let types: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.types.as_ref())
+        .map(|types| {
+            types
+                .iter()
+                .map(|declared| {
+                    ::serde_json::json!({
+                        "name": declared.name,
+                        "description": declared.description,
+                        "values": declared
+                            .values
+                            .iter()
+                            .map(|value| ::serde_json::json!({
+                                "value": value.value,
+                                "description": value.description,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let variables: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.variables.as_ref())
+        .map(|variables| {
+            variables
+                .iter()
+                .map(|variable| {
+                    ::serde_json::json!({
+                        "name": variable.name,
+                        "type": variable.r#type,
+                        "description": variable.description,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rules: Vec<::serde_json::Value> = definition
+        .and_then(|definition| definition.rules.as_ref())
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| {
+                    ::serde_json::json!({
+                        "id": rule.id,
+                        "expression": rule.expression,
+                        "alternateExpression": rule.alternate_expression,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ::serde_json::json!({
+        "version": format_version,
+        "types": types,
+        "variables": variables,
+        "rules": rules,
+    })
+}
+
 /// narrows it further.
 pub fn marketplace_model_endpoint_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("sagemaker", region, &format!("endpoint/{name}"))
@@ -2627,6 +3214,56 @@ pub fn custom_model_deployment_summary(
 /// model.
 pub fn custom_model_arn(region: &str, base: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("custom-model/{base}/{id}"))
+}
+
+/// The ARN of a model customization job in `region`:
+/// `arn:aws:bedrock:<region>:<account>:model-customization-job/<base model>/<id>`, as
+/// `ModelCustomizationJobArn`
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:model-customization-job/[a-z0-9-]{1,63}[.]{1}…/[a-z0-9]{12}$`)
+/// spells it.
+///
+/// `base_model_id` is the base-model segment that pattern carries before the id — the
+/// `modelId` of the catalog row the request's `baseModelIdentifier` resolved to, exactly as
+/// the custom model the job produces carries it in [`custom_model_arn`].
+pub fn model_customization_job_arn(region: &str, base_model_id: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        "bedrock",
+        region,
+        &format!("model-customization-job/{base_model_id}/{id}"),
+    )
+}
+
+/// The `CustomizationType` a create request's `customizationType` names, or
+/// [`CUSTOMIZATION_TYPE_FINE_TUNING`] when it names none; `None` for a value the modelled
+/// enum does not carry.
+///
+/// Resolved against `crate::ops::types::CUSTOMIZATION_TYPE_VALUES` — the enum's own value
+/// list — so a stored record carries one of the modelled values rather than whatever text
+/// arrived.
+#[must_use]
+pub fn customization_type_of(requested: Option<&str>) -> Option<&'static str> {
+    let Some(requested) = requested else {
+        return Some(CUSTOMIZATION_TYPE_FINE_TUNING);
+    };
+    crate::ops::types::CUSTOMIZATION_TYPE_VALUES
+        .iter()
+        .find(|value| **value == requested)
+        .copied()
+}
+
+/// Whether `model` is published as supporting the customization `customization_type` names,
+/// which is what decides whether a customization job can be created over it.
+///
+/// [`FoundationModel::customizations_supported`] is the `ModelCustomizationList`
+/// `ListFoundationModels` reports for that model, each value out of `ModelCustomization`
+/// (`crate::ops::types::MODEL_CUSTOMIZATION_VALUES`) — so this reads the published catalog
+/// rather than any property of the request, exactly as
+/// [`supports_provisioned_throughput`] does for a Provisioned Throughput.
+#[must_use]
+pub fn supports_customization(model: &FoundationModel, customization_type: &str) -> bool {
+    model
+        .customizations_supported
+        .contains(&customization_type)
 }
 
 /// The `CustomModelSummary` a listing reports for a stored custom model.

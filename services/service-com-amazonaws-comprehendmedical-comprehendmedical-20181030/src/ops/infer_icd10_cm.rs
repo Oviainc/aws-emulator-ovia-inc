@@ -18,6 +18,16 @@
 //! so repeating the call returns the same entities and nothing a later caller reads is
 //! changed by calling it.
 //!
+//! ## The shared clinical-text pass
+//!
+//! Tokenization, spans, lexicon matching, the context cues and the confidence weights
+//! below are `pub(crate)` because every ontology-linking operation of this service runs
+//! the SAME pass over its OWN lexicon and answers with its own modelled shapes:
+//! `crate::ops::infer_snomedct` reaches them instead of carrying a second copy of the
+//! tokenizer. What stays private here is what is ICD-10-CM's own — the condition
+//! lexicon, the time-expression rule, and the mapping onto the modelled ICD-10-CM
+//! shapes.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -140,25 +150,26 @@ const WEIGHT_TERM_PER_TOKEN: f32 = 0.04;
 /// The token count past which a longer written form adds no more confidence.
 const TERM_TOKENS_AT_FULL_CONFIDENCE: usize = 4;
 
-/// Confidence of a span a closed-form pattern placed — a time expression, whose own
-/// characters are the whole of the evidence, so nothing but the form can be wrong.
-const WEIGHT_PATTERN: f32 = 0.95;
+/// Confidence of a span a closed-form pattern placed — a time expression, a measured
+/// value — whose own characters are the whole of the evidence, so nothing but the form
+/// can be wrong.
+pub(crate) const WEIGHT_PATTERN: f32 = 0.95;
 
 /// Confidence of a trait a context cue licensed (a negation, a family reference): the
 /// cue is a single word standing next to the mention, which is weaker evidence than the
 /// mention's own written form.
-const WEIGHT_CUE: f32 = 0.90;
+pub(crate) const WEIGHT_CUE: f32 = 0.90;
 
 /// Confidence of an attribute a one-word modifier lexicon placed.
-const WEIGHT_MODIFIER: f32 = 0.90;
+pub(crate) const WEIGHT_MODIFIER: f32 = 0.90;
 
 /// Confidence that a modifier STANDING NEXT to the mention modifies it, which is what
 /// the modelled `RelationshipScore` reports.
-const WEIGHT_RELATIONSHIP: f32 = 0.95;
+pub(crate) const WEIGHT_RELATIONSHIP: f32 = 0.95;
 
 /// How much each token between the modifier and the mention lowers that relationship
 /// confidence: a modifier further from the mention is less likely to belong to it.
-const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
+pub(crate) const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
 
 /// How much of the previous candidate's confidence the next ICD-10-CM candidate keeps.
 ///
@@ -166,19 +177,19 @@ const RELATIONSHIP_DISTANCE_PENALTY: f32 = 0.08;
 /// `ICD10CMConcept$Score` reports "the likelihood of the match", so each successive
 /// candidate reports this share of the one in front of it and the list is strictly
 /// descending.
-const CONCEPT_RANK_DECAY: f32 = 0.72;
+pub(crate) const CONCEPT_RANK_DECAY: f32 = 0.72;
 
-/// The most ICD-10-CM candidates one entity reports.
-const CONCEPT_CANDIDATE_LIMIT: usize = 5;
+/// The most ontology candidates one entity reports.
+pub(crate) const CONCEPT_CANDIDATE_LIMIT: usize = 5;
 
 /// How far from a mention, in tokens, a modifier or a time expression is still read as
 /// belonging to it. A clause boundary stops the search whatever this allows.
-const ATTRIBUTE_WINDOW_TOKENS: usize = 4;
+pub(crate) const ATTRIBUTE_WINDOW_TOKENS: usize = 4;
 
 /// How far BEFORE a mention, in tokens, a negation, hypothetical or low-confidence cue
 /// is still read as scoping it. A family reference scopes its whole clause instead, so
 /// it is searched for without this window.
-const CUE_WINDOW_TOKENS: usize = 6;
+pub(crate) const CUE_WINDOW_TOKENS: usize = 6;
 
 /// One ICD-10-CM concept: the code and the long description the ontology gives it.
 #[derive(Debug)]
@@ -1081,7 +1092,7 @@ const LOW_CONFIDENCE_CUES: &[&str] = &[
 /// is written with in clinical text: how far the condition has progressed (acuity),
 /// which side or part of the body it is on (direction), the body system or site it
 /// affects, and how it presents (quality).
-const ACUITY_MODIFIERS: &[&str] = &[
+pub(crate) const ACUITY_MODIFIERS: &[&str] = &[
     "acute",
     "chronic",
     "subacute",
@@ -1097,7 +1108,7 @@ const ACUITY_MODIFIERS: &[&str] = &[
     "new",
 ];
 
-const DIRECTION_MODIFIERS: &[&str] = &[
+pub(crate) const DIRECTION_MODIFIERS: &[&str] = &[
     "left",
     "right",
     "bilateral",
@@ -1112,7 +1123,7 @@ const DIRECTION_MODIFIERS: &[&str] = &[
     "posterior",
 ];
 
-const QUALITY_MODIFIERS: &[&str] = &[
+pub(crate) const QUALITY_MODIFIERS: &[&str] = &[
     "severe",
     "mild",
     "moderate",
@@ -1209,45 +1220,58 @@ fn lexicon() -> &'static Lexicon {
 /// One token of the submitted text: where it is written, how it compares, and which
 /// clause it belongs to.
 #[derive(Debug)]
-struct Token {
+pub(crate) struct Token {
     /// Byte offset of the token's first character in the submitted text.
-    start: usize,
+    pub(crate) start: usize,
     /// Byte offset one past the token's last character.
-    end: usize,
+    pub(crate) end: usize,
     /// The token lowercased, which is what every table above is matched against.
-    lower: String,
+    pub(crate) lower: String,
     /// Which clause of the text the token is in. A cue only scopes the mentions of its
     /// own clause, so a sentence boundary stops every context rule below.
-    clause: usize,
+    pub(crate) clause: usize,
 }
 
 /// The submitted text as tokens: each maximal run of alphanumeric characters is one
 /// token, and every other character separates tokens — so case, hyphenation and
 /// punctuation do not change what is matched. The clause number advances at sentence
 /// and clause punctuation.
-fn tokenize(text: &str) -> Vec<Token> {
+///
+/// A period standing BETWEEN two digits is a decimal point rather than a sentence end,
+/// so a written number is one token in one clause ("7.2", not "7" and a new clause
+/// holding "2").
+pub(crate) fn tokenize(text: &str) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut clause = 0usize;
     let mut run: Option<(usize, usize)> = None;
-    for (index, character) in text.char_indices() {
-        if character.is_alphanumeric() {
+    let mut previous: Option<char> = None;
+    let mut characters = text.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        let decimal_point = character == '.'
+            && run.is_some()
+            && previous.is_some_and(|before| before.is_ascii_digit())
+            && characters
+                .peek()
+                .is_some_and(|&(_, next)| next.is_ascii_digit());
+        if character.is_alphanumeric() || decimal_point {
             match run {
                 Some((_, ref mut end)) => *end = index + character.len_utf8(),
                 None => run = Some((index, index + character.len_utf8())),
             }
-            continue;
+        } else {
+            if let Some((start, end)) = run.take() {
+                tokens.push(Token {
+                    start,
+                    end,
+                    lower: text[start..end].to_lowercase(),
+                    clause,
+                });
+            }
+            if matches!(character, '.' | '!' | '?' | ';' | ':' | '\n' | '\r') {
+                clause += 1;
+            }
         }
-        if let Some((start, end)) = run.take() {
-            tokens.push(Token {
-                start,
-                end,
-                lower: text[start..end].to_lowercase(),
-                clause,
-            });
-        }
-        if matches!(character, '.' | '!' | '?' | ';' | ':' | '\n' | '\r') {
-            clause += 1;
-        }
+        previous = Some(character);
     }
     if let Some((start, end)) = run {
         tokens.push(Token {
@@ -1263,21 +1287,35 @@ fn tokenize(text: &str) -> Vec<Token> {
 /// A stretch of the submitted text the pass placed, in TOKEN indices and in BYTE
 /// offsets into that text.
 #[derive(Debug, Clone)]
-struct Span {
-    tokens: Range<usize>,
-    start: usize,
-    end: usize,
+pub(crate) struct Span {
+    pub(crate) tokens: Range<usize>,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl Span {
     /// The span covering `tokens[range]`.
-    fn of(tokens: &[Token], range: Range<usize>) -> Self {
+    pub(crate) fn of(tokens: &[Token], range: Range<usize>) -> Self {
         Self {
             start: tokens[range.start].start,
             end: tokens[range.end - 1].end,
             tokens: range,
         }
     }
+}
+
+/// The 0-based CHARACTER offset of every character of `text`, as its BYTE offset.
+///
+/// The passes work in byte offsets; both modelled offset members report character
+/// offsets, so the two are converted through this table once per request.
+pub(crate) fn character_starts(text: &str) -> Vec<usize> {
+    text.char_indices().map(|(index, _)| index).collect()
+}
+
+/// The 0-based CHARACTER offset of the position `byte` bytes into the text whose
+/// character starts are `starts`.
+pub(crate) fn character_offset(starts: &[usize], byte: usize) -> i32 {
+    i32::try_from(starts.partition_point(|&start| start < byte)).unwrap_or(i32::MAX)
 }
 
 /// One attribute of a condition mention: a stretch of text beside the mention that says
@@ -1314,16 +1352,79 @@ impl Placed {
     }
 }
 
-/// Whether `token` counts a quantity: a run of digits, or a counting word.
-fn is_count(token: &Token) -> bool {
-    (!token.lower.is_empty() && token.lower.chars().all(|character| character.is_ascii_digit()))
-        || NUMBER_WORDS.contains(&token.lower.as_str())
+/// Whether `token` counts a quantity: a written number (a run of digits, with at most
+/// one decimal point), or a counting word.
+pub(crate) fn is_count(token: &Token) -> bool {
+    let word = token.lower.as_str();
+    let number = word.chars().any(|character| character.is_ascii_digit())
+        && word
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.')
+        && word.chars().filter(|&character| character == '.').count() <= 1;
+    number || NUMBER_WORDS.contains(&word)
 }
 
 /// The confidence of a mention its lexicon entry spans `term_tokens` tokens of.
-fn term_confidence(term_tokens: usize) -> f32 {
+pub(crate) fn term_confidence(term_tokens: usize) -> f32 {
     let extra = term_tokens.clamp(1, TERM_TOKENS_AT_FULL_CONFIDENCE) - 1;
     (WEIGHT_TERM_ONE_TOKEN + WEIGHT_TERM_PER_TOKEN * extra as f32).clamp(0.0, 1.0)
+}
+
+/// Every maximal lexicon match in `tokens`, left to right, longest written form first.
+///
+/// `max_tokens` is the longest written form the lexicon holds, and `is_term` answers
+/// whether a phrase — the tokens lowercased and joined by single spaces, which is how
+/// every lexicon in this crate spells its entries — is one of them. The tokens of a
+/// match are marked covered, so a match never overlaps another and the scan resumes past
+/// it; the caller maps the phrase it gets back onto its own lexicon entry.
+pub(crate) fn lexicon_matches(
+    tokens: &[Token],
+    covered: &mut [bool],
+    max_tokens: usize,
+    is_term: impl Fn(&str) -> bool,
+) -> Vec<(Span, String)> {
+    let mut placed = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if covered[index] {
+            index += 1;
+            continue;
+        }
+        let longest = max_tokens.min(tokens.len() - index);
+        let mut matched = None;
+        for length in (1..=longest).rev() {
+            let range = index..index + length;
+            // A written form is never read across a clause boundary, and never over a
+            // token something else already placed.
+            if tokens[range.clone()]
+                .iter()
+                .any(|token| token.clause != tokens[index].clause)
+                || covered[range.clone()].iter().any(|taken| *taken)
+            {
+                continue;
+            }
+            let phrase = tokens[range.clone()]
+                .iter()
+                .map(|token| token.lower.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if is_term(phrase.as_str()) {
+                matched = Some((range, phrase));
+                break;
+            }
+        }
+        match matched {
+            Some((range, phrase)) => {
+                for token in &mut covered[range.clone()] {
+                    *token = true;
+                }
+                index = range.end;
+                placed.push((Span::of(tokens, range), phrase));
+            }
+            None => index += 1,
+        }
+    }
+    placed
 }
 
 /// Every condition mention in `tokens`, longest written form first, left to right.
@@ -1336,42 +1437,17 @@ fn condition_mentions(
     covered: &mut [bool],
 ) -> Vec<(Span, &'static Condition)> {
     let lexicon = lexicon();
-    let mut placed = Vec::new();
-    let mut index = 0usize;
-    while index < tokens.len() {
-        let longest = lexicon.max_tokens.min(tokens.len() - index);
-        let mut matched = None;
-        for length in (1..=longest).rev() {
-            let range = index..index + length;
-            // A written form is never read across a clause boundary.
-            if tokens[range.clone()]
-                .iter()
-                .any(|token| token.clause != tokens[index].clause)
-            {
-                continue;
-            }
-            let phrase = tokens[range.clone()]
-                .iter()
-                .map(|token| token.lower.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if let Some(condition) = lexicon.terms.get(phrase.as_str()) {
-                matched = Some((range, *condition));
-                break;
-            }
-        }
-        match matched {
-            Some((range, condition)) => {
-                for token in &mut covered[range.clone()] {
-                    *token = true;
-                }
-                index = range.end;
-                placed.push((Span::of(tokens, range), condition));
-            }
-            None => index += 1,
-        }
-    }
-    placed
+    lexicon_matches(tokens, covered, lexicon.max_tokens, |phrase| {
+        lexicon.terms.contains_key(phrase)
+    })
+    .into_iter()
+    .filter_map(|(span, phrase)| {
+        lexicon
+            .terms
+            .get(phrase.as_str())
+            .map(|condition| (span, *condition))
+    })
+    .collect()
 }
 
 /// Every time expression in the tokens no mention covers: a count followed by a unit
@@ -1454,7 +1530,7 @@ fn relationship_type(attribute_type: &str) -> &'static str {
 ///
 /// One pass over the text, so the family rule costs the same whether the text carries
 /// one mention or hundreds.
-fn first_family_cues(tokens: &[Token]) -> HashMap<usize, usize> {
+pub(crate) fn first_family_cues(tokens: &[Token]) -> HashMap<usize, usize> {
     let mut first: HashMap<usize, usize> = HashMap::new();
     for (index, token) in tokens.iter().enumerate() {
         if FAMILY_CUES.contains(&token.lower.as_str()) {
@@ -1464,48 +1540,66 @@ fn first_family_cues(tokens: &[Token]) -> HashMap<usize, usize> {
     first
 }
 
-/// The traits the words around `span` license, beside the one its lexicon entry carries.
+/// Whether one of `cues` stands in the [`CUE_WINDOW_TOKENS`] tokens BEFORE `span`, in
+/// the span's own clause — the window a cue that scopes what follows it reaches over.
+pub(crate) fn cue_precedes(tokens: &[Token], span: &Span, cues: &[&str]) -> bool {
+    let clause = tokens[span.tokens.start].clause;
+    let window_start = span.tokens.start.saturating_sub(CUE_WINDOW_TOKENS);
+    tokens[window_start..span.tokens.start]
+        .iter()
+        .filter(|token| token.clause == clause)
+        .any(|token| cues.contains(&token.lower.as_str()))
+}
+
+/// The names of the traits the words around `span` license, beside the one its lexicon
+/// entry carries. Every name is a member of both ontologies' trait enums, so each
+/// operation maps them onto its own modelled trait shape.
 ///
 /// A negation, hedge or hypothetical cue scopes the mentions that follow it within
 /// [`CUE_WINDOW_TOKENS`] tokens of the same clause; a family reference scopes the rest of
 /// its clause, because it names whose record the rest of the clause is about.
+pub(crate) fn cue_trait_names(
+    tokens: &[Token],
+    span: &Span,
+    first_family_cues: &HashMap<usize, usize>,
+) -> Vec<&'static str> {
+    let clause = tokens[span.tokens.start].clause;
+    let family = first_family_cues
+        .get(&clause)
+        .is_some_and(|&cue| cue < span.tokens.start);
+    let mut names = Vec::new();
+    for (licensed, name) in [
+        (cue_precedes(tokens, span, NEGATION_CUES), TRAIT_NEGATION),
+        (family, TRAIT_PERTAINS_TO_FAMILY),
+        (
+            cue_precedes(tokens, span, HYPOTHETICAL_CUES),
+            TRAIT_HYPOTHETICAL,
+        ),
+        (
+            cue_precedes(tokens, span, LOW_CONFIDENCE_CUES),
+            TRAIT_LOW_CONFIDENCE,
+        ),
+    ] {
+        if licensed {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The traits the words around `span` license, as the modelled ICD-10-CM trait shape.
 fn cue_traits(
     tokens: &[Token],
     span: &Span,
     first_family_cues: &HashMap<usize, usize>,
 ) -> Vec<ICD10CMTrait> {
-    let clause = tokens[span.tokens.start].clause;
-    let mut traits = Vec::new();
-    let window_start = span.tokens.start.saturating_sub(CUE_WINDOW_TOKENS);
-    let near = tokens[window_start..span.tokens.start]
-        .iter()
-        .filter(|token| token.clause == clause);
-    let mut negated = false;
-    let mut hypothetical = false;
-    let mut hedged = false;
-    for token in near {
-        let word = token.lower.as_str();
-        negated |= NEGATION_CUES.contains(&word);
-        hypothetical |= HYPOTHETICAL_CUES.contains(&word);
-        hedged |= LOW_CONFIDENCE_CUES.contains(&word);
-    }
-    let family = first_family_cues
-        .get(&clause)
-        .is_some_and(|&cue| cue < span.tokens.start);
-    for (licensed, name) in [
-        (negated, TRAIT_NEGATION),
-        (family, TRAIT_PERTAINS_TO_FAMILY),
-        (hypothetical, TRAIT_HYPOTHETICAL),
-        (hedged, TRAIT_LOW_CONFIDENCE),
-    ] {
-        if licensed {
-            traits.push(ICD10CMTrait {
-                name: Some(name.to_string()),
-                score: Some(WEIGHT_CUE),
-            });
-        }
-    }
-    traits
+    cue_trait_names(tokens, span, first_family_cues)
+        .into_iter()
+        .map(|name| ICD10CMTrait {
+            name: Some(name.to_string()),
+            score: Some(WEIGHT_CUE),
+        })
+        .collect()
 }
 
 /// The attributes of the mention at `span`: the modifiers standing within
@@ -1632,9 +1726,8 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
 
     // Character offsets, as both modelled offset members document, from the byte offsets
     // the pass works in.
-    let character_starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
-    let character_offset =
-        |byte: usize| i32::try_from(character_starts.partition_point(|&start| start < byte)).unwrap_or(i32::MAX);
+    let character_starts = character_starts(text);
+    let character_offset = |byte: usize| character_offset(&character_starts, byte);
 
     // `Id` is "a monotonically increasing id unique within this response": every entity
     // and every attribute takes the next one, in the order they are written.

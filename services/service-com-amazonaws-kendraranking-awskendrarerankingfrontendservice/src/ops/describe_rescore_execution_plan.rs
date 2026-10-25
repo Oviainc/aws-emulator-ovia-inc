@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `Id`'s 36-character length and pattern are modelled, so a malformed id is
         // already refused with a 400 `ValidationException` before this handler runs.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeRescoreExecutionPlanErrorModeled::InternalServerException(
@@ -188,9 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let now = crate::state::now_millis();
-        let Some(plan) = store.plans.get(&input.id) else {
+        // A plan lives in the region its create was signed for, so an id is resolved in
+        // THIS request's region only: a plan of another region names nothing here.
+        let Some(plan) = store.plan(&region, &input.id) else {
             return Err(
                 DescribeRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
                     crate::state::plan_not_found(),

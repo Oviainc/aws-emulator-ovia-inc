@@ -27,6 +27,8 @@ mod group_tags;
 mod group_untag;
 #[path = "all/grouping_statuses.rs"]
 mod grouping_statuses;
+#[path = "all/list_groups_filters.rs"]
+mod list_groups_filters;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/resource_group_lifecycle.rs"]

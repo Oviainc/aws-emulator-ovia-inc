@@ -6,13 +6,18 @@
 //! handler needs (name keying, ARN building, id minting, policy-document checks,
 //! opaque pagination markers). Handlers reach it through [`service_state`]; they
 //! never keep a second copy of a resource.
+//!
+//! [`authorization`] is the sub-module that answers who a signed request speaks for
+//! and whether that principal's identity-based policies let it do what it asks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    AttachedPermissionsBoundary, InstanceProfile, LoginProfile, Policy, PolicyVersion, Role,
+    AttachedPermissionsBoundary, Group, InstanceProfile, LoginProfile, Policy, PolicyVersion, Role,
     SAMLPrivateKey, ServiceSpecificCredentialMetadata, Tag, User,
 };
+
+pub mod authorization;
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
 /// directly under the account root. The model's `pathType` documentation states
@@ -59,6 +64,11 @@ const USER_ID_PREFIX: &str = "AIDA";
 /// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
 const ROLE_ID_PREFIX: &str = "AROA";
+
+/// The prefix AWS gives an IAM group's unique id. `Group$GroupId` is modelled as
+/// `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
+/// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
+const GROUP_ID_PREFIX: &str = "AGPA";
 
 /// The prefix AWS gives an instance profile's unique id.
 /// `InstanceProfile$InstanceProfileId` is modelled as `idType` (len 16..128, pattern
@@ -125,6 +135,12 @@ pub const MAX_MANAGED_POLICY_CHARACTERS: usize = 6_144;
 /// `LimitExceededException`, whose documentation says "the error message describes
 /// the limit exceeded".
 pub const MAX_USERS_PER_ACCOUNT: usize = 5_000;
+
+/// How many IAM groups one account may hold. AWS's "IAM and STS quotas" page gives
+/// the quota "IAM groups in an account: 300", and a create past it is refused with
+/// `LimitExceededException`, whose documentation says "the error message describes
+/// the limit exceeded". It is also what stops the group map growing without end.
+pub const MAX_GROUPS_PER_ACCOUNT: usize = 300;
 
 /// The status a key IAM has just minted carries. `CreateAccessKey`'s
 /// documentation states "the default status for new keys is Active", and `Active`
@@ -327,6 +343,11 @@ pub const MARKER_SCOPE_USERS: &str = "users";
 /// as a position in the user collection and vice versa.
 pub const MARKER_SCOPE_ROLES: &str = "roles";
 
+/// The marker scope of the account's group collection, which `ListGroups` pages
+/// over. It is its OWN scope, for the same reason the role collection is: a marker
+/// issued while paging groups is not read as a position among the users or roles.
+pub const MARKER_SCOPE_GROUPS: &str = "groups";
+
 /// The marker scope of ONE role's attached managed policies, which
 /// `ListAttachedRolePolicies` pages over. The role's key follows it, so a marker
 /// issued while paging one role's attachments does not name a position in
@@ -350,6 +371,12 @@ pub const MARKER_SCOPE_ROLE_POLICIES: &str = "role-policies";
 /// select within the order rather than changing it.
 pub const MARKER_SCOPE_ENTITIES_FOR_POLICY: &str = "entities-for-policy";
 
+/// The marker scope of the versions of ONE managed policy, which
+/// `ListPolicyVersions` pages over. The policy's ARN follows it, so a marker
+/// issued while paging one policy's versions does not name a position among
+/// another's: see [`policy_versions_marker_scope`].
+pub const MARKER_SCOPE_POLICY_VERSIONS: &str = "policy-versions";
+
 /// The marker scope of the account's alias collection, which
 /// `ListAccountAliases` pages over. It is its OWN scope, exactly as the user and
 /// role collections are, so a marker issued while paging another collection is
@@ -368,6 +395,12 @@ pub const MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS: &str = "service-specific-cr
 /// the same key order (the access key id) whichever user it reports on — the
 /// user selects within the order rather than changing it.
 pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
+
+/// The marker scope of a policy simulation's evaluation results, which
+/// `SimulatePrincipalPolicy` pages over. Unlike the other scopes this one names a
+/// position in a list the request itself determines (its actions and resources), so
+/// the key the marker carries is the INDEX of the next result rather than a store key.
+pub const MARKER_SCOPE_SIMULATION_RESULTS: &str = "simulation-results";
 
 /// The marker scope of the tag set of ONE tagged entity, which IAM's tag-listing
 /// operations page over. The entity's handle follows it, so a marker issued while
@@ -719,6 +752,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// "are not distinguished by case", while `Role::role_name` keeps the case the
     /// name was minted with.
     pub roles: BTreeMap<String, Role>,
+    /// The persisted IAM groups, keyed by [`name_key`] of the group name, for the
+    /// same reason users and roles are: IAM entity names are unique within the
+    /// account and "are not distinguished by case" (`CreateGroup$GroupName`), while
+    /// `Group::group_name` keeps the case the creator chose. `CreateGroup` fills
+    /// this map and `ListGroups` pages over it.
+    pub groups: BTreeMap<String, Group>,
     /// Inline user policies: [`name_key`] of the user name -> [`name_key`] of the
     /// policy name -> the policy. Policy names are case-folded for the same reason
     /// user names are: the model's `CreateUser$UserName` documentation says "user,
@@ -830,6 +869,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub user_id_seq: u64,
     /// Monotonic counter feeding [`next_role_id`](Self::next_role_id).
     pub role_id_seq: u64,
+    /// Monotonic counter feeding [`next_group_id`](Self::next_group_id).
+    pub group_id_seq: u64,
     /// Monotonic counter feeding [`next_policy_id`](Self::next_policy_id).
     pub policy_id_seq: u64,
     /// Monotonic counter feeding
@@ -857,6 +898,16 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_role_id(&mut self) -> String {
         self.role_id_seq += 1;
         unique_id(ROLE_ID_PREFIX, self.role_id_seq)
+    }
+
+    /// Mint the next group's `GroupId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
+    /// is: the counter is bijectively mixed into the suffix, and the id is minted
+    /// once and then stored with the group.
+    pub fn next_group_id(&mut self) -> String {
+        self.group_id_seq += 1;
+        unique_id(GROUP_ID_PREFIX, self.group_id_seq)
     }
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
@@ -1051,6 +1102,30 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The identity-based policies the IAM identity whose ARN is `arn` carries, or
     /// `None` when `arn` names no identity the account holds.
     ///
+    /// The documents alone, which is what a caller evaluating or reading them needs;
+    /// [`principal_sourced_policies`](Self::principal_sourced_policies) is the same
+    /// collection with each document's provenance kept, and is where the collection
+    /// rule itself lives.
+    pub fn principal_policies(&self, arn: &str) -> Option<PrincipalPolicies> {
+        let mut collected = PrincipalPolicies::default();
+        for policy in self.principal_sourced_policies(arn)? {
+            match (policy.document, policy.source) {
+                (Some(document), _) => collected.documents.push(document),
+                // Only an attached managed policy can resolve to no document (see
+                // [`PrincipalPolicies::uncarried`]).
+                (None, PolicySource::Managed { policy_arn, .. }) => {
+                    collected.uncarried.push(policy_arn)
+                }
+                (None, PolicySource::Inline { .. }) => {}
+            }
+        }
+        Some(collected)
+    }
+
+    /// The identity-based policies the IAM identity whose ARN is `arn` carries, each
+    /// with WHERE it comes from, or `None` when `arn` names no identity the account
+    /// holds.
+    ///
     /// An identity's own permissions come from the policies attached to it: the
     /// inline policies embedded in it, plus the DEFAULT version of each managed
     /// policy attached to it — "the default version is the operative version …
@@ -1059,23 +1134,35 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// not one of them, so a role's trust policy — which says who may assume the
     /// role rather than what the role may do — is not collected.
     ///
+    /// The provenance is kept because a caller can be asked about the policies as
+    /// INDIVIDUAL policies rather than as one set: `SimulatePrincipalPolicy`'s
+    /// `PolicyExclusionList` names policies to leave out of a simulation by type, by
+    /// ARN or by inline name and the entity they are attached to, which is decidable
+    /// only from where each document came from.
+    ///
     /// The stored identity answers only when its OWN ARN is the one asked for, the
     /// identity test [`policy_by_arn`](Self::policy_by_arn) applies to a policy: an
     /// ARN carrying another path, another account or another resource type names no
     /// identity of this account's. The collection is read from the STORE alone, the
     /// way every other report of the account's record of an identity's attachments
     /// answers (see [`service_provisioned_role`]), and it writes nothing.
-    pub fn principal_policies(&self, arn: &str) -> Option<PrincipalPolicies> {
+    pub fn principal_sourced_policies(&self, arn: &str) -> Option<Vec<SourcedPolicy>> {
         let source = parse_entity_arn(arn)?;
         let key = name_key(&source.name);
-        let mut collected = PrincipalPolicies::default();
+        let mut collected: Vec<SourcedPolicy> = Vec::new();
+        let embedded = match source.kind {
+            EntityKind::User => &self.user_inline_policies,
+            EntityKind::Role => &self.role_inline_policies,
+            // `PutGroupPolicy` is still scaffolded, so a group embeds no inline
+            // policy; when it is implemented its map joins this collection.
+            EntityKind::Group => &EMPTY_INLINE_POLICIES,
+        };
         let attached: Vec<String> = match source.kind {
             EntityKind::User => {
                 let user = self.users.get(&key)?;
                 if user.arn != arn {
                     return None;
                 }
-                collected.documents = inline_documents(&self.user_inline_policies, &key);
                 // `AddUserToGroup` is still scaffolded, so no user carries a group
                 // membership; when it is implemented, the policies of the groups
                 // the user belongs to join this collection, which is why nothing
@@ -1090,16 +1177,35 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 if role.arn != arn {
                     return None;
                 }
-                collected.documents = inline_documents(&self.role_inline_policies, &key);
                 self.role_attached_policies
                     .get(&key)
                     .map(|attached| attached.iter().cloned().collect())
                     .unwrap_or_default()
             }
-            // `CreateGroup` is still scaffolded, so the account holds no group and
-            // a group's ARN names no identity it holds.
-            EntityKind::Group => return None,
+            EntityKind::Group => {
+                let group = self.groups.get(&key)?;
+                if group.arn != arn {
+                    return None;
+                }
+                // `AttachGroupPolicy` is still scaffolded, so a group the account
+                // holds carries no managed policy attachment; when it is
+                // implemented, those documents join this collection.
+                Vec::new()
+            }
         };
+
+        // The inline policies the identity embeds, ordered by policy name — the
+        // order the embedding map holds them in, so two reads collect them alike.
+        for (_, policy) in embedded.get(&key).into_iter().flatten() {
+            collected.push(SourcedPolicy {
+                source: PolicySource::Inline {
+                    policy_name: policy.policy_name.clone(),
+                    attachment_type: source.kind.resource_type(),
+                    attachment_name: source.name.clone(),
+                },
+                document: Some(policy.policy_document.clone()),
+            });
+        }
         for policy_arn in attached {
             let document = self.resolve_policy(&policy_arn).and_then(|policy| {
                 let default = policy
@@ -1111,10 +1217,13 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                     .get(&default)
                     .and_then(|version| version.document.clone())
             });
-            match document {
-                Some(document) => collected.documents.push(document),
-                None => collected.uncarried.push(policy_arn),
-            }
+            collected.push(SourcedPolicy {
+                source: PolicySource::Managed {
+                    aws_owned: is_aws_managed_policy_arn(&policy_arn),
+                    policy_arn,
+                },
+                document,
+            });
         }
         Some(collected)
     }
@@ -1240,6 +1349,15 @@ pub fn user_arn(path: &str, user_name: &str) -> String {
 /// Built the same way [`user_arn`] is, from the `policy` resource type.
 pub fn policy_arn(path: &str, policy_name: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("policy{path}{policy_name}"))
+}
+
+/// The ARN of an IAM group: `arn:aws:iam::<account>:group<path><name>`.
+///
+/// Built the same way [`user_arn`] is, from the `group` resource type: `path`
+/// already begins and ends with `/`, and IAM is a global service, so the region
+/// segment is empty.
+pub fn group_arn(path: &str, group_name: &str) -> String {
+    ::engine::emulator_arn("iam", "", &format!("group{path}{group_name}"))
 }
 
 /// The ARN of an IAM role: `arn:aws:iam::<account>:role<path><name>`.
@@ -1657,6 +1775,41 @@ pub fn entities_for_policy_marker_scope(policy_arn: &str) -> String {
     format!("{MARKER_SCOPE_ENTITIES_FOR_POLICY}:{policy_arn}")
 }
 
+/// The marker scope of the version collection of the managed policy `policy_arn`
+/// names. See [`MARKER_SCOPE_POLICY_VERSIONS`].
+pub fn policy_versions_marker_scope(policy_arn: &str) -> String {
+    format!("{MARKER_SCOPE_POLICY_VERSIONS}:{policy_arn}")
+}
+
+/// The page key of ONE policy version in the order a reader of a managed policy's
+/// versions enumerates them: the version NUMBER, zero padded, followed by the
+/// version identifier itself.
+///
+/// A version identifier is `v` then a number then an optional dotted suffix
+/// (`policyVersionIdType`'s pattern `^v[1-9][0-9]*(\.[A-Za-z0-9-]*)?$`), so the
+/// identifiers alone do not sort in version order — `v10` precedes `v2` byte by
+/// byte. Padding the number to [`POLICY_VERSION_KEY_DIGITS`] digits makes the byte
+/// order of these keys the numeric order, which is the order the versions were
+/// created in, and appending the identifier keeps the key unique when two
+/// identifiers carry the same number with different suffixes. The byte order IS the
+/// enumeration order, which is what lets a reader resume strictly after the key a
+/// `Marker` names even when the version it named has since been deleted.
+pub fn policy_version_page_key(version_id: &str) -> String {
+    let digits: String = version_id
+        .trim_start_matches('v')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    // An identifier the model's pattern admits always carries a number; one that
+    // somehow does not sorts first rather than being dropped from the order.
+    let number: u64 = digits.parse().unwrap_or(0);
+    format!("{number:0width$}:{version_id}", width = POLICY_VERSION_KEY_DIGITS)
+}
+
+/// How many digits [`policy_version_page_key`] pads a version number to: enough
+/// for every `u64`, so no number can overflow the padding and sort out of order.
+const POLICY_VERSION_KEY_DIGITS: usize = 20;
+
 /// The marker scope of the tag set of the entity `entity_handle` names — an ARN or
 /// an entity key, whichever handle the tag-listing operation takes. See
 /// [`MARKER_SCOPE_ENTITY_TAGS`].
@@ -1863,23 +2016,51 @@ pub struct PrincipalPolicies {
     pub uncarried: Vec<String>,
 }
 
-/// The documents of the inline policies embedded in the entity keyed by `key`,
-/// ordered by policy name — the order the embedding map holds them in, so two reads
-/// collect them the same way.
-fn inline_documents(
-    embedded: &BTreeMap<String, BTreeMap<String, InlinePolicy>>,
-    key: &str,
-) -> Vec<String> {
-    embedded
-        .get(key)
-        .map(|policies| {
-            policies
-                .values()
-                .map(|policy| policy.policy_document.clone())
-                .collect()
-        })
-        .unwrap_or_default()
+/// WHERE one identity-based policy in force on a principal comes from, as
+/// [`principal_sourced_policies`](ComAmazonawsIamAwsidentitymanagementv20100508State::principal_sourced_policies)
+/// reports it.
+///
+/// The two forms an identity-based policy takes are the two the IAM grammar names: a
+/// policy EMBEDDED in the identity (an inline policy, identified by its own name and
+/// the entity it is embedded in) and a managed policy ATTACHED to it (identified by
+/// its ARN, which also says whether AWS or the account owns it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicySource {
+    /// An inline policy embedded in the identity.
+    Inline {
+        /// The policy's own name, as the put that embedded it spelled it.
+        policy_name: String,
+        /// Which kind of identity embeds it: one of [`EntityKind::resource_type`]'s
+        /// words, the same three values the model's `AttachmentType` enum declares.
+        attachment_type: &'static str,
+        /// The friendly name of the identity that embeds it.
+        attachment_name: String,
+    },
+    /// A managed policy attached to the identity.
+    Managed {
+        /// The attached policy's ARN.
+        policy_arn: String,
+        /// Whether that ARN is in AWS's own managed-policy namespace rather than the
+        /// account's ([`is_aws_managed_policy_arn`]).
+        aws_owned: bool,
+    },
 }
+
+/// One identity-based policy in force on a principal: where it comes from, and its
+/// document when this emulator holds one for it (see
+/// [`PrincipalPolicies::uncarried`] for the one case it does not).
+#[derive(Debug, Clone)]
+pub struct SourcedPolicy {
+    /// Where the policy comes from.
+    pub source: PolicySource,
+    /// The document in force: an inline policy's own text, or the default version of
+    /// an attached managed policy.
+    pub document: Option<String>,
+}
+
+/// The embedding map of an identity kind that embeds no inline policy yet — read in
+/// place of one so the collection has a single shape for every identity kind.
+static EMPTY_INLINE_POLICIES: BTreeMap<String, BTreeMap<String, InlinePolicy>> = BTreeMap::new();
 
 /// Every condition context key the IAM policy documents in `documents` reference,
 /// folded to one entry per key and ordered.

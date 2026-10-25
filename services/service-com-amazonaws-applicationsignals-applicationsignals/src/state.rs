@@ -92,10 +92,21 @@ pub const MAX_SLOS: usize = 2_000;
 /// same for the CloudWatch resource it addresses — "You can associate as many as 50 tags
 /// with a CloudWatch resource". The modelled `TagList` bound (`length 0..200`) is wider than
 /// that, so the boundary validator admits a list the service itself refuses and the count is
-/// checked where the tags are attached ([`tag_count_refusal`]). A resource whose own API
+/// checked where the tags are attached ([`tag_count_refusal`] for a create, which starts from
+/// no tags, and [`max_tags_of`] where tags are added to a resource that already carries
+/// some). A resource whose own API
 /// documents no such maximum — the dynamic instrumentation configuration, whose `Tags` doc
-/// states only that the list is optional — is bounded by the modelled `TagList` instead.
+/// states only that the list is optional — is bounded by the modelled `TagList` instead
+/// ([`MAX_TAGS_PER_LIST`]).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The most tags a resource whose API documents NO tag maximum may carry: the modelled
+/// `TagList` maximum (`smithy_query(query="shape",shape="TagList")` -> `length 0..200`),
+/// which is the only bound stated for such a resource.
+///
+/// The boundary validator already holds one REQUEST's list to it; this is the same bound on
+/// the resource's resulting set, which an attachment grows beyond one request's list.
+pub const MAX_TAGS_PER_LIST: usize = 200;
 
 /// The largest page `ListAuditFindings` returns when the caller names no `MaxResults`.
 /// Model doc for the member: "The maximum number of audit findings to return in one
@@ -290,6 +301,44 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 value: value.clone(),
             })
             .collect()
+    }
+
+    /// Attach `tags` to the tag set of the resource stored under `arn`, leaving every other
+    /// tag of that resource in place, and hand back nothing: the stored set is what a later
+    /// read reports.
+    ///
+    /// A tag set is a map from key to value, so attaching is per KEY: a key the resource does
+    /// not carry yet is added, a key it already carries takes the new value, and a key the
+    /// request does not name keeps the value it had. Attaching the same set twice therefore
+    /// leaves the resource exactly as the first call left it. A key named more than once in one
+    /// request resolves to the last value given for it, which is what a map of the request's
+    /// pairs holds. An empty list attaches nothing and leaves no entry behind, so a resource
+    /// that was never tagged stays stored exactly as one holding an empty tag set.
+    pub fn put_tags(&mut self, arn: &str, tags: &[Tag]) {
+        if tags.is_empty() {
+            return;
+        }
+        let stored = self.tags.entry(arn.to_string()).or_default();
+        for tag in tags {
+            stored.insert(tag.key.clone(), tag.value.clone());
+        }
+    }
+
+    /// How many tags the resource stored under `arn` would carry once `tags` were attached by
+    /// [`Self::put_tags`].
+    ///
+    /// Counted over the UNION of the stored keys and the request's, because attaching is per
+    /// key: a request that only re-values keys the resource already carries adds nothing to
+    /// the count, and a key repeated in the request counts once.
+    pub fn tag_count_after_put(&self, arn: &str, tags: &[Tag]) -> usize {
+        let stored = self.tags.get(arn);
+        let added = tags
+            .iter()
+            .filter(|tag| stored.is_none_or(|stored| !stored.contains_key(&tag.key)))
+            .map(|tag| tag.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        stored.map_or(0, BTreeMap::len) + added
     }
 
     /// Detach `keys` from the tag set of the resource stored under `arn`, leaving every
@@ -660,11 +709,16 @@ pub fn validation_envelope(clauses: &[String]) -> String {
 /// The refusal for a request that attaches more tags to one resource than that resource's
 /// API documents, or `None` when the list is within [`MAX_TAGS_PER_RESOURCE`].
 ///
-/// One helper for every operation that attaches a `TagList` to a resource with a documented
-/// tag maximum, so the bound a create enforces is the bound the whole service enforces (the
-/// SLO create today, and `TagResource` once it is implemented). Worded through the same
-/// clause builder the boundary validator uses for a `@length` maximum, because that is what
-/// this is: a maximum on the member's length that the model states too wide to enforce.
+/// One helper for every CREATE that attaches a `TagList` to a resource with a documented tag
+/// maximum, so the bound one create enforces is the bound they all enforce. Worded through
+/// the same clause builder the boundary validator uses for a `@length` maximum, because for a
+/// create that is what this is: a maximum on the member's length that the model states too
+/// wide to enforce, checked against the whole tag set the new resource will carry.
+///
+/// An operation that attaches tags to an EXISTING resource ends up over the maximum through
+/// the tags the resource already carries as much as through the ones the request names, so the
+/// count there is a property of the resource rather than the length of a member — see
+/// [`tag_quota_message`].
 pub fn tag_count_refusal(tags: Option<&[Tag]>) -> Option<String> {
     let count = tags.map_or(0, <[Tag]>::len);
     (count > MAX_TAGS_PER_RESOURCE).then(|| {
@@ -675,6 +729,33 @@ pub fn tag_count_refusal(tags: Option<&[Tag]>) -> Option<String> {
             ),
         )])
     })
+}
+
+/// The most tags the resource an ARN addresses may carry: the maximum that resource's own API
+/// documents where it documents one ([`MAX_TAGS_PER_RESOURCE`]), and the modelled `TagList`
+/// maximum ([`MAX_TAGS_PER_LIST`]) for a kind whose API documents none.
+///
+/// Which KIND an ARN addresses is [`tagged_resource_type`]'s rule, so the bound an attachment
+/// enforces is the bound the create of that same kind enforces — a resource cannot be stored
+/// carrying more tags than a later attachment to it would admit.
+pub fn max_tags_of(resource_arn: &str) -> usize {
+    if tagged_resource_type(resource_arn) == INSTRUMENTATION_CONFIG_RESOURCE_TYPE {
+        MAX_TAGS_PER_LIST
+    } else {
+        MAX_TAGS_PER_RESOURCE
+    }
+}
+
+/// The message of the quota failure for an attachment that would leave one resource carrying
+/// more tags than [`max_tags_of`] admits for its kind.
+///
+/// The limit is on the resource, so the message states it as such: how many tags the
+/// resulting set would hold and the maximum that resource may carry.
+pub fn tag_quota_message(count_after: usize, maximum: usize) -> String {
+    format!(
+        "Attaching these tags would leave the resource with {count_after} tags, \
+         over the quota of {maximum} tags per resource"
+    )
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with: the requirement

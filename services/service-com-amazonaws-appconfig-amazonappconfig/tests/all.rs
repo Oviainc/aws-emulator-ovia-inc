@@ -25,6 +25,8 @@ mod control_plane_fidelity;
 mod create_deployment_strategy;
 #[path = "all/delete_configuration_profile.rs"]
 mod delete_configuration_profile;
+#[path = "all/delete_experiment_definition.rs"]
+mod delete_experiment_definition;
 #[path = "all/delete_hosted_configuration_version.rs"]
 mod delete_hosted_configuration_version;
 #[path = "all/deployment_wire_fidelity.rs"]

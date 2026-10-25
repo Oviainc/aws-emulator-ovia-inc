@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_inputs.rs"]
 mod arn_inputs;
+#[path = "all/automated_reasoning_policies.rs"]
+mod automated_reasoning_policies;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
 #[path = "all/custom_models.rs"]
@@ -37,6 +39,8 @@ mod imported_models;
 mod inference_profiles;
 #[path = "all/marketplace_model_endpoints.rs"]
 mod marketplace_model_endpoints;
+#[path = "all/model_customization_jobs.rs"]
+mod model_customization_jobs;
 #[path = "all/model_import_jobs.rs"]
 mod model_import_jobs;
 #[path = "all/model_invocation_logging.rs"]

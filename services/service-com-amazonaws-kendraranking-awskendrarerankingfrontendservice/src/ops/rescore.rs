@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `OriginalScore` are modelled, so a request violating one of THOSE is already
         // refused with a 400 `ValidationException` before this handler runs. The model
         // puts no UPPER bound on `Documents`, so that one is enforced below.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RescoreErrorModeled::InternalServerException(
                 InternalServerException {
@@ -265,8 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             let now = crate::state::now_millis();
             // A transition the clock already owes is reported as due, so a plan whose
-            // transient span has passed serves this call even if nobody polled it.
-            match store.plans.get(&input.rescore_execution_plan_id) {
+            // transient span has passed serves this call even if nobody polled it. The
+            // plan is resolved in THIS request's region only: a plan created in another
+            // region names nothing here.
+            match store.plan(&region, &input.rescore_execution_plan_id) {
                 None => PlanState::Missing,
                 Some(plan) if plan.status_at(now) != crate::state::STATUS_ACTIVE => {
                     PlanState::NotActive

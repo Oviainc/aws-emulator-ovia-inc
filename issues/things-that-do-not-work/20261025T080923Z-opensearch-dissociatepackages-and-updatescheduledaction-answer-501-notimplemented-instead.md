@@ -1,0 +1,58 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: opensearch.associate-dissociate-packages-concurrent-race-conflict opensearch.update-scheduled-action-conflicting-window-rejected
+Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
+Issue-Key: opensearch.associate-dissociate-packages-concurrent-race-conflict|run#16|AssertionError|assert r_dissoc[1] == "ConflictException", f"unexpected dissociate error code: {results}"
+Issue-Key: opensearch.update-scheduled-action-conflicting-window-rejected|run#10|AssertionError|assert control_code == "ResourceNotFoundException", (
+Issue-Commit: 870f326825aa89e9aec352c0ac8db3065d945cf4
+
+# opensearch: DissociatePackages and UpdateScheduledAction answer 501 NotImplemented instead of their modeled rejections (2 causes)
+
+> _Note: this issue was identified against the code base at commit `870f326825aa89e9aec352c0ac8db3065d945cf4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DissociatePackages
+
+## Description
+Two net-new root causes in the Amazon OpenSearch Service control plane. Both are surfaced by behavioral checks the replay report left UNMARKED (no ALREADY FILED / OWNED marker), i.e. no open issue carries their replay keys: there is no open stub issue for DissociatePackages and none for UpdateScheduledAction (see `list_existing_issues` for opensearch — the closest, 20261025T034451Z-opensearch-associatepackage-associatepackages-createvpcendpoint-answer-notimplemented-instead-of.md, covers AssociatePackage/AssociatePackages/CreateVpcEndpoint and neither of these operations). In both causes the operation answers the scaffold's unmodeled `NotImplemented` where AWS answers a modeled rejection, so the error semantics the checks pin cannot be observed at all.
+
+=== Cause 1 of 2: DissociatePackages answers NotImplemented instead of 409 ConflictException while the domain-package association is mid-transition ===
+Failing check: opensearch.associate-dissociate-packages-concurrent-race-conflict
+AWS: Smithy: DissociatePackages (POST /2021-01-01/packages/dissociateMultiple, required PackageList + DomainName) models ConflictException (client, httpError 409, documented "An error occurred because the client attempts to remove a resource that is currently in use."), ResourceNotFoundException, DisabledOperationException, ValidationException, BaseException and InternalException; `NotImplemented` is NOT a modeled error of this operation. Recorded behavior: with an association already in flight (DomainPackageStatus ASSOCIATING, not yet ACTIVE), a concurrent DissociatePackages for that same domain/package pair is refused with ConflictException — it is neither allowed to silently no-op nor to half-apply; the in-flight association then settles to ACTIVE with exactly ONE association record, and a solo DissociatePackages issued after it settles succeeds (200) and actually removes the association.
+Emulator: DissociatePackages is a scaffold stub that returns HTTP 501 with error code `NotImplemented` ("operation DissociatePackages is scaffolded but not implemented in this emulator") for every call. In the same run the concurrent AssociatePackages did answer ConflictException, so the race is exercised but the dissociate half of it is unobservable, and the whole settle/positive-control tail of the contract (one association record, successful solo dissociation) is unreachable.
+Why: a client that must distinguish "the resource is in use, retry later" (ConflictException, 409, retryable) from "this request is bad" or "the service is unavailable" cannot do so — `NotImplemented` is not in this operation's modeled error set, so typed SDK catch blocks fall through to generic failure and retry logic never fires. Worse, package dissociation is simply impossible against the emulator, so any workflow that attaches a dictionary/plugin package to a domain can never detach it.
+Fix: the DissociatePackages handler (services/service-com-amazonaws-opensearch-amazonopensearchservice/src/ops/dissociate_packages.rs, whose handle() currently returns `Scaffolded::not_implemented("DissociatePackages")` at line 169) plus the domain-package association state it must read and write: reject a dissociation of a pair that is not in a settled state with ConflictException, reject an unknown domain/package with the modeled not-found/validation error, and otherwise transition the association to DISSOCIATING/DISSOCIATED and return the DomainPackageDetailsList. Note the check's tail also reads ListPackagesForDomain, which has its own already-filed stub issue; this cause is about DissociatePackages only.
+Traces: opensearch.associate-dissociate-packages-concurrent-race-conflict.
+
+=== Cause 2 of 2: UpdateScheduledAction answers NotImplemented for a well-formed request instead of 409 ResourceNotFoundException for an unknown ActionID ===
+Failing check: opensearch.update-scheduled-action-conflicting-window-rejected
+AWS: Smithy: UpdateScheduledAction (PUT /2021-01-01/opensearch/domain/{DomainName}/scheduledAction/update; required DomainName, ActionID, ActionType, ScheduleAt; optional DesiredStartTime) models ResourceNotFoundException (client, httpError 409 as modeled), ValidationException (client, 400), ConflictException, SlotNotAvailableException, LimitExceededException, InternalException and BaseException; `NotImplemented` is NOT modeled. Recorded behavior, on an active domain: a fully well-formed request (ActionType=SERVICE_SOFTWARE_UPDATE, ScheduleAt=NOW) naming an ActionID that does not exist is refused with ResourceNotFoundException, while the same unknown ActionID with ScheduleAt=TIMESTAMP and DesiredStartTime omitted is refused with ValidationException — i.e. input validation is applied BEFORE the action lookup, and the two refusals are materially different codes. ListScheduledActions is unchanged by either refusal.
+Emulator: the well-formed request is refused with error code `NotImplemented` (HTTP 501), so no not-found path exists and the validation-before-lookup ordering cannot be demonstrated. The input-validation layer in front of the stub does work (an out-of-enum ActionType is already refused as ValidationException), so only the handler body is missing.
+Why: callers that manage scheduled Auto-Tune / service-software actions cannot tell a stale or mistyped ActionID (ResourceNotFoundException — fixable client-side, do not retry) from a malformed request or an unavailable API; nothing in the scheduled-action lifecycle (reschedule to NOW, PENDING_UPDATE/IN_PROGRESS/COMPLETED status round-trip) can be exercised.
+Fix: the UpdateScheduledAction handler (services/service-com-amazonaws-opensearch-amazonopensearchservice/src/ops/update_scheduled_action.rs, currently a SCAFFOLDED stub) and the per-domain scheduled-action state it must consult: resolve DomainName, then ActionID, returning ResourceNotFoundException when the action is absent, refusing ScheduleAt=TIMESTAMP without DesiredStartTime with ValidationException, and returning the updated ScheduledAction otherwise.
+Note for the fixer: the sibling check opensearch.overly-permissive-scheduled-action-invalid-type-rejected exercises the same operation and is NOT part of this issue — it fails only on the ORDER in which the ActionType enum values are listed inside an otherwise-correct ValidationException message (emulator uses the model's declaration order SERVICE_SOFTWARE_UPDATE, JVM_HEAP_SIZE_TUNING, JVM_YOUNG_GEN_TUNING; the recording shows a different order that neither the model nor AWS documentation specifies), which is a message-text-only difference with no known rule and is deliberately not filed as a defect.
+Traces: opensearch.update-scheduled-action-conflicting-window-rejected.
+
+## Evidence
+Suite: simparity-behavioral-ga-prod-v1. Overall 9/168 passed; opensearch 8/140 passed. Both checks below were reported WITHOUT an ALREADY FILED or OWNED marker.
+
+Cause 1 — opensearch.associate-dissociate-packages-concurrent-race-conflict [mismatch]:
+  AssertionError: unexpected dissociate error code: [('associate', ('err', 'ConflictException')), ('dissociate', ('err', 'NotImplemented'))]
+  Expected: concurrent DissociatePackages against a pair in ASSOCIATING -> ConflictException (HTTP 409); association then settles to ACTIVE with exactly one record in ListPackagesForDomain; a solo DissociatePackages afterwards returns 200 and the association disappears.
+  Actual: DissociatePackages returns HTTP 501 error code 'NotImplemented' ("operation DissociatePackages is scaffolded but not implemented in this emulator"). Handler: services/service-com-amazonaws-opensearch-amazonopensearchservice/src/ops/dissociate_packages.rs:169 returns Scaffolded::not_implemented("DissociatePackages"); the SCAFFOLDED marker is on line 4 of that file.
+  Model: DissociatePackages errors = BaseException 400, ConflictException 409, DisabledOperationException 409, InternalException 500, ResourceNotFoundException 409, ValidationException 400. NotImplemented is not among them.
+
+Cause 2 — opensearch.update-scheduled-action-conflicting-window-rejected [mismatch]:
+  AssertionError: expected the well-formed sibling request (same nonexistent ActionID) to fail ResourceNotFoundException, got 'NotImplemented'
+  Request: UpdateScheduledAction(DomainName=<active domain>, ActionID=<nonexistent>, ActionType='SERVICE_SOFTWARE_UPDATE', ScheduleAt='NOW').
+  Expected: ResourceNotFoundException (modeled httpError 409); and the TIMESTAMP-without-DesiredStartTime variant -> ValidationException (400), with ListScheduledActions unchanged.
+  Actual: error code 'NotImplemented' (HTTP 501). Handler: .../src/ops/update_scheduled_action.rs is a SCAFFOLDED, NOT IMPLEMENTED stub.
+  Model: UpdateScheduledAction errors = BaseException 400, ConflictException 409, InternalException 500, LimitExceededException 409, ResourceNotFoundException 409, SlotNotAvailableException 409, ValidationException 400.
+
+## Steps to Reproduce
+Replay these behavioral checks against the emulator (service token `opensearch`):
+
+1. opensearch.associate-dissociate-packages-concurrent-race-conflict — create an S3 bucket holding a synonyms .txt object and a bucket policy allowing opensearchservice.amazonaws.com s3:GetObject; CreatePackage(PackageType='TXT-DICTIONARY', PackageSource={S3BucketName,S3Key}) and poll DescribePackages until PackageStatus=AVAILABLE. CreateDomain(EngineVersion='OpenSearch_2.11', ClusterConfig={t3.small.search,1}, EBSOptions={gp2,10}) and wait until Created && !Processing. Call AssociatePackages(PackageList=[{PackageID:X}], DomainName=D) to open an ASSOCIATING window, then fire AssociatePackages and DissociatePackages(PackageList=[X], DomainName=D) concurrently behind a threading.Barrier(2). Observe the DissociatePackages error code: expected ConflictException, actual NotImplemented. Then (once it answers) assert the association settles to ACTIVE with exactly one ListPackagesForDomain entry and that a solo DissociatePackages succeeds and removes it.
+
+2. opensearch.update-scheduled-action-conflicting-window-rejected — CreateDomain (minimal single-node domain) and wait until active. Read ListScheduledActions(DomainName=D) for a baseline. Call UpdateScheduledAction(DomainName=D, ActionID='<unique nonexistent id>', ActionType='SERVICE_SOFTWARE_UPDATE', ScheduleAt='NOW') and read the error code: expected ResourceNotFoundException, actual NotImplemented. Then call the same with ScheduleAt='TIMESTAMP' and DesiredStartTime omitted: expected ValidationException, and ListScheduledActions must be unchanged.

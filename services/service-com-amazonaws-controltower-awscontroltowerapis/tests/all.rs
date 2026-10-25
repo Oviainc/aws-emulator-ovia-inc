@@ -33,6 +33,8 @@ mod enabled_control_lifecycle;
 mod enabled_control_update;
 #[path = "all/front_door_validation.rs"]
 mod front_door_validation;
+#[path = "all/landing_zone_identifier.rs"]
+mod landing_zone_identifier;
 #[path = "all/landing_zone_lifecycle.rs"]
 mod landing_zone_lifecycle;
 #[path = "all/landing_zone_reset.rs"]

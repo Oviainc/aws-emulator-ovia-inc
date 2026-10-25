@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelFlow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelFlow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelFlow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a channel flow under the `AppInstanceArn` the request names, from the
+//! processors it declares, and stores it in [`crate::state`] under the ARN it returns —
+//! which `DescribeChannelFlow` then reports. A processor IS a Lambda function, so each
+//! one's `ResourceArn` is resolved against this emulator's Lambda service before anything
+//! is written; see [`crate::state::unresolvable_processor_lambda`] for what that check
+//! can and cannot ground a refusal on.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelFlow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelFlowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelFlow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateChannelFlowErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // `FallbackAction` and `InvocationType` are modelled as enums but arrive as
+        // strings, so the values the model declares are checked here — as `CreateChannel`
+        // checks `Mode` and `Privacy`.
+        for processor in &input.processors {
+            if !FALLBACK_ACTION_VALUES.contains(&processor.fallback_action.as_str()) {
+                return Err(bad_request(format!(
+                    "Processors[{}].FallbackAction must be one of {FALLBACK_ACTION_VALUES:?}; got {:?}",
+                    processor.name, processor.fallback_action
+                )));
+            }
+            let invocation_type = &processor.configuration.lambda.invocation_type;
+            if !INVOCATION_TYPE_VALUES.contains(&invocation_type.as_str()) {
+                return Err(bad_request(format!(
+                    "Processors[{}].Configuration.Lambda.InvocationType must be one of {INVOCATION_TYPE_VALUES:?}; got {invocation_type:?}",
+                    processor.name
+                )));
+            }
+        }
+
+        let idempotency_key = (
+            input.app_instance_arn.clone(),
+            input.client_request_token.clone(),
+        );
+
+        // A replayed `@idempotencyToken` answers with the result the first request
+        // produced, and it is answered BEFORE any processor is resolved: the replay is a
+        // fact this store already holds, so the answer must not depend on a processor's
+        // Lambda still being resolvable (nor pay a round trip per processor to say what
+        // was already decided). The guard is a temporary — nothing is awaited while it is
+        // held.
+        if let Some(first) = state
+            .lock()
+            .remembered_channel_flow(&idempotency_key)
+            .cloned()
+        {
+            return Ok(CreateChannelFlowOutput {
+                channel_flow_arn: Some(first),
+            });
+        }
+
+        // A channel flow's processors are the Lambda functions every message to an
+        // associated channel goes through, and the service resolves them when the flow is
+        // created rather than when a message arrives — so a flow whose processor cannot be
+        // resolved is refused and NOTHING is written. Resolved before the store is locked:
+        // the lock is not held across an await.
+        for processor in &input.processors {
+            let resource_arn = &processor.configuration.lambda.resource_arn;
+            if let Some(reason) =
+                crate::state::unresolvable_processor_lambda(ctx, resource_arn).await
+            {
+                ::tracing::info!(
+                    processor = %processor.name,
+                    %resource_arn,
+                    %reason,
+                    "refusing CreateChannelFlow: a processor's Lambda function could not be \
+                     resolved"
+                );
+                return Err(bad_request(UNINVOKABLE_PROCESSOR_LAMBDA.to_string()));
+            }
+        }
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // Checked again under the write lock the mint happens under: another request
+        // carrying the same token can have been remembered while the processors above
+        // were being resolved, and only one of the two may mint a flow.
+        if let Some(first) = store.remembered_channel_flow(&idempotency_key) {
+            return Ok(CreateChannelFlowOutput {
+                channel_flow_arn: Some(first.clone()),
+            });
+        }
+
+        // A channel flow is a resource OF the app instance, so its ARN extends that app
+        // instance's — exactly as `CreateChannel` derives a `ChannelArn`.
+        let channel_flow_id = store.mint_id(&input.app_instance_arn);
+        let arn = format!("{}/channel-flow/{channel_flow_id}", input.app_instance_arn);
+        let arn_length = arn.chars().count();
+        if arn_length > CHIME_ARN_MAX_LENGTH {
+            return Err(bad_request(format!(
+                "the channel flow ARN derived from AppInstanceArn is {arn_length} characters, over the {CHIME_ARN_MAX_LENGTH}-character ChimeArn limit"
+            )));
+        }
+        if store.channel_flows.contains_key(&arn) {
+            return Err(CreateChannelFlowErrorModeled::ConflictException(ConflictException {
+                code: Some("Conflict".to_string()),
+                message: Some(format!("a channel flow already exists at {arn}")),
+            })
+            .into());
+        }
+        // `DeleteChannelFlow` is the only way a channel flow leaves the store and calling
+        // it is the caller's option, so the store carries a cap of its own; past it this
+        // is a quota refusal, which is the modelled error for exceeding a resource limit.
+        if store.channel_flows.len() >= crate::state::MAX_STORED_CHANNEL_FLOWS {
+            return Err(CreateChannelFlowErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    code: Some("ResourceLimitExceeded".to_string()),
+                    message: Some(format!(
+                        "this emulator stores at most {} channel flows at once; delete a channel flow before creating another",
+                        crate::state::MAX_STORED_CHANNEL_FLOWS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.channel_flows.insert(
+            arn.clone(),
+            crate::state::ChannelFlowRecord {
+                arn: arn.clone(),
+                app_instance_arn: input.app_instance_arn,
+                name: input.name,
+                processors: input.processors,
+                created_millis: now,
+                last_updated_millis: now,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        store.remember_channel_flow(idempotency_key, arn.clone());
+
+        Ok(CreateChannelFlowOutput {
+            channel_flow_arn: Some(arn),
+        })
     }
+}
+
+/// `ChimeArn`'s modelled maximum length, which the derived channel flow ARN must respect.
+const CHIME_ARN_MAX_LENGTH: usize = 1600;
+
+/// What the service states when a processor's Lambda function cannot be invoked.
+///
+/// The REQUIREMENT for this refusal is the modelled `BadRequestException` — HTTP 400 with
+/// `Code` `BadRequest` — and the sentence is the one Amazon Chime SDK Messaging itself
+/// returns for it (observed in the AWS wire recording this behaviour was implemented
+/// against). It names no value from the request, so it is the same sentence for every
+/// caller; which processor it was is logged instead.
+const UNINVOKABLE_PROCESSOR_LAMBDA: &str =
+    "One or more resource Arn provided in the request are invalid as lambda function cannot be invoked";
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> CreateChannelFlowError {
+    CreateChannelFlowErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

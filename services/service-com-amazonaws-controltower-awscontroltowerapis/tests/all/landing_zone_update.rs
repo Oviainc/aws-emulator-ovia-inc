@@ -20,7 +20,7 @@
 //! * an `operationIdentifier` the call returns is fresh and resolves through
 //!   `GetLandingZoneOperation` to an `UPDATE` record — `IN_PROGRESS` before the span,
 //!   `SUCCEEDED` with a stable `endTime` after;
-//! * an identifier no landing zone matches is `ResourceNotFoundException` (404), and
+//! * a landing zone ARN no landing zone matches is `ResourceNotFoundException` (404), and
 //!   nothing is persisted;
 //! * an update against a landing zone with an operation already in flight is
 //!   `ConflictException` (409), and nothing is persisted.
@@ -136,9 +136,6 @@ struct UpdateCase {
     update_version: &'static str,
     update_region: Option<&'static str>,
     update_remediation_types: Option<&'static [&'static str]>,
-    /// Address the landing zone by the bare resource id its ARN ends in rather than by
-    /// the ARN itself; both forms resolve.
-    by_bare_id: bool,
     /// `latestAvailableVersion` once the update is deployed: the numerically later of the
     /// deployed version and the catalog's newest.
     expected_latest_available: &'static str,
@@ -149,7 +146,7 @@ struct UpdateCase {
 /// line, across the major boundary, and its newest), whether the request carries a new
 /// `manifest` or omits it, whether it carries `remediationTypes` (`RemediationType` has
 /// the single value `INHERITANCE_DRIFT`, and the list's length is 1..1), adds them, omits
-/// them, and which of the two identifier forms addresses the landing zone.
+/// them.
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
@@ -160,7 +157,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.2",
             update_region: Some("eu-west-1"),
             update_remediation_types: None,
-            by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -171,7 +167,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.3",
             update_region: None,
             update_remediation_types: None,
-            by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -182,7 +177,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.0",
             update_region: Some("ap-south-1"),
             update_remediation_types: None,
-            by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -193,7 +187,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.3",
             update_region: Some("us-east-1"),
             update_remediation_types: None,
-            by_bare_id: true,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -204,7 +197,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "2.1",
             update_region: Some("ca-central-1"),
             update_remediation_types: None,
-            by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -215,7 +207,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.1",
             update_region: Some("eu-central-1"),
             update_remediation_types: Some(&["INHERITANCE_DRIFT"]),
-            by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
@@ -226,7 +217,6 @@ fn update_cases() -> Vec<UpdateCase> {
             update_version: "3.1",
             update_region: None,
             update_remediation_types: None,
-            by_bare_id: true,
             expected_latest_available: "3.3",
         },
     ]
@@ -255,14 +245,7 @@ async fn an_update_deploys_its_configuration_when_the_clock_makes_the_operation_
             row.created_remediation_types,
         )
         .await;
-        let identifier = if row.by_bare_id {
-            arn.rsplit('/')
-                .next()
-                .expect("an ARN ends in its resource segment")
-                .to_string()
-        } else {
-            arn.clone()
-        };
+        let identifier = arn.clone();
 
         let mut body = serde_json::json!({
             "landingZoneIdentifier": identifier,
@@ -449,13 +432,16 @@ async fn each_update_mints_a_fresh_identifier_and_every_record_keeps_resolving()
     }
 }
 
-/// RULE: an update whose `landingZoneIdentifier` matches no landing zone is
-/// `ResourceNotFoundException` (404) and persists nothing.
+/// RULE: an update whose `landingZoneIdentifier` is a landing zone ARN that matches no
+/// landing zone is `ResourceNotFoundException` (404) and persists nothing.
+///
+/// A value that is not a landing zone ARN at all is a malformed input rather than a
+/// missing resource; that rule is asserted in `landing_zone_identifier`.
 #[tokio::test]
 async fn an_update_of_an_unknown_landing_zone_is_not_found() {
-    // Rows span the forms a client can hold: an identifier of the right shape that was
-    // never minted, a bare resource id, a plain name, and the ARN of a landing zone this
-    // account did hold and deleted (the row whose literal is `None`).
+    // Rows span the landing zone ARNs a client can hold: one of the right shape that was
+    // never minted, one naming another account, one naming another region, and the ARN of
+    // a landing zone this account did hold and deleted (the row whose literal is `None`).
     let cases: Vec<(&str, Option<&str>)> = vec![
         (
             "an ARN no call returned",
@@ -465,10 +451,13 @@ async fn an_update_of_an_unknown_landing_zone_is_not_found() {
             ),
         ),
         (
-            "a bare resource id no call returned",
-            Some("11111111-2222-3333-4444-555555555555"),
+            "an ARN naming another account",
+            Some("arn:aws:controltower:us-west-2:000000000000:landingzone/absent"),
         ),
-        ("a plain name", Some("my-landing-zone")),
+        (
+            "an ARN naming another region",
+            Some("arn:aws:controltower:eu-west-1:123456789012:landingzone/absent"),
+        ),
         ("the ARN of a landing zone that was deleted", None),
     ];
 

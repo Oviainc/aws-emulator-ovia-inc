@@ -32,11 +32,12 @@ use crate::application_status_gates::reach;
 use crate::benefit_application_lifecycle::{error_code, instant, text, Harness, CATALOG};
 
 /// ARNs spanning the forms the modelled `Arn` `@pattern` admits — the shape `ResourceArn`
-/// targets, `^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`
+/// targets, shared with `tests/all/associate_benefit_application_resource.rs`, which
+/// states the mirror rule over the same resource forms: `^arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)$`
 /// (`smithy_query(query="operation",operation="DisassociateBenefitApplicationResource")`):
 /// a service name with a digit and a hyphen, a region and no region, an account and no
 /// account, a `-gov` region, and both the `type/id` and the `type:id` resource forms.
-const RESOURCE_ARNS: [&str; 6] = [
+pub(crate) const RESOURCE_ARNS: [&str; 6] = [
     "arn:aws:s3:::partner-proposals",
     "arn:aws:ec2:us-west-2:000000000000:instance/i-0123456789abcdef0",
     "arn:aws:iam::000000000000:role/PartnerDelivery",
@@ -46,15 +47,18 @@ const RESOURCE_ARNS: [&str; 6] = [
 ];
 
 /// An application id of the modelled `BenefitApplicationId` form that no store holds.
-const UNKNOWN_APPLICATION: &str = "benappl-00000000000001";
+pub(crate) const UNKNOWN_APPLICATION: &str = "benappl-00000000000001";
 
 /// Create one application in `catalog` carrying `resources`, and return its id.
 ///
 /// `CreateBenefitApplication` is the only operation in this slice that can put
-/// associations on a new record (`UpdateBenefitApplication` binds no `AssociatedResources`
-/// member, and `AssociateBenefitApplicationResource` is still a scaffold stub with its own
-/// issue), so every row below starts from a create.
-async fn seed(
+/// associations on a NEW record (`UpdateBenefitApplication` binds no `AssociatedResources`
+/// member, and `AssociateBenefitApplicationResource` adds one association at a time to a
+/// record that already exists), so every row below starts from a create.
+///
+/// Shared with `tests/all/associate_benefit_application_resource.rs`, so both suites drive
+/// the same seeding path.
+pub(crate) async fn seed(
     harness: &Harness,
     case: &str,
     catalog: &str,
@@ -82,7 +86,7 @@ async fn seed(
 ///
 /// A record carrying none omits the member (it is a list the create never stored), which
 /// is the empty vector here.
-fn associated(body: &Value) -> Vec<String> {
+pub(crate) fn associated(body: &Value) -> Vec<String> {
     body["AssociatedResources"]
         .as_array()
         .map(|items| {
@@ -95,8 +99,10 @@ fn associated(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One `DisassociateBenefitApplicationResource` request body.
-fn body(catalog: &str, identifier: &str, resource_arn: &str) -> Value {
+/// One `DisassociateBenefitApplicationResource` request body — the same three members
+/// `AssociateBenefitApplicationResource` binds, so the sibling suite builds its requests
+/// with this too.
+pub(crate) fn body(catalog: &str, identifier: &str, resource_arn: &str) -> Value {
     json!({
         "Catalog": catalog,
         "BenefitApplicationIdentifier": identifier,

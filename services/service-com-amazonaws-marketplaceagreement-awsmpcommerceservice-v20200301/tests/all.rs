@@ -19,6 +19,8 @@ mod agreement_charges;
 mod agreement_entitlements;
 #[path = "all/agreement_lifecycle.rs"]
 mod agreement_lifecycle;
+#[path = "all/agreement_parties.rs"]
+mod agreement_parties;
 #[path = "all/billing_adjustments.rs"]
 mod billing_adjustments;
 #[path = "all/cancellation_request_decisions.rs"]

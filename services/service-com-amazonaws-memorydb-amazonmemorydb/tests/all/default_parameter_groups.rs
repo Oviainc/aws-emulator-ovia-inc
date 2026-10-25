@@ -12,7 +12,9 @@
 //! carries that family's engine defaults and cannot be modified. The rows are not one
 //! recorded name: the families come from `DescribeEngineVersions` itself, for BOTH
 //! engines the service publishes, so every family the catalog reports is covered and a
-//! family added to the catalog later is covered too.
+//! family added to the catalog later is covered too. The default groups the catalog does
+//! not name — the search baselines — are listed in [`EXTRA_DEFAULT_GROUPS`], and the
+//! `default_parameter_group_catalog` suite asserts what each of them reports.
 
 use std::collections::BTreeSet;
 
@@ -41,6 +43,17 @@ const ENGINES: &[&str] = &["redis", "valkey"];
 /// the first generation on), of which these are three the parameter-group suites do not
 /// otherwise assert on a DEFAULT group.
 const BASELINE_PARAMETERS: &[&str] = &["maxmemory-policy", "timeout", "activedefrag"];
+
+/// The default parameter groups an account holds that the engine catalog does NOT name:
+/// the search baseline of a line (named after the line, reporting the line's own family)
+/// and the search PREVIEW family's own group. Source: the `default.*` groups the
+/// recorded MemoryDB endpoint reports for an account that created none; the
+/// `default_parameter_group_catalog` suite asserts each one's family and description.
+const EXTRA_DEFAULT_GROUPS: &[&str] = &[
+    "default.memorydb-redis7.search",
+    "default.memorydb-redis7.search.preview",
+    "default.memorydb-valkey7.search",
+];
 
 /// The parameter group families `DescribeEngineVersions` reports, over every engine.
 async fn catalog_families(router: &MultiServiceRouter) -> BTreeSet<String> {
@@ -255,6 +268,7 @@ async fn every_catalog_family_has_a_default_parameter_group_nobody_created() {
         .map(|group| group["Name"].as_str().unwrap_or_default().to_string())
         .collect();
     let mut expected: Vec<String> = families.iter().map(|f| default_group_name(f)).collect();
+    expected.extend(EXTRA_DEFAULT_GROUPS.iter().map(|name| name.to_string()));
     expected.sort();
     assert_eq!(
         reported, expected,

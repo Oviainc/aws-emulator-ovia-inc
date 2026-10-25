@@ -57,6 +57,8 @@ mod reserved_node_offerings;
 mod reset_cluster_parameter_group;
 #[path = "all/snapshot_access.rs"]
 mod snapshot_access;
+#[path = "all/snapshot_copy_grants.rs"]
+mod snapshot_copy_grants;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]

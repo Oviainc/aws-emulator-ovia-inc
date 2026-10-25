@@ -43,6 +43,8 @@ mod scheduling_policy_teardown_and_conflicts;
 mod service_environment;
 #[path = "all/service_job_capacity_placement.rs"]
 mod service_job_capacity_placement;
+#[path = "all/service_job_listing.rs"]
+mod service_job_listing;
 #[path = "all/service_job_priority_updates.rs"]
 mod service_job_priority_updates;
 #[path = "all/service_job_submission.rs"]

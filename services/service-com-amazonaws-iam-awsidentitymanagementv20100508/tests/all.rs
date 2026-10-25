@@ -23,6 +23,10 @@ mod account_aliases;
 mod aws_managed_policy_catalog;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
+#[path = "all/group_listing.rs"]
+mod group_listing;
+#[path = "all/identity_policy_enforcement.rs"]
+mod identity_policy_enforcement;
 #[path = "all/instance_profile_role_binding.rs"]
 mod instance_profile_role_binding;
 #[path = "all/instance_profile_role_removal.rs"]
@@ -41,6 +45,10 @@ mod login_profiles;
 mod managed_policies;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/policy_simulation.rs"]
+mod policy_simulation;
+#[path = "all/policy_version_listing.rs"]
+mod policy_version_listing;
 #[path = "all/principal_policy_context_keys.rs"]
 mod principal_policy_context_keys;
 #[path = "all/role_attached_policies.rs"]

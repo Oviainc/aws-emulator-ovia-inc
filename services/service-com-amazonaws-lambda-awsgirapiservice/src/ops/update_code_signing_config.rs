@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCodeSigningConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCodeSigningConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCodeSigningConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reconfigures a code-signing configuration already in [`crate::state`], addressed by
+//! the ARN it was minted with: each member the request carries replaces the stored value
+//! and each one it omits leaves the stored value alone. The response is read back out of
+//! the store, so `GetCodeSigningConfig` reports exactly what this call persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCodeSigningConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCodeSigningConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCodeSigningConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCodeSigningConfigErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A configuration is addressed by the ARN it was minted with, which is the key
+        // the store holds it under.
+        let Some(record) = store
+            .code_signing_configs
+            .get_mut(&input.code_signing_config_arn)
+        else {
+            return Err(
+                UpdateCodeSigningConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The resource you requested does not exist. Resource: {}",
+                            input.code_signing_config_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Each member the request carries replaces the stored value, and each one it omits
+        // leaves the stored value alone — the same rule every other update in this service
+        // follows. The identity (the id and the ARN) and the tags are not among the
+        // members this operation models, so they stay as created.
+        let mut changed = false;
+        if let Some(publishers) = input.allowed_publishers {
+            changed |= record.signing_profile_version_arns
+                != publishers.signing_profile_version_arns;
+            record.signing_profile_version_arns = publishers.signing_profile_version_arns;
+        }
+        if let Some(policy) = input
+            .code_signing_policies
+            .and_then(|policies| policies.untrusted_artifact_on_deployment)
+        {
+            changed |= record.untrusted_artifact_on_deployment != policy;
+            record.untrusted_artifact_on_deployment = policy;
+        }
+        if let Some(description) = input.description {
+            changed |= record.description.as_deref() != Some(&*description);
+            record.description = Some(description);
+        }
+        // "The date and time that the Code signing configuration was last modified" (the
+        // model's own `CodeSigningConfig$LastModified` documentation): a call that changed
+        // nothing modified nothing, so it leaves the stamp where it was.
+        if changed {
+            record.last_modified = crate::state::iso8601(now);
+        }
+
+        // Answered by reading the record back out of the store, so
+        // `GetCodeSigningConfig` reports exactly what this call persisted.
+        Ok(UpdateCodeSigningConfigOutput {
+            code_signing_config: record.to_wire(),
+        })
     }
 }

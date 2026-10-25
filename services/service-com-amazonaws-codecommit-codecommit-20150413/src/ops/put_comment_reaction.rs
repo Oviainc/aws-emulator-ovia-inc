@@ -233,11 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        // A deleted comment can no longer be reacted to.
+        // A deleted comment can no longer be reacted to. The refusal carries the
+        // exception's own sentence pair: a reaction is not an edit or a deletion
+        // of the comment itself, and no lead clause is recorded for it.
         if comment.deleted {
             return Err(PutCommentReactionErrorModeled::CommentDeletedException(
                 CommentDeletedException {
-                    message: Some(crate::state::comment_deleted_message(None)),
+                    message: Some(
+                        crate::state::comment_deleted_message(
+                            crate::state::CommentDeletedRefusal::AlreadyDeleted,
+                        )
+                        .to_string(),
+                    ),
                 },
             )
             .into());

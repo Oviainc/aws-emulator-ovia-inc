@@ -370,6 +370,17 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// The requests each web ACL has evaluated, by `(Scope, Id)`: the log
     /// `GetTopPathStatisticsByTraffic` aggregates. See [`BotRequestRecord`].
     pub bot_requests: HashMap<(String, String), Vec<BotRequestRecord>>,
+    /// The live web ACL association of every protected resource: the resource's
+    /// own ARN → the ARN of the web ACL that is in front of it.
+    ///
+    /// Keyed by the RESOURCE, because a protected resource has at most one web
+    /// ACL in front of it — `GetWebACLForResource` answers "the web ACL that is
+    /// associated with the resource", one shape and not a list — while one web ACL
+    /// protects any number of resources, which is the direction
+    /// `ListResourcesForWebACL` reports. A protected resource is NOT a wafv2
+    /// resource: it belongs to another service (see [`PROTECTED_RESOURCE_FORMS`]),
+    /// so it is held by ARN and is not in [`Self::arn_index`].
+    pub web_acl_associations: HashMap<String, String>,
 }
 
 impl ComAmazonawsWafv2Awswaf20190729State {
@@ -742,6 +753,70 @@ impl ComAmazonawsWafv2Awswaf20190729State {
                 })
         })
     }
+
+    /// The web ACL `arn` names, or `None` when it names no web ACL this service
+    /// holds.
+    ///
+    /// The index resolves an ARN to its resource KIND as well as to its identity,
+    /// so an ARN of another kind — an IP set, a rule group, a regex pattern set —
+    /// names no web ACL, and neither does an ARN that was never minted here. That
+    /// is the same stance [`Self::holds_rule_group`] takes.
+    pub fn web_acl_by_arn(&self, arn: &str) -> Option<&WebAclEntry> {
+        match self.arn_index.get(arn)? {
+            ResourceRef::WebAcl { scope, id } => self.web_acls.get(&(scope.clone(), id.clone())),
+            ResourceRef::IpSet { .. }
+            | ResourceRef::RegexPatternSet { .. }
+            | ResourceRef::RuleGroup { .. } => None,
+        }
+    }
+
+    /// Put the web ACL `web_acl_arn` in front of the resource `resource_arn`, and
+    /// answer whether the binding was stored.
+    ///
+    /// A resource has at most ONE web ACL in front of it, so binding a resource
+    /// that is already protected REPLACES its binding rather than adding a second
+    /// one, and re-binding the resource to the web ACL it already carries changes
+    /// nothing. `false` means the web ACL already protects
+    /// [`MAX_PROTECTED_RESOURCES_PER_WEB_ACL`] resources, which is the refusal a
+    /// binding operation reports as its modelled `WAFLimitsExceededException`.
+    pub fn associate_web_acl(&mut self, resource_arn: &str, web_acl_arn: &str) -> bool {
+        let already_bound =
+            self.web_acl_associations.get(resource_arn).map(String::as_str) == Some(web_acl_arn);
+        if !already_bound
+            && self.protected_resources(web_acl_arn).len() >= MAX_PROTECTED_RESOURCES_PER_WEB_ACL
+        {
+            return false;
+        }
+        self.web_acl_associations
+            .insert(resource_arn.to_string(), web_acl_arn.to_string());
+        true
+    }
+
+    /// Every resource ARN the web ACL `web_acl_arn` is in front of, in ARN order
+    /// so one listing of one web ACL always reports them the same way round.
+    pub fn protected_resources(&self, web_acl_arn: &str) -> Vec<&str> {
+        let mut arns: Vec<&str> = self
+            .web_acl_associations
+            .iter()
+            .filter(|(_, bound)| bound.as_str() == web_acl_arn)
+            .map(|(resource, _)| resource.as_str())
+            .collect();
+        arns.sort_unstable();
+        arns
+    }
+
+    /// The web ACL in front of `resource_arn`, or `None` when the resource carries
+    /// no association.
+    pub fn web_acl_for_resource(&self, resource_arn: &str) -> Option<&WebAclEntry> {
+        let web_acl_arn = self.web_acl_associations.get(resource_arn)?;
+        self.web_acl_by_arn(web_acl_arn)
+    }
+
+    /// Take the web ACL away from `resource_arn`, and answer whether one was there
+    /// to take away.
+    pub fn disassociate_web_acl(&mut self, resource_arn: &str) -> bool {
+        self.web_acl_associations.remove(resource_arn).is_some()
+    }
 }
 
 /// The deepest a rule's statement tree may nest.
@@ -768,6 +843,17 @@ pub const MAX_IP_SETS_PER_SCOPE: usize = 100;
 /// [`MAX_WEB_ACLS_PER_SCOPE`]. WAF's published quota is 100 rule groups per Region
 /// per scope.
 pub const MAX_RULE_GROUPS_PER_SCOPE: usize = 100;
+
+/// The most resources one web ACL is put in front of before a binding is refused
+/// with the modelled `WAFLimitsExceededException`.
+///
+/// Unlike [`MAX_WEB_ACLS_PER_SCOPE`] this is NOT a quota WAF publishes: it is this
+/// emulator's own bound on
+/// [`ComAmazonawsWafv2Awswaf20190729State::web_acl_associations`], whose keys are
+/// resource ARNs the caller supplies, so that no caller can grow that map without
+/// limit. It is the same size as the other per-scope bounds, and a web ACL at it
+/// can still be re-bound to a resource it already protects.
+pub const MAX_PROTECTED_RESOURCES_PER_WEB_ACL: usize = 100;
 
 /// The most regex pattern sets this service stores per scope before
 /// `CreateRegexPatternSet` answers its modelled `WAFLimitsExceededException`.
@@ -1572,6 +1658,151 @@ pub fn is_wafv2_resource_arn(value: &str) -> bool {
         && resource_parts.len() == 4
         && matches!(resource_parts[0], "global" | "regional")
         && resource_parts[1..].iter().all(|part| !part.is_empty())
+}
+
+/// One form of protected-resource ARN a web ACL can be put in front of, and the
+/// `ResourceType` value that form names.
+#[derive(Debug)]
+pub struct ProtectedResourceForm {
+    /// The ARN's service-namespace segment (`elasticloadbalancing`, `appsync`, …).
+    pub service: &'static str,
+    /// The ARN's resource part, segment by segment: `Some(literal)` must match
+    /// that segment exactly, `None` is any ONE non-empty segment — a name or an
+    /// id the owning service minted.
+    pub segments: &'static [Option<&'static str>],
+    /// The `ResourceType` value this form names.
+    pub resource_type: &'static str,
+}
+
+impl ProtectedResourceForm {
+    /// `true` when `service` and the slash-separated `parts` of an ARN's resource
+    /// part are this form.
+    fn matches(&self, service: &str, parts: &[&str]) -> bool {
+        self.service == service
+            && parts.len() == self.segments.len()
+            && parts
+                .iter()
+                .zip(self.segments)
+                .all(|(part, segment)| match segment {
+                    Some(literal) => part == literal,
+                    None => !part.is_empty(),
+                })
+    }
+}
+
+/// Every resource form a web ACL can be put in front of through this API.
+///
+/// `AssociateWebACLRequest$ResourceArn` gives the ARN format of each one
+/// (`smithy_query(query="doc",shape="AssociateWebACLRequest",member="ResourceArn")`:
+/// "the ARN must be in one of the following formats"), and `ResourceType`
+/// (`smithy_query(query="shape",shape="ResourceType")`) names the same eight kinds,
+/// so this table is those two lists joined — the catalogue of what a web ACL can
+/// protect, and the only place a protected resource's kind is decided.
+///
+/// A CloudFront distribution is deliberately absent: it is bound to a web ACL
+/// through the distribution's own configuration, not through this API ("use this
+/// for all resource types except for Amazon CloudFront distributions", the
+/// operation's own doc), and `ResourceType` does not list it either.
+pub const PROTECTED_RESOURCE_FORMS: &[ProtectedResourceForm] = &[
+    ProtectedResourceForm {
+        service: "elasticloadbalancing",
+        // `loadbalancer/app/<load-balancer-name>/<load-balancer-id>`: the `app`
+        // segment is an APPLICATION Load Balancer, which is the only kind of load
+        // balancer the list names.
+        segments: &[Some("loadbalancer"), Some("app"), None, None],
+        resource_type: "APPLICATION_LOAD_BALANCER",
+    },
+    ProtectedResourceForm {
+        service: "apigateway",
+        // `/restapis/<api-id>/stages/<stage-name>`, whose leading slash is dropped
+        // before the parts are compared.
+        segments: &[Some("restapis"), None, Some("stages"), None],
+        resource_type: "API_GATEWAY",
+    },
+    ProtectedResourceForm {
+        service: "appsync",
+        // `apis/<GraphQLApiId>`
+        segments: &[Some("apis"), None],
+        resource_type: "APPSYNC",
+    },
+    ProtectedResourceForm {
+        service: "cognito-idp",
+        // `userpool/<user-pool-id>`
+        segments: &[Some("userpool"), None],
+        resource_type: "COGNITO_USER_POOL",
+    },
+    ProtectedResourceForm {
+        service: "apprunner",
+        // `service/<apprunner-service-name>/<apprunner-service-id>`
+        segments: &[Some("service"), None, None],
+        resource_type: "APP_RUNNER_SERVICE",
+    },
+    ProtectedResourceForm {
+        service: "ec2",
+        // `verified-access-instance/<instance-id>`
+        segments: &[Some("verified-access-instance"), None],
+        resource_type: "VERIFIED_ACCESS_INSTANCE",
+    },
+    ProtectedResourceForm {
+        service: "amplify",
+        // `apps/<app-id>`
+        segments: &[Some("apps"), None],
+        resource_type: "AMPLIFY",
+    },
+    ProtectedResourceForm {
+        service: "bedrock-agentcore",
+        // `gateway/<gateway-id>`
+        segments: &[Some("gateway"), None],
+        resource_type: "AGENTCORE_GATEWAY",
+    },
+];
+
+/// The `ResourceType` a listing selects when the request names none: "if you don't
+/// provide a resource type, the call uses the resource type
+/// APPLICATION_LOAD_BALANCER" (`ListResourcesForWebACLRequest$ResourceType`).
+pub const DEFAULT_RESOURCE_TYPE: &str = "APPLICATION_LOAD_BALANCER";
+
+/// The `ResourceType` of the resource `arn` names, or `None` when a web ACL cannot
+/// be put in front of it.
+///
+/// `None` covers both ways an ARN fails this parameter, which WAF reports as one
+/// refusal ("your request references an ARN that is malformed, or corresponds to a
+/// resource with which a web ACL can't be associated",
+/// `WAFInvalidParameterException`): a string that is not an ARN at all, and a
+/// well-formed ARN of a resource kind [`PROTECTED_RESOURCE_FORMS`] does not
+/// catalogue.
+pub fn protected_resource_type(arn: &str) -> Option<&'static str> {
+    let mut segments = arn.split(':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(_region),
+        Some(_account),
+        Some(resource),
+        None,
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return None;
+    };
+    if partition.is_empty() {
+        return None;
+    }
+    // An API Gateway stage's resource part begins with a slash
+    // (`::/restapis/<api-id>/stages/<stage-name>`); every other form does not.
+    let parts: Vec<&str> = resource.trim_start_matches('/').split('/').collect();
+    PROTECTED_RESOURCE_FORMS
+        .iter()
+        .find(|form| form.matches(service, &parts))
+        .map(|form| form.resource_type)
 }
 
 /// The region segment of a scope's ARNs.

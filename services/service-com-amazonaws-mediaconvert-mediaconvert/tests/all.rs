@@ -61,6 +61,8 @@ mod queue_deletion;
 mod queue_hopping;
 #[path = "all/queue_listing.rs"]
 mod queue_listing;
+#[path = "all/queue_name_identity.rs"]
+mod queue_name_identity;
 #[path = "all/queue_pause_gating.rs"]
 mod queue_pause_gating;
 #[path = "all/queue_update.rs"]

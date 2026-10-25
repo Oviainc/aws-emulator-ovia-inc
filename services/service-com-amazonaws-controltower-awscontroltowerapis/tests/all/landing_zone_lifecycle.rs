@@ -14,8 +14,8 @@
 //!   well-formed `Manifest` document and any `remediationTypes` list;
 //! * `latestAvailableVersion` is the NUMERICALLY later of the deployed version and the
 //!   catalog's newest version, so it is never older than what is deployed;
-//! * an identifier a mutating call returns resolves, and an identifier no call returned
-//!   is `ResourceNotFoundException` (404);
+//! * an identifier a mutating call returns resolves, and a landing zone ARN no call
+//!   returned is `ResourceNotFoundException` (404);
 //! * the account holds at most one landing zone.
 
 use std::sync::Arc;
@@ -772,11 +772,13 @@ async fn values_outside_a_modeled_bound_are_refused_and_persist_nothing() {
     }
 }
 
-/// RULE: an identifier no call returned resolves to nothing, so the operation answers
-/// `ResourceNotFoundException` (404) — never a synthesized success.
+/// RULE: an identifier of the right shape that no call returned resolves to nothing, so
+/// the operation answers `ResourceNotFoundException` (404) — never a synthesized success.
 ///
 /// Rows span both identifier kinds and both reporting and mutating operations, on an
-/// empty account AND on an account that holds a different landing zone.
+/// empty account AND on an account that holds a different landing zone. A value that is
+/// not of the right shape at all is a different rule — a malformed input, refused with
+/// `ValidationException` — and is asserted in `landing_zone_identifier`.
 #[tokio::test]
 async fn an_identifier_no_call_returned_is_not_found() {
     // Well-formed per OperationIdentifier's pattern, but never minted here.
@@ -795,9 +797,12 @@ async fn an_identifier_no_call_returned_is_not_found() {
             serde_json::json!({ "landingZoneIdentifier": unknown_arn }),
         ),
         (
-            "get-landingzone on an unknown bare id",
+            "get-landingzone on a landing zone ARN of another region",
             "/get-landingzone",
-            serde_json::json!({ "landingZoneIdentifier": "absent" }),
+            serde_json::json!({
+                "landingZoneIdentifier":
+                    "arn:aws:controltower:eu-west-1:000000000000:landingzone/absent"
+            }),
         ),
         (
             "delete-landingzone on an unknown ARN",
@@ -872,20 +877,27 @@ async fn optional_members_are_reported_as_they_were_supplied() {
     }
 }
 
-/// RULE: a landing zone resolves by either form of its identifier — the ARN it is stored
-/// under, or the bare resource id that ARN ends in.
+/// RULE: a landing zone resolves by the ARN this service reports for it, whichever call
+/// reported it — the one the create handed back and the one the listing reports are the
+/// same identifier, and each resolves to the same landing zone.
 #[tokio::test]
-async fn a_landing_zone_resolves_by_arn_or_by_bare_id() {
+async fn a_landing_zone_resolves_by_the_arn_every_call_reports() {
     let router = emulator();
     let created = create(&router, "3.3", simple_manifest()).await;
     let arn = created.string("arn");
-    let bare_id = arn
-        .split('/')
-        .next_back()
-        .expect("the ARN carries a resource id")
+    let listed = call(&router, "/list-landingzones", serde_json::json!({})).await;
+    let listed_arn = listed
+        .get("landingZones")
+        .get(0)
+        .and_then(|summary| summary.get("arn"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
         .to_string();
 
-    for (case, identifier) in [("full ARN", arn.clone()), ("bare resource id", bare_id)] {
+    for (case, identifier) in [
+        ("the ARN the create reported", arn.clone()),
+        ("the ARN the listing reports", listed_arn),
+    ] {
         let detail = call(
             &router,
             "/get-landingzone",

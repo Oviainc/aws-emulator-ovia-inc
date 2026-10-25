@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_emr_elasticmapreduce::state::MAX_CLUSTERS;
 use service_com_amazonaws_emr_elasticmapreduce::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1430,4 +1431,53 @@ async fn documented_limits_are_enforced_at_their_bounds() {
             "case {label:?}: expected HTTP {expected}, got {status} with {payload}"
         );
     }
+}
+
+/// THE RULE: the account holds a bounded number of clusters, so a launch past that bound
+/// is refused rather than accepted into unbounded growth — probed at the bound and one
+/// past it. A cluster record outlives its cluster (`ListClusters` reports a terminated
+/// one), so terminating does not make room either.
+#[tokio::test]
+async fn the_cluster_ceiling_is_enforced_at_its_bound() {
+    let emr = Emr::new();
+
+    // Up to and including the bound every launch is accepted.
+    for held in 0..MAX_CLUSTERS {
+        let label = format!("cluster {} of {MAX_CLUSTERS}", held + 1);
+        let (status, payload) = emr.call("RunJobFlow", minimal_request(&label)).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200, got {status} with {payload}"
+        );
+    }
+
+    // One past it is refused.
+    let (status, payload) = emr
+        .call("RunJobFlow", minimal_request("one past the ceiling"))
+        .await;
+    assert_refused(
+        "one past the ceiling",
+        status,
+        &payload,
+        "ValidationException",
+    );
+
+    // The refusal stands after the clusters terminate: a terminated cluster is still a
+    // record this account holds.
+    let listed = emr.ok("ListClusters", json!({})).await;
+    let first = listed["Clusters"][0]["Id"]
+        .as_str()
+        .expect("ListClusters must report the clusters this account holds")
+        .to_string();
+    emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [first] }))
+        .await;
+    let (status, payload) = emr
+        .call("RunJobFlow", minimal_request("after a termination"))
+        .await;
+    assert_refused(
+        "after a termination",
+        status,
+        &payload,
+        "ValidationException",
+    );
 }

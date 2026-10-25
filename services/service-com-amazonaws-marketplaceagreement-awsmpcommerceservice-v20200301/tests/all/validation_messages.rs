@@ -366,9 +366,9 @@ async fn a_sort_attribute_is_refused_outside_the_party_type_that_supports_it() {
             "case {:?}: expected HTTP 200, got {} with {:?}",
             case.case, answer.status, answer.body
         );
-        // A served search still reports what the store holds: the caller is the
-        // acceptor of the agreement it accepted and the proposer of nothing, so
-        // a proposer-scoped search selects none of it.
+        // A served search still reports what the store holds: the caller is both
+        // parties of the agreement it accepted, so a search scoped to either
+        // party type selects it.
         let reported: Vec<String> = answer.body["agreementViewSummaries"]
             .as_array()
             .cloned()
@@ -381,11 +381,7 @@ async fn a_sort_attribute_is_refused_outside_the_party_type_that_supports_it() {
                     .to_string()
             })
             .collect();
-        let expected: Vec<String> = if case.party_type == Some("Proposer") {
-            Vec::new()
-        } else {
-            vec![agreement.clone()]
-        };
+        let expected: Vec<String> = vec![agreement.clone()];
         assert_eq!(
             reported, expected,
             "case {:?}: expected {expected:?}, got {:?}",

@@ -141,6 +141,12 @@ mod create_pipeline_bounds;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/computation_model_lifecycle.rs"]
+mod computation_model_lifecycle;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/asset_model_interface_relationship.rs"]
 mod asset_model_interface_relationship;
 
@@ -239,4 +245,9 @@ mod list_queries;
 // of its own. Fold it into the sorted list once the churn settles.
 #[path = "all/gateway_capability_configuration.rs"]
 mod gateway_capability_configuration;
+
+// Declared last for the same reason as the suites above it. Fold it into the
+// sorted list once the churn settles.
+#[path = "all/project_lifecycle.rs"]
+mod project_lifecycle;
 

@@ -27,7 +27,7 @@ const SLO_RESOURCE_TYPE: &str = "Slo";
 /// The ARN of the SLO called `name` in this account and region, as the modelled
 /// `ServiceLevelObjectiveArn` pattern spells it
 /// (`^arn:(aws|aws-us-gov):application-signals:[^:]*:[^:]*:slo/...$`).
-fn slo_arn(name: &str) -> String {
+pub(crate) fn slo_arn(name: &str) -> String {
     format!("arn:aws:application-signals:{REGION}:{ACCOUNT}:slo/{name}")
 }
 

@@ -948,15 +948,24 @@ pub fn subscription_attribute_value_reason(name: &str, value: &str) -> Option<St
     }
 }
 
-/// Why the subscription attribute `name` cannot be set to `value` on a subscription
-/// that delivers over `protocol`, or `None` when it can.
+/// The WHOLE `InvalidParameter` message SNS refuses a subscription attribute with when
+/// the subscription's delivery protocol is not one SNS documents the attribute for, or
+/// `None` when the attribute applies to that protocol.
 ///
 /// SNS documents some subscription attributes for the delivery protocols they have a
 /// meaning for alone, and refuses one set on a subscription of any other protocol:
 /// storing it would leave the subscription reporting a setting nothing it does is
 /// governed by. Shared by every operation that writes a subscription attribute, so the
 /// scope does not depend on which call wrote it.
-pub fn subscription_attribute_protocol_reason(
+///
+/// The message is the complete sentence SNS states for this condition, directly after
+/// `Invalid parameter: ` — this refusal is about the SUBSCRIPTION the attribute was set
+/// on rather than about the value of one request member, so it is not nested in the
+/// `<member> Reason: ` frame this crate frames a member-level constraint failure in.
+/// Recorded evidence: enabling raw message delivery on a `lambda` subscription answers
+/// `400 InvalidParameter` with exactly `Invalid parameter: Delivery protocol [lambda]
+/// does not support raw message delivery.`
+pub fn subscription_attribute_protocol_refusal(
     name: &str,
     value: &str,
     protocol: &str,
@@ -974,8 +983,12 @@ pub fn subscription_attribute_protocol_reason(
         }
         _ => return None,
     };
-    (!scoped.contains(&protocol))
-        .then(|| format!("Delivery protocol [{protocol}] does not support {feature}"))
+    (!scoped.contains(&protocol)).then(|| {
+        format!(
+            "Invalid parameter: Delivery protocol [{protocol}] does not support \
+             {feature}."
+        )
+    })
 }
 
 /// The effective delivery policy of one SUBSCRIPTION: the system defaults, the

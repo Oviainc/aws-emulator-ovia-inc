@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfirmSignUp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfirmSignUp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Accepts the confirmation code a sign-up sent and makes the user's account
+//! active.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfirmSignUp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only the code OUTSTANDING for that user's sign-up is accepted, and accepting it
+//! spends it: the account becomes `CONFIRMED` and the attribute the code was sent to
+//! becomes verified, which is also what makes that value the user's alias.
 //!
 //! ## Shape of an operation
 //!
@@ -239,18 +236,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfirmSignUp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfirmSignUpErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfirmSignUp"))
+        // Request metadata only: the app client in the body names the pool, and
+        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // A code's validity is read against the clock, so an expired one is refused
+        // whether or not anything has swept it.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // This operation models no `UserPoolId`: the app client the request names is
+        // what resolves the pool the user signed up in.
+        let pool = guard
+            .pool_of_client(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        let user_pool_id = pool.id.clone();
+        let client = pool
+            .clients
+            .get(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+        if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
+            return Err(unverified_secret_hash(&input.client_id));
+        }
+        let hides_user_existence = client.hides_user_existence();
+
+        let Some(user) = pool.user(&input.username) else {
+            return Err(if hides_user_existence {
+                not_authorized("Username/client id combination not found.")
+            } else {
+                user_not_found()
+            });
+        };
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        // This operation "confirms the account of a new user" (its own doc): an account
+        // something already confirmed is not one a code confirms again.
+        if user.status != crate::state::UserStatus::Unconfirmed {
+            return Err(not_authorized(&format!(
+                "User cannot be confirmed. Current status is {}",
+                user.status.as_str()
+            )));
+        }
+        let username = user.username.clone();
+
+        // The code is checked against the one STORED for this user's sign-up, and the
+        // record says which attribute the message went to — which is the attribute the
+        // user "confirms ownership of" by answering it.
+        let accepted = user
+            .check_code(
+                &crate::state::CodePurpose::SignUpConfirmation,
+                &input.confirmation_code,
+                now,
+            )
+            .map_err(code_rejected)?;
+        let attribute = accepted.attribute.clone();
+        let destination = accepted.destination.clone();
+
+        // Confirming the value makes it an ACTIVE alias of this user
+        // ([`crate::state::User::alias_is_active`]), and an alias value names ONE user
+        // of the pool: "If `ForceAliasCreation` is `false`, the API throws an
+        // `AliasExistsException` error" for a value another user already holds, and
+        // `true` "migrates the alias from the previous user to the newly created user"
+        // (`ConfirmSignUp.ForceAliasCreation` in this service's model).
+        let migrate_from = if pool.is_alias_attribute(&attribute)
+            && pool.alias_taken(&attribute, &destination, &username)
+        {
+            if !input.force_alias_creation {
+                return Err(alias_exists(&attribute));
+            }
+            pool.users
+                .iter()
+                .find(|(_, other)| {
+                    other.username != username
+                        && other.destination_of(&attribute).as_deref() == Some(destination.as_str())
+                        && other.alias_is_active(&attribute)
+                })
+                .map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+
+        let pool = guard
+            .pool_mut(&user_pool_id)
+            .ok_or_else(internal_error)?;
+        // The migrated alias is no longer the previous holder's: its value stays, but
+        // the flag that made it an alias no longer vouches for it.
+        if let Some(key) = migrate_from {
+            if let Some(flag) = crate::state::verified_flag(&attribute) {
+                if let Some(previous) = pool.users.get_mut(&key) {
+                    previous
+                        .attributes
+                        .insert(flag.to_string(), crate::state::FLAG_UNCONFIRMED.to_string());
+                    previous.user_last_modified_date = now;
+                }
+            }
+        }
+
+        let user = pool.user_mut(&username).ok_or_else(internal_error)?;
+        // "their user account becomes active", and they "confirm ownership of the email
+        // address or phone number that they provided" — so the flag for the attribute
+        // the code was sent to now says the value was confirmed.
+        user.status = crate::state::UserStatus::Confirmed;
+        if let Some(flag) = crate::state::verified_flag(&attribute) {
+            user.attributes
+                .insert(flag.to_string(), crate::state::FLAG_CONFIRMED.to_string());
+        }
+        // The code is accepted ONCE: presenting it again finds nothing outstanding.
+        user.consume_code(&crate::state::CodePurpose::SignUpConfirmation);
+        user.user_last_modified_date = now;
+
+        Ok(ConfirmSignUpOutput {
+            // `Session` is only answered for a confirmation that carries one, to "sign
+            // in your user with the USER_AUTH flow" straight afterwards; this emulator
+            // starts no such session at sign-up, so there is none to continue.
+            session: None,
+        })
     }
+}
+
+/// The modelled refusal a presented code earns: "this exception is thrown if the
+/// provided code doesn't match what the server was expecting"
+/// (`CodeMismatchException`) and "this exception is thrown if a code has expired"
+/// (`ExpiredCodeException`), both of this operation's own modelled errors.
+fn code_rejected(rejection: crate::state::CodeRejection) -> ConfirmSignUpError {
+    match rejection {
+        crate::state::CodeRejection::Mismatch => {
+            ConfirmSignUpErrorModeled::CodeMismatchException(CodeMismatchException {
+                message: Some(crate::state::CODE_MISMATCH_MESSAGE.to_string()),
+            })
+            .into()
+        }
+        crate::state::CodeRejection::Expired => {
+            ConfirmSignUpErrorModeled::ExpiredCodeException(ExpiredCodeException {
+                message: Some(crate::state::EXPIRED_CODE_MESSAGE.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> ConfirmSignUpError {
+    ConfirmSignUpErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException` for a request whose `SecretHash` is not the
+/// one the app client's stored secret expects — including a request that carries none.
+fn unverified_secret_hash(client_id: &str) -> ConfirmSignUpError {
+    not_authorized(&format!(
+        "Unable to verify secret hash for client {client_id}."
+    ))
+}
+
+/// This operation's `UserNotFoundException`. Carries the fixed message of
+/// [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> ConfirmSignUpError {
+    ConfirmSignUpErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `AliasExistsException` for a value another user of the pool
+/// already holds as its alias. The message names the attribute and no stored value,
+/// so it reports which value collided without disclosing whose.
+fn alias_exists(attribute: &str) -> ConfirmSignUpError {
+    ConfirmSignUpErrorModeled::AliasExistsException(AliasExistsException {
+        message: Some(format!(
+            "An account with the given {attribute} already exists."
+        )),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> ConfirmSignUpError {
+    ConfirmSignUpErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ConfirmSignUpError {
+    ConfirmSignUpErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

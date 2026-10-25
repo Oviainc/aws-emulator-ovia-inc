@@ -22,7 +22,7 @@ use service_com_amazonaws_marketplacedeployment_awsmpdeploymentparametersservice
     TAG_CHARACTER_CLASS, TAG_KEY_MAX_LEN, TAG_VALUE_MAX_LEN,
 };
 
-use crate::deployment_parameters::{emulator, error_code, message, provision, put, tag};
+use crate::deployment_parameters::{emulator, error_code, message, provision, put};
 
 /// `Catalog`'s `@pattern`, unanchored. Model value: `^[a-zA-Z_-]+$`
 /// (`smithy_query(query="shape",shape="Catalog")`).
@@ -237,49 +237,47 @@ async fn a_bound_violation_states_the_bound_and_a_sensitive_value_is_not_echoed(
 async fn the_tag_character_class_this_service_states_carries_no_anchors() {
     let (router, engine) = emulator();
     provision(&engine, "AWSMarketplace", "agmt-tags", &["prod-tags"]);
-    let (status, created) = put(
-        &router,
-        "AWSMarketplace",
-        "prod-tags",
-        &json!({
-            "agreementId": "agmt-tags",
-            "deploymentParameter": { "name": "Tagged", "secretString": "s" },
-        }),
-    )
-    .await;
-    assert_eq!(status, 200, "the setup Put must succeed, got {created:?}");
-    let arn = created
-        .get("resourceArn")
-        .and_then(Value::as_str)
-        .expect("a minted resourceArn")
-        .to_string();
 
-    // A tag key or value outside the modelled `TagKey` / `TagValue` is refused by
-    // this service's own tag check (the centralized walk does not report map-key
-    // constraints), which states the same character class — so it is quoted
-    // unanchored there too.
+    // The character class is a constraint of the model's CONSTRAINED tag map, which
+    // only `PutDeploymentParameter$tags` targets — so these rows drive that member.
+    // A tag KEY outside the class is refused by this service's own check (the
+    // centralized walk reports a map's values, not its keys), which states the same
+    // class — so it is quoted unanchored there too. A key past the length bound is
+    // refused by the tagging limit every member keeps, which states a bound and no
+    // class at all.
     let rows: Vec<(&str, Vec<(String, String)>)> = vec![
         (
             "a key carrying a bang",
             vec![("bad!".to_string(), "v".to_string())],
         ),
         (
-            "a value carrying a space",
-            vec![("k".to_string(), "bad value".to_string())],
+            "a key carrying a space",
+            vec![("bad key".to_string(), "v".to_string())],
         ),
         (
             "a key one character past its maximum",
             vec![("k".repeat(TAG_KEY_MAX_LEN + 1), "v".to_string())],
         ),
-        (
-            "a value one character past its maximum",
-            vec![("k".to_string(), "v".repeat(TAG_VALUE_MAX_LEN + 1))],
-        ),
     ];
 
-    for (case, pairs) in rows {
-        let tags = pairs.into_iter().collect();
-        let (status, answer) = tag(&router, &arn, &tags).await;
+    for (index, (case, pairs)) in rows.into_iter().enumerate() {
+        let tags: serde_json::Map<String, Value> = pairs
+            .into_iter()
+            .map(|(key, value)| (key, json!(value)))
+            .collect();
+        // A fresh identity per row: `tags` is applied on the create path, which is
+        // where the member is judged.
+        let (status, answer) = put(
+            &router,
+            "AWSMarketplace",
+            "prod-tags",
+            &json!({
+                "agreementId": "agmt-tags",
+                "deploymentParameter": { "name": format!("Tagged{index}"), "secretString": "s" },
+                "tags": tags,
+            }),
+        )
+        .await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected a 400 refusal, got {status} {answer:?}"
@@ -295,6 +293,53 @@ async fn the_tag_character_class_this_service_states_carries_no_anchors() {
             "case {case:?}: a stated character class carries no anchors, got {reported:?}"
         );
     }
+
+    // A tag VALUE outside the class is reported by the centralized walk, which
+    // quotes the same class unanchored.
+    let (status, answer) = put(
+        &router,
+        "AWSMarketplace",
+        "prod-tags",
+        &json!({
+            "agreementId": "agmt-tags",
+            "deploymentParameter": { "name": "TaggedValue", "secretString": "s" },
+            "tags": { "k": "bad value" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a value outside the class must be 400, got {status} {answer:?}"
+    );
+    let reported = message(&answer);
+    assert!(
+        reported.contains(TAG_CHARACTER_CLASS)
+            && !reported.contains('^')
+            && !reported.contains('$'),
+        "expected the unanchored class, got {reported:?}"
+    );
+
+    // A value past its maximum is the same refusal stating a bound instead of a class.
+    let (status, answer) = put(
+        &router,
+        "AWSMarketplace",
+        "prod-tags",
+        &json!({
+            "agreementId": "agmt-tags",
+            "deploymentParameter": { "name": "TaggedLong", "secretString": "s" },
+            "tags": { "k": "v".repeat(TAG_VALUE_MAX_LEN + 1) },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a value past its maximum must be 400, got {status} {answer:?}"
+    );
+    let reported = message(&answer);
+    assert!(
+        !reported.contains('^') && !reported.contains('$'),
+        "a reported bound carries no anchors, got {reported:?}"
+    );
 
     // The constant the refusals quote is the class itself.
     assert!(

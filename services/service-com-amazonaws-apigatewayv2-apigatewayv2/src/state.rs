@@ -1820,6 +1820,119 @@ pub const MAX_PORTALS: usize = 100;
 /// settles in once `DisablePortal` has run.
 pub const PUBLISH_STATUS_DISABLED: &str = "DISABLED";
 
+/// The `PublishStatus` of a portal that is serving its content, out of
+/// `PUBLISH_STATUS_VALUES`: the value a portal settles in once the publish
+/// `PublishPortal` started has come due.
+pub const PUBLISH_STATUS_PUBLISHED: &str = "PUBLISHED";
+
+/// The `PublishStatus` a portal reports while the publish `PublishPortal` started is
+/// still being built, out of `PUBLISH_STATUS_VALUES`. Not a terminal value: the portal
+/// leaves it for [`PUBLISH_STATUS_PUBLISHED`] once [`PORTAL_BUILD`] has passed.
+pub const PUBLISH_STATUS_PUBLISH_IN_PROGRESS: &str = "PUBLISH_IN_PROGRESS";
+
+/// The `PublishStatus` a portal reports while the publication `DisablePortal` is taking
+/// down is still being removed, out of `PUBLISH_STATUS_VALUES`. Not a terminal value:
+/// the portal leaves it for [`PUBLISH_STATUS_DISABLED`] once [`PORTAL_BUILD`] has
+/// passed.
+pub const PUBLISH_STATUS_DISABLE_IN_PROGRESS: &str = "DISABLE_IN_PROGRESS";
+
+/// The `PreviewStatus` a portal's preview reports while it is still being built, out of
+/// `PREVIEW_STATUS_VALUES` (`PREVIEW_FAILED | PREVIEW_IN_PROGRESS | PREVIEW_READY`,
+/// `smithy_query(query="shape", shape="PreviewStatus")`).
+pub const PREVIEW_STATUS_PREVIEW_IN_PROGRESS: &str = "PREVIEW_IN_PROGRESS";
+
+/// The `PreviewStatus` of a preview that has finished building and can be opened, out
+/// of `PREVIEW_STATUS_VALUES`.
+pub const PREVIEW_STATUS_PREVIEW_READY: &str = "PREVIEW_READY";
+
+/// How long one server-managed portal build takes: the span a publish, a disable or a
+/// preview is still in flight for, after which the clock owes the portal the status
+/// that build settles it in.
+///
+/// A CHOSEN span, not one AWS documents — AWS takes as long as building and
+/// distributing a portal's content takes. What matters is that it is never zero, so a
+/// caller that publishes a portal and immediately reads it back still sees
+/// [`PUBLISH_STATUS_PUBLISH_IN_PROGRESS`] and the refusal that status carries, and that
+/// nothing sleeps for it: the due instant is stored and the status derived from the
+/// clock on every read.
+pub const PORTAL_BUILD: Duration = Duration::from_millis(500);
+
+/// A publish or a disable of a portal that the SERVICE carries out on its own once the
+/// call that asked for it has answered.
+///
+/// Holds the two statuses the build moves between and the instant it is due, so the
+/// status a portal reports is derived from the clock rather than written by whoever
+/// reads it; see [`Portal::settle`].
+#[derive(Debug, Clone)]
+pub struct PortalTransition {
+    /// The `PublishStatus` the portal reports while this build is still in flight.
+    pub in_progress: &'static str,
+    /// The `PublishStatus` the portal settles in once this build is due.
+    pub settled: &'static str,
+    /// When this build is due to finish.
+    pub due_at: SystemTime,
+    /// The publication this build makes, reported once it has settled, or `None` for a
+    /// disable: taking a publication down does not make one, so it leaves the record of
+    /// the last one alone.
+    pub published: Option<PortalPublication>,
+    /// Whether this build is building the portal's content: a publish is, a disable is
+    /// not. Decided by [`PortalBuild::builds_content`] and carried here so
+    /// [`Portal::content_build_in_flight`] can answer it off the build in flight.
+    pub builds_content: bool,
+}
+
+/// What a settled publish reports as the portal's last publication.
+#[derive(Debug, Clone)]
+pub struct PortalPublication {
+    /// The instant the portal was published — the instant the publish finished, which
+    /// is when the content it built went live.
+    pub at: SystemTime,
+    /// The description the publish request carried: "When the portal is published, this
+    /// description becomes the last published description"
+    /// (`PublishPortal$Description`). `None` for a publish that carried none, which
+    /// publishes a version with no description.
+    pub description: Option<String>,
+}
+
+/// What one of the three portal build calls asks the service to do.
+///
+/// Each names what it NEEDS before it can start — the portal's publication still, its
+/// content build free, or nothing at all — which is what decides whether it can start
+/// while the service is already busy with this portal (see [`Portal::start_build`]).
+#[derive(Debug, Clone)]
+pub enum PortalBuild {
+    /// `PublishPortal`: build the portal's content and serve it, recording the
+    /// description the request carried as the last published one.
+    Publish { description: Option<String> },
+    /// `DisablePortal`: take the publication down, after which the portal serves
+    /// nothing.
+    Disable,
+    /// `PreviewPortal`: build a preview of the portal's content, which changes nothing
+    /// about what the portal publishes.
+    Preview,
+}
+
+impl PortalBuild {
+    /// Whether this build needs the portal's publication to be STILL before it can
+    /// start: a publish does, since publishing on top of a publication change still in
+    /// flight would leave two answers for what the portal serves.
+    ///
+    /// A disable does not: taking the publication down is a revocation, which the
+    /// service applies at once and which supersedes a publish still in flight rather
+    /// than queueing behind it.
+    pub fn needs_a_still_publication(&self) -> bool {
+        matches!(self, PortalBuild::Publish { .. })
+    }
+
+    /// Whether this build builds the portal's CONTENT, so it both occupies the content
+    /// build and cannot start while another content build is still in flight: a publish
+    /// builds the content it serves and a preview builds the content it shows, while a
+    /// disable builds nothing — it only stops serving what is already built.
+    pub fn builds_content(&self) -> bool {
+        matches!(self, PortalBuild::Publish { .. } | PortalBuild::Preview)
+    }
+}
+
 /// A persisted `Portal` resource.
 ///
 /// An account-level resource: a portal is not owned by an api, and the resources it
@@ -1847,8 +1960,11 @@ pub struct Portal {
     pub logo_uri: Option<String>,
     pub portal_content: wire::PortalContent,
     pub rum_app_monitor_name: Option<String>,
-    /// One of `PUBLISH_STATUS_VALUES`; [`PUBLISH_STATUS_DISABLED`] for a portal that has
-    /// never been published.
+    /// The TERMINAL `PublishStatus` this portal has settled in, out of
+    /// `PUBLISH_STATUS_VALUES`: [`PUBLISH_STATUS_DISABLED`] for a portal that has never
+    /// been published. An `..._IN_PROGRESS` status is never stored here — it belongs to
+    /// a build still in flight, which [`Portal::transition`] holds and
+    /// [`Portal::settle`] retires.
     pub publish_status: String,
     pub last_modified: SystemTime,
     /// Set only once the portal has been published; `None` until then, so nothing is
@@ -1858,31 +1974,172 @@ pub struct Portal {
     /// "Error information for failed portal operations" — `None` while nothing has
     /// failed.
     pub status_exception: Option<wire::StatusException>,
-    /// The preview this portal's last PreviewPortal produced; `None` until one runs.
-    pub preview: Option<wire::Preview>,
+    /// The publish or disable the service is building, or the last one it built; `None`
+    /// until one is started. See [`Portal::settle`].
+    pub transition: Option<PortalTransition>,
+    /// When the preview this portal's last `PreviewPortal` started is due to be
+    /// ready; `None` until one runs, so nothing is reported for a portal with no
+    /// preview. The `PreviewStatus` is derived from it on every read, so no stored copy
+    /// of it can go stale.
+    pub preview_ready_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
 }
 
 impl Portal {
-    /// Project the record onto the modelled `PortalSummary` shape — the shape that
-    /// carries every member the portal readers report, so each of them projects from
-    /// this one value.
-    pub fn to_wire(&self) -> wire::PortalSummary {
+    /// The change to this portal's PUBLICATION that is still in flight as of `now`,
+    /// named by the `PublishStatus` it reports while it runs, or `None` when the
+    /// publication is not moving.
+    pub fn publication_change_in_flight(&self, now: SystemTime) -> Option<&'static str> {
+        self.transition
+            .as_ref()
+            .filter(|transition| now < transition.due_at)
+            .map(|transition| transition.in_progress)
+    }
+
+    /// The build of this portal's CONTENT that is still in flight as of `now`, named by
+    /// the status it reports while it runs — the `PublishStatus` of a publish, which
+    /// builds the content it serves, or the `PreviewStatus` of a preview — or `None` when
+    /// nothing is being built.
+    pub fn content_build_in_flight(&self, now: SystemTime) -> Option<&'static str> {
+        let publishing = self
+            .transition
+            .as_ref()
+            .filter(|transition| now < transition.due_at && transition.builds_content)
+            .map(|transition| transition.in_progress);
+        let previewing = self
+            .preview_ready_at
+            .filter(|ready_at| now < *ready_at)
+            .map(|_| PREVIEW_STATUS_PREVIEW_IN_PROGRESS);
+        publishing.or(previewing)
+    }
+
+    /// Materialise a publish or disable the CLOCK has already made due: the status it
+    /// settles the portal in, and the publication it made, become the portal's own and
+    /// the build is retired.
+    ///
+    /// Owed at the due instant whether or not anyone called, so the change is the
+    /// clock's rather than this caller's. Readers never have to run it against the
+    /// stored record — [`Portal::to_wire`] settles a copy — so reading a portal writes
+    /// nothing.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self
+            .transition
+            .as_ref()
+            .is_none_or(|transition| now < transition.due_at)
+        {
+            return;
+        }
+        let Some(transition) = self.transition.take() else {
+            return;
+        };
+        self.publish_status = transition.settled.to_string();
+        if let Some(published) = transition.published {
+            self.last_published = Some(published.at);
+            self.last_published_description = published.description;
+        }
+    }
+
+    /// Start one server-managed build on this portal, due [`PORTAL_BUILD`] from `now`.
+    ///
+    /// A build starts only when what it needs is free: a publish needs the publication
+    /// still AND the content build free, a preview needs the content build free, and a
+    /// disable needs nothing — it revokes what the portal serves, so it supersedes a
+    /// publish still in flight (which then publishes nothing) instead of queueing behind
+    /// it. So a preview and a disable run side by side, while a publish runs alone.
+    ///
+    /// `Err` carries the status of the build already in flight, for the caller's
+    /// `ConflictException` — "the requested operation would cause a conflict with the
+    /// current state of a service resource associated with the request" — and leaves the
+    /// record exactly as it was. The refusal lifts of its own accord once the build this
+    /// service already owes comes due.
+    pub fn start_build(&mut self, now: SystemTime, build: PortalBuild) -> Result<(), &'static str> {
+        self.settle(now);
+        if build.needs_a_still_publication() {
+            if let Some(in_flight) = self.publication_change_in_flight(now) {
+                return Err(in_flight);
+            }
+        }
+        if build.builds_content() {
+            if let Some(in_flight) = self.content_build_in_flight(now) {
+                return Err(in_flight);
+            }
+        }
+        let builds_content = build.builds_content();
+        let due_at = now + PORTAL_BUILD;
+        match build {
+            PortalBuild::Publish { description } => {
+                self.transition = Some(PortalTransition {
+                    in_progress: PUBLISH_STATUS_PUBLISH_IN_PROGRESS,
+                    settled: PUBLISH_STATUS_PUBLISHED,
+                    due_at,
+                    published: Some(PortalPublication {
+                        at: due_at,
+                        description,
+                    }),
+                    builds_content,
+                });
+            }
+            PortalBuild::Disable => {
+                self.transition = Some(PortalTransition {
+                    in_progress: PUBLISH_STATUS_DISABLE_IN_PROGRESS,
+                    settled: PUBLISH_STATUS_DISABLED,
+                    due_at,
+                    published: ::std::option::Option::None,
+                    builds_content,
+                });
+            }
+            PortalBuild::Preview => self.preview_ready_at = Some(due_at),
+        }
+        Ok(())
+    }
+
+    /// Project the record onto the modelled `PortalSummary` shape as of `now` — the
+    /// shape that carries every member the portal readers report, so each of them
+    /// projects from this one value.
+    pub fn to_wire(&self, now: SystemTime) -> wire::PortalSummary {
+        // A read must not change what a later caller sees, so the projection settles a
+        // COPY: a build the clock has already made due is reported as settled while the
+        // stored record is left for the next writer to settle.
+        let mut settled = self.clone();
+        settled.settle(now);
+        // Every build the clock owed is retired above, so a transition still held is one
+        // still in flight and the portal reports the status it carries while it runs.
+        let publish_status = match &settled.transition {
+            Some(transition) => transition.in_progress.to_string(),
+            ::std::option::Option::None => settled.publish_status.clone(),
+        };
+        let preview = settled.preview_ready_at.map(|ready_at| wire::Preview {
+            preview_status: if now < ready_at {
+                PREVIEW_STATUS_PREVIEW_IN_PROGRESS
+            } else {
+                PREVIEW_STATUS_PREVIEW_READY
+            }
+            .to_string(),
+            preview_url: Some(portal_preview_url(&settled.endpoint_configuration)),
+            // Nothing failed, so there is no exception to explain.
+            status_exception: ::std::option::Option::None,
+        });
         wire::PortalSummary {
-            authorization: self.authorization.clone(),
-            endpoint_configuration: self.endpoint_configuration.clone(),
-            included_portal_product_arns: self.included_portal_product_arns.clone(),
-            last_modified: to_timestamp(self.last_modified),
-            last_published: self.last_published.map(to_timestamp),
-            last_published_description: self.last_published_description.clone(),
-            portal_arn: self.portal_arn.clone(),
-            portal_content: self.portal_content.clone(),
-            portal_id: self.portal_id.clone(),
-            preview: self.preview.clone(),
-            publish_status: Some(self.publish_status.clone()),
-            rum_app_monitor_name: self.rum_app_monitor_name.clone(),
-            status_exception: self.status_exception.clone(),
-            tags: Some(self.tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            authorization: settled.authorization.clone(),
+            endpoint_configuration: settled.endpoint_configuration.clone(),
+            included_portal_product_arns: settled.included_portal_product_arns.clone(),
+            last_modified: to_timestamp(settled.last_modified),
+            last_published: settled.last_published.map(to_timestamp),
+            last_published_description: settled.last_published_description.clone(),
+            portal_arn: settled.portal_arn.clone(),
+            portal_content: settled.portal_content.clone(),
+            portal_id: settled.portal_id.clone(),
+            preview,
+            publish_status: Some(publish_status),
+            rum_app_monitor_name: settled.rum_app_monitor_name.clone(),
+            status_exception: settled.status_exception.clone(),
+            tags: Some(
+                settled
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
         }
     }
 }
@@ -2611,6 +2868,21 @@ pub fn portal_arn(region: &str, portal_id: &str) -> String {
 /// 3..256 bound; the subdomain label is CHOSEN.
 pub fn portal_default_domain_name(portal_id: &str, region: &str) -> String {
     format!("{portal_id}.portal.{region}.amazonaws.com")
+}
+
+/// The URL a portal's preview is served on.
+///
+/// A preview is the portal's own content served before anything is published, so it is
+/// served on the domain API Gateway generates and manages for the portal
+/// ([`portal_default_domain_name`]) rather than on a domain the account brought, which
+/// need not resolve to the portal yet, under a path of its own.
+///
+/// AWS publishes no format for `Preview$PreviewUrl`, so the path label is CHOSEN; what
+/// the member has to hold is a URL that names THIS portal and is stable across reads,
+/// which it is because it is derived from the endpoint configuration the create
+/// resolved once.
+pub fn portal_preview_url(endpoint: &wire::EndpointConfigurationResponse) -> String {
+    format!("https://{}/preview", endpoint.portal_default_domain_name)
 }
 
 /// How many characters follow the leading `Z` of a hosted zone id, matching the

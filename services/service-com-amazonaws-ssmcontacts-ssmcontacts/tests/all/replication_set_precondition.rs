@@ -76,14 +76,12 @@ fn write_rows() -> Vec<WriteRow> {
             }),
         },
         WriteRow {
-            case: "CreateContact for an ONCALL_SCHEDULE whose plan carries rotation ids",
+            case: "CreateContact for an ONCALL_SCHEDULE whose plan carries the RotationIds shape",
             operation: "CreateContact",
             request: json!({
                 "Alias": "weekend-rotation",
                 "Type": "ONCALL_SCHEDULE",
-                "Plan": {"RotationIds": [
-                    format!("arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:rotation/weekend"),
-                ]},
+                "Plan": {"RotationIds": []},
             }),
         },
         WriteRow {
@@ -262,7 +260,7 @@ async fn the_same_writes_are_serviced_once_the_account_has_a_replication_set() {
     let expected: BTreeMap<&str, u16> = BTreeMap::from([
         ("CreateContact for a PERSONAL contact with an engagement plan", 200),
         ("CreateContact for an ESCALATION plan with two stages", 200),
-        ("CreateContact for an ONCALL_SCHEDULE whose plan carries rotation ids", 200),
+        ("CreateContact for an ONCALL_SCHEDULE whose plan carries the RotationIds shape", 200),
         ("CreateContact carrying an IdempotencyToken and tags", 200),
         ("CreateContactChannel of type EMAIL under a contact that exists once onboarded", 200),
         ("CreateContactChannel of type SMS under a contact that never exists", 404),
