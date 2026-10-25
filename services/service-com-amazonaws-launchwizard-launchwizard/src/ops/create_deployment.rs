@@ -287,14 +287,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `dryRun` checks the request without making it. The model declares no
-        // `DryRunOperation` error for this operation, so a dry run that passes every
-        // check above answers success — and, by definition, persists NOTHING, so it
-        // mints no id to report.
+        // `dryRun` checks the request without making it, and is documented to answer
+        // with an ERROR RESPONSE rather than success: `DryRunOperation` for a caller
+        // who holds the permissions the action needs. A 200 would be
+        // indistinguishable from a create that forgot to report its id, which is the
+        // ambiguity that error code exists to remove. The code is not one this
+        // service's model declares, so it goes out through the unmodeled channel (see
+        // `state::dry_run_operation`). Answered after every check above, so a
+        // pre-flight of a request this service would refuse reports that refusal, and
+        // before anything is written, so it persists NOTHING.
         if input.dry_run {
-            return Ok(CreateDeploymentOutput {
-                deployment_id: None,
-            });
+            return Err(crate::state::dry_run_operation());
         }
 
         // The store lives as long as the process, so it has a ceiling; see

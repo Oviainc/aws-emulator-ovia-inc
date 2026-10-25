@@ -17,6 +17,9 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::ops::types::{
     DEPLOYMENT_FILTER_KEY_VALUES, DEPLOYMENT_STATUS_VALUES, EVENT_STATUS_VALUES,
 };
+use service_com_amazonaws_launchwizard_launchwizard::state::{
+    DRY_RUN_OPERATION_CODE, DRY_RUN_OPERATION_STATUS,
+};
 
 // The HTTP harness, the signing region and the pagination walker are shared with the
 // other suites in this crate rather than copied — see `tests/all/harness.rs`.
@@ -456,8 +459,9 @@ async fn a_dry_run_validates_and_stores_nothing() {
         before["deployments"]
     );
 
-    // A dry run that passes every check succeeds and mints no id — because it stored
-    // no record for an id to name.
+    // A dry run that passes every check is answered with the documented pre-flight
+    // ERROR response rather than success, and stores nothing — see
+    // `tests/all/dry_run_preflight.rs` for the rule's own table.
     for (workload, pattern, name) in [
         ("SAP", "SapHanaSingle", "dry-one"),
         ("SQLServer", "SqlServerHA", "dry-two"),
@@ -465,10 +469,12 @@ async fn a_dry_run_validates_and_stores_nothing() {
     ] {
         let case = format!("dry run {workload}/{pattern}");
         let body = harness
-            .ok(
+            .refused(
                 &case,
                 "/createDeployment",
                 create_body(&harness, workload, pattern, name, true).await,
+                DRY_RUN_OPERATION_STATUS,
+                DRY_RUN_OPERATION_CODE,
             )
             .await;
         assert!(
