@@ -9,8 +9,10 @@
 //! * [`Monitor`] — what `CreateMonitor` inserts, `GetMonitor` / `ListMonitors`
 //!   report and `DeleteMonitor` removes.
 //! * [`Probe`] — what `CreateProbe` attaches to a monitor and `DeleteProbe`
-//!   detaches. There is no second probe index: `GetMonitor`'s `probes` list is
-//!   the stored map, so a probe can never appear in one place and not the other.
+//!   starts tearing down ([`Probe::start_teardown`]), which leaves the record in
+//!   place until the clock has carried its teardown through. There is no second
+//!   probe index: `GetMonitor`'s `probes` list is the stored map, so a probe can
+//!   never appear in one place and not the other.
 //!
 //! Those records are held PER REGION
 //! ([`ComAmazonawsNetworkmonitorNetworkmonitorState`]): the service answers on a
@@ -74,6 +76,16 @@ pub const PROBE_STATE_ACTIVE: &str = "ACTIVE";
 /// `ProbeState` of a probe a caller has switched off: it keeps its
 /// configuration but sends no packets.
 pub const PROBE_STATE_INACTIVE: &str = "INACTIVE";
+/// `ProbeState` of a probe whose teardown has been accepted and is under way
+/// (model enum `ProbeState`). SERVICE-ASSIGNED and TRANSIENT: an accepted
+/// `DeleteProbe` puts the probe here and the clock owes it
+/// [`PROBE_STATE_DELETED`] ([`PROBE_TEARDOWN_STAGE`]).
+pub const PROBE_STATE_DELETING: &str = "DELETING";
+/// `ProbeState` of a probe whose teardown has finished. SERVICE-ASSIGNED and
+/// TRANSIENT: the record is still readable, and the clock owes its removal one
+/// more [`PROBE_TEARDOWN_STAGE`], after which a read of the probe reports it
+/// not found.
+pub const PROBE_STATE_DELETED: &str = "DELETED";
 
 /// The `ProbeState` values a CALLER may ask a probe to be put into.
 ///
@@ -141,6 +153,17 @@ const DESTINATION_REQUIREMENT: &str = "Member must be an IPv4 or IPv6 address";
 /// the due instant is stored on the record ([`Monitor::activates_at`],
 /// [`Probe::activates_at`]) so no handler ever sleeps for it.
 pub const ACTIVATION_AFTER: Duration = Duration::from_millis(500);
+
+/// How long one stage of a probe's TEARDOWN lasts: the span from the accepted
+/// delete to the `DELETING` -> `DELETED` transition, and the span from there to
+/// the record being forgotten.
+///
+/// A CHOSEN span, not a documented one: AWS takes as long as releasing the
+/// probe's network path needs. It is deliberately non-zero, so a caller that
+/// reads the probe straight after deleting it still observes the teardown
+/// states, and the due instant is stored on the record ([`Probe::deletes_at`])
+/// so no handler ever sleeps for it.
+pub const PROBE_TEARDOWN_STAGE: Duration = Duration::from_millis(300);
 
 /// The HTTP status a successful TAG MUTATION answers with.
 ///
@@ -593,6 +616,7 @@ pub fn build_probe(
         activates_at: now
             .checked_add(ACTIVATION_AFTER)
             .unwrap_or(now),
+        deletes_at: None,
         tags: spec.tags,
         created_at: now,
         modified_at: now,
@@ -692,6 +716,13 @@ pub struct Probe {
     /// When the clock owes this probe its `PENDING` -> `ACTIVE` transition. See
     /// [`ACTIVATION_AFTER`].
     pub activates_at: SystemTime,
+    /// When the clock owes this probe its `DELETING` -> `DELETED` transition,
+    /// set by the accepted `DeleteProbe` that started its teardown; `None` for a
+    /// probe nothing has asked to delete. A probe that carries one is being torn
+    /// down ([`Probe::is_being_torn_down`]) and leaves the store one
+    /// [`PROBE_TEARDOWN_STAGE`] after that instant
+    /// ([`Probe::is_forgotten_at`]).
+    pub deletes_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
@@ -712,6 +743,55 @@ impl Probe {
         }
     }
 
+    /// Accept this probe's deletion: tearing a probe down is asynchronous, so
+    /// the record STAYS, moves into the teardown half of its lifecycle
+    /// ([`PROBE_STATE_DELETING`]) and the clock owes it the rest
+    /// ([`PROBE_TEARDOWN_STAGE`]).
+    ///
+    /// Idempotent, as the modelled operation that calls it is: a probe already
+    /// being torn down keeps the instants the first accepted delete set, so a
+    /// repeat neither postpones the teardown nor restarts it.
+    pub fn start_teardown(&mut self, now: SystemTime) {
+        if self.is_being_torn_down() {
+            return;
+        }
+        self.state = PROBE_STATE_DELETING.to_string();
+        self.deletes_at = Some(now.checked_add(PROBE_TEARDOWN_STAGE).unwrap_or(now));
+    }
+
+    /// Whether this probe's teardown has been accepted. Such a probe is still
+    /// reported, in its teardown state, but it is on its way out: its teardown
+    /// is irreversible, so no later call puts it back into service.
+    pub fn is_being_torn_down(&self) -> bool {
+        self.deletes_at.is_some()
+    }
+
+    /// Whether this probe's teardown finished long enough ago that the record is
+    /// no longer readable at `now` — from then on a read of it is not-found.
+    pub fn is_forgotten_at(&self, now: SystemTime) -> bool {
+        self.deletes_at.is_some_and(|deletes_at| {
+            deletes_at
+                .checked_add(PROBE_TEARDOWN_STAGE)
+                .is_some_and(|forgotten_at| now >= forgotten_at)
+        })
+    }
+
+    /// Materialise the lifecycle transition the clock has already made due for
+    /// THIS probe: `PENDING` -> `ACTIVE` once its activation instant has passed,
+    /// and `DELETING` -> `DELETED` once its teardown instant has. A probe being
+    /// torn down owes nothing else: the teardown outranks the activation, so a
+    /// probe deleted while still provisioning never becomes `ACTIVE`.
+    fn settle(&mut self, now: SystemTime) {
+        if let Some(deletes_at) = self.deletes_at {
+            if now >= deletes_at {
+                self.state = PROBE_STATE_DELETED.to_string();
+            }
+            return;
+        }
+        if self.state == PROBE_STATE_PENDING && now >= self.activates_at {
+            self.state = PROBE_STATE_ACTIVE.to_string();
+        }
+    }
 }
 
 /// A monitor: the container `CreateMonitor` inserts, holding its own probes.
@@ -912,22 +992,35 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         format!("probe-{nanos:016x}{seq:08x}")
     }
 
-    /// Materialise the transition the clock has already made due, for ONE
+    /// Materialise the transitions the clock has already made due, for ONE
     /// monitor and its probes.
     ///
-    /// This is the ONLY write a reporting operation performs: a monitor whose
+    /// These are the ONLY writes a reporting operation performs: a monitor whose
     /// `activates_at` has passed was owed its activation at that instant whether
-    /// or not anybody called, so a read settles it before reporting. Nothing
-    /// else about the monitor changes, and `modified_at` is NOT touched: the
-    /// caller modified nothing.
+    /// or not anybody called, and a probe whose teardown instants have passed
+    /// was owed its `DELETED` state, and then its removal, at those instants, so
+    /// a read settles them before reporting. Nothing else about the monitor
+    /// changes, and `modified_at` is NOT touched: the caller modified nothing.
+    ///
+    /// The order is removal first, then the per-probe transition: a probe whose
+    /// teardown finished long enough ago is not reported at all, and one still
+    /// within its teardown is reported in the state that teardown has reached.
     pub fn settle_monitor(&mut self, region: &str, monitor_name: &str, now: SystemTime) {
         let Some(monitor) = self.monitor_mut(region, monitor_name) else {
             return;
         };
+        monitor.probes.retain(|_, probe| !probe.is_forgotten_at(now));
         for probe in monitor.probes.values_mut() {
-            if probe.state == PROBE_STATE_PENDING && now >= probe.activates_at {
-                probe.state = PROBE_STATE_ACTIVE.to_string();
+            probe.settle(now);
+        }
+        // A monitor left holding no probe has nothing to aggregate, so the
+        // teardown of its last probe takes its activation away with it — the
+        // same state a monitor created without probes is in.
+        if monitor.probes.is_empty() {
+            if monitor.state != MONITOR_STATE_INACTIVE || monitor.activates_at.is_some() {
+                monitor.clear_activation();
             }
+            return;
         }
         if monitor.state == MONITOR_STATE_PENDING
             && monitor

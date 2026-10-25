@@ -167,48 +167,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `nextToken` is opaque: the only thing it has to be is one of THIS operation's
         // own cursors. Anything that does not decode to one was never issued here, and is
         // refused with the service's one fixed invalid-token text, the same as every other
-        // token member.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => match crate::state::parse_reports_page_token(token) {
-                Some(position) => position,
-                None => {
-                    return Err(ListReportsErrorModeled::ValidationException(
-                        crate::state::invalid_token(),
-                    )
-                    .into())
-                }
-            },
-        };
+        // token member — the shared judgement, lifted into this operation's own error.
+        let resume_at = crate::state::resume_position(
+            input.next_token.as_deref(),
+            crate::state::parse_reports_page_token,
+        )
+        .map_err(ListReportsErrorModeled::ValidationException)?;
 
         let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
-        let mut reports = Vec::with_capacity(page_size.min(store.reports.len()));
-        let mut next_token = None;
-        let mut position = 0usize;
-        for report in store.reports.values() {
-            // A report exists because AWS published a version of it; one holding none has
-            // nothing to summarise, and is passed over rather than reported empty.
-            // Resolved BEFORE the page-full check, so a cursor is only ever cut at an
-            // entry this operation would really report: a token always implies a further
-            // item, never a trailing empty page.
-            let Some(latest) = report.resolve(None) else {
-                continue;
-            };
-            // Resume at the cursor's position in this operation's own total order.
-            if position < resume_at {
-                position += 1;
-                continue;
-            }
-            if reports.len() >= page_size {
-                next_token = Some(crate::state::reports_page_token(position));
-                break;
-            }
-            reports.push(report.to_summary(latest, &region));
-            position += 1;
-        }
+        // The catalog entries this operation reports, each with the version it reports:
+        // a report exists because AWS published a version of it, so one holding none has
+        // nothing to summarise and is passed over rather than reported empty. Resolved
+        // BEFORE the walk, so a cursor is only ever cut at an entry this operation would
+        // really report — a token always implies a further item, never a trailing empty
+        // page — and the position it carries counts only reported entries.
+        let published = store
+            .reports
+            .values()
+            .filter_map(|report| report.resolve(None).map(|latest| (report, latest)));
+        // The service's one page-walk rule: resume at the cursor's position in this
+        // operation's own total order, cut the page at `maxResults`.
+        let (reports, next_token) = crate::state::walk_page(
+            published,
+            resume_at,
+            page_size,
+            crate::state::reports_page_token,
+            |(report, latest)| report.to_summary(latest, &region),
+        );
 
         Ok(ListReportsOutput {
             reports: Some(reports),
