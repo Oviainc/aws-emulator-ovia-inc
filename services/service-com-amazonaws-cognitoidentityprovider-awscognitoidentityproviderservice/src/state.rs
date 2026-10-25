@@ -1073,6 +1073,20 @@ impl UserPool {
             .find(|stored| stored.domain == domain)
     }
 
+    /// Take this pool's domain under the name `domain` out of the pool — its
+    /// prefix domain or its custom one — and hand back the record that was
+    /// stored, or `None` when this pool holds no domain of that name.
+    ///
+    /// The two slots are the same resource kind under `UserPoolType.Domain` and
+    /// `UserPoolType.CustomDomain`, so a delete clears whichever one holds the
+    /// name and leaves the other in place.
+    pub fn remove_domain_named(&mut self, domain: &str) -> Option<UserPoolDomain> {
+        [&mut self.domain, &mut self.custom_domain]
+            .into_iter()
+            .find(|slot| slot.as_ref().is_some_and(|stored| stored.domain == domain))
+            .and_then(Option::take)
+    }
+
     /// The modelled view of this pool, rendered from what is stored.
     pub fn to_user_pool_type(&self) -> UserPoolType {
         UserPoolType {
