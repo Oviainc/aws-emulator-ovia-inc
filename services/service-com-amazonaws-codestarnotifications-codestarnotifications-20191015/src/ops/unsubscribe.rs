@@ -141,13 +141,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // ONE region-scoped lookup. This operation models no not-found error, so a rule
-        // this region does not hold is refused with the one client error it does model.
+        // this region does not hold is refused with the one client error it does model —
+        // stating the same absence the not-found paths state, named by the rule ID the
+        // submitted ARN carries.
         let arn = input.arn.clone();
         let detached = {
             let Some(rule) = store.rule_in_region_mut(&region, &arn) else {
-                return Err(invalid(format!(
-                    "No notification rule matches the ARN {arn}"
-                )));
+                return Err(invalid(st::no_rule_with_identifier(st::rule_id_of_arn(
+                    &arn,
+                ))));
             };
             let before = rule.targets.len();
             rule.targets
