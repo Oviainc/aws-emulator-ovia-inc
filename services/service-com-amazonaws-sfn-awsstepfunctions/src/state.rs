@@ -129,6 +129,17 @@ pub const VALIDATION_REASON_MISSING_PARAMETER: &str = "MISSING_REQUIRED_PARAMETE
 pub const VALIDATION_REASON_INVALID_ROUTING_CONFIGURATION: &str =
     "INVALID_ROUTING_CONFIGURATION";
 
+/// `ValidationExceptionReason`'s member for a configuration change asked of a Map
+/// Run that has already finished, from the same enum.
+pub const VALIDATION_REASON_COMPLETED_MAP_RUN: &str = "CANNOT_UPDATE_COMPLETED_MAP_RUN";
+
+/// What the modelled `ValidationException` says when the Map Run a configuration
+/// change was asked of has already reached a terminal status: `UpdateMapRun`
+/// "updates an IN-PROGRESS Map Run's configuration", so there is nothing left for
+/// the change to govern. It states that rule and names no value of the request, the
+/// way [`LABELED_ARN_MESSAGE`] does.
+pub const COMPLETED_MAP_RUN_MESSAGE: &str = "Cannot update a completed Map Run";
+
 /// What the modelled `ValidationException` says about a map-run labeled state
 /// machine ARN, on every operation that documents refusing one. It names nothing
 /// from the request, so every such operation answers exactly this.
@@ -1424,6 +1435,62 @@ pub struct MapRun {
 pub struct PendingMapRunOutcome {
     pub due_at: SystemTime,
     pub status: String,
+}
+
+/// What a Map Run reports as its `maxConcurrency` for a declared limit of `limit`:
+/// the limit itself, and the largest value the modelled integer carries for a limit
+/// of `0`.
+///
+/// `MaxConcurrency`'s own default is `0`, which the Amazon States Language defines as
+/// NO limit, and a Map Run reports its limit through a modelled integer: an unlimited
+/// Map Run therefore reports the largest value that integer carries, rather than a
+/// `0` a client would read as "none at a time". RECORDED: `DescribeMapRun` on a `Map`
+/// state that declares no `MaxConcurrency` answers `2147483647`
+/// (`sfn.describe-map-run-default-fields-and-execution-counts`).
+///
+/// One rule for both the `Map` state that declares the limit ([`asl`]) and the
+/// `UpdateMapRun` that changes it, so one Map Run never reports "no limit" two ways.
+pub fn reported_max_concurrency(limit: i64) -> i32 {
+    if limit <= 0 {
+        i32::MAX
+    } else {
+        i32::try_from(limit).unwrap_or(i32::MAX)
+    }
+}
+
+/// Whether a Map Run whose items turned out this way stayed INSIDE the failure
+/// thresholds it ran under.
+///
+/// `toleratedFailureCount` is "the maximum number of failed items before the Map Run
+/// fails" and `toleratedFailurePercentage` "the maximum percentage of failed items"
+/// before it does, so either threshold on its own is enough to tolerate the
+/// failures: a run is past what it tolerates only when more items failed than the
+/// count AND than that share of them. A percentage of `0` — the member's own default
+/// — is no share at all, so it tolerates nothing by itself.
+///
+/// The interpreter decides a `Map` state's outcome with this ([`asl`]), which is also
+/// what the Map Run's status reports.
+pub fn within_tolerated_failures(
+    failed: i64,
+    total: i64,
+    tolerated_count: i64,
+    tolerated_percentage: f64,
+) -> bool {
+    failed <= tolerated_count
+        || (tolerated_percentage > 0.0
+            && (failed as f64) * 100.0 <= tolerated_percentage * (total as f64))
+}
+
+/// Why an `UpdateMapRun` was not applied; see
+/// [`ComAmazonawsSfnAwsstepfunctionsState::update_map_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapRunUpdateRejection {
+    /// The store holds no Map Run under that ARN — the modelled `ResourceNotFound`.
+    NotFound,
+    /// The Map Run has already reached a terminal status, so it has no in-progress
+    /// configuration to change — the modelled `ValidationException` carrying
+    /// [`VALIDATION_REASON_COMPLETED_MAP_RUN`].
+    Completed,
 }
 
 impl MapRun {
@@ -3062,6 +3129,60 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.pending_map_runs.retain(|pending| pending != &arn);
         self.pending_map_runs.push(arn.clone());
         self.map_runs.insert(arn, record);
+    }
+
+    /// Apply `UpdateMapRun`'s configuration to the Map Run `arn` names.
+    ///
+    /// Only the members the request CARRIED are changed; the others keep what the
+    /// `Map` state declared, because the request states a change to the settings it
+    /// names and says nothing about the rest.
+    ///
+    /// What the Map Run's items PRODUCED is not touched, and neither is the status
+    /// they left it owed: the iterations are not re-run by a configuration change,
+    /// and the execution around the Map Run reached its own outcome through the same
+    /// `Map` state under the thresholds that state declared — so re-deciding the Map
+    /// Run's status here alone would leave the two contradicting each other, with a
+    /// Map Run reported as succeeded inside an execution reported as failed at it.
+    ///
+    /// Call [`Self::settle`] first, so a Map Run the clock has already finished is
+    /// refused as the completed Map Run it is.
+    pub fn update_map_run(
+        &mut self,
+        arn: &str,
+        max_concurrency: Option<i32>,
+        tolerated_failure_count: Option<i64>,
+        tolerated_failure_percentage: Option<f32>,
+    ) -> Result<(), MapRunUpdateRejection> {
+        let Some(map_run) = self.map_runs.get_mut(arn) else {
+            return Err(MapRunUpdateRejection::NotFound);
+        };
+        // "Updates an IN-PROGRESS Map Run's configuration": a Map Run that has
+        // reached a terminal status has no configuration left to govern it.
+        if map_run.is_terminal() {
+            return Err(MapRunUpdateRejection::Completed);
+        }
+        let before = map_run.retained_bytes;
+        if let Some(max_concurrency) = max_concurrency {
+            // A caller's `0` is the same "no limit" the `Map` state's own default is,
+            // so the record reports it the one way a Map Run reports no limit.
+            map_run.max_concurrency = reported_max_concurrency(i64::from(max_concurrency));
+        }
+        if let Some(tolerated_failure_count) = tolerated_failure_count {
+            map_run.tolerated_failure_count = tolerated_failure_count;
+        }
+        if let Some(tolerated_failure_percentage) = tolerated_failure_percentage {
+            map_run.tolerated_failure_percentage = tolerated_failure_percentage;
+        }
+        // The settings a caller sends cost no bytes of their own, but the record is
+        // re-measured exactly as every other write to one is, so the store's total
+        // never depends on which write path touched it last.
+        map_run.retained_bytes = map_run.measure();
+        let after = map_run.retained_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        Ok(())
     }
 
     /// One execution's Map Runs, in the order their `Map` states were entered.
