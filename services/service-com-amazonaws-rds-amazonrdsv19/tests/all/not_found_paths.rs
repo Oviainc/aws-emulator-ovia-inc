@@ -888,6 +888,7 @@ async fn event_subscriptions_are_reported_out_of_state_per_region() {
                     source_ids: vec![format!("{name}-source")],
                     event_categories: vec!["availability".to_string()],
                     enabled: true,
+                    pending_status: None,
                     tags: Vec::new(),
                 },
             );

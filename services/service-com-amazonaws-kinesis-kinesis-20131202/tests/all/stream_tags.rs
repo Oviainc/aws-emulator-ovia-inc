@@ -44,7 +44,7 @@ use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region most cases sign for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `X-Amz-Target` prefix of this service (`OPERATIONS.md`, "Wire protocol").
 const TARGET_PREFIX: &str = "Kinesis_20131202";
@@ -64,18 +64,18 @@ const TAG_PUNCTUATION: &str = "_ ./=+-%@";
 
 /// How long a case waits before treating a freshly created stream as ready: past the
 /// instant the create armed the `CREATING` -> `ACTIVE` transition for.
-fn past_activation() -> Duration {
+pub(crate) fn past_activation() -> Duration {
     ACTIVATION_DELAY + Duration::from_millis(400)
 }
 
 /// A router carrying exactly this service, over one shared engine: the same assembly
 /// `core/router` performs, with one service mounted.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here, so requests are unauthenticated.
@@ -86,7 +86,7 @@ impl Emulator {
 
     /// Call `operation` with `body`, signed for `region` so the service resolves the
     /// request's region the way it does in production (the SigV4 credential scope).
-    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -108,12 +108,12 @@ impl Emulator {
     }
 
     /// [`Self::call_in`] in the default test region.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in(REGION, operation, body).await
     }
 
     /// Call `operation` in `region`, asserting a 200 and answering the body.
-    async fn ok_in(&self, case: &str, region: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok_in(&self, case: &str, region: &str, operation: &str, body: &Value) -> Value {
         let (status, response) = self.call_in(region, operation, body).await;
         assert_eq!(
             status, 200,
@@ -124,13 +124,13 @@ impl Emulator {
     }
 
     /// [`Self::ok_in`] in the default test region.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         self.ok_in(case, REGION, operation, body).await
     }
 }
 
 /// The `__type` an awsJson1_1 error body carries, reduced to the error's shape name.
-fn error_code(response: &Value) -> String {
+pub(crate) fn error_code(response: &Value) -> String {
     response
         .get("__type")
         .and_then(Value::as_str)
@@ -142,7 +142,7 @@ fn error_code(response: &Value) -> String {
 }
 
 /// The `message` an awsJson1_1 error body carries, under either casing the protocols use.
-fn error_message(response: &Value) -> String {
+pub(crate) fn error_message(response: &Value) -> String {
     response
         .get("message")
         .or_else(|| response.get("Message"))
@@ -152,7 +152,7 @@ fn error_message(response: &Value) -> String {
 }
 
 /// The ARN a stream named `name` in `region` is addressed by.
-fn stream_arn(region: &str, name: &str) -> String {
+pub(crate) fn stream_arn(region: &str, name: &str) -> String {
     format!(
         "arn:aws:kinesis:{region}:{}:stream/{name}",
         engine::EMULATOR_ACCOUNT_ID
@@ -160,7 +160,7 @@ fn stream_arn(region: &str, name: &str) -> String {
 }
 
 /// A `TagMap` body member built from pairs.
-fn tag_map(tags: &[(String, String)]) -> Value {
+pub(crate) fn tag_map(tags: &[(String, String)]) -> Value {
     Value::Object(
         tags.iter()
             .map(|(key, value)| (key.clone(), Value::String(value.clone())))
@@ -170,7 +170,7 @@ fn tag_map(tags: &[(String, String)]) -> Value {
 
 /// The `Tags` a `ListTagsForStream` response carries, as pairs in the order the response
 /// listed them.
-fn reported_tags(case: &str, response: &Value) -> Vec<(String, String)> {
+pub(crate) fn reported_tags(case: &str, response: &Value) -> Vec<(String, String)> {
     let tags = response
         .get("Tags")
         .and_then(Value::as_array)
@@ -238,12 +238,12 @@ struct TagCase {
 }
 
 /// A pair, spelled short.
-fn pair(key: &str, value: &str) -> (String, String) {
+pub(crate) fn pair(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
 /// `count` distinct pairs, keyed so lexicographic key order is also numeric order.
-fn pairs(count: usize) -> Vec<(String, String)> {
+pub(crate) fn pairs(count: usize) -> Vec<(String, String)> {
     (0..count)
         .map(|index| (format!("key-{index:02}"), format!("value-{index:02}")))
         .collect()
@@ -367,7 +367,7 @@ fn tag_cases() -> Vec<TagCase> {
 }
 
 /// The pairs `expected` holds, in the key order every read must report them in.
-fn in_key_order(expected: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn in_key_order(expected: &[(String, String)]) -> Vec<(String, String)> {
     let mut ordered = expected.to_vec();
     ordered.sort_by(|left, right| left.0.cmp(&right.0));
     ordered

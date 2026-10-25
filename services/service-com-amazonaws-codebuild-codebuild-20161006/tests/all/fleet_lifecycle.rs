@@ -18,14 +18,14 @@ use super::project_build_lifecycle::{call, emulator, emulator_on, error_type, ex
 
 /// Long enough for a fleet's clock-owed move out of `CREATING` to have fallen due
 /// (the service settles it [`state::FLEET_SETTLE_MILLIS`] after `CreateFleet`).
-const PAST_THE_FLEET_SETTLE_SPAN: Duration =
+pub(crate) const PAST_THE_FLEET_SETTLE_SPAN: Duration =
     Duration::from_millis(state::FLEET_SETTLE_MILLIS as u64 + 350);
 
 /// A minimal valid `CreateFleet` request for `name`, with `extra`'s members merged in.
 ///
 /// The compute and environment types are two of the values the model's `ComputeType` /
 /// `EnvironmentType` enums declare; a row that cares about them overrides them.
-fn create_fleet_body(name: &str, extra: Value) -> Value {
+pub(crate) fn create_fleet_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "name": name,
         "baseCapacity": 2,
@@ -39,7 +39,7 @@ fn create_fleet_body(name: &str, extra: Value) -> Value {
 }
 
 /// Create `name`, asserting it succeeded, and hand back the reported fleet.
-async fn create_fleet(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
+pub(crate) async fn create_fleet(router: &MultiServiceRouter, name: &str, extra: Value) -> Value {
     let (status, body) = call(router, "CreateFleet", create_fleet_body(name, extra)).await;
     assert_eq!(
         status, 200,
@@ -49,7 +49,7 @@ async fn create_fleet(router: &MultiServiceRouter, name: &str, extra: Value) -> 
 }
 
 /// `BatchGetFleets` over `identifiers`, asserting it succeeded.
-async fn batch_get_fleets(router: &MultiServiceRouter, identifiers: &[&str]) -> Value {
+pub(crate) async fn batch_get_fleets(router: &MultiServiceRouter, identifiers: &[&str]) -> Value {
     let (status, body) = call(router, "BatchGetFleets", json!({"names": identifiers})).await;
     assert_eq!(
         status, 200,

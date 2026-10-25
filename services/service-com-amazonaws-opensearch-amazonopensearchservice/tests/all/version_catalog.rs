@@ -19,6 +19,12 @@
 //!   the whole catalog in order, every page is within its size, only the last page
 //!   carries no token, a page size outside the modelled bound is refused at either end,
 //!   and a token the operation never issued is refused;
+//! * a token names WHERE the catalog resumes and nothing else — the model's
+//!   `@paginated(inputToken: NextToken, outputToken: NextToken, pageSize: MaxResults)`
+//!   keeps the cursor and the page size separate — so over a table of (issuing page
+//!   size, resuming page size) pairs the resumed walk is the catalog's suffix whatever
+//!   page size either side used, and resuming from one token twice answers the same
+//!   versions;
 //! * the read changes nothing a later caller sees.
 
 use std::collections::BTreeSet;
@@ -324,6 +330,95 @@ async fn paging_partitions_the_catalog() {
             "ValidationException",
             "case {invented}: expected the modelled validation refusal, got {:?}",
             answer.body
+        );
+    }
+}
+
+/// The versions a walk reports starting AT `token`, over pages of `page_size` (`0` for
+/// the unbounded page), to the end of the catalog.
+async fn walk_from(emulator: &Emulator, token: &str, page_size: i32, case: &str) -> Vec<String> {
+    let mut walked: Vec<String> = Vec::new();
+    let mut cursor = Some(token.to_owned());
+    while let Some(token) = cursor {
+        let query = if page_size == 0 {
+            format!("nextToken={token}")
+        } else {
+            format!("maxResults={page_size}&nextToken={token}")
+        };
+        let answer = list(emulator, &query).await;
+        walked.extend(versions(&answer, case));
+        cursor = answer.body["NextToken"].as_str().map(str::to_owned);
+        assert!(
+            walked.len() < 10_000,
+            "case {case}: paging kept issuing tokens past the end of the catalog"
+        );
+    }
+    walked
+}
+
+#[tokio::test]
+async fn a_token_resumes_where_the_previous_page_stopped() {
+    let emulator = Emulator::new();
+    let catalog = whole_catalog(&emulator, 0).await;
+
+    // One row per (page size the token was issued at, page size it is resumed at):
+    // the smallest both ways, each crossed with a larger one, a resume that sends no
+    // page size at all, and a resume at the largest the modelled range allows.
+    for (issued_with, resumed_with) in [
+        (1_i32, 1_i32),
+        (1, 5),
+        (5, 1),
+        (2, 0),
+        (3, 100),
+        (7, 4),
+    ] {
+        let case = format!("token issued at page size {issued_with}, resumed at {resumed_with}");
+        let page_size = usize::try_from(issued_with).unwrap_or_default();
+        assert!(
+            catalog.len() > page_size,
+            "case {case}: this row needs a catalog longer than its page size, got {} versions",
+            catalog.len()
+        );
+
+        let first = list(&emulator, &format!("maxResults={issued_with}")).await;
+        let head = versions(&first, &case);
+        assert_eq!(
+            head.len(),
+            page_size,
+            "case {case}: expected a full first page while the catalog holds more, got {head:?}"
+        );
+        let token = first.body["NextToken"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: expected a token while {} of {} versions are unreported, got \
+                     {:?}",
+                    catalog.len() - head.len(),
+                    catalog.len(),
+                    first.body
+                )
+            });
+
+        // The cursor is a position in the catalog, so the page size used to resume it
+        // changes how the suffix is cut into pages and not which versions it reports.
+        let tail = walk_from(&emulator, &token, resumed_with, &case).await;
+        let rejoined: Vec<String> = head.iter().chain(tail.iter()).cloned().collect();
+        assert_eq!(
+            rejoined, catalog,
+            "case {case}: expected the resumed walk to be the catalog's suffix, got {} versions \
+             after a {}-version first page",
+            tail.len(),
+            head.len()
+        );
+
+        // Resuming from one token is a read: the second walk reports the same versions.
+        let again = walk_from(&emulator, &token, resumed_with, &case).await;
+        assert_eq!(
+            again, tail,
+            "case {case}: expected one token to answer the same versions twice, got {} versions \
+             the second time",
+            again.len()
         );
     }
 }

@@ -61,6 +61,24 @@ pub fn is_terminal(status: &str) -> bool {
     TERMINAL_STATUSES.contains(&status)
 }
 
+/// The suite-run statuses that report a SUCCESSFUL run of the suite.
+///
+/// The `SuiteRunStatus` values a run reaches by executing its suite and passing it, as
+/// against the ones that report it failing (`ERROR`, `FAIL`) or never finishing
+/// (`CANCELED`, `STOPPED`, and the three non-terminal statuses). The single definition of
+/// "successful", which is what decides whether a run has a qualification report
+/// ([`ComAmazonawsIotdeviceadvisorIotsenateserviceState::qualification_report`]).
+///
+/// Nothing executes a suite in this emulator ([`NO_TEST_RUNNER_REASON`]), so no run of it
+/// reaches one of these; the rule still belongs here rather than in the reader, so a run
+/// that can succeed needs no second decision about what its success means.
+pub const SUCCESSFUL_STATUSES: &[&str] = &["PASS", "PASS_WITH_WARNINGS"];
+
+/// True when `status` reports a run that executed its suite and passed.
+pub fn is_successful(status: &str) -> bool {
+    SUCCESSFUL_STATUSES.contains(&status)
+}
+
 /// How many suite definitions this account's store holds at once.
 ///
 /// An OCCUPANCY BOUND this emulator chooses, not a claim about a published AWS quota: the
@@ -641,6 +659,45 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
             self.tags.remove(&arn);
         }
     }
+
+    /// The QUALIFICATION REPORT of the suite run `(suite_definition_id, suite_run_id)`
+    /// names, when that run has one: its definition and the run itself.
+    ///
+    /// The ONE rule for whether a report exists, and the only place it is stated. A
+    /// qualification report is the report of a SUCCESSFUL qualifying test suite run, so
+    /// all three of these hold for a run that has one:
+    ///
+    /// * the run belongs to the definition the caller named, since crossing one
+    ///   definition's id with another's run names no report, just as it names no run;
+    /// * the definition it ran is INTENDED FOR QUALIFICATION, since the report is the
+    ///   qualification report of a qualifying suite; and
+    /// * the run SUCCEEDED ([`is_successful`]), so a run still in progress, one a caller
+    ///   stopped, and one that failed or errored have none.
+    ///
+    /// No run of THIS emulator reaches a successful status: nothing executes the suite
+    /// (see [`NO_TEST_RUNNER_REASON`]), so a run ends in `ERROR`, and the operation that
+    /// reads this therefore answers its modelled not-found refusal for every run the
+    /// emulator can produce. The rule is the SERVICE's, not the lifecycle's: a report
+    /// appears the moment a run can succeed, with nothing here to change.
+    ///
+    /// A pure read: the clock-owed transitions are NOT materialised here, so a caller that
+    /// wants the report of a run whose next transition has just become due materialises it
+    /// first ([`Self::run_mut`]) and then asks.
+    pub fn qualification_report(
+        &self,
+        suite_definition_id: &str,
+        suite_run_id: &str,
+    ) -> Option<(&SuiteDefinition, &SuiteRun)> {
+        let run = self.runs.get(suite_run_id)?;
+        if run.suite_definition_id != suite_definition_id {
+            return None;
+        }
+        let definition = self.definitions.get(suite_definition_id)?;
+        if definition.configuration.intended_for_qualification != Some(true) {
+            return None;
+        }
+        is_successful(&run.status).then_some((definition, run))
+    }
 }
 
 /// The message a refusal carries when the resource the request NAMED does not exist.
@@ -1137,6 +1194,81 @@ pub fn is_arn_of_service(value: &str, service: &str) -> bool {
         && fields.next().is_some()
         && fields.next().is_some()
         && fields.next().is_some_and(|resource| !resource.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// The qualification report's download URL
+//
+// `GetSuiteRunReport` reports a DOWNLOAD URL for the report a successful qualifying
+// run leaves. AWS announces that document from object storage, which this emulator
+// does not have, so what is announced here is a LOCATOR built from the report's own
+// subject on the endpoint the caller reached. Nothing in this service serves it, and
+// nothing reads it back: the report AWS compiles is AWS's, and a document of this
+// emulator's own making would not be it.
+
+/// The path a qualification report's download URL carries, under which the report of one
+/// `(suite definition, suite run)` is addressed.
+const QUALIFICATION_REPORT_PATH: &str = "/qualificationReports";
+
+/// The endpoint a report URL names when the request carries none, so a URL this service
+/// announces always names an endpoint rather than an empty authority.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The endpoint the request reached this emulator on, as a report URL names it: the
+/// request's own `Host`, else the authority its URI carries, else [`LOOPBACK_HOST`].
+///
+/// Read from the request rather than built from the model's endpoint template, because
+/// the URL has to resolve for whoever was handed it: a client addressing the emulator by
+/// socket is handed that socket, and a literal AWS endpoint here would send a following
+/// client to the real service. The value is the CALLER's, and it is interpolated into a
+/// URL this service announces, so only a bare authority is honoured.
+///
+/// The same rule, with the same two sources and the same filter, as
+/// `service-com-amazonaws-artifact-artifact`'s `document_url_host`: both services resolve
+/// the caller's own endpoint for a URL they announce, and this note is here so the two
+/// cannot drift apart unnoticed if either changes.
+pub fn report_url_host(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        // The URI's AUTHORITY, not its host: a request that carries its endpoint on the
+        // URI carries the port there too, and a URL announced without the port would not
+        // resolve back to the socket the caller reached.
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
+        .filter(|candidate| is_bare_authority(candidate))
+        .unwrap_or(LOOPBACK_HOST)
+        .to_string()
+}
+
+/// True when `value` is a bare authority: a host with an optional port and nothing else.
+///
+/// A path, query, fragment, userinfo or space makes it something other than an endpoint,
+/// so a URL built around it would not resolve back to this emulator.
+fn is_bare_authority(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['/', '?', '#', '@', '\\', ' ', '\t'])
+        && value.parse::<::http::uri::Authority>().is_ok()
+}
+
+/// The download URL of one suite run's qualification report, addressed to `host`.
+///
+/// Derived from the report's own subject: the definition that was run and the run that
+/// produced the report, so every read of one report announces the same URL rather than a
+/// freshly invented one, and the URL names the record it can be traced back to. The ids
+/// are the UUIDs this service mints, which carry no character the path shape would have to
+/// escape. AWS announces the document from object storage, which this emulator does not
+/// have; what it announces instead is this locator on the endpoint the caller reached,
+/// never a literal AWS endpoint (which would send a following client to the real service).
+pub fn qualification_report_url(
+    host: &str,
+    definition: &SuiteDefinition,
+    run: &SuiteRun,
+) -> String {
+    format!(
+        "https://{host}{QUALIFICATION_REPORT_PATH}/{}/{}",
+        definition.id, run.id
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -17,8 +17,12 @@
 //!   are the requested bundles, in order, reported exactly when the mode is a
 //!   bundled one. The mode catalog is the model's own `PricingMode` enum
 //!   (`ops::types::PRICING_MODE_VALUES`), so no row is keyed to one request;
-//! * the change takes effect at once: `effectiveDateTime` equals
-//!   `updateDateTime`, both fall inside the call, and nothing is left pending;
+//! * WHEN the change takes effect is the service's: a change that buys the
+//!   account at least what it had takes effect at once — `effectiveDateTime`
+//!   equals `updateDateTime` and nothing is left pending — while leaving a
+//!   bundled plan for the pay-as-you-go mode is billed from the next cycle, so
+//!   it is reported as `pendingPricingPlan` and lands later
+//!   (`pricing_plan_tier_and_pending.rs` is the suite about that);
 //! * `updateReason` says what the change was, read off the plan it replaced —
 //!   `PRICING_MODE_UPDATE` for a mode change, `PRICING_TIER_UPDATE` when only
 //!   the bundles moved, `OVERWRITTEN` when it superseded a change that had not
@@ -30,13 +34,13 @@
 //!   is refused with HTTP 400 `ValidationException` and leaves the stored plan
 //!   untouched.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::ops::types::PRICING_MODE_VALUES;
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
-    pricing_mode_is_bundled, PricingPlanRecord, PRICING_MODE_BASIC,
-    UPDATE_REASON_OVERWRITTEN, UPDATE_REASON_PRICING_MODE_UPDATE,
+    pricing_change_is_deferred, pricing_mode_is_bundled, PricingPlanRecord, PRICING_MODE_BASIC,
+    PRICING_PLAN_PENDING_SPAN, UPDATE_REASON_OVERWRITTEN, UPDATE_REASON_PRICING_MODE_UPDATE,
     UPDATE_REASON_PRICING_TIER_UPDATE,
 };
 
@@ -242,7 +246,9 @@ async fn an_accepted_change_is_the_plan_in_force_and_reads_back() {
 /// request alone: `PRICING_MODE_UPDATE` when the mode differs from the mode in
 /// force, `PRICING_TIER_UPDATE` when the mode is unchanged so only the bundles
 /// can have moved, and `OVERWRITTEN` when the change superseded one that had
-/// been accepted but had not taken effect.
+/// been accepted but had not taken effect. The reason rides on the plan the
+/// change IS — the plan in force when it takes effect at once, the pending plan
+/// when the service bills it from the next cycle.
 #[tokio::test]
 async fn the_update_reason_describes_the_change() {
     /// One row: the plan to arrive at, and whether a change was pending.
@@ -334,6 +340,7 @@ async fn the_update_reason_describes_the_change() {
 
     for row in rows {
         let emulator = Emulator::new();
+        let mut mode_in_force = PRICING_MODE_BASIC;
         for (mode, bundles) in &row.before {
             let bundles: Vec<String> = bundles.iter().map(|b| (*b).to_string()).collect();
             let resp = emulator.update_pricing_plan(request(mode, &bundles)).await;
@@ -342,13 +349,20 @@ async fn the_update_reason_describes_the_change() {
                 "case {:?}: the setup change to {mode:?} must be accepted, got {resp:?}",
                 row.case
             );
+            // Only a change that takes effect at once moves the mode in force;
+            // every setup change above is one.
+            mode_in_force = mode;
         }
         if row.pending {
-            // A change accepted but not yet in force can only be put in the
-            // store directly: nothing in this emulator defers one.
+            // A change the service has accepted for a LATER instant, put in the
+            // store directly so this row starts from one that is still ahead
+            // whatever the machine's timing.
             let state = emulator.state();
-            state.lock().region_mut(REGION).pending_pricing_plan =
-                Some(PricingPlanRecord::default_plan(SystemTime::now()));
+            let now = SystemTime::now();
+            state.lock().region_mut(REGION).pending_pricing_plan = Some(PricingPlanRecord {
+                effective_date_time: now + PRICING_PLAN_PENDING_SPAN,
+                ..PricingPlanRecord::default_plan(now)
+            });
         }
 
         let bundles: Vec<String> = row.bundles.iter().map(|b| (*b).to_string()).collect();
@@ -358,46 +372,58 @@ async fn the_update_reason_describes_the_change() {
             "case {:?}: expected 200 from UpdatePricingPlan, got {resp:?}",
             row.case
         );
+        // The change the service bills from the next cycle is the PENDING plan,
+        // so that is the plan its reason rides on.
+        let member = if pricing_change_is_deferred(mode_in_force, row.mode) {
+            "pendingPricingPlan"
+        } else {
+            "currentPricingPlan"
+        };
         assert_eq!(
-            resp.member("currentPricingPlan")["updateReason"].as_str(),
+            resp.member(member)["updateReason"].as_str(),
             Some(row.expected_reason),
-            "case {:?}: expected updateReason {:?}, got {:?}",
+            "case {:?}: expected {member}.updateReason {:?}, got {:?}",
             row.case,
             row.expected_reason,
-            resp.member("currentPricingPlan")["updateReason"]
+            resp.member(member)["updateReason"]
         );
-        assert!(
-            resp.member("pendingPricingPlan").is_null(),
-            "case {:?}: a superseded change is gone, not pending, got {:?}",
-            row.case,
-            resp.member("pendingPricingPlan")
-        );
+        if member == "currentPricingPlan" {
+            assert!(
+                resp.member("pendingPricingPlan").is_null(),
+                "case {:?}: a superseded change is gone, not pending, got {:?}",
+                row.case,
+                resp.member("pendingPricingPlan")
+            );
+        }
         // The reason is persisted, not just answered.
         let read = emulator.get_pricing_plan().await;
         assert_eq!(
-            read.member("currentPricingPlan")["updateReason"].as_str(),
+            read.member(member)["updateReason"].as_str(),
             Some(row.expected_reason),
             "case {:?}: GetPricingPlan must report the stored updateReason, got {read:?}",
             row.case
         );
-        assert!(
-            read.member("pendingPricingPlan").is_null(),
-            "case {:?}: nothing is pending in the store, got {read:?}",
-            row.case
-        );
+        if member == "currentPricingPlan" {
+            assert!(
+                read.member("pendingPricingPlan").is_null(),
+                "case {:?}: nothing is pending in the store, got {read:?}",
+                row.case
+            );
+        }
     }
 }
 
-/// RULE: successive changes each replace the plan WHOLE — the plan in force
-/// carries only what the latest request named, never a member left over from the
-/// plan before it — and each change's `updateDateTime` is at or after the one
-/// before.
+/// RULE: successive changes each replace the plan WHOLE — the plan the change
+/// lands as carries only what the latest request named, never a member left over
+/// from the plan before it — and each change's `updateDateTime` is at or after
+/// the one before.
 #[tokio::test]
 async fn each_change_replaces_the_plan_whole() {
     let emulator = Emulator::new();
 
     // A walk whose steps differ in mode, in bundle count and in direction, so a
-    // leftover bundle from an earlier step would show up.
+    // leftover bundle from an earlier step would show up — including the step
+    // off bundles entirely, which the service bills from the next cycle.
     let walk: Vec<(&str, &str, Vec<&str>)> = vec![
         (
             "onto a three-bundle tiered plan",
@@ -411,8 +437,10 @@ async fn each_change_replaces_the_plan_whole() {
     ];
 
     let mut previous_update = 0.0_f64;
+    let mut mode_in_force = PRICING_MODE_BASIC;
     for (case, mode, bundles) in walk {
         let bundles: Vec<String> = bundles.iter().map(|b| (*b).to_string()).collect();
+        let deferred = pricing_change_is_deferred(mode_in_force, mode);
         let before = SystemTime::now();
         let resp = emulator.update_pricing_plan(request(mode, &bundles)).await;
         let after = SystemTime::now();
@@ -420,15 +448,41 @@ async fn each_change_replaces_the_plan_whole() {
             resp.status, 200,
             "case {case:?}: expected 200 from UpdatePricingPlan, got {resp:?}"
         );
-        let current = resp.member("currentPricingPlan");
-        assert_plan_names(case, "currentPricingPlan", current, mode, &bundles);
-        let updated = assert_effective_at_once(case, "currentPricingPlan", current, before, after);
+        let updated = if deferred {
+            // Accepted now, in force later: the plan the change IS is the
+            // pending one, and it carries only what this request named.
+            let pending = resp.member("pendingPricingPlan");
+            assert_plan_names(case, "pendingPricingPlan", pending, mode, &bundles);
+            let updated = epoch_secs(
+                case,
+                "pendingPricingPlan.updateDateTime",
+                &pending["updateDateTime"],
+            );
+            let effective = epoch_secs(
+                case,
+                "pendingPricingPlan.effectiveDateTime",
+                &pending["effectiveDateTime"],
+            );
+            assert!(
+                effective > updated,
+                "case {case:?}: a change billed from the next cycle falls due after it was \
+                 accepted, got effectiveDateTime {effective} against updateDateTime {updated}"
+            );
+            // Walk on from the plan this change becomes, once it has.
+            tokio::time::sleep(PRICING_PLAN_PENDING_SPAN + Duration::from_millis(250)).await;
+            updated
+        } else {
+            let current = resp.member("currentPricingPlan");
+            assert_plan_names(case, "currentPricingPlan", current, mode, &bundles);
+            assert_effective_at_once(case, "currentPricingPlan", current, before, after)
+        };
         assert!(
             updated >= previous_update,
             "case {case:?}: expected updateDateTime at or after the previous change's \
              {previous_update}, got {updated}"
         );
         previous_update = updated;
+        mode_in_force = mode;
 
         let read = emulator.get_pricing_plan().await;
         assert_plan_names(
