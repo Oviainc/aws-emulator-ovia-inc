@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLayerVersionByArn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLayerVersionByArn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLayerVersionByArn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one version of a layer out of [`crate::state`] — the record
+//! [`crate::ops::publish_layer_version`] persisted — addressed by that version's own
+//! ARN rather than by a layer name and a version number, and answers exactly what
+//! [`crate::ops::get_layer_version`] reports for the same version. A pure read:
+//! nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLayerVersionByArn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLayerVersionByArnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLayerVersionByArn"))
+        // "Returns information about a version of an Lambda layer": a pure report, so
+        // the answer depends on the stored record alone and on no request metadata —
+        // the ARNs it carries are the ones the layer was published with, not the value
+        // the request addressed the version by.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLayerVersionByArnErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "The ARN of the layer version": the boundary has already refused any value
+        // outside the two forms the model's `LayerVersionArn` pattern admits, so what
+        // reaches here either names a published version or names a version number no
+        // layer is ever assigned (versions count from 1 upwards), which no store holds.
+        let Some(crate::state::LayerVersionReference::Published { name, version }) =
+            crate::state::parse_layer_version_arn(&input.arn)
+        else {
+            // The other admitted form, `arn:<partition>:lambda:::awslayer:<name>`, names
+            // a layer Lambda itself provides: it belongs to no account, so this account
+            // holds no version of it for a read to report either.
+            return Err(no_such_layer_version(&input.arn));
+        };
+
+        let store = state.lock();
+        let detail = store
+            .layers
+            .get(&name)
+            .and_then(|record| {
+                let held = record.versions.get(&version)?;
+                Some(record.version_detail(held))
+            })
+            .ok_or_else(|| no_such_layer_version(&input.arn))?;
+        Ok(layer_version(detail))
+    }
+}
+
+/// The modelled 404 this operation answers for an ARN naming a layer version this
+/// account holds none of.
+fn no_such_layer_version(arn: &str) -> GetLayerVersionByArnError {
+    GetLayerVersionByArnErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(format!("Layer version {arn} does not exist")),
+    })
+    .into()
+}
+
+/// The one layer-version report the model declares, in this operation's own generated
+/// shape of it.
+///
+/// [`crate::state::LayerRecord::version_detail`] builds the shared
+/// `GetLayerVersionResponse` every operation reporting a layer version answers with;
+/// this operation's output is generated as its own struct over the same members, so they
+/// are carried across one for one rather than rebuilt from state a second time.
+fn layer_version(detail: GetLayerVersionOutput) -> GetLayerVersionByArnOutput {
+    GetLayerVersionByArnOutput {
+        content: detail.content,
+        layer_arn: detail.layer_arn,
+        layer_version_arn: detail.layer_version_arn,
+        description: detail.description,
+        created_date: detail.created_date,
+        version: detail.version,
+        compatible_architectures: detail.compatible_architectures,
+        compatible_runtimes: detail.compatible_runtimes,
+        license_info: detail.license_info,
     }
 }
