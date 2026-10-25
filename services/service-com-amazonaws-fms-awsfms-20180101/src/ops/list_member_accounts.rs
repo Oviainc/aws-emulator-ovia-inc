@@ -118,12 +118,6 @@ impl From<ListMemberAccountsErrorModeled> for ListMemberAccountsError {
     }
 }
 
-/// The largest page `ListMemberAccounts` serves, which is the maximum the model's
-/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
-/// 1..100). It bounds the response for EVERY caller, including one that sends no
-/// `MaxResults` at all.
-const MAX_PAGE_SIZE: usize = 100;
-
 /// The `ListMemberAccounts` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -199,15 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let lower = start.unwrap_or_default();
         let mut remaining = accounts.range(lower..);
 
-        // The page is bounded whether or not the caller asked for a bound: the
-        // model's `PaginationMaxResults` range is 1..100, so 100 is the largest page
-        // this operation serves. Clamped rather than only capped, so a page can
-        // never come back empty with a token (which a client would follow forever)
-        // if that modelled validation ever changes.
-        let page_size = input
-            .max_results
-            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page is bounded whether or not the caller asked for a bound, by
+        // the one page-size rule every paginated operation of this service
+        // shares ([`crate::state::page_size`]).
+        let page_size = crate::state::page_size(input.max_results);
         let member_accounts: Vec<String> = remaining.by_ref().take(page_size).cloned().collect();
         // A token only when an account is left AFTER this page, so the last page
         // carries none.

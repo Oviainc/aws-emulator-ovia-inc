@@ -186,15 +186,18 @@ async fn submit(
     (successful, failed)
 }
 
-/// The `clientToken`s the campaign's buffer holds, straight out of the store.
+/// The `clientToken`s the campaign's buffer holds, straight out of the store — read
+/// from the region the campaign was created in, which is the only region that holds
+/// it.
 fn buffered_tokens(
     engine: &engine::InMemoryEngine,
+    region: &str,
     campaign: &str,
 ) -> BTreeSet<String> {
     engine
         .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>()
         .lock()
-        .campaign(campaign)
+        .campaign(region, campaign)
         .expect("the campaign under test")
         .outbound_requests
         .keys()
@@ -204,11 +207,11 @@ fn buffered_tokens(
 
 /// The requests the campaign still has pending at this instant, as the store derives
 /// it from each record's stored `expirationTime`.
-fn pending_count(engine: &engine::InMemoryEngine, campaign: &str) -> usize {
+fn pending_count(engine: &engine::InMemoryEngine, region: &str, campaign: &str) -> usize {
     engine
         .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>()
         .lock()
-        .campaign(campaign)
+        .campaign(region, campaign)
         .expect("the campaign under test")
         .pending_outbound_requests(SystemTime::now())
 }
@@ -332,7 +335,7 @@ async fn an_expired_request_releases_its_buffer_slot_and_its_client_token() {
     let short_lived_id = id_of(&successful, "short-lived");
     let long_lived_id = id_of(&successful, "long-lived");
     assert_eq!(
-        pending_count(&engine, &campaign),
+        pending_count(&engine, region, &campaign),
         2,
         "case {:?}: both requests are pending while inside their expiration",
         "a short-lived and a long-lived request"
@@ -360,7 +363,7 @@ async fn an_expired_request_releases_its_buffer_slot_and_its_client_token() {
     tokio::time::sleep(Duration::from_secs_f64(short_lived_secs) + Duration::from_millis(400))
         .await;
     assert_eq!(
-        pending_count(&engine, &campaign),
+        pending_count(&engine, region, &campaign),
         1,
         "case {:?}: the short-lived request is past its expiration, so only the long-lived \
          one is still pending",
@@ -383,7 +386,7 @@ async fn an_expired_request_releases_its_buffer_slot_and_its_client_token() {
         "a batch submitted after the expiration"
     );
     assert_eq!(
-        buffered_tokens(&engine, &campaign),
+        buffered_tokens(&engine, region, &campaign),
         ["fresh".to_string(), "long-lived".to_string()]
             .into_iter()
             .collect::<BTreeSet<String>>(),

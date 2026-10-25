@@ -15,6 +15,10 @@
 //! documented minimum unreserved capacity, or that names no function, is refused and
 //! stores nothing.
 //!
+//! The harness below (the router, the `Answer` wrapper and the concurrency request
+//! helpers) is `pub(crate)` so the sibling suite covering `DeleteFunctionConcurrency`
+//! drives the same wire rather than rebuilding one that could disagree with it.
+//!
 //! Every row drives real HTTP requests through the router and reads the value back, so a
 //! reservation that was answered but never stored fails here. The rows differ along what
 //! the rule generalises over: the value reserved (each published bound, one past it, and
@@ -44,10 +48,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=not-verified";
 
 /// The region the scope above names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A well-formed execution role ARN, satisfying the model's `RoleArn` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
@@ -56,22 +60,22 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 /// account in a Region (AWS Lambda quotas, "Concurrent executions … 1,000"). Written as
 /// the published number rather than as the crate's constant, so a wrong constant fails
 /// here.
-const CONCURRENT_EXECUTIONS_LIMIT: i64 = 1_000;
+pub(crate) const CONCURRENT_EXECUTIONS_LIMIT: i64 = 1_000;
 
 /// The capacity an account must leave unreserved, from `PutFunctionConcurrency`'s own
 /// documentation: "You can reserve concurrency for as many functions as you like, as long
 /// as you leave at least 100 simultaneous executions unreserved for functions that aren't
 /// configured with a per-function limit."
-const MIN_UNRESERVED: i64 = 100;
+pub(crate) const MIN_UNRESERVED: i64 = 100;
 
 /// The largest reservation the rule above admits on an account nothing else reserves on.
-const MAX_RESERVABLE: i64 = CONCURRENT_EXECUTIONS_LIMIT - MIN_UNRESERVED;
+pub(crate) const MAX_RESERVABLE: i64 = CONCURRENT_EXECUTIONS_LIMIT - MIN_UNRESERVED;
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answer {
@@ -89,12 +93,12 @@ impl Answer {
     }
 
     /// The integer at `pointer`, when the body carries one there.
-    fn number(&self, pointer: &str) -> Option<i64> {
+    pub(crate) fn number(&self, pointer: &str) -> Option<i64> {
         self.json().pointer(pointer).and_then(Value::as_i64)
     }
 
     /// The wire error code (`__type`, or the `x-amzn-errortype` header).
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.json()
             .get("__type")
             .and_then(Value::as_str)
@@ -109,14 +113,14 @@ impl Answer {
     }
 
     /// The body text, for a failure message.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 }
 
 /// One service mounted on its own engine, reached the way the production router reaches
 /// it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -124,7 +128,12 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Dispatch one JSON request.
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> Answer {
     let payload = if body.is_null() {
         Vec::new()
     } else {
@@ -148,7 +157,11 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value
 }
 
 /// `PutFunctionConcurrency` (`PUT /2017-10-31/functions/{FunctionName}/concurrency`).
-async fn put_concurrency(router: &MultiServiceRouter, reference: &str, reserved: i64) -> Answer {
+pub(crate) async fn put_concurrency(
+    router: &MultiServiceRouter,
+    reference: &str,
+    reserved: i64,
+) -> Answer {
     call(
         router,
         "PUT",
@@ -159,7 +172,7 @@ async fn put_concurrency(router: &MultiServiceRouter, reference: &str, reserved:
 }
 
 /// `GetFunctionConcurrency` (`GET /2019-09-30/functions/{FunctionName}/concurrency`).
-async fn get_concurrency(router: &MultiServiceRouter, reference: &str) -> Answer {
+pub(crate) async fn get_concurrency(router: &MultiServiceRouter, reference: &str) -> Answer {
     call(
         router,
         "GET",
@@ -182,7 +195,7 @@ async fn get_function(router: &MultiServiceRouter, reference: &str) -> Answer {
 }
 
 /// The account's `UnreservedConcurrentExecutions`, through `GetAccountSettings`.
-async fn unreserved(router: &MultiServiceRouter) -> i64 {
+pub(crate) async fn unreserved(router: &MultiServiceRouter) -> i64 {
     let answer = call(router, "GET", ACCOUNT_SETTINGS_URI, &Value::Null).await;
     assert_eq!(
         answer.status,
@@ -202,7 +215,7 @@ async fn unreserved(router: &MultiServiceRouter) -> i64 {
 }
 
 /// Create a function to reserve capacity for.
-async fn create_function(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_function(router: &MultiServiceRouter, name: &str) {
     let package: Vec<u8> = (0..64u16)
         .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
         .collect();
@@ -229,7 +242,11 @@ async fn create_function(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Every reader's view of one function's reserved concurrency, which must agree.
-async fn reported(case: &str, router: &MultiServiceRouter, reference: &str) -> Option<i64> {
+pub(crate) async fn reported(
+    case: &str,
+    router: &MultiServiceRouter,
+    reference: &str,
+) -> Option<i64> {
     let concurrency = get_concurrency(router, reference).await;
     assert_eq!(
         concurrency.status,

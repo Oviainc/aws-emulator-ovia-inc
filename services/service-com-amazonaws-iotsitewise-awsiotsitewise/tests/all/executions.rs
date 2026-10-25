@@ -44,8 +44,8 @@ enum Target {
     AssetA,
     /// The second asset the fixture creates.
     AssetB,
-    /// A computation model: `CreateComputationModel` is a scaffold stub, so no
-    /// computation model is stored and this id names one that cannot exist.
+    /// A computation model: this fixture creates none, so this id names one the
+    /// store does not hold.
     ComputationModel,
 }
 
@@ -188,8 +188,7 @@ const LONGEST_ACTION_ROW: &str = "aaaaaaa2-2222-4222-8222-222222222222";
 const ABSENT_ID: &str = "11111111-2222-4333-8444-555555555555";
 
 /// The `targetResourceId` of the computation-model row: a well-formed `ID` that
-/// names a computation model, which no store holds while
-/// `CreateComputationModel` is a scaffold stub.
+/// names a computation model this fixture never creates, so no store holds it.
 const COMPUTATION_MODEL_ID: &str = "77777777-2222-4333-8444-555555555555";
 
 /// The fixture: a router over a store holding two assets and the seeded

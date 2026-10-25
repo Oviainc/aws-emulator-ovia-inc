@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let merged = crate::state::merged_tags(&current, &input.tags);
-        if let Some(rejection) = crate::state::tag_bounds_rejection(&merged) {
+        if let Some(rejection) = crate::state::tag_bounds_rejection("tags", &merged) {
             return Err(TagResourceErrorModeled::ValidationException(rejection).into());
         }
 

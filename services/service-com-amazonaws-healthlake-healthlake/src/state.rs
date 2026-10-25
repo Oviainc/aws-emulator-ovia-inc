@@ -14,8 +14,9 @@
 //!
 //! The data transformation profile is the second: `CreateDataTransformationProfile`
 //! mints one in DRAFT here, `UpdateDataTransformationProfile` rewrites that DRAFT's
-//! content in place, and `GetDataTransformationProfile` reads the SAME record back,
-//! version by version.
+//! content in place, `PublishDataTransformationProfile` snapshots a version of it
+//! into [`DataTransformationProfile::published`], and
+//! `GetDataTransformationProfile` reads the SAME record back, version by version.
 //!
 //! The FHIR export job is the third: a job record belongs to the data store it
 //! exports, `StartFHIRExportJob` MINTS one here, and `DescribeFHIRExportJob` /
@@ -426,23 +427,36 @@ pub const MAX_PROFILE_MAPPING_VALUE_LEN: usize = 102_400;
 /// heap a product of caller-chosen factors (the same reason the FHIR data plane
 /// budgets [`MAX_FHIR_RESOURCE_BYTES`]). This ceiling is this emulator's, not an AWS
 /// quota: it admits ten modelled-maximum files, or all 500 small ones, which is more
-/// than a profile needs, and it is what bounds the retained profile content —
-/// [`MAX_PROFILES`] profiles times this, because no profile can hold a second
-/// version yet: `CreateDataTransformationProfile` writes the DRAFT and
-/// `UpdateDataTransformationProfile` REPLACES it in place, and
-/// `PublishDataTransformationProfile` — the operation that would snapshot the DRAFT
-/// into a version of its own — is still a 501 scaffold.
-///
-/// WHOEVER IMPLEMENTS that one must also charge a per-profile retained-byte
-/// budget, the way the FHIR data plane charges
-/// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`] against
-/// [`Datastore::fhir_resource_bytes`]: a profile may then hold
-/// `1 + MAX_PROFILE_VERSION` versions, and this per-version ceiling alone would stop
-/// bounding what the store retains.
+/// than a profile needs. It bounds ONE version; a profile holds up to
+/// `1 + MAX_PROFILE_VERSION` of them once `PublishDataTransformationProfile`
+/// snapshots the DRAFT into published versions, so what one profile retains is
+/// bounded by [`MAX_PROFILE_RETAINED_BYTES`] and what every profile retains
+/// together by [`MAX_PROFILE_RETAINED_BYTES_TOTAL`] — the way the FHIR data plane
+/// budgets [`MAX_FHIR_RESOURCE_BYTES`], [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`]
+/// and [`MAX_FHIR_RESOURCE_BYTES_TOTAL`] — so no product of caller-chosen factors
+/// is the bound.
 ///
 /// Measured in BYTES (`str::len`) rather than characters, so multi-byte content
 /// cannot pass the budget by a factor of four.
 pub const MAX_PROFILE_MAPPING_BYTES: usize = 1 << 20;
+
+/// The most BYTES of version content ONE data transformation profile retains,
+/// across its DRAFT and every version published from it.
+///
+/// A count ceiling alone does not bound the retained heap: a profile may hold
+/// `1 + MAX_PROFILE_VERSION` versions, each up to
+/// [`MAX_PROFILE_MAPPING_BYTES`], so the per-version ceiling alone would leave what
+/// one profile retains a product of caller-chosen factors. This is this emulator's
+/// ceiling, not a claim about any AWS quota;
+/// `PublishDataTransformationProfile` — the only operation that gives a profile a
+/// second version — refuses past it with the `ServiceQuotaExceededException` it
+/// models.
+pub const MAX_PROFILE_RETAINED_BYTES: usize = 4 << 20;
+
+/// The most BYTES of version content EVERY data transformation profile retains
+/// together, so [`MAX_PROFILES`] profiles at their own budget cannot multiply into
+/// an unbounded heap.
+pub const MAX_PROFILE_RETAINED_BYTES_TOTAL: usize = 32 << 20;
 
 /// The most data transformation profiles this emulator holds at once.
 ///
@@ -1247,6 +1261,22 @@ impl ProfileVersionRecord {
             .map(|(path, content)| (path.clone(), content.clone()))
             .collect()
     }
+
+    /// How many BYTES of keys and values this version's content holds together —
+    /// what [`MAX_PROFILE_MAPPING_BYTES`] bounds for one version and
+    /// [`MAX_PROFILE_RETAINED_BYTES`] bounds across a profile's versions.
+    pub fn retained_bytes(&self) -> usize {
+        mapping_bytes(&self.mapping)
+    }
+}
+
+/// How many BYTES of keys and values `mapping` holds together, in the one place
+/// every profile byte budget measures it, so a stored version and a candidate one
+/// are never measured two different ways.
+pub fn mapping_bytes(mapping: &BTreeMap<String, String>) -> usize {
+    mapping.iter().fold(0usize, |total, (path, content)| {
+        total.saturating_add(path.len()).saturating_add(content.len())
+    })
 }
 
 /// One persisted data transformation profile: the metadata
@@ -1305,6 +1335,21 @@ impl DataTransformationProfile {
     pub fn latest_published(&self) -> Option<&ProfileVersionRecord> {
         self.published.values().next_back()
     }
+
+    /// How many BYTES of content this profile retains across its DRAFT and every
+    /// version published from it — what [`MAX_PROFILE_RETAINED_BYTES`] bounds.
+    ///
+    /// Summed over the versions rather than tracked as a second counter, so a
+    /// version's bytes are given back by the version being dropped and the two can
+    /// never disagree. The walk is bounded: at most `1 + MAX_PROFILE_VERSION`
+    /// versions, each of at most [`MAX_PROFILE_MAPPING_ENTRIES`] entries.
+    pub fn retained_bytes(&self) -> usize {
+        self.published
+            .values()
+            .fold(self.draft.retained_bytes(), |total, version| {
+                total.saturating_add(version.retained_bytes())
+            })
+    }
 }
 
 /// Refuse profile content the modelled `ProfileMapping` could not carry, with
@@ -1344,9 +1389,7 @@ pub fn validate_profile_mapping(mapping: &BTreeMap<String, String>) -> Result<()
     // Every entry can satisfy its own modelled bound and the mapping still be far
     // larger than this emulator retains, so the bytes they hold TOGETHER are bounded
     // too — see [`MAX_PROFILE_MAPPING_BYTES`].
-    let bytes = mapping.iter().fold(0usize, |total, (path, content)| {
-        total.saturating_add(path.len()).saturating_add(content.len())
-    });
+    let bytes = mapping_bytes(mapping);
     if bytes > MAX_PROFILE_MAPPING_BYTES {
         return Err(format!(
             "ProfileMapping must hold at most {MAX_PROFILE_MAPPING_BYTES} bytes of keys and \
@@ -1439,6 +1482,20 @@ impl ComAmazonawsHealthlakeHealthlakeState {
             .fold(0usize, |total, datastore| {
                 total.saturating_add(datastore.fhir_resource_bytes)
             })
+    }
+
+    /// How many BYTES of profile content every data transformation profile
+    /// retains together — what [`MAX_PROFILE_RETAINED_BYTES_TOTAL`] bounds.
+    ///
+    /// Summed over the profiles' own versions, for the reason
+    /// [`Self::fhir_resource_bytes_total`] is summed over the data stores: a
+    /// dropped profile gives its bytes back by being dropped. The walk is bounded
+    /// by [`MAX_PROFILES`] times what [`DataTransformationProfile::retained_bytes`]
+    /// walks.
+    pub fn profile_retained_bytes_total(&self) -> usize {
+        self.profiles.values().fold(0usize, |total, profile| {
+            total.saturating_add(profile.retained_bytes())
+        })
     }
 
     /// Materialise every lifecycle transition the clock has ALREADY made due.

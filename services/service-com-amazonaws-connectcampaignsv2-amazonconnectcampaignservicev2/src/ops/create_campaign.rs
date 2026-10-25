@@ -251,12 +251,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
-        // A campaign belongs to a Connect instance that is onboarded to Campaigns:
-        // the instance-onboarding store is the one record of which instances those
-        // are, and an id whose onboarding job has not finished there is not a campaign
-        // target, so the create is refused with the error the model declares for a
-        // resource that was not found BEFORE anything is stored.
-        if !store.is_onboarded(&input.connect_instance_id, ::std::time::SystemTime::now()) {
+        // A campaign belongs to a Connect instance that is onboarded to Campaigns in
+        // the region this request was signed for: the instance-onboarding store of
+        // that region is the one record of which instances those are, and an id whose
+        // onboarding job has not finished there is not a campaign target, so the
+        // create is refused with the error the model declares for a resource that was
+        // not found BEFORE anything is stored. The campaign the create mints is this
+        // region's resource too — the region its ARN names below — so it is stored
+        // under that region alone.
+        if !store.is_onboarded(&region, &input.connect_instance_id, ::std::time::SystemTime::now())
+        {
             return Err(CreateCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::instance_not_found_message(
@@ -275,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_name = input.name.clone();
         let requested_instance = input.connect_instance_id.clone();
 
-        let stored = store.insert_new_campaign(crate::state::StoredCampaign {
+        let stored = store.insert_new_campaign(&region, crate::state::StoredCampaign {
             id,
             arn,
             name: input.name,
