@@ -386,8 +386,9 @@ async fn tags_belong_to_the_resource_the_arn_names() {
         "the second plan keeps its own tags, got {second_tags:?}"
     );
 
-    // A plan's ARN is addressable from a request signed for another region: the ARN,
-    // not the caller's credential scope, names the resource.
+    // A plan's ARN resolves in the region that plan lives in: the ARN names that
+    // region, and this service's endpoint is per-region, so the same ARN presented to
+    // another region names no resource there.
     let (status, answer) = call_in(
         &router,
         "eu-west-1",
@@ -395,7 +396,15 @@ async fn tags_belong_to_the_resource_the_arn_names() {
         json!({ "ResourceARN": first }),
     )
     .await;
-    assert_eq!(status, 200, "cross-region read of {first}: got {answer}");
+    assert_eq!(
+        status, 400,
+        "cross-region read of {first}: expected a refusal, got {status} {answer}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "ResourceUnavailableException",
+        "cross-region read of {first}: got {answer}"
+    );
 }
 
 #[tokio::test]

@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Name`'s length and pattern, `Description`'s, and
         // `CapacityUnits.RescoreCapacityUnits >= 0`) is already refused with a 400
         // `ValidationException` before this handler runs.
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateRescoreExecutionPlanErrorModeled::InternalServerException(
@@ -210,7 +210,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let Some(plan) = store.plans.get_mut(&input.id) else {
+        // A plan lives in the region its create was signed for, so an id is resolved in
+        // THIS request's region only: a plan of another region cannot be updated here.
+        let Some(plan) = store.plan_mut(&region, &input.id) else {
             return Err(
                 UpdateRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
                     // The service's ONE not-found sentence (`crate::state::plan_not_found`),
