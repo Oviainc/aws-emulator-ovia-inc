@@ -6,9 +6,10 @@
 //! ([`crate::state::acme_domain_validation_summary`]), in one deterministic order (by
 //! validation ARN) and paged by `MaxResults` with a `NextToken` that resumes where the
 //! previous page stopped ([`crate::state::encode_page_cursor`], the token form this
-//! service's parent-scoped paginated reads share). An ARN no stored endpoint answers to
-//! is `ResourceNotFoundException`, and a `NextToken` this service did not issue for that
-//! endpoint is `ValidationException`.
+//! service's parent-scoped paginated reads share). An ARN naming another account is
+//! `ValidationException` before the store is read; an ARN of this account that no stored
+//! endpoint answers to is `ResourceNotFoundException`, and a `NextToken` this service did
+//! not issue for that endpoint is `ValidationException`.
 //!
 //! Reporting, not mutating: the only write it makes is
 //! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
@@ -174,6 +175,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The endpoint ARN is INPUT this operation validates, and its account segment is
+        // part of what it validates: a caller addresses only their own account's
+        // resources, so an endpoint ARN carrying another account's id names nothing they
+        // could read. That is a verdict on the ARN the request is addressed to, so it is
+        // reached before anything else the request carries is read and before the store
+        // is consulted at all — never reported as a resource this account happens not to
+        // hold.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(cross_account_arn(crate::state::ACME_ENDPOINT_RESOURCE_TYPE));
+        }
+
         // A token is only ever read against the endpoint it was issued for, so it is
         // decoded before the store is locked. A token this service did not issue for that
         // endpoint names no position to resume from, and is refused rather than answered
@@ -290,6 +302,16 @@ const MAX_PAGE_SIZE: usize = 100;
 fn invalid_next_token() -> ListAcmeDomainValidationsError {
     ListAcmeDomainValidationsErrorModeled::ValidationException(ValidationException {
         message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an ARN input member addressing `resource_type` that names another
+/// account's resource: the same `ValidationException` class, worded once for the whole
+/// service ([`crate::service::cross_account_arn_refusal`]).
+fn cross_account_arn(resource_type: &str) -> ListAcmeDomainValidationsError {
+    ListAcmeDomainValidationsErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::service::cross_account_arn_refusal(resource_type)),
     })
     .into()
 }
