@@ -186,13 +186,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // could be read in and is refused rather than silently answered in
         // another.
         let language_code = input.language_code.as_deref();
-        if let Some(language_code) = language_code {
-            if !LANGUAGE_CODE_VALUES.contains(&language_code) {
-                return Err(validation(format!(
-                    "languageCode: {language_code} is not a language code; expected one of {}",
-                    LANGUAGE_CODE_VALUES.join(", ")
-                )));
-            }
+        if let Some(message) = crate::state::language_code_refusal(language_code) {
+            return Err(validation(message));
         }
 
         // The token names the catalog position the next page begins at
@@ -239,15 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let page = &selected[..page_size.min(selected.len())];
-        // Issued only when a row the filter selects is still unreported: the
-        // `@paginated` contract is that an absent token ends the iteration.
-        let next_token = match page.last() {
-            Some((position, _)) if selected.len() > page.len() => {
-                Some(crate::state::encode_page_token(PAGE_KIND, position + 1))
-            }
-            _ => None,
-        };
+        // The page cut and the token it issues are this service's one
+        // pagination rule, stated beside the token codec and the page-size
+        // resolution it belongs with, so both paginated operations page alike.
+        let (page, next_token) = crate::state::cut_page(PAGE_KIND, &selected, page_size);
 
         Ok(ListAccountActivitiesOutput {
             activities: page.iter().map(|(_, summary)| summary.clone()).collect(),

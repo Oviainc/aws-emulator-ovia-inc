@@ -196,14 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let page = &selected[..page_size.min(selected.len())];
-        // Issued only when a record the filter selects is still unreported.
-        let next_token = match page.last() {
-            Some((position, _)) if selected.len() > page.len() => {
-                Some(crate::state::encode_page_token(PAGE_KIND, position + 1))
-            }
-            _ => None,
-        };
+        // The same pagination rule `ListAccountActivities` pages by, stated
+        // once beside the token codec and the page-size resolution.
+        let (page, next_token) = crate::state::cut_page(PAGE_KIND, &selected, page_size);
 
         Ok(GetFreeTierUsageOutput {
             free_tier_usages: page.iter().map(|(_, record)| render(record)).collect(),

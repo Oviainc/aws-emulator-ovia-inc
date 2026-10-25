@@ -23,6 +23,8 @@ mod free_tier;
 mod refused_request_media_type;
 #[path = "all/resource_not_found_status.rs"]
 mod resource_not_found_status;
+#[path = "all/shared_rules.rs"]
+mod shared_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire_contract.rs"]
