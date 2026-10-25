@@ -937,12 +937,21 @@ pub const AWAITING_ACCEPTANCE_CONNECTION_STATE: &str = "requested";
 /// Partner"), which is the first leg of the progression the clock then owes it.
 pub const ACCEPTED_CONNECTION_STATE: &str = "pending";
 
+/// The `ConnectionState` a connection whose bandwidth is being re-provisioned
+/// reports ("updating: the connection is being updated"), which is the transient
+/// state `UpdateConnection`'s own change hands the connection to the clock in.
+pub const UPDATING_CONNECTION_STATE: &str = "updating";
+
 /// The `ConnectionState` values a connection whose proposal HAS been accepted, and
 /// whose circuit has not since been torn down or failed, reports: the accepted state
 /// itself, the fully provisioned one, the one a provisioned circuit that is not
 /// passing traffic reports, and the one an in-flight change reports.
-pub const ACCEPTED_CONNECTION_STATES: [&str; 4] =
-    [ACCEPTED_CONNECTION_STATE, "available", "down", "updating"];
+pub const ACCEPTED_CONNECTION_STATES: [&str; 4] = [
+    ACCEPTED_CONNECTION_STATE,
+    "available",
+    "down",
+    UPDATING_CONNECTION_STATE,
+];
 
 /// Whether `state` is one a connection reports once its proposal has been accepted.
 pub fn is_accepted_state(state: &str) -> bool {
@@ -1006,12 +1015,54 @@ pub fn proposal_not_acceptable_message(connection_id: &str, state: &str) -> Stri
 /// The service states the rule in its own refusal ("only connections in 'requested'
 /// or 'available' state can be updated"), so it is an allowlist: every other modelled
 /// state — `pending`, `down`, `deleting`, `deleted`, `failed`, `updating` — is a
-/// connection whose circuit is mid-flight or gone, and an update on it is refused.
+/// connection whose circuit is mid-flight or gone, and an update that asks it for a
+/// CHANGE is refused. A request that asks for no change is judged by
+/// [`update_permitted_from`], which is where the whole rule lives.
 pub const UPDATABLE_CONNECTION_STATES: [&str; 2] = ["requested", "available"];
 
 /// Whether a connection in `state` may be updated at all.
 pub fn is_updatable_state(state: &str) -> bool {
     UPDATABLE_CONNECTION_STATES.contains(&state)
+}
+
+/// Whether applying `description` and `bandwidth` to `connection` would leave it
+/// exactly as it already is.
+///
+/// What makes a repeated update the SAME update: every member it supplies already
+/// holds the value it asks for, so the call has nothing left to change. One that asks
+/// for anything else is a different update. The comparison is against the STORED
+/// record rather than against the request that was first made, because an update
+/// allocates no resource of its own — the record is the whole outcome of the call that
+/// applied it, so a request the record already satisfies is that call's own answer.
+pub fn update_already_applied(
+    connection: &Connection,
+    description: Option<&String>,
+    bandwidth: Option<&String>,
+) -> bool {
+    description.is_none_or(|supplied| *supplied == connection.description)
+        && bandwidth.is_none_or(|supplied| *supplied == connection.bandwidth)
+}
+
+/// Whether a connection in `state` may take an update that `asks_for_change`.
+///
+/// A request that asks for a CHANGE is held to the states the service permits an
+/// update from ([`UPDATABLE_CONNECTION_STATES`]): a circuit that is mid-flight,
+/// impaired or gone has nothing a description or bandwidth change can be applied to.
+///
+/// A request that asks for NO change — every member it supplies already holds the
+/// value it asks for ([`update_already_applied`]) — changes nothing, so there is
+/// nothing for that precondition to protect: it is answered with the record the call
+/// that applied it already produced, which is what the `@idempotent` trait asks for
+/// when a client or an SDK repeats a request that has already succeeded. In
+/// particular the transient state this operation's own change hands the connection to
+/// the clock in is one such state, so the repeat of a bandwidth change is a no-op
+/// rather than a refusal. A connection that is being deleted, deleted or failed is
+/// gone, and an update reports nothing on it at all.
+pub fn update_permitted_from(state: &str, asks_for_change: bool) -> bool {
+    if asks_for_change {
+        return is_updatable_state(state);
+    }
+    is_updatable_state(state) || is_accepted_state(state)
 }
 
 /// How `UpdateConnection` words a refusal on a connection whose state does not permit
