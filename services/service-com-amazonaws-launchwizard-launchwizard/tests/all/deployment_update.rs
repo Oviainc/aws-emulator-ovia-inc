@@ -12,7 +12,8 @@
 //! * the settings are judged against the specification schema of the deployment
 //!   pattern the deployment deploys (the schema `GetWorkloadDeploymentPattern`
 //!   reports), and `force` is what applies an update despite those warnings;
-//! * `dryRun` checks the request and persists nothing;
+//! * `dryRun` checks the request, persists nothing and answers with the documented
+//!   pre-flight error response;
 //! * a deployment that is not there, is going away, or is asked for a version the
 //!   catalogue does not hold, is refused rather than updated (the refusal of a
 //!   deployment whose create or update is still IN FLIGHT has its own suite,
@@ -31,7 +32,8 @@ use service_com_amazonaws_launchwizard_launchwizard::ops::types::{
     DEPLOYMENT_STATUS_VALUES, EVENT_STATUS_VALUES,
 };
 use service_com_amazonaws_launchwizard_launchwizard::state::{
-    service_state, DeploymentEvent, EVENT_IN_PROGRESS, MAX_EVENTS_PER_DEPLOYMENT,
+    service_state, DeploymentEvent, DRY_RUN_OPERATION_CODE, DRY_RUN_OPERATION_STATUS,
+    EVENT_IN_PROGRESS, MAX_EVENTS_PER_DEPLOYMENT,
 };
 
 use crate::deployment_lifecycle::{create, get};
@@ -568,9 +570,10 @@ async fn a_dry_run_update_checks_the_request_and_persists_nothing() {
     std::thread::sleep(CREATE_SETTLE);
     let before = get(&harness, &case, &id).await;
 
-    // Every row is a dry run that passes its checks: it answers success, reports no
-    // deployment (nothing was made, so there is no updated record to report), and
-    // leaves the stored record exactly as it was.
+    // Every row is a dry run that passes its checks: it is answered with the
+    // documented pre-flight ERROR response (nothing was made, so there is no updated
+    // record to report), and leaves the stored record exactly as it was. See
+    // `tests/all/dry_run_preflight.rs` for the rule's own table.
     let rows = [
         ("conforming settings", update_body(&id, &conforming)),
         (
@@ -581,10 +584,12 @@ async fn a_dry_run_update_checks_the_request_and_persists_nothing() {
     for (label, body) in rows {
         let case = format!("{case}: {label}");
         let answered = harness
-            .ok(
+            .refused(
                 &case,
                 "/updateDeployment",
                 with_member(&body, "dryRun", json!(true)),
+                DRY_RUN_OPERATION_STATUS,
+                DRY_RUN_OPERATION_CODE,
             )
             .await;
         assert!(
