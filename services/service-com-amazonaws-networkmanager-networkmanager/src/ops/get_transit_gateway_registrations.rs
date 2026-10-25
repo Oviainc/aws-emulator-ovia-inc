@@ -1,34 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTransitGatewayRegistrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTransitGatewayRegistrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the transit gateway registrations of one global network from the one
+//! registration map the three registration operations share
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::transit_gateway_registrations`).
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTransitGatewayRegistrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `GetTransitGatewayRegistrations::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! A reporting operation: it answers the stored registrations of the global network the
+//! path names, as of the instant it reads them, and writes nothing. `TransitGatewayArns`
+//! narrows the answer and `MaxResults` / `NextToken` page it, like every other listing of
+//! this service.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::service_state`] and read it through the guard it hands
+//! back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -153,17 +140,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTransitGatewayRegistrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTransitGatewayRegistrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTransitGatewayRegistrations"))
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTransitGatewayRegistrationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let requested = input.transit_gateway_arns.unwrap_or_default();
+        let store = state.lock();
+        // Of the stored state this read consults, the resource the PATH addresses is
+        // checked first: an unknown global network is not found whatever selector or page
+        // token the query string carries.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(
+                GetTransitGatewayRegistrationsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // `TransitGatewayArns` documents a maximum of 10 values that the modelled
+        // `TransitGatewayArnList` does not express as `@length`, so a longer filter is
+        // refused — before anything is listed — rather than silently honoured, exactly as
+        // the id-list filters of the other listings of this service are.
+        crate::state::check_filter_ids("TransitGatewayArns", &requested)
+            .map_err(GetTransitGatewayRegistrationsErrorModeled::ValidationException)?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                GetTransitGatewayRegistrationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a token this service issued".to_string(),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "NextToken".to_string(),
+                            message: "the token could not be parsed".to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // `TransitGatewayArns` narrows the global network's registrations, the way every
+        // other listing of this service treats the selectors its query string carries: an
+        // ARN that names no stored registration matches nothing rather than failing the
+        // read, and an absent filter reports every registration of the global network.
+        let entries: Vec<(String, TransitGatewayRegistration)> = store
+            .transit_gateway_registrations
+            .iter()
+            .filter(|(_, record)| record.global_network_id == input.global_network_id)
+            .filter(|(_, record)| {
+                requested.is_empty() || requested.contains(&record.transit_gateway_arn)
+            })
+            .map(|(key, record)| (key.clone(), record.to_shape(now)))
+            .collect();
+        drop(store);
+
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(GetTransitGatewayRegistrationsOutput {
+            transit_gateway_registrations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

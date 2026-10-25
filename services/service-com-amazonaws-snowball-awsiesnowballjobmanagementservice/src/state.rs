@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Address, ClusterMetadata, DeviceConfiguration, JobListEntry, JobMetadata, JobResource,
-    Notification, OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails,
-    TaxDocuments,
+    Address, ClusterListEntry, ClusterMetadata, DeviceConfiguration, JobListEntry, JobMetadata,
+    JobResource, Notification, OnDeviceServiceConfiguration, PickupDetails, ServiceVersion,
+    ShippingDetails, TaxDocuments,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -734,6 +734,19 @@ impl StoredCluster {
         }
     }
 
+    /// This record as the modelled `ClusterListEntry` `ListClusters` pages over.
+    ///
+    /// The entry reports the same members off the same record `DescribeCluster` reports
+    /// from, so a listing and a describe can never disagree about a cluster.
+    pub fn to_cluster_list_entry(&self) -> ClusterListEntry {
+        ClusterListEntry {
+            cluster_id: Some(self.cluster_id.clone()),
+            cluster_state: Some(self.cluster_state.as_wire().to_string()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            description: self.description.clone(),
+        }
+    }
+
     /// A node job of this cluster under the id `job_id`, created at `created`, carrying
     /// the unlock code `unlock_code` the store minted for it.
     ///
@@ -1203,35 +1216,80 @@ pub fn page_size(max_results: Option<i32>) -> usize {
         .unwrap_or(DEFAULT_MAX_RESULTS)
 }
 
-/// One page of `jobs`: the `JobListEntry` list a job-listing operation reports, together
-/// with the cursor its next page resumes at — `None` on the last page, since only a page
-/// with jobs after it carries a token.
+/// One page of `records`: the list entries a listing operation reports, together with the
+/// cursor its next page resumes at — `None` on the last page, since only a page with
+/// records after it carries a token.
 ///
-/// `next_token` is a cursor an earlier page of the SAME listing minted, naming the job that
-/// page stopped before. A token that decodes to nothing, or to a job this listing does not
-/// hold — one the store no longer holds, or one belonging to a different listing — cannot be
-/// resumed from, which is this function's `None`: the caller answers its own operation's
-/// `InvalidNextTokenException` for it.
+/// `key` is the id a cursor over this listing names (a job id, a cluster id) and `entry`
+/// turns one stored record into the modelled list entry the operation reports. The whole
+/// paging rule of this service lives here, so every list operation walks its records the
+/// same way whatever it lists.
+///
+/// `next_token` is a cursor an earlier page of the SAME listing minted, naming the record
+/// that page stopped before. A token that decodes to nothing, or to a record this listing
+/// does not hold — one the store no longer holds, or one belonging to a different listing —
+/// cannot be resumed from, which is this function's `None`: the caller answers its own
+/// operation's `InvalidNextTokenException` for it.
+#[allow(clippy::type_complexity)]
+pub fn page_of<T, E>(
+    records: &[&T],
+    next_token: Option<&str>,
+    page_size: usize,
+    key: impl Fn(&T) -> &str,
+    entry: impl Fn(&T) -> E,
+) -> Option<(Vec<E>, Option<String>)> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let resume_at = decode_cursor(token)?;
+            records
+                .iter()
+                .position(|record| key(record) == resume_at.as_str())?
+        }
+    };
+    let page: Vec<E> = records[start..]
+        .iter()
+        .take(page_size)
+        .map(|record| entry(record))
+        .collect();
+    let next = records
+        .get(start + page.len())
+        .map(|record| encode_cursor(key(record)));
+    Some((page, next))
+}
+
+/// One page of `jobs`, as [`page_of`] pages any listing: the `JobListEntry` list a
+/// job-listing operation reports, with the cursor its next page resumes at.
 #[allow(clippy::type_complexity)]
 pub fn page_of_jobs(
     jobs: &[&StoredJob],
     next_token: Option<&str>,
     page_size: usize,
 ) -> Option<(Vec<JobListEntry>, Option<String>)> {
-    let start = match next_token {
-        None => 0,
-        Some(token) => decode_cursor(token)
-            .and_then(|job_id| jobs.iter().position(|job| job.job_id == job_id))?,
-    };
-    let page: Vec<JobListEntry> = jobs[start..]
-        .iter()
-        .take(page_size)
-        .map(|job| job.to_job_list_entry())
-        .collect();
-    let next = jobs
-        .get(start + page.len())
-        .map(|job| encode_cursor(&job.job_id));
-    Some((page, next))
+    page_of(
+        jobs,
+        next_token,
+        page_size,
+        |job| job.job_id.as_str(),
+        StoredJob::to_job_list_entry,
+    )
+}
+
+/// One page of `clusters`, as [`page_of`] pages any listing: the `ClusterListEntry` list
+/// `ListClusters` reports, with the cursor its next page resumes at.
+#[allow(clippy::type_complexity)]
+pub fn page_of_clusters(
+    clusters: &[&StoredCluster],
+    next_token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<ClusterListEntry>, Option<String>)> {
+    page_of(
+        clusters,
+        next_token,
+        page_size,
+        |cluster| cluster.cluster_id.as_str(),
+        StoredCluster::to_cluster_list_entry,
+    )
 }
 
 /// What a list operation says when the `NextToken` it was handed is not one it minted for
@@ -1259,6 +1317,8 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub long_term_pricing_ids: BTreeSet<String>,
     /// The ids in `jobs` in creation order, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
+    /// The ids in `clusters` in creation order, so `ListClusters` pages deterministically.
+    pub cluster_order: Vec<String>,
     /// The versions of each Snow on-device service this emulator supports, keyed by the
     /// service's `ServiceName` and held newest-version-first, so `ListServiceVersions`
     /// pages deterministically. Seeded by [`seed_service_versions`] when the store is
@@ -1301,6 +1361,7 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             clusters: HashMap::new(),
             long_term_pricing_ids: BTreeSet::new(),
             job_order: Vec::new(),
+            cluster_order: Vec::new(),
             service_versions: seed_service_versions(),
             job_file_grants: Vec::new(),
             return_shipping_labels: HashMap::new(),
@@ -1425,6 +1486,7 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         if !self.can_store_another_cluster() {
             return false;
         }
+        self.cluster_order.push(cluster.cluster_id.clone());
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         true
     }
@@ -1501,6 +1563,17 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         self.job_order
             .iter()
             .filter_map(|job_id| self.jobs.get(job_id))
+            .collect()
+    }
+
+    /// Every stored cluster in creation order — the order `ListClusters` pages over.
+    ///
+    /// Every cluster this store holds is here whatever state it is in: nothing in this API
+    /// removes a cluster, and a cancelled one is a cluster whose `ClusterState` says so.
+    pub fn clusters_in_creation_order(&self) -> Vec<&StoredCluster> {
+        self.cluster_order
+            .iter()
+            .filter_map(|cluster_id| self.clusters.get(cluster_id))
             .collect()
     }
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the attributes STORED against the resources of one cluster — "a list of
+//! attribute objects, one for each attribute on each resource" — narrowed by attribute
+//! name and value as the request asks and paged in a stable order. A reporting
+//! operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +100,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// What separates the target id from the attribute name in the `nextToken` this
+/// operation mints. Neither part can contain it: `Attribute$name` "may contain letters
+/// (uppercase and lowercase), numbers, hyphens (-), underscores (_), forward slashes
+/// (/), back slashes (\), or periods (.)", and an ARN carries none either — so a token
+/// always splits back into the two values it was built from.
+const ATTRIBUTE_PAGE_TOKEN_SEPARATOR: char = '|';
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -177,18 +179,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAttributesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(ListAttributesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "maxResults must be between 1 and {}; got {max_results}",
+                            crate::state::MAX_LIST_PAGE_SIZE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `attributeValue`: "You must also specify an attribute name to use this
+        // parameter." A value on its own names no attribute to match it against, so the
+        // request is REFUSED rather than answered with a listing that ignored it.
+        if input.attribute_value.is_some() && input.attribute_name.is_none() {
+            return Err(ListAttributesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "attributeValue requires attributeName to be specified too".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        // Nothing this listing reports moves on the clock — an attribute is written by
+        // the call that reports the resource carrying it — so this read takes the store
+        // as it stands.
+        let guard = state.lock();
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(ListAttributesErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `nextToken`: "This token should be treated as an opaque identifier that is only
+        // used to retrieve the next items in a list and not for other programmatic
+        // purposes." This operation mints it as the `<targetId>|<name>` of the attribute
+        // the next page starts at, so a value of any other shape is an identifier that
+        // names no page — a `ClientException`, the error for a request "specifying an
+        // identifier that isn't valid".
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match token.split_once(ATTRIBUTE_PAGE_TOKEN_SEPARATOR) {
+                Some((target_id, name)) if !target_id.is_empty() && !name.is_empty() => {
+                    Some((target_id.to_string(), name.to_string()))
+                }
+                _ => {
+                    return Err(ListAttributesErrorModeled::ClientException(ClientException {
+                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                    })
+                    .into())
+                }
+            },
+        };
+
+        // "When you specify a target type and cluster, ListAttributes returns a list of
+        // attribute objects, one for each attribute on each resource": every attribute
+        // stored against every resource of the requested target type in this cluster.
+        // `TargetType` models ONE value, `container-instance`, and the schema refuses any
+        // other before this handler runs, so the container instances registered into the
+        // cluster are that set of resources.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttributes"))
+        // A DEREGISTERED instance is not one of them — "Deregistering a container
+        // instance removes the instance from a cluster" — which is the same set
+        // `ListContainerInstances` reports by default ("all states other than INACTIVE").
+        let mut matching: Vec<(String, Attribute)> = guard
+            .container_instances
+            .values()
+            .filter(|instance| instance.cluster_name == cluster_name)
+            .filter(|instance| instance.status != crate::state::CONTAINER_INSTANCE_INACTIVE)
+            .flat_map(|instance| {
+                instance
+                    .attributes
+                    .iter()
+                    .map(|attribute| (instance.arn.clone(), attribute.clone()))
+            })
+            // "You can filter the list of results to a single attribute name to only
+            // return results that have that name. You can also filter the results by
+            // attribute name and value." Both are the whole value, not a prefix.
+            .filter(|(_, attribute)| {
+                input
+                    .attribute_name
+                    .as_deref()
+                    .is_none_or(|name| attribute.name == name)
+            })
+            .filter(|(_, attribute)| {
+                input
+                    .attribute_value
+                    .as_deref()
+                    .is_none_or(|value| attribute.value.as_deref() == Some(value))
+            })
+            .collect();
+        // The target and the attribute name identify an attribute, so ordering by the
+        // two gives paging a stable sequence to walk: container-instance ARNs end in a
+        // zero-padded, monotonically minted id, so this is registration order, and the
+        // attributes of one instance follow by name.
+        matching.sort_by(|left, right| {
+            (&left.0, &left.1.name).cmp(&(&right.0, &right.1.name))
+        });
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token names the attribute the next page starts at, so a page is unaffected
+        // by attributes stored or removed before it.
+        let start = match resume_at.as_ref() {
+            Some((target_id, name)) => matching.partition_point(|(entry_target, entry)| {
+                (entry_target.as_str(), entry.name.as_str()) < (target_id.as_str(), name.as_str())
+            }),
+            None => 0,
+        };
+        // `start` is either 0 or a `partition_point` result, so it never exceeds the
+        // length, and `end` is clamped to it: the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let attributes: Vec<Attribute> = matching[start..end]
+            .iter()
+            .map(|(target_id, attribute)| Attribute {
+                name: attribute.name.clone(),
+                value: attribute.value.clone(),
+                // `Attribute$targetType`: "This parameter is required if you use the
+                // short form ID for a resource instead of the full ARN" — the listing
+                // reports the full ARN of the resource the attribute is on, so the
+                // target needs no type beside it.
+                target_type: None,
+                target_id: Some(target_id.clone()),
+            })
+            .collect();
+        // "This value is null when there are no more results to return."
+        let next_token = matching
+            .get(end)
+            .map(|(target_id, attribute)| {
+                format!(
+                    "{target_id}{ATTRIBUTE_PAGE_TOKEN_SEPARATOR}{}",
+                    attribute.name
+                )
+            });
+
+        Ok(ListAttributesOutput {
+            attributes: Some(attributes),
+            next_token,
+        })
     }
 }

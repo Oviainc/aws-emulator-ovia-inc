@@ -842,6 +842,121 @@ pub fn tag_count_error(resource: &str, tags: Option<&[Tag]>) -> Option<String> {
     })
 }
 
+/// The kind of CloudWatch resource an `AmazonResourceName` names, for the operations that
+/// read and write a resource's tags: "Currently, the only CloudWatch resources that can be
+/// tagged are alarms, dashboards, metric streams and Contributor Insights rules."
+/// (`TagResource`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggableKind {
+    /// An alarm — metric, composite or log — whose ARN's resource part is `alarm:<name>`.
+    Alarm,
+    /// A dashboard, whose ARN's resource part is `dashboard/<name>`.
+    Dashboard,
+    /// A metric stream, whose ARN's resource part is `metric-stream/<name>`.
+    MetricStream,
+    /// A Contributor Insights rule, whose ARN's resource part is `insight-rule/<name>`.
+    InsightRule,
+}
+
+impl TaggableKind {
+    /// The `ResourceType` a `ResourceNotFoundException` about a resource of this kind
+    /// reports.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::Alarm => "Alarm",
+            Self::Dashboard => "Dashboard",
+            Self::MetricStream => "MetricStream",
+            Self::InsightRule => "InsightRule",
+        }
+    }
+}
+
+/// The taggable resource one ARN names: its kind, and the name the store holding that kind
+/// keys on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaggableResource<'a> {
+    /// Which of this service's resources the ARN names.
+    pub kind: TaggableKind,
+    /// The resource's name, as the ARN's resource part carries it.
+    pub name: &'a str,
+}
+
+/// The resource-part prefix each taggable kind's ARN carries: "The ARN format of an alarm is
+/// arn:aws:cloudwatch:Region:account-id:alarm:alarm-name The ARN format of a Contributor
+/// Insights rule is arn:aws:cloudwatch:Region:account-id:insight-rule/insight-rule-name The
+/// ARN format of a dashboard is arn:aws:cloudwatch::account-id:dashboard/dashboard-name The
+/// ARN format of a metric stream is
+/// arn:aws:cloudwatch:Region:account-id:metric-stream/metric-stream-name"
+/// (`TagResourceInput$ResourceARN`).
+const TAGGABLE_ARN_PREFIXES: [(&str, TaggableKind); 4] = [
+    ("alarm:", TaggableKind::Alarm),
+    ("dashboard/", TaggableKind::Dashboard),
+    ("insight-rule/", TaggableKind::InsightRule),
+    ("metric-stream/", TaggableKind::MetricStream),
+];
+
+/// The ARN namespace of this service's resources, the vendor field every ARN it tags
+/// carries (`aws.api#service$arnNamespace`).
+const ARN_NAMESPACE: &str = "cloudwatch";
+
+/// The CloudWatch resource `arn` names, or `None` when `arn` is not the ARN of a resource
+/// this service can tag.
+///
+/// The ARN itself is read by the one shared parse, so this service cannot disagree with
+/// another about what an ARN is; only the resource-part prefixes above are this service's.
+/// The resource is resolved from its KIND and NAME, which is what every store here keys on;
+/// the partition, region and account fields are not part of that key.
+pub fn parse_taggable_arn(arn: &str) -> Option<TaggableResource<'_>> {
+    let resource = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?.resource;
+    TAGGABLE_ARN_PREFIXES.iter().find_map(|(prefix, kind)| {
+        resource
+            .strip_prefix(prefix)
+            .filter(|name| !name.is_empty())
+            .map(|name| TaggableResource { kind: *kind, name })
+    })
+}
+
+/// The CloudWatch resource `arn` names, or the sentence saying why it names none. Every
+/// operation that takes a `ResourceARN` resolves it through this one rule and renders the
+/// sentence through whichever parameter fault its own model declares.
+pub fn taggable_resource(arn: &str) -> Result<TaggableResource<'_>, String> {
+    parse_taggable_arn(arn).ok_or_else(|| {
+        format!(
+            "The value {arn} for parameter ResourceARN is not valid: it is not the ARN of a \
+             CloudWatch alarm, dashboard, metric stream or Contributor Insights rule"
+        )
+    })
+}
+
+/// Why a resource this store does not hold cannot carry tags. The caller reports it through
+/// its modelled `ResourceNotFoundException` ("The named resource does not exist").
+pub fn unknown_resource_message(arn: &str) -> String {
+    format!("the CloudWatch resource {arn} does not exist")
+}
+
+/// Apply one request's `tags` to a resource's tag set.
+///
+/// "If you specify a new tag key for the alarm, this tag is appended to the list of tags
+/// associated with the alarm. If you specify a tag key that is already associated with the
+/// alarm, the new tag value that you specify replaces the previous value for that tag."
+/// (`TagResource`) — so a key already held keeps its position and takes the new value, and
+/// a key not held is appended. A request naming one key twice leaves its last value, by the
+/// same rule applied in order.
+pub fn merge_tags(held: &mut Vec<Tag>, tags: &[Tag]) {
+    for tag in tags {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value.clone(),
+            None => held.push(tag.clone()),
+        }
+    }
+}
+
+/// Remove from a resource's tag set every tag whose key `keys` names, leaving the rest in
+/// the order they were added. A key the resource does not carry removes nothing.
+pub fn remove_tags(held: &mut Vec<Tag>, keys: &[String]) {
+    held.retain(|tag| !keys.iter().any(|key| key == &tag.key));
+}
+
 /// The largest number of metric streams this in-memory store holds.
 ///
 /// A capacity bound, not an AWS quota: the stream records live in this process's memory, so
@@ -923,6 +1038,72 @@ pub const COMPOSITE_EVALUATION_DELAY_SECS: f64 = 0.5;
 pub const MAX_STATE_REASON_DATA_LEN: usize = 4000;
 
 impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
+    /// The tags the resource `resource` names carries, or `None` when this store holds no
+    /// such resource.
+    ///
+    /// There is ONE tag set per resource: the tags live on the stored resource its writer
+    /// created (`PutMetricAlarm`, `PutCompositeAlarm`, `PutLogAlarm`, `PutMetricStream`,
+    /// `PutInsightRule`), so a tag written at create time and one written afterwards are
+    /// the same set, and deleting the resource takes its tags with it.
+    pub fn resource_tags(&self, resource: &TaggableResource<'_>) -> Option<&[Tag]> {
+        match resource.kind {
+            // An alarm ARN does not say which KIND of alarm it names, and one name belongs
+            // to at most one of the three stores, so all three answer for it.
+            TaggableKind::Alarm => self
+                .alarms
+                .get(resource.name)
+                .map(|stored| stored.tags.as_slice())
+                .or_else(|| {
+                    self.composite_alarms
+                        .get(resource.name)
+                        .map(|stored| stored.tags.as_slice())
+                })
+                .or_else(|| {
+                    self.log_alarms
+                        .get(resource.name)
+                        .map(|stored| stored.tags.as_slice())
+                }),
+            TaggableKind::MetricStream => self
+                .metric_streams
+                .get(resource.name)
+                .map(|stored| stored.tags.as_slice()),
+            TaggableKind::InsightRule => self
+                .insight_rules
+                .get(resource.name)
+                .map(|stored| stored.tags.as_slice()),
+            // Nothing in this store creates a dashboard, so no dashboard ARN names a
+            // resource it holds.
+            TaggableKind::Dashboard => None,
+        }
+    }
+
+    /// The tag set of the resource `resource` names, to write through, or `None` when this
+    /// store holds no such resource. The mutable half of [`Self::resource_tags`].
+    pub fn resource_tags_mut(&mut self, resource: &TaggableResource<'_>) -> Option<&mut Vec<Tag>> {
+        match resource.kind {
+            TaggableKind::Alarm => {
+                if let Some(stored) = self.alarms.get_mut(resource.name) {
+                    return Some(&mut stored.tags);
+                }
+                if let Some(stored) = self.composite_alarms.get_mut(resource.name) {
+                    return Some(&mut stored.tags);
+                }
+                self.log_alarms
+                    .get_mut(resource.name)
+                    .map(|stored| &mut stored.tags)
+            }
+            TaggableKind::MetricStream => self
+                .metric_streams
+                .get_mut(resource.name)
+                .map(|stored| &mut stored.tags),
+            TaggableKind::InsightRule => self
+                .insight_rules
+                .get_mut(resource.name)
+                .map(|stored| &mut stored.tags),
+            TaggableKind::Dashboard => None,
+        }
+    }
+
     /// Append `data` to the series `key` names, creating it when it does not exist.
     ///
     /// `Err(())` when the store already holds [`MAX_SERIES`] series and `key` names a new

@@ -75,5 +75,7 @@ mod resource_share;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/system_job_templates.rs"]
+mod system_job_templates;
 #[path = "all/system_presets.rs"]
 mod system_presets;

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExtension
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExtension`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExtension::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExtension` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExtensionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExtension"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateExtensionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Dynamic parameters can't be marked `Required`" — the one `ParameterMap` rule
+        // the model states in prose rather than as a constraint, so the schema walk let
+        // the request through and it is enforced here, through the one function every
+        // writer of a `ParameterMap` refuses through. Checked before anything is written,
+        // so a parameter a refused update would have changed keeps the state it had.
+        if let Some(reason) = input
+            .parameters
+            .as_ref()
+            .and_then(crate::state::parameter_rejection)
+        {
+            return Err(bad_request(reason));
+        }
+        // `ActionsMap`'s key targets the model's `ActionPoint` enum, so an action bound
+        // to anything else names no point in AppConfig's workflow — the same check
+        // `CreateExtension` makes of the map it stores. Belt and braces: the schema walk
+        // refuses an unmodelled enum value before this handler runs, and a request that
+        // reached here with one still changes nothing.
+        if let Some(actions) = input.actions.as_ref() {
+            let mut action_points: Vec<&String> = actions.keys().collect();
+            action_points.sort();
+            if let Some(unknown) = action_points
+                .into_iter()
+                .find(|point| !ACTION_POINT_VALUES.contains(&point.as_str()))
+            {
+                return Err(bad_request(format!(
+                    "{unknown} is not an AppConfig action point."
+                )));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // AppConfig's own extensions are published rather than owned by this account, so
+        // there is no definition of one for a caller to edit — the same refusal
+        // `DeleteExtension` answers one with, for the same reason: a 200 would claim an
+        // update that changed nothing, and a 404 would deny an extension `GetExtension`
+        // and `ListExtensions` still report.
+        if crate::state::aws_authored_extension(&input.extension_identifier, &region).is_some() {
+            return Err(bad_request(format!(
+                "Extension {} is an Amazon Web Services authored AppConfig extension \
+                 and cannot be updated.",
+                input.extension_identifier
+            )));
+        }
+
+        // `ExtensionIdentifier` is "the name, the ID, or the Amazon Resource Name (ARN)
+        // of the extension", resolved through the one state function every extension
+        // operation resolves an identifier with. An ARN addresses one VERSION, so it pins
+        // the version to update unless the request names one explicitly.
+        let Some((extension, pinned_version)) =
+            store.resolve_extension(&input.extension_identifier, &region)
+        else {
+            return Err(not_found(crate::state::extension_not_found()));
+        };
+        let extension_id = extension.id.clone();
+        let extension_name = extension.name.clone();
+        // `VersionNumber` names WHICH version of the extension this call edits; it is not
+        // an optimistic lock, so the number a caller supplies is never compared against
+        // the extension's latest and a second caller supplying the same number is not
+        // stale. A request naming no version edits the highest one, the version an
+        // identifier alone addresses everywhere in this service.
+        let Some(version_number) = input
+            .version_number
+            .or(pinned_version)
+            .or_else(|| extension.latest_version().map(|version| version.version_number))
+        else {
+            return Err(not_found(crate::state::extension_not_found()));
+        };
+
+        // The update is IN PLACE: the named version keeps its number, the ARN that names
+        // it and its tags, and no version is forked, so an extension this call edits
+        // holds exactly the versions it held before. Concurrent callers therefore all
+        // land, and the extension ends carrying whichever of them wrote last.
+        let Some(version) = store.extension_version_mut(&extension_id, version_number) else {
+            return Err(not_found(crate::state::extension_version_not_found(
+                &input.extension_identifier,
+                version_number,
+            )));
+        };
+        // An update carries only the members the caller means to change, so a member the
+        // request omits keeps the value the version already holds. Supplying `Actions` or
+        // `Parameters` replaces that whole map: the member is the map itself, not a set
+        // of edits to it.
+        if let Some(description) = input.description {
+            version.description = Some(description);
+        }
+        if let Some(actions) = input.actions {
+            version.actions = actions;
+        }
+        if let Some(parameters) = input.parameters {
+            version.parameters = parameters;
+        }
+
+        // Answered from the stored record, so this response and a later `GetExtension`
+        // report the same extension version.
+        Ok(UpdateExtensionOutput {
+            id: Some(extension_id),
+            name: Some(extension_name),
+            version_number: version.version_number,
+            arn: Some(version.arn.clone()),
+            description: version.description.clone(),
+            actions: Some(version.actions.clone()),
+            // `ParameterMap` is bounded `len 1..10`, so an extension that declares no
+            // parameter reports the member absent rather than an empty map a client
+            // would have to treat as a constraint violation.
+            parameters: (!version.parameters.is_empty()).then(|| version.parameters.clone()),
+        })
     }
+}
+
+/// The `BadRequestException` (HTTP 400) this operation answers an update it will not
+/// store with: "The input fails to satisfy the constraints specified by an Amazon Web
+/// Services service."
+fn bad_request(message: String) -> UpdateExtensionError {
+    UpdateExtensionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The `ResourceNotFoundException` (HTTP 404) this operation answers an identifier that
+/// addresses no extension version this service holds with.
+fn not_found(message: String) -> UpdateExtensionError {
+    UpdateExtensionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: None,
+    })
+    .into()
 }

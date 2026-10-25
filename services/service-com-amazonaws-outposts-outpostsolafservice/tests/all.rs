@@ -23,6 +23,8 @@ mod blocking_instances;
 mod capacity_task_lifecycle;
 #[path = "all/catalog_items.rs"]
 mod catalog_items;
+#[path = "all/dependent_resource_conflict.rs"]
+mod dependent_resource_conflict;
 #[path = "all/error_classification.rs"]
 mod error_classification;
 #[path = "all/error_message_rules.rs"]

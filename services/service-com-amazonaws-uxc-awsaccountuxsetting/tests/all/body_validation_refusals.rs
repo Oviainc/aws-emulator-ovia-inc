@@ -11,13 +11,15 @@
 //! `nextToken`) is NOT a body rejection and keeps the modelled
 //! `ValidationException`.
 //!
-//! The modelled constraints are the WHOLE admission rule for these inputs: the
-//! complement of this rule — that a value they admit is accepted, whatever a
-//! catalog happens to hold — is `visible_services_round_trip`'s.
+//! The modelled constraints are the SHAPE half of the admission rule for these
+//! inputs: a value they admit still has to name an entry of the service catalog
+//! to be a `visibleServices` value, which is
+//! `visible_service_catalog_membership`'s rule, and the round trip of a value
+//! both halves admit is `visible_services_round_trip`'s.
 
 use crate::wire::{
     build_router, call, encode_query_value, get_customizations, legal_region,
-    update_customizations,
+    update_customizations, whole_catalog,
 };
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -168,14 +170,17 @@ async fn a_body_breaking_a_modelled_constraint_is_refused_as_bad_request() {
     }
 }
 
-/// Every value AT a modelled bound is accepted, so the refusals above are the
-/// bound and not an off-by-one: each colour the enum declares, a one-character
-/// service identifier, one of exactly 64 characters, and the shortest legal
-/// Region code.
+/// Every value AT a modelled bound passes the body check, so the refusals above
+/// are the bound and not an off-by-one: each colour the enum declares, a
+/// one-character service identifier, one of exactly 64 characters, and the
+/// shortest legal Region code.
 ///
-/// An identifier inside `Service`'s `@length(1, 64)` and `@pattern` is accepted
-/// and read back whatever else it resembles: the modelled constraints are the
-/// whole admission rule for this member.
+/// "Passes the body check" is what a row at a bound shows, which is not the same
+/// as being accepted: a service identifier also has to name a catalog entry
+/// (`visible_service_catalog_membership`), so a row inside `@length(1, 64)` that
+/// the catalog does not name is answered in the modelled `ValidationException`
+/// channel and NOT with the front door's `BadRequestException` — the distinction
+/// each row below asserts.
 #[tokio::test]
 async fn values_at_a_modelled_bound_pass_the_body_check() {
     // The ten values of `AccountColor`
@@ -200,24 +205,71 @@ async fn values_at_a_modelled_bound_pass_the_body_check() {
     }
 
     // A one-character and a 64-character identifier are both inside
-    // `Service`'s `@length(1, 64)`, so both are accepted and read back.
-    let at_length_bound = ["a".to_string(), "a".repeat(64)];
-    for service in at_length_bound {
+    // `Service`'s `@length(1, 64)`, so neither is a body refusal: `q` is the
+    // catalog's own one-character entry and is accepted outright, while the
+    // 64-character one clears the shape check and is then refused for membership
+    // — in the modelled channel, with the record left alone.
+    let catalog = whole_catalog(&build_router()).await;
+    let shortest = catalog
+        .iter()
+        .find(|entry| entry.len() == 1)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the catalog must hold a one-character entry for this row, got {} entries",
+                catalog.len()
+            )
+        });
+    let router = build_router();
+    let (status, error_type, body) =
+        update_customizations(&router, json!({"visibleServices": [shortest.clone()]})).await;
+    assert_eq!(
+        status, 200,
+        "case {shortest:?}: a one-character catalog entry must be accepted, got {status} ({body}) [{error_type}]"
+    );
+    assert_eq!(
+        body.get("visibleServices"),
+        Some(&json!([shortest])),
+        "case {shortest:?}: the accepted identifier must be read back, got {body:?}"
+    );
+
+    for length in [1_usize, 64] {
+        let at_bound = "a".repeat(length);
         let router = build_router();
+        let primed = prime(&router).await;
         let (status, error_type, body) =
-            update_customizations(&router, json!({"visibleServices": [service.clone()]})).await;
+            update_customizations(&router, json!({"visibleServices": [at_bound.clone()]})).await;
         assert_eq!(
-            status, 200,
-            "case {} chars: an identifier inside @length(1, 64) must be accepted, got {status} ({body}) [{error_type}]",
-            service.len()
+            status, 400,
+            "case {length} chars: an identifier the catalog does not name must be refused, got {status} ({body})"
         );
         assert_eq!(
-            body.get("visibleServices"),
-            Some(&json!([service.clone()])),
-            "case {} chars: the accepted identifier must be read back, got {body:?}",
-            service.len()
+            error_type, VALIDATION_EXCEPTION,
+            "case {length} chars: an identifier inside @length(1, 64) clears the body check, so \
+             its refusal is the modelled one, got {error_type:?} (message {:?})",
+            message(&body)
+        );
+        let (_, _, fetched) = get_customizations(&router).await;
+        assert_eq!(
+            fetched, primed,
+            "case {length} chars: the refused update must leave the record untouched, got {fetched:?}"
         );
     }
+
+    // One character PAST the maximum is a shape violation, so it is the front
+    // door's refusal instead: the two channels meet exactly at the bound.
+    let router = build_router();
+    let (status, error_type, body) =
+        update_customizations(&router, json!({"visibleServices": ["a".repeat(65)]})).await;
+    assert_eq!(
+        status, 400,
+        "65 characters must be refused, got {status} ({body})"
+    );
+    assert_eq!(
+        error_type, BAD_REQUEST_EXCEPTION,
+        "65 characters is outside @length(1, 64), so the front door owns it, got {error_type:?} (message {:?})",
+        message(&body)
+    );
 
     // The shortest legal Region code under
     // `^[a-z]{2}(-[a-z]{1,10}){1,2}-[1-9]$`, and the longest segment it admits.

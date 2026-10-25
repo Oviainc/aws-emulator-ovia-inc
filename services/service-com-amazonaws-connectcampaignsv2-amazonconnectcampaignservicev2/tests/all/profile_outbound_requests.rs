@@ -210,12 +210,18 @@ async fn submit(
     (successful, failed)
 }
 
-/// The `clientToken`s the campaign's profile buffer holds, straight out of the store.
-fn buffered_tokens(engine: &engine::InMemoryEngine, campaign: &str) -> BTreeSet<String> {
+/// The `clientToken`s the campaign's profile buffer holds, straight out of the store
+/// — read from the region the campaign was created in, which is the only region that
+/// holds it.
+fn buffered_tokens(
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    campaign: &str,
+) -> BTreeSet<String> {
     engine
         .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>()
         .lock()
-        .campaign(campaign)
+        .campaign(region, campaign)
         .expect("the campaign under test")
         .profile_outbound_requests
         .keys()
@@ -226,13 +232,14 @@ fn buffered_tokens(engine: &engine::InMemoryEngine, campaign: &str) -> BTreeSet<
 /// What the store holds for one taken request: `(id, profileId, sourceEvent)`.
 fn stored_request(
     engine: &engine::InMemoryEngine,
+    region: &str,
     campaign: &str,
     client_token: &str,
 ) -> Option<(String, String, Option<String>)> {
     engine
         .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>()
         .lock()
-        .campaign(campaign)
+        .campaign(region, campaign)
         .expect("the campaign under test")
         .profile_outbound_requests
         .get(client_token)
@@ -247,11 +254,11 @@ fn stored_request(
 
 /// The profile requests the campaign still has pending at this instant, as the store
 /// derives it from each record's stored `expirationTime`.
-fn pending_count(engine: &engine::InMemoryEngine, campaign: &str) -> usize {
+fn pending_count(engine: &engine::InMemoryEngine, region: &str, campaign: &str) -> usize {
     engine
         .state::<ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State>()
         .lock()
-        .campaign(campaign)
+        .campaign(region, campaign)
         .expect("the campaign under test")
         .pending_profile_outbound_requests(SystemTime::now())
 }
@@ -375,7 +382,7 @@ async fn a_pending_token_answers_with_its_own_id_and_an_expired_one_frees_its_sl
     let short_lived_id = id_of(&successful, "short-lived");
     let unexpiring_id = id_of(&successful, "unexpiring");
     assert_eq!(
-        pending_count(&engine, &campaign),
+        pending_count(&engine, region, &campaign),
         2,
         "case {case:?}: both requests are pending, got {successful:?}"
     );
@@ -387,7 +394,7 @@ async fn a_pending_token_answers_with_its_own_id_and_an_expired_one_frees_its_sl
         ("short-lived", 7u128, &short_lived_id),
         ("unexpiring", 8u128, &unexpiring_id),
     ] {
-        let stored = stored_request(&engine, &campaign, token);
+        let stored = stored_request(&engine, region, &campaign, token);
         let expected = Some((
             id.clone(),
             profile_id(seed),
@@ -417,7 +424,7 @@ async fn a_pending_token_answers_with_its_own_id_and_an_expired_one_frees_its_sl
          {repeat:?}"
     );
     assert_eq!(
-        pending_count(&engine, &campaign),
+        pending_count(&engine, region, &campaign),
         2,
         "case {repeat_case:?}: a repeated token stores no second request"
     );
@@ -428,7 +435,7 @@ async fn a_pending_token_answers_with_its_own_id_and_an_expired_one_frees_its_sl
         .await;
     let after_case = "after the short-lived request's expiration";
     assert_eq!(
-        pending_count(&engine, &campaign),
+        pending_count(&engine, region, &campaign),
         1,
         "case {after_case:?}: the short-lived request is past its expiration, so only the \
          unexpiring one is still pending"
@@ -467,7 +474,7 @@ async fn a_pending_token_answers_with_its_own_id_and_an_expired_one_frees_its_sl
          got {reused:?}"
     );
     assert_eq!(
-        buffered_tokens(&engine, &campaign),
+        buffered_tokens(&engine, region, &campaign),
         ["short-lived".to_string(), "unexpiring".to_string()]
             .into_iter()
             .collect::<BTreeSet<String>>(),
@@ -515,7 +522,7 @@ async fn only_a_running_campaign_takes_a_profile_batch() {
         );
         if *expected_status == 200 {
             assert_eq!(
-                pending_count(&engine, &id),
+                pending_count(&engine, region, &id),
                 1,
                 "case {case:?}: a running campaign takes the request, got {body}"
             );
@@ -533,7 +540,7 @@ async fn only_a_running_campaign_takes_a_profile_batch() {
             "case {case:?}: the refusal names the state the campaign is in, got {reported:?}"
         );
         assert_eq!(
-            pending_count(&engine, &id),
+            pending_count(&engine, region, &id),
             0,
             "case {case:?}: a refused batch stores nothing, got {body}"
         );

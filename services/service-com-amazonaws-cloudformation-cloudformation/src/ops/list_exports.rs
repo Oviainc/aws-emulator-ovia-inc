@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the exported output values the stacks of the request's Region
+//! have published — one `Export` per deployed stack output that declares an `Export`
+//! name — derived from the persisted stacks rather than from a registry of its own, so a
+//! stack's exports appear when its deployment completes and go when the stack goes.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +63,29 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::StoredStack;
+
+/// The exports ONE stack publishes: every output of the template it has deployed that
+/// declares an `Export` name.
+///
+/// `Export$Name` "is defined in the `Export` field in the associated stack's `Outputs`
+/// section", and `Export$Value` is "the value of the exported output" — so an export is
+/// exactly a deployed output that names one, and it carries that output's evaluated
+/// value. An output this service could not evaluate carries no `OutputValue`
+/// ([`crate::state::StoredOutput`]), and its export is therefore reported without a
+/// `Value`: the member is optional, and the export exists because the template declares
+/// it, not because its value resolved.
+fn exports_of(stack: &StoredStack) -> impl Iterator<Item = Export> + '_ {
+    stack.outputs.iter().filter_map(|output| {
+        // Only an output that DECLARES an export name publishes one.
+        let name = output.export_name.clone()?;
+        Some(Export {
+            exporting_stack_id: Some(stack.stack_id.clone()),
+            name: Some(name),
+            value: output.value.clone(),
+        })
+    })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -136,18 +154,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExports"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no stack store to read exports
+            // from, so this answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ListExports"));
+        };
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due — which is also what decides whether a stack's
+        // deployment has published its exports yet, and whether a completed deletion has
+        // withdrawn them.
+        store.settle(::std::time::SystemTime::now());
+
+        // "Lists all exported output values in the account and Region in which you call
+        // this action": the exports of the stacks of the Region the request was signed
+        // for, and of the LIVE ones only — a stack whose deletion has completed holds no
+        // outputs any more, so it publishes nothing another stack could import.
+        let region = crate::state::request_region(ctx.parts());
+        let mut exports: Vec<Export> = store.live_stacks(&region).flat_map(exports_of).collect();
+        // The model documents no order for `Exports`, and a paginated read needs a TOTAL
+        // one so that two pages of one collection neither repeat nor skip an entry: by
+        // export name, which is what names an export account-wide, then by the stack
+        // that publishes it.
+        exports.sort_by(|left, right| {
+            (&left.name, &left.exporting_stack_id).cmp(&(&right.name, &right.exporting_stack_id))
+        });
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Exports)`:
+        // one response carries one bounded page, and `NextToken` identifies the next
+        // ("If the output exceeds 100 exported output values").
+        let (page, next_token) = crate::state::paginate(
+            crate::state::PageOf::Exports,
+            exports,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListExportsOutput {
+            exports: Some(page),
+            next_token,
+        })
     }
 }
