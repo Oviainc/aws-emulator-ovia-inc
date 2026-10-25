@@ -978,15 +978,85 @@ pub fn page<T: Clone>(
 /// export past it is refused with the modelled `ValidationException` instead.
 pub const MAX_RESOURCE_TAGS: usize = 200;
 
+/// The tag-key prefix Amazon Web Services reserves for the tags it generates itself.
+///
+/// Amazon Web Services' tagging rules reserve this prefix for its own use: a caller can
+/// neither create nor edit nor delete a tag key carrying it. The model cannot express the
+/// rule — `ResourceTagKey` is `@length 1..128` with NO `@pattern` (smithy_query shape
+/// `ResourceTagKey`) — so every path on this surface that takes a caller-supplied tag key
+/// enforces it instead ([`check_tag_keys_not_reserved`]). The comparison is
+/// case-insensitive, because the namespace is reserved however the prefix is cased.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// `str::get` rather than a byte-range slice (`key[..4]`), which PANICS when the key
+/// carries a multi-byte character straddling that byte index — `ResourceTagKey` carries no
+/// `@pattern`, so a key of any characters at all passes boundary validation and reaches
+/// here. `get` answers `None` for a key shorter than the prefix or one whose boundary
+/// falls mid-character, which is exactly "not reserved".
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// `Ok(())` when no key in `keys` is reserved, else the modelled 400 naming `member` and
+/// the offending keys.
+///
+/// One helper so every operation that takes caller-supplied tag keys — `CreateExport` and
+/// `TagResource` through [`tag_map`], and `UntagResource` with its `ResourceTagKeys` —
+/// refuses that one namespace the same way and cannot drift apart. The offenders are
+/// sorted and deduplicated, so a request naming one of them twice reports it once and the
+/// text does not depend on iteration order, and each is clipped the way every other
+/// refusal of this service quotes a caller-supplied value.
+pub fn check_tag_keys_not_reserved<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ValidationException> {
+    let mut reserved: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+    let offenders = reserved
+        .into_iter()
+        .map(clip_for_message)
+        .collect::<Vec<String>>()
+        .join(", ");
+    Err(ValidationException {
+        message: format!(
+            "{member} names tag keys in the reserved {RESERVED_TAG_KEY_PREFIX} namespace, \
+             which a caller cannot set or remove: {offenders}."
+        ),
+        reason: Some(VALIDATION_REASON_FIELD_FAILED.to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!(
+                "A tag key must not begin with {RESERVED_TAG_KEY_PREFIX}; that prefix is \
+                 reserved for the tags Amazon Web Services generates."
+            ),
+        }]),
+    })
+}
+
 /// A submitted `ResourceTagList` collapsed into the keyed map the store holds, or the
-/// modelled refusal for a list that names one key twice.
+/// modelled refusal for a list that names one key twice or claims the reserved namespace.
 ///
 /// "Each tag consists of a key and a value, and each key must be unique for the resource"
 /// (the modelled doc for `ResourceTags`), so a list carrying one key twice names two
-/// values for one tag and cannot be satisfied. Lives here because every operation that
-/// accepts a `ResourceTagList` — `CreateExport` and `TagResource` — must read it the same
-/// way, or one of them would silently keep the last value for a duplicated key.
+/// values for one tag and cannot be satisfied. A key in the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace is refused for the reason stated there, and
+/// refused for the WHOLE list before any of it is collapsed, so a request mixing an
+/// ordinary pair with a reserved one stores neither. Lives here because every operation
+/// that accepts a `ResourceTagList` — `CreateExport` and `TagResource` — must read it the
+/// same way, or one of them would silently keep the last value for a duplicated key or
+/// seed a key the other refuses.
 pub fn tag_map(tags: Vec<ResourceTag>) -> Result<BTreeMap<String, String>, ValidationException> {
+    check_tag_keys_not_reserved(TAG_LIST_MEMBER, tags.iter().map(|tag| tag.key.as_str()))?;
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for tag in tags {
         if map.insert(tag.key.clone(), tag.value).is_some() {
@@ -995,6 +1065,14 @@ pub fn tag_map(tags: Vec<ResourceTag>) -> Result<BTreeMap<String, String>, Valid
     }
     Ok(map)
 }
+
+/// The input member a submitted `ResourceTagList` arrives in, which both operations that
+/// accept one name identically (smithy_query operations `CreateExport`, `TagResource`).
+pub const TAG_LIST_MEMBER: &str = "ResourceTags";
+
+/// The input member `UntagResource` names the tag keys to remove in (smithy_query
+/// operation `UntagResource`).
+pub const TAG_KEY_LIST_MEMBER: &str = "ResourceTagKeys";
 
 /// The modelled 400 for a `ResourceTags` list that carries `key` more than once.
 pub fn duplicate_tag_key(key: &str) -> ValidationException {

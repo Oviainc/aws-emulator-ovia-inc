@@ -109,6 +109,21 @@ async fn feed_in_status(router: &MultiServiceRouter, status: FeedStatus) -> Stri
             assert_eq!(code, 202, "DeleteFeed answers 202, got {code} with {body}");
             id
         }
+        FeedStatus::Updating => {
+            let id = create_feed(router, "reconfigured-feed", json!([plain_output("crop1")])).await;
+            let (code, body) = call(
+                router,
+                "PUT",
+                &format!("/v1/feed/{id}"),
+                Some(json!({
+                    "name": "reconfigured-feed",
+                    "outputs": [plain_output("crop2")]
+                })),
+            )
+            .await;
+            assert_eq!(code, 200, "UpdateFeed answers 200, got {code} with {body}");
+            id
+        }
         FeedStatus::Archived => {
             let id = create_feed(router, "released-feed", json!([plain_output("crop1")])).await;
             let (code, body) = associate(router, &id, "held-media").await;
@@ -125,11 +140,14 @@ async fn feed_in_status(router: &MultiServiceRouter, status: FeedStatus) -> Stri
 /// over every such status, and whatever name the request carried.
 #[tokio::test]
 async fn a_release_with_nothing_to_release_reports_the_feeds_own_status() {
-    // One row per status that holds no resource. CREATING and UPDATING are never
-    // reported by this service (a created feed is AVAILABLE at once, and UpdateFeed
-    // answers 200), and ACTIVE is the one status that DOES hold a resource.
+    // One row per status that holds no resource: a never-associated feed, one being
+    // reconfigured (`UpdateFeed` suspends the status it was in), one on its way out and
+    // one whose resource has been released. CREATING is never reported by this service
+    // (a created feed is AVAILABLE at once), and ACTIVE is the one status that DOES hold
+    // a resource.
     let statuses = [
         ("AVAILABLE", FeedStatus::Available),
+        ("UPDATING", FeedStatus::Updating),
         ("DELETING", FeedStatus::Deleting),
         ("ARCHIVED", FeedStatus::Archived),
     ];

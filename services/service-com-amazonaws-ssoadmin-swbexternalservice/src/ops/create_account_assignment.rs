@@ -242,10 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store
-            .permission_set(&input.instance_arn, &input.permission_set_arn)
-            .is_none()
-        {
+        // Granting an assignment PROVISIONS the permission set into the target account, so
+        // the account is given the definition that is current at this instant. That
+        // revision is recorded on the row below, which is what lets a later read tell an
+        // account holding the permission set's latest definition from one left behind by a
+        // change to it.
+        let Some(permission_set) =
+            store.permission_set(&input.instance_arn, &input.permission_set_arn)
+        else {
             return Err(CreateAccountAssignmentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -256,7 +260,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
+        };
+        let provisioned_revision = permission_set.definition_revision();
 
         let created_date = ::aws_smithy_types::DateTime::from(now);
         // (instance, account, permission set, principal type, principal id) is the
@@ -330,6 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 principal_id: input.principal_id.clone(),
                 created_date,
                 request_id: request_id.clone(),
+                provisioned_revision,
             });
         store.assignment_operations.insert(
             request_id.clone(),

@@ -192,14 +192,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is read and written inside this block, so the lock is released at
         // its end: the status report write below is an in-process call into the
         // emulator's own S3 service, and nothing awaits while the store is held.
+        //
+        // Everything it touches is the portfolio of the Region this request was signed
+        // for: the task is started there and is reported only by reads signed for that
+        // same Region.
+        let region = crate::state::request_region(ctx.parts());
         let (id, report) = {
             let mut store = state.lock();
 
             // The store is bounded: past its quota an import is refused rather than
             // adding another record. `ServiceQuotaExceededException` is this operation's
             // modelled refusal for exactly that ("The AWS account has reached its quota
-            // of imports.").
-            if store.import_tasks.len() >= crate::state::IMPORT_TASK_QUOTA {
+            // of imports."). The quota is this Region's, as the service's quotas are.
+            if store.region(&region).import_tasks.len() >= crate::state::IMPORT_TASK_QUOTA {
                 return Err(
                     StartImportFileTaskErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException {
@@ -213,7 +218,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
 
-            let id = store.mint_import_file_task_id();
+            // And the store keeps a portfolio for a bounded number of Regions: the Region
+            // comes from the caller's own credential scope, so this is what stops
+            // made-up Regions growing the store without bound. A Region that already
+            // holds something is never refused here.
+            if store.region_capacity_reached(&region) {
+                return Err(
+                    StartImportFileTaskErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "this emulator holds import file tasks in at most {} Regions",
+                                crate::state::MAX_REGIONS
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let id = store.mint_import_file_task_id(&region);
             let task = crate::state::ImportFileTask {
                 id: id.clone(),
                 import_name: input.name,
@@ -258,12 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::import_status_report_document(&task),
                 )
             });
-            store.import_tasks.insert(id.clone(), task);
+            store.region_entry(&region).import_tasks.insert(id.clone(), task);
             (id, report)
         };
 
         if let Some((bucket, key, document)) = report {
-            let region = crate::state::request_region(ctx.parts());
             match crate::state::put_import_status_report(ctx, &region, &bucket, &key, document)
                 .await
             {
@@ -271,7 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // reported from here on by both the single read and the list read.
                 Ok(()) => {
                     let mut store = state.lock();
-                    if let Some(task) = store.import_tasks.get_mut(&id) {
+                    if let Some(task) = store
+                        .region_mut(&region)
+                        .and_then(|portfolio| portfolio.import_tasks.get_mut(&id))
+                    {
                         task.status_report_s3_key = Some(key);
                     }
                 }
