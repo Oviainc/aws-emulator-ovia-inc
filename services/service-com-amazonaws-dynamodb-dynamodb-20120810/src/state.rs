@@ -266,6 +266,13 @@ pub const COUNTER_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const DEFAULT_WARM_READ_UNITS_PER_SECOND: i64 = 12_000;
 pub const DEFAULT_WARM_WRITE_UNITS_PER_SECOND: i64 = 4_000;
 
+/// How much unused capacity a provisioned table keeps for a burst: "DynamoDB currently
+/// retains up to 300 seconds (5 minutes) of unused read and write capacity" (DynamoDB
+/// Developer Guide, "Using burst capacity effectively"). It is the CEILING on what the
+/// budget in [`CapacityBudget`] can hold, so a table that has been idle admits a burst
+/// of this many seconds' worth of writes at once and no more.
+pub const BURST_CAPACITY_WINDOW: Duration = Duration::from_secs(300);
+
 /// One write capacity unit covers a write of up to 1 KB (DynamoDB Developer Guide,
 /// "Read/write capacity mode").
 const WRITE_UNIT_BYTES: i64 = 1024;
@@ -1302,6 +1309,68 @@ impl MeteredCounters {
     }
 }
 
+/// What is left of the capacity a PROVISIONED table is provisioned for, and when that
+/// figure was last advanced.
+///
+/// "Provisioned throughput is the maximum amount of capacity that an application can
+/// consume from a table or index" per second (DynamoDB Developer Guide, "Read/write
+/// capacity mode"), and "DynamoDB currently retains up to 300 seconds (5 minutes) of
+/// unused read and write capacity" for a burst — so the budget refills at the
+/// provisioned rate and never holds more than [`BURST_CAPACITY_WINDOW`] of it. The
+/// rate is PASSED IN rather than stored, because the capacity in force is the table's
+/// own and an `UpdateTable` moves it.
+///
+/// Only the figure and the instant are kept, so nothing runs on a timer: how much has
+/// refilled is derived from the clock when the next write asks for it.
+#[derive(Debug, Clone)]
+pub struct CapacityBudget {
+    /// What was left at [`Self::measured_at`], or `None` while nothing has been spent:
+    /// an untouched budget holds the whole ceiling, whatever rate is in force by the
+    /// time it is first spent from.
+    remaining: Option<f64>,
+    /// When `remaining` was measured.
+    measured_at: SystemTime,
+}
+
+impl CapacityBudget {
+    /// The budget a resource created at `now` starts life with: it has consumed
+    /// nothing, so the first write it is asked to admit has the whole burst ceiling
+    /// behind it.
+    pub fn new(now: SystemTime) -> Self {
+        Self {
+            remaining: None,
+            measured_at: now,
+        }
+    }
+
+    /// Take `units` from the budget a rate of `units_per_second` refills, reporting
+    /// whether the budget covered them.
+    ///
+    /// A request the budget cannot cover takes NOTHING from it: capacity is consumed by
+    /// the work that was done, so a throttled write leaves the budget where it was.
+    pub fn take(&mut self, units_per_second: i64, units: f64, now: SystemTime) -> bool {
+        let rate = units_as_f64(units_per_second);
+        let ceiling = rate * BURST_CAPACITY_WINDOW.as_secs_f64();
+        let elapsed = now
+            .duration_since(self.measured_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let available = match self.remaining {
+            None => ceiling,
+            Some(remaining) => (remaining + elapsed * rate).min(ceiling),
+        };
+        self.measured_at = now;
+        let covered = available >= units;
+        self.remaining = Some(if covered { available - units } else { available });
+        covered
+    }
+}
+
+/// A capacity figure the store holds as an integer, as the arithmetic above takes it.
+fn units_as_f64(units: i64) -> f64 {
+    f64::from(u32::try_from(units.max(0)).unwrap_or(u32::MAX))
+}
+
 /// One table's or index's warm throughput: the read and write units per second it keeps
 /// warm, and when the pair in force became (or becomes) `ACTIVE`.
 ///
@@ -1686,6 +1755,10 @@ pub struct Table {
     /// [`Table::refresh_due_counters`] maintains, so a client is never told this number.
     /// Keeping it lets `PutItem` check its budget without walking the table.
     pub stored_bytes: i64,
+    /// What is left of the write capacity this table is provisioned for
+    /// ([`Table::admit_write`]). Like [`Table::stored_bytes`] it is admission-control
+    /// bookkeeping: no response reports it.
+    pub write_budget: CapacityBudget,
 }
 
 impl Table {
@@ -2200,6 +2273,33 @@ impl Table {
             }
         }
         capacity
+    }
+
+    /// Admit a write that consumes `units` write capacity units, reporting whether the
+    /// capacity this table is provisioned for covered it.
+    ///
+    /// "Provisioned throughput is the maximum amount of capacity that an application can
+    /// consume from a table or index" per second (DynamoDB Developer Guide, "Read/write
+    /// capacity mode"), so a PROVISIONED table admits its provisioned write units each
+    /// second plus whatever of them went unused inside [`BURST_CAPACITY_WINDOW`], and a
+    /// write past that is throttled rather than applied. A table on-demand
+    /// (`PAY_PER_REQUEST`) is provisioned for no capacity to exceed, so every write of
+    /// one is admitted.
+    ///
+    /// Only writes are admitted from a budget: a read in this emulator leaves nothing
+    /// behind it, so what a later caller is told never depends on how much has been
+    /// read.
+    pub fn admit_write(&mut self, units: f64, now: SystemTime) -> bool {
+        let provisioned = match (
+            self.billing_mode.as_str(),
+            self.provisioned_throughput.as_ref(),
+        ) {
+            ("PROVISIONED", Some(throughput)) if throughput.write_capacity_units > 0 => {
+                throughput.write_capacity_units
+            }
+            _ => return true,
+        };
+        self.write_budget.take(provisioned, units, now)
     }
 
     /// The `ItemCollectionKey` of an item: "The partition key value of the item
