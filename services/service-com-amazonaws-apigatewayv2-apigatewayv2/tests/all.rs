@@ -73,6 +73,8 @@ mod portal_product_update;
 mod portal_publication;
 #[path = "all/portal_update.rs"]
 mod portal_update;
+#[path = "all/product_page_lifecycle.rs"]
+mod product_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]
 mod product_rest_endpoint_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_update.rs"]

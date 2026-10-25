@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendContactMethodVerification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendContactMethodVerification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sends a fresh verification request to the contact method of the requested
+//! protocol in the Region the request was made in, and answers the
+//! operation-log entry the write appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendContactMethodVerification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The emulator sends no mail: what a verification request leaves behind is the
+//! contact method's own `status`, which is what this operation writes — a
+//! contact method with a verification request outstanding is
+//! `PendingVerification` ("The contact method has not yet been verified, and the
+//! verification has not yet expired"), while one that is already `Valid` has
+//! been verified and stays so, because sending another request does not
+//! un-verify it. A protocol this account holds no contact method for in that
+//! Region is refused with the service's `DoesNotExist` envelope: there is
+//! nothing to send a verification to.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +173,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendContactMethodVerification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendContactMethodVerificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendContactMethodVerification"))
+        // A contact method belongs to one Region — the account holds one per
+        // protocol "in each Amazon Web Services Region" — and this request names
+        // only a protocol, so the Region of its SigV4 credential scope is what
+        // says WHICH contact method the verification goes to.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+        // `protocol` targets the modelled `ContactMethodVerificationProtocol`
+        // enum, whose only member is `Email` ("SMS contact methods don't need to
+        // be verified"), so the centralized walk refused every other value
+        // before this body ran and the lookup below is by the protocol the
+        // request carries rather than by a protocol this handler picks.
+        let protocol = input.protocol;
+
+        crate::state::with_state(&*self.engine, |store| {
+            let method = store
+                .contact_method_mut(&region, &protocol)
+                .ok_or_else(|| not_found(&protocol))?;
+            // A verification request is now outstanding, so the contact method
+            // is pending verification — which is also what re-sends the
+            // verification "if a previous verification request was deleted, or
+            // has expired", moving the contact method back out of the status
+            // that expiry left it in. A contact method that is already `Valid`
+            // has been verified and confirmed; another verification request does
+            // not un-verify it, so its status is left alone.
+            if method.status != crate::state::CONTACT_METHOD_STATUS_VALID {
+                method.status =
+                    crate::state::CONTACT_METHOD_STATUS_PENDING_VERIFICATION.to_string();
+            }
+            let name = method.name.clone();
+            let location = method.location.clone();
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; this one sends to exactly one contact
+            // method, so it answers exactly one entry. The entry is TERMINAL:
+            // the verification request has gone out by the time this call
+            // returns, and whether the holder of the endpoint confirms it is not
+            // work of this operation — nothing the clock does confirms a
+            // verification.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_SEND_CONTACT_METHOD_VERIFICATION,
+                crate::state::RESOURCE_TYPE_CONTACT_METHOD,
+                &name,
+                &location,
+                None,
+            );
+            Ok(SendContactMethodVerificationOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This Region holds no contact method of that protocol, so there is no
+/// destination to send a verification request to: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the identifier the
+/// request carried, which for a contact method is its protocol. The same
+/// rejection `DeleteContactMethod` answers for the same missing record.
+fn not_found(protocol: &str) -> SendContactMethodVerificationError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTACT_METHOD,
+        protocol,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> SendContactMethodVerificationError {
+    SendContactMethodVerificationErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail contact method store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

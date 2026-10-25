@@ -2086,7 +2086,39 @@ pub fn experiment_run_already_active(experiment_definition_id: &str, active_run:
     )
 }
 
-/// `Message` for a hosted configuration version the named profile does not hold.
+/// `Message` for an update refused because the run it addressed is no longer running.
+///
+/// Derived from the state that refused it — the run addressed and the status it holds —
+/// so the caller can see why the run takes no further change.
+pub fn experiment_run_not_running(
+    experiment_definition_id: &str,
+    run: i32,
+    status: &str,
+) -> String {
+    format!(
+        "Run {run} of experiment definition {experiment_definition_id} is {status}, so it \
+         cannot be updated: only a running experiment can be updated."
+    )
+}
+
+/// `Message` for an update refused because it would lower the audience the run exposes.
+///
+/// Derived from the state that refused it — the exposure the run is already delivering —
+/// beside the exposure the request asked for.
+pub fn experiment_run_exposure_decrease(
+    experiment_definition_id: &str,
+    run: i32,
+    current: f32,
+    requested: f32,
+) -> String {
+    format!(
+        "Run {run} of experiment definition {experiment_definition_id} is already exposing \
+         {current} percent of its audience, so ExposurePercentage cannot be decreased to \
+         {requested}: audience exposure can only be increased."
+    )
+}
+
+
 pub fn hosted_configuration_version_not_found(
     application_id: &str,
     configuration_profile_id: &str,

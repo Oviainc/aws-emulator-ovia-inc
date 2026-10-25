@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -112,6 +113,44 @@ pub fn as_map(value: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The longest a receive in [`receive_until`] waits for one message, in seconds. Inside
+/// the documented `ReceiveMessageRequest$WaitTimeSeconds` range ("an integer from 0 to
+/// 20").
+const RECEIVE_WAIT_SECONDS: u64 = 1;
+
+/// Receive from the queue at `url` until `wanted` messages have come over or `deadline`
+/// passes, and answer each one's `(MessageId, Body)` in the order they were handed over.
+///
+/// Every suite that waits for messages a queue is owed shares this loop rather than
+/// re-deriving the wait and the receive shape.
+pub async fn receive_until(
+    router: &MultiServiceRouter,
+    url: &str,
+    wanted: usize,
+    deadline: Instant,
+) -> Vec<(String, String)> {
+    let mut delivered: Vec<(String, String)> = Vec::with_capacity(wanted);
+    while delivered.len() < wanted && Instant::now() < deadline {
+        let reply = ok(
+            router,
+            "ReceiveMessage",
+            json!({
+                "QueueUrl": url,
+                "MaxNumberOfMessages": 10,
+                "WaitTimeSeconds": RECEIVE_WAIT_SECONDS,
+            }),
+        )
+        .await;
+        for message in messages(&reply) {
+            delivered.push((
+                message["MessageId"].as_str().unwrap_or_default().to_string(),
+                message["Body"].as_str().unwrap_or_default().to_string(),
+            ));
+        }
+    }
+    delivered
+}
+
 /// Create a queue and return the raw reply.
 pub async fn create(router: &MultiServiceRouter, name: &str, attributes: &Value) -> (u16, Value) {
     let mut body = json!({"QueueName": name});
@@ -156,6 +195,16 @@ pub async fn all_attributes(
     )
     .await;
     as_map(&reported["Attributes"])
+}
+
+/// One attribute of the queue at `url` as the integer it reports, which is how every
+/// `ApproximateNumberOfMessages*` attribute is carried.
+pub async fn attribute_count(router: &MultiServiceRouter, url: &str, attribute: &str) -> i64 {
+    let attributes: BTreeMap<String, String> = all_attributes(router, url).await;
+    attributes
+        .get(attribute)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("case {attribute} of {url}: not an integer in {attributes:?}"))
 }
 
 /// Create a queue called `name` and a queue called `<name>-source` whose `RedrivePolicy`

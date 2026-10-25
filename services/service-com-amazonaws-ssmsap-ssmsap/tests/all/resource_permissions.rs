@@ -15,7 +15,7 @@
 //!   no such resource is refused with the modelled `ResourceNotFoundException`
 //!   (HTTP 404) naming that ARN, by the grant and by the read alike, and the refusal
 //!   persists nothing. A grant therefore cannot outlive the registration its target came
-//!   from.
+//!   from, and a grant made for a Region that holds nothing keeps no partition for it.
 //!
 //! The tables span what those rules generalise over: the kind of resource the target ARN
 //! names (the application itself, a database its credentials named, a database its
@@ -26,15 +26,16 @@
 //! `PermissionActionType` the model declares
 //! (`service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES`),
 //! and the ways an ARN can name nothing here (never registered, deregistered, another
-//! Region, a database the registration never named, another service's resource). A single
-//! HANA database target with one source — the shape the issue's reproduction calls — is
-//! ONE row.
+//! Region, a Region holding nothing at all, a database the registration never named,
+//! another service's resource). A single HANA database target with one source — the shape
+//! the issue's reproduction calls — is ONE row.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch` (the harness
 //! `tests/all/application_lifecycle.rs` owns), so the restJson1 routing, the boundary
 //! constraint walk, the handler and the response serialization all run exactly as they
 //! do in the emulator binary. Nothing reaches into `crate::state` directly: a grant is
-//! only believed when a later `GetResourcePermission` reports it back.
+//! only believed when a later `GetResourcePermission` reports it back, and a target is
+//! only made to exist by registering it through `RegisterApplication`.
 
 use std::collections::BTreeSet;
 
@@ -45,8 +46,8 @@ use crate::resource_tags::{application_arn, database_arn, register, registration
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::PERMISSION_ACTION_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    permission_policy_action, MAX_PERMISSION_SOURCES_PER_RESOURCE, POLICY_EFFECT_ALLOW,
-    POLICY_VERSION,
+    permission_policy_action, MAX_PERMISSION_SOURCES_PER_RESOURCE, MAX_REGIONS,
+    POLICY_EFFECT_ALLOW, POLICY_VERSION,
 };
 
 /// The account every emulated ARN carries, from the core's single source of truth.
@@ -65,6 +66,11 @@ const OTHER_REGION: &str = "us-west-2";
 /// `ResourceNotFoundException` `@httpError 404`, declared for `GetResourcePermission`
 /// too).
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The error code a registration past the store's Region ceiling carries
+/// (`smithy_query(query="operation", operation="RegisterApplication")`:
+/// `ConflictException` `@httpError 409`).
+const CONFLICT_EXCEPTION: &str = "ConflictException";
 
 /// One row: a label, the registration that brings the target into being, the target
 /// resource ARN, and the source resource ARNs granted on it in the order the test grants
@@ -763,6 +769,120 @@ async fn grants_are_held_per_region() {
                 assert_not_found(&reply, &target, &case);
             }
         }
+    }
+}
+
+/// RULE: a target only resolves in a Region that already holds the registration it came
+/// from, so a grant made at the endpoint of a Region holding nothing is refused as not
+/// found and keeps no partition for it — the store's Region ceiling stays where
+/// `RegisterApplication`, the only call that mints a partition, enforces it.
+#[tokio::test]
+async fn a_grant_for_a_region_holding_nothing_keeps_no_partition() {
+    let emulator = Emulator::new();
+    let action = PERMISSION_ACTION_TYPE_VALUES[0];
+    let source = format!("arn:aws:ssm-sap:{REGION}:{ACCOUNT}:database/perm-source/HDB");
+
+    // More invented Regions than the store keeps partitions for: the Region comes from
+    // the caller's credential scope, so nothing stops a caller naming as many as it likes.
+    for index in 0..=MAX_REGIONS {
+        let region = format!("us-test-{index}");
+        let case = format!(
+            "grant in {region} (invented Region {} of {})",
+            index + 1,
+            MAX_REGIONS + 1
+        );
+        let target = database_arn(&region, "perm-unregistered", "HDB");
+        assert_not_found(
+            &put_in_region(&emulator, &region, &target, action, &source).await,
+            &target,
+            &case,
+        );
+        assert_not_found(
+            &get_in_region(&emulator, &region, &target, None).await,
+            &target,
+            &case,
+        );
+    }
+
+    // Had any of those calls kept a partition, the ceiling would be spent and a
+    // registration in yet another Region would be refused. It is not: the Region is still
+    // free, and the resource it brings is a target that holds nothing.
+    register_in_region(
+        &emulator,
+        "a registration after the refused grants",
+        "eu-central-1",
+        registration("perm-after-refusals", &[], Some(&["HDB"])),
+    )
+    .await;
+    let target = database_arn("eu-central-1", "perm-after-refusals", "HDB");
+    let read = get_in_region(&emulator, "eu-central-1", &target, None).await;
+    assert_eq!(
+        read.status, 200,
+        "case \"a registration after the refused grants\": expected HTTP 200 for its database, \
+         got {read:?}"
+    );
+    assert!(
+        read.member("Policy").is_none(),
+        "case \"a registration after the refused grants\": expected no Policy, got {read:?}"
+    );
+}
+
+/// RULE: the store holds applications in at most [`MAX_REGIONS`] Regions; a registration
+/// that would mint one past that is refused with the modelled `ConflictException`
+/// (HTTP 409) and stores nothing — the ceiling that bounds every partition the store
+/// keeps, since registering is the only call that mints one.
+#[tokio::test]
+async fn the_region_partition_ceiling_is_enforced_where_a_partition_is_minted() {
+    let emulator = Emulator::new();
+
+    for index in 0..MAX_REGIONS {
+        let region = format!("us-test-{index}");
+        register_in_region(
+            &emulator,
+            &format!("Region {} of {MAX_REGIONS}", index + 1),
+            &region,
+            registration("perm-ceiling", &[], Some(&["HDB"])),
+        )
+        .await;
+    }
+
+    let over = format!("us-test-{MAX_REGIONS}");
+    let case = format!("one Region past {MAX_REGIONS}");
+    let reply = emulator
+        .send_in_region(
+            &over,
+            "/register-application",
+            registration("perm-ceiling", &[], Some(&["HDB"])),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 409,
+        "case {case:?}: expected HTTP 409 past the ceiling, got {reply:?}"
+    );
+    assert_eq!(
+        reply.code(),
+        CONFLICT_EXCEPTION,
+        "case {case:?}: expected {CONFLICT_EXCEPTION}, got {reply:?}"
+    );
+    // The refusal stored nothing, so the Region holds no resource to grant on.
+    let target = database_arn(&over, "perm-ceiling", "HDB");
+    assert_not_found(
+        &get_in_region(&emulator, &over, &target, None).await,
+        &target,
+        &case,
+    );
+
+    // Every Region within the ceiling still holds its own resource, each a target of its
+    // own.
+    let action = PERMISSION_ACTION_TYPE_VALUES[0];
+    for index in 0..MAX_REGIONS {
+        let region = format!("us-test-{index}");
+        let case = format!("{region} after the refusal");
+        let target = database_arn(&region, "perm-ceiling", "HDB");
+        let source = format!("arn:aws:ssm-sap:{region}:{ACCOUNT}:database/perm-source/HDB");
+        let reply = put_in_region(&emulator, &region, &target, action, &source).await;
+        let expected: BTreeSet<String> = BTreeSet::from([source.clone()]);
+        assert_policy_grants(&policy(&reply, &case), &target, action, &expected, &case);
     }
 }
 

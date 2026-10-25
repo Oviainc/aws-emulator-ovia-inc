@@ -179,6 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // A tag key in the reserved namespace names a system tag, which is not
+        // the caller's to set, so a request carrying one is refused before
+        // anything is stored rather than creating a resource that claims it.
+        if let Some(key) = crate::state::reserved_tag_key_in(input.tags.as_ref()) {
+            return Err(CreateChannelPlacementGroupErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::reserved_tag_key_message(key)),
+                },
+            )
+            .into());
+        }
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 

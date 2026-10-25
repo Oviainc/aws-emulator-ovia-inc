@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSecretVersionStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSecretVersionStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSecretVersionStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves a staging label between the versions of a secret, and takes one off the
+//! version that holds it — the label moves one version at a time, and moving
+//! `AWSCURRENT` leaves `AWSPREVIOUS` on the version it came from.
 //!
 //! ## Shape of an operation
 //!
@@ -178,20 +172,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSecretVersionStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSecretVersionStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSecretVersionStage"))
+        let stage = input.version_stage.clone();
+        let move_to = input.move_to_version_id.clone();
+        let remove_from = input.remove_from_version_id.clone();
+
+        // One of the two version parameters has to be there: `MoveToVersionId`
+        // is "the ID of the version to add the staging label to. To remove a
+        // label from a version, then do not specify this parameter", and
+        // `RemoveFromVersionId` "the ID of the version that the staging label is
+        // to be removed from" (this service's Smithy model) — a call naming
+        // neither asks for no change at all.
+        if move_to.is_none() && remove_from.is_none() {
+            return Err(invalid_parameter(
+                "You must specify either MoveToVersionId or RemoveFromVersionId.",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // The permanent removal the clock has already made due, materialised
+        // before this call resolves anything: it was owed at this instant
+        // whether or not anybody called.
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(UpdateSecretVersionStageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // A secret inside its recovery window still exists, so a staging-label
+        // change is refused by its state: "The secret is scheduled for
+        // deletion." (`InvalidRequestException`, this service's Smithy model.)
+        if secret.scheduled_for_deletion() {
+            return Err(marked_for_deletion());
+        }
+
+        // The version the label names right now. For `AWSPENDING` that is the id
+        // a started rotation reserved, even before its version exists — which is
+        // what lets a caller clean up after a cancelled rotation.
+        let holder = secret.stage_holder(&stage).map(str::to_string);
+
+        // Attach the label to a version, taking it off whichever version holds
+        // it; with no version to attach it to, take it off the one named.
+        if let Some(move_to) = move_to {
+            if secret.version(&move_to).is_none() {
+                return Err(
+                    UpdateSecretVersionStageErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::version_not_found_message(&move_to)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "If the staging label you are trying to attach to one version is
+            // already attached to a different version, then you must include
+            // this parameter and specify the version that the label is to be
+            // removed from. If the label is attached and you either do not
+            // specify this parameter, or the version ID does not match, then the
+            // operation fails."
+            // (`UpdateSecretVersionStageRequest$RemoveFromVersionId`, this
+            // service's Smithy model.) The precondition is what makes two
+            // concurrent moves of one label resolve with a single winner: the
+            // loser named the version the label has already left.
+            if let Some(holder) = holder.as_deref().filter(|held| *held != move_to.as_str()) {
+                match remove_from.as_deref() {
+                    None => {
+                        return Err(invalid_parameter(format!(
+                            "The parameter RemoveFromVersionId can't be empty. Staging label \
+                             {stage} is currently attached to version {holder}, so you must \
+                             explicitly reference that version in RemoveFromVersionId."
+                        )));
+                    }
+                    Some(named) if named != holder => {
+                        return Err(stale_remove_from(&stage, Some(holder), named));
+                    }
+                    Some(_) => {}
+                }
+            } else if let Some(named) = remove_from
+                .as_deref()
+                .filter(|named| holder.as_deref() != Some(*named))
+            {
+                // The label is not where the caller says it is: refusing is what
+                // tells a caller its view of the labels is stale, rather than
+                // silently attaching.
+                return Err(stale_remove_from(&stage, holder.as_deref(), named));
+            }
+
+            let already_there = holder.as_deref() == Some(move_to.as_str());
+            // One version carries at most `STAGES_PER_VERSION` labels of the
+            // caller's own; the labels the service moves itself do not take a
+            // slot. Over that, "the request failed because it would exceed one
+            // of the Secrets Manager quotas."
+            if !already_there && !crate::state::is_reserved_stage(&stage) {
+                let attached = secret
+                    .version(&move_to)
+                    .map(crate::state::SecretVersion::custom_stage_count)
+                    .unwrap_or_default();
+                if attached >= crate::state::STAGES_PER_VERSION {
+                    return Err(UpdateSecretVersionStageErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(crate::state::STAGE_LIMIT_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            if !already_there {
+                secret.attach_stage(&stage, &move_to, now);
+            }
+        // A call that names no version to attach the label to removes it from
+        // the version it names; a call naming neither is refused above, so this
+        // is every remaining request.
+        } else if let Some(remove_from) = remove_from {
+            if holder.as_deref() != Some(remove_from.as_str()) {
+                return Err(stale_remove_from(&stage, holder.as_deref(), &remove_from));
+            }
+            secret.detach_stage(&stage, &remove_from, now);
+        }
+
+        Ok(UpdateSecretVersionStageOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+        })
     }
+}
+
+/// `InvalidParameterException` — "the parameter name or value is invalid" — for a
+/// request whose version parameters cannot hold together.
+fn invalid_parameter(message: impl Into<String>) -> UpdateSecretVersionStageError {
+    UpdateSecretVersionStageErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `InvalidRequestException` for a `RemoveFromVersionId` that does not name the
+/// version the label is on — "a parameter value is not valid for the current
+/// state of the resource" (this service's Smithy model), which is exactly what a
+/// caller holding a stale view of the labels sends. The message names where the
+/// label actually is, so the caller can retry against the current state.
+fn stale_remove_from(
+    stage: &str,
+    holder: Option<&str>,
+    named: &str,
+) -> UpdateSecretVersionStageError {
+    let message = match holder {
+        Some(holder) => format!(
+            "Staging label {stage} is currently attached to version {holder}, so you can't remove \
+             it from version {named}."
+        ),
+        None => format!("Staging label {stage} is not attached to version {named}."),
+    };
+    UpdateSecretVersionStageErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `InvalidRequestException` for a secret that is inside its recovery window: it
+/// still exists, so the refusal is about its state (see
+/// [`crate::state::MARKED_FOR_DELETION_MESSAGE`]).
+fn marked_for_deletion() -> UpdateSecretVersionStageError {
+    UpdateSecretVersionStageErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> UpdateSecretVersionStageError {
+    UpdateSecretVersionStageErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

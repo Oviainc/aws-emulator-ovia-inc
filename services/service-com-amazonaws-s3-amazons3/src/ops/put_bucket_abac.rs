@@ -221,13 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::MALFORMED_XML_CODE,
                 MALFORMED_XML_STATUS,
-                // The documented sentence for the code, naming the member and the value
-                // set it is judged against; the rejected value is NOT echoed back, so a
-                // refusal reflects nothing the request carried.
-                format!(
-                    "{}: AbacStatus.Status must name one of {BUCKET_ABAC_STATUS_VALUES:?}",
-                    crate::state::MALFORMED_XML_MESSAGE
-                ),
+                // That code's own FIXED published sentence, sent whole and alone: the code
+                // says the document did not validate against the published schema, and
+                // that schema is the same for every document, so nothing about this
+                // request is appended to it — the rule
+                // [`crate::state::LifecycleConfigurationRejection::message`] already states
+                // for this service. The boundary refusal of a VALUE outside the same
+                // member's enum carries the identical text (`crate::service`), so both
+                // forms of one schema violation read the same on the wire.
+                crate::state::MALFORMED_XML_MESSAGE,
             ));
         };
 

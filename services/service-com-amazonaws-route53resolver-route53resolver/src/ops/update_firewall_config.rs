@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallConfig"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateFirewallConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `FirewallFailOpen` is one of the values the modelled
+        // `FirewallFailOpenStatus` enum declares; an unmodelled value is refused
+        // rather than stored, so a later read never reports a status the enum
+        // does not carry.
+        let requested = input.firewall_fail_open.as_str();
+        if !crate::ops::types::FIREWALL_FAIL_OPEN_STATUS_VALUES.contains(&requested) {
+            return Err(UpdateFirewallConfigErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "FirewallFailOpen must be one of {:?}",
+                        crate::ops::types::FIREWALL_FAIL_OPEN_STATUS_VALUES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Updates the configuration of the firewall behavior provided by DNS
+        // Firewall for a single VPC": the configuration is a per-VPC singleton
+        // the service maintains itself, so this call writes the requested
+        // behaviour onto the configuration that VPC already has — its identity
+        // (`Id`, `ResourceId`, `OwnerId`) unchanged — and reports it back.
+        let mut store = state.lock();
+        let mut record = store.firewall_config(&input.resource_id);
+        if record.seq == 0 {
+            // A VPC the store holds no record for needs one allocated, and the
+            // store is bounded: an update past the bound is refused with the
+            // server-side-capacity refusal this operation models and writes
+            // nothing. An update of a VPC already stored allocates nothing, so
+            // it is never refused here.
+            if !store.can_store_another_firewall_config() {
+                return Err(UpdateFirewallConfigErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: Some(format!(
+                            "This emulator stores firewall configurations for at most {} VPCs",
+                            crate::state::MAX_STORED_FIREWALL_CONFIGS
+                        )),
+                    },
+                )
+                .into());
+            }
+            record.seq = store.next_seq();
+        }
+        record.firewall_fail_open = requested.to_string();
+        store
+            .firewall_configs
+            .insert(record.resource_id.clone(), record.clone());
+
+        Ok(UpdateFirewallConfigOutput {
+            firewall_config: Some(record.to_firewall_config()),
+        })
     }
 }

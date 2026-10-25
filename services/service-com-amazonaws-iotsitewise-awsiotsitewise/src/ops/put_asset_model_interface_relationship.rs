@@ -442,10 +442,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .asset_models
             .get_mut(&asset_model_id)
             .ok_or_else(|| model_not_found(&input.asset_model_id))?;
+        // The definition this call supersedes, read before its writes land: it
+        // stays the model's ACTIVE version until the new one settles.
+        let superseded = record.definition();
         record.properties.extend(created);
         // Applying an interface changes the model's definition, so it carries a new
         // version and reports UPDATING until the transition this call owes falls due.
-        record.begin_update(now);
+        record.begin_update(superseded, now);
         let output = PutAssetModelInterfaceRelationshipOutput {
             asset_model_id: record.id.clone(),
             interface_asset_model_id: interface_asset_model_id.clone(),

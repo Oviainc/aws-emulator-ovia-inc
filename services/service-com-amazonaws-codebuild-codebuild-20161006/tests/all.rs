@@ -37,6 +37,8 @@ mod project_build_lifecycle;
 mod project_visibility;
 #[path = "all/read_response_shape.rs"]
 mod read_response_shape;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/report_group_lifecycle.rs"]
 mod report_group_lifecycle;
 #[path = "all/report_group_reads.rs"]

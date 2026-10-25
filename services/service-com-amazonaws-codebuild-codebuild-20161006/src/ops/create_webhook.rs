@@ -341,11 +341,9 @@ fn check_source_supports_webhook(
     input: &CreateWebhookInput,
     project_arn: &str,
 ) -> Result<(), CreateWebhookError> {
-    if let Some(message) = crate::state::webhook_build_type_violation(
-        source_type,
-        input.build_type.as_deref(),
-        project_arn,
-    ) {
+    if let Some(message) =
+        crate::state::webhook_build_type_violation(source_type, input.build_type.as_deref())
+    {
         return Err(invalid_input(message));
     }
     if input.manual_creation == Some(true)
@@ -359,3 +357,4 @@ fn check_source_supports_webhook(
     }
     Ok(())
 }
+
