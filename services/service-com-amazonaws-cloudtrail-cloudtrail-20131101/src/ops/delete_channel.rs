@@ -4,15 +4,14 @@
 //!
 //! Deletes one channel out of the channel registry [`crate::state::channels`] owns.
 //!
-//! A channel is addressed by its ARN or by the bare id CloudTrail minted for it
+//! A channel is addressed by its ARN or by the `UUID` CloudTrail minted as its id
 //! (`DeleteChannelRequest$Channel`: "The ARN or the UUID value of the channel that you
 //! want to delete"), and the ARN carries the account that owns the channel and the Region
-//! it lives in — so a channel is deleted out of the Region that holds it, an id no
-//! channel carries names no channel, and an `arn:`-prefixed value that is not a channel
-//! ARN is refused as one. Both readings, and the refusal wording for either failure,
-//! live in `crate::state::channels` so `GetChannel`, `UpdateChannel` and `ListChannels`
-//! cannot
-//! drift from this handler.
+//! it lives in — so a channel is deleted out of the Region that holds it, an identifier
+//! in one of those two forms that no stored channel matches names no channel, and a
+//! value in NEITHER form is refused as a malformed channel ARN. Both readings, and the
+//! refusal wording for either failure, live in `crate::state::channels` so `GetChannel`,
+//! `UpdateChannel` and `ListChannels` cannot drift from this handler.
 //!
 //! What this handler does NOT reach is the modelled `OperationNotPermittedException`:
 //! real CloudTrail refuses to delete a channel it manages on a customer's behalf (a
@@ -197,9 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // An `arn:`-prefixed identifier that is not a channel ARN cannot name a channel,
-        // so it is refused as a malformed ARN rather than reported absent. Anything else
-        // is a channel id, and an id no channel carries is an absent channel.
+        // An identifier in neither documented form — an `arn:` value that is not a
+        // channel ARN, or a bare value that is not a channel `UUID` — cannot name a
+        // channel, so it is refused as a malformed ARN rather than reported absent. A
+        // well-formed identifier no stored channel matches is an absent channel.
         let address = store
             .addressed_channel(&input.channel, &region)
             .ok_or_else(|| {

@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutPropertyValues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutPropertyValues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! WRITES values into the time series of the properties the request's entries
+//! name: "sets values for multiple time series properties". Each entry is
+//! served on its own — the entries this service can serve are stored and the
+//! ones it cannot come back in `errorEntries`, one `BatchPutPropertyError` per
+//! failed entry carrying the entry itself, so a batch mixing servable entries
+//! with unservable ones is PARTIALLY applied rather than refused whole. The
+//! whole request is refused only for what is wrong with the request rather than
+//! with an entry: an unknown workspace is the `ResourceNotFoundException` the
+//! operation models.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutPropertyValues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An entry is servable when its `entityPropertyReference` resolves to a
+//! component of an entity of the workspace — by `entityId` with `componentName`
+//! or `componentPath`, or by the `externalIdProperty` that names the component
+//! by its external id — and the property it names is a TIME SERIES property
+//! ([`crate::state::property_is_time_series`]) every one of the entry's values
+//! carries an instant and a value of the declared `dataType` for. A reference
+//! naming an entity or a component the workspace does not hold earns a
+//! `ResourceNotFoundException` entry error; a property that is not a time
+//! series property, a value of another data type and a value with no instant
+//! earn a `ValidationException` entry error.
+//!
+//! A value is stored under the instant it was written FOR — `time`, else the
+//! deprecated `timestamp` — so the series is in time order however it was
+//! written and a second value for one instant replaces the first.
+//! `GetPropertyValueHistory` reads it back.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +160,508 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutPropertyValues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutPropertyValuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutPropertyValues"))
+        // Every call is recorded, successful or refused: this one writes tenant
+        // state, and how many entries it carried is what a later read of the
+        // log is about.
+        ::tracing::info!(
+            operation = "BatchPutPropertyValues",
+            workspace_id = %input.workspace_id,
+            entries = input.entries.len(),
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store it writes to: a
+        // workspace created through another Region's endpoint is not in it, so
+        // it holds no property to write to.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchPutPropertyValuesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        let state = state.region_mut(&region);
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(not_found(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            )));
+        };
+
+        // Resolved against the workspace as it stands, BEFORE anything is
+        // written: every entry is judged against the same state, so the order
+        // the entries arrive in cannot decide which of them are servable. The
+        // whole batch is at most `Entries`' modelled ten entries of at most ten
+        // values each.
+        let mut plans = Vec::new();
+        let mut error_entries = Vec::new();
+        for entry in &input.entries {
+            match plan_entry(workspace, &input.workspace_id, entry) {
+                Ok(plan) => plans.push(plan),
+                Err(error) => error_entries.push(BatchPutPropertyErrorEntry {
+                    errors: vec![BatchPutPropertyError {
+                        error_code: error.code.to_string(),
+                        error_message: error.message,
+                        // The entry itself, so a caller matching errors to what
+                        // it sent does not have to count positions.
+                        entry: entry.clone(),
+                    }],
+                }),
+            }
+        }
+        for plan in plans {
+            apply(workspace, plan);
+        }
+
+        Ok(BatchPutPropertyValuesOutput { error_entries })
+    }
+}
+
+/// Answer that something the request named does not exist. The operation models
+/// `ResourceNotFoundException` itself, so the refusal is the modelled shape
+/// rather than the scaffold wrapper's.
+fn not_found(message: String) -> BatchPutPropertyValuesError {
+    BatchPutPropertyValuesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The `errorCode` an entry error carries when the entry itself is not one this
+/// service can be asked to serve: the property is not a time series property,
+/// a value carries no instant, or a value is of another data type than the
+/// property's.
+///
+/// `errorCode` is modelled as a plain string, so the two codes below are not
+/// read off the model: they are the names of the two failures the operation
+/// models at the REQUEST level (`ValidationException`, HTTP 400, and
+/// `ResourceNotFoundException`, HTTP 404), reported per entry because one entry
+/// failing leaves the others servable.
+const ERROR_CODE_VALIDATION: &str = "ValidationException";
+
+/// See [`ERROR_CODE_VALIDATION`]. Carried by an entry whose reference names an
+/// entity or a component the workspace does not hold.
+const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// Why ONE entry cannot be served: the `errorCode` and `errorMessage` its
+/// reported error carries.
+struct EntryError {
+    code: &'static str,
+    message: String,
+}
+
+/// An entry this service cannot be asked to serve.
+fn invalid_entry(message: String) -> EntryError {
+    EntryError {
+        code: ERROR_CODE_VALIDATION,
+        message,
+    }
+}
+
+/// An entry whose reference names something the workspace does not hold.
+fn absent_entry(message: String) -> EntryError {
+    EntryError {
+        code: ERROR_CODE_NOT_FOUND,
+        message,
+    }
+}
+
+/// What one entry writes, where: the keys the store holds the addressed
+/// property under, and the values to record in its series.
+struct Plan {
+    entity_id: String,
+    component_name: String,
+    /// The key of the composite component inside that component, for an entry
+    /// addressing a property of one; `None` for a top-level component.
+    composite_path: Option<String>,
+    property_name: String,
+    /// The values to store, each with the instant it is written for.
+    values: Vec<(i128, crate::state::TimeSeriesValue)>,
+}
+
+/// The component an `EntityPropertyReference` addresses, as the store holds it:
+/// the keys to reach it by, and what resolving a property of it needs.
+struct Addressed<'a> {
+    entity_id: String,
+    component_name: String,
+    composite_path: Option<String>,
+    component_type_id: Option<&'a str>,
+    properties: &'a ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+}
+
+/// Judge one entry against the workspace and say what it writes.
+///
+/// Nothing here mutates: an entry is servable or it is not, and the whole batch
+/// is judged before any of it is applied.
+fn plan_entry(
+    workspace: &crate::state::Workspace,
+    workspace_id: &str,
+    entry: &PropertyValueEntry,
+) -> Result<Plan, EntryError> {
+    let reference = &entry.entity_property_reference;
+    let property_name = reference.property_name.as_str();
+    let addressed = address(workspace, workspace_id, reference)?;
+
+    // The definition that gives the property its meaning: the component's own,
+    // else the one it inherits from the component type it instantiates. A
+    // property neither declares nor carries anything is none of the
+    // component's, and a property whose definition is not `isTimeSeries` is
+    // not one this data plane sets values for.
+    let definition = workspace.effective_property_definition(
+        addressed.component_type_id,
+        addressed.properties,
+        property_name,
+    );
+    if definition.is_none() && !addressed.properties.contains_key(property_name) {
+        return Err(invalid_entry(format!(
+            "Property {property_name} is not a property of component {} of entity {}.",
+            addressed.component_name, addressed.entity_id
+        )));
+    }
+    if !crate::state::property_is_time_series(definition) {
+        return Err(invalid_entry(format!(
+            "Property {property_name} of component {} of entity {} is not a time series \
+             property.",
+            addressed.component_name, addressed.entity_id
+        )));
+    }
+
+    let requested = entry.property_values.as_deref().unwrap_or_default();
+    if requested.is_empty() {
+        return Err(invalid_entry(format!(
+            "The entry for property {property_name} carries no propertyValues to set."
+        )));
+    }
+    let mut values = Vec::with_capacity(requested.len());
+    for value in requested {
+        if let Some(violation) =
+            crate::state::data_value_type_violation(property_name, definition, &value.value)
+        {
+            return Err(invalid_entry(violation));
+        }
+        values.push(instant_and_value(property_name, value)?);
+    }
+
+    Ok(Plan {
+        entity_id: addressed.entity_id,
+        component_name: addressed.component_name,
+        composite_path: addressed.composite_path,
+        property_name: property_name.to_string(),
+        values,
+    })
+}
+
+/// The instant one `PropertyValue` is written FOR, with the value to store
+/// under it.
+///
+/// `time` is "the ISO8601 DateTime of a value for a time series property";
+/// `timestamp` is the deprecated member that carried the same instant before
+/// it ("use time instead"), so it is read where a caller still sends it and
+/// the instant it names is rendered as the `time` a read reports. A value
+/// carrying neither names no moment in the series, so there is nowhere to put
+/// it.
+fn instant_and_value(
+    property_name: &str,
+    value: &PropertyValue,
+) -> Result<(i128, crate::state::TimeSeriesValue), EntryError> {
+    if let Some(time) = value.time.as_deref() {
+        let at = crate::state::instant_of_time(time).ok_or_else(|| {
+            invalid_entry(format!(
+                "The time {time} of a value of property {property_name} is not an ISO8601 \
+                 DateTime."
+            ))
+        })?;
+        return Ok((
+            at,
+            crate::state::TimeSeriesValue {
+                value: value.value.clone(),
+                time: time.to_string(),
+            },
+        ));
+    }
+    if let Some(timestamp) = value.timestamp.as_ref() {
+        let at = crate::state::instant_of_timestamp(timestamp);
+        let time = crate::state::time_of_instant(at).ok_or_else(|| {
+            invalid_entry(format!(
+                "The timestamp of a value of property {property_name} is not an instant this \
+                 service can record."
+            ))
+        })?;
+        return Ok((
+            at,
+            crate::state::TimeSeriesValue {
+                value: value.value.clone(),
+                time,
+            },
+        ));
+    }
+    Err(invalid_entry(format!(
+        "A value of property {property_name} carries neither time nor timestamp."
+    )))
+}
+
+/// The component the reference addresses, resolved against stored state.
+///
+/// `entityId` with `componentName` names one of the entity's components, and
+/// with `componentPath` the component that path leads to — the top-level
+/// component for a path of one segment, the composite component stored under
+/// the rest of it for a longer one. A reference carrying neither, and only an
+/// `externalIdProperty`, names the component by "the primary key of an external
+/// storage system", which is resolved against the external ids the workspace's
+/// components carry ([`crate::state::Workspace::component_external_ids`] is the
+/// same reading of which property is one).
+fn address<'a>(
+    workspace: &'a crate::state::Workspace,
+    workspace_id: &str,
+    reference: &EntityPropertyReference,
+) -> Result<Addressed<'a>, EntryError> {
+    if let Some(entity_id) = reference.entity_id.as_deref() {
+        let Some(entity) = workspace.entities.get(entity_id) else {
+            return Err(absent_entry(crate::state::entity_not_found_message(
+                workspace_id,
+                entity_id,
+            )));
+        };
+        return match (
+            reference.component_path.as_deref(),
+            reference.component_name.as_deref(),
+        ) {
+            (Some(component_path), _) => at_path(entity, component_path).ok_or_else(|| {
+                absent_entry(format!(
+                    "Entity {entity_id} in workspace {workspace_id} has no component at \
+                     componentPath {component_path}."
+                ))
+            }),
+            (None, Some(component_name)) => entity
+                .components
+                .get(component_name)
+                .map(|component| of_component(entity, component))
+                .ok_or_else(|| {
+                    absent_entry(format!(
+                        "Component {component_name} of entity {entity_id} in workspace \
+                         {workspace_id} not found."
+                    ))
+                }),
+            // A property belongs to a component, so an entity alone addresses
+            // none of them.
+            (None, None) => Err(invalid_entry(format!(
+                "The reference to entity {entity_id} names neither componentName nor \
+                 componentPath, so it addresses no component."
+            ))),
+        };
+    }
+
+    let external_ids = reference
+        .external_id_property
+        .as_ref()
+        .filter(|external_ids| !external_ids.is_empty())
+        .ok_or_else(|| {
+            invalid_entry(
+                "The reference names neither entityId nor externalIdProperty, so it addresses \
+                 no property."
+                    .to_string(),
+            )
+        })?;
+    let mut matched = by_external_id(workspace, external_ids);
+    match matched.len() {
+        1 => Ok(matched.remove(0)),
+        0 => Err(absent_entry(format!(
+            "No component in workspace {workspace_id} carries the external id the reference \
+             names."
+        ))),
+        _ => Err(invalid_entry(format!(
+            "The external id the reference names is carried by more than one component of \
+             workspace {workspace_id}, so it addresses no one component."
+        ))),
+    }
+}
+
+/// One of an entity's top-level components as the component a reference
+/// addressed.
+fn of_component<'a>(
+    entity: &'a crate::state::Entity,
+    component: &'a crate::state::ComponentRecord,
+) -> Addressed<'a> {
+    Addressed {
+        entity_id: entity.entity_id.clone(),
+        component_name: component.component_name.clone(),
+        composite_path: None,
+        component_type_id: component.component_type_id.as_deref(),
+        properties: &component.properties,
+    }
+}
+
+/// One composite component as the component a reference addressed. It is
+/// reached through the component it hangs under and the path below it, which is
+/// the key [`crate::state::ComponentRecord::composite_components`] holds it
+/// under.
+fn of_composite<'a>(
+    entity: &'a crate::state::Entity,
+    component: &'a crate::state::ComponentRecord,
+    composite: &'a crate::state::CompositeComponentRecord,
+    composite_path: &str,
+) -> Addressed<'a> {
+    Addressed {
+        entity_id: entity.entity_id.clone(),
+        component_name: component.component_name.clone(),
+        composite_path: Some(composite_path.to_string()),
+        component_type_id: Some(&composite.component_type_id),
+        properties: &composite.properties,
+    }
+}
+
+/// The component of `entity` a `componentPath` addresses: "the path to the
+/// composite component, STARTING FROM the top-level component", so a path of
+/// one segment names that top-level component and a longer one the composite
+/// component stored under the rest of the path inside it.
+fn at_path<'a>(
+    entity: &'a crate::state::Entity,
+    component_path: &str,
+) -> Option<Addressed<'a>> {
+    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
+        None => Some(of_component(
+            entity,
+            entity.components.get(component_path)?,
+        )),
+        Some((component_name, composite_path)) => {
+            let component = entity.components.get(component_name)?;
+            let composite = component.composite_components.get(composite_path)?;
+            Some(of_composite(entity, component, composite, composite_path))
+        }
+    }
+}
+
+/// Every component of the workspace whose external-id properties carry EVERY
+/// pair the reference names.
+///
+/// `externalIdProperty` maps a property name to the external id its value is,
+/// so a component matches when each named property is one its effective
+/// definition marks `isExternalId` and reads as that value — the same reading
+/// of an external id `ListEntities`' `externalId` filter selects on.
+///
+/// BOUNDED on both sides of the scan: at most [`MAX_COMPONENTS_SCANNED`]
+/// components are looked at, and the walk stops as soon as a second match
+/// settles the answer — one reference addresses one component, so a further
+/// match cannot change the outcome.
+fn by_external_id<'a>(
+    workspace: &'a crate::state::Workspace,
+    external_ids: &::std::collections::HashMap<String, String>,
+) -> Vec<Addressed<'a>> {
+    let mut matched = Vec::new();
+    let mut scanned = 0usize;
+    for entity in workspace.entities.values() {
+        for component in entity.components.values() {
+            if matched.len() > 1 || scanned >= MAX_COMPONENTS_SCANNED {
+                return matched;
+            }
+            scanned = scanned.saturating_add(1);
+            if carries_external_ids(
+                workspace,
+                component.component_type_id.as_deref(),
+                &component.properties,
+                external_ids,
+            ) {
+                matched.push(of_component(entity, component));
+            }
+            for (composite_path, composite) in &component.composite_components {
+                if matched.len() > 1 || scanned >= MAX_COMPONENTS_SCANNED {
+                    return matched;
+                }
+                scanned = scanned.saturating_add(1);
+                if carries_external_ids(
+                    workspace,
+                    Some(&composite.component_type_id),
+                    &composite.properties,
+                    external_ids,
+                ) {
+                    matched.push(of_composite(entity, component, composite, composite_path));
+                }
+            }
+        }
+    }
+    matched
+}
+
+/// The most components one entry's `externalIdProperty` is resolved against.
+///
+/// Resolving an external id is a SCAN of the workspace's components — over
+/// caller-grown state, under the store's lock — so it is capped by this
+/// emulator's own ceiling rather than by how large a caller has grown the
+/// workspace.
+const MAX_COMPONENTS_SCANNED: usize = 10_000;
+
+/// Whether one component's properties carry every external id pair named.
+fn carries_external_ids(
+    workspace: &crate::state::Workspace,
+    component_type_id: Option<&str>,
+    properties: &::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+    external_ids: &::std::collections::HashMap<String, String>,
+) -> bool {
+    external_ids.iter().all(|(property_name, external_id)| {
+        let Some(definition) =
+            workspace.effective_property_definition(component_type_id, properties, property_name)
+        else {
+            return false;
+        };
+        if !definition.is_external_id.unwrap_or(false) {
+            return false;
+        }
+        crate::state::latest_property_value(properties.get(property_name), Some(definition))
+            .and_then(|value| value.string_value)
+            .is_some_and(|carried| carried == *external_id)
+    })
+}
+
+/// Record one entry's values in the series of the property it addressed.
+///
+/// The property record is CREATED where the component carries none: a time
+/// series property normally takes its definition from the component type the
+/// component instantiates, so the component itself holds nothing for it until a
+/// value is written.
+fn apply(workspace: &mut crate::state::Workspace, plan: Plan) {
+    let Plan {
+        entity_id,
+        component_name,
+        composite_path,
+        property_name,
+        values,
+    } = plan;
+    let Some(entity) = workspace.entities.get_mut(&entity_id) else {
+        // Unreachable: the entity was resolved under the same lock this write
+        // is applied under. Logged rather than ignored so a regression that
+        // breaks that is visible instead of silently dropping a write.
+        ::tracing::error!(
+            operation = "BatchPutPropertyValues",
+            entity_id = %entity_id,
+            "the entity a planned write addressed is gone"
+        );
+        return;
+    };
+    let Some(component) = entity.components.get_mut(&component_name) else {
+        ::tracing::error!(
+            operation = "BatchPutPropertyValues",
+            entity_id = %entity_id,
+            component_name = %component_name,
+            "the component a planned write addressed is gone"
+        );
+        return;
+    };
+    let properties = match &composite_path {
+        None => &mut component.properties,
+        Some(composite_path) => match component.composite_components.get_mut(composite_path) {
+            Some(composite) => &mut composite.properties,
+            None => {
+                ::tracing::error!(
+                    operation = "BatchPutPropertyValues",
+                    entity_id = %entity_id,
+                    component_path = %composite_path,
+                    "the composite component a planned write addressed is gone"
+                );
+                return;
+            }
+        },
+    };
+    let property = properties.entry(property_name).or_default();
+    for (at, value) in values {
+        property.record_time_series_value(at, value);
     }
 }

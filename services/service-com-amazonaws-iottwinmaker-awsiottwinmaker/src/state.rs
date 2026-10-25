@@ -2544,6 +2544,271 @@ pub fn latest_property_value(
         .or_else(|| definition.and_then(|definition| definition.default_value.clone()))
 }
 
+/// Whether `definition` declares a property whose values are a TIME SERIES —
+/// `isTimeSeries`, "a Boolean value that specifies whether the property
+/// consists of time series data", resolved so an absent member reads as
+/// `false`, and so a property with no definition at all is not one.
+///
+/// Which properties the time-series data plane serves is decided here once:
+/// `BatchPutPropertyValues` "sets values for multiple time series properties"
+/// and `GetPropertyValueHistory` reads "the history of a time series property
+/// value", so both resolve the property's EFFECTIVE definition
+/// ([`Workspace::effective_property_definition`]) and ask this.
+pub fn property_is_time_series(
+    definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+) -> bool {
+    definition.is_some_and(|definition| definition.is_time_series.unwrap_or(false))
+}
+
+/// Which `Type` the value in a `DataValue` belongs to — the member it travels
+/// in, spelled as the `Type` enum spells it
+/// (`crate::ops::types::TYPE_VALUES`) — or `None` when it carries no typed
+/// value at all.
+///
+/// A `DataValue` carries ONE value, so the members are tried in a fixed order
+/// and the first one present names the type. `expression` is none of them: it
+/// carries a parameter reference to be resolved rather than a value of a
+/// declared type.
+pub fn data_value_type(value: &crate::ops::types::DataValue) -> Option<&'static str> {
+    if value.string_value.is_some() {
+        return Some("STRING");
+    }
+    if value.double_value.is_some() {
+        return Some("DOUBLE");
+    }
+    if value.integer_value.is_some() {
+        return Some("INTEGER");
+    }
+    if value.long_value.is_some() {
+        return Some("LONG");
+    }
+    if value.boolean_value.is_some() {
+        return Some("BOOLEAN");
+    }
+    if value.list_value.is_some() {
+        return Some("LIST");
+    }
+    if value.map_value.is_some() {
+        return Some("MAP");
+    }
+    if value.relationship_value.is_some() {
+        return Some("RELATIONSHIP");
+    }
+    None
+}
+
+/// Why `value` cannot be stored as a value of the property `definition`
+/// defines, as the message that earns — `None` when it can.
+///
+/// A property's `dataType` is "an object that specifies the data type of a
+/// property", so a value written to the property carries a value of THAT type:
+/// one carrying another type, or no value at all, is refused rather than
+/// stored, which would leave a read reporting a value of a type the definition
+/// does not declare. A definition declaring no `dataType` constrains nothing,
+/// so only the presence of a value is required there.
+pub fn data_value_type_violation(
+    property_name: &str,
+    definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+    value: &crate::ops::types::DataValue,
+) -> Option<String> {
+    let carried = data_value_type(value);
+    let Some(carried) = carried else {
+        return Some(format!(
+            "the value written to property {property_name} carries no value of any data type"
+        ));
+    };
+    let declared = definition
+        .and_then(|definition| definition.data_type.as_ref())
+        .map(|data_type| data_type.r#type.as_str())?;
+    (carried != declared).then(|| {
+        format!(
+            "the value written to property {property_name} is a {carried} where that \
+             property's dataType is {declared}"
+        )
+    })
+}
+
+/// The comparison operators a property FILTER may carry.
+///
+/// `operator` is modelled as a plain string with no value list, so this set is
+/// not read off the model: these are the comparisons this service's own query
+/// language spells in a `WHERE` clause (`crate::ops::execute_query`), asked of
+/// the same stored property values. An operator outside the set is refused by
+/// name rather than ignored, which would answer a filtered question with
+/// unfiltered rows. Shared by every operation that filters on a property's
+/// value, so one filter means one thing wherever it is read.
+pub const COMPARISON_OPERATORS: &[&str] = &["=", "!=", "<", "<=", ">", ">="];
+
+/// The operator a filter that names none compares with: a filter carries a
+/// value to compare against, and equality is the comparison that value alone
+/// describes.
+pub const COMPARISON_OPERATOR_EQUALS: &str = "=";
+
+/// Whether a comparison that came out `ordering` satisfies `operator`.
+pub fn comparison_satisfies(operator: &str, ordering: ::std::cmp::Ordering) -> bool {
+    use ::std::cmp::Ordering;
+    match operator {
+        "=" => ordering == Ordering::Equal,
+        "!=" => ordering != Ordering::Equal,
+        "<" => ordering == Ordering::Less,
+        "<=" => ordering != Ordering::Greater,
+        ">" => ordering == Ordering::Greater,
+        ">=" => ordering != Ordering::Less,
+        // Unreachable: a filter's operator is checked against
+        // [`COMPARISON_OPERATORS`] before it is applied, and every one of them
+        // is matched above.
+        _ => false,
+    }
+}
+
+/// Compare two modelled `DataValue`s for a FILTER, or `None` when they carry
+/// nothing comparable: two values of different kinds, or a kind with no order
+/// (a list, a map, a relationship, an expression).
+///
+/// `INTEGER`, `LONG` and `DOUBLE` are widths of ONE domain, so a filter
+/// comparing a property against a threshold compares numbers whichever member
+/// each of them travels in; two integral values compare exactly, so two `LONG`s
+/// too far apart for a double to tell apart still compare as the distinct
+/// values they are.
+pub fn compare_data_values(
+    left: &crate::ops::types::DataValue,
+    right: &crate::ops::types::DataValue,
+) -> Option<::std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (DataNumber::of(left), DataNumber::of(right)) {
+        return left.compare(&right);
+    }
+    if let (Some(left), Some(right)) = (
+        left.string_value.as_deref(),
+        right.string_value.as_deref(),
+    ) {
+        return Some(left.cmp(right));
+    }
+    if let (Some(left), Some(right)) = (left.boolean_value, right.boolean_value) {
+        return Some(left.cmp(&right));
+    }
+    None
+}
+
+/// The number a `DataValue` carries placed on the DOUBLE, the one width every
+/// number can be placed on — what an ORDERING compares, where a total relation
+/// matters more than the last bits of a very large integer — or `None` when it
+/// carries no number.
+pub fn data_value_as_double(value: &crate::ops::types::DataValue) -> Option<f64> {
+    DataNumber::of(value).map(|number| number.as_double())
+}
+
+/// A number a `DataValue` carries, at the width it travels in. The integral
+/// widths are kept as an integer rather than folded into a double, so two
+/// values too far apart for a double to tell apart still compare as the
+/// distinct values they are.
+enum DataNumber {
+    Integer(i128),
+    Double(f64),
+}
+
+impl DataNumber {
+    /// The number this value carries, or `None` when it carries none.
+    fn of(value: &crate::ops::types::DataValue) -> Option<Self> {
+        if let Some(double) = value.double_value {
+            return Some(Self::Double(double));
+        }
+        if let Some(integer) = value.integer_value {
+            return Some(Self::Integer(i128::from(integer)));
+        }
+        value.long_value.map(|long| Self::Integer(i128::from(long)))
+    }
+
+    /// See [`data_value_as_double`].
+    fn as_double(&self) -> f64 {
+        match self {
+            Self::Integer(integer) => *integer as f64,
+            Self::Double(double) => *double,
+        }
+    }
+
+    /// Compare two numbers for a FILTER, which judges one pair at a time: two
+    /// integral values compare exactly, and a comparison that involves a double
+    /// compares on the double — `None` when a `NaN` makes the pair
+    /// incomparable.
+    fn compare(&self, other: &Self) -> Option<::std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(right)),
+            _ => self.as_double().partial_cmp(&other.as_double()),
+        }
+    }
+}
+
+/// Nanoseconds in one second: the unit a stored time-series instant is kept in,
+/// so a value written with a fractional second keeps it.
+pub const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// The instant an ISO 8601 `Time` names, in nanoseconds since the Unix epoch,
+/// or `None` when the text names none.
+///
+/// `Time` is "the ISO8601 DateTime of a value for a time series property",
+/// which is a STRING in the model, so nothing before a handler parses it. The
+/// zone it declares is read by the one reader of an RFC 3339 offset
+/// (`service_common::rfc3339::split_utc_offset`) and text carrying no zone at
+/// all is read as UTC, the zone the format's own designator stands for; the
+/// calendar conversion itself is the library's.
+pub fn instant_of_time(text: &str) -> Option<i128> {
+    let (civil, offset_seconds) = match ::service_common::rfc3339::split_utc_offset(text) {
+        Some(split) => split,
+        None => (text, 0),
+    };
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        &format!("{civil}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    Some(instant_of_timestamp(&parsed) - i128::from(offset_seconds) * NANOS_PER_SECOND)
+}
+
+/// The instant a modelled `Timestamp` names, in nanoseconds since the Unix
+/// epoch — the same unit [`instant_of_time`] answers in, so a value written
+/// with the deprecated `timestamp` member and one written with `time` land on
+/// one timeline.
+pub fn instant_of_timestamp(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos())
+}
+
+/// A stored instant as the ISO 8601 `Time` the wire carries, or `None` for an
+/// instant outside the range the library's calendar covers.
+pub fn time_of_instant(at: i128) -> Option<String> {
+    let secs = i64::try_from(at.div_euclid(NANOS_PER_SECOND)).ok()?;
+    let nanos = u32::try_from(at.rem_euclid(NANOS_PER_SECOND)).ok()?;
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(secs, nanos)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+}
+
+/// The most values this emulator keeps for ONE time series property.
+///
+/// A time series has no end: `BatchPutPropertyValues` may be called forever, so
+/// the series a property holds is a bounded window of the most recent values
+/// rather than everything ever written. The real service keeps values for a
+/// retention period this emulator has no clock to age them out with, so the
+/// bound is on the COUNT and is this emulator's own declared ceiling — the
+/// same reading as [`MAX_WORKSPACES`] and the ceilings beside it.
+pub const MAX_TIME_SERIES_VALUES_PER_PROPERTY: usize = 10_000;
+
+/// One value of a time series property: what was written, and the instant text
+/// it was written with.
+///
+/// The instant itself is the key the value is held under
+/// ([`PropertyRecord::time_series`]), so two values written for the same
+/// instant are one value — the later write replaces the earlier one — and the
+/// series is in time order whatever order it was written in. The TEXT is kept
+/// beside the value so a read reports the instant as the writer spelled it
+/// rather than as this service would re-render it.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesValue {
+    pub value: crate::ops::types::DataValue,
+    /// The ISO 8601 `Time` the write carried, or the rendering of the instant
+    /// for a write that carried only the deprecated `timestamp`.
+    pub time: String,
+}
+
 /// One component of an entity.
 ///
 /// A component's properties and property groups are stored as the modelled
@@ -2718,6 +2983,35 @@ pub fn resolve_composite_component_path(
 pub struct PropertyRecord {
     pub definition: Option<crate::ops::types::PropertyDefinitionRequest>,
     pub value: Option<crate::ops::types::DataValue>,
+    /// The values written to this property through the time-series data plane
+    /// (`BatchPutPropertyValues`), keyed by the instant each was written FOR in
+    /// nanoseconds since the Unix epoch ([`instant_of_time`]).
+    ///
+    /// A map keyed by the instant, so the series is in time order however it
+    /// was written, a value written twice for one instant is stored once, and a
+    /// read of a window takes a range of it. It is EMPTY for every property
+    /// nothing has written a time-series value to, which is every property of a
+    /// definition that is not `isTimeSeries`
+    /// ([`property_is_time_series`]) — the data plane writes to no other.
+    pub time_series: BTreeMap<i128, TimeSeriesValue>,
+}
+
+impl PropertyRecord {
+    /// Record one time-series value for this property, at the instant `at`.
+    ///
+    /// A value written for an instant the series already holds REPLACES it: the
+    /// instant is the value's identity, so writing the same instant twice
+    /// leaves one value rather than two readings of one moment. Past this
+    /// emulator's declared ceiling
+    /// ([`MAX_TIME_SERIES_VALUES_PER_PROPERTY`]) the OLDEST values are
+    /// dropped, so a caller that keeps writing grows the store no further and
+    /// keeps the most recent window.
+    pub fn record_time_series_value(&mut self, at: i128, value: TimeSeriesValue) {
+        self.time_series.insert(at, value);
+        while self.time_series.len() > MAX_TIME_SERIES_VALUES_PER_PROPERTY {
+            self.time_series.pop_first();
+        }
+    }
 }
 
 /// One property group of a component or of a component type.

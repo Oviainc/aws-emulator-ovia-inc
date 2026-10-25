@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOffering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOffering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOffering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one entry of the offering catalogue this service publishes: the offering the
+//! request's `OfferingArn` addresses in the Region the request is signed for, resolved by
+//! [`crate::state::published_offering`] against the one projection ListOfferings reports
+//! ([`crate::state::published_offerings`]), so a described offering cannot drift from a
+//! listed one. An ARN the catalogue publishes no offering under is refused with the
+//! modelled `NotFoundException`.
+//!
+//! A pure READ: the catalogue is a published price list, not caller state — nothing a
+//! request does adds to, changes or removes an offering (purchasing one mints a
+//! RESERVATION), so this handler needs no store and writes nothing at all.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +150,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOffering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOfferingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The catalogue is this service's published price list and holds no per-account
+        // state, so this read needs no store: `self.engine` is the seam every operation is
+        // constructed from, and this one reaches past it to the catalogue ListOfferings
+        // answers from too.
+        let _ = &self.engine;
+
+        // An offering's ARN carries the Region it is published in, because an offering
+        // reserves bandwidth in the Region whose endpoint the caller addressed — so the
+        // catalogue the ARN is resolved against is the one for the Region this request was
+        // signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // An offering is addressed by the ARN this service publishes it under. Any other
+        // identifier — another Region's or account's ARN, another service's, another
+        // resource type of this one, an entry this catalogue does not hold, or a string
+        // that is no ARN at all — resolves no offering, and the modelled
+        // `NotFoundException` is what says so; its message is derived from the REQUEST,
+        // never from the catalogue.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOffering"))
+        // Eligibility is NOT read here: "if you have an active reservation ... your account
+        // isn't eligible for other offerings" is documented on ListOfferings, scoping what
+        // the account is OFFERED, and a reservation the account holds does not retire the
+        // catalogue entry it was bought from.
+        let Some(offering) = crate::state::published_offering(&region, &input.offering_arn) else {
+            return Err(
+                DescribeOfferingErrorModeled::NotFoundException(NotFoundException {
+                    message: crate::state::not_found_message(&input.offering_arn),
+                })
+                .into(),
+            );
+        };
+
+        // The described offering IS the listed one: it is moved across from the catalogue's
+        // single projection rather than derived a second time here, so the two readers
+        // cannot drift.
+        Ok(DescribeOfferingOutput {
+            offering: Some(offering),
+        })
     }
 }

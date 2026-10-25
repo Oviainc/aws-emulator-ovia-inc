@@ -198,11 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The only write this reporting call makes: the `Creating` -> `InService`
-        // transition the clock already owed each cluster. It was due at the stored
-        // instant whether or not anybody listed the clusters, so listing them changes
-        // nothing a later caller sees that the clock had not already changed.
+        // The only write this reporting call makes: the transitions the clock already
+        // owed each cluster — the `Creating` -> `InService` move, and the release of a
+        // cluster whose deletion has completed. Both were due at the stored instant
+        // whether or not anybody listed the clusters, so listing them changes nothing a
+        // later caller sees that the clock had not already changed.
         let now = ::std::time::SystemTime::now();
+        store.release_deleted_clusters(now);
         let settled: Vec<String> = store
             .clusters
             .values_mut()

@@ -208,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+        // The deletions the clock already completed are materialised first, so the name
+        // and the quota slot a gone cluster held are free again: the release was due at
+        // the stored instant whether or not anybody created a cluster.
+        store.release_deleted_clusters(now);
         // A name already in use is refused, never overwritten: otherwise the caller
         // reads a 200 for a cluster it did not create, and the one it did create is gone.
         // `ResourceInUse` is the conflict this operation models, and it is decided before
@@ -269,6 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 in_service_at: now + crate::state::CLUSTER_IN_SERVICE_AFTER,
+                // No deletion has been asked for, so the clock owes this cluster none.
+                removal_due_at: None,
                 // A cluster is created with no nodes: provisioning the instances a group
                 // asks for is work this emulator does not do, so the nodes a cluster
                 // holds are the ones `BatchAddClusterNodes` added to it.

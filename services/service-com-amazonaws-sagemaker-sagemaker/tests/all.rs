@@ -166,3 +166,5 @@ mod hyperpod_cluster_lifecycle;
 mod create_cluster_admission;
 #[path = "all/hyperpod_cluster_node_listing.rs"]
 mod hyperpod_cluster_node_listing;
+#[path = "all/hyperpod_cluster_deletion.rs"]
+mod hyperpod_cluster_deletion;
