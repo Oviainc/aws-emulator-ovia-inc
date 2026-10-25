@@ -4628,11 +4628,12 @@ pub struct Cluster {
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub in_service_at: SystemTime,
-    /// The cluster's nodes, keyed by `NodeLogicalId` — what `BatchAddClusterNodes` adds
-    /// to this record, `DescribeClusterNode` replays and `AttachClusterNodeVolume`
-    /// attaches storage inside. A cluster starts with none: provisioning the instances a
-    /// group asks for is work this emulator does not do, so the nodes it holds are the
-    /// ones a call added.
+    /// The cluster's nodes, keyed by `NodeLogicalId` — the instances its groups were
+    /// created asking for plus the ones `BatchAddClusterNodes` added, which
+    /// `ListClusterNodes` reports, `DescribeClusterNode` replays and
+    /// `AttachClusterNodeVolume` attaches storage inside. A cluster still `Creating`
+    /// holds none: its groups' instances are minted when it reaches `InService`, by
+    /// [`Cluster::settle_status`].
     pub nodes: BTreeMap<String, ClusterNode>,
     /// What a `BatchAddClusterNodes` `ClientToken` replays: the outcome of the first call
     /// carrying that token. Keyed by the token.
@@ -4648,9 +4649,86 @@ impl Cluster {
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if self.status == STATUS_CREATING && now >= self.in_service_at {
             self.status = STATUS_IN_SERVICE.to_string();
+            self.provision_group_instances(now);
             return true;
         }
         false
+    }
+
+    /// Bring every instance group up to the number of instances it declares, minting the
+    /// ones it is short of as `Running` nodes of that group.
+    ///
+    /// `InstanceCount` is "the number of instances to add to the instance group", so a
+    /// group that declares N holds N of them once the cluster is provisioned — the same N
+    /// that [`Cluster::instance_group_details`] reports as realised in `CurrentCount`, so
+    /// the cluster's counts and its node list cannot disagree. They come up WITH the
+    /// cluster, which is why this runs at the instant it reaches `InService` and never
+    /// before: a caller listing nodes straight after the create sees none, and one that
+    /// waits sees the instances the groups asked for.
+    ///
+    /// A group is short by however many nodes it does not already hold, so the nodes a
+    /// call added to it (which raised its count by the same amount) are not minted twice.
+    /// The whole cluster stays inside [`CLUSTER_NODE_QUOTA`], the bound every other node
+    /// path honours.
+    fn provision_group_instances(&mut self, now: SystemTime) {
+        // The groups' settings are read off first, so the nodes can be written while
+        // iterating them. A restricted group's instances are instances of this cluster
+        // too, and `ListClusterNodes` reports "the list of instances ... in a SageMaker
+        // HyperPod cluster".
+        let declared: Vec<(String, i32, Option<String>, Option<i32>)> = self
+            .instance_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.instance_group_name.clone(),
+                    group.instance_count,
+                    instance_group_types(group).first().cloned(),
+                    group.threads_per_core,
+                )
+            })
+            .chain(self.restricted_instance_groups.iter().map(|group| {
+                (
+                    group.instance_group_name.clone(),
+                    group.instance_count,
+                    Some(group.instance_type.clone()),
+                    group.threads_per_core,
+                )
+            }))
+            .collect();
+
+        for (group_name, instance_count, instance_type, threads_per_core) in declared {
+            let held = self
+                .nodes
+                .values()
+                .filter(|node| node.instance_group_name == group_name)
+                .count();
+            let declared_count = usize::try_from(instance_count).unwrap_or_default();
+            for _ in held..declared_count {
+                if self.nodes.len() >= CLUSTER_NODE_QUOTA {
+                    return;
+                }
+                let logical_id = mint_node_logical_id();
+                self.nodes.insert(
+                    logical_id.clone(),
+                    ClusterNode {
+                        logical_id: logical_id.clone(),
+                        // An instance that is up has its id, the same one the
+                        // `Pending` -> `Running` transition mints for an added node.
+                        instance_id: Some(mint_instance_id()),
+                        instance_group_name: group_name.clone(),
+                        instance_type: instance_type.clone(),
+                        status: NODE_STATUS_RUNNING.to_string(),
+                        // A group's zones follow from the subnets of its VPC
+                        // configuration, which this emulator does not resolve.
+                        availability_zone: None,
+                        threads_per_core,
+                        launch_time: now,
+                        running_at: now,
+                        volume_attachments: BTreeMap::new(),
+                    },
+                );
+            }
+        }
     }
 
     /// The training plans this cluster's capacity is reserved against, in first-seen

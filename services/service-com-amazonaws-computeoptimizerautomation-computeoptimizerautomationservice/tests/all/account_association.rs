@@ -317,10 +317,11 @@ async fn the_callers_association_is_readable_through_its_enrollment_configuratio
         "before-association",
     )
     .await;
-    assert!(
-        before.get("organizationRuleMode").is_none(),
-        "case \"before-association\": an account that was never associated has no organization \
-         rule mode, got {before}"
+    assert_eq!(
+        string_member(&before, "organizationRuleMode"),
+        state::ORGANIZATION_RULE_MODE_NONE_ALLOWED,
+        "case \"before-association\": an account that was never associated does not let the \
+         management account create rules for it, got {before}"
     );
 
     call_ok(

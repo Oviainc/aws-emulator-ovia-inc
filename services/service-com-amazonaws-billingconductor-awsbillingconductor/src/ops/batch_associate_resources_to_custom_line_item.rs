@@ -350,11 +350,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             target
                 .associated_resources
-                .push(crate::state::ResourceAssociationRecord {
-                    arn: resource_arn,
-                    inclusive_start_billing_period: inclusive_start_billing_period.clone(),
-                    exclusive_end_billing_period: exclusive_end_billing_period.clone(),
-                });
+                .push(crate::state::ResourceAssociationRecord::new(
+                    resource_arn,
+                    crate::state::BillingPeriodSpan::new(
+                        inclusive_start_billing_period.clone(),
+                        exclusive_end_billing_period.clone(),
+                    ),
+                ));
             target.last_modified_time_millis = now;
             associated.push(AssociateResourceResponseElement {
                 arn: Some(requested.clone()),

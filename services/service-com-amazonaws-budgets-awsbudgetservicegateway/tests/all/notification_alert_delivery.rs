@@ -753,3 +753,126 @@ async fn alerts_are_owed_by_writes_only_and_one_per_notification_in_alarm() {
          {after_reads:?}"
     );
 }
+
+/// Rule, on the write that REPLACES a notification: `UpdateNotification` leaves the
+/// budget holding the notification it was given, with the subscribers that were already
+/// attached, so the alert owed is decided from that state — one alert per `SNS`
+/// subscriber when the notification it leaves behind is in alarm (naming what the
+/// REPLACEMENT alerts on), and none when it leaves the notification out of alarm.
+///
+/// The rows differ along the alarm state the update leaves the notification in, which is
+/// what the rule turns on: a replacement that names `ALARM`, one that names `OK`, and one
+/// that names no state at all over a notification already in alarm (the state the service
+/// owns is kept, so the alert is still owed).
+#[tokio::test]
+async fn an_update_that_leaves_a_notification_in_alarm_publishes_its_alert() {
+    for (case, created_state, new_state, alerts_expected) in [
+        ("the replacement names ALARM", "OK", Some("ALARM"), true),
+        ("the replacement names OK", "ALARM", Some("OK"), false),
+        ("the replacement names no state", "ALARM", None, true),
+        ("neither is in alarm", "OK", Some("OK"), false),
+    ] {
+        let emulator = emulator();
+        given_topic(&emulator, REGION, "budget-alerts").await;
+        let topic = primary_topic();
+        let name = "alert-update";
+
+        let old = json!({
+            "NotificationType": "ACTUAL",
+            "ComparisonOperator": "GREATER_THAN",
+            "Threshold": 80,
+            "NotificationState": created_state
+        });
+        let (status, body) = call(
+            &emulator.router,
+            "CreateBudget",
+            &json!({
+                "AccountId": account_id(),
+                "Budget": {
+                    "BudgetName": name,
+                    "TimeUnit": "MONTHLY",
+                    "BudgetType": "COST",
+                    "BudgetLimit": {"Amount": "100", "Unit": "USD"}
+                },
+                "NotificationsWithSubscribers": [{
+                    "Notification": old,
+                    "Subscribers": [sns_subscriber(&topic), email_subscriber(0)]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateBudget answered {status} {body}"
+        );
+        // Whatever the creating write already owed is set aside, so what is asserted
+        // below is what the UPDATE published.
+        let before = delivered(&emulator);
+
+        let mut new = json!({
+            "NotificationType": "FORECASTED",
+            "ComparisonOperator": "LESS_THAN",
+            "Threshold": 42.5,
+            "ThresholdType": "ABSOLUTE_VALUE"
+        });
+        if let Some(state) = new_state {
+            new["NotificationState"] = json!(state);
+        }
+        let (status, body) = call(
+            &emulator.router,
+            "UpdateNotification",
+            &json!({
+                "AccountId": account_id(),
+                "BudgetName": name,
+                "OldNotification": old,
+                "NewNotification": new
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UpdateNotification answered {status} {body}"
+        );
+
+        let found = delivered(&emulator);
+        let published: Vec<&(String, Value)> = found
+            .iter()
+            .filter(|alert| !before.contains(alert))
+            .collect();
+        if alerts_expected {
+            // One alert, on the SNS subscriber's topic, naming what the REPLACEMENT
+            // alerts on — never the notification it replaced. The email subscriber is a
+            // mailbox no service here hosts, so it adds none.
+            let want = alert(
+                name,
+                "COST",
+                "MONTHLY",
+                Some(("100", "USD")),
+                "FORECASTED",
+                "LESS_THAN",
+                42.5,
+                "ABSOLUTE_VALUE",
+            );
+            assert_eq!(
+                published.len(),
+                1,
+                "case {case:?}: expected one alert from the update, got {published:?}"
+            );
+            assert_eq!(
+                published[0].0, topic,
+                "case {case:?}: expected the alert on {topic}, got it on {}",
+                published[0].0
+            );
+            assert!(
+                same(&published[0].1, &want),
+                "case {case:?}: expected the alert {want}, got {}",
+                published[0].1
+            );
+        } else {
+            assert!(
+                published.is_empty(),
+                "case {case:?}: expected the update to publish nothing, got {published:?}"
+            );
+        }
+    }
+}

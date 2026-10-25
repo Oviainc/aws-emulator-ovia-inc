@@ -43,6 +43,8 @@ mod extension_registry;
 mod failed_create_rollback;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
+#[path = "all/generated_templates.rs"]
+mod generated_templates;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
 #[path = "all/list_stack_resources.rs"]

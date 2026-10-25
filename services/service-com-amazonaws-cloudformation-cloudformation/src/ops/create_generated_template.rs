@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGeneratedTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGeneratedTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGeneratedTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts generating a template from resources an existing stack already manages, and hands
+//! back the generated template's id. The generation itself is asynchronous and is metered:
+//! at most [`crate::state::generated_template::MAX_CONCURRENT_GENERATIONS`] generations may
+//! be in flight at once, and a call beyond that cap is refused with the modelled
+//! `ConcurrentResourcesLimitExceededException` and leaves no record behind — so
+//! `DescribeGeneratedTemplate` on the refused name answers
+//! `GeneratedTemplateNotFoundException`. The cap is transient: it counts the records whose
+//! generation has not concluded, so it lifts as those conclude
+//! ([`crate::state::generated_template`] holds that clock).
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +157,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGeneratedTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGeneratedTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGeneratedTemplate"))
+        use crate::state::generated_template as generated;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no store to record a generated
+            // template in, so this answers 501 rather than an id nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateGeneratedTemplate",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Settled FIRST, so the in-flight count below meters the generations that are
+        // really still in flight at this instant rather than ones the clock has already
+        // concluded.
+        store.settle(now);
+
+        // "The resource with the name requested already exists": a name addresses one
+        // generated template of the request's Region, so a second create under it is
+        // refused.
+        if store
+            .resolve_generated_template(&region, &input.generated_template_name)
+            .is_some()
+        {
+            return Err(CreateGeneratedTemplateErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!(
+                        "Generated template [{}] already exists",
+                        input.generated_template_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "An optional name or ARN of a stack to use as the base stack for the generated
+        // template": the base stack's own resources are the ones the template is generated
+        // from, so a stack this account does not hold is refused rather than generating a
+        // template from nothing.
+        let base = match input.stack_name.as_deref() {
+            Some(stack_name) => {
+                let stack = store.resolve(&region, stack_name).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(stack_name),
+                    )
+                })?;
+                Some((stack.stack_id.clone(), stack.current_resources()))
+            }
+            None => None,
+        };
+
+        // The in-flight cap, which is what this operation is metered by: "No more than 5
+        // generated templates can be in an InProgress or Pending status at one time" —
+        // metered in the Region the request was signed for, the way every CloudFormation
+        // quota is. Refused BEFORE anything is written, so a refused call leaves no
+        // generated template behind.
+        if store.generations_in_flight(&region) >= generated::MAX_CONCURRENT_GENERATIONS {
+            return Err(
+                CreateGeneratedTemplateErrorModeled::ConcurrentResourcesLimitExceededException(
+                    ConcurrentResourcesLimitExceededException {
+                        message: Some(format!(
+                            "No more than {} generated templates can be in an InProgress or \
+                             Pending status at one time",
+                            generated::MAX_CONCURRENT_GENERATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The quota for the resource has already been reached": one Region holds at most
+        // this many generated templates.
+        if store.generated_templates_in(&region).count() >= generated::MAX_GENERATED_TEMPLATES
+        {
+            return Err(CreateGeneratedTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for generated templates exceeded: no more than {} generated \
+                         templates can exist in this account and Region",
+                        generated::MAX_GENERATED_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+        // The Region that quota is metered in comes from the request's own credential
+        // scope, so it is a value the CALLER chooses: this is the ceiling on the store as a
+        // whole, which is what bounds its growth however many Regions a caller signs for.
+        if store.generated_templates.len() >= generated::MAX_STORED_GENERATED_TEMPLATES {
+            return Err(CreateGeneratedTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for generated templates exceeded: no more than {} generated \
+                         templates can exist in this account",
+                        generated::MAX_STORED_GENERATED_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (stack_id, stack_resources) = match base {
+            Some((stack_id, resources)) => (Some(stack_id), resources),
+            None => (None, Vec::new()),
+        };
+        let resources = generated_resources(&stack_resources, input.resources.as_deref());
+        // Both modelled resource lists of this feature are `@length(max: 500)`, so a
+        // generated template cannot hold — or report — more resources than that.
+        if resources.len() > generated::MAX_GENERATED_TEMPLATE_RESOURCES {
+            return Err(CreateGeneratedTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Limit for resources in a generated template exceeded: no more than \
+                         {} resources can be included",
+                        generated::MAX_GENERATED_TEMPLATE_RESOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let generated_template_id = crate::state::new_generated_template_id(
+            &region,
+            &input.generated_template_name,
+        );
+        // "You can check the status of the template generation using the
+        // DescribeGeneratedTemplate API action": the record is answered with its generation
+        // still in flight and concludes on the clock.
+        let mut template = generated::StoredGeneratedTemplate::starting(
+            generated_template_id.clone(),
+            input.generated_template_name.clone(),
+            region.clone(),
+            now,
+        );
+        template.stack_id = stack_id;
+        template.resources = resources;
+        if let Some(configuration) = input.template_configuration.as_ref() {
+            template.deletion_policy = configuration.deletion_policy.clone();
+            template.update_replace_policy = configuration.update_replace_policy.clone();
+        }
+        store.generated_templates.push(template);
+
+        Ok(CreateGeneratedTemplateOutput {
+            generated_template_id: Some(generated_template_id),
+        })
     }
+}
+
+/// The resources the generated template carries: the base stack's, plus the ones the
+/// request listed itself.
+///
+/// A listed resource that names a logical id the base stack already contributed is the SAME
+/// resource of the generated template, not a second one, so it is folded onto the stack's
+/// row (the request's own `ResourceIdentifier` is what identifies it) rather than appended
+/// beside it.
+fn generated_resources(
+    stack_resources: &[crate::state::StoredResource],
+    listed: Option<&[ResourceDefinition]>,
+) -> Vec<crate::state::generated_template::GeneratedResource> {
+    use crate::state::generated_template::GeneratedResource;
+
+    let mut resources: Vec<GeneratedResource> = stack_resources
+        .iter()
+        .map(|resource| GeneratedResource {
+            resource_type: resource.resource_type.clone(),
+            logical_resource_id: Some(resource.logical_id.clone()),
+            resource_identifier: ::std::collections::BTreeMap::new(),
+        })
+        .collect();
+    for definition in listed.unwrap_or_default() {
+        let identifier: ::std::collections::BTreeMap<String, String> = definition
+            .resource_identifier
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let already = definition.logical_resource_id.as_ref().and_then(|logical| {
+            resources.iter_mut().find(|resource| {
+                resource.logical_resource_id.as_ref() == Some(logical)
+                    && resource.resource_type == definition.resource_type
+            })
+        });
+        match already {
+            Some(resource) => resource.resource_identifier = identifier,
+            None => resources.push(GeneratedResource {
+                resource_type: definition.resource_type.clone(),
+                logical_resource_id: definition.logical_resource_id.clone(),
+                resource_identifier: identifier,
+            }),
+        }
+    }
+    resources
 }

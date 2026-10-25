@@ -599,6 +599,31 @@ pub struct EnabledControl {
     /// The instant the clock owes this control its terminal enablement status. Stored,
     /// never slept on: a reader materialises the transition once it is due.
     pub due_at: SystemTime,
+    /// The configuration an `UPDATE_ENABLED_CONTROL` still in flight will apply, or
+    /// `None` when nothing is pending. [`settle`] applies it once that operation is due,
+    /// so the configured parameters change when the asynchronous update completes and not
+    /// when the call that asked for it returned.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub pending_update: Option<PendingEnabledControlUpdate>,
+}
+
+/// A configuration `UpdateEnabledControl` accepted and the clock has yet to apply.
+///
+/// `UpdateEnabledControl` "updates the configuration of an already enabled control"
+/// through an asynchronous operation, so the request's parameters are parked here and
+/// become the control's configured ones once the clock has made that operation due.
+#[derive(Debug, Clone)]
+pub struct PendingEnabledControlUpdate {
+    /// The `UPDATE_ENABLED_CONTROL` operation whose completion applies this change.
+    pub operation_identifier: String,
+    /// The instant the clock owes this change its application — the same instant that
+    /// operation becomes due, held here so applying it never depends on the operation's
+    /// record still being in the (bounded) log. Stored, never slept on.
+    pub due_at: SystemTime,
+    /// The configured parameters the update replaces the control's with. Required on the
+    /// request, so an accepted update always carries a (possibly empty) list.
+    pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
 }
 
 /// A persisted landing zone. Everything `GetLandingZone` reports is read from here.
@@ -933,6 +958,32 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             };
         }
 
+        // An UPDATE_ENABLED_CONTROL the clock has made due has finished applying the
+        // configuration it carried, so those parameters are the control's whether or not
+        // anybody called. The due instant is the pending change's OWN, not read back off
+        // the operation log: `enforce_log_bound` evicts the oldest in-flight record when
+        // every record is in flight, and a missing record must not be read as "due" and
+        // apply a change the clock does not owe yet.
+        let control_operations = &self.control_operations;
+        for control in self.enabled_controls.values_mut() {
+            // Not due yet leaves the pending change parked, unchanged.
+            let due = control
+                .pending_update
+                .take_if(|pending| now >= pending.due_at);
+            let Some(pending) = due else {
+                continue;
+            };
+            if control_operations
+                .get(&pending.operation_identifier)
+                .is_some_and(|operation| operation.status == ControlOperationStatus::Failed)
+            {
+                // A failed update applied nothing, so the control keeps the parameters it
+                // had.
+                continue;
+            }
+            control.parameters = pending.parameters;
+        }
+
         for control in self.enabled_controls.values_mut() {
             if control.status == EnablementStatus::UnderChange && now >= control.due_at {
                 control.status = EnablementStatus::Succeeded;
@@ -1188,6 +1239,59 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         );
         enforce_log_bound(&mut self.control_operations, MAX_CONTROL_OPERATIONS);
         operation_identifier
+    }
+
+    /// Start an `UPDATE_ENABLED_CONTROL` against the control `arn` names, parking
+    /// `parameters` for [`settle`] to apply once that operation is due, and return the
+    /// operation's `operationIdentifier`.
+    ///
+    /// `None` when `arn` names no stored control, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written. Writes no new resource, so it
+    /// is not bounded by [`MAX_ENABLED_CONTROLS`]; the operation it appends is bounded by
+    /// the log's own retention rule.
+    ///
+    /// The caller refuses an update that overlaps an operation still changing the control
+    /// with the modelled `ConflictException`, which is what keeps the single pending slot
+    /// from being overwritten while the change it holds is still owed: every accepted
+    /// update is applied before another can be accepted.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_enabled_control_update(
+        &mut self,
+        arn: &str,
+        parameters: Vec<(String, ::aws_smithy_types::Document)>,
+        now: SystemTime,
+    ) -> Option<String> {
+        let (control_identifier, target_identifier) = self
+            .enabled_controls
+            .get(arn)
+            .map(|control| {
+                (
+                    control.control_identifier.clone(),
+                    control.target_identifier.clone(),
+                )
+            })?;
+
+        let operation_identifier = self.record_control_operation(
+            ControlOperationType::UpdateEnabledControl,
+            &control_identifier,
+            &target_identifier,
+            arn,
+            now,
+        );
+        let control = self.enabled_controls.get_mut(arn)?;
+        // The control's configuration is changing until the update is due, so a caller
+        // reading straight after the call sees the transient status rather than the
+        // configuration it asked for.
+        control.status = EnablementStatus::UnderChange;
+        control.last_operation_identifier = operation_identifier.clone();
+        control.due_at = now + OPERATION_SETTLE_AFTER;
+        control.pending_update = Some(PendingEnabledControlUpdate {
+            operation_identifier: operation_identifier.clone(),
+            due_at: now + OPERATION_SETTLE_AFTER,
+            parameters,
+        });
+        Some(operation_identifier)
     }
 
     /// The stored ARN an `enabledBaselineIdentifier` names, or `None` when no enabled
@@ -1963,6 +2067,73 @@ pub fn unacceptable_parameters_message(
         weight = weight.saturating_add(key.len()).saturating_add(value_weight);
     }
     None
+}
+
+/// Why `parameters` does not configure an enabled control, or `None` when it does.
+///
+/// The one place a control's parameter list is checked, so `EnableControl` and
+/// `UpdateEnabledControl` refuse the same lists in the same words. `EnabledControlParameters`
+/// carries no modelled length and a control publishes no parameter catalogue, so a list is
+/// unacceptable when it holds more than [`MAX_ENABLED_CONTROL_PARAMETERS`] entries, repeats
+/// a key (a parameter is addressed by its key, so a list carrying one twice does not
+/// describe one configuration) or weighs more than
+/// [`MAX_ENABLED_CONTROL_PARAMETER_BYTES`].
+pub fn unacceptable_control_parameters_message(
+    parameters: &[(String, ::aws_smithy_types::Document)],
+) -> Option<String> {
+    if parameters.len() > MAX_ENABLED_CONTROL_PARAMETERS {
+        return Some(format!(
+            "parameters carries {} entries, more than the {MAX_ENABLED_CONTROL_PARAMETERS} a \
+             control may be configured with",
+            parameters.len()
+        ));
+    }
+
+    // One pass over a set of the keys already seen, so detecting a repeat costs
+    // O(n log n) in the entry count rather than O(n^2).
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut weight = 0usize;
+    for (key, value) in parameters {
+        if !seen.insert(key.as_str()) {
+            return Some(format!(
+                "parameters carries key {key:?} more than once; each control parameter key \
+                 may be given at most once"
+            ));
+        }
+        // The budget left for this value, so the whole list is measured once and the walk
+        // stops at the first node that takes it past the cap.
+        let budget =
+            MAX_ENABLED_CONTROL_PARAMETER_BYTES.saturating_sub(weight.saturating_add(key.len()));
+        let Some(value_weight) = document_weight_within(value, budget) else {
+            return Some(format!(
+                "parameters weighs more than the {MAX_ENABLED_CONTROL_PARAMETER_BYTES} bytes \
+                 a control configuration may hold"
+            ));
+        };
+        weight = weight.saturating_add(key.len()).saturating_add(value_weight);
+    }
+    None
+}
+
+/// Whether `configured` and `requested` describe the SAME control configuration.
+///
+/// A parameter is addressed by its key and a list may carry a key at most once
+/// ([`unacceptable_control_parameters_message`]), so a configuration is the key/value
+/// mapping a list denotes and the order the entries were sent in does not distinguish two
+/// configurations.
+pub fn same_control_configuration(
+    configured: &[(String, ::aws_smithy_types::Document)],
+    requested: &[(String, ::aws_smithy_types::Document)],
+) -> bool {
+    fn as_map(
+        parameters: &[(String, ::aws_smithy_types::Document)],
+    ) -> BTreeMap<&str, &::aws_smithy_types::Document> {
+        parameters
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect()
+    }
+    as_map(configured) == as_map(requested)
 }
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.

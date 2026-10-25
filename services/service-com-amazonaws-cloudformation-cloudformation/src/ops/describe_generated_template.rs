@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGeneratedTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGeneratedTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGeneratedTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one generated template's record back: the progress of the generation
+//! `CreateGeneratedTemplate` (or `UpdateGeneratedTemplate`) started, and the resources that
+//! generation covers. A reporting operation — the only write it makes is through
+//! `crate::state::...::settle`, which materialises the generation status the clock had
+//! already made due. A name this account and Region holds no record for is refused with the
+//! modelled `GeneratedTemplateNotFoundException`, which is how a caller confirms that a
+//! refused `CreateGeneratedTemplate` left nothing behind.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +167,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGeneratedTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGeneratedTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGeneratedTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no generated template to read, so
+            // this answers 501 rather than a status nothing stands behind.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeGeneratedTemplate",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — here the generation's own conclusion, which was owed at the
+        // same instant whether or not anybody read it.
+        store.settle(::std::time::SystemTime::now());
+
+        let template = store
+            .resolve_generated_template(&region, &input.generated_template_name)
+            .ok_or_else(|| {
+                DescribeGeneratedTemplateErrorModeled::GeneratedTemplateNotFoundException(
+                    GeneratedTemplateNotFoundException {
+                        message: Some(crate::state::generated_template::does_not_exist(
+                            &input.generated_template_name,
+                        )),
+                    },
+                )
+            })?;
+
+        let resource_status = template.resource_status();
+        let progress = template.progress();
+        Ok(DescribeGeneratedTemplateOutput {
+            generated_template_id: Some(template.generated_template_id.clone()),
+            generated_template_name: Some(template.generated_template_name.clone()),
+            // `ResourceDetails` is `@length(min: 1)`, so a generation that covers no
+            // resource at all reports no list rather than an empty one. ("If no resources
+            // are specified, the template will be created without any resources.")
+            resources: (!template.resources.is_empty()).then(|| {
+                template
+                    .resources
+                    .iter()
+                    .map(|resource| ResourceDetail {
+                        resource_type: Some(resource.resource_type.clone()),
+                        logical_resource_id: resource.logical_resource_id.clone(),
+                        resource_identifier: (!resource.resource_identifier.is_empty()).then(
+                            || {
+                                resource
+                                    .resource_identifier
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.clone()))
+                                    .collect()
+                            },
+                        ),
+                        resource_status: Some(resource_status.to_string()),
+                        // "The reason for the resource detail, providing more information
+                        // if a failure happened": no resource of a generation here fails on
+                        // its own, so there is no reason to report.
+                        resource_status_reason: None,
+                        // "The warnings generated for this resource": this emulator
+                        // generates none.
+                        warnings: None,
+                    })
+                    .collect()
+            }),
+            status: Some(template.status.clone()),
+            status_reason: template.status_reason.clone(),
+            creation_time: Some(crate::state::timestamp(template.creation_time)),
+            last_updated_time: Some(crate::state::timestamp(template.last_updated_time)),
+            progress: Some(TemplateProgress {
+                resources_succeeded: Some(progress.resources_succeeded),
+                resources_failed: Some(progress.resources_failed),
+                resources_processing: Some(progress.resources_processing),
+                resources_pending: Some(progress.resources_pending),
+            }),
+            // "The stack ARN of the base stack if a base stack was provided when generating
+            // the template" — absent for a generation that was given none.
+            stack_id: template.stack_id.clone(),
+            template_configuration: (template.deletion_policy.is_some()
+                || template.update_replace_policy.is_some())
+            .then(|| TemplateConfiguration {
+                deletion_policy: template.deletion_policy.clone(),
+                update_replace_policy: template.update_replace_policy.clone(),
+            }),
+            // "The number of warnings generated for this template. The warnings are found
+            // in the details of each of the resources in the template": the count of the
+            // warnings reported above, which is none.
+            total_warnings: Some(0),
+        })
     }
 }
