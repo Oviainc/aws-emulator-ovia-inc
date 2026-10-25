@@ -43,7 +43,16 @@
 //! policies live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::access_policies`], keyed by the
 //! minted `accessPolicyId`, each record naming the identity, the Monitor
-//! resource and the permission the last write to it stated. Every
+//! resource and the permission the last write to it stated. An interface asset
+//! model applied to an asset model lives in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_relationships`],
+//! keyed by the two models, carrying the property and hierarchy mappings the
+//! application resolved to. The applications of a workspace live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::applications`], keyed by the
+//! minted `applicationId` — which identifies one across every workspace — each
+//! record naming the workspace it was created in, the Identity Center instance
+//! the create named and the instant the `CREATING` -> `ACTIVE` transition it
+//! owes falls due. Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
@@ -58,10 +67,10 @@ use crate::ops::types::{
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
     ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, Identity, ImageLocation,
-    LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry,
-    ProcessingInput, PropertyType, QueryStatistics, ResolveTo, Resource, ResourceStatus,
-    TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, HierarchyMapping, Identity,
+    ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
+    PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, ResolveTo,
+    Resource, ResourceStatus, TargetResource, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
     WorkspaceEncryptionConfiguration,
     WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
     VIDEO_DATA_TYPE_VALUES,
@@ -862,6 +871,46 @@ impl AssetModelRecord {
         path
     }
 
+    /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to
+    /// the id of a property THIS model declares.
+    ///
+    /// The property-list counterpart of [`Self::resolve_composite_model_id`], so
+    /// every operation that addresses a model property by label resolves it the
+    /// same way.
+    pub fn resolve_property_id(&self, label: &str) -> Option<String> {
+        self.properties
+            .iter()
+            .find(|property| {
+                matches_id_label(
+                    property.id.as_deref(),
+                    property.external_id.as_deref(),
+                    label,
+                )
+            })
+            .and_then(|property| property.id.clone())
+    }
+
+    /// The id of the property this model declares under `name`, if any.
+    ///
+    /// A property's name is the only identity two asset models can share — ids
+    /// are minted per model — so this is how an interface's property is paired
+    /// with the property of the model the interface is applied to.
+    pub fn property_id_named(&self, name: &str) -> Option<String> {
+        self.properties
+            .iter()
+            .find(|property| property.name == name)
+            .and_then(|property| property.id.clone())
+    }
+
+    /// The id of the hierarchy this model declares under `name`, if any. The
+    /// hierarchy counterpart of [`Self::property_id_named`].
+    pub fn hierarchy_id_named(&self, name: &str) -> Option<String> {
+        self.hierarchies
+            .iter()
+            .find(|hierarchy| hierarchy.name == name)
+            .and_then(|hierarchy| hierarchy.id.clone())
+    }
+
     /// Composite model `id` as the summary both `DescribeAssetModel` and
     /// `DescribeAssetModelCompositeModel` report it as, so the two views of one
     /// stored composite model cannot disagree.
@@ -910,6 +959,27 @@ impl AssetModelRecord {
             path: self.asset_composite_model_path(id),
         })
     }
+}
+
+/// A stored interface relationship: an interface asset model applied to an
+/// asset model, and the mappings that application resolved to.
+///
+/// The mappings are RESOLVED ONCE, by the call that applies the interface, and
+/// stored: they pair ids of two different models, which nothing else in the
+/// store relates, so a later read reports the pairing the application made
+/// rather than re-deriving one from definitions that may have moved since.
+#[derive(Debug, Clone)]
+pub struct InterfaceRelationshipRecord {
+    /// The stored `assetModelId` of the model the interface is applied to.
+    pub asset_model_id: String,
+    /// The stored `assetModelId` of the interface asset model.
+    pub interface_asset_model_id: String,
+    /// Each property of the interface asset model, paired with the property of
+    /// [`Self::asset_model_id`] it maps to.
+    pub property_mappings: Vec<PropertyMapping>,
+    /// Each hierarchy of the interface asset model that the applied-to model
+    /// also declares, paired with that model's own hierarchy.
+    pub hierarchy_mappings: Vec<HierarchyMapping>,
 }
 
 /// A stored asset. `properties` is materialised from the referenced model's
@@ -1873,6 +1943,34 @@ pub fn pipeline_key(workspace_name: &str, pipeline_name: &str) -> (String, Strin
     (workspace_name.to_string(), pipeline_name.to_string())
 }
 
+/// The key an interface relationship is stored under in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::interface_relationships`]: the
+/// asset model the interface is applied to, then the interface asset model.
+/// Both are STORED ids, not labels.
+pub fn interface_relationship_key(
+    asset_model_id: &str,
+    interface_asset_model_id: &str,
+) -> (String, String) {
+    (
+        asset_model_id.to_string(),
+        interface_asset_model_id.to_string(),
+    )
+}
+
+/// The ceiling on how many interface relationships this store holds.
+///
+/// The same reasoning as [`MAX_ASSET_MODELS`]: applying an interface is the only
+/// thing that adds one and nothing evicts one, so the map needs a maximum entry
+/// count. The emulator's own bound, not a published AWS quota; the operation
+/// that would exceed it is refused with the modelled `LimitExceededException`.
+pub const MAX_INTERFACE_RELATIONSHIPS: usize = 1_000;
+
+/// The `AssetModelType` value an asset model must carry to be applied to another
+/// asset model as an interface: the `AssetModelType` enum's third value, which
+/// `CreateAssetModel` documents as "INTERFACE - An interface is a type of model
+/// that defines a standard structure".
+pub const MODEL_TYPE_INTERFACE: &str = "INTERFACE";
+
 /// The canonical ARN of a pipeline in `region`.
 ///
 /// The resource section carries the WORKSPACE as well as the pipeline name: the
@@ -2832,6 +2930,11 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Workspaces by `workspaceName`, which is what identifies one in an
     /// account and region.
     pub workspaces: HashMap<String, WorkspaceRecord>,
+    /// Applications by `applicationId`, which identifies one across every
+    /// workspace; the workspace it was created in lives on its record, because
+    /// the modelled reads address an application by `(workspaceName, id)`.
+    /// Written by `CreateApplication` and read by `DescribeApplication`.
+    pub applications: HashMap<String, ApplicationRecord>,
     /// Pipeline executions by `pipelineExecutionId`. The id alone identifies one,
     /// and the record names the workspace and pipeline it belongs to, so a read
     /// scoped to another pipeline resolves to nothing.
@@ -2853,9 +2956,26 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// Written beside the source itself, and bounded by it: at most one entry per
     /// source that carries an alias.
     pub capture_source_aliases: HashMap<String, HashMap<String, String>>,
+    /// The interface relationships, by [`interface_relationship_key`] — the asset
+    /// model the interface is applied to and the interface asset model — because
+    /// one asset model may implement several interfaces and one interface may be
+    /// applied to several asset models. Bounded by
+    /// [`MAX_INTERFACE_RELATIONSHIPS`].
+    pub interface_relationships: HashMap<(String, String), InterfaceRelationshipRecord>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The interface relationship between two STORED asset model ids, if one was
+    /// applied. Resolve both labels with [`Self::resolve_asset_model_id`] first.
+    pub fn interface_relationship(
+        &self,
+        asset_model_id: &str,
+        interface_asset_model_id: &str,
+    ) -> Option<&InterfaceRelationshipRecord> {
+        self.interface_relationships
+            .get(&interface_relationship_key(asset_model_id, interface_asset_model_id))
+    }
+
     /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to a
     /// stored `assetModelId`.
     pub fn resolve_asset_model_id(&self, label: &str) -> Option<String> {
@@ -3534,6 +3654,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of(self.tasks.get(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
+            APPLICATION_RESOURCE_TYPE => tags_of(self.applications.get(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of(self.access_policies.get(id), arn),
             _ => None,
@@ -3557,6 +3678,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of_mut(self.tasks.get_mut(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
+            APPLICATION_RESOURCE_TYPE => tags_of_mut(self.applications.get_mut(id), arn),
             WORKSPACE_RESOURCE_TYPE => tags_of_mut(self.workspaces.get_mut(id), arn),
             ACCESS_POLICY_RESOURCE_TYPE => tags_of_mut(self.access_policies.get_mut(id), arn),
             _ => None,
@@ -3633,12 +3755,22 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
-    /// Forget an asset model and its external-id entry.
+    /// Forget an asset model, its external-id entry and every interface
+    /// relationship it stood on either side of.
+    ///
+    /// A relationship names two models, so a model that is gone leaves no
+    /// relationship behind: the entries are dropped here rather than left to
+    /// consume the [`MAX_INTERFACE_RELATIONSHIPS`] budget for a pair nothing can
+    /// address any more.
     pub fn forget_asset_model(&mut self, asset_model_id: &str) -> Option<AssetModelRecord> {
         let record = self.asset_models.remove(asset_model_id)?;
         if let Some(external) = record.external_id.as_deref() {
             self.asset_model_external_ids.remove(external);
         }
+        self.interface_relationships
+            .retain(|(applied_to, interface), _| {
+                applied_to != asset_model_id && interface != asset_model_id
+            });
         Some(record)
     }
 
@@ -5345,3 +5477,142 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIotsitewiseAwsiotsitewiseState>)
 }
+
+// ---------------------------------------------------------------------------
+// The application slice: the record `CreateApplication` writes and
+// `DescribeApplication` reports, its bound, the resource kind a refusal names
+// and the values an application derives (its ARN, its DNS subdomain and the
+// Identity Center application it reports).
+//
+// One section, like the history-selection and aggregate sections above: what an
+// application IS and every value derived from it sit beside each other, so the
+// create and the read cannot disagree about either.
+// ---------------------------------------------------------------------------
+
+/// The ARN resource-type segment of an application ARN, as [`application_arn`]
+/// builds it.
+pub const APPLICATION_RESOURCE_TYPE: &str = "application";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the application map.
+/// `CreateApplication` is the only thing that adds an application and it declares
+/// the modelled `LimitExceededException` (HTTP 410), so that is how this store
+/// refuses past the cap. The emulator's own bound, not a published AWS default.
+pub const MAX_APPLICATIONS: usize = 1_000;
+
+/// The resource kind a not-found refusal names for an application of a
+/// workspace; see [`not_found_message`].
+pub const RESOURCE_APPLICATION: &str = "Application";
+
+/// The resource segment an IAM Identity Center application ARN carries, which is
+/// what an instance ARN's own `instance/` segment becomes in the ARN of an
+/// application created in that instance; see [`idc_application_arn`].
+const IDC_INSTANCE_SEGMENT: &str = "instance/";
+/// See [`IDC_INSTANCE_SEGMENT`].
+const IDC_APPLICATION_SEGMENT: &str = "application/";
+
+/// A stored application of a workspace: everything `DescribeApplication`
+/// reports, plus the `tags` the tagging operations read.
+///
+/// An application is minted with an id of its own and `ListApplications` spans
+/// every workspace, so the id identifies it on its own; the workspace it was
+/// created in is held here because the modelled reads address an application by
+/// `(workspaceName, id)`.
+#[derive(Debug, Clone)]
+pub struct ApplicationRecord {
+    pub id: String,
+    pub arn: String,
+    /// The workspace the create named. A read naming another workspace names no
+    /// application this store holds, however the id resolves.
+    pub workspace_name: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The Identity Center instance ARN the create named — what
+    /// [`Self::idc_application_arn`] was derived from.
+    pub idc_instance_arn: String,
+    /// The Identity Center application this application reports, derived once
+    /// here so every later read reports the same ARN; see
+    /// [`idc_application_arn`].
+    pub idc_application_arn: String,
+    pub dns_subdomain: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The instant the transition the clock owes — `CREATING` to `ACTIVE` —
+    /// falls due.
+    pub active_at: SystemTime,
+    /// The `clientToken` of the create that made this application, if it carried
+    /// one, so a retry of that same create replays its answer rather than
+    /// minting a second application.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl ApplicationRecord {
+    /// The application's `ApplicationStatus` as of `now`: [`STATE_CREATING`]
+    /// until the transition the create owes falls due, [`STATE_ACTIVE`] from
+    /// then on. Derived, so a read never has to write.
+    ///
+    /// `ApplicationStatus` spells only `CREATING`, `ACTIVE` and `DELETING`
+    /// (smithy_query query="shape" shape="ApplicationStatus"), so an application
+    /// owes exactly this one transition and the settling state is the same for
+    /// every record rather than stored per record.
+    pub fn status(&self, now: SystemTime) -> String {
+        state_at(STATE_CREATING, self.active_at, now).to_string()
+    }
+}
+
+/// The canonical ARN of an application in `region`.
+///
+/// The resource section carries the application's own id and not its workspace:
+/// unlike a pipeline or a task, an application is minted with an id that
+/// identifies it across every workspace, which is also why `ListApplications`
+/// takes no workspace.
+pub fn application_arn(region: &str, application_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{APPLICATION_RESOURCE_TYPE}/{application_id}"),
+    )
+}
+
+/// The `dnsSubdomain` an application reports.
+///
+/// DERIVED from the application's own id rather than minted, for the reason
+/// [`portal_start_url`] states: it is then stable across reads and unique per
+/// application without anything being written on a read. The modelled
+/// `DnsSubdomain` is a DNS label (len 1..63, `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+/// and every id [`new_id`] mints is one already — 36 characters of lowercase hex
+/// and hyphens, beginning and ending with a hex digit. Derived through this one
+/// function so the form has a single place to change if a subdomain ever has to
+/// differ from the id.
+pub fn application_dns_subdomain(application_id: &str) -> String {
+    application_id.to_string()
+}
+
+/// The `idcApplicationArn` an application reports: the Identity Center
+/// application that was created in the instance `idc_instance_arn` names.
+///
+/// DERIVED from the two things that identify it — the instance the create named
+/// and the application's own id — rather than minted, so it is stable across
+/// reads and unique per application. Identity Center nests an application under
+/// its instance, so the instance ARN's own resource segment becomes the
+/// application one and the application's id is appended; an instance ARN
+/// carrying no such segment gets the application segment and the id appended
+/// instead, so every application still reports an ARN that names it uniquely.
+///
+/// Split at the FIRST `instance/`, which in an instance ARN is the one its
+/// resource section opens with: an ARN's resource section is its last field, so
+/// nothing ahead of that segment can be a second one.
+pub fn idc_application_arn(idc_instance_arn: &str, application_id: &str) -> String {
+    match idc_instance_arn.split_once(IDC_INSTANCE_SEGMENT) {
+        Some((prefix, instance_id)) => {
+            format!("{prefix}{IDC_APPLICATION_SEGMENT}{instance_id}/{application_id}")
+        }
+        None => format!("{idc_instance_arn}/{IDC_APPLICATION_SEGMENT}{application_id}"),
+    }
+}
+
+// An application's tags live on its own record, reached by ARN like every other
+// taggable resource's; the shared `TaggedRecord` seam is what
+// `ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource` resolves it
+// through.
+tagged_record!(ApplicationRecord);

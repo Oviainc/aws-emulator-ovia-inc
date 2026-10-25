@@ -10,6 +10,10 @@
 //! an ARN no stored resource answers to is
 //! refused with the modelled 404 `ResourceNotFoundException`.
 //!
+//! The write reports nothing back, so a success is answered with the no-content
+//! status ([`crate::state::TAG_MUTATION_SUCCESS_STATUS`]) rather than the
+//! model's defaulted 200.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,7 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag write reports nothing — `TagResourceOutput` declares no members
+    // — so it answers with the no-content status rather than the model's defaulted 200;
+    // see [`crate::state::TAG_MUTATION_SUCCESS_STATUS`].
+    const SUCCESS_STATUS: u16 = crate::state::TAG_MUTATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,

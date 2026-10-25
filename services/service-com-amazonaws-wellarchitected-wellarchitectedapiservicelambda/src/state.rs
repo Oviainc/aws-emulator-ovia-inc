@@ -3891,6 +3891,29 @@ pub fn agent_list_page_size(max_results: i32) -> usize {
 /// `ValidationExceptionField$Name` reports it.
 pub const PILLARS_MEMBER: &str = "pillars";
 
+/// The refusal for a `Pillars` list that names a value the `Pillar` enum does not
+/// publish, or `None` when every entry is published.
+///
+/// `Pillar` is an enum, so the boundary walk in `crate::service` refuses such a value with
+/// this same 400 before a handler runs; every operation that STORES a pillar list keeps
+/// the check as defence in depth for a caller that builds the input directly, so the
+/// sentence they all refuse it with is built here rather than once per operation.
+pub fn unpublished_pillar_exception(
+    pillars: &[String],
+) -> Option<crate::ops::types::ValidationException> {
+    let published = crate::ops::types::PILLAR_VALUES;
+    let unknown = pillars
+        .iter()
+        .find(|pillar| !published.contains(&pillar.as_str()))?;
+    Some(member_constraint_exception(
+        PILLARS_MEMBER,
+        &format!(
+            "Member must satisfy enum value set: [{}], got {unknown}",
+            published.join(", ")
+        ),
+    ))
+}
+
 /// The modelled input member a context-type finding names
 /// (`CreateAgentContextRequest$contextType`), as `ValidationExceptionField$Name` reports
 /// it.
@@ -4339,6 +4362,15 @@ pub struct CreateAgentProfileToken {
     pub fingerprint: String,
 }
 
+/// What an `UpdateAgentProfile` idempotency token resolves to: the profile the original
+/// request updated, plus that request's parameter fingerprint, so a retry carrying the
+/// token can be told from a later request that happens to reuse it for other values.
+#[derive(Debug, Clone)]
+pub struct UpdateAgentProfileToken {
+    pub profile_arn: String,
+    pub fingerprint: String,
+}
+
 /// What a `CreateAgentGoal` idempotency token resolves to: the goal the original request
 /// created, the profile it belongs to, and that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -4451,6 +4483,10 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateAgentProfile`'s `clientToken` -> what the original request created. Caller
     /// input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_agent_profile_tokens: TokenLedger<CreateAgentProfileToken>,
+    /// `UpdateAgentProfile`'s `clientToken` -> the profile and parameters the original
+    /// request applied, so a retry carrying it records no second modification. Caller
+    /// input keys it, so it is a BOUNDED [`TokenLedger`] like every ledger here.
+    pub update_agent_profile_tokens: TokenLedger<UpdateAgentProfileToken>,
     /// Every optimization goal recorded against an agent profile, keyed by that
     /// profile's ARN then by the goal's `UUID`. A `BTreeMap` because goal-id order is the
     /// stable order `ListAgentGoals` pages over.
@@ -5029,8 +5065,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
-    /// Drop an agent profile and everything keyed to it: every create token that
-    /// resolved to it, the goals and contexts recorded against it with the create
+    /// Drop an agent profile and everything keyed to it: every create or update token
+    /// that resolved to it, the goals and contexts recorded against it with the create
     /// tokens that resolved to those, and the recommendation generations started against
     /// it, so nothing outlives the profile it belongs to and the next request carrying
     /// one of those tokens acts afresh.
@@ -5047,6 +5083,8 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub fn remove_agent_profile(&mut self, profile_arn: &str) -> Option<AgentProfileRecord> {
         let record = self.agent_profiles.remove(profile_arn)?;
         self.create_agent_profile_tokens
+            .retain(|token| token.profile_arn != profile_arn);
+        self.update_agent_profile_tokens
             .retain(|token| token.profile_arn != profile_arn);
         self.agent_goals.remove(profile_arn);
         self.create_agent_goal_tokens
@@ -5848,9 +5886,14 @@ pub const REASON_CANNOT_PARSE: &str = "CANNOT_PARSE";
 pub fn field_validation_exception(
     fields: &[(String, String)],
 ) -> crate::ops::types::ValidationException {
+    // The distinct messages in the order they first appear, with membership tested against
+    // a set rather than by scanning the messages already kept: `fields` carries one entry
+    // per offending value of a request list, so a scan per entry would make building the
+    // refusal cost work quadratic in a length the caller chose.
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut distinct: Vec<&str> = Vec::new();
     for (_, message) in fields {
-        if !distinct.contains(&message.as_str()) {
+        if seen.insert(message.as_str()) {
             distinct.push(message);
         }
     }

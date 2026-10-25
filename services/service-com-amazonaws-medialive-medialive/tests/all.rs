@@ -182,6 +182,9 @@ mod node_lifecycle;
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 
+#[path = "all/offering_description.rs"]
+mod offering_description;
+
 #[path = "all/partner_input.rs"]
 mod partner_input;
 

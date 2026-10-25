@@ -31,5 +31,7 @@ mod policy_configuration_validation;
 mod policy_read_projection;
 #[path = "all/policy_type.rs"]
 mod policy_type;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

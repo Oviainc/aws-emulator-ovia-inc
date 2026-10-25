@@ -21,7 +21,7 @@
 //!
 //! The deletion half and the refusal half are rows of the same rule: deleting the stack
 //! deletes the queues it created, and a queue SQS REFUSES to create leaves the stack
-//! `CREATE_FAILED` naming the resource rather than publishing a dangling url.
+//! `ROLLBACK_COMPLETE` naming the resource rather than publishing a dangling url.
 //!
 //! The UPDATE half is the same rule for a stack that already has the queue: **a deployment
 //! that re-declares a resource it created with a different configuration applies that
@@ -1040,9 +1040,9 @@ async fn a_queue_sqs_refuses_to_create_fails_the_stack() {
     let body = create_and_settle(&router, case, stack_name, template).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than publish a queue url \
-         nothing answers to, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than publish a \
+         queue url nothing answers to, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(

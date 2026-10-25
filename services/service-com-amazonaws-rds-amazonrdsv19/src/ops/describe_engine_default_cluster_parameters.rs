@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEngineDefaultClusterParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEngineDefaultClusterParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the DB CLUSTER parameter catalog the engine named by
+//! a DB cluster parameter group family publishes. The SCAFFOLDED marker line is gone, which
+//! is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below are
+//! the scaffold's notes on how an operation of this service is wired. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEngineDefaultClusterParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cluster catalogs live here, beside the handler that reports them, for the same
+//! reason the DB-parameter-group catalogs live in
+//! `crate::ops::describe_engine_default_parameters`: they are reference data this front door
+//! publishes rather than a record any request creates. A cluster parameter is a DIFFERENT
+//! parameter from an instance one — it applies to every instance of a DB cluster at once —
+//! so this catalog is its own and not a copy of that one; what the two share, the rule that
+//! reads a family as an engine plus that engine's version, is read from there.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +79,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The one row-builder for a published parameter lives with the DB-parameter-group catalogs
+// next door, and so does the rule that reads a `DBParameterGroupFamily`: a family is a
+// family whichever of the two engine-default reports is asked, and a second copy of either
+// could disagree with it.
+use super::describe_engine_default_parameters::parameter;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +153,254 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEngineDefaultClusterParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEngineDefaultClusterParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEngineDefaultClusterParameters"))
+        // "Returns the default engine and system parameter information for the cluster
+        // database engine": the CLUSTER-level defaults of the engine a DB cluster parameter
+        // group family names, which belong to the FAMILY and not to any group a caller
+        // created. They are reference data this front door publishes — the same answer
+        // before and after anything is created, in every region — so this handler reads no
+        // record and, being a report, writes nothing at all. Both the store seam and the
+        // request context are bound so the generated signature stays as it is.
+        let _ = (ctx, &self.engine);
+
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeEngineDefaultClusterParametersError::invalid_parameter_value)?;
+        // `Filters`: "This parameter isn't currently supported." A request carrying one is
+        // refused rather than served as though the filter had been applied, which would
+        // report parameters the caller asked to exclude.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(
+                DescribeEngineDefaultClusterParametersError::invalid_parameter_value(
+                    "Filters isn't currently supported by \
+                     DescribeEngineDefaultClusterParameters",
+                ),
+            );
+        }
+
+        let family = input.db_parameter_group_family;
+        let published = cluster_engine_default_parameters(&family)
+            .map_err(DescribeEngineDefaultClusterParametersError::invalid_parameter_value)?;
+
+        // The catalog is kept in parameter-name order, so its own order is the report's and
+        // a page is a window over it.
+        let records: Vec<(String, Parameter)> = published
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name.to_string(),
+                    crate::state::engine_default_parameter_to_wire(spec),
+                )
+            })
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(records, input.marker.as_deref(), page_size)
+            .map_err(DescribeEngineDefaultClusterParametersError::invalid_parameter_value)?;
+        Ok(DescribeEngineDefaultClusterParametersOutput {
+            engine_defaults: Some(EngineDefaults {
+                db_parameter_group_family: Some(family),
+                marker: page.next_marker,
+                parameters: Some(page.items),
+            }),
+        })
     }
 }
+
+/// The cluster parameters the engine named by `family` publishes, or the refusal message for
+/// a value that is not a DB CLUSTER parameter group family.
+///
+/// A family is an engine this front door serves followed by that engine's version — the rule
+/// `crate::ops::describe_engine_default_parameters::family_engine` reads, shared so the two
+/// engine-default reports cannot disagree about what a family is. A DB CLUSTER parameter
+/// group family is narrower: its engine must have a cluster form, which is the value list
+/// `CreateDBClusterMessage$Engine` publishes ([`crate::state::DB_CLUSTER_ENGINES`]). A family
+/// of an engine that runs only as a single DB instance publishes no cluster parameters at
+/// all, so it is refused rather than answered with an empty list, which would read as "that
+/// engine's clusters carry no parameters".
+///
+/// A cluster family whose engine this emulator publishes no catalog for is a different
+/// answer, and deliberately a 200 with an empty list: the family IS one this front door
+/// serves, and the honest report of a catalog this emulator does not hold is no parameters
+/// rather than invented ones.
+fn cluster_engine_default_parameters(
+    family: &str,
+) -> Result<&'static [crate::state::ClusterParameterSpec], String> {
+    let Some(engine) = super::describe_engine_default_parameters::family_engine(family) else {
+        return Err(format!(
+            "Invalid value '{family}' for DBParameterGroupFamily: a DB cluster parameter group \
+             family names an engine this service serves followed by that engine's version \
+             (aurora-mysql8.0, aurora-postgresql16, docdb5.0)"
+        ));
+    };
+    if !crate::state::DB_CLUSTER_ENGINES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(engine))
+    {
+        return Err(format!(
+            "Invalid value '{family}' for DBParameterGroupFamily: only an engine that has a \
+             cluster form publishes DB cluster parameters, and those engines are {}",
+            crate::state::DB_CLUSTER_ENGINES.join(", ")
+        ));
+    }
+    // The MySQL-compatible cluster engines share one cluster vocabulary (Aurora MySQL's is
+    // MySQL's), and so do the PostgreSQL-compatible ones.
+    Ok(match engine {
+        _ if engine.ends_with("mysql") => MYSQL_CLUSTER_PARAMETERS,
+        _ if engine.ends_with("postgresql") || engine == "postgres" => POSTGRES_CLUSTER_PARAMETERS,
+        // Amazon DocumentDB keeps every parameter in a DB CLUSTER parameter group, so its
+        // catalog is the SHARED one the cluster-parameter-group operations of this front door
+        // already validate values against (`crate::state::published_parameters`), reported
+        // here for every version of that engine by the same rule as the engines above: the
+        // parameters are the engine's, and which versions of an engine exist is a question
+        // for the engine-version report, not for this one.
+        "docdb" => crate::state::published_parameters(family)
+            .unwrap_or(crate::state::DOCDB_CLUSTER_PARAMETERS),
+        "neptune" => NEPTUNE_CLUSTER_PARAMETERS,
+        // Every engine with a cluster form is covered above; one added to that list without a
+        // cluster catalog reports no parameters rather than invented ones.
+        _ => &[],
+    })
+}
+
+/// The cluster parameters the MySQL-compatible cluster engines publish — Aurora MySQL, and
+/// Amazon RDS for MySQL in a Multi-AZ DB cluster, which run the same engine.
+///
+/// Source: the cluster-level rows of the Amazon Aurora User Guide's Aurora MySQL parameter
+/// tables ("Cluster-level parameters"), which publish each parameter's apply type, data
+/// type, allowed values, default value and whether it is modifiable; `description` is the
+/// one-line description the engine's own documentation gives the parameter, which is the
+/// text the API reports.
+///
+/// It is not AWS's whole list — a cluster parameter group publishes dozens of parameters per
+/// family, and that list moves with every engine release. What a caller can rely on is that
+/// a cluster family this service serves reports its engine's cluster parameters with the
+/// metadata above, each sourced `engine-default`, in parameter-name order, paginated as this
+/// operation documents.
+///
+/// `minimum_engine_version` is published only where the version a parameter was introduced
+/// in is the same for every engine that shares this catalog; an entry that names none — one
+/// the engine has carried since before any version this service serves — reports no
+/// `MinimumEngineVersion` rather than a guessed one.
+///
+/// The entries are in ascending parameter-name order, which is the order the report is
+/// paginated in. [`parameter`]'s columns are, in order: name, apply type, data type, allowed
+/// values, default value, modifiable, minimum engine version, description.
+pub(crate) const MYSQL_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "binlog_format",
+        crate::state::APPLY_TYPE_STATIC,
+        "string",
+        "ROW,STATEMENT,MIXED,OFF",
+        "OFF",
+        true,
+        "",
+        "The format binary log events are written in; OFF disables binary logging.",
+    ),
+    parameter(
+        "lower_case_table_names",
+        crate::state::APPLY_TYPE_STATIC,
+        "integer",
+        "0-1",
+        "0",
+        true,
+        "",
+        "Whether table names are stored on disk and compared case-insensitively.",
+    ),
+    parameter(
+        "require_secure_transport",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "string",
+        "ON,OFF",
+        "OFF",
+        true,
+        "",
+        "Requires client connections to the cluster to use TLS.",
+    ),
+    parameter(
+        "server_audit_logging",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the auditing of cluster activity.",
+    ),
+];
+
+/// The cluster parameters the PostgreSQL-compatible cluster engines publish — Aurora
+/// PostgreSQL, and Amazon RDS for PostgreSQL in a Multi-AZ DB cluster; see
+/// [`MYSQL_CLUSTER_PARAMETERS`] for where the data comes from and what it does and does not
+/// claim.
+pub(crate) const POSTGRES_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "rds.force_ssl",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Requires client connections to the cluster to use TLS.",
+    ),
+    parameter(
+        "rds.logical_replication",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables logical decoding, which a logical replication slot needs.",
+    ),
+];
+
+/// The cluster parameters Amazon Neptune publishes.
+///
+/// Source: the "DB cluster parameter group parameters" section of the Amazon Neptune User
+/// Guide — Neptune's cluster parameters, as distinct from the single parameter its DB
+/// parameter group carries (`crate::ops::describe_engine_default_parameters`'s Neptune
+/// catalog); see [`MYSQL_CLUSTER_PARAMETERS`] for what the columns are and what the catalog
+/// does and does not claim.
+pub(crate) const NEPTUNE_CLUSTER_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
+    parameter(
+        "neptune_enable_audit_log",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the auditing of cluster activity.",
+    ),
+    parameter(
+        "neptune_enforce_ssl",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "1",
+        true,
+        "",
+        "Requires client connections to the cluster to use TLS.",
+    ),
+    parameter(
+        "neptune_query_timeout",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "integer",
+        "10-2147483647",
+        "120000",
+        true,
+        "",
+        "The time in milliseconds after which a graph query is timed out.",
+    ),
+    parameter(
+        "neptune_streams",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables the change-log stream of the cluster's graph.",
+    ),
+];

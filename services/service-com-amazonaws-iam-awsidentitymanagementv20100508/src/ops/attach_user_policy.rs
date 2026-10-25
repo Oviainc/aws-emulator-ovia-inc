@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachUserPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachUserPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachUserPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +166,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachUserPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachUserPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachUserPolicy"))
+        // `ctx` carries request metadata only; nothing about an attachment depends
+        // on it — IAM is global, and both entities are named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AttachUserPolicyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` asks only for a 20..2048 character string, so the ARN still has
+        // to BE a managed policy's: `arn:<partition>:iam::<account>:policy/<path><name>`.
+        // Anything else is an "invalid … value … supplied for an input parameter".
+        let Some(policy) = crate::state::parse_policy_arn(&input.policy_arn) else {
+            return Err(AttachUserPolicyErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "ARN {} is not valid: PolicyArn must be an IAM managed policy ARN",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // The user is named (friendly name, not ARN) and IAM entity names "are not
+        // distinguished by case", so the case-folded name is the identity. A name
+        // the account holds no user under "referenced a resource entity that does
+        // not exist".
+        let user_key = crate::state::name_key(&input.user_name);
+        if !store.users.contains_key(&user_key) {
+            return Err(AttachUserPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A managed policy is attachable only if it exists. An AWS-managed policy
+        // (account segment `aws`) belongs to AWS rather than to this account, so it
+        // is not account state and is taken as present, exactly as
+        // `crate::ops::attach_role_policy` takes it: AWS's catalog runs to well over
+        // a thousand policies and `crate::state::AWS_MANAGED_POLICIES` carries a
+        // subset of it, so refusing the ARNs outside that subset would refuse
+        // attachments AWS accepts. A customer-managed policy, by contrast, exists
+        // exactly when this account holds it — which is what the policy store
+        // `CreatePolicy` writes records.
+        let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
+        if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
+            return Err(AttachUserPolicyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} does not exist or is not attachable.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Amazon Web Services service role policies can only be attached to the
+        // service-linked role for that service" (`PolicyNotAttachableException`):
+        // such a policy is one filed under the reserved service-linked role path,
+        // and a user is not a service-linked role, so no user can carry one.
+        if crate::state::is_service_linked_role_path(&policy.path) {
+            return Err(AttachUserPolicyErrorModeled::PolicyNotAttachableException(
+                PolicyNotAttachableException {
+                    message: Some(format!(
+                        "Policy {} is not attachable: a service role policy can only be \
+                         attached to the service-linked role for that service",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let attached = store.user_attached_policies.entry(user_key).or_default();
+        // A policy is either attached to a user or it is not, so attaching one that
+        // is already attached leaves the user exactly as it is — and in particular
+        // does not consume a second slot of the user's quota.
+        if !attached.contains(&input.policy_arn) {
+            // A user carries a bounded number of managed policies, so a caller
+            // cannot grow a user's permissions without limit.
+            if attached.len() >= crate::state::MAX_MANAGED_POLICIES_PER_USER {
+                return Err(AttachUserPolicyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Cannot exceed quota for PoliciesPerUser: {}",
+                            crate::state::MAX_MANAGED_POLICIES_PER_USER
+                        )),
+                    },
+                )
+                .into());
+            }
+            attached.insert(input.policy_arn);
+        }
+
+        Ok(AttachUserPolicyOutput)
     }
 }

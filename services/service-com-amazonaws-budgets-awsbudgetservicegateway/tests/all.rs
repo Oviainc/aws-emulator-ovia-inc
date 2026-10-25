@@ -39,6 +39,8 @@ mod budget_creation_limits;
 mod budget_end_date_expiry;
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
+#[path = "all/budget_performance_history.rs"]
+mod budget_performance_history;
 #[path = "all/budget_read_projection.rs"]
 mod budget_read_projection;
 #[path = "all/budget_validation_rules.rs"]

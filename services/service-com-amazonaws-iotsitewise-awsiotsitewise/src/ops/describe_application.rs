@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one application from
+//! [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::applications`]. An
+//! application is addressed by `(workspaceName, id)`, so a request naming an id this
+//! store holds in ANOTHER workspace names no application and is refused as not found.
+//! A read, so nothing here writes: the reported status is DERIVED from the instant the
+//! transition the create owes falls due.
 //!
 //! ## Shape of an operation
 //!
@@ -167,20 +165,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeApplicationError::Modeled(
+                DescribeApplicationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read, so nothing here writes: the status is DERIVED from the instant the
+        // transition the create owes falls due.
+        let store = state.lock();
+
+        // The read is scoped to a workspace, so a workspace this store does not hold
+        // is the same absence every other workspace-scoped operation in this service
+        // reports, named as the workspace the request supplied.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+
+        let record = store
+            .applications
+            .get(&input.id)
+            // An application lives in the workspace its create named, and this
+            // operation addresses one by that workspace AND its id, so an id read
+            // from another workspace names no application this store holds.
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .ok_or_else(|| not_found(crate::state::RESOURCE_APPLICATION, &input.id))?;
+
+        Ok(DescribeApplicationOutput {
+            arn: record.arn.clone(),
+            created_at: crate::state::to_date_time(record.created_at),
+            dns_subdomain: record.dns_subdomain.clone(),
+            // Reported as the create stored it. This output member targets
+            // `ApplicationDescription`, whose pattern is narrower than the
+            // `Description` the create's own member targets, so a stored
+            // description the create accepted can be one this shape's pattern
+            // would not admit: the model is inconsistent between the two, and what
+            // the caller gets back is what it sent.
+            description: record.description.clone(),
+            id: record.id.clone(),
+            idc_application_arn: record.idc_application_arn.clone(),
+            name: record.name.clone(),
+            status: record.status(now),
+            updated_at: crate::state::to_date_time(record.updated_at),
+            workspace_name: record.workspace_name.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind the request
+/// addressed and the identifier it supplied.
+fn not_found(resource: &str, requested: &str) -> DescribeApplicationError {
+    DescribeApplicationError::Modeled(
+        DescribeApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        }),
+    )
 }

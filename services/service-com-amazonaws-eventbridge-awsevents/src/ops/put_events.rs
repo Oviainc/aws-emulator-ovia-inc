@@ -20,11 +20,20 @@
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
 //!
+//! An entry naming a bus this account does not hold is nonetheless ACCEPTED and
+//! given an `EventId`: the destination is not a property of the entry, and this
+//! operation models no error for a missing one. Such an event is routed nowhere
+//! — no rules to match it against, nothing recorded under it — so a publisher
+//! is never told that a bus created later is not there yet.
+//!
 //! `FailedEntryCount` is the number of entries that were
 //! NOT accepted, computed from those per-entry outcomes. An entry that does not
 //! provide each of `Detail`, `DetailType` and `Source` names no event, so it
 //! fails on its own — and a request in which NO entry provides all three is
-//! refused whole. An entry whose `Source` claims the `aws.` namespace AWS
+//! refused whole, as is one whose entries total more than the published size
+//! bound ([`crate::state::MAX_ENTRY_SIZE_BYTES`]), which is charged on the
+//! request rather than on one entry. An entry whose `Source` claims the `aws.`
+//! namespace AWS
 //! reserves for its own services is not accepted either: it too fails on its
 //! own row, through the per-entry failure channel. The ONE exception is the
 //! origin that namespace belongs to — an emulated AWS service publishing its own
@@ -164,6 +173,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`is_reserved_source`]).
         let service_publication = is_service_publication(ctx);
 
+        // "You can batch multiple event entries into one request for
+        // efficiency. However, the total entry size must be less than 1MB"
+        // (this operation's own documentation): the published bound is on the
+        // REQUEST, charged the way AWS documents under "Calculating PutEvents
+        // event entry size" and summed over its entries, and it is INCLUSIVE —
+        // only MORE than the maximum is refused. A request past it carries no
+        // publishable entry list at all, so it is refused as a WHOLE rather
+        // than entry by entry (which is also what bounds the text the matcher
+        // below has to walk). A single entry over the bound is the one-entry
+        // case of the same sum.
+        let total_size: usize = input
+            .entries
+            .iter()
+            .map(|entry| {
+                crate::state::put_events_entry_size(
+                    entry.time.is_some(),
+                    entry.source.as_deref(),
+                    entry.detail_type.as_deref(),
+                    entry.detail.as_deref(),
+                    entry.resources.as_deref().unwrap_or_default(),
+                )
+            })
+            .sum();
+        if total_size > crate::state::MAX_ENTRY_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::REQUEST_SIZE_EXCEEDED,
+            ));
+        }
+
         // PASS 1 — no lock, no routing: the checks that depend only on the
         // entry itself, so a refusable entry never reaches the matcher.
         let mut screened: Vec<Screened> = input
@@ -187,9 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // PASS 2 — under the lock, and only for as long as reading takes:
         // snapshot the routing table for the buses these entries name (at most
-        // `Entries`' modelled 10) and mint one EventId per entry whose bus
-        // exists. Each rule's `EventPattern` is parsed ONCE here rather than
-        // once per (entry, rule) pair. No pattern is evaluated under the lock.
+        // `Entries`' modelled 10) and mint one EventId per accepted entry. Each
+        // rule's `EventPattern` is parsed ONCE here rather than once per
+        // (entry, rule) pair. No pattern is evaluated under the lock.
         let mut routing: ::std::collections::BTreeMap<String, Option<Vec<CompiledRule>>> =
             ::std::collections::BTreeMap::new();
         {
@@ -204,9 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                     routing.insert(accepted.bus.clone(), compiled);
                 }
-                if routing.get(&accepted.bus).is_some_and(Option::is_some) {
-                    accepted.event_id = store.next_event_id(now);
-                }
+                // Minted for every accepted entry, whether or not the bus it
+                // names is one this account holds: the id is the ingestion
+                // receipt this operation answers with, and what becomes of the
+                // event afterwards does not change that it was ingested.
+                accepted.event_id = store.next_event_id(now);
             }
         }
 
@@ -222,9 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // index in the request array" (this operation's `Entries` output).
         let mut entries: Vec<PutEventsResultEntry> = Vec::with_capacity(screened.len());
         let mut deliveries: Vec<crate::state::DeliveredEvent> = Vec::new();
-        // What routing decided to deliver, and the envelope to deliver: the event
-        // text a target receives is the whole envelope, so it is kept beside the
-        // targets rather than rebuilt per target.
+        // What routing decided to deliver, and the text to deliver: the event a
+        // target receives is the whole envelope, rendered ONCE per event rather
+        // than per target.
         let mut dispatches: Vec<Dispatch> = Vec::new();
         let mut failed = 0usize;
         for slot in screened {
@@ -236,25 +276,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Screened::Accepted(accepted) => accepted,
             };
+            // An entry naming a bus this account does not hold is still
+            // INGESTED: the destination is not a property of the entry, and
+            // this operation's only modelled error is `InternalException`, so
+            // nothing reports a missing bus to the publisher. The event is
+            // simply routed nowhere — there are no rules to match it against
+            // and nothing to record it under.
             let Some(Some(rules)) = routing.get(&accepted.bus) else {
-                failed += 1;
-                entries.push(refused(
-                    RESOURCE_NOT_FOUND,
-                    crate::state::no_such_event_bus(&accepted.bus),
-                ));
+                entries.push(PutEventsResultEntry {
+                    event_id: Some(accepted.event_id),
+                    error_code: None,
+                    error_message: None,
+                });
                 continue;
             };
-            let envelope = crate::state::event_envelope(
-                &accepted.event_id,
-                &region,
-                accepted.source.as_deref(),
-                accepted.detail_type.as_deref(),
-                accepted.detail.as_deref(),
-                &accepted.resources,
-                accepted.time,
-            );
-            match route(&envelope, rules) {
-                Some(matched) => {
+            match evaluate(&accepted, &region, rules) {
+                Routed::Matched { matched, rendered } => {
                     deliveries.push(crate::state::DeliveredEvent {
                         event_id: accepted.event_id.clone(),
                         bus: accepted.bus.clone(),
@@ -269,11 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .flat_map(|rule| rule.targets.iter().map(|target| target.arn.clone()))
                             .collect(),
                     });
-                    if matched.iter().any(|rule| !rule.targets.is_empty()) {
+                    if let Some(rendered) = rendered {
                         dispatches.push(Dispatch {
                             event_id: accepted.event_id.clone(),
                             bus: accepted.bus,
-                            envelope,
+                            rendered,
                             matched,
                         });
                     }
@@ -283,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         error_message: None,
                     });
                 }
-                None => {
+                Routed::BudgetSpent => {
                     failed += 1;
                     entries.push(refused(
                         INVALID_ARGUMENT,
@@ -318,7 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut clients = Clients::default();
         let mut invocations: Vec<crate::state::TargetInvocation> = Vec::new();
         'dispatch: for dispatch in dispatches {
-            let rendered = dispatch.envelope.to_string();
+            let rendered = dispatch.rendered;
             for rule in &dispatch.matched {
                 let rule_arn = crate::state::rule_arn(&region, &dispatch.bus, &rule.name);
                 for target in &rule.targets {
@@ -385,9 +422,6 @@ const NOT_AUTHORIZED_FOR_SOURCE: &str = "NotAuthorizedForSourceException";
 const NOT_AUTHORIZED_FOR_SOURCE_MESSAGE: &str = "Not authorized for the source.";
 /// "The JSON provided is not valid" (`PutEventsResultEntry$ErrorCode`).
 const MALFORMED_DETAIL: &str = "MalformedDetail";
-/// The bus an entry names does not exist, so there is nothing to publish onto;
-/// the code is the service-wide one for a missing entity.
-const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// A refused entry's result: no `EventId`, and the code and message saying why.
 fn refused(code: &str, message: String) -> PutEventsResultEntry {
@@ -435,7 +469,8 @@ struct Accepted {
     detail: Option<String>,
     resources: Vec<String>,
     time: ::std::time::SystemTime,
-    /// Minted once the entry's bus is known to exist; empty until then.
+    /// Minted for every accepted entry, whatever bus it names; empty until
+    /// the store that owns the counter is reached.
     event_id: String,
 }
 
@@ -513,8 +548,9 @@ fn is_service_publication(ctx: &smithy_server_runtime::OperationContext<'_>) -> 
 
 /// Screen ONE entry against the checks that depend only on the entry: the
 /// members an event must carry, the namespace its `Source` claims, the
-/// per-member limits the entry's own documentation states, `Detail`'s form, and
-/// the published entry size.
+/// per-member limits the entry's own documentation states, and `Detail`'s form.
+/// The size bound belongs to the request rather than to one entry, so it is
+/// charged by the handler before any of this runs.
 fn screen(
     entry: PutEventsRequestEntry,
     now: ::std::time::SystemTime,
@@ -577,45 +613,27 @@ fn screen(
 
     // "PutEvents accepts the data in JSON format" and `Detail` is "a valid JSON
     // object" (`PutEventsRequestEntry$Detail`), which a pattern reaches into, so
-    // anything else cannot be routed. Text that is only whitespace is no more a
-    // JSON object than any other non-object, so it reaches this check too: the
-    // entry CARRIED `Detail` (the required-property check above passed), and
-    // what it carried is malformed.
+    // anything else cannot be routed; the document may nest as deep as this
+    // operation documents and no deeper
+    // (`crate::state::MAX_DETAIL_DEPTH`). Text that is only whitespace is no
+    // more a JSON object than any other non-object, so it reaches this check
+    // too: the entry CARRIED `Detail` (the required-property check above
+    // passed), and what it carried is malformed. Judging it costs no depth, so
+    // a document past the bound is refused here without being read.
     if let Some(detail) = entry.detail.as_deref() {
-        let parsed = ::serde_json::from_str::<::serde_json::Value>(detail);
-        if !parsed.is_ok_and(|value| value.is_object()) {
+        if let Err(refusal) = crate::state::validate_detail(detail) {
             return Screened::Refused {
-                result: refused(MALFORMED_DETAIL, "Detail is malformed.".to_string()),
+                result: refused(MALFORMED_DETAIL, refusal.message()),
                 missing: None,
             };
         }
     }
 
-    // "The total entry size must be less than 1MB" (this operation's own
-    // documentation), measured the way AWS documents under "Calculating
-    // PutEvents event entry size". Refusing an oversized entry is also what
-    // bounds the text the pattern matcher has to walk.
+    // The published size bound is on the REQUEST as a whole, so it is charged
+    // and refused before any entry is screened (see the handler above); what
+    // the entry still owes this screen is its resource list, which routing
+    // carries into the event envelope.
     let resources = entry.resources.unwrap_or_default();
-    let size = crate::state::put_events_entry_size(
-        entry.time.is_some(),
-        entry.source.as_deref(),
-        entry.detail_type.as_deref(),
-        entry.detail.as_deref(),
-        &resources,
-    );
-    if size >= crate::state::MAX_ENTRY_SIZE_BYTES {
-        return Screened::Refused {
-            result: refused(
-                INVALID_ARGUMENT,
-                format!(
-                    "Total size of the entries in the request is {size} bytes, which exceeds the \
-                     maximum entry size of {} bytes.",
-                    crate::state::MAX_ENTRY_SIZE_BYTES
-                ),
-            ),
-            missing: None,
-        };
-    }
 
     Screened::Accepted(Accepted {
         bus: crate::state::effective_bus_name(entry.event_bus_name.as_deref()),
@@ -631,6 +649,52 @@ fn screen(
             .unwrap_or(now),
         event_id: String::new(),
     })
+}
+
+/// What routing made of one accepted entry.
+enum Routed {
+    /// The rules it matched, and the text to hand each of their targets —
+    /// `None` when no matched rule has a target, so nothing is delivered and
+    /// the envelope is never rendered.
+    Matched {
+        matched: Vec<MatchedRule>,
+        rendered: Option<String>,
+    },
+    /// The entry's matching budget was spent before every rule was evaluated,
+    /// so no verdict was reached.
+    BudgetSpent,
+}
+
+/// Evaluate one accepted entry: build its event envelope, match it against the
+/// rules of its bus, and render what a target receives.
+///
+/// The three are done TOGETHER, and the parse tree never leaves this call: the
+/// envelope carries the entry's `Detail` parsed, so building it, matching
+/// against it, rendering it and dropping it are each as deep as that document
+/// nests. Doing them in one place is what makes that depth paid for ONCE per
+/// entry, bounded by `crate::state::MAX_DETAIL_DEPTH` — the published depth a
+/// document may nest to, which the parse charges itself.
+fn evaluate(accepted: &Accepted, region: &str, rules: &[CompiledRule]) -> Routed {
+    let envelope = crate::state::event_envelope(
+        &accepted.event_id,
+        region,
+        accepted.source.as_deref(),
+        accepted.detail_type.as_deref(),
+        accepted.detail.as_deref(),
+        &accepted.resources,
+        accepted.time,
+    );
+    let Some(matched) = route(&envelope, rules) else {
+        return Routed::BudgetSpent;
+    };
+    // Rendered ONCE per event, and only for an event that has somewhere to go:
+    // the text is as large as the entry, so an event no target is waiting for
+    // is never serialized.
+    let rendered = matched
+        .iter()
+        .any(|rule| !rule.targets.is_empty())
+        .then(|| envelope.to_string());
+    Routed::Matched { matched, rendered }
 }
 
 /// Route one accepted entry's envelope: the rules whose `EventPattern` matches
@@ -676,7 +740,9 @@ struct MatchedRule {
 struct Dispatch {
     event_id: String,
     bus: String,
-    envelope: ::serde_json::Value,
+    /// The whole event envelope, rendered when the event was routed (see
+    /// [`evaluate`]) rather than carried as a parse tree into this pass.
+    rendered: String,
     matched: Vec<MatchedRule>,
 }
 
@@ -1475,5 +1541,75 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {url:?}"
             );
         }
+    }
+
+    /// An entry's `Detail` nests as deep as its CONTAINERS go: a container
+    /// delimiter inside a JSON string is text, not structure, so it does not
+    /// count — which is what lets the published nesting bound be charged on the
+    /// document before anything parses it. The rows differ along where the
+    /// delimiters sit, how the string around them is escaped, and whether the
+    /// deepest nesting is the first one reached.
+    #[test]
+    fn a_detail_nests_as_deep_as_its_containers_and_no_deeper() {
+        // (case, the document, the nesting depth it has)
+        let rows: Vec<(&str, &str, usize)> = vec![
+            ("no container at all", "7", 0),
+            ("a flat object", r#"{"a":1}"#, 1),
+            ("an object inside an object", r#"{"a":{"b":1}}"#, 2),
+            ("an array inside an object", r#"{"a":[1,2]}"#, 2),
+            ("arrays inside an array", r#"{"a":[[[1]]]}"#, 4),
+            ("delimiters inside a string value", r#"{"a":"{{{[[["}"#, 1),
+            ("an escaped quote before a delimiter", r#"{"a":"\"{"}"#, 1),
+            ("an escaped backslash ending the string", r#"{"a":"\\","b":{"c":1}}"#, 2),
+            ("the deepest of two siblings", r#"{"a":{"b":1},"c":{"d":{"e":1}}}"#, 3),
+            ("a delimiter in a KEY", r#"{"{a}":{"b":1}}"#, 2),
+        ];
+        for (case, document, depth) in rows {
+            let measured = crate::state::json_nesting_depth(document);
+            assert_eq!(
+                measured, depth,
+                "case {case:?}: expected a nesting depth of {depth}, got {measured}"
+            );
+        }
+    }
+
+    /// A `Detail` anywhere within the published nesting bound is JUDGED without
+    /// descending into it: the depth charge and the form check cost no stack, so
+    /// an entry is screened on the thread its request arrived on however deeply
+    /// it nests, and a document past the bound is refused without being read.
+    /// (Building the parse tree is the read that does descend, and it is reached
+    /// only for a document this has bounded.)
+    #[test]
+    fn a_detail_is_judged_without_descending_into_it() {
+        // A stack far smaller than any thread this emulator serves on, so the
+        // judgement is shown to cost no depth rather than to fit a large one.
+        const SMALL_STACK_BYTES: usize = 256 * 1024;
+        let deepest = crate::state::MAX_DETAIL_DEPTH;
+        let mut document = "1".to_string();
+        for _ in 0..deepest {
+            document = format!(r#"{{"a":{document}}}"#);
+        }
+        // One level past the bound, which must be refused rather than read.
+        let over = format!(r#"{{"a":{document}}}"#);
+        let judged = ::std::thread::Builder::new()
+            .stack_size(SMALL_STACK_BYTES)
+            .spawn(move || {
+                (
+                    crate::state::validate_detail(&document),
+                    crate::state::validate_detail(&over),
+                )
+            })
+            .expect("the probe thread starts")
+            .join()
+            .expect("the probe thread finishes");
+        assert_eq!(
+            judged,
+            (
+                Ok(()),
+                Err(crate::state::DetailRefusal::TooDeep(deepest + 1))
+            ),
+            "a Detail at and past {deepest} levels must be judged on a \
+             {SMALL_STACK_BYTES}-byte stack"
+        );
     }
 }

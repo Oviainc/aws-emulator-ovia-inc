@@ -25,6 +25,8 @@ mod region_isolation;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_mutation_no_content.rs"]
+mod tag_mutation_no_content;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/update_monitor.rs"]

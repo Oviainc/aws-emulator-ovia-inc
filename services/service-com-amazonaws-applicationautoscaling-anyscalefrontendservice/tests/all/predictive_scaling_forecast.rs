@@ -39,6 +39,10 @@ const POLICY: &str = "forecaster";
 /// How many past hours a row publishes its observations into.
 const PUBLISHED_HOURS: i64 = 5;
 
+/// The namespace prefix AWS reserves for its own services' metrics, which no client may
+/// publish into (`PutMetricDataInput$Namespace`).
+const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
+
 /// One row of the forecast table.
 struct ForecastRow {
     case: &'static str,
@@ -625,6 +629,11 @@ async fn put_predictive_policy(emulator: &Emulator, target: &Value, configuratio
 }
 
 /// Publish `values` into one CloudWatch series, all stamped at `at`.
+///
+/// A series of the AWS-reserved namespace space is one its own AWS service authors, and no
+/// client may publish into it (`PutMetricData` refuses a `Namespace` beginning with `AWS/`),
+/// so such a row's observations are seeded into the metric store the way that service writes
+/// them. A customer-namespace series goes over the wire, through the handler.
 async fn publish(
     emulator: &Emulator,
     namespace: &str,
@@ -634,6 +643,11 @@ async fn publish(
     values: &[f64],
 ) {
     if values.is_empty() {
+        return;
+    }
+    if namespace.starts_with(RESERVED_NAMESPACE_PREFIX) {
+        #[allow(clippy::cast_precision_loss)]
+        emulator.seed_metric_data(namespace, metric_name, dimensions, at as f64, values);
         return;
     }
     let dimensions: Vec<Value> = dimensions

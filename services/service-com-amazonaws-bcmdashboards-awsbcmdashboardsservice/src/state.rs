@@ -10,6 +10,7 @@
 //! rather than duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -702,6 +703,90 @@ pub fn decode_page_token(token: &str, arn_segment: &str) -> Option<String> {
         && arn.contains(":bcm-dashboards::")
         && arn.contains(arn_segment);
     names_the_resource.then_some(arn)
+}
+
+/// One page of a listing over an ARN-keyed resource map: the records of the page,
+/// already projected onto the shape the listing answers, and the cursor the next page
+/// resumes at — present exactly when a record remains after the page.
+#[derive(Debug)]
+pub struct ListingPage<T> {
+    /// The page's records, in ARN order.
+    pub items: Vec<T>,
+    /// The `nextToken` to answer, or `None` when the page exhausted the map.
+    pub next_token: Option<String>,
+}
+
+/// Why a listing request names no page this service can serve. The listing turns it
+/// into its own modelled `ValidationException` with [`ListingRefusal::message`], which
+/// is the only part of the refusal that differs between listings.
+#[derive(Debug)]
+pub enum ListingRefusal {
+    /// The request carried a `nextToken` this service did not mint for a listing over
+    /// the resource type walked.
+    UninterpretableToken,
+    /// The request asked for a page of this many records, which is not a page any
+    /// listing can answer.
+    NonPositivePageSize(i32),
+}
+
+impl ListingRefusal {
+    /// The `ValidationException` message for this refusal of `operation`'s listing.
+    pub fn message(&self, operation: &str) -> String {
+        match self {
+            Self::UninterpretableToken => format!(
+                "Member must be a nextToken returned by a previous {operation} call: nextToken"
+            ),
+            Self::NonPositivePageSize(max_results) => format!(
+                "Member must have value greater than or equal to 1: maxResults {max_results}"
+            ),
+        }
+    }
+}
+
+/// One page of a listing over `records`, an ARN-keyed map of this service's resources.
+///
+/// Every listing this service serves pages the same way, so the rule lives here once
+/// rather than once per list handler: a `next_token` is the ARN to resume at, decoded
+/// for the resource type `arn_segment` names and refused when it is not a cursor this
+/// service minted for that type; `max_results` is the page size, refused when it is not
+/// at least one (a zero-item page that still carried a cursor would be a client loop
+/// that never terminates); the walk starts at the cursor's ARN inclusive, or at the
+/// first stored record, takes at most a page of records and projects each one with
+/// `project`; and the cursor minted is the ARN of the first record AFTER the page, so
+/// `next_token` is present exactly when one remains.
+///
+/// The token is decoded before the page size is read, so a request that is wrong in
+/// both ways is answered for its token.
+pub fn listing_page<'records, R, T>(
+    records: &'records BTreeMap<String, R>,
+    next_token: Option<&str>,
+    max_results: i32,
+    arn_segment: &str,
+    mut project: impl FnMut(&'records R) -> T,
+) -> Result<ListingPage<T>, ListingRefusal> {
+    let resume_from = match next_token {
+        None => None,
+        Some(token) => Some(
+            decode_page_token(token, arn_segment).ok_or(ListingRefusal::UninterpretableToken)?,
+        ),
+    };
+    let page_size = match usize::try_from(max_results) {
+        Ok(size) if size >= 1 => size,
+        _ => return Err(ListingRefusal::NonPositivePageSize(max_results)),
+    };
+    // Borrowed bounds, so resuming copies no ARN.
+    let start = match resume_from.as_deref() {
+        Some(arn) => Bound::Included(arn),
+        None => Bound::Unbounded,
+    };
+    let mut remaining = records.range::<str, _>((start, Bound::Unbounded));
+    let items: Vec<T> = remaining
+        .by_ref()
+        .take(page_size)
+        .map(|(_, record)| project(record))
+        .collect();
+    let next_token = remaining.next().map(|(arn, _)| encode_page_token(arn));
+    Ok(ListingPage { items, next_token })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

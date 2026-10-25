@@ -23,3 +23,14 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the iotsitewise emulator
 2. Call DescribeApplication and observe HTTP 501 with no state persisted
+
+## Status note
+
+`DescribeApplication` was implemented alongside `CreateApplication` (the
+`20261024T100802Z-iotsitewise-createapplication-stub` fix), because a create has to be
+proved through the reader that answers it: the handler now reports the stored
+application record, the scaffold marker is gone from
+`src/ops/describe_application.rs`, and `tests/all/application_lifecycle.rs` covers the
+round trip, the `(workspaceName, id)` addressing and the not-found refusals. Nothing is
+left to implement here; this report is kept only so the work item that owns it can close
+it.

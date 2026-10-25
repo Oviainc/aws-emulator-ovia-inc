@@ -466,6 +466,11 @@ pub const DEFAULT_VOCABULARY_LIST_MAX_RESULTS: i32 = 5;
 /// is used" (model doc for `ListCallAnalyticsCategoriesRequest$MaxResults`).
 pub const DEFAULT_CATEGORY_LIST_MAX_RESULTS: i32 = 5;
 
+/// The number of custom language models `ListLanguageModels` returns when the request
+/// names no `MaxResults`: "If you do not specify a value, a default of 5 is used"
+/// (model doc for `ListLanguageModelsRequest$MaxResults`).
+pub const DEFAULT_MODEL_LIST_MAX_RESULTS: i32 = 5;
+
 /// `InputType` values, from the model's enum
 /// (`smithy_query(query="shape", shape="InputType")`, also
 /// [`crate::ops::types::INPUT_TYPE_VALUES`]): a Call Analytics category applies
@@ -1201,6 +1206,21 @@ impl ComAmazonawsTranscribeTranscribeState {
         let record = self.language_models.get_mut(name)?;
         record.advance_clock(now);
         Some(record)
+    }
+
+    /// Materialise every clock-owed language-model transition, then the stored custom
+    /// language models newest first — the order `ListLanguageModels` documents
+    /// ("Language models are ordered by creation date, with the newest model first").
+    pub fn language_models_newest_first(
+        &mut self,
+        now: SystemTime,
+    ) -> Vec<&LanguageModelRecord> {
+        for record in self.language_models.values_mut() {
+            record.advance_clock(now);
+        }
+        let mut records: Vec<&LanguageModelRecord> = self.language_models.values().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+        records
     }
 
     /// Whether this account holds a resource of `family` named `name`.

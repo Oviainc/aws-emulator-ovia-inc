@@ -45,7 +45,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{
-    accept, agreement_over, call, cancel, create, emulator, term, variable_payment_term, Answer,
+    accept, agreement_over, call, cancel, create, emulator, invoiced_agreement, term,
+    variable_payment_term, Answer,
 };
 use crate::billing_adjustments::{
     entry as adjustment_entry, get as get_adjustment, submit as submit_adjustments,
@@ -234,9 +235,17 @@ async fn every_error_body_carries_a_unique_modelled_request_id() {
         accepted.body
     );
     // One stored billing adjustment request, so a child lookup can find one.
+    // The adjustment is made against an invoice of its own agreement, which is
+    // the one the acceptance of a prepaid charge issued.
+    let (adjusted, adjusted_invoice) = invoiced_agreement(&router, "ap-idsadjusted").await;
     let submitted = submit_adjustments(
         &router,
-        vec![adjustment_entry(&active, "inv-ids-1", "5", "token-ids-1")],
+        vec![adjustment_entry(
+            &adjusted,
+            &adjusted_invoice,
+            "5",
+            "token-ids-1",
+        )],
     )
     .await;
     let adjustment = submitted.str_at("/items/0/billingAdjustmentRequestId");
@@ -471,8 +480,8 @@ async fn each_unusable_input_member_of_a_send_names_itself() {
 async fn a_nested_lookup_names_the_resource_that_failed_to_resolve() {
     let router = emulator();
     let agreement =
-        adjustment_agreement(&router, "ap-nested", "inv-nested-1", "token-nested-1").await;
-    let other = adjustment_agreement(&router, "ap-nested2", "inv-nested-2", "token-nested-2").await;
+        adjustment_agreement(&router, "ap-nested", "token-nested-1").await;
+    let other = adjustment_agreement(&router, "ap-nested2", "token-nested-2").await;
 
     let stored = get_adjustment(&router, &agreement.0, &agreement.1).await;
     assert_eq!(
@@ -520,15 +529,17 @@ async fn a_nested_lookup_names_the_resource_that_failed_to_resolve() {
 
 /// One agreement with one stored billing adjustment request against it,
 /// answering both ids.
+///
+/// The adjustment names the invoice the agreement's own acceptance issued: an
+/// entry may only adjust an invoice of the agreement it names.
 async fn adjustment_agreement(
     router: &MultiServiceRouter,
     proposal: &str,
-    invoice: &str,
     token: &str,
 ) -> (String, String) {
-    let agreement = agreement_over(router, proposal, vec![term("eula.v1")]).await;
+    let (agreement, invoice) = invoiced_agreement(router, proposal).await;
     let submitted =
-        submit_adjustments(router, vec![adjustment_entry(&agreement, invoice, "7", token)]).await;
+        submit_adjustments(router, vec![adjustment_entry(&agreement, &invoice, "7", token)]).await;
     let id = submitted.str_at("/items/0/billingAdjustmentRequestId");
     assert!(
         !id.is_empty(),

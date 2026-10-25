@@ -523,8 +523,8 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
                 &[],
             );
             assert_eq!(
-                status, "CREATE_FAILED",
-                "expected the stack to fail, got {status} {reason:?}"
+                status, "ROLLBACK_COMPLETE",
+                "expected the failed create to be rolled back, got {status} {reason:?}"
             );
             let reason = reason.unwrap_or_default();
             assert!(
@@ -546,8 +546,8 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
             );
 
             // The same failure in a stack that ALSO declares a repository it COULD create:
-            // the one that was created really exists — the stack records it, so its own
-            // deletion is what deletes it — while the stack still reports the failure.
+            // rolling the failed create back removes the one it had made — that is what a
+            // rollback is — while the repository the stack never created is left alone.
             let template = "{\"Resources\": {\
                             \"Good\": {\"Type\": \"AWS::ECR::PublicRepository\", \
                             \"Properties\": {\"RepositoryName\": \"cfn-partial-good\"}}, \
@@ -556,8 +556,8 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
             let (status, reason) =
                 create_stack_and_settle(&router, &runtime, "cfn-partial", template, &[]);
             assert_eq!(
-                status, "CREATE_FAILED",
-                "expected the stack to fail, got {status} {reason:?}"
+                status, "ROLLBACK_COMPLETE",
+                "expected the failed create to be rolled back, got {status} {reason:?}"
             );
             let (status, body) = ecr_public(
                 &router,
@@ -566,12 +566,14 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
                 serde_json::json!({"repositoryNames": ["cfn-partial-good"]}),
             );
             assert_eq!(
-                status, 200,
-                "the repository the failed stack DID create must exist, got {status} {body}"
+                (status, error_code(&body).as_str()),
+                (400, "RepositoryNotFoundException"),
+                "the repository the failed create had made must be removed by the \
+                 rollback, got {status} {body}"
             );
 
-            // Deleting that failed stack deletes the one resource it managed to create,
-            // and leaves the repository it never created alone.
+            // Deleting that rolled-back stack has nothing left of its own to delete, and
+            // leaves the repository it never created alone.
             let (_, described) = cloudformation(
                 &router,
                 &runtime,
@@ -603,7 +605,8 @@ fn a_stack_whose_repository_cannot_be_created_fails_and_says_which_one() {
             assert_eq!(
                 (status, error_code(&body).as_str()),
                 (400, "RepositoryNotFoundException"),
-                "expected the failed stack's own repository to go with it, got {status} {body}"
+                "expected the rolled-back stack's own repository to stay gone, got \
+                 {status} {body}"
             );
             let (status, body) = ecr_public(
                 &router,
