@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The page-size window every MemoryDB listing serves, and how an identifier refusal
+//! names what it rejected — end to end over the wire.
+//!
+//! Every case drives the SAME path a client does: an `awsJson1_1` `POST /` with
+//! `X-Amz-Target: AmazonMemoryDB.<Operation>` through the multi-service router (the
+//! shared harness in `cluster_lifecycle`), so what is asserted is the emulator's HTTP
+//! behaviour and not a handler called directly.
+//!
+//! The rules under test, each over a SET of inputs rather than one recorded request:
+//!
+//! * a paginated listing serves a `MaxResults` inside the service's page-size window and
+//!   refuses one outside it with the modelled `InvalidParameterValueException` naming
+//!   both bounds — the SAME window on every paginated listing the service implements,
+//!   exercised at each bound, one past each bound and further out, each listing naming
+//!   its page size in the noun its own refusal uses;
+//! * an accepted page size really bounds the page: a listing whose set is larger than
+//!   the page hands out a full page and a token, and the pages concatenate to the whole
+//!   set;
+//! * a name that is not a well-formed identifier is refused with the sentence the
+//!   service words that kind of refusal in: a parameter group's is built from the REQUEST
+//!   MEMBER the name arrived in, every other kind's from the service's own label for that
+//!   identifier.
+
+use serde_json::{json, Value};
+
+use crate::cluster_lifecycle::{call, error_code, ok, router};
+
+/// The page-size window every MemoryDB listing serves, mirrored from
+/// `crate::state::MIN_MAX_RESULTS` / `MAX_MAX_RESULTS`: a page size inside it is served,
+/// one outside it is refused. Spelled out HERE rather than taken from the crate under
+/// test, so the assertions below are independent of the code that enforces the window.
+const WINDOW_MIN: i32 = 20;
+const WINDOW_MAX: i32 = 100;
+
+/// What the service answers a page size outside the window with — the rule itself,
+/// naming both bounds. The BOUND is one rule for every listing; the noun is how that
+/// listing names its page size (mirrored from `crate::state::PageSizeNoun`).
+fn window_message(noun: &str) -> String {
+    format!("Invalid value for {noun}. Must be between {WINDOW_MIN} and {WINDOW_MAX}")
+}
+
+/// The clauses of the identifier rule, which every spelling refusal ends with.
+const IDENTIFIER_CLAUSES: &str = "must begin with a letter; must contain only ASCII \
+                                  letters, digits, and hyphens; and must not end with a \
+                                  hyphen or contain two consecutive hyphens.";
+
+/// A parameter group family the engine catalog publishes.
+const FAMILY: &str = "memorydb_valkey7";
+
+/// A password that breaks none of the documented password rules.
+const PASSWORD: &str = "Sim2realPassword-1";
+
+/// The `message` of a failure body, under either spelling of the member.
+fn message(body: &Value, case: &str) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a message in {body}"))
+        .to_string()
+}
+
+/// The items one page of `listing` reported, under the member that listing answers them
+/// in.
+fn page_items(body: &Value, items: &str, case: &str) -> Vec<Value> {
+    body.get(items)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected {items} in {body}"))
+        .clone()
+}
+
+/// Every paginated listing this service implements, with the member it answers its items
+/// in, the noun its own refusal names the page size with, and the rest of the request it
+/// needs (`DescribeParameters` names the group it lists for).
+fn listings(group: &str) -> Vec<(&'static str, &'static str, &'static str, Value)> {
+    vec![
+        ("DescribeUsers", "Users", "max records", json!({})),
+        ("DescribeACLs", "ACLs", "max records", json!({})),
+        ("DescribeClusters", "Clusters", "max records", json!({})),
+        (
+            "DescribeParameterGroups",
+            "ParameterGroups",
+            "max results",
+            json!({}),
+        ),
+        (
+            "DescribeEngineVersions",
+            "EngineVersions",
+            "max records",
+            json!({}),
+        ),
+        ("DescribeEvents", "Events", "max records", json!({})),
+        (
+            "DescribeParameters",
+            "Parameters",
+            "max results",
+            json!({ "ParameterGroupName": group }),
+        ),
+    ]
+}
+
+/// Set up a store every listing above has something to report from: a user, an ACL, a
+/// cluster and a parameter group.
+async fn seeded_store() -> (smithy_server_runtime::MultiServiceRouter, String) {
+    let router = router();
+    let group = "window-group".to_string();
+    ok(
+        &router,
+        "CreateUser",
+        &json!({
+            "UserName": "window-user",
+            "AccessString": "on ~* +@all",
+            "AuthenticationMode": { "Type": "password", "Passwords": [PASSWORD] },
+        }),
+        "setup",
+    )
+    .await;
+    ok(
+        &router,
+        "CreateACL",
+        &json!({ "ACLName": "window-acl", "UserNames": ["window-user"] }),
+        "setup",
+    )
+    .await;
+    ok(
+        &router,
+        "CreateCluster",
+        &json!({
+            "ClusterName": "window-cluster",
+            "NodeType": "db.t4g.small",
+            "ACLName": "window-acl",
+        }),
+        "setup",
+    )
+    .await;
+    ok(
+        &router,
+        "CreateParameterGroup",
+        &json!({ "ParameterGroupName": &group, "Family": FAMILY }),
+        "setup",
+    )
+    .await;
+    (router, group)
+}
+
+/// A page size inside the window is served by every paginated listing, and the page it
+/// answers is no longer than the size asked for.
+#[tokio::test]
+async fn a_page_size_inside_the_window_is_served_by_every_listing() {
+    let (router, group) = seeded_store().await;
+
+    // The rows span the window: each bound, one inside each bound, and the middle.
+    let accepted = [
+        WINDOW_MIN,
+        WINDOW_MIN + 1,
+        (WINDOW_MIN + WINDOW_MAX) / 2,
+        WINDOW_MAX - 1,
+        WINDOW_MAX,
+    ];
+    for (operation, items, _, base) in listings(&group) {
+        for page_size in accepted {
+            let case = format!("{operation} MaxResults={page_size}");
+            let mut request = base.clone();
+            request["MaxResults"] = json!(page_size);
+            let body = ok(&router, operation, &request, &case).await;
+            let page = page_items(&body, items, &case);
+            assert!(
+                i32::try_from(page.len()).unwrap_or(i32::MAX) <= page_size,
+                "case {case:?}: a page holds at most {page_size} items, got {}",
+                page.len()
+            );
+        }
+    }
+}
+
+/// A page size outside the window names no page: every paginated listing refuses it with
+/// the modelled invalid-value error, and the message states the window's own bounds in
+/// the noun that listing names its page size with.
+#[tokio::test]
+async fn a_page_size_outside_the_window_is_refused_with_the_window_message() {
+    let (router, group) = seeded_store().await;
+
+    // The rows span the class on both sides of the window: one past each bound, the
+    // smallest positive size, zero, a negative size, and far above the upper bound.
+    let refused = [
+        WINDOW_MIN - 1,
+        1,
+        0,
+        -1,
+        -4_096,
+        WINDOW_MAX + 1,
+        i32::from(i16::MAX),
+    ];
+    for (operation, _, noun, base) in listings(&group) {
+        for page_size in refused {
+            let case = format!("{operation} MaxResults={page_size}");
+            let mut request = base.clone();
+            request["MaxResults"] = json!(page_size);
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {case:?}: expected the modelled invalid-value refusal, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                message(&body, &case),
+                window_message(noun),
+                "case {case:?}: expected the window's own bounds, got {body}"
+            );
+        }
+    }
+}
+
+/// An accepted page size is APPLIED, not merely tolerated: a listing whose set is larger
+/// than the page hands out exactly that many items plus a token, and the pages
+/// concatenate to the unpaged listing with nothing repeated or dropped.
+#[tokio::test]
+async fn an_accepted_page_size_bounds_the_page() {
+    let (router, group) = seeded_store().await;
+    let case = "parameters paged at the smallest served size";
+    let whole: Vec<Value> = page_items(
+        &ok(
+            &router,
+            "DescribeParameters",
+            &json!({ "ParameterGroupName": &group }),
+            case,
+        )
+        .await,
+        "Parameters",
+        case,
+    );
+    assert!(
+        i32::try_from(whole.len()).unwrap_or(i32::MAX) > WINDOW_MIN,
+        "case {case:?}: the family must publish more parameters than the smallest page \
+         for this to page at all, got {}",
+        whole.len()
+    );
+
+    let mut walked: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0_usize;
+    loop {
+        let mut request = json!({ "ParameterGroupName": &group, "MaxResults": WINDOW_MIN });
+        if let Some(token) = token.as_deref() {
+            request["NextToken"] = json!(token);
+        }
+        let body = ok(&router, "DescribeParameters", &request, case).await;
+        let page = page_items(&body, "Parameters", case);
+        token = body
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_some() {
+            // A page that is not the last one is FULL: the size asked for bounded it.
+            assert_eq!(
+                i32::try_from(page.len()).unwrap_or(i32::MAX),
+                WINDOW_MIN,
+                "case {case:?}: a page before the last holds exactly {WINDOW_MIN} items, \
+                 got {}",
+                page.len()
+            );
+        }
+        walked.extend(page);
+        pages += 1;
+        assert!(
+            pages <= whole.len(),
+            "case {case:?}: the walk must end, got {pages} pages"
+        );
+        if token.is_none() {
+            break;
+        }
+    }
+    assert!(
+        pages > 1,
+        "case {case:?}: a set larger than the page must take several pages, got {pages}"
+    );
+    assert_eq!(
+        walked, whole,
+        "case {case:?}: the pages together must be the whole listing, in order"
+    );
+}
+
+/// A name that is not a well-formed identifier is refused with the sentence the service
+/// words that kind of refusal in — a parameter group's names the REQUEST MEMBER the name
+/// arrived in, every other kind's the service's own label for that identifier — over
+/// every form of malformed name, and a well-formed name is accepted by the same path.
+#[tokio::test]
+async fn a_malformed_identifier_is_refused_in_the_wording_for_that_kind_of_resource() {
+    let router = router();
+
+    // The rows span the spelling clause: every part of the rule, broken one at a time.
+    let names = [
+        ("beginning with a digit", "9lives"),
+        ("beginning with a hyphen", "-leading"),
+        ("holding an underscore", "under_score"),
+        ("holding a dot", "dotted.name"),
+        ("holding a space", "two words"),
+        ("ending with a hyphen", "trailing-"),
+        ("two consecutive hyphens", "double--hyphen"),
+    ];
+    // One row per create that validates a name, with the sentence that create's refusal
+    // states the rule in: the parameter-group surface names the member, the RBAC and
+    // cluster surfaces their own label for the identifier.
+    let creates: &[(&str, String)] = &[
+        (
+            "CreateParameterGroup",
+            format!(
+                "The parameter ParameterGroupName is not a valid identifier. Identifiers \
+                 {IDENTIFIER_CLAUSES}"
+            ),
+        ),
+        ("CreateUser", format!("User id {IDENTIFIER_CLAUSES}")),
+        ("CreateACL", format!("ACL name {IDENTIFIER_CLAUSES}")),
+        ("CreateCluster", format!("Cluster name {IDENTIFIER_CLAUSES}")),
+    ];
+
+    for (operation, wanted) in creates {
+        for (name_case, name) in names {
+            let case = format!("{operation}/{name_case}");
+            let (status, body) = call(&router, operation, &create_body(operation, name)).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {case:?}: expected the modelled invalid-value refusal, got {status} \
+                 with {body}"
+            );
+            assert_eq!(
+                &message(&body, &case),
+                wanted,
+                "case {case:?}: expected the refusal this kind of resource is worded \
+                 with, got {body}"
+            );
+        }
+        // The same path accepts a name the rule admits, so the refusals above are the
+        // rule and not a blanket one.
+        let case = format!("{operation}/well formed");
+        ok(
+            &router,
+            operation,
+            &create_body(operation, "well-formed-1"),
+            &case,
+        )
+        .await;
+    }
+}
+
+/// The create request each name-taking operation carries `name` in. `CreateCluster` is
+/// built on the `open-access` ACL every account already has, so the only value under
+/// test is the name.
+fn create_body(operation: &str, name: &str) -> Value {
+    match operation {
+        "CreateUser" => json!({
+            "UserName": name,
+            "AccessString": "on ~* +@all",
+            "AuthenticationMode": { "Type": "password", "Passwords": [PASSWORD] },
+        }),
+        "CreateACL" => json!({ "ACLName": name }),
+        "CreateParameterGroup" => json!({ "ParameterGroupName": name, "Family": FAMILY }),
+        "CreateCluster" => json!({
+            "ClusterName": name,
+            "NodeType": "db.t4g.small",
+            "ACLName": "open-access",
+        }),
+        other => panic!("case {other:?}: not a name-taking create"),
+    }
+}
