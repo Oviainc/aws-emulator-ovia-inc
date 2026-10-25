@@ -284,7 +284,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(portfolio) = store.region_mut(&region) {
             portfolio.settle_all(now);
         }
-        let Some(server) = store.region(&region).servers.get(&input.server_id) else {
+        let portfolio = store.region(&region);
+        let Some(server) = portfolio.servers.get(&input.server_id) else {
             return Err(
                 GetServerDetailsErrorModeled::ResourceNotFoundException(server_not_found()).into(),
             );
@@ -315,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetServerDetailsOutput {
             // The detail is the server itself, so every page of its applications reports
             // it: the caller asked for the server, not for one page of it.
-            server_detail: Some(server.to_server_detail()),
+            server_detail: Some(server.to_server_detail(&portfolio.application_components)),
             associated_applications: Some(associated_applications),
             next_token,
         })

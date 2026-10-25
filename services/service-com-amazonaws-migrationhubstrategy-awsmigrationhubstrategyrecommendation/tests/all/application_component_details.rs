@@ -188,6 +188,10 @@ fn component(row: usize) -> ApplicationComponentRecord {
         strategy: has_recommendation.then(|| STRATEGIES[row % STRATEGIES.len()].to_string()),
         target_destination: has_recommendation
             .then(|| TARGET_DESTINATIONS[row % TARGET_DESTINATIONS.len()].to_string()),
+        // The tool a recommendation names is the subject of `assessment_analysis.rs`,
+        // where an assessment's own analysis picks it; these rows seed none, so the
+        // detail reports a recommendation without one.
+        transformation_tool: None,
         os_version: (!row.is_multiple_of(3)).then(|| format!("Ubuntu 20.0{}", row % 10)),
         os_driver: (!row.is_multiple_of(3)).then(|| format!("driver-{row}")),
         last_analyzed: row.is_multiple_of(2).then(|| analyzed_at(row)),
@@ -398,8 +402,8 @@ fn detail_members(record: &ApplicationComponentRecord) -> Vec<(String, Value)> {
             format!("{prefix}/recommendationSet/targetDestination"),
             string_or_null(&record.target_destination),
         ),
-        // Nothing in this emulator picks a transformation tool, generates an anti-pattern
-        // report or analyses source code, so none of these is ever reported.
+        // These rows seed no transformation tool, and nothing here generates an
+        // anti-pattern report or analyses source code, so none of these is reported.
         (
             format!("{prefix}/recommendationSet/transformationTool"),
             Value::Null,

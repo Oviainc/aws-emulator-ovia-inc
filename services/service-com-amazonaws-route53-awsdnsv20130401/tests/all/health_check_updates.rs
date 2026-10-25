@@ -42,7 +42,14 @@ const INVALID_INPUT: &str = "InvalidInput";
 
 /// Send one `UpdateHealthCheck` request, with `members` as the body of the
 /// request.
-async fn update_health_check(router: &MultiServiceRouter, id: &str, members: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite drives the update through the SAME request
+/// rather than growing a second copy of it.
+pub(crate) async fn update_health_check(
+    router: &MultiServiceRouter,
+    id: &str,
+    members: &str,
+) -> Reply {
     call(
         router,
         "POST",
@@ -89,7 +96,10 @@ fn assert_reports(reply: &Reply, case: &str, pairs: &[(String, String)]) {
 }
 
 /// The `HealthCheckVersion` a reply carrying a `HealthCheck` reports.
-fn reported_version(reply: &Reply, case: &str) -> i64 {
+///
+/// `pub(crate)` so a sibling suite reads the counter out of a reply the same
+/// way.
+pub(crate) fn reported_version(reply: &Reply, case: &str) -> i64 {
     let reported = reply.first("HealthCheck/HealthCheckVersion").unwrap_or_else(|| {
         panic!(
             "case {case:?}: the reply must carry HealthCheck/HealthCheckVersion; body {}",

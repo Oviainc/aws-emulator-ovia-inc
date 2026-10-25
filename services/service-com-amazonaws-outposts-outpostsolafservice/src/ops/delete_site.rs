@@ -2,10 +2,10 @@
 
 //! @op DeleteSite
 //! IMPLEMENTED: removes the stored site the `SiteId` names, so every later call observes
-//! it gone. A site an Outpost still belongs to is refused with `ConflictException`
-//! (409), whose `ResourceId` / `ResourceType` name that Outpost — the request is well
-//! formed and it is the resource's dependents that hold the delete back; an absent id
-//! is `NotFoundException` (404).
+//! it gone. A site an Outpost still belongs to is refused with `ValidationException`
+//! (400), worded by [`crate::state::site_has_outposts_report`] — the refusal names the
+//! site the caller asked to delete and nothing else; an absent id is
+//! `NotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -169,28 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // An Outpost names the site it lives at, so removing a site that still has
         // one would leave that Outpost pointing at nothing: the service refuses the
-        // request. Every parameter of that request is valid — what blocks it is a
-        // resource that still depends on the one being deleted — so the refusal is
-        // the modelled `ConflictException` (409), carrying the `ResourceId` /
-        // `ResourceType` the model puts on it to name the dependent the caller has
-        // to clear first. Nothing is written: the site is left exactly as it was.
-        //
-        // What holds the delete back is the PRESENCE of such a record, read before
-        // the mutable borrow below; the dependent's id is only what the refusal
-        // names it by, so a record this store somehow held without one still
-        // refuses rather than letting the delete through.
-        let blocking = store
-            .outpost_at_site(&region, &site_id)
-            .map(|record| record.outpost.outpost_id.clone());
-        if let Some(outpost_id) = blocking {
-            return Err(DeleteSiteErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::site_dependents_conflict(
-                        &site_id,
-                        outpost_id.as_deref(),
-                    )),
-                    resource_id: outpost_id,
-                    resource_type: Some(crate::state::RESOURCE_TYPE_OUTPOST.to_string()),
+        // request with the `ValidationException` (400) it models, worded by
+        // `crate::state::site_has_outposts_report`. What holds the delete back is
+        // the PRESENCE of such a record and nothing else — no dependent is named,
+        // so a record this store somehow held without an id still refuses rather
+        // than letting the delete through. Nothing is written: the site is left
+        // exactly as it was.
+        if store.outpost_at_site(&region, &site_id).is_some() {
+            return Err(DeleteSiteErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::site_has_outposts_report(&site_id)),
                 },
             )
             .into());

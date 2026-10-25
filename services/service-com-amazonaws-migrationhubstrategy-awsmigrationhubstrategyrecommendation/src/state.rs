@@ -25,6 +25,12 @@
 //! data that fetch brought with it ([`ServerDiscovery`]), which is what
 //! `ListAnalyzableServers` reports.
 //!
+//! The recommendation a server or an application component holds is what an ASSESSMENT
+//! produced: an assessment that reaches `COMPLETE` has analysed the portfolio it covered,
+//! so at that instant every resource it covered is given the recommendation the account's
+//! saved preferences select for it and the instant it was analysed
+//! ([`RegionState::analyze_portfolio`], and [`analysis`] for what the preferences select).
+//!
 //! Beside the servers sit the **data collectors** installed in the account's environment
 //! ([`CollectorRecord`]), which `ListCollectors` reports a page at a time: each one is
 //! reported exactly as its registration recorded it, so that read derives nothing from the
@@ -50,7 +56,8 @@
 //!
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
-//! `GetPortfolioPreferences` reports, member for member.
+//! `GetPortfolioPreferences` reports, member for member — and what the analysis of the
+//! portfolio is computed from, so they are read as well as written.
 //!
 //! Last, the account's **recommendation report generation tasks**
 //! ([`RecommendationReport`]): what `StartRecommendationReportGeneration` mints — one at
@@ -69,13 +76,18 @@ use crate::ops::types::{
     DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
-    StrategyOption, SystemInfo, TransformationTool, ValidationException, GROUP_NAME_VALUES,
+    StrategyOption, StrategySummary, SystemInfo, TransformationTool, ValidationException,
+    GROUP_NAME_VALUES,
 };
 
 /// The Region partitioning of this store: the per-service state struct itself, the Region
 /// a request is served in, and the ceiling on how many Regions the store keeps a
 /// portfolio for.
 pub mod regions;
+
+/// What the analysis of a portfolio produces, computed from the account's saved
+/// preferences and the resources' own stored members.
+pub mod analysis;
 
 pub use regions::{
     request_region, ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState,
@@ -578,15 +590,14 @@ impl Assessment {
     /// Materialise the completion the clock owes this assessment, if `now` is past its
     /// due instant: every server still in progress has finished collecting by then.
     ///
-    /// Answers whether THIS call materialised it, which is what tells its caller the
-    /// servers the assessment covers have to be moved off their collecting status too
-    /// ([`RegionState::finish_server_collection`]).
-    pub fn settle(&mut self, now: SystemTime) -> bool {
-        let Some(due) = self.completion_due else {
-            return false;
-        };
+    /// Answers the instant THIS call materialised the completion at, which is what tells
+    /// its caller the assessment's terminal status has to be materialised on the
+    /// portfolio it covered as well ([`RegionState::finish_assessment`]) — and `None` for
+    /// an assessment this call changed nothing about.
+    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
+        let due = self.completion_due?;
         if now < due {
-            return false;
+            return None;
         }
         self.status = ASSESSMENT_COMPLETE.to_string();
         self.completion_time = Some(due);
@@ -597,7 +608,7 @@ impl Assessment {
             "Data collection completed for {} of {} servers.",
             self.success, self.servers
         ));
-        true
+        Some(due)
     }
 
     /// True once this assessment reached a terminal `AssessmentStatus` — nothing is
@@ -778,22 +789,90 @@ pub const ANALYSIS_CONFIGURED: &str = "CONFIGURED";
 /// analysis up and no result, success or failure is ever reported for work nothing ran.
 pub const ANALYSIS_TO_BE_SCHEDULED: &str = "ANALYSIS_TO_BE_SCHEDULED";
 
-/// The `RecommendationSet` a stored strategy and destination amount to, or `None` when
-/// neither is held.
+/// The `RecommendationSet` a stored strategy, destination and transformation tool amount
+/// to, or `None` when none of the three is held.
 ///
-/// A recommendation of this emulator is a strategy and/or a destination and carries no
-/// transformation tool, because nothing here picks one. Both the server inventory and the
-/// application components hold those two members, so both report their recommendation
-/// through this one function.
+/// The three are what an analysis stored on the resource ([`analysis::Recommendation`]) —
+/// the tool being named by its name alone, with no description and no installation link,
+/// because what the analysis picked is a catalog entry rather than a catalog. Both the
+/// server inventory and the application components hold those three members, so both
+/// report their recommendation through this one function.
 fn recommendation_of(
     strategy: &Option<String>,
     target_destination: &Option<String>,
+    transformation_tool: &Option<String>,
 ) -> Option<RecommendationSet> {
-    (strategy.is_some() || target_destination.is_some()).then(|| RecommendationSet {
-        transformation_tool: None,
-        target_destination: target_destination.clone(),
-        strategy: strategy.clone(),
-    })
+    (strategy.is_some() || target_destination.is_some() || transformation_tool.is_some()).then(
+        || RecommendationSet {
+            transformation_tool: transformation_tool.clone().map(|name| TransformationTool {
+                name: Some(name),
+                description: None,
+                tranformation_tool_installation_link: None,
+            }),
+            target_destination: target_destination.clone(),
+            strategy: strategy.clone(),
+        },
+    )
+}
+
+/// The `StrategySummary` list a server reports for the application components running on
+/// it — `ServerDetail$applicationComponentStrategySummary`, "a list of strategy
+/// summaries", whose `count` is "the count of recommendations per strategy".
+///
+/// It is counted off the component records themselves, grouped by the strategy the
+/// analysis recommended for each one, so the summary and the components cannot disagree. A
+/// component the analysis recommended nothing for counts towards no strategy, and one kept
+/// out of the assessment counts towards nothing at all: `inclusionStatus` "indicates
+/// whether the application component has been included for server recommendation or not".
+/// The groups come out in the strategies' own order, and a server nothing runs on gets an
+/// EMPTY list, which its read reports as no summary at all.
+fn component_strategy_summary(
+    server_id: &str,
+    components: &BTreeMap<String, ApplicationComponentRecord>,
+) -> Vec<StrategySummary> {
+    let mut counted: BTreeMap<&str, i32> = BTreeMap::new();
+    for component in components.values() {
+        if !component.recommended_for_server(server_id) {
+            continue;
+        }
+        if let Some(strategy) = component.strategy.as_deref() {
+            *counted.entry(strategy).or_default() += 1;
+        }
+    }
+    counted
+        .into_iter()
+        .map(|(strategy, count)| StrategySummary {
+            strategy: Some(strategy.to_string()),
+            count: Some(count),
+        })
+        .collect()
+}
+
+/// How many application components running on the server `server_id` the analysis
+/// recommended `strategy` for — `ServerStrategy$numberOfApplicationComponents`, "the
+/// number of application components with this strategy recommendation running on the
+/// server".
+///
+/// Counted off the same records as [`component_strategy_summary`], so one number is the
+/// other's entry: a strategy none of the server's components carries counts zero. A server
+/// this service holds no component for has nothing to count, so the member is reported as
+/// absent rather than as a zero no component stands behind; so is a listing that names no
+/// strategy at all, which is not a strategy recommendation to count components for.
+fn components_with_strategy(
+    server_id: &str,
+    strategy: Option<&str>,
+    components: &BTreeMap<String, ApplicationComponentRecord>,
+) -> Option<i32> {
+    let strategy = strategy?;
+    let mut running = components
+        .values()
+        .filter(|component| component.recommended_for_server(server_id))
+        .peekable();
+    running.peek()?;
+    let counted = running
+        .filter(|component| component.strategy.as_deref() == Some(strategy))
+        .count();
+    Some(i32::try_from(counted).unwrap_or(i32::MAX))
 }
 
 /// The `RecommendationSet` a stored preference names.
@@ -945,10 +1024,17 @@ pub struct ServerRecord {
     pub strategy: Option<String>,
     /// `RecommendationSet$targetDestination` — one of `TargetDestination`'s values.
     pub target_destination: Option<String>,
+    /// `TransformationTool$name` of the recommendation held for this server — one of
+    /// `TransformationToolName`'s values, once an analysis picked the tool that performs
+    /// the move it recommends ([`analysis::Recommendation`]). `None` where the catalog
+    /// names no tool for that move.
+    pub transformation_tool: Option<String>,
     /// `ServerError$serverErrorCategory` — one of `ServerErrorCategory`'s values, for a
     /// server whose analysis failed.
     pub error_category: Option<String>,
-    /// `ServerDetail$lastAnalyzedTimestamp`.
+    /// `ServerDetail$lastAnalyzedTimestamp` — "the timestamp of when the server was
+    /// assessed", which is the instant the assessment covering it reached `COMPLETE` and
+    /// the analysis above was recorded ([`RegionState::analyze_portfolio`]).
     pub last_analyzed: Option<SystemTime>,
     /// The import groups this server came in with — `StartImportFileTaskRequest$groupId`
     /// of the import that brought it in. Not a member of `ServerDetail`: it is what
@@ -985,16 +1071,20 @@ pub struct ServerRecord {
 }
 
 impl ServerRecord {
-    /// The `ServerDetail` a read reports for this server: this record's own members, and
-    /// nothing for the ones no part of this emulator produces.
+    /// The `ServerDetail` a read reports for this server: this record's own members, the
+    /// components of `components` running on it, and nothing for the ones no part of this
+    /// emulator produces.
     ///
-    /// `listAntipatternSeveritySummary`, `antipatternReport*` and
-    /// `applicationComponentStrategySummary` are left unset rather than filled with a
-    /// shape nothing computed — no anti-pattern report is generated and application
-    /// components are a resource of their own — and the nested structures are reported
-    /// only when the record holds something to put in them, so a server the import knew
-    /// nothing about does not come back as a tree of empty objects.
-    pub fn to_server_detail(&self) -> ServerDetail {
+    /// `listAntipatternSeveritySummary` and `antipatternReport*` are left unset rather
+    /// than filled with a shape nothing computed — no anti-pattern report is generated —
+    /// and the nested structures are reported only when the record holds something to put
+    /// in them, so a server the import knew nothing about does not come back as a tree of
+    /// empty objects. `applicationComponentStrategySummary` is counted off the components
+    /// themselves ([`component_strategy_summary`]).
+    pub fn to_server_detail(
+        &self,
+        components: &BTreeMap<String, ApplicationComponentRecord>,
+    ) -> ServerDetail {
         let os_info = (self.os_type.is_some() || self.os_version.is_some()).then(|| OSInfo {
             r#type: self.os_type.clone(),
             version: self.os_version.clone(),
@@ -1011,6 +1101,7 @@ impl ServerRecord {
             cpu_architecture: self.cpu_architecture.clone(),
         });
         let recommendation_set = self.analyzed_recommendation();
+        let component_strategies = component_strategy_summary(&self.id, components);
         ServerDetail {
             id: Some(self.id.clone()),
             name: self.name.clone(),
@@ -1019,7 +1110,8 @@ impl ServerRecord {
             status_message: self.status_message.clone(),
             list_antipattern_severity_summary: None,
             system_info,
-            application_component_strategy_summary: None,
+            application_component_strategy_summary: (!component_strategies.is_empty())
+                .then_some(component_strategies),
             antipattern_report_s3_object: None,
             antipattern_report_status: None,
             antipattern_report_status_message: None,
@@ -1062,29 +1154,39 @@ impl ServerRecord {
     /// The `RecommendationSet` the service's own recommendation for this server amounts
     /// to, or `None` when it holds none.
     ///
-    /// The same two members `to_server_detail` reports: a recommendation is a strategy
-    /// and/or a destination, and no transformation tool is part of it, because nothing in
-    /// this emulator picks one.
+    /// The same three members `to_server_detail` reports: the strategy, the destination
+    /// and the transformation tool the analysis recorded.
     fn analyzed_recommendation(&self) -> Option<RecommendationSet> {
-        recommendation_of(&self.strategy, &self.target_destination)
+        recommendation_of(
+            &self.strategy,
+            &self.target_destination,
+            &self.transformation_tool,
+        )
     }
 
     /// The strategies a read reports for this server — [`strategy_listings`] as
     /// `ServerStrategy`.
     ///
-    /// `numberOfApplicationComponents` is left unset: the component records this service
-    /// holds carry the servers they run on, but nothing here attributes a component to a
-    /// strategy of a server, so a count would be a number nothing computed.
-    pub fn to_server_strategies(&self) -> Vec<ServerStrategy> {
+    /// `numberOfApplicationComponents` is counted off the components of `components`
+    /// running on this server that carry the listing's own strategy
+    /// ([`components_with_strategy`]).
+    pub fn to_server_strategies(
+        &self,
+        components: &BTreeMap<String, ApplicationComponentRecord>,
+    ) -> Vec<ServerStrategy> {
         strategy_listings(
             self.analyzed_recommendation(),
             self.preferred_strategy.as_ref(),
         )
         .into_iter()
         .map(|listing| ServerStrategy {
+            number_of_application_components: components_with_strategy(
+                &self.id,
+                listing.recommendation.strategy.as_deref(),
+                components,
+            ),
             recommendation: Some(listing.recommendation),
             status: listing.status,
-            number_of_application_components: None,
             is_preferred: Some(listing.is_preferred),
         })
         .collect()
@@ -1173,11 +1275,17 @@ pub struct ApplicationComponentRecord {
     pub strategy: Option<String>,
     /// `RecommendationSet$targetDestination` — one of `TargetDestination`'s values.
     pub target_destination: Option<String>,
+    /// `TransformationTool$name` of the recommendation held for this component — one of
+    /// `TransformationToolName`'s values, once an analysis picked the tool that performs
+    /// the move it recommends ([`analysis::Recommendation`]).
+    pub transformation_tool: Option<String>,
     /// `ApplicationComponentDetail$osVersion`.
     pub os_version: Option<String>,
     /// `ApplicationComponentDetail$osDriver`.
     pub os_driver: Option<String>,
-    /// `ApplicationComponentDetail$lastAnalyzedTimestamp`.
+    /// `ApplicationComponentDetail$lastAnalyzedTimestamp` — the instant the assessment
+    /// covering this component reached `COMPLETE` and the analysis above was recorded
+    /// ([`RegionState::analyze_portfolio`]).
     pub last_analyzed: Option<SystemTime>,
     /// `DatabaseConfigDetail$secretName` — the Secrets Manager secret the component's
     /// database is reached with, for a component that has one.
@@ -1292,10 +1400,26 @@ impl ApplicationComponentRecord {
     }
 
     /// The `RecommendationSet` the service's own recommendation for this component amounts
-    /// to, or `None` when it holds none — the same two members [`Self::to_detail`]
+    /// to, or `None` when it holds none — the same three members [`Self::to_detail`]
     /// reports.
     fn analyzed_recommendation(&self) -> Option<RecommendationSet> {
-        recommendation_of(&self.strategy, &self.target_destination)
+        recommendation_of(
+            &self.strategy,
+            &self.target_destination,
+            &self.transformation_tool,
+        )
+    }
+
+    /// Whether this component counts towards the recommendation reported for the server
+    /// `server_id`: it runs on that server, and `inclusionStatus` — "indicates whether the
+    /// application component has been included for server recommendation or not" — does
+    /// not keep it out.
+    fn recommended_for_server(&self, server_id: &str) -> bool {
+        self.inclusion_status.as_deref() != Some(analysis::EXCLUDE_FROM_ASSESSMENT)
+            && self
+                .associated_server_ids
+                .iter()
+                .any(|held| held == server_id)
     }
 
     /// The strategies a read reports for this component — [`strategy_listings`] as
@@ -1510,11 +1634,11 @@ impl RegionState {
     }
 
     /// The assessment `id` names, with any completion the clock owes it already
-    /// materialised — on the assessment AND on the servers it covers.
+    /// materialised — on the assessment AND on the portfolio it covered.
     pub fn settled_assessment_mut(&mut self, id: &str, now: SystemTime) -> Option<&mut Assessment> {
         let completed = self.assessments.get_mut(id)?.settle(now);
-        if completed {
-            self.finish_server_collection(COLLECTION_SUCCESS);
+        if let Some(at) = completed {
+            self.finish_assessment(at);
         }
         self.assessments.get_mut(id)
     }
@@ -1561,6 +1685,53 @@ impl RegionState {
             {
                 server.data_collection_status = Some(status.to_string());
             }
+        }
+    }
+
+    /// Materialise on the PORTFOLIO what an assessment reaching `COMPLETE` at `at` owes
+    /// it: every server that was still collecting has finished, and the analysis that
+    /// completion stands for is recorded on every resource the assessment covered.
+    ///
+    /// One site for both, so no caller can materialise the terminal status of an
+    /// assessment without the analysis output that status means the service produced.
+    pub fn finish_assessment(&mut self, at: SystemTime) {
+        self.finish_server_collection(COLLECTION_SUCCESS);
+        self.analyze_portfolio(at);
+    }
+
+    /// Record the analysis a completed assessment produced, on every resource of this
+    /// portfolio.
+    ///
+    /// `StartAssessment` "starts the assessment of an on-premises environment", so an
+    /// assessment that reached `COMPLETE` has analysed that environment: each server and
+    /// each application component the assessment covered carries from here on the
+    /// recommendation the account's saved preferences select for it
+    /// ([`analysis::server_recommendation`], [`analysis::component_recommendation`]) and
+    /// the instant it was analysed — `at`, the instant the assessment completed, so the
+    /// same analysis is reported however late it is first read.
+    ///
+    /// A component the analysis does not cover (one kept out of the assessment, or one
+    /// outside the `applicationMode` the preferences name) is left exactly as it was,
+    /// rather than being given a recommendation nothing computed for it.
+    pub fn analyze_portfolio(&mut self, at: SystemTime) {
+        let preferences = self.portfolio_preferences.clone();
+        for server in self.servers.values_mut() {
+            let recommendation = analysis::server_recommendation(preferences.as_ref(), server);
+            server.strategy = recommendation.strategy;
+            server.target_destination = recommendation.target_destination;
+            server.transformation_tool = recommendation.transformation_tool;
+            server.last_analyzed = Some(at);
+        }
+        for component in self.application_components.values_mut() {
+            let Some(recommendation) =
+                analysis::component_recommendation(preferences.as_ref(), component)
+            else {
+                continue;
+            };
+            component.strategy = recommendation.strategy;
+            component.target_destination = recommendation.target_destination;
+            component.transformation_tool = recommendation.transformation_tool;
+            component.last_analyzed = Some(at);
         }
     }
 
@@ -1665,18 +1836,31 @@ impl RegionState {
     }
 
     /// Materialise every completion the clock owes, for a caller about to read across
-    /// all of the records — including the per-server face of an assessment the clock just
-    /// completed.
+    /// all of the records — including what the completion of an assessment owes the
+    /// portfolio it covered ([`Self::finish_assessment`]).
+    ///
+    /// An assessment's analysis is PORTFOLIO-wide by construction: the analysis a
+    /// completion stands for is the one the whole portfolio then holds, so several
+    /// assessments coming due at once produce one analysis, recorded at the latest of
+    /// their completion instants, rather than one per assessment. Narrowing an assessment
+    /// to the resources its `assessmentTargets` select is filed separately (the
+    /// `StartAssessment` parameter-ignored issue); that work is what turns this one
+    /// analysis per sweep into one per assessment, and it does not change that the
+    /// completion is what records the analysis.
     pub fn settle_all(&mut self, now: SystemTime) {
         for task in self.import_tasks.values_mut() {
             task.settle(now);
         }
-        let mut completed = false;
+        let mut completed: Option<SystemTime> = None;
         for assessment in self.assessments.values_mut() {
-            completed |= assessment.settle(now);
+            if let Some(at) = assessment.settle(now) {
+                // Several assessments can come due at once; the LATEST completion is the
+                // analysis the portfolio holds, because it is the one that ran last.
+                completed = Some(completed.map_or(at, |held: SystemTime| held.max(at)));
+            }
         }
-        if completed {
-            self.finish_server_collection(COLLECTION_SUCCESS);
+        if let Some(at) = completed {
+            self.finish_assessment(at);
         }
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);
