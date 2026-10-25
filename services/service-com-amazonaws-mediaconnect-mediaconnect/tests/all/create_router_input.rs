@@ -28,7 +28,7 @@ use crate::router_input_restart::{
 };
 use crate::router_network_interfaces::{create_network_interface, public_configuration};
 use crate::router_output_lifecycle::delete_router_output;
-use crate::router_outputs::{create_router_output, standard};
+use crate::router_outputs::{create_router_output, minted_network_interface, standard};
 use crate::update_flow_output::without_keys;
 
 /// Send one DeleteRouterInput request (`DELETE /v1/routerInput/{Arn}`).
@@ -409,10 +409,11 @@ async fn a_replayed_client_token_answers_the_sibling_router_resources_as_of_the_
     const INTERFACE_TOKEN: &str = "rni-replayed-token";
 
     let emulator = Emulator::new();
+    let output_interface = minted_network_interface(&emulator, "rni-ri-replayed").await;
 
     let output_body = json!({
         "name": "ro-replayed",
-        "configuration": standard(json!({
+        "configuration": standard(&output_interface, json!({
             "Rtp": { "destinationAddress": "198.51.100.20", "destinationPort": 5020 }
         })),
         "maximumBitrate": 20_000_000i64,

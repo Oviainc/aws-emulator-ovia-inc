@@ -407,17 +407,25 @@ async fn an_update_is_permitted_only_from_the_states_the_service_names() {
 async fn a_deleted_connection_converges_to_a_terminal_state_promptly() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
+    // An attach point is a Direct Connect gateway of the account, so the gateways every
+    // row below attaches to are created through that service first.
+    emulator
+        .ready_gateways(&[
+            ("ic-delete-lifecycle-a", None),
+            ("ic-delete-lifecycle-b", Some(64_512)),
+        ])
+        .await;
 
     // Rows differ in the environment (and so in the provider kind, the location and
     // the `ConnectionId` prefix), in the bandwidth the connection is created with, and
-    // in the attach point it is created on — one of the Environment's own listed attach
+    // in the attach point it is created on — one of the account's own listed attach
     // points, so the delete path is exercised on a connection a client could have made.
     for environment in creatable_environments(&catalog) {
         let environment_id = text(&environment, "environmentId");
         let attach_points = emulator.attach_points(&environment_id).await;
         assert!(
             !attach_points.is_empty(),
-            "case {environment_id:?}: expected the environment to offer an attach point, got {attach_points:?}"
+            "case {environment_id:?}: expected the account's gateways to be listed as attach points, got {attach_points:?}"
         );
         for (index, bandwidth) in available_bandwidths(&environment).iter().enumerate() {
             let attach_point = text(&attach_points[index % attach_points.len()], "identifier");
