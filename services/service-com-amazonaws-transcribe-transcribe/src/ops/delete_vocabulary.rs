@@ -2,8 +2,8 @@
 
 //! @op DeleteVocabulary
 //! Deletes a stored custom vocabulary, refusing one that is still being processed and
-//! answering the same empty success for a name this account holds no vocabulary under
-//! (see [`DeleteVocabulary::handle`]).
+//! refusing a name this account holds no vocabulary under (see
+//! [`DeleteVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -220,20 +220,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "custom vocabulary deleted"
                 );
             }
-            // A DELETE IS IDEMPOTENT: a name this account holds no vocabulary under
-            // leaves nothing to do, and the recorded wire response for such a request
-            // is this operation's ordinary empty success, not a failure — absence is
-            // the state the caller asked for. This is why the delete path does NOT take
-            // the service's absent-resource branch (`crate::state::not_found_message`
-            // over `BadRequestException`, which every READING operation here answers):
-            // a teardown that runs twice, or one that follows a create that never took,
-            // succeeds both times instead of leaking a failure.
+            // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
+            // `BadRequestException` sentence covers it — "This can occur when the
+            // entity you're trying to delete doesn't exist OR if it's in a non-terminal
+            // state" — so a name this account holds no vocabulary under is refused with
+            // this service's own absent-resource text
+            // (`crate::state::not_found_message`), exactly as every reader of the
+            // family answers it, and nothing is stored or removed.
             None => {
                 ::tracing::info!(
                     operation = "DeleteVocabulary",
                     vocabulary = %input.vocabulary_name,
-                    "no custom vocabulary of that name; the delete is already satisfied"
+                    "no custom vocabulary of that name; the delete is refused"
                 );
+                return Err(DeleteVocabularyErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_VOCABULARY,
+                        )),
+                    },
+                )
+                .into());
             }
         }
 

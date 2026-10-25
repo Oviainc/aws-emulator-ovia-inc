@@ -172,10 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no category under is REFUSED, not answered as an already-satisfied
             // delete. That is also the shape and wording this service's recorded
             // absent-category responses carry (`crate::state::not_found_message`), and
-            // it is why this path does not take the idempotent-success branch
-            // `DeleteVocabulary` takes: there the recorded wire response for an absent
-            // custom vocabulary IS the ordinary empty success, and a recording outranks
-            // the family resemblance.
+            // it is the answer every delete of this service gives for an entity that is
+            // not there.
+            ::tracing::info!(
+                operation = "DeleteCallAnalyticsCategory",
+                category = %input.category_name,
+                "no Call Analytics category of that name; the delete is refused"
+            );
             return Err(DeleteCallAnalyticsCategoryErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::not_found_message(
