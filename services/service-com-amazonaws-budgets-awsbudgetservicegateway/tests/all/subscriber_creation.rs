@@ -39,7 +39,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine, same};
 
 /// The subscriber every seeded notification starts with: `Subscribers` is
 /// `@length(min: 1)`, so a notification cannot be created without one, and every table
@@ -280,7 +280,7 @@ fn persistence_rows() -> Vec<Row> {
 #[tokio::test]
 async fn a_created_subscriber_is_persisted_on_its_notification() {
     let (router, engine) = router_with_engine();
-    let account_id = account(911_111_111);
+    let account_id = caller_account();
     let catalog = notification_catalog();
 
     for (row_index, row) in persistence_rows().into_iter().enumerate() {
@@ -355,7 +355,7 @@ async fn a_created_subscriber_is_persisted_on_its_notification() {
 #[tokio::test]
 async fn a_subscriber_is_identified_by_its_type_and_its_address() {
     let (router, engine) = router_with_engine();
-    let account_id = account(922_222_222);
+    let account_id = caller_account();
     let notification = json!({
         "NotificationType": "ACTUAL",
         "ComparisonOperator": "GREATER_THAN",
@@ -442,7 +442,7 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
 }
 
 /// RULE 3: the subscriber is reached only through a notification of a budget the account
-/// holds — a budget `(AccountId, BudgetName)` does not name, or a notification the budget
+/// holds — a name the account holds no budget under, or a notification the budget
 /// does not alert on, is refused with `NotFoundException` and stores nothing — while the
 /// service-owned `NotificationState` is not part of what names the notification, so any
 /// value for it (or none) still reaches the stored one. A `BudgetName` outside its
@@ -450,15 +450,14 @@ async fn a_subscriber_is_identified_by_its_type_and_its_address() {
 #[tokio::test]
 async fn a_subscriber_is_reached_only_through_a_notification_of_an_existing_budget() {
     let (router, engine) = router_with_engine();
-    let owner = account(933_333_333);
-    let other = account(944_444_444);
+    let owner = caller_account();
     let notification = json!({
         "NotificationType": "ACTUAL",
         "ComparisonOperator": "GREATER_THAN",
         "Threshold": 80.0,
         "ThresholdType": "PERCENTAGE"
     });
-    let budget_name = "shared-name";
+    let budget_name = "stored-name";
     seed(
         &router,
         &owner,
@@ -468,19 +467,15 @@ async fn a_subscriber_is_reached_only_through_a_notification_of_an_existing_budg
     .await;
     let subscriber = json!({"SubscriptionType": "EMAIL", "Address": "reached@example.com"});
 
-    // The budget side: a name the account does not hold, and another account's budget of
-    // the same name.
-    for (case, account_id, named_budget) in [
-        ("a budget the account does not hold", &owner, "absent"),
-        (
-            "another account's budget of the same name",
-            &other,
-            budget_name,
-        ),
+    // The budget side: a name the account holds nothing under, and a stored name whose
+    // case does not match.
+    for (case, named_budget) in [
+        ("a name the account holds no budget under", "absent"),
+        ("the stored name in another case", "STORED-NAME"),
     ] {
         let (status, body) = create_subscriber(
             &router,
-            account_id,
+            &owner,
             named_budget,
             &notification,
             &subscriber,
@@ -604,7 +599,7 @@ async fn a_subscriber_is_reached_only_through_a_notification_of_an_existing_budg
 #[tokio::test]
 async fn growing_a_notification_one_subscriber_at_a_time_honours_the_per_type_limits() {
     let (router, engine) = router_with_engine();
-    let account_id = account(955_555_555);
+    let account_id = caller_account();
     let notification = json!({
         "NotificationType": "FORECASTED",
         "ComparisonOperator": "LESS_THAN",

@@ -39,7 +39,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// An `ExecutionRoleArn` satisfying `RoleArn`'s modelled `@pattern` and `@length(32, 618)`
 /// (`smithy_query(query="shape",shape="RoleArn")`).
@@ -405,7 +405,7 @@ fn merged(left: &Value, patch: &Value) -> Value {
 #[tokio::test]
 async fn creating_an_action_records_one_create_action_event() {
     let router = router();
-    let account_id = account(100_000_001);
+    let account_id = caller_account();
     for row in action_catalog() {
         let budget_name = format!("budget-{}", row.case.replace('/', "-"));
         create_budget(&router, &account_id, &budget_name).await;
@@ -480,7 +480,7 @@ async fn creating_an_action_records_one_create_action_event() {
 #[tokio::test]
 async fn each_update_appends_one_update_action_event() {
     let router = router();
-    let account_id = account(100_000_002);
+    let account_id = caller_account();
     let row = &action_catalog()[0];
     let budget_name = "update-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
@@ -611,7 +611,7 @@ async fn each_update_appends_one_update_action_event() {
 #[tokio::test]
 async fn executing_an_action_records_one_execute_action_event() {
     let router = router();
-    let account_id = account(100_000_012);
+    let account_id = caller_account();
     let budget_name = "execution-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -757,7 +757,7 @@ fn all_messages() -> Vec<String> {
 /// Build a router holding one budget with one action whose history is the seeded one.
 async fn seeded() -> (MultiServiceRouter, String, String, String) {
     let (router, engine) = router_with_engine();
-    let account_id = account(100_000_003);
+    let account_id = caller_account();
     let budget_name = "seeded-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -998,8 +998,7 @@ async fn a_time_period_whose_bounds_do_not_hold_together_is_refused() {
 #[tokio::test]
 async fn an_action_that_does_not_exist_is_refused() {
     let router = router();
-    let account_id = account(100_000_004);
-    let other_account = account(100_000_005);
+    let account_id = caller_account();
     let budget_name = "owned-budget".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -1021,9 +1020,9 @@ async fn an_action_that_does_not_exist_is_refused() {
             action_id.clone(),
         ),
         (
-            "another account",
-            other_account.clone(),
-            budget_name.clone(),
+            "the budget's name in another case",
+            account_id.clone(),
+            budget_name.to_uppercase(),
             action_id.clone(),
         ),
     ];
@@ -1094,7 +1093,7 @@ async fn an_action_that_does_not_exist_is_refused() {
 #[tokio::test]
 async fn a_definition_must_match_the_action_type() {
     let router = router();
-    let account_id = account(100_000_006);
+    let account_id = caller_account();
     let budget_name = "definition-rules".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let template = &action_catalog()[0];
@@ -1138,7 +1137,7 @@ async fn a_definition_must_match_the_action_type() {
 #[tokio::test]
 async fn an_update_cannot_replace_a_definition_with_another_format() {
     let router = router();
-    let account_id = account(100_000_007);
+    let account_id = caller_account();
     let catalog = action_catalog();
 
     for action_type in ACTION_TYPE_VALUES {
@@ -1188,7 +1187,7 @@ async fn an_update_cannot_replace_a_definition_with_another_format() {
 #[tokio::test]
 async fn a_budget_cannot_hold_more_actions_than_its_quota() {
     let router = router();
-    let account_id = account(100_000_008);
+    let account_id = caller_account();
     let budget_name = "action-quota".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -1226,7 +1225,7 @@ async fn a_budget_cannot_hold_more_actions_than_its_quota() {
 #[tokio::test]
 async fn reading_an_action_history_changes_nothing() {
     let router = router();
-    let account_id = account(100_000_009);
+    let account_id = caller_account();
     let budget_name = "repeated-reads".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -1265,7 +1264,7 @@ async fn reading_an_action_history_changes_nothing() {
 #[tokio::test]
 async fn an_action_history_drops_its_oldest_record_at_the_ceiling() {
     let (router, engine) = router_with_engine();
-    let account_id = account(100_000_011);
+    let account_id = caller_account();
     let budget_name = "bounded-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];
@@ -1354,7 +1353,7 @@ async fn an_action_history_drops_its_oldest_record_at_the_ceiling() {
 #[tokio::test]
 async fn a_value_outside_a_modelled_bound_is_refused() {
     let router = router();
-    let account_id = account(100_000_010);
+    let account_id = caller_account();
     let budget_name = "modelled-bounds".to_string();
     create_budget(&router, &account_id, &budget_name).await;
     let row = &action_catalog()[0];

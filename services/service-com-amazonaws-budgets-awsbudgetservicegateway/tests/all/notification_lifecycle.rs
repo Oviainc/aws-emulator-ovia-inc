@@ -20,7 +20,8 @@
 //!    subscriber and up to 10 email subscribers, for a total of 11" — are enforced.
 //! 5. Reading subscribers is a pure, paginated read.
 //!
-//! The harness (`router`, `call`, `is_error`, `account`) is the lifecycle suite's, so
+//! The harness (`router`, `call`, `is_error`, `caller_account`) is the lifecycle
+//! suite's, so
 //! every suite in this target drives the service exactly the same way.
 
 use serde_json::{json, Value};
@@ -38,7 +39,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION, THRESHOLD_TYPE_PERCENTAGE,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
 /// A budget that satisfies every modelled constraint and documented cross-member rule,
 /// so a notification row varies only the notification.
@@ -212,7 +213,7 @@ fn persistence_rows() -> Vec<Row> {
 #[tokio::test]
 async fn a_created_notification_and_its_subscribers_read_back() {
     let router = router();
-    let account_id = account(111_122_223_333);
+    let account_id = caller_account();
 
     for (index, row) in persistence_rows().into_iter().enumerate() {
         let Row {
@@ -315,7 +316,7 @@ async fn a_created_notification_and_its_subscribers_read_back() {
 #[tokio::test]
 async fn every_modelled_notification_combination_reads_back() {
     let router = router();
-    let account_id = account(222_233_334_444);
+    let account_id = caller_account();
 
     // The catalogs are small, and a budget holds at most ten notifications, so each
     // combination gets its own budget keyed by the combination itself.
@@ -385,7 +386,7 @@ struct Distinct {
 #[tokio::test]
 async fn what_a_notification_alerts_on_is_its_identity() {
     let router = router();
-    let account_id = account(333_344_445_555);
+    let account_id = caller_account();
     let name = "identity";
     seed_budget(&router, &account_id, name).await;
 
@@ -585,13 +586,11 @@ async fn what_a_notification_alerts_on_is_its_identity() {
 /// hold is refused with `NotFoundException` and stores nothing. The same holds for
 /// reading the subscribers of a notification that is not there.
 ///
-/// The rows differ along WHAT is missing: the budget name, the account that holds it,
-/// and the notification itself.
+/// The rows differ along WHAT is missing: the budget name, and the notification itself.
 #[tokio::test]
 async fn a_notification_needs_the_budget_that_owns_it() {
     let router = router();
-    let account_id = account(444_455_556_666);
-    let other_account = account(555_566_667_777);
+    let account_id = caller_account();
     let name = "owned";
     seed_budget(&router, &account_id, name).await;
     let present = notification("ACTUAL", "GREATER_THAN", json!(80));
@@ -621,11 +620,11 @@ async fn a_notification_needs_the_budget_that_owns_it() {
             }),
         ),
         (
-            "create for the right name under another account",
+            "create for a budget name whose case does not match the stored one",
             "CreateNotification",
             json!({
-                "AccountId": &other_account,
-                "BudgetName": name,
+                "AccountId": &account_id,
+                "BudgetName": name.to_uppercase(),
                 "Notification": &present,
                 "Subscribers": [email_subscriber(0)]
             }),
@@ -661,7 +660,7 @@ async fn a_notification_needs_the_budget_that_owns_it() {
     }
 
     // Nothing the refusals named was created: the budget still holds exactly the one
-    // notification, and the other account still holds no budget.
+    // notification, and no budget was brought into being by a refused call.
     let (_, body) = call(
         &router,
         "DescribeNotificationsForBudget",
@@ -676,13 +675,13 @@ async fn a_notification_needs_the_budget_that_owns_it() {
     let (_, body) = call(
         &router,
         "DescribeBudgets",
-        &json!({"AccountId": &other_account}),
+        &json!({"AccountId": &account_id}),
     )
     .await;
     assert_eq!(
         body["Budgets"].as_array().map(Vec::len),
-        Some(0),
-        "expected the other account to still hold no budget, got {body}"
+        Some(1),
+        "expected the account to still hold only the one seeded budget, got {body}"
     );
 }
 
@@ -692,7 +691,7 @@ async fn a_notification_needs_the_budget_that_owns_it() {
 #[tokio::test]
 async fn a_budget_holds_at_most_the_documented_number_of_notifications() {
     let router = router();
-    let account_id = account(666_677_778_888);
+    let account_id = caller_account();
     let name = "crowded";
     seed_budget(&router, &account_id, name).await;
 
@@ -763,7 +762,7 @@ async fn a_budget_holds_at_most_the_documented_number_of_notifications() {
 #[tokio::test]
 async fn a_notification_holds_at_most_the_documented_subscribers_of_each_type() {
     let router = router();
-    let account_id = account(777_788_889_999);
+    let account_id = caller_account();
     let name = "subscribed";
     seed_budget(&router, &account_id, name).await;
 
@@ -906,7 +905,7 @@ async fn a_notification_holds_at_most_the_documented_subscribers_of_each_type() 
 #[tokio::test]
 async fn reading_subscribers_pages_without_changing_anything() {
     let router = router();
-    let account_id = account(888_899_990_000);
+    let account_id = caller_account();
     let name = "paged";
     seed_budget(&router, &account_id, name).await;
 

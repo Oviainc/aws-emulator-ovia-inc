@@ -43,7 +43,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     MAX_ACTIONS_PER_BUDGET,
 };
 
-use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// A budget that satisfies every modelled constraint and documented cross-member rule,
 /// so an action row varies only the action.
@@ -460,7 +460,7 @@ fn persistence_rows() -> Vec<Row> {
 #[tokio::test]
 async fn a_created_action_round_trips_as_supplied() {
     let router = router();
-    let account_id = account(210_000_001);
+    let account_id = caller_account();
     let budget_name = "action-round-trip";
     seed_budget(&router, &account_id, budget_name).await;
 
@@ -652,7 +652,7 @@ const ALLOWED_EXECUTIONS: &[(&str, &str, &str, &str)] = &[
 #[tokio::test]
 async fn an_execution_moves_the_action_only_where_its_status_leaves_work() {
     let (router, engine) = router_with_engine();
-    let account_id = account(210_000_002);
+    let account_id = caller_account();
     let budget_name = "action-state-machine";
     seed_budget(&router, &account_id, budget_name).await;
     let action_id = seed_action(&router, &account_id, budget_name).await;
@@ -757,7 +757,7 @@ async fn an_execution_moves_the_action_only_where_its_status_leaves_work() {
 #[tokio::test]
 async fn the_clock_settles_an_execution_with_no_further_call() {
     let (router, engine) = router_with_engine();
-    let account_id = account(210_000_003);
+    let account_id = caller_account();
     let budget_name = "action-settles-on-the-clock";
     seed_budget(&router, &account_id, budget_name).await;
     let action_id = seed_action(&router, &account_id, budget_name).await;
@@ -842,19 +842,17 @@ async fn the_clock_settles_an_execution_with_no_further_call() {
     );
 }
 
-/// RULE 4: an action belongs to one budget of one account, so a request naming another
-/// budget, another account, or an id no action carries locates nothing — for the read
-/// and for the execution alike.
+/// RULE 4: an action belongs to one budget of the account, so a request naming another
+/// budget, or an id no action carries, locates nothing — for the read and for the
+/// execution alike.
 #[tokio::test]
 async fn an_action_is_scoped_to_the_budget_that_owns_it() {
     let router = router();
-    let owner = account(210_000_004);
-    let other_account = account(210_000_005);
+    let owner = caller_account();
     let budget_name = "action-scoping";
     let sibling = "action-scoping-sibling";
     seed_budget(&router, &owner, budget_name).await;
     seed_budget(&router, &owner, sibling).await;
-    seed_budget(&router, &other_account, budget_name).await;
     let action_id = seed_action(&router, &owner, budget_name).await;
 
     // A well-formed `ActionId` no action carries: the modelled pattern is satisfied, so
@@ -865,11 +863,32 @@ async fn an_action_is_scoped_to_the_budget_that_owns_it() {
         "the absent id must satisfy the modelled ActionId pattern"
     );
 
+    let uppercased = budget_name.to_uppercase();
     let rows: Vec<(&str, &str, &str, &str)> = vec![
-        ("a budget that does not exist", owner.as_str(), "no-such-budget", action_id.as_str()),
-        ("another budget of the same account", owner.as_str(), sibling, action_id.as_str()),
-        ("the same budget name under another account", other_account.as_str(), budget_name, action_id.as_str()),
-        ("an id no action carries", owner.as_str(), budget_name, absent_id),
+        (
+            "a budget that does not exist",
+            owner.as_str(),
+            "no-such-budget",
+            action_id.as_str(),
+        ),
+        (
+            "another budget of the same account",
+            owner.as_str(),
+            sibling,
+            action_id.as_str(),
+        ),
+        (
+            "the owning budget's name in another case",
+            owner.as_str(),
+            uppercased.as_str(),
+            action_id.as_str(),
+        ),
+        (
+            "an id no action carries",
+            owner.as_str(),
+            budget_name,
+            absent_id,
+        ),
     ];
 
     for (case, account_id, budget, action) in rows {
@@ -911,7 +930,7 @@ async fn an_action_is_scoped_to_the_budget_that_owns_it() {
 #[tokio::test]
 async fn an_action_definition_must_match_its_action_type() {
     let (router, engine) = router_with_engine();
-    let account_id = account(210_000_006);
+    let account_id = caller_account();
     let budget_name = "action-definition-rule";
     seed_budget(&router, &account_id, budget_name).await;
 
@@ -986,7 +1005,7 @@ async fn an_action_definition_must_match_its_action_type() {
 #[tokio::test]
 async fn a_budget_holds_a_bounded_number_of_actions_each_with_its_own_id() {
     let (router, engine) = router_with_engine();
-    let account_id = account(210_000_007);
+    let account_id = caller_account();
     let budget_name = "action-quota";
     let sibling = "action-quota-sibling";
     seed_budget(&router, &account_id, budget_name).await;
@@ -1063,7 +1082,7 @@ async fn a_budget_holds_a_bounded_number_of_actions_each_with_its_own_id() {
 #[tokio::test]
 async fn an_action_cannot_be_created_on_a_budget_that_does_not_exist() {
     let router = router();
-    let account_id = account(210_000_008);
+    let account_id = caller_account();
 
     let (http, body) = call(
         &router,

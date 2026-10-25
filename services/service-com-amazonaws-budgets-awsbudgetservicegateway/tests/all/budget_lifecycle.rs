@@ -104,9 +104,21 @@ pub(crate) fn same(left: &Value, right: &Value) -> bool {
     }
 }
 
-/// An account id: 12 digits, as `AccountId`'s `^\d{12}$` requires.
+/// An account id: 12 digits, as `AccountId`'s `^\d{12}$` requires. Used for the
+/// accounts that are NOT the caller's — the ones every operation refuses — so a suite
+/// that wants a served request uses [`caller_account`] instead.
 pub(crate) fn account(n: u64) -> String {
     format!("{n:012}")
+}
+
+/// The one account this emulator answers for (`engine::emulator_account_id`), never a
+/// literal.
+///
+/// Budgets is scoped to the calling account, so this is the only `AccountId` any
+/// operation serves: a suite that wants two isolated stores builds two
+/// [`router`]s rather than naming two accounts.
+pub(crate) fn caller_account() -> String {
+    engine::emulator_account_id().to_string()
 }
 
 /// The instant `YYYY-MM-DDThh:mm:ssZ` names, in epoch seconds — so a suite writes a
@@ -347,11 +359,13 @@ fn assert_read_back(case: &str, sent: &Value, read: &Value) {
 /// the delete and the read answer `NotFoundException`.
 #[tokio::test]
 async fn a_budget_round_trips_through_its_whole_lifecycle() {
-    let router = router();
-    for (index, row) in lifecycle_rows().into_iter().enumerate() {
+    for row in lifecycle_rows() {
         let case = row.case;
-        // One account per row, so rows cannot see each other's budgets.
-        let account_id = account(100_000_000 + index as u64);
+        // One store per row, so rows cannot see each other's budgets. (Every request
+        // names the one account the service serves, so a row cannot isolate itself by
+        // naming another.)
+        let router = router();
+        let account_id = caller_account();
         let name = row.budget["BudgetName"]
             .as_str()
             .expect("every row names its budget")
@@ -548,7 +562,7 @@ async fn a_budget_round_trips_through_its_whole_lifecycle() {
 #[tokio::test]
 async fn every_modelled_time_unit_and_budget_type_round_trips() {
     let router = router();
-    let account_id = account(222_222_222);
+    let account_id = caller_account();
     for (index, time_unit) in TIME_UNIT_VALUES.iter().enumerate() {
         for budget_type in BUDGET_TYPE_VALUES {
             let case = format!("{time_unit}/{budget_type}");
@@ -662,7 +676,7 @@ async fn pagination_partitions_the_account_in_budget_name_order() {
     let page_sizes = [None, Some(1), Some(2), Some(3), Some(7), Some(1000)];
     for total in [0_usize, 1, 2, 5, 13] {
         let router = router();
-        let account_id = account(300_000_000 + total as u64);
+        let account_id = caller_account();
         // Created in an order unrelated to the order they must be served in.
         let mut expected: Vec<String> = (0..total)
             .map(|i| format!("budget-{:02}", (i * 7) % 100))
@@ -706,7 +720,7 @@ async fn pagination_partitions_the_account_in_budget_name_order() {
 #[tokio::test]
 async fn notifications_paginate_by_max_results() {
     let router = router();
-    let account_id = account(444_444_444);
+    let account_id = caller_account();
     let notification = |i: u32| {
         json!({
             "NotificationType": if i.is_multiple_of(2) { "ACTUAL" } else { "FORECASTED" },
@@ -813,7 +827,7 @@ async fn notifications_paginate_by_max_results() {
 #[tokio::test]
 async fn an_undecodable_next_token_is_refused() {
     let router = router();
-    let account_id = account(555_555_555);
+    let account_id = caller_account();
     let (status, body) = call(
         &router,
         "CreateBudget",
@@ -895,16 +909,20 @@ async fn an_undecodable_next_token_is_refused() {
     }
 }
 
-/// RULE: a budget is scoped to its account, so a name stored for one account is not
-/// visible to another — every read and write keyed on it answers `NotFoundException`
-/// (HTTP 400, the status this service sends for it).
+/// RULE: a budget is identified by its name within the account it belongs to, so a
+/// name the account holds no budget under is not found by any operation keyed on it,
+/// and one it does hold is reached by that name alone — every read and write keyed on
+/// an absent name answers `NotFoundException` (HTTP 400, the status this service sends
+/// for it).
+///
+/// The account half of that identity is `account_scoping.rs`: the service answers for
+/// one account, and a request naming another is refused before it is looked up at all.
 #[tokio::test]
-async fn budgets_are_scoped_to_their_account() {
+async fn a_budget_is_identified_by_its_name_within_the_account() {
     let router = router();
-    let owner = account(666_666_666);
-    let other = account(777_777_777);
+    let account_id = caller_account();
     let budget = json!({
-        "BudgetName": "shared-name",
+        "BudgetName": "stored-name",
         "TimeUnit": "MONTHLY",
         "BudgetType": "COST",
         "BudgetLimit": {"Amount": "1", "Unit": "USD"}
@@ -912,76 +930,69 @@ async fn budgets_are_scoped_to_their_account() {
     let (status, body) = call(
         &router,
         "CreateBudget",
-        &json!({"AccountId": &owner, "Budget": budget.clone()}),
+        &json!({"AccountId": &account_id, "Budget": budget.clone()}),
     )
     .await;
     assert_eq!(
         status, 200,
-        "expected the owner's budget to be created, got {status} {body}"
+        "expected the budget to be created, got {status} {body}"
     );
 
-    for (operation, request) in [
-        (
-            "DescribeBudget",
-            json!({"AccountId": &other, "BudgetName": "shared-name"}),
-        ),
-        (
-            "DeleteBudget",
-            json!({"AccountId": &other, "BudgetName": "shared-name"}),
-        ),
-        (
-            "DescribeNotificationsForBudget",
-            json!({"AccountId": &other, "BudgetName": "shared-name"}),
-        ),
-        (
-            "UpdateBudget",
-            json!({"AccountId": &other, "NewBudget": budget.clone()}),
-        ),
-        (
-            "DescribeBudget",
-            json!({"AccountId": &owner, "BudgetName": "never-created"}),
-        ),
-    ] {
-        let (status, body) = call(&router, operation, &request).await;
-        assert_eq!(
-            status, 400,
-            "case {operation} {request}: expected 400, got {status} {body}"
-        );
-        assert!(
-            is_error(&body, "NotFoundException"),
-            "case {operation} {request}: expected NotFoundException, got {body}"
-        );
+    // Names that differ from the stored one in a way a key lookup must respect: a name
+    // never used, the stored name with a suffix, and its case flipped.
+    for absent in ["never-created", "stored-name-2", "STORED-NAME"] {
+        for (operation, request) in [
+            (
+                "DescribeBudget",
+                json!({"AccountId": &account_id, "BudgetName": absent}),
+            ),
+            (
+                "DeleteBudget",
+                json!({"AccountId": &account_id, "BudgetName": absent}),
+            ),
+            (
+                "DescribeNotificationsForBudget",
+                json!({"AccountId": &account_id, "BudgetName": absent}),
+            ),
+            (
+                "UpdateBudget",
+                json!({
+                    "AccountId": &account_id,
+                    "NewBudget": {
+                        "BudgetName": absent,
+                        "TimeUnit": "MONTHLY",
+                        "BudgetType": "COST",
+                        "BudgetLimit": {"Amount": "1", "Unit": "USD"}
+                    }
+                }),
+            ),
+        ] {
+            let (status, body) = call(&router, operation, &request).await;
+            assert_eq!(
+                status, 400,
+                "case {operation} {request}: expected 400, got {status} {body}"
+            );
+            assert!(
+                is_error(&body, "NotFoundException"),
+                "case {operation} {request}: expected NotFoundException, got {body}"
+            );
+        }
     }
 
-    // The other account creating the same name is not a duplicate: it is its own
-    // budget, and the owner's is untouched.
+    // None of those refusals touched the budget that IS stored under its own name.
     let (status, body) = call(
         &router,
-        "CreateBudget",
-        &json!({
-            "AccountId": &other,
-            "Budget": {
-                "BudgetName": "shared-name",
-                "TimeUnit": "DAILY",
-                "BudgetType": "USAGE",
-                "BudgetLimit": {"Amount": "2", "Unit": "GB"}
-            }
-        }),
+        "DescribeBudget",
+        &json!({"AccountId": &account_id, "BudgetName": "stored-name"}),
     )
     .await;
     assert_eq!(
         status, 200,
-        "expected the same name in another account to be accepted, got {status} {body}"
+        "expected the stored budget to be readable by its own name, got {status} {body}"
     );
-    let (_, body) = call(
-        &router,
-        "DescribeBudget",
-        &json!({"AccountId": &owner, "BudgetName": "shared-name"}),
-    )
-    .await;
     assert_eq!(
         body["Budget"]["TimeUnit"], "MONTHLY",
-        "expected the owner's budget to be untouched, got {body}"
+        "expected the stored budget to be untouched, got {body}"
     );
 }
 
@@ -1000,7 +1011,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
         "BudgetLimit": {"Amount": "1", "Unit": "USD"}
     });
     let subscriber = json!([{"SubscriptionType": "EMAIL", "Address": "a@example.com"}]);
-    let empty = account(1);
+    let empty = caller_account();
     let cases: Vec<(&str, &str, Value)> = vec![
         // AccountId is @length(12, 12) + @pattern(^\d{12}$).
         (
@@ -1268,7 +1279,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
 #[tokio::test]
 async fn mutually_exclusive_budget_members_are_refused() {
     let router = router();
-    let account_id = account(888_888_888);
+    let account_id = caller_account();
     let limit = json!({"Amount": "1", "Unit": "USD"});
     let refused: Vec<(&str, Value)> = vec![
         (
@@ -1437,7 +1448,7 @@ async fn mutually_exclusive_budget_members_are_refused() {
 #[tokio::test]
 async fn a_caller_supplied_last_updated_time_is_replaced() {
     let router = router();
-    let account_id = account(131_313_131);
+    let account_id = caller_account();
     // Values differing along form: the epoch, a past date, and a date in the far future.
     for (case, sent) in [
         ("epoch", 0.0_f64),
@@ -1519,81 +1530,91 @@ async fn a_caller_supplied_last_updated_time_is_replaced() {
 /// crate's own) rather than by driving 20,000 requests.
 #[tokio::test]
 async fn an_account_cannot_exceed_its_budget_quota() {
-    let (router, engine) = router_with_engine();
-    let full = account(141_414_141);
-    let other = account(151_515_151);
-
-    {
-        let state = engine.state::<ComAmazonawsBudgetsAwsbudgetservicegatewayState>();
-        let mut store = state.lock();
-        for index in 0..MAX_BUDGETS_PER_ACCOUNT {
-            let budget_name = format!("seeded-{index:06}");
-            let budget = Budget {
-                budget_name: budget_name.clone(),
-                time_unit: "MONTHLY".to_string(),
-                budget_type: "COST".to_string(),
-                ..Budget::default()
-            };
-            store.budgets.insert(
-                (full.clone(), budget_name),
-                StoredBudget {
-                    budget,
-                    notifications: Vec::new(),
-                    actions: Vec::new(),
-                    tags: Vec::new(),
-                },
-            );
-        }
-        assert_eq!(
-            store.budgets.len(),
-            MAX_BUDGETS_PER_ACCOUNT,
-            "the seeded account must sit exactly at its quota"
-        );
-    }
-
     let new_budget = json!({
         "BudgetName": "one-too-many",
         "TimeUnit": "MONTHLY",
         "BudgetType": "COST",
         "BudgetLimit": {"Amount": "1", "Unit": "USD"}
     });
-    let (status, body) = call(
-        &router,
-        "CreateBudget",
-        &json!({"AccountId": &full, "Budget": new_budget.clone()}),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "case at-quota: expected CreateBudget to answer 400, got {status} {body}"
-    );
-    assert!(
-        is_error(&body, "ServiceQuotaExceededException"),
-        "case at-quota: expected ServiceQuotaExceededException, got {body}"
-    );
-    let (_, body) = call(
-        &router,
-        "DescribeBudget",
-        &json!({"AccountId": &full, "BudgetName": "one-too-many"}),
-    )
-    .await;
-    assert!(
-        is_error(&body, "NotFoundException"),
-        "case at-quota: the refused budget must not have been stored, got {body}"
-    );
+    // The rows sit on the quota and one under it, so what is asserted is the bound
+    // itself rather than that a seeded store refuses everything.
+    for seeded in [MAX_BUDGETS_PER_ACCOUNT - 1, MAX_BUDGETS_PER_ACCOUNT] {
+        let case = format!("{seeded} budgets already held");
+        let at_quota = seeded >= MAX_BUDGETS_PER_ACCOUNT;
+        let (router, engine) = router_with_engine();
+        let account_id = caller_account();
 
-    // The quota is per account: another account is unaffected.
-    let (status, body) = call(
-        &router,
-        "CreateBudget",
-        &json!({"AccountId": &other, "Budget": new_budget}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case other-account: the quota is per account, so this must be accepted, \
-         got {status} {body}"
-    );
+        {
+            let state = engine.state::<ComAmazonawsBudgetsAwsbudgetservicegatewayState>();
+            let mut store = state.lock();
+            for index in 0..seeded {
+                let budget_name = format!("seeded-{index:06}");
+                let budget = Budget {
+                    budget_name: budget_name.clone(),
+                    time_unit: "MONTHLY".to_string(),
+                    budget_type: "COST".to_string(),
+                    ..Budget::default()
+                };
+                store.budgets.insert(
+                    (account_id.clone(), budget_name),
+                    StoredBudget {
+                        budget,
+                        notifications: Vec::new(),
+                        actions: Vec::new(),
+                        tags: Vec::new(),
+                    },
+                );
+            }
+            assert_eq!(
+                store.budgets.len(),
+                seeded,
+                "case {case:?}: the seeded account must hold exactly {seeded} budgets, \
+                 got {}",
+                store.budgets.len()
+            );
+        }
+
+        let (status, body) = call(
+            &router,
+            "CreateBudget",
+            &json!({"AccountId": &account_id, "Budget": new_budget.clone()}),
+        )
+        .await;
+        if at_quota {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected CreateBudget to answer 400, got {status} {body}"
+            );
+            assert!(
+                is_error(&body, "ServiceQuotaExceededException"),
+                "case {case:?}: expected ServiceQuotaExceededException, got {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create under the quota to answer 200, \
+                 got {status} {body}"
+            );
+        }
+
+        let (_, body) = call(
+            &router,
+            "DescribeBudget",
+            &json!({"AccountId": &account_id, "BudgetName": "one-too-many"}),
+        )
+        .await;
+        if at_quota {
+            assert!(
+                is_error(&body, "NotFoundException"),
+                "case {case:?}: the refused budget must not have been stored, got {body}"
+            );
+        } else {
+            assert_eq!(
+                body["Budget"]["BudgetName"], "one-too-many",
+                "case {case:?}: expected the accepted budget to read back, got {body}"
+            );
+        }
+    }
 }
 
 /// RULE: a budget's `FilterExpression` is returned only when the caller asks for it
@@ -1601,7 +1622,7 @@ async fn an_account_cannot_exceed_its_budget_quota() {
 #[tokio::test]
 async fn the_filter_expression_is_returned_only_when_asked_for() {
     let router = router();
-    let account_id = account(999_999_999);
+    let account_id = caller_account();
     let expression = json!({
         "And": [
             {
@@ -1684,7 +1705,7 @@ async fn the_filter_expression_is_returned_only_when_asked_for() {
 #[tokio::test]
 async fn reads_do_not_change_what_a_later_caller_sees() {
     let router = router();
-    let account_id = account(121_212_121);
+    let account_id = caller_account();
     let (status, body) = call(
         &router,
         "CreateBudget",

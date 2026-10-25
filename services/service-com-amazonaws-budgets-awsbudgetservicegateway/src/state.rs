@@ -29,7 +29,10 @@ use std::time::{Duration, SystemTime};
 /// Per-service state for com-amazonaws-budgets-awsbudgetservicegateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBudgetsAwsbudgetservicegatewayState {
-    /// Every budget this emulator holds, keyed by `(AccountId, BudgetName)`.
+    /// Every budget this emulator holds, keyed by `(AccountId, BudgetName)` — the
+    /// identity AWS gives a budget. The account half is always the one account this
+    /// emulator answers for, since a request naming another is refused
+    /// ([`foreign_account_refusal`]).
     pub budgets: HashMap<(String, String), StoredBudget>,
 }
 
@@ -1079,6 +1082,31 @@ pub fn page<T: Clone>(
     Some((items[start..end].to_vec(), next))
 }
 
+/// The refusal message a request whose `AccountId` is not the caller's own account
+/// takes, or `None` when it names the caller's account.
+///
+/// The budgets control plane is scoped to the account the request is signed by: every
+/// operation takes the `AccountId` "that is associated with the budget" and declares
+/// `AccessDeniedException` ("You are not authorized to use this operation with the
+/// given parameters.", HTTP 403), and a caller reaches no account but its own through
+/// it. This emulator answers for exactly one account
+/// ([`::engine::emulator_account_id`]), so a request naming any other account is
+/// refused with that error before it reads or writes anything — rather than being
+/// served a budget namespace of its own.
+///
+/// Shared by every operation handler, so the one gate cannot drift between them.
+pub fn foreign_account_refusal(account_id: &str) -> Option<String> {
+    (account_id != ::engine::emulator_account_id())
+        .then(|| ACCESS_DENIED_MESSAGE.to_string())
+}
+
+/// What [`foreign_account_refusal`] says: `AccessDeniedException`'s own documented
+/// sentence, which states the one fact a caller needs (this operation is not available
+/// with the parameters sent) and names neither the account asked for nor the one the
+/// emulator answers for.
+pub const ACCESS_DENIED_MESSAGE: &str =
+    "You are not authorized to use this operation with the given parameters.";
+
 /// Every budget stored for `account_id`, as a read reports it at `at`, ordered by
 /// `BudgetName`.
 ///
@@ -1122,11 +1150,13 @@ pub fn budget_count_for_account(
 /// resource", HTTP 402) once an account holds this many.
 pub const MAX_BUDGETS_PER_ACCOUNT: usize = 20_000;
 
-/// The whole store lives in memory, and both halves of a budget's key come from the
-/// request, so the number of ACCOUNTS a caller can name is unbounded too. This is the
-/// emulator's own ceiling on the total number of budgets it will hold — not an AWS
-/// quota — so a client cannot grow the process without limit by varying `AccountId`.
-/// It is answered with the same modelled `ServiceQuotaExceededException`.
+/// The whole store lives in memory and a budget's name comes from the request, so this
+/// is the emulator's own ceiling on the total number of budgets it will hold — not an
+/// AWS quota — answered with the same modelled `ServiceQuotaExceededException`. Every
+/// request is scoped to the one account this emulator answers for
+/// ([`foreign_account_refusal`]), so the per-account quota above is what a caller
+/// reaches first; this bound stands over whatever a test or a future operation seeds
+/// into the store directly.
 pub const MAX_BUDGETS_TOTAL: usize = 100_000;
 
 /// `BudgetName`'s modelled `@pattern`, verbatim from the model

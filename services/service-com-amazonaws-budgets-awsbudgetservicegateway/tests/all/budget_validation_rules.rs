@@ -12,19 +12,18 @@
 //! limit, the instant, the adjustment period, the form of a planned-limit key. The
 //! requests the issue recorded are single rows.
 //!
-//! The harness (`router`, `call`, `account`, `is_error`, `same`, `carries`) is the one
-//! `tests/all/budget_lifecycle.rs` builds, so this suite drives the service exactly the
-//! way the others do.
+//! The harness (`router`, `call`, `caller_account`, `is_error`, `same`, `carries`) is
+//! the one `tests/all/budget_lifecycle.rs` builds, so this suite drives the service
+//! exactly the way the others do.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
-use std::cell::Cell;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
     BUDGET_TYPE_VALUES, TIME_UNIT_VALUES,
 };
 
-use super::budget_lifecycle::{account, call, carries, civil_secs, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, carries, civil_secs, is_error, router, same};
 
 /// What a write of a given budget must answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,34 +61,33 @@ fn baseline(name: &str) -> Value {
     })
 }
 
-/// One service, plus the account seed that keeps each row's budgets out of every other
-/// row's account.
+/// The account every row sends, and the fresh stores it drives.
+///
+/// Every request names the one account this service serves, so a row cannot keep its
+/// budgets out of another row's by naming a second account: it gets a STORE of its own
+/// instead (one per write path, since both paths use the same budget name).
 struct Harness {
-    router: MultiServiceRouter,
-    next: Cell<u64>,
+    account: String,
 }
 
 impl Harness {
     fn new() -> Self {
         Self {
-            router: router(),
-            next: Cell::new(0),
+            account: caller_account(),
         }
     }
 
-    /// A fresh `(create-path, update-path)` account pair.
-    fn accounts(&self) -> (String, String) {
-        let seed = self.next.get();
-        self.next.set(seed + 1);
-        (account(600_000_000 + seed), account(700_000_000 + seed))
+    /// A fresh service over a store of its own.
+    fn store(&self) -> MultiServiceRouter {
+        router()
     }
 
-    /// The `DescribeBudget` body for `name` under `account_id`.
-    async fn describe(&self, account_id: &str, name: &str) -> Value {
+    /// The `DescribeBudget` body for `name` in `store`.
+    async fn describe(&self, store: &MultiServiceRouter, name: &str) -> Value {
         let (_, body) = call(
-            &self.router,
+            store,
             "DescribeBudget",
-            &json!({"AccountId": account_id, "BudgetName": name}),
+            &json!({"AccountId": &self.account, "BudgetName": name}),
         )
         .await;
         body
@@ -111,13 +109,13 @@ impl Harness {
             Verdict::Refused => "InvalidParameterException",
             Verdict::OutsideModelledConstraint => "ValidationException",
         };
-        let (creating, updating) = self.accounts();
+        let (creating, updating) = (self.store(), self.store());
 
         // The create path.
         let (status, body) = call(
-            &self.router,
+            &creating,
             "CreateBudget",
-            &json!({"AccountId": &creating, "Budget": budget}),
+            &json!({"AccountId": &self.account, "Budget": budget}),
         )
         .await;
         let read = self.describe(&creating, &name).await;
@@ -147,9 +145,9 @@ impl Harness {
 
         // The update path, over a budget that already exists.
         let (status, body) = call(
-            &self.router,
+            &updating,
             "CreateBudget",
-            &json!({"AccountId": &updating, "Budget": baseline(&name)}),
+            &json!({"AccountId": &self.account, "Budget": baseline(&name)}),
         )
         .await;
         assert_eq!(
@@ -158,9 +156,9 @@ impl Harness {
         );
         let before = self.describe(&updating, &name).await["Budget"].clone();
         let (status, body) = call(
-            &self.router,
+            &updating,
             "UpdateBudget",
-            &json!({"AccountId": &updating, "NewBudget": budget}),
+            &json!({"AccountId": &self.account, "NewBudget": budget}),
         )
         .await;
         let after = self.describe(&updating, &name).await["Budget"].clone();
