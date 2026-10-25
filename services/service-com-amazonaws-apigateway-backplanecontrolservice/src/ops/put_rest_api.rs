@@ -937,6 +937,22 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
     Ok(definition)
 }
 
+/// The refusal a definition import answers when the caller asked it to roll back on a
+/// warning: the diagnostics the served response would have carried, one per line under
+/// API Gateway's fixed lead, so the caller is told WHAT was reported rather than only that
+/// something was.
+///
+/// `pub` because `ImportRestApi` reads a definition through the same reader and refuses it
+/// on the same condition, so the two cannot word that refusal differently.
+pub fn warnings_refusal(warnings: &[String]) -> String {
+    let mut message = String::from("Warnings found during import:");
+    for warning in warnings {
+        message.push_str("\n\t");
+        message.push_str(warning);
+    }
+    message
+}
+
 /// Report what an import could not carry over, up to the entries this emulator reports
 /// for a caller-sized list: what the response carries stays bounded however much the
 /// document declares.
@@ -1008,7 +1024,9 @@ pub fn imported_method(
 
     // An operation that specifies security needs the authorizer its security scheme named
     // to have been created for the method to keep that authorization. This import creates
-    // no authorizer, so the method is imported open and what it specified is reported.
+    // no authorizer, so the method is imported OPEN, and the diagnostic reports that
+    // OUTCOME — the method is left unsecured — rather than only that the declaration was
+    // dropped.
     //
     // A security requirement is the DOCUMENT's unless the operation declares one of its
     // own: an OpenAPI document's `security` applies across the API, and an operation
@@ -1023,7 +1041,7 @@ pub fn imported_method(
             format!(
                 "Method '{verb}' on resource '{path}' specified security, but no custom \
                  authorizers were created and the extension {AUTHORIZER_EXTENSION} was not \
-                 provided. Ignoring."
+                 properly set. This method will be not be secured."
             ),
         );
     }
@@ -1732,10 +1750,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read before anything is written, so the rollback is that no record changes at
         // all.
         if input.fail_on_warnings && !definition.warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                definition.warnings.join("; ")
-            )));
+            return Err(bad_request(warnings_refusal(&definition.warnings)));
         }
 
         let mut store = state.lock();
