@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use crate::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, keyspace_arn, minimal_schema, table_arn, Emulator,
+    assert_failure, assert_ok, keyspace_arn, minimal_schema, settle_wait, table_arn, Emulator,
 };
 
 /// `rs` = `SINGLE_REGION`, from the model's `rs` enum.
@@ -427,6 +427,8 @@ async fn a_service_managed_keyspace_refuses_every_write() {
             )
             .await,
     );
+    // The keyspace and its table are deletable once their creation has settled.
+    tokio::time::sleep(settle_wait()).await;
     assert_ok(
         own,
         emulator
