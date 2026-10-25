@@ -531,8 +531,8 @@ async fn token_domain_failures_are_reported_against_the_list_member() {
         "the elision must report the real size, got {message:?}"
     );
 
-    // A list every element of which is legal reaches the operation, which is still
-    // scaffolded: the layer refuses bad input, it does not refuse input.
+    // A list every element of which is legal reaches the operation, which mints a
+    // key for it: the layer refuses bad input, it does not refuse input.
     for domains in [
         vec!["abc.com".to_string()],
         vec!["store.abc.com".to_string(), "a".to_string()],
@@ -545,9 +545,13 @@ async fn token_domain_failures_are_reported_against_the_list_member() {
             )
             .await;
         assert_eq!(
-            status, 501,
-            "case {domains:?}: a legal TokenDomains must reach the unimplemented \
-             operation, got status {status} and body {body}"
+            status, 200,
+            "case {domains:?}: a legal TokenDomains must reach the operation, got \
+             status {status} and body {body}"
+        );
+        assert!(
+            body["APIKey"].as_str().is_some_and(|key| !key.is_empty()),
+            "case {domains:?}: the operation must answer the key it minted, got {body}"
         );
     }
 }
