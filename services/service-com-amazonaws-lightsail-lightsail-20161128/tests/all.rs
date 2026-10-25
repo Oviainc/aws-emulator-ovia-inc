@@ -77,6 +77,8 @@ mod disk_snapshot_listing;
 mod distribution_cdn;
 #[path = "all/distribution_certificate_attachment.rs"]
 mod distribution_certificate_attachment;
+#[path = "all/distribution_listing.rs"]
+mod distribution_listing;
 #[path = "all/distribution_metric_data.rs"]
 mod distribution_metric_data;
 #[path = "all/domain_delete.rs"]
@@ -127,6 +129,10 @@ mod load_balancer_listing;
 mod load_balancer_provisioning;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]
 mod load_balancer_tls_certificate_delete;
+#[path = "all/operations_for_resource.rs"]
+mod operations_for_resource;
+#[path = "all/paging.rs"]
+mod paging;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

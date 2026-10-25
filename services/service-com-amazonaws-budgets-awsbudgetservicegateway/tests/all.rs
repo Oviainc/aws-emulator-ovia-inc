@@ -67,6 +67,8 @@ mod resource_tags;
 mod service_owned_budget_members;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscriber_address_validation.rs"]
+mod subscriber_address_validation;
 #[path = "all/subscriber_creation.rs"]
 mod subscriber_creation;
 #[path = "all/subscriber_notification_reads.rs"]

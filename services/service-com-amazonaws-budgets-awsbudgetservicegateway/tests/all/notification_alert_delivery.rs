@@ -472,7 +472,7 @@ fn rows() -> Vec<Row> {
             expected: Vec::new(),
         },
         Row {
-            case: "an SNS subscriber whose address names no topic at all",
+            case: "an SNS subscriber naming a topic in another partition",
             attach: Attach::AfterBudget,
             budget: cost_budget(),
             notification: json!({
@@ -481,7 +481,9 @@ fn rows() -> Vec<Row> {
                 "Threshold": 80,
                 "NotificationState": "ALARM"
             }),
-            subscribers: json!([sns_subscriber("budget-alerts")]),
+            subscribers: json!([sns_subscriber(
+                "arn:aws-cn:sns:cn-north-1:123456789012:budget-alerts"
+            )]),
             then_subscribe: None,
             expected: Vec::new(),
         },

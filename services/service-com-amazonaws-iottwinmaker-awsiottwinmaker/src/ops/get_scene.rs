@@ -174,7 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scene_id = %input.scene_id,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a scene created through another Region's endpoint is not in it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSceneErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
@@ -183,6 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read, so the store is borrowed immutably: nothing a later caller
         // sees changes because this scene was read.
         let state = state.lock();
+        let state = state.region(&region);
 
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(GetSceneErrorModeled::ResourceNotFoundException(

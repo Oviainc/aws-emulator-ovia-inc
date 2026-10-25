@@ -334,10 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateApiKeyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     retry_after_seconds: None,
-                    message: Some(format!(
-                        "Maximum number of API keys exceeded: {}",
-                        crate::state::MAX_API_KEYS
-                    )),
+                    message: Some(crate::state::quota_reached("API Keys", "account")),
                 },
             )
             .into());

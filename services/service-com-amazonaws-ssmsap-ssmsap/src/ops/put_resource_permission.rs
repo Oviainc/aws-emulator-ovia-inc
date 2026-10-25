@@ -4,6 +4,12 @@
 //! Grants a source resource permission to take a `PermissionActionType` on a target
 //! resource, and answers the target's resulting policy document.
 //!
+//! The target is a resource this account and Region holds — a registered application
+//! or a SAP HANA database of one of its registrations
+//! ([`crate::state::RegionState::holds_resource`]) — so an ARN that names no such
+//! resource is refused with the modelled `ResourceNotFoundException` rather than
+//! granted a permission nothing could use.
+//!
 //! The grant is the (target resource ARN, action type, source resource ARN) triple
 //! held in [`crate::state::ComAmazonawsSsmsapSsmsapState::resource_permissions`], so
 //! granting the same triple twice leaves ONE grant and the response is the same
@@ -160,36 +166,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ActionType`, `ResourceArn` and `SourceResourceArn` are all modelled
         // `@required` with their own constraints, so reaching here means each is
-        // present and well formed. Nothing else about the two ARNs can be checked
-        // against state: this emulator holds no database or component registry (both
-        // `GetDatabase` and `ListDatabases` are still scaffolds), so it cannot tell a
-        // target that exists from one that does not, and answering the modelled
-        // `ResourceNotFoundException` here would refuse requests that are valid.
-        // The emulator's own ceiling on how many Regions it keeps a partition for; the
-        // Region comes from the caller's credential scope, so this is what stops
-        // made-up Regions growing the store without bound. Checked BEFORE
-        // `region_entry` mints one, so a refused grant leaves no partition behind.
-        if !state.holds_region(&region) && state.region_count() >= crate::state::MAX_REGIONS {
-            return Err(PutResourcePermissionErrorModeled::ValidationException(
-                crate::state::validation(format!(
-                    "Cannot grant {} on {} in {region}: this emulator holds permissions in at most {} Regions",
-                    input.action_type,
-                    input.resource_arn,
-                    crate::state::MAX_REGIONS
+        // present and well formed. What the model cannot state is whether the TARGET
+        // names anything: the policy is attached TO that resource, so it has to be one
+        // this account and Region holds — a registered application or a SAP HANA
+        // database of one of its registrations. The lookup is the one resolution this
+        // crate does for a resource named by ARN
+        // ([`crate::state::RegionState::holds_resource`]), the same one the tagging
+        // calls run, so a target that resolves for one of them resolves for all.
+        //
+        // `SourceResourceArn` is NOT resolved against this store: it names the
+        // counterparty the grant permits to act on the target, which for a restore
+        // permission is ordinarily a resource of another account or Region — that is
+        // what granting it is for — so nothing this partition holds decides whether it
+        // exists.
+        if !state
+            .region(&region)
+            .holds_resource(&region, &input.resource_arn)
+        {
+            return Err(PutResourcePermissionErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::resource_not_found_message(
+                    &input.resource_arn,
                 )),
             )
             .into());
         }
 
+        // The target resolved in THIS Region, so the partition already holds the
+        // registration it came from: reaching for it to write the grant mints no
+        // partition, which is why nothing here has to bound how many Regions the store
+        // keeps (`RegisterApplication`, the only call that can mint one, is where
+        // [`crate::state::MAX_REGIONS`] is enforced) or clean one up after a refusal.
         let outcome = state.region_entry(&region).grant_resource_permission(
             &input.resource_arn,
             &input.action_type,
             &input.source_resource_arn,
         );
         if let Err(refusal) = outcome {
-            // A refused grant leaves nothing behind — including the partition this call
-            // may have just minted for a Region that holds nothing else.
-            state.forget_region_if_empty(&region);
+            // A refused grant leaves nothing behind.
             return Err(PutResourcePermissionErrorModeled::ValidationException(refusal).into());
         }
 

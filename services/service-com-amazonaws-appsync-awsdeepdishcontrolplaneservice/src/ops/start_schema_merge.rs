@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSchemaMerge
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSchemaMerge`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: initiates the merge of the source API's schema into the Merged API for
+//! the association `(mergedApiIdentifier, associationId)` names, and answers with the
+//! `SourceApiAssociationStatus` that initiation leaves the association in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSchemaMerge::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Scheduling is all the call does: the merge comes due one [`crate::state::MERGE_SPAN`]
+//! later and the clock materialises it
+//! ([`crate::state::SourceApiAssociationRecord::settle`]), so the status answered is the
+//! non-terminal `MERGE_SCHEDULED` and the association reaches `MERGE_SUCCESS` with no
+//! further call. A merge the clock already owes is the merge this call initiates, so
+//! re-initiating neither pushes that due instant out nor leaves two merges owed.
+//!
+//! The pair is resolved by the rule this operation and `GetSourceApiAssociation` share
+//! ([`crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::resolve_association`]):
+//! a Merged API identifier nothing can name is a bad request, and an `associationId`
+//! that names no association OF that Merged API is not found. An association whose
+//! DELETION the clock still owes is being destroyed, so initiating a merge on it is
+//! refused as the modification already in progress it is.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +164,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSchemaMerge` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSchemaMergeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSchemaMerge"))
+        // Nothing in the answer depends on this request's metadata: the association is
+        // resolved from the store and the status comes from the stored record.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSchemaMergeErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // Materialise everything the clock already owes first, so this call schedules
+        // against the association state of THIS instant rather than the one the last
+        // caller left behind: an association whose deletion came due is gone before a
+        // merge can be initiated on it.
+        guard.settle_associations(now);
+
+        // Which association the pair names, by the rule the read follows too. The id is
+        // the STORED record's key, so the write below reaches the record the lookup
+        // resolved.
+        let association_id =
+            match guard.resolve_association(&input.merged_api_identifier, &input.association_id) {
+                Ok(association) => association.association_id.clone(),
+                Err(refusal) => return Err(refuse(refusal.into())),
+            };
+
+        // Initiating the merge SCHEDULES it; the clock owes its outcome, so nothing here
+        // performs it or waits for it.
+        let started = guard
+            .source_api_associations
+            .get_mut(&association_id)
+            .map(|association| association.start_merge(now));
+
+        match started {
+            Some(Ok(status)) => Ok(StartSchemaMergeOutput {
+                source_api_association_status: Some(status),
+            }),
+            Some(Err(refusal)) => Err(refuse(refusal)),
+            // Unreachable: the lookup above resolved this very key under the same lock.
+            None => Err(StartSchemaMergeErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(format!(
+                        "the appsync store lost source API association {association_id}"
+                    )),
+                },
+            )
+            .into()),
+        }
     }
 }
+
+/// This operation's modelled error for a refusal the shared association rules state —
+/// the pair lookup's, and the merge initiation's own.
+///
+/// Each variant keeps the status the model gives its shape and carries the rule's own
+/// text: a not-found names no identifier, so which side of the pair was missing is not
+/// reported.
+fn refuse(refusal: crate::state::AssociationRefusal) -> StartSchemaMergeError {
+    match refusal {
+        crate::state::AssociationRefusal::BadRequest(message) => {
+            StartSchemaMergeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+        }
+        crate::state::AssociationRefusal::NotFound(message) => {
+            StartSchemaMergeErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        crate::state::AssociationRefusal::ConcurrentModification(message) => {
+            StartSchemaMergeErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(message),
+                },
+            )
+        }
+    }
+    .into()
+}
+

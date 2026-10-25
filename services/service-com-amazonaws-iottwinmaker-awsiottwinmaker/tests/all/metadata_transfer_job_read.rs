@@ -30,7 +30,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     METADATA_TRANSFER_JOB_STATE_ERROR, METADATA_TRANSFER_JOB_STATE_VALIDATING,
 };
 
-use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator};
+use crate::harness::{metadata_transfer_job_arn, workspace_arn, Emulator, REGION};
 
 /// The workspace the destination of every transfer created here names.
 const WORKSPACE: &str = "readWorkspace";
@@ -260,6 +260,7 @@ async fn a_read_refuses_an_unheld_id_and_an_id_outside_the_model() {
         emulator
             .state()
             .lock()
+            .region(REGION)
             .metadata_transfer_jobs
             .keys()
             .cloned()
@@ -295,6 +296,7 @@ async fn a_read_mints_no_job_and_removes_none() {
     let before: Vec<String> = emulator
         .state()
         .lock()
+        .region(REGION)
         .metadata_transfer_jobs
         .keys()
         .cloned()
@@ -318,6 +320,7 @@ async fn a_read_mints_no_job_and_removes_none() {
         let after: Vec<String> = emulator
             .state()
             .lock()
+            .region(REGION)
             .metadata_transfer_jobs
             .keys()
             .cloned()

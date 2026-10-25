@@ -168,6 +168,30 @@ pub(crate) async fn call(
     }
 }
 
+/// `StartSearchJob` for an S3 scope, answering the identifier it minted. The first call
+/// of every suite that needs a job to act on, so it lives beside the harness rather than
+/// once per suite.
+pub(crate) async fn start_s3_search_job(
+    emulator: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+) -> String {
+    let started = call(
+        emulator,
+        region,
+        "PUT",
+        "/search-jobs",
+        Some(json!({"Name": "started", "SearchScope": {"BackupResourceTypes": ["S3"]}})),
+    )
+    .await;
+    assert_eq!(
+        started.status, 200,
+        "case {case:?}: StartSearchJob must succeed, got {} ({:?})",
+        started.status, started.body
+    );
+    started.string("SearchJobIdentifier")
+}
+
 /// One row of the start-a-job table: a `StartSearchJob` body and the region it is signed
 /// for. The rows differ in resource type, in whether `Name`/`ItemFilters`/`Tags` are
 /// present, in filter count and in signing region.

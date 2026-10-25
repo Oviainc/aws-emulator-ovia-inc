@@ -298,12 +298,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled `TagSyncTaskArn` writes the group-name segment narrower than
         // a group name may be, so a group whose name does not fit it cannot host a
         // task the caller could address afterwards.
-        if !crate::state::is_tag_sync_task_group_name(&group.name) {
+        if !crate::state::is_qualifiable_group_name(&group.name) {
             return Err(bad_request(format!(
                 "the group's name is not one a tag-sync task's ARN can carry: that \
                  ARN writes it as at most {} of the letters, digits and `_ . -` a \
                  task ARN admits",
-                crate::state::MAX_TAG_SYNC_TASK_GROUP_NAME_LENGTH,
+                crate::state::MAX_QUALIFIED_GROUP_NAME_LENGTH,
             )));
         }
         let group_name = group.name.clone();

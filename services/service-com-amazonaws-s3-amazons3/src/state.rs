@@ -3390,6 +3390,27 @@ pub struct Bucket {
     /// Private, like `tags` and `replication`, so the accessor pair below is the only way
     /// in or out.
     metrics_configurations: BTreeMap<String, crate::ops::types::MetricsConfiguration>,
+    /// The bucket's storage class analysis configurations, by the id each one is identified
+    /// by: "Sets an analytics configuration for the bucket (specified by the analytics
+    /// configuration ID)" (`PutBucketAnalyticsConfiguration`'s own documentation).
+    ///
+    /// A MAP rather than one value, for the reason [`Self::metrics_configurations`] is one —
+    /// "You can have up to 1,000 analytics configurations per bucket" (same documentation,
+    /// [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]) — each addressable on its own by the id
+    /// the request named it with, so a read, a replacement or a delete of one configuration
+    /// leaves every other one exactly as it was. A `BTreeMap`, so iterating it IS ascending
+    /// id order and a listing needs no sort step. Empty for a bucket no analytics
+    /// configuration has been put on, the state a bucket is created in.
+    ///
+    /// The MODELLED container is stored whole, the way [`Self::replication`] is: it is
+    /// exactly what the put carries as its payload and what
+    /// `GetBucketAnalyticsConfiguration` reports back, so a read answers the configuration
+    /// the bucket actually carries — every member the request named, including the
+    /// destination's own account id — rather than a re-derived copy of it.
+    ///
+    /// Private, like `tags` and `metrics_configurations`, so the accessor pair below is the
+    /// only way in or out.
+    analytics_configurations: BTreeMap<String, crate::ops::types::AnalyticsConfiguration>,
     /// The S3 Intelligent-Tiering configurations the bucket carries, by the id each one is
     /// identified by — empty while the bucket carries none, which is the state it is
     /// created in.
@@ -3875,23 +3896,49 @@ impl Bucket {
         &mut self,
         id: String,
         configuration: crate::ops::types::MetricsConfiguration,
-    ) -> MetricsConfigurationWrite {
-        // The ceiling is read BEFORE the entry is taken, because taking it borrows the map.
-        let at_the_ceiling =
-            self.metrics_configurations.len() >= MAX_METRICS_CONFIGURATIONS_PER_BUCKET;
-        match self.metrics_configurations.entry(id) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                entry.insert(configuration);
-                MetricsConfigurationWrite::Replaced
-            }
-            std::collections::btree_map::Entry::Vacant(_) if at_the_ceiling => {
-                MetricsConfigurationWrite::QuotaReached
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(configuration);
-                MetricsConfigurationWrite::Stored
-            }
-        }
+    ) -> BucketConfigurationWrite {
+        put_keyed_configuration(
+            &mut self.metrics_configurations,
+            id,
+            configuration,
+            MAX_METRICS_CONFIGURATIONS_PER_BUCKET,
+        )
+    }
+
+    /// The analytics configuration the bucket carries under `id`, or `None` when it carries
+    /// none under that id — the state every bucket starts in, and what makes a read answer
+    /// [`NO_SUCH_CONFIGURATION_CODE`].
+    ///
+    /// The stored container itself, so what a reader reports is what the put recorded rather
+    /// than a re-derived copy — the reading [`Self::metrics_configuration`] gives.
+    pub fn analytics_configuration(
+        &self,
+        id: &str,
+    ) -> Option<&crate::ops::types::AnalyticsConfiguration> {
+        self.analytics_configurations.get(id)
+    }
+
+    /// Associate `configuration` with the bucket under `id`, and report what that did.
+    ///
+    /// Per-ID and a full replacement of that id alone: a put "specified by the analytics
+    /// configuration ID" (`PutBucketAnalyticsConfiguration`'s own documentation) carries the
+    /// whole container, so the configuration stored under `id` becomes exactly the one this
+    /// request named and every other id the bucket carries is left as it was.
+    ///
+    /// The ceiling is checked HERE, where the bucket's configuration count is, so a put
+    /// cannot reach past [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]; replacing an id the
+    /// bucket already carries adds no configuration and so is never refused for it.
+    pub fn put_analytics_configuration(
+        &mut self,
+        id: String,
+        configuration: crate::ops::types::AnalyticsConfiguration,
+    ) -> BucketConfigurationWrite {
+        put_keyed_configuration(
+            &mut self.analytics_configurations,
+            id,
+            configuration,
+            MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET,
+        )
     }
 
     /// Every S3 Intelligent-Tiering configuration the bucket carries, in ascending id
@@ -5990,17 +6037,29 @@ pub const MAX_METRICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
 /// the character set is this family's own.
 pub const MAX_METRICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
 
-/// Whether `value` is an id a metrics configuration may be identified by: at most
-/// [`MAX_METRICS_ID_CHARS`] characters, every one of them a letter, a number, a period, a
-/// dash or an underscore — the rule quoted on that constant.
+/// Whether `value` is an id a metrics configuration may be identified by: a configuration
+/// id by length ([`is_valid_configuration_id`]), every character of which is a letter, a
+/// number, a period, a dash or an underscore — the rule quoted on
+/// [`MAX_METRICS_ID_CHARS`].
 ///
 /// An EMPTY id identifies no configuration, so it is not one either.
 pub fn is_valid_metrics_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().count() <= MAX_METRICS_ID_CHARS
+    is_valid_configuration_id(value)
         && value
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+}
+
+/// Whether `value` is long enough and short enough to identify a bucket configuration:
+/// between one and [`MAX_CONFIGURATION_ID_CHARS`] characters.
+///
+/// The LENGTH half every bucket configuration id shares, so the families cannot drift apart
+/// on it: [`is_valid_metrics_id`] composes it with the character set its own member
+/// documents, and [`is_valid_analytics_id`] is it alone. An EMPTY id identifies no
+/// configuration, so it is never one.
+pub fn is_valid_configuration_id(value: &str) -> bool {
+    let characters = value.chars().count();
+    characters > 0 && characters <= MAX_CONFIGURATION_ID_CHARS
 }
 
 /// The code S3 answers a read that names a bucket subresource configuration the bucket
@@ -6017,18 +6076,79 @@ pub const NO_SUCH_CONFIGURATION_MESSAGE: &str = "The specified configuration doe
 /// list.
 pub const NO_SUCH_CONFIGURATION_STATUS: u16 = 404;
 
-/// What [`Bucket::put_metrics_configuration`] did, so the caller answers each outcome
-/// without re-deriving it — and cannot reach the stored cases without having gone through
-/// the per-bucket ceiling.
+/// What [`Bucket::put_metrics_configuration`] or [`Bucket::put_analytics_configuration`]
+/// did, so the caller answers each outcome without re-deriving it — and cannot reach the
+/// stored cases without having gone through the per-bucket ceiling.
+///
+/// ONE type for both families, because a put of either is the same transaction: a full
+/// replacement of the configuration of the id it names, bounded by how many of them one
+/// bucket may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetricsConfigurationWrite {
+pub enum BucketConfigurationWrite {
     /// The bucket carried no configuration under that id; this one was recorded.
     Stored,
     /// A configuration of that id was already there and this one replaced it IN FULL.
     Replaced,
-    /// The bucket already holds [`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`] configurations
-    /// and this put would add one more; NOTHING was written.
+    /// The bucket already holds as many configurations of that family as it may
+    /// ([`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`],
+    /// [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]) and this put would add one more;
+    /// NOTHING was written.
     QuotaReached,
+}
+
+/// Record `configuration` under `id` in one of a bucket's per-id configuration maps,
+/// refusing a NEW id once the map holds `ceiling` of them.
+///
+/// The one implementation behind [`Bucket::put_metrics_configuration`] and
+/// [`Bucket::put_analytics_configuration`]: both store the modelled container whole under
+/// the id the request identifies it by, so replacing an id already present overwrites that
+/// entry alone and counts against no ceiling.
+fn put_keyed_configuration<T>(
+    configurations: &mut BTreeMap<String, T>,
+    id: String,
+    configuration: T,
+    ceiling: usize,
+) -> BucketConfigurationWrite {
+    // The ceiling is read BEFORE the entry is taken, because taking it borrows the map.
+    let at_the_ceiling = configurations.len() >= ceiling;
+    match configurations.entry(id) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.insert(configuration);
+            BucketConfigurationWrite::Replaced
+        }
+        std::collections::btree_map::Entry::Vacant(_) if at_the_ceiling => {
+            BucketConfigurationWrite::QuotaReached
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(configuration);
+            BucketConfigurationWrite::Stored
+        }
+    }
+}
+
+/// How many analytics configurations one bucket may hold, and so how many entries one
+/// bucket's analytics record can ever carry.
+///
+/// AWS publishes the bound on the operation itself: "You can have up to 1,000 analytics
+/// configurations per bucket" (`PutBucketAnalyticsConfiguration`'s own documentation), which
+/// also names the refusal past it ([`TOO_MANY_CONFIGURATIONS_CODE`]). A put past it is
+/// refused rather than recorded, so a caller looping on fresh ids cannot grow one bucket's
+/// record without end.
+pub const MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
+
+/// The most characters an analytics configuration id may carry.
+///
+/// [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares: the model
+/// constrains `AnalyticsId` no further — `smithy_query(query="shape",shape="AnalyticsId")`
+/// reports a plain string with no `length` or `pattern` — so nothing refuses a longer id
+/// before a handler does, and an id is what one bucket's analytics map keys on.
+pub const MAX_ANALYTICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
+
+/// Whether `value` is an id an analytics configuration may be identified by: a
+/// configuration id by length ([`is_valid_configuration_id`], i.e. between one and
+/// [`MAX_ANALYTICS_ID_CHARS`] characters), which is all `AnalyticsId` constrains.
+pub fn is_valid_analytics_id(value: &str) -> bool {
+    is_valid_configuration_id(value)
 }
 
 /// The HTTP status [`INVALID_REQUEST_CODE`] is rendered with: 400, from Amazon S3's "Error

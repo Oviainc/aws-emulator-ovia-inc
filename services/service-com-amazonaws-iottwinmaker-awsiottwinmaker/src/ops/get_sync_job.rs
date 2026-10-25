@@ -175,13 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sync_source = %input.sync_source,
             "serving a request"
         );
-        let _ = ctx;
+        // The Region this request is signed for picks the store that answers
+        // it: a sync job created through another Region's endpoint is not in it.
+        let region = crate::state::request_region(ctx.parts());
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetSyncJobErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the iottwinmaker store is unavailable".to_string()),
             })
         })?;
         let mut state = state.lock();
+        let state = state.region_mut(&region);
 
         // A sync job is addressed by its workspace AND its sync source, and
         // `workspaceId` is carried in the `workspace` query parameter rather

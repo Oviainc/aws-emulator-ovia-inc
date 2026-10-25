@@ -497,9 +497,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         if store.rest_apis.len() >= crate::state::MAX_REST_APIS {
-            return Err(limit_exceeded(format!(
-                "Maximum number of REST APIs exceeded: {}",
-                crate::state::MAX_REST_APIS
+            return Err(limit_exceeded(crate::state::quota_reached(
+                "REST APIs",
+                "account",
             )));
         }
 

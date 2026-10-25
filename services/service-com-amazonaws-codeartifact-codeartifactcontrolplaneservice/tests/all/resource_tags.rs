@@ -16,8 +16,9 @@
 //! 2. A tag key and value are opaque Unicode strings, stored and reported verbatim —
 //!    never normalised, trimmed or re-encoded.
 //! 3. A resource holds at most [`MAX_TAGS_PER_RESOURCE`] tags; a call that would leave it
-//!    holding more is refused with `ServiceQuotaExceededException` (402) and writes
-//!    nothing.
+//!    holding more is refused with `ServiceQuotaExceededException` (402), writes nothing,
+//!    and states the bound in the sentence the service states it in — the same sentence
+//!    at every site that writes a tag set.
 //! 4. A tag set belongs to the one resource its ARN names: an ARN outside this service's
 //!    namespace is a bad request (400), a well-formed one naming no held resource is a
 //!    404, and tagging one resource never touches another's set.
@@ -629,6 +630,116 @@ async fn create_time_tags_follow_the_same_per_resource_rules() {
         (404, "ResourceNotFoundException".to_string()),
         "a refused create must leave no repository behind, got {absent:?}"
     );
+}
+
+/// RULE 3's REFUSAL WORDING: a tag-quota rejection states the RULE — the bound on the
+/// tag set the request would leave the resource holding — and states it identically at
+/// every site that writes a tag set, whatever the request carried and whichever kind of
+/// resource it addressed.
+///
+/// SOURCE: the sentence the service's tagging refusal carries for this quota, "The
+/// resultant tag set must not have more than N user tags.", with N the published
+/// per-resource bound ([`MAX_TAGS_PER_RESOURCE`]).
+///
+/// The rows differ along how the bound is passed (one batch past it, many past it,
+/// accumulated across batches), which kind of resource holds the set (domain,
+/// repository, package group) and which operation writes it (`TagResource` and each
+/// create carrying a `tags` member) — the sentence is the same in all of them, because
+/// it states the rule rather than the request.
+#[tokio::test]
+async fn a_tag_quota_refusal_states_the_rule_identically_at_every_write_site() {
+    let router = emulator();
+    // The literal sentence, written out rather than re-derived from the implementation's
+    // template, so what is pinned here is the service's WORDING. Its one variable part is
+    // the published per-resource bound of 50 (`MAX_TAGS_PER_RESOURCE`), asserted below to
+    // be the bound this build enforces, so a build that moved the bound fails loudly here
+    // instead of silently pinning the wrong number.
+    let expected = "The resultant tag set must not have more than 50 user tags.";
+    assert_eq!(
+        MAX_TAGS_PER_RESOURCE, 50,
+        "the sentence below names the published bound, got {MAX_TAGS_PER_RESOURCE}"
+    );
+    let over_quota = tag_list(&generated(MAX_TAGS_PER_RESOURCE + 1));
+    let mut answers: Vec<(String, Answer)> = Vec::new();
+
+    let domain_arn = create_tagged_domain(&router, "quota-message", &[]).await;
+    let repository_arn = create_tagged_repository(&router, "quota-message", "repo", &[]).await;
+    let group_arn =
+        create_tagged_package_group(&router, "quota-message", "/npm/scope/*", &[]).await;
+
+    // `TagResource`, one batch past the bound and well past it, on each taggable kind.
+    for (kind, arn) in [
+        ("domain", &domain_arn),
+        ("repository", &repository_arn),
+        ("package group", &group_arn),
+    ] {
+        for over in [1_usize, 7] {
+            let count = MAX_TAGS_PER_RESOURCE + over;
+            answers.push((
+                format!("TagResource on a {kind} with {count} tags in one batch"),
+                tag(&router, arn, &generated(count)).await,
+            ));
+        }
+    }
+
+    // Accumulated: the bound is on what the resource HOLDS, so a single new key past a
+    // full set is refused with the same sentence as a batch that is far too large.
+    let accumulated = create_tagged_domain(&router, "quota-message-accumulated", &[]).await;
+    let filled = tag(&router, &accumulated, &generated(MAX_TAGS_PER_RESOURCE)).await;
+    assert_eq!(
+        filled.status, 200,
+        "filling to the bound must be accepted, got {filled:?}"
+    );
+    answers.push((
+        "TagResource with one new key past a full set".to_string(),
+        tag(&router, &accumulated, &pairs(&[("one-more", "x")])).await,
+    ));
+
+    // The create sites that carry a `tags` member write a tag set too.
+    answers.push((
+        "CreateDomain carrying one tag past the bound".to_string(),
+        call(
+            &router,
+            "POST",
+            "/v1/domain?domain=quota-message-created",
+            Some(json!({ "tags": over_quota.clone() })),
+        )
+        .await,
+    ));
+    answers.push((
+        "CreateRepository carrying one tag past the bound".to_string(),
+        call(
+            &router,
+            "POST",
+            "/v1/repository?domain=quota-message&repository=repo-created",
+            Some(json!({ "tags": over_quota.clone() })),
+        )
+        .await,
+    ));
+    answers.push((
+        "CreatePackageGroup carrying one tag past the bound".to_string(),
+        call(
+            &router,
+            "POST",
+            "/v1/package-group?domain=quota-message",
+            Some(json!({ "packageGroup": "/maven/created/*", "tags": over_quota })),
+        )
+        .await,
+    ));
+
+    for (case, answer) in &answers {
+        assert_eq!(
+            (answer.status, answer.code()),
+            (402, "ServiceQuotaExceededException".to_string()),
+            "case {case:?}: expected the modelled quota refusal, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message().as_str(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
 }
 
 /// RULES 1–4 on the THIRD taggable kind this store holds: a package group, whose

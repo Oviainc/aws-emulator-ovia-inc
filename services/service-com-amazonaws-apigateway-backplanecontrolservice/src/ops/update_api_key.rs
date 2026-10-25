@@ -100,19 +100,14 @@ use crate::state::{
     PatchOpKind, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
-/// The paths `UpdateApiKey` accepts for a `replace`: the `ApiKey`'s single-valued
-/// updateable members. A recorded AWS refusal of a `replace` of `/id` names exactly
-/// this set — "Must be one of: [/description, /enabled, /name, /customerId]" — so `id`,
-/// `value`, `createdDate` and `lastUpdatedDate` are not patchable (the service assigns
-/// them) and `tags` are changed through `TagResource`/`UntagResource`.
-const REPLACE_PATHS: &[&str] = &["/description", "/enabled", "/name", "/customerId"];
-
-/// The paths it accepts for an `add` or a `remove`: the key's COLLECTION members, which
-/// are what an element is added to or removed from. A recorded AWS refusal of a
-/// `remove` of `/description` names exactly this set — "Must be one of: [/stages,
-/// /labels]" — so the single-valued members above take a `replace` and only these two
-/// take an `add` or a `remove`.
-const COLLECTION_PATHS: &[&str] = &["/stages", "/labels"];
+// The paths `UpdateApiKey` accepts for a `replace` are the `ApiKey`'s single-valued
+// updateable members, the ones the `Replace` arm below has a case for: `id`, `value`,
+// `createdDate` and `lastUpdatedDate` are not patchable (the service assigns them) and
+// `tags` are changed through `TagResource`/`UntagResource`.
+//
+// The paths it accepts for an `add` or a `remove` are the key's COLLECTION members, which
+// are what an element is added to or removed from, so the single-valued members take a
+// `replace` and only those two take an `add` or a `remove`.
 
 /// Apply one patch to a COPY of a stored key.
 ///
@@ -131,7 +126,7 @@ fn apply_patch(
             "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
             "customerId" => patch_optional_string(&mut entry.customer_id, patch, MAX_STRING_CHARS),
             "enabled" => patch_bool(&mut entry.enabled, patch),
-            _ => Err(patch.unsupported_path(REPLACE_PATHS)),
+            _ => Err(patch.unsupported_path()),
         },
         PatchOpKind::Add | PatchOpKind::Remove => match patch.member() {
             // One entry names one stage of one API, which is how the member is stored
@@ -171,7 +166,7 @@ fn apply_patch(
                     .map_err(PatchFailure::BadRequest)?;
                 patch_string_set(&mut entry.labels, patch, &label, MAX_COLLECTION_ENTRIES)
             }
-            _ => Err(patch.unsupported_path(COLLECTION_PATHS)),
+            _ => Err(patch.unsupported_path()),
         },
         // `move`, `copy` and `test` name no member of this resource: "Not all valid
         // operations are supported for a given resource" (`PatchOperation$op`).

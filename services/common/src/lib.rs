@@ -204,6 +204,10 @@ pub mod bedrock;
 pub mod chime_app_instance_admins;
 pub mod chime_family;
 pub mod db_data_sources;
+/// The ONE reading of a caller-supplied EMAIL ADDRESS, for every service whose model
+/// documents a member as one and targets it at a bare string — so two services asked
+/// whether a value is an address cannot answer differently.
+pub mod email_address;
 /// The `vnd.amazon.eventstream` framing and routing seam a service with a
 /// `@streaming` output member needs, which the scaffold does not generate.
 pub mod event_stream;

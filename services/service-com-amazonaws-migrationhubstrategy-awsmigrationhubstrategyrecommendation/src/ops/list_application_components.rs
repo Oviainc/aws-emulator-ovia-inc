@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationComponents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationComponents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationComponents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's application components — the processes and databases the
+//! portfolio holds ([`crate::state::ApplicationComponentRecord`]) — filtered, ordered and
+//! paged as the request asks. It is a REPORT: it writes nothing, so two identical calls
+//! answer the same thing and a later caller sees exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +88,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    filter_pair, list_page, page_token_not_accepted, selection_fingerprint,
+    ApplicationComponentRecord, ListCursor, APPLICATION_COMPONENT_PAGE_MARKER,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -125,6 +126,25 @@ impl From<ListApplicationComponentsErrorModeled> for ListApplicationComponentsEr
     fn from(modeled: ListApplicationComponentsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Lift a refusal the service decided — an unusable value
+/// ([`crate::state::invalid_request_body`]) or an unresolvable one
+/// ([`crate::state::page_token_not_accepted`]) — into this operation's error channel.
+///
+/// The rules behind those refusals are the service's, shared by every list it serves
+/// ([`filter_pair`], [`crate::state::sort_descending`],
+/// [`crate::state::check_group_names`], [`list_page`]); this is the one place that says
+/// which of THIS operation's modelled errors carries them.
+fn refusal(exception: ValidationException) -> ListApplicationComponentsError {
+    ListApplicationComponentsErrorModeled::ValidationException(exception).into()
+}
+
+/// This operation's refusal of a `nextToken` it cannot resolve, worded the way the service
+/// words any unresolvable parameter — the same refusal its sibling lists answer for a
+/// cursor of their own that resolves to nothing.
+fn token_refused() -> ListApplicationComponentsError {
+    refusal(page_token_not_accepted())
 }
 
 /// The `ListApplicationComponents` operation.
@@ -163,18 +183,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationComponents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationComponentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationComponents"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListApplicationComponentsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the migrationhub-strategy application component inventory is \
+                             unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every refusal is decided from the request alone, before the store is read, by
+        // the service's own rules for a list request.
+        let filter = filter_pair(
+            input.application_component_criteria.as_deref(),
+            input.filter_value.as_deref(),
+            APPLICATION_COMPONENT_CRITERIA_VALUES,
+        )
+        .map_err(refusal)?;
+        let descending = crate::state::sort_descending(input.sort.as_deref()).map_err(refusal)?;
+        let groups = input.group_id_filter.unwrap_or_default();
+        crate::state::check_group_names(&groups).map_err(refusal)?;
+        // The selection this call takes its list under: a token is only good for the same
+        // one.
+        let selection = selection_fingerprint(filter, descending, &groups);
+        let page = list_page(
+            input.max_results,
+            input.next_token,
+            APPLICATION_COMPONENT_PAGE_MARKER,
+            &selection,
+        )
+        .map_err(refusal)?;
+
+        // A read: the store is only looked at here, so running ListApplicationComponents
+        // changes nothing a later caller sees — nothing in this emulator analyses a
+        // component's source code or database, so no status of one is owed by the clock.
+        // The components are those of the Region this request was signed for: a Region
+        // nothing was brought into reads as empty and gets no partition minted for it.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        let selected: Vec<&ApplicationComponentRecord> = store
+            .region(&region)
+            .application_components
+            .values()
+            // `groupIdFilter` scopes the list to the components that came in with one of
+            // the groups it names; an absent or empty filter scopes nothing.
+            .filter(|component| groups.is_empty() || component.in_any_group(&groups))
+            // and the (criteria, value) pair selects on the member the criteria names.
+            .filter(|component| match filter {
+                None => true,
+                Some((criteria, value)) => component.matches_criteria(criteria, value),
+            })
+            .collect();
+
+        // `application_components` is keyed by id, so iterating it already gives the
+        // ascending order; `DESC` is that order reversed.
+        let ordered: Vec<&ApplicationComponentRecord> = if descending {
+            selected.into_iter().rev().collect()
+        } else {
+            selected
+        };
+
+        // Where this page starts: at the id the cursor names, which is the first component
+        // the previous page did not report. The cursor already proved it was issued for
+        // this selection, so an id the list no longer holds means the record went away
+        // between pages, and the token is refused rather than answered from the top.
+        let start = match page.resume_at {
+            None => 0,
+            Some(resume_at) => ordered
+                .iter()
+                .position(|component| component.id == resume_at)
+                .ok_or_else(token_refused)?,
+        };
+        let end = start.saturating_add(page.size).min(ordered.len());
+        let application_component_infos: Vec<ApplicationComponentDetail> = ordered[start..end]
+            .iter()
+            .map(|component| component.to_detail())
+            .collect();
+        // The cursor the next page resumes from, or none once this page ended the list.
+        let next_token = ordered.get(end).map(|component| {
+            ListCursor {
+                selection,
+                resume_at: component.id.clone(),
+            }
+            .to_token(APPLICATION_COMPONENT_PAGE_MARKER)
+        });
+
+        Ok(ListApplicationComponentsOutput {
+            application_component_infos: Some(application_component_infos),
+            next_token,
+        })
     }
 }

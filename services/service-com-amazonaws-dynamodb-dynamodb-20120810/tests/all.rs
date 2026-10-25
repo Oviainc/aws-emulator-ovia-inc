@@ -47,6 +47,8 @@ mod number_canonicalization;
 mod on_demand_backups;
 #[path = "all/partiql_statements.rs"]
 mod partiql_statements;
+#[path = "all/partiql_transactions.rs"]
+mod partiql_transactions;
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]

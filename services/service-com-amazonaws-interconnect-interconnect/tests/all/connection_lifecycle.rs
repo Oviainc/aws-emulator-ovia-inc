@@ -7,17 +7,16 @@
 //!
 //! Every assertion here is about a RULE, checked over a table of inputs built from
 //! the live seeded catalog rather than from a copy of it: a row differs from its
-//! neighbours in the environment, the provider kind, the bandwidth, the attach-point
-//! union member, whether the optional members are present, and the region the request
-//! is signed for.
+//! neighbours in the environment, the provider kind, the bandwidth, the attach point
+//! the connection is created on, whether the optional members are present, and the
+//! region the request is signed for.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use serde_json::{json, Map, Value};
-use smithy_server_runtime::MultiServiceRouter;
+
+use crate::emulator::{remote_account_for, Emulator};
 
 /// The signing name the model gives this service; also its ARN namespace.
 const SIGNING_NAME: &str = "interconnect";
@@ -27,75 +26,16 @@ const ACCOUNT_ID: &str = "000000000000";
 /// the transition is due at a stored instant, so any wait past the span settles it.
 const SETTLE_WAIT: Duration = Duration::from_millis(700);
 
-/// One emulator: a router with only this service mounted, over one shared engine.
-struct Emulator {
-    router: MultiServiceRouter,
-}
+/// The gateways the rows below attach their connections to: an attach point IS a
+/// Direct Connect gateway of the account, so the suite creates its own and the rows
+/// differ in which one they use, in its name and in its `amazonSideAsn`. (The `arn`
+/// member of the union has its own suite,
+/// `create_connection_attach_point_validation`.)
+const GATEWAY_ROWS: [(&str, Option<i64>); 2] = [
+    ("ic-lifecycle-table-a", None),
+    ("ic-lifecycle-table-b", Some(64_512)),
+];
 
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Pinned off so the suite does not depend on the process-wide default; the
-        // Authorization header below is still what carries the credential scope.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    /// Call `operation` with `body`, signed for `region`. Returns the status and the
-    /// decoded JSON body.
-    async fn call_in(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
-        let authorization = format!(
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{SIGNING_NAME}/aws4_request, \
-             SignedHeaders=host;x-amz-date;x-amz-target, Signature=00"
-        );
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("host", "interconnect.localhost")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("Interconnect.{operation}"))
-            .header("authorization", authorization)
-            .body(Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let decoded = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, decoded)
-    }
-
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        self.call_in("us-east-1", operation, body).await
-    }
-
-    /// Call `operation` and require a 200, reporting the body when it is not.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
-        let (status, decoded) = self.call(operation, body).await;
-        assert_eq!(
-            status, 200,
-            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
-        );
-        decoded
-    }
-
-    /// Every seeded Environment, as `ListEnvironments` reports it.
-    async fn environments(&self) -> Vec<Value> {
-        let listed = self.ok("ListEnvironments", json!({})).await;
-        listed["environments"]
-            .as_array()
-            .expect("environments is a list")
-            .clone()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shape checks, written from the model's own constraints
@@ -180,20 +120,6 @@ fn expected_id_prefix(environment: &Value) -> &'static str {
     } else {
         "lmcc"
     }
-}
-
-/// An attach point naming a Direct Connect gateway by UUID.
-fn dxgw_attach_point(seed: u8) -> Value {
-    json!({ "directConnectGateway": format!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeee{seed:02}") })
-}
-
-/// An attach point naming another connection by full ARN (length 59..150).
-fn arn_attach_point(seed: u8) -> Value {
-    json!({
-        "arn": format!(
-            "arn:aws:interconnect:us-east-1:{ACCOUNT_ID}:connection/mcc-aaaaaa{seed:02}"
-        )
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +224,7 @@ async fn environment_catalog_is_seeded_and_every_filter_selects_its_subset() {
             })
             .cloned()
             .collect();
-        let listed = emulator.ok("ListEnvironments", filter.clone()).await;
+        let listed = emulator.ic_ok("ListEnvironments", filter.clone()).await;
         let actual = listed["environments"].as_array().cloned().unwrap_or_default();
         assert_eq!(
             actual, expected,
@@ -326,7 +252,7 @@ async fn environment_pages_walk_the_catalog_without_repeats_or_gaps() {
                 request.insert("nextToken".to_string(), json!(token));
             }
             let listed = emulator
-                .ok("ListEnvironments", Value::Object(request))
+                .ic_ok("ListEnvironments", Value::Object(request))
                 .await;
             let page = listed["environments"].as_array().cloned().unwrap_or_default();
             assert!(
@@ -361,7 +287,7 @@ async fn environment_pages_walk_the_catalog_without_repeats_or_gaps() {
         "env:",
     ] {
         let (status, body) = emulator
-            .call("ListEnvironments", json!({ "nextToken": token }))
+            .ic("ListEnvironments", json!({ "nextToken": token }))
             .await;
         assert_eq!(
             status, 400,
@@ -383,7 +309,7 @@ async fn get_environment_returns_the_record_the_list_returned() {
 
     for expected in &catalog {
         let id = text(expected, "environmentId");
-        let fetched = emulator.ok("GetEnvironment", json!({ "id": id })).await;
+        let fetched = emulator.ic_ok("GetEnvironment", json!({ "id": id })).await;
         assert_eq!(
             &fetched["environment"], expected,
             "case {id:?}: expected GetEnvironment to return the listed record, got {:?}",
@@ -392,7 +318,7 @@ async fn get_environment_returns_the_record_the_list_returned() {
     }
 
     for case in ["env-does-not-exist", "0", &"e".repeat(64)] {
-        let (status, body) = emulator.call("GetEnvironment", json!({ "id": case })).await;
+        let (status, body) = emulator.ic("GetEnvironment", json!({ "id": case })).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400 for an unknown environment, got {status} with {body:?}"
@@ -415,6 +341,7 @@ struct CreateCase {
     bandwidth: String,
     region: &'static str,
     attach_point: Value,
+    remote_account: Option<Value>,
     description: Option<String>,
     tags: Option<Value>,
 }
@@ -431,16 +358,21 @@ impl CreateCase {
         if let Some(tags) = &self.tags {
             request.insert("tags".to_string(), tags.clone());
         }
+        // The identifying information the row's Environment asks every create on it
+        // for, which is a property of the Environment and not of this table.
+        if let Some(remote_account) = &self.remote_account {
+            request.insert("remoteAccount".to_string(), remote_account.clone());
+        }
         Value::Object(request)
     }
 }
 
 /// The create table: every bandwidth of every environment that can take a
-/// connection, alternating the attach-point union member, the presence of the two
-/// optional members, and the region the request is signed for.
-fn create_table(catalog: &[Value]) -> Vec<(Value, CreateCase)> {
+/// connection, alternating the gateway the connection is attached to, the presence of
+/// the two optional members, and the region the request is signed for.
+fn create_table(catalog: &[Value], gateways: &[String]) -> Vec<(Value, CreateCase)> {
     let mut rows = Vec::new();
-    let mut seed = 0u8;
+    let mut seed = 0usize;
     for environment in catalog {
         if text(environment, "state") == "unavailable" {
             continue;
@@ -457,11 +389,10 @@ fn create_table(catalog: &[Value]) -> Vec<(Value, CreateCase)> {
                     } else {
                         "us-east-1"
                     },
-                    attach_point: if seed.is_multiple_of(2) {
-                        arn_attach_point(seed)
-                    } else {
-                        dxgw_attach_point(seed)
-                    },
+                    attach_point: json!({
+                        "directConnectGateway": gateways[seed % gateways.len()]
+                    }),
+                    remote_account: remote_account_for(environment),
                     description: if seed.is_multiple_of(3) {
                         None
                     } else {
@@ -486,7 +417,8 @@ fn create_table(catalog: &[Value]) -> Vec<(Value, CreateCase)> {
 async fn create_connection_computes_every_server_owned_member_and_persists_it() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let table = create_table(&catalog);
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = create_table(&catalog, &gateways);
     assert!(
         table.len() >= 4,
         "the create table must span several environments and bandwidths, got {} rows",
@@ -497,7 +429,7 @@ async fn create_connection_computes_every_server_owned_member_and_persists_it() 
 
     for (environment, case) in table {
         let (status, body) = emulator
-            .call_in(case.region, "CreateConnection", case.request())
+            .ic_in(case.region, "CreateConnection", case.request())
             .await;
         assert_eq!(
             status, 200,
@@ -634,7 +566,7 @@ async fn create_connection_computes_every_server_owned_member_and_persists_it() 
 
         // The stored record is what a read returns: same content, every member.
         let fetched = emulator
-            .ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok("GetConnection", json!({ "identifier": id }))
             .await;
         assert_eq!(
             fetched["connection"], connection,
@@ -651,15 +583,16 @@ async fn create_connection_computes_every_server_owned_member_and_persists_it() 
 async fn create_connection_replays_a_repeated_client_token() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let table = create_table(&catalog);
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = create_table(&catalog, &gateways);
 
     for (index, (environment, case)) in table.into_iter().enumerate() {
         let token = format!("token-{index}");
         let mut request = case.request();
         request["clientToken"] = json!(token);
 
-        let first = emulator.ok("CreateConnection", request.clone()).await;
-        let replay = emulator.ok("CreateConnection", request.clone()).await;
+        let first = emulator.ic_ok("CreateConnection", request.clone()).await;
+        let replay = emulator.ic_ok("CreateConnection", request.clone()).await;
         assert_eq!(
             replay["connection"], first["connection"],
             "case {case:?}: expected the same connection back for client token {token:?}, got {:?}",
@@ -668,7 +601,7 @@ async fn create_connection_replays_a_repeated_client_token() {
 
         let mut other = request.clone();
         other["clientToken"] = json!(format!("{token}-other"));
-        let fresh = emulator.ok("CreateConnection", other).await;
+        let fresh = emulator.ic_ok("CreateConnection", other).await;
         assert_ne!(
             fresh["connection"]["id"], first["connection"]["id"],
             "case {case:?}: expected a distinct connection for a distinct client token, got {:?}",
@@ -677,7 +610,7 @@ async fn create_connection_replays_a_repeated_client_token() {
 
         // Exactly two connections exist for this pair of tokens, not three.
         let listed = emulator
-            .ok(
+            .ic_ok(
                 "ListConnections",
                 json!({ "environmentId": case.environment_id }),
             )
@@ -727,7 +660,7 @@ async fn create_connection_replays_a_repeated_client_token() {
         }
 
         for (label, mismatched) in mismatches {
-            let (status, body) = emulator.call("CreateConnection", mismatched).await;
+            let (status, body) = emulator.ic("CreateConnection", mismatched).await;
             assert_eq!(
                 status, 400,
                 "case {case:?}/{label}: expected the reused token to be refused, got {status} with {body:?}"
@@ -746,11 +679,17 @@ async fn create_connection_replays_a_repeated_client_token() {
 async fn create_connection_refuses_what_the_environment_does_not_offer() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
+    // The rows below are about the BANDWIDTH, so each one attaches to an attach point
+    // of the account — a gateway that exists — and carries the identifying information
+    // its Environment asks for.
+    let gateway = emulator.attach_point().await;
+    let attach_point = json!({ "directConnectGateway": gateway });
 
     for environment in &catalog {
         let id = text(environment, "environmentId");
         let available = available_bandwidths(environment);
         let supported = supported_bandwidths(environment);
+        let remote_account = remote_account_for(environment);
 
         // A bandwidth the environment supports but does not currently offer, plus
         // one it does not even support: both are refused, and 1 Mbps/one past the
@@ -764,12 +703,14 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
         refused.push("40Gbps".to_string());
 
         for bandwidth in refused {
-            let request = json!({
-                "environmentId": id,
-                "bandwidth": bandwidth,
-                "attachPoint": dxgw_attach_point(7),
-            });
-            let (status, body) = emulator.call("CreateConnection", request).await;
+            let mut request = Map::new();
+            request.insert("environmentId".to_string(), json!(id));
+            request.insert("bandwidth".to_string(), json!(bandwidth));
+            request.insert("attachPoint".to_string(), attach_point.clone());
+            if let Some(remote_account) = &remote_account {
+                request.insert("remoteAccount".to_string(), remote_account.clone());
+            }
+            let (status, body) = emulator.ic("CreateConnection", Value::Object(request)).await;
             let case = format!("environment {id}, bandwidth {bandwidth}");
             assert_eq!(
                 status, 400,
@@ -794,12 +735,14 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
 
         // And every bandwidth the environment DOES offer is accepted.
         for bandwidth in available {
-            let request = json!({
-                "environmentId": id,
-                "bandwidth": bandwidth,
-                "attachPoint": dxgw_attach_point(8),
-            });
-            let (status, body) = emulator.call("CreateConnection", request).await;
+            let mut request = Map::new();
+            request.insert("environmentId".to_string(), json!(id));
+            request.insert("bandwidth".to_string(), json!(bandwidth));
+            request.insert("attachPoint".to_string(), attach_point.clone());
+            if let Some(remote_account) = &remote_account {
+                request.insert("remoteAccount".to_string(), remote_account.clone());
+            }
+            let (status, body) = emulator.ic("CreateConnection", Value::Object(request)).await;
             assert_eq!(
                 status, 200,
                 "case {id:?}/{bandwidth:?}: expected an available bandwidth to be accepted, got {status} with {body:?}"
@@ -809,12 +752,12 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
 
     // An environment that does not exist is a 400 client refusal, and creates nothing.
     let (status, body) = emulator
-        .call(
+        .ic(
             "CreateConnection",
             json!({
                 "environmentId": "env-does-not-exist",
                 "bandwidth": "1Gbps",
-                "attachPoint": dxgw_attach_point(9),
+                "attachPoint": attach_point,
             }),
         )
         .await;
@@ -823,7 +766,7 @@ async fn create_connection_refuses_what_the_environment_does_not_offer() {
         "case \"unknown environment\": expected HTTP 400, got {status} with {body:?}"
     );
     let listed = emulator
-        .ok(
+        .ic_ok(
             "ListConnections",
             json!({ "environmentId": "env-does-not-exist" }),
         )
@@ -845,20 +788,21 @@ async fn create_connection_stops_at_the_connection_quota() {
 
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let (_, case) = create_table(&catalog)
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let (_, case) = create_table(&catalog, &gateways)
         .into_iter()
         .next()
         .expect("the create table has rows");
 
     for index in 0..MAX_CONNECTIONS {
-        let (status, body) = emulator.call("CreateConnection", case.request()).await;
+        let (status, body) = emulator.ic("CreateConnection", case.request()).await;
         assert_eq!(
             status, 200,
             "case \"connection {index} of the quota\": expected HTTP 200, got {status} with {body:?}"
         );
     }
 
-    let (status, body) = emulator.call("CreateConnection", case.request()).await;
+    let (status, body) = emulator.ic("CreateConnection", case.request()).await;
     assert_eq!(
         status, 402,
         "case \"one past the quota\": expected the quota refusal's modelled status, got {status} with {body:?}"
@@ -877,7 +821,7 @@ async fn create_connection_stops_at_the_connection_quota() {
         if let Some(token) = &token {
             request.insert("nextToken".to_string(), json!(token));
         }
-        let listed = emulator.ok("ListConnections", Value::Object(request)).await;
+        let listed = emulator.ic_ok("ListConnections", Value::Object(request)).await;
         counted += listed["connections"]
             .as_array()
             .expect("connections is a list")
@@ -897,16 +841,16 @@ async fn create_connection_stops_at_the_connection_quota() {
     // record into its terminal `deleted` state.
     let first_id = {
         let listed = emulator
-            .ok("ListConnections", json!({ "maxResults": 1 }))
+            .ic_ok("ListConnections", json!({ "maxResults": 1 }))
             .await;
         text(&listed["connections"][0], "id")
     };
     emulator
-        .ok("DeleteConnection", json!({ "identifier": first_id }))
+        .ic_ok("DeleteConnection", json!({ "identifier": first_id }))
         .await;
     tokio::time::sleep(SETTLE_WAIT).await;
 
-    let (status, body) = emulator.call("CreateConnection", case.request()).await;
+    let (status, body) = emulator.ic("CreateConnection", case.request()).await;
     assert_eq!(
         status, 200,
         "case \"after deleting one of the quota\": expected the freed place to be usable, got {status} with {body:?}"
@@ -928,11 +872,12 @@ async fn create_connection_stops_at_the_connection_quota() {
 async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let table = create_table(&catalog);
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = create_table(&catalog, &gateways);
 
     let mut created: Vec<Value> = Vec::new();
     for (_, case) in &table {
-        let body = emulator.ok("CreateConnection", case.request()).await;
+        let body = emulator.ic_ok("CreateConnection", case.request()).await;
         created.push(body["connection"].clone());
     }
     assert!(
@@ -946,11 +891,11 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
     // filter expectations below are computed from the full listing.
     let deleted_id = text(&created[0], "id");
     emulator
-        .ok("DeleteConnection", json!({ "identifier": deleted_id }))
+        .ic_ok("DeleteConnection", json!({ "identifier": deleted_id }))
         .await;
     tokio::time::sleep(SETTLE_WAIT).await;
 
-    let all = emulator.ok("ListConnections", json!({})).await;
+    let all = emulator.ic_ok("ListConnections", json!({})).await;
     let all: Vec<Value> = all["connections"]
         .as_array()
         .expect("connections is a list")
@@ -1008,7 +953,7 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
             })
             .cloned()
             .collect();
-        let listed = emulator.ok("ListConnections", filter).await;
+        let listed = emulator.ic_ok("ListConnections", filter).await;
         let actual = listed["connections"].as_array().cloned().unwrap_or_default();
         assert_eq!(
             actual, expected,
@@ -1028,7 +973,7 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
             if let Some(token) = &token {
                 request.insert("nextToken".to_string(), json!(token));
             }
-            let listed = emulator.ok("ListConnections", Value::Object(request)).await;
+            let listed = emulator.ic_ok("ListConnections", Value::Object(request)).await;
             walked.extend(listed["connections"].as_array().cloned().unwrap_or_default());
             token = listed["nextToken"].as_str().map(str::to_string);
             if token.is_none() {
@@ -1049,7 +994,7 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
     // Same cursor rule here: a token ListConnections did not issue is refused.
     for token in ["not-a-cursor", "mcc-00000000", "env:env-csp-azure-us-east-1"] {
         let (status, body) = emulator
-            .call("ListConnections", json!({ "nextToken": token }))
+            .ic("ListConnections", json!({ "nextToken": token }))
             .await;
         assert_eq!(
             status, 400,
@@ -1061,7 +1006,7 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
     for summary in &all {
         let id = text(summary, "id");
         let fetched = emulator
-            .ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok("GetConnection", json!({ "identifier": id }))
             .await;
         let connection = &fetched["connection"];
         for member in [
@@ -1098,12 +1043,13 @@ async fn list_connections_applies_every_filter_and_pages_with_a_real_cursor() {
 async fn update_connection_changes_only_the_members_it_is_given() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
     // The clock-settle check costs real wall time, so it is made once rather than
     // on every row; the span is a single constant shared by all of them.
     let mut settle_checked = false;
 
     // Rows: description only, bandwidth only, both, and neither.
-    for (environment, case) in create_table(&catalog) {
+    for (environment, case) in create_table(&catalog, &gateways) {
         let available = available_bandwidths(&environment);
         let other_bandwidth = available
             .iter()
@@ -1120,7 +1066,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
             ),
             ("neither", None, None),
         ] {
-            let created = emulator.ok("CreateConnection", case.request()).await;
+            let created = emulator.ic_ok("CreateConnection", case.request()).await;
             let before = created["connection"].clone();
             let id = text(&before, "id");
             let label = format!("{label} on {id}");
@@ -1134,7 +1080,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
                 request.insert("bandwidth".to_string(), json!(bandwidth));
             }
             let updated = emulator
-                .ok("UpdateConnection", Value::Object(request))
+                .ic_ok("UpdateConnection", Value::Object(request))
                 .await;
             let after = updated["connection"].clone();
 
@@ -1206,7 +1152,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
             // is in flight the reported state may already have settled, so the
             // members under test are compared rather than the whole record.
             let fetched = emulator
-                .ok("GetConnection", json!({ "identifier": id }))
+                .ic_ok("GetConnection", json!({ "identifier": id }))
                 .await;
             if changed_bandwidth {
                 for member in ["description", "bandwidth", "billingTier", "id", "arn"] {
@@ -1241,7 +1187,7 @@ async fn update_connection_changes_only_the_members_it_is_given() {
                 settle_checked = true;
                 tokio::time::sleep(SETTLE_WAIT).await;
                 let settled = emulator
-                    .ok("GetConnection", json!({ "identifier": id }))
+                    .ic_ok("GetConnection", json!({ "identifier": id }))
                     .await;
                 let state = text(&settled["connection"], "state");
                 let progression = ["requested", "pending", "available"];
@@ -1272,14 +1218,15 @@ async fn update_connection_changes_only_the_members_it_is_given() {
 async fn update_connection_refuses_an_unknown_or_unofferable_change() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
-    let (environment, case) = create_table(&catalog)
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let (environment, case) = create_table(&catalog, &gateways)
         .into_iter()
         .next()
         .expect("the create table has rows");
 
     for identifier in ["mcc-00000000", "lmcc-zzzzzzzz"] {
         let (status, body) = emulator
-            .call(
+            .ic(
                 "UpdateConnection",
                 json!({ "identifier": identifier, "description": "new name" }),
             )
@@ -1289,7 +1236,7 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
             "case {identifier:?}: expected HTTP 404 for an unknown connection, got {status} with {body:?}"
         );
         let (status, body) = emulator
-            .call("GetConnection", json!({ "identifier": identifier }))
+            .ic("GetConnection", json!({ "identifier": identifier }))
             .await;
         assert_eq!(
             status, 404,
@@ -1299,7 +1246,7 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
 
     // A bandwidth the environment does not currently offer is refused on update
     // for the same reason as on create.
-    let created = emulator.ok("CreateConnection", case.request()).await;
+    let created = emulator.ic_ok("CreateConnection", case.request()).await;
     let id = text(&created["connection"], "id");
     let supported = supported_bandwidths(&environment);
     let available = available_bandwidths(&environment);
@@ -1310,7 +1257,7 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
     refused.push("40Gbps".to_string());
     for bandwidth in refused {
         let (status, body) = emulator
-            .call(
+            .ic(
                 "UpdateConnection",
                 json!({ "identifier": id, "bandwidth": bandwidth }),
             )
@@ -1320,7 +1267,7 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
             "case {bandwidth:?}: expected HTTP 400 for a bandwidth the environment does not offer, got {status} with {body:?}"
         );
         let fetched = emulator
-            .ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok("GetConnection", json!({ "identifier": id }))
             .await;
         assert_eq!(
             fetched["connection"]["bandwidth"], created["connection"]["bandwidth"],
@@ -1341,14 +1288,15 @@ async fn update_connection_refuses_an_unknown_or_unofferable_change() {
 async fn delete_connection_moves_through_deleting_to_deleted() {
     let emulator = Emulator::new();
     let catalog = emulator.environments().await;
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
     let mut deleted_ids: Vec<String> = Vec::new();
 
-    for (_, case) in create_table(&catalog) {
-        let created = emulator.ok("CreateConnection", case.request()).await;
+    for (_, case) in create_table(&catalog, &gateways) {
+        let created = emulator.ic_ok("CreateConnection", case.request()).await;
         let id = text(&created["connection"], "id");
 
         let deleted = emulator
-            .ok("DeleteConnection", json!({ "identifier": id }))
+            .ic_ok("DeleteConnection", json!({ "identifier": id }))
             .await;
         let state = text(&deleted["connection"], "state");
         assert_eq!(
@@ -1363,7 +1311,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
 
         // A repeat neither fails nor restarts the transition.
         let repeat = emulator
-            .ok("DeleteConnection", json!({ "identifier": id }))
+            .ic_ok("DeleteConnection", json!({ "identifier": id }))
             .await;
         assert_eq!(
             repeat["connection"], deleted["connection"],
@@ -1373,7 +1321,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
 
         // While it is on its way out, it is no longer modifiable.
         let (status, body) = emulator
-            .call(
+            .ic(
                 "UpdateConnection",
                 json!({ "identifier": id, "description": "too late" }),
             )
@@ -1391,7 +1339,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
     tokio::time::sleep(SETTLE_WAIT).await;
     for id in &deleted_ids {
         let fetched = emulator
-            .ok("GetConnection", json!({ "identifier": id }))
+            .ic_ok("GetConnection", json!({ "identifier": id }))
             .await;
         let state = text(&fetched["connection"], "state");
         assert_eq!(
@@ -1408,7 +1356,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
             ("deleting", false),
         ] {
             let listed = emulator
-                .ok("ListConnections", json!({ "state": wanted }))
+                .ic_ok("ListConnections", json!({ "state": wanted }))
                 .await;
             let present = listed["connections"]
                 .as_array()
@@ -1425,7 +1373,7 @@ async fn delete_connection_moves_through_deleting_to_deleted() {
 
     // A delete of something that never existed is a 404.
     let (status, body) = emulator
-        .call("DeleteConnection", json!({ "identifier": "mcc-ffffffff" }))
+        .ic("DeleteConnection", json!({ "identifier": "mcc-ffffffff" }))
         .await;
     assert_eq!(
         status, 404,

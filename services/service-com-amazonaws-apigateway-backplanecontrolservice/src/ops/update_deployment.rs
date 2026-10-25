@@ -82,17 +82,16 @@ use crate::state::{
     patch_optional_string, DeploymentEntry, Patch, PatchFailure, MAX_STRING_CHARS,
 };
 
-/// The patch paths a `Deployment` accepts.
-///
-/// The `Deployment` shape this service models declares four members — `id`,
-/// `createdDate`, `apiSummary` and `description` (`smithy_query(query="shape",
-/// shape="Deployment")`) — and the first three are not caller-set: the service mints the
-/// `id` and stamps the `createdDate`, and the `apiSummary` is the snapshot of the API's
-/// methods taken when the deployment was created (`Deployment$apiSummary`: "A summary of
-/// the RestApi at the date and time that the deployment resource was created"), which a
-/// later edit would stop being. So `description` is the one member "Changes information
-/// about a Deployment resource" can change.
-const SUPPORTED_PATHS: &[&str] = &["/description"];
+// The patch paths a `Deployment` accepts are the ones `apply_patch` below has an arm for.
+//
+// The `Deployment` shape this service models declares four members — `id`,
+// `createdDate`, `apiSummary` and `description` (`smithy_query(query="shape",
+// shape="Deployment")`) — and the first three are not caller-set: the service mints the
+// `id` and stamps the `createdDate`, and the `apiSummary` is the snapshot of the API's
+// methods taken when the deployment was created (`Deployment$apiSummary`: "A summary of
+// the RestApi at the date and time that the deployment resource was created"), which a
+// later edit would stop being. So `description` is the one member "Changes information
+// about a Deployment resource" can change.
 
 /// Apply one patch to a COPY of a stored deployment.
 fn apply_patch(entry: &mut DeploymentEntry, patch: &Patch) -> Result<(), PatchFailure> {
@@ -101,7 +100,7 @@ fn apply_patch(entry: &mut DeploymentEntry, patch: &Patch) -> Result<(), PatchFa
         // single-valued optional string member: `add`/`replace` set it, `remove` clears
         // it, and any other op is refused as unsupported.
         "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
-        _ => Err(patch.unsupported_path(SUPPORTED_PATHS)),
+        _ => Err(patch.unsupported_path()),
     }
 }
 

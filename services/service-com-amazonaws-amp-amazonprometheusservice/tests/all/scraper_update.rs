@@ -8,9 +8,10 @@
 //! what the service PERSISTED rather than what the request carried.
 //!
 //! The store is seeded directly here, through the same engine the mounted service reads
-//! ([`crate::scraper_listing::seed`]): `CreateScraper` is still scaffolded (its own stub
-//! issue), so seeding is how a scraper exists to update at all — and it is the same record
-//! the handlers read, not a second copy of it.
+//! ([`crate::scraper_listing::seed`]): seeding is how a scraper of an EXACT stored shape —
+//! a chosen id, status, source and destination — exists to update, and it is the same
+//! record the handlers read, not a second copy of it. `CreateScraper` itself is driven in
+//! `crate::scraper_creation`.
 
 use crate::scraper_listing::{dataset_destination, eks_source, scraper, seed, workspace_destination};
 use crate::workspace_lifecycle::{tags_of, text, wait_for_due_transition, Amp};
@@ -47,7 +48,7 @@ const UNTOUCHED_MEMBERS: [&str; 6] = [
 /// The wire form of a `ScrapeConfiguration`: a union whose `configurationBlob` member is a
 /// blob, and `restJson1` carries a blob as base-64 — encoded with the runtime's own
 /// encoder, so no second encoding rule is written here.
-fn scrape_configuration_json(yaml: &str) -> serde_json::Value {
+pub(crate) fn scrape_configuration_json(yaml: &str) -> serde_json::Value {
     serde_json::json!({
         "configurationBlob": ::aws_smithy_types::base64::encode(yaml.as_bytes()),
     })
@@ -55,7 +56,7 @@ fn scrape_configuration_json(yaml: &str) -> serde_json::Value {
 
 /// An OpenSearch exporter, named by the domain ARN `OpenSearchExporterConfiguration`
 /// models. `ExporterList` is `len ..1`, so one entry is the whole range.
-fn exporters_json(domain: &str) -> serde_json::Value {
+pub(crate) fn exporters_json(domain: &str) -> serde_json::Value {
     serde_json::json!([{
         "openSearchConfiguration": {
             "domainArn": format!(
@@ -68,7 +69,7 @@ fn exporters_json(domain: &str) -> serde_json::Value {
 
 /// A cross-account role configuration, both ARNs satisfying `IamRoleArn`'s pattern
 /// `^arn:aws[-a-z]*:iam::[0-9]{12}:role/.+$`.
-fn role_configuration_json() -> serde_json::Value {
+pub(crate) fn role_configuration_json() -> serde_json::Value {
     let account = engine::emulator_account_id();
     serde_json::json!({
         "sourceRoleArn": format!("arn:aws:iam::{account}:role/aps-source"),

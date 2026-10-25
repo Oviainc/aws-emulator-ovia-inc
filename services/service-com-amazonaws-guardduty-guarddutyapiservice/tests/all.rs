@@ -45,6 +45,8 @@ mod filter_delete;
 mod filter_lifecycle;
 #[path = "all/filter_listing.rs"]
 mod filter_listing;
+#[path = "all/filter_update_isolation.rs"]
+mod filter_update_isolation;
 #[path = "all/finding_field_catalog.rs"]
 mod finding_field_catalog;
 #[path = "all/findings_archive_state.rs"]
