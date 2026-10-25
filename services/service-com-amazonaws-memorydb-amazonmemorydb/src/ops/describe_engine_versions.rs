@@ -168,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         }
-        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+        if let Some(message) = crate::state::max_results_rejection(
+            crate::state::PageSizeNoun::Records,
+            input.max_results,
+        ) {
             // A page size outside the window names no page: the same refusal every
             // other listing in this service makes, carried by this operation's own
             // modelled 400.

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource policy attached to one Bedrock resource of this account.
+//!
+//! A REPORTING operation (`@readonly`): it hands back the document
+//! `PutResourcePolicy` stored, byte for byte, and changes nothing a later caller sees —
+//! the only write on this path is the one the CLOCK already made due, the status
+//! transitions resolving the resource materialises, which a read of that resource itself
+//! would have materialised at the same instant. A resource that holds no policy — none
+//! was ever attached, or the resource the ARN names is not one this account holds — is
+//! answered 404 `ResourceNotFoundException`, the error this operation models for a
+//! resource that was not found.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +151,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "resource policy state is not available on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(document) = store.resource_policy(&input.resource_arn, &region, now) else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no resource policy is attached to {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            resource_policy: Some(document.to_string()),
+        })
     }
 }

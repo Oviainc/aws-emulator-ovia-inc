@@ -143,14 +143,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         state.settle();
 
         // This operation models no not-found error, so an id that names no stored
-        // template is refused as an invalid request rather than answered as a no-op: the
-        // output reports the id that WAS deleted, and there was none.
-        let Some(record) = state.remove_job_template(&input.id) else {
+        // template in this region is refused as an invalid request rather than answered
+        // as a no-op: the output reports the id that WAS deleted, and there was none.
+        let Some(record) = state.remove_job_template(&region, &input.id) else {
             return Err(DeleteJobTemplateErrorModeled::ValidationException(
                 ValidationException {
                     // The same not-found message form the read path uses: `<Resource

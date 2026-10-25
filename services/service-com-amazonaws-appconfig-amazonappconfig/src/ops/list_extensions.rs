@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExtensions
-//! IMPLEMENTED: reports the extensions this account holds, newest version of each, in
-//! name order, a page at a time.
+//! IMPLEMENTED: reports the whole extension catalogue this account can see, newest
+//! version of each, in name order, a page at a time.
 //!
 //! The model documents this operation as listing "all custom and Amazon Web Services
-//! authored AppConfig extensions in the account". Only the custom ones are reported: this
-//! emulator stores no record for an AWS-authored extension — nothing here creates one, no
-//! operation invokes one, and the model carries neither their names nor their definitions
-//! — so a catalog of them here would be invented rather than read. Every summary this
-//! operation answers is read out of the state a `CreateExtension` call wrote.
+//! authored AppConfig extensions in the account", so the listing is the union of both
+//! halves of the catalogue [`crate::state::ComAmazonawsAppconfigAmazonappconfigState::all_extensions`]
+//! answers with: AppConfig's AWS-authored extensions, which every account can read
+//! without having created one, and the extensions a `CreateExtension` call wrote. Every
+//! summary is read off that record, so the listing cannot disagree with `GetExtension`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListExtensionsErrorModeled::InternalServerException(
@@ -156,16 +156,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
 
-        // One summary per extension, built from its LATEST version: a summary carries a
-        // single `VersionNumber`, and an extension's current definition is its newest
-        // version. `Name` narrows the listing to the extension that carries that name,
-        // which is unique per account. Every member — the ARN included — is read off the
-        // stored version rather than rebuilt here, so the listing cannot disagree with
-        // what `GetExtension` reports.
+        // One summary per extension of the catalogue, built from its LATEST version: a
+        // summary carries a single `VersionNumber`, and an extension's current definition
+        // is its newest version. `Name` narrows the listing to the extension that carries
+        // that name, which is unique per account. Every member — the ARN included — is
+        // read off the record rather than rebuilt here, so the listing cannot disagree
+        // with what `GetExtension` reports for the same extension.
         let mut listed: Vec<(String, ExtensionSummary)> = store
-            .created_extensions()
+            .all_extensions(&region)
+            .into_iter()
             .filter(|extension| {
                 input
                     .name

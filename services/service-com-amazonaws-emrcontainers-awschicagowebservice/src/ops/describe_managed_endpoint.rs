@@ -149,13 +149,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let mut state = store.lock();
         // Reporting, but it materialises what the clock already owed: the CREATING ->
         // ACTIVE step was due at that instant whether or not anybody looked.
         state.settle();
 
-        let Some(record) = state.managed_endpoint(&input.virtual_cluster_id, &input.id) else {
+        // Resolved in the region this request is signed for: an endpoint created at
+        // another region's endpoint does not exist here.
+        let Some(record) = state.managed_endpoint(&region, &input.virtual_cluster_id, &input.id)
+        else {
             return Err(
                 DescribeManagedEndpointErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

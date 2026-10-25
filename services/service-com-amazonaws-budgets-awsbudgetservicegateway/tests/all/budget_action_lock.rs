@@ -45,8 +45,15 @@ fn is_in_progress(status: &str) -> bool {
 
 /// A second `ExecutionRoleArn`, satisfying `RoleArn`'s `@length(32, 618)` and its
 /// `arn:aws:iam::<12 digits>:role/<name>` pattern — so an accepted update is visible and
-/// a refused one is too.
-const OTHER_EXECUTION_ROLE: &str = "arn:aws:iam::111122223333:role/budget-action-replacement";
+/// a refused one is too. It names a role in the account the action lives in, which is the
+/// only account this service serves: "roles and actions must be in the same account"
+/// (`Action$ExecutionRoleArn`).
+fn other_execution_role() -> String {
+    format!(
+        "arn:aws:iam::{}:role/budget-action-replacement",
+        caller_account()
+    )
+}
 
 /// A second `Definition.IamActionDefinition`, which is the format the action type these
 /// rows are created with (`APPLY_IAM_POLICY`) names.
@@ -83,7 +90,7 @@ fn update_patches() -> Vec<(&'static str, Value)> {
         ("definition", json!({"Definition": other_iam_definition()})),
         (
             "execution-role",
-            json!({"ExecutionRoleArn": OTHER_EXECUTION_ROLE}),
+            json!({"ExecutionRoleArn": other_execution_role()}),
         ),
         (
             "subscribers",
@@ -105,7 +112,7 @@ fn update_patches() -> Vec<(&'static str, Value)> {
             "every-member",
             json!({
                 "Definition": other_iam_definition(),
-                "ExecutionRoleArn": OTHER_EXECUTION_ROLE,
+                "ExecutionRoleArn": other_execution_role(),
                 "Subscribers": [email_subscriber(7)],
                 "NotificationType": "FORECASTED",
                 "ApprovalModel": "AUTOMATIC",
@@ -263,7 +270,7 @@ async fn the_lock_covers_every_mutating_budget_action_method() {
                             &account_id,
                             budget_name,
                             &action_id,
-                            &json!({"ExecutionRoleArn": OTHER_EXECUTION_ROLE}),
+                            &json!({"ExecutionRoleArn": other_execution_role()}),
                         ),
                     )
                     .await
@@ -329,7 +336,7 @@ async fn the_clock_releases_the_lock_an_execution_took() {
     // its update meets the lock.
     let patch = json!({
         "Definition": other_iam_definition(),
-        "ExecutionRoleArn": OTHER_EXECUTION_ROLE,
+        "ExecutionRoleArn": other_execution_role(),
         "Subscribers": [email_subscriber(4)]
     });
     let request = update_body(&account_id, budget_name, &action_id, &patch);

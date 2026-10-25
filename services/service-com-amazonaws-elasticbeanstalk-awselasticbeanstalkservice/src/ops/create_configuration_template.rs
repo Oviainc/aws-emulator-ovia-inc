@@ -451,6 +451,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             solution_stack_name,
             platform_arn,
             option_settings,
+            // The settings are stored by this call, so the configuration set
+            // this record holds is the one in effect for the template from
+            // here on.
+            deployment_status: crate::state::DEPLOYMENT_STATUS_DEPLOYED.to_string(),
             date_created: created,
             date_updated: created,
             tags: input.tags.clone().unwrap_or_default(),

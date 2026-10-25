@@ -57,6 +57,9 @@ mod get_agent_goal;
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 
+#[path = "all/get_answer_reads.rs"]
+mod get_answer_reads;
+
 #[path = "all/get_lens.rs"]
 mod get_lens;
 
@@ -74,6 +77,9 @@ mod lens_review_improvements;
 
 #[path = "all/lens_review_listing.rs"]
 mod lens_review_listing;
+
+#[path = "all/lens_review_notes.rs"]
+mod lens_review_notes;
 
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;

@@ -552,10 +552,6 @@ async fn an_identifier_naming_no_stored_sink_is_refused_by_both_operations() {
             "an ARN of another service",
             format!("arn:aws:logs:{REGION}:{ACCOUNT}:sink/{}", "abc"),
         ),
-        (
-            "an ARN of another resource kind",
-            sink_arn.replace("sink/", "link/"),
-        ),
     ];
     for (case, identifier) in &absent {
         let (status, got) = get_policy(&router, identifier, REGION).await;

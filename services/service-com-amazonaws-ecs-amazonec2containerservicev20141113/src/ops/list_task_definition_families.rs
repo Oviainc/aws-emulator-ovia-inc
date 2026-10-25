@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTaskDefinitionFamilies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTaskDefinitionFamilies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTaskDefinitionFamilies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the NAMES of the task-definition families the stored revisions belong to,
+//! narrowed by `familyPrefix` and by whether the family still has an `ACTIVE` revision,
+//! ordered lexicographically and paged in that order. A reporting operation: it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +172,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTaskDefinitionFamilies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTaskDefinitionFamiliesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTaskDefinitionFamilies"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTaskDefinitionFamiliesErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(
+                    ListTaskDefinitionFamiliesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "maxResults must be between 1 and {}; got {max_results}",
+                                crate::state::MAX_LIST_PAGE_SIZE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let guard = state.lock();
+
+        // `nextToken`: "This token should be treated as an opaque identifier that is only
+        // used to retrieve the next items in a list". This operation mints it as the NAME
+        // of the family the next page starts at, so a value that names no family this
+        // account holds a revision of is an identifier that names no page — a
+        // `ClientException`, the error for a request "specifying an identifier that isn't
+        // valid" — rather than being read as some insertion point in the sequence. The
+        // family only has to be STORED, whatever its revisions' status: a token minted
+        // mid-walk still resumes after the family it names has dropped out of this
+        // listing's own filter.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token)
+                if guard
+                    .task_definitions
+                    .keys()
+                    .any(|(family, _)| family == token) =>
+            {
+                Some(token.to_string())
+            }
+            Some(_) => {
+                return Err(ListTaskDefinitionFamiliesErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // "Returns a list of task definition families that are registered to your account.
+        // This list includes task definition families that no longer have any ACTIVE task
+        // definition revisions" — a family is registered to the account exactly while a
+        // revision of it is stored, whatever that revision's status, so both the family
+        // set and each family's ACTIVE-ness are derived from the stored revisions. The
+        // map is keyed by the family name, so the listing is already in the lexicographic
+        // order the token walks.
+        let mut has_active: ::std::collections::BTreeMap<&str, bool> =
+            ::std::collections::BTreeMap::new();
+        for record in guard.task_definitions.values() {
+            let active = record.status == crate::state::TASK_DEFINITION_ACTIVE;
+            has_active
+                .entry(record.family.as_str())
+                .and_modify(|seen| *seen |= active)
+                .or_insert(active);
+        }
+
+        // "By default, both ACTIVE and INACTIVE task definition families are listed. If
+        // this parameter is set to ACTIVE, only task definition families that have an
+        // ACTIVE task definition revision are returned. If this parameter is set to
+        // INACTIVE, only task definition families that do not have any ACTIVE task
+        // definition revisions are returned." The third `TaskDefinitionFamilyStatus`
+        // value, `ALL`, is that default made explicit, so it narrows nothing.
+        let wanted_active = match input.status.as_deref() {
+            Some(crate::state::TASK_DEFINITION_ACTIVE) => Some(true),
+            Some(crate::state::TASK_DEFINITION_INACTIVE) => Some(false),
+            _ => None,
+        };
+
+        let matching: Vec<&str> = has_active
+            .iter()
+            // "If you specify a familyPrefix, only task definition family names that begin
+            // with the familyPrefix string are returned" — a LEADING FRAGMENT of a name,
+            // not the whole name.
+            .filter(|(family, _)| {
+                input
+                    .family_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| family.starts_with(prefix))
+            })
+            .filter(|(_, active)| wanted_active.is_none_or(|wanted| **active == wanted))
+            .map(|(family, _)| *family)
+            .collect();
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+        // The token names the family the next page starts at, so a page is unaffected by
+        // families registered before it.
+        let start = match resume_at.as_deref() {
+            Some(resume) => matching.partition_point(|family| *family < resume),
+            None => 0,
+        };
+        // `start` is either 0 or a `partition_point` result, so it never exceeds the
+        // length and the slice below is always in range.
+        let end = start.saturating_add(page_size).min(matching.len());
+        let families: Vec<String> = matching[start..end]
+            .iter()
+            .map(|family| (*family).to_string())
+            .collect();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).map(|family| (*family).to_string());
+
+        Ok(ListTaskDefinitionFamiliesOutput {
+            families: Some(families),
+            next_token,
+        })
     }
 }

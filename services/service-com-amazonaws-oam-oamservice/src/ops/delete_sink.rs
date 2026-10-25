@@ -136,6 +136,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `Identifier`'s presence and its `ResourceIdentifier` pattern are modelled
         // constraints, already refused by the centralized walk before this body runs.
+        //
+        // An identifier naming the OTHER resource kind cannot be authorized for this
+        // action, and that decision is taken before the sink table is consulted, so
+        // the refusal says nothing about what is stored.
+        crate::state::require_resource_kind(
+            Self::NAME,
+            &input.identifier,
+            crate::state::ResourceKind::Sink,
+        )?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSinkErrorModeled::InternalServiceFault(InternalServiceFault {
                 message: Some("the sink store is unavailable".to_string()),
@@ -153,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|sink| (sink.id.clone(), sink.arn.clone()))
             .ok_or_else(|| {
                 DeleteSinkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "no sink matching '{}' exists in this account and Region",
-                        input.identifier
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                     ..Default::default()
                 })
             })?;

@@ -161,6 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carried to a terminal state.
         store.settle(now);
 
+        // The account/region device precondition, FIRST: a Region this account has
+        // activated no device in is refused before the addressed task id is
+        // resolved, so a repeated cancel there is refused the same way every time
+        // instead of reporting whether that task exists.
+        if !store.has_devices_in(&region) {
+            return Err(CancelTaskErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
+
         let Some(task) = store.task_in(&region, &input.task_id) else {
             return Err(CancelTaskErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::TASK_RESOURCE_TYPE, &input.task_id),

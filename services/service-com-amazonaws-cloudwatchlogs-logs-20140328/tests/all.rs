@@ -19,6 +19,8 @@ mod account_policy_release;
 mod account_policy_removal;
 #[path = "all/account_policy_selection_criteria.rs"]
 mod account_policy_selection_criteria;
+#[path = "all/anomaly_suppression.rs"]
+mod anomaly_suppression;
 #[path = "all/data_protection_policies.rs"]
 mod data_protection_policies;
 #[path = "all/data_protection_policy.rs"]
@@ -71,6 +73,8 @@ mod query_definitions;
 mod refusal_error_codes;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tag_removal.rs"]

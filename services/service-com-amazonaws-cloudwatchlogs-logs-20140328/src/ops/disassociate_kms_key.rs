@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(group) = store.log_groups.get_mut(&name) else {
                     return Err(DisassociateKmsKeyErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some("The specified log group does not exist".to_string()),
+                            message: Some(crate::state::resource_not_found_message("log group")),
                         },
                     )
                     .into());

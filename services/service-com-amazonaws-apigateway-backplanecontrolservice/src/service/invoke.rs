@@ -39,7 +39,10 @@
 //!    `{parameter}`, which beats a greedy `{proxy+}`;
 //! 4. the request's verb names a method of that resource in the deployment, or the
 //!    `ANY` catch-all;
-//! 5. the method's deployed `authorizationType` and `apiKeyRequired` are enforced;
+//! 5. the method's deployed `authorizationType` and `apiKeyRequired` are enforced — a
+//!    key-required method admits only an enabled API key the records associate with THIS
+//!    stage, through a usage plan over that api stage or the key's own deprecated
+//!    `stageKeys`, and refuses every other request before the integration is reached;
 //! 6. the method's integration decides the response.
 //!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
@@ -542,9 +545,7 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
     if let Some(refusal) = authorization_refusal(api, live_method, authorization_type, req) {
         return refusal_response(Some(api), refusal);
     }
-    if snapshot.api_key_required
-        && !api_key_admits(&store.api_keys, api, &stage.stage_name, req)
-    {
+    if snapshot.api_key_required && !api_key_admits(&store, api, &stage.stage_name, req) {
         return refusal_response(Some(api), INVALID_API_KEY);
     }
 
@@ -647,11 +648,14 @@ fn authorization_refusal(
 ///
 /// The key travels in [`API_KEY_HEADER`] when the API's `apiKeySource` is `HEADER`; the
 /// other documented source reads it from a custom authorizer's returned context, which is
-/// a decision this emulator cannot obtain, so no key is presented for it. A key admits the
-/// call when it is enabled and its `stageKeys` name this API's stage — the association
-/// `UpdateApiKey`'s `/stages` patch writes.
+/// a decision this emulator cannot obtain, so no key is presented for it.
+///
+/// A key admits the call when it is ENABLED and this api's `stage` is among the stages the
+/// records associate it with — see [`associates_stage`] for the two associations that say
+/// so. A value no stored key carries, a disabled key and a key associated with some other
+/// stage are each a key that does not admit the call.
 fn api_key_admits(
-    keys: &std::collections::BTreeMap<String, ApiKeyEntry>,
+    store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
     api: &RestApiEntry,
     stage: &str,
     req: &RtRequest,
@@ -666,9 +670,40 @@ fn api_key_admits(
     let Some(presented) = req.headers().get(API_KEY_HEADER).filter(|key| !key.is_empty()) else {
         return false;
     };
-    let stage_key = format!("{}/{stage}", api.id);
-    keys.values()
-        .any(|key| key.value == presented && key.enabled && key.stage_keys.contains(&stage_key))
+    store
+        .api_keys
+        .values()
+        .filter(|key| key.value == presented && key.enabled)
+        .any(|key| associates_stage(store, key, api, stage))
+}
+
+/// Whether the records associate `key` with `stage` of `api`, in EITHER of the two
+/// associations this service's model carries.
+///
+/// A USAGE PLAN is the current one: a `UsagePlan` is "used to specify who can access
+/// associated API stages", its `apiStages` name the api and stage its limits apply to, and
+/// a `UsagePlanKey` is the association of one stored API key with one plan. So a client
+/// creates the key, a plan over the api stage, and a plan key — and that key is what the
+/// stage admits.
+///
+/// The key's own `stageKeys` is the OLDER one, which `CreateApiKey$stageKeys` documents as
+/// "DEPRECATED FOR USAGE PLANS - Specifies stages associated with the API key". It is
+/// honoured beside the plan because the operations that write it still accept it, and a
+/// deprecated association is still an association.
+fn associates_stage(
+    store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    key: &ApiKeyEntry,
+    api: &RestApiEntry,
+    stage: &str,
+) -> bool {
+    let metered_for_stage = store.usage_plans.values().any(|plan| {
+        plan.keys.contains_key(&key.id)
+            && plan.api_stages.iter().any(|api_stage| {
+                api_stage.api_id.as_deref() == Some(api.id.as_str())
+                    && api_stage.stage.as_deref() == Some(stage)
+            })
+    });
+    metered_for_stage || key.stage_keys.contains(&format!("{}/{stage}", api.id))
 }
 
 /// Serve the call through the method's integration.

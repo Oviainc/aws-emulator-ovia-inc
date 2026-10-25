@@ -63,6 +63,24 @@ use std::sync::Arc;
 /// operation-aware refusal seam in the framework, which this service cannot add.
 const TAGGING_ONLY_MEMBERS: &[&str] = &["resourceArn", "tagKeys"];
 
+/// The body validator's clause for one violation, or `None` when the violation is not
+/// a `@pattern` one.
+///
+/// The clause states the rule the value had to satisfy — the member's own regular
+/// expression, which the front end evaluates as an ECMA-262 one — and the value that
+/// did not satisfy it. Both come from this request: the pattern from the model member
+/// the value was sent for, the string from the request itself (already bounded by the
+/// framework, which elides a long echoed value before it reaches here).
+fn ecma_262_clause(violation: &Violation) -> Option<String> {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    let shown = violation.value.as_deref().unwrap_or_default();
+    Some(format!(
+        "ECMA 262 regex \"{pattern}\" does not match input string \"{shown}\""
+    ))
+}
+
 /// The `com-amazonaws-oam-oamservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -114,19 +132,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // OAM models its own two client-input errors and uses them where the
-        // framework's default wording would say `ValidationException`: a member the
-        // request left out is `MissingRequiredParameterException` ("A required
-        // parameter is missing from the request") and a value outside a declared
-        // bound, pattern or enum is `InvalidParameterException` ("A parameter is
-        // specified incorrectly"). Both are HTTP 400, which is the status this
-        // refusal already carries, so only the code and the message change.
+        // Two layers answer a refused request, and they do not answer alike.
+        //
+        // The REST front end validates the request BODY against the model's
+        // constraint traits, and a value outside a declared `@pattern` is refused
+        // there, before the service sees the request at all: HTTP 400
+        // `BadRequestException` (a code no operation of this service declares, because
+        // the front end is not the service), with the body-validation message naming
+        // the regular expression the value had to satisfy and the value that did not.
+        //
+        // Everything else is the SERVICE's own wording, and OAM models its own two
+        // client-input errors for it: a member the request left out is
+        // `MissingRequiredParameterException` ("A required parameter is missing from
+        // the request") and a value outside a declared bound, enum or uniqueness rule
+        // is `InvalidParameterException` ("A parameter is specified incorrectly").
+        // Both are HTTP 400, which is the status this refusal already carries, so only
+        // the code and the message change.
         //
         // The three tagging operations are the exception: `ListTagsForResource`,
-        // `TagResource` and `UntagResource` model `ValidationException` and neither
-        // of the two codes above, and they are the only operations that bind
-        // `ResourceArn` and `TagKeys` — so a violation on one of those members keeps
-        // the `ValidationException` the default already names.
+        // `TagResource` and `UntagResource` model `ValidationException` and neither of
+        // the two codes above, and they are the only operations that bind
+        // `ResourceArn` and `TagKeys` — which are an `@httpLabel` and an `@httpQuery`,
+        // so they are not part of a request BODY and the body validator above never
+        // judges them. A violation on one of those members therefore keeps the
+        // `ValidationException` the default already names.
         let violations = match refusal {
             Refusal::Invalid(violations) => violations,
             // An authentication refusal is the framework's 403 to word, not ours.
@@ -142,6 +171,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             TAGGING_ONLY_MEMBERS.contains(&member)
         }) {
             return None;
+        }
+        // A value the model's own regular expression does not admit is the front end's
+        // refusal, whichever member and whichever operation carried it.
+        let pattern_clauses: Vec<String> = violations
+            .iter()
+            .filter_map(ecma_262_clause)
+            .collect();
+        if !pattern_clauses.is_empty() {
+            return Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: format!("Invalid request body: [{}]", pattern_clauses.join(", ")),
+            });
         }
         // One absent member makes the whole request a missing-parameter refusal; the
         // caller has to supply it before any other complaint matters.

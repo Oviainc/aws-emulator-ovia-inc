@@ -83,6 +83,8 @@ mod resource_tags;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags_from_creates.rs"]
+mod tags_from_creates;
 #[path = "all/trusted_token_issuers.rs"]
 mod trusted_token_issuers;
 #[path = "all/validation_message_wording.rs"]
