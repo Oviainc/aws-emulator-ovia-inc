@@ -16,11 +16,15 @@
 //! the ones its model declares, and an authorization code is declared for no
 //! operation of this service.
 //!
-//! `DeleteAllPolicyResources` asks the real service to clean up the protections
-//! and managed resources the policy created in member accounts. This emulator
-//! creates none — no WAF web ACL, Shield protection or Network Firewall exists
-//! here to clean up — so the policy and its tags are removed either way, which
-//! is the whole of the state this flag could reach.
+//! `DeleteAllPolicyResources` selects what becomes of the objects Firewall
+//! Manager holds BECAUSE of the policy, as opposed to the policy itself: the
+//! policy record and its tag-index entry go on every delete, and the policy's
+//! own protections — in this store, the violations an evaluation of this policy
+//! recorded and the attacks recorded against the resources it protects — are
+//! taken with it only when the cleanup is asked for, and otherwise left in
+//! place. [`crate::state::ComAmazonawsFmsAwsfms20180101State::delete_policy`] is
+//! both halves, so no other reader of the store can disagree about which of them
+//! a given delete did.
 //!
 //! ## Shape of an operation
 //!
@@ -200,14 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // `PolicyId` is an opaque lookup key: the store decides the answer, and
         // an id no stored policy carries is the modelled not-found, so nothing
-        // is removed.
-        let Some(removed) = store.policies.remove(&input.policy_id) else {
+        // is removed. The request's cleanup selector decides how far the
+        // removal reaches — the policy alone, or the policy and everything this
+        // store holds on its behalf.
+        if store
+            .delete_policy(&input.policy_id, input.delete_all_policy_resources)
+            .is_none()
+        {
             return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )
             .into());
-        };
-        store.tags_by_arn.remove(&removed.policy_arn);
+        }
         Ok(DeletePolicyOutput)
     }
 }

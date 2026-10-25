@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 
-use crate::global_network_lifecycle::{error_code, expected_arn, Emulator};
+use crate::global_network_lifecycle::{error_code, expected_arn, expected_scoped_arn, Emulator};
 use crate::resource_tagging::{tags_uri, untag_uri};
 
 /// The constant text AWS answers, from the two recordings above.
@@ -162,7 +162,7 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
         NotFoundCase {
             case: "ListTagsForResource on the ARN of a device that never existed",
             method: "GET",
-            uri: tags_uri(&expected_arn(DEVICE, &unknown_device)),
+            uri: tags_uri(&expected_scoped_arn(DEVICE, &live_network, &unknown_device)),
             body: None,
             resource_id: unknown_device.clone(),
             resource_type: DEVICE,
@@ -178,7 +178,7 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
         NotFoundCase {
             case: "TagResource on the ARN of a deleted site",
             method: "POST",
-            uri: tags_uri(&expected_arn(SITE, &gone_site)),
+            uri: tags_uri(&expected_scoped_arn(SITE, &live_network, &gone_site)),
             body: Some(json!({ "Tags": [{ "Key": "env", "Value": "test" }] })),
             resource_id: gone_site.clone(),
             resource_type: SITE,
@@ -194,7 +194,7 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
         NotFoundCase {
             case: "UntagResource on the ARN of a link that never existed",
             method: "DELETE",
-            uri: untag_uri(&expected_arn(LINK, &unknown_link), &["env"]),
+            uri: untag_uri(&expected_scoped_arn(LINK, &live_network, &unknown_link), &["env"]),
             body: None,
             resource_id: unknown_link.clone(),
             resource_type: LINK,
@@ -202,7 +202,7 @@ async fn every_not_found_refusal_carries_the_constant_message_and_identifies_the
         NotFoundCase {
             case: "ListTagsForResource on the ARN of a site that never existed",
             method: "GET",
-            uri: tags_uri(&expected_arn(SITE, &unknown_site)),
+            uri: tags_uri(&expected_scoped_arn(SITE, &live_network, &unknown_site)),
             body: None,
             resource_id: unknown_site,
             resource_type: SITE,

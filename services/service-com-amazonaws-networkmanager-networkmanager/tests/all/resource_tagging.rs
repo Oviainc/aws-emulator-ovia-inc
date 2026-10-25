@@ -11,7 +11,7 @@
 
 use serde_json::{json, Value};
 
-use crate::global_network_lifecycle::{error_code, expected_arn, Emulator};
+use crate::global_network_lifecycle::{error_code, expected_arn, expected_scoped_arn, Emulator};
 
 /// The taggable resource kinds this service's state holds; each is also the ARN resource
 /// type of that kind (`arn:aws:networkmanager::<account>:<kind>/<id>`).
@@ -597,12 +597,25 @@ async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
         ),
         (
             "a site that does not exist",
-            expected_arn(SITE, "site-000000000000000ff"),
+            expected_scoped_arn(
+                SITE,
+                "global-network-000000000000000ff",
+                "site-000000000000000ff",
+            ),
             404,
         ),
         (
             "a link that does not exist",
-            expected_arn(LINK, "link-000000000000000ff"),
+            expected_scoped_arn(
+                LINK,
+                "global-network-000000000000000ff",
+                "link-000000000000000ff",
+            ),
+            404,
+        ),
+        (
+            "a site ARN that names no global network at all",
+            expected_arn(SITE, "site-000000000000000ff"),
             404,
         ),
         (

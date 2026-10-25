@@ -45,6 +45,14 @@
 //! [`ApplicationDatabase::summary`]) — which is what `ListDatabases` reports, so a
 //! database cannot outlive the registration it came from.
 //!
+//! An application's COMPONENTS are held the same way: the [`StoredComponent`] records in
+//! [`StoredApplication::components`] are the ones the registration's `ComponentsInfo`
+//! declared, projected onto the wire `Component` by
+//! [`StoredApplication::component_view`] — which is what `GetComponent` reads back. So a
+//! component a caller can read is one a registration declared, it reports the status its
+//! application is in, and the databases it reports are the ones that registration gave
+//! it.
+//!
 //! What a configuration check RUN produced hangs off that same record: the sub-check
 //! results in [`StoredConfigurationCheckOperation::sub_check_results`], each holding the
 //! rule results of its own sub-check ([`StoredSubCheckResult::rule_results`]), which is
@@ -69,10 +77,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Application, ApplicationCredential, ApplicationSummary, ConfigurationCheckOperation,
-    ConflictException, DatabaseSummary, Filter, InternalServerException, Operation,
-    OperationEvent, Resource, ResourceNotFoundException, RuleResult, SubCheckResult,
-    ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
+    Application, ApplicationCredential, ApplicationSummary, AssociatedHost, Component,
+    ConfigurationCheckOperation, ConflictException, DatabaseSummary, Filter,
+    InternalServerException, Operation, OperationEvent, Resource, ResourceNotFoundException,
+    RuleResult, SubCheckResult, ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -173,6 +181,23 @@ pub const OPERATION_EVENT_STATUS_FAILED: &str = "FAILED";
 /// `ComponentType` of the SAP HANA database component of an application. One of the
 /// model's `ComponentType` values (see [`crate::ops::types::COMPONENT_TYPE_VALUES`]).
 pub const COMPONENT_TYPE_HANA: &str = "HANA";
+
+/// `ComponentStatus` of a component of an application that is up. One of the model's
+/// `ComponentStatus` values (see [`crate::ops::types::COMPONENT_STATUS_VALUES`]).
+pub const COMPONENT_STATUS_RUNNING: &str = "RUNNING";
+
+/// `ComponentStatus` of a component being started.
+pub const COMPONENT_STATUS_STARTING: &str = "STARTING";
+
+/// `ComponentStatus` of a component being stopped.
+pub const COMPONENT_STATUS_STOPPING: &str = "STOPPING";
+
+/// `ComponentStatus` of a component that is not running.
+pub const COMPONENT_STATUS_STOPPED: &str = "STOPPED";
+
+/// `ComponentStatus` for a component whose status the service cannot state from what it
+/// knows about the application — which is what the model documents this value for.
+pub const COMPONENT_STATUS_UNDEFINED: &str = "UNDEFINED";
 
 /// The name SAP HANA gives the system database of a multitenant database system; every
 /// other database of that system is a tenant database. It is what tells a `DatabaseType`
@@ -329,10 +354,10 @@ pub struct StoredApplication {
     /// An `ApplicationDiscoveryStatus` value; see the `DISCOVERY_STATUS_*` constants.
     pub discovery_status: String,
     pub status_message: Option<String>,
-    /// The component ids of this application, derived from the `ComponentsInfo` the
+    /// The components of this application, derived from the `ComponentsInfo` the
     /// registration carried. The emulator discovers nothing on its own, so an
     /// application registered without `ComponentsInfo` has no components.
-    pub components: Vec<String>,
+    pub components: Vec<StoredComponent>,
     pub associated_application_arns: Vec<String>,
     pub last_updated: SystemTime,
     pub sid: Option<String>,
@@ -401,7 +426,7 @@ impl StoredApplication {
             app_registry_arn: self.app_registry_arn.clone(),
             status: Some(self.status.clone()),
             discovery_status: Some(self.discovery_status.clone()),
-            components: Some(self.components.clone()),
+            components: Some(self.components.iter().map(|c| c.id.clone()).collect()),
             last_updated: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
             status_message: self.status_message.clone(),
             associated_application_arns: if self.associated_application_arns.is_empty() {
@@ -508,6 +533,106 @@ impl StoredApplication {
         }
         databases.into_values().collect()
     }
+
+    /// The component of this application whose `ComponentId` is `component_id`, or `None`
+    /// when the application has no such component.
+    ///
+    /// The components an application has are the ones its registration described, so this
+    /// resolves exactly the ids [`Self::view`] reports in `Application$Components`.
+    pub fn component(&self, component_id: &str) -> Option<&StoredComponent> {
+        self.components
+            .iter()
+            .find(|component| component.id == component_id)
+    }
+
+    /// Project `component` of this application onto the modelled `Component`.
+    ///
+    /// What the response can state about a component is what the registration declared
+    /// about it (its id, System ID, type and EC2 instance) plus what this store knows
+    /// about the application it belongs to: the status its components are in, the instant
+    /// the application last changed, and the SAP HANA databases of the application that
+    /// belong to this component ([`Self::databases`], which is also what `ListDatabases`
+    /// reports for it). Everything the real service reads off the instance by discovery —
+    /// hostnames, SAP features, kernel and HANA versions, system replication and cluster
+    /// state, connection endpoints — is left ABSENT rather than invented, because the
+    /// emulator discovers nothing.
+    ///
+    /// `region` is the Region the application is registered in, which is the Region the
+    /// ARNs reported here carry.
+    pub fn component_view(&self, component: &StoredComponent, region: &str) -> Component {
+        // The databases of the application that belong to THIS component, by the same
+        // (database -> component) assignment `ListDatabases` reports and narrows by.
+        let databases: Vec<String> = self
+            .databases(region)
+            .into_iter()
+            .filter(|database| database.component_id.as_deref() == Some(component.id.as_str()))
+            .map(|database| database.database_id)
+            .collect();
+        Component {
+            component_id: Some(component.id.clone()),
+            sid: Some(component.sid.clone()),
+            // The SAP system number of the component: the instance number the
+            // registration named for the application's SAP system, which is this
+            // component's only when it was declared under that same System ID.
+            system_number: self
+                .sap_instance_number
+                .clone()
+                .filter(|_| self.sid.as_deref() == Some(component.sid.as_str())),
+            // `ParentComponent`/`ChildComponents` describe a highly available setup.
+            // Nothing registers a parent or child relation between components, so a
+            // component declared here has neither.
+            parent_component: None,
+            child_components: None,
+            application_id: Some(self.id.clone()),
+            component_type: Some(component.component_type.clone()),
+            status: Some(component_status_for(&self.status).to_string()),
+            // Discovered on the instance; see this method's docs.
+            sap_hostname: None,
+            sap_feature: None,
+            sap_kernel_version: None,
+            hdb_version: None,
+            resilience: None,
+            // The EC2 instance the registration declared this component on is the host it
+            // is associated with; the rest of the host's properties are discovered.
+            associated_host: Some(AssociatedHost {
+                hostname: None,
+                ec2_instance_id: Some(component.ec2_instance_id.clone()),
+                ip_addresses: None,
+                os_version: None,
+            }),
+            databases: if databases.is_empty() {
+                None
+            } else {
+                Some(databases)
+            },
+            // `Hosts` and `PrimaryHost` are deprecated in the model in favour of
+            // `AssociatedHost`, so nothing is reported in them.
+            hosts: None,
+            primary_host: None,
+            database_connection: None,
+            last_updated: Some(::aws_smithy_types::DateTime::from(self.last_updated)),
+            arn: Some(component_arn(region, &self.id, &component.id)),
+        }
+    }
+}
+
+/// A component of a registered application: the record `Component` is projected from by
+/// [`StoredApplication::component_view`].
+///
+/// The emulator discovers nothing on the registered instances, so a component is what the
+/// registration DECLARED about it in one `ComponentsInfo` entry — the type it runs, the
+/// System ID of the SAP system it belongs to, and the EC2 instance it runs on.
+#[derive(Debug, Clone)]
+pub struct StoredComponent {
+    /// The `ComponentId`, derived from the System ID and the type by [`component_id`].
+    pub id: String,
+    /// A `ComponentType` value, exactly as declared (see
+    /// [`crate::ops::types::COMPONENT_TYPE_VALUES`]).
+    pub component_type: String,
+    /// The `SID` the component was declared under.
+    pub sid: String,
+    /// The `Ec2InstanceId` the component was declared on.
+    pub ec2_instance_id: String,
 }
 
 /// A SAP HANA database of a registered application: the record `DatabaseSummary` is
@@ -1553,6 +1678,40 @@ pub fn component_id(sid: &str, component_type: &str) -> String {
     format!("{sid}-{component_type}")
 }
 
+/// The ARN of the component `component_id` of the application `application_id` in
+/// `region`: `arn:aws:ssm-sap:<region>:<account>:component/<ApplicationId>/<ComponentId>`.
+///
+/// A component is a sub-resource of its application, so its ARN names both ids, exactly
+/// as a database's does ([`database_arn`]); the account segment comes from the core's
+/// single source of truth, never a literal.
+pub fn component_arn(region: &str, application_id: &str, component_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("component/{application_id}/{component_id}"),
+    )
+}
+
+/// The `ComponentStatus` of a component of an application whose `ApplicationStatus` is
+/// `application_status`.
+///
+/// A component runs as part of its application: starting, stopping and stopping an
+/// application is what starts and stops its components, so a component is up exactly
+/// while the application is up and is in the same transition while the application is in
+/// one. For any other application status — one where the service has not established what
+/// the application is running (its registration or its deregistration is still under way,
+/// or discovery never succeeded) — no component status follows from it, which is what the
+/// model's `UNDEFINED` states.
+pub fn component_status_for(application_status: &str) -> &'static str {
+    match application_status {
+        APPLICATION_STATUS_ACTIVATED => COMPONENT_STATUS_RUNNING,
+        APPLICATION_STATUS_STARTING => COMPONENT_STATUS_STARTING,
+        APPLICATION_STATUS_STOPPING => COMPONENT_STATUS_STOPPING,
+        APPLICATION_STATUS_STOPPED => COMPONENT_STATUS_STOPPED,
+        _ => COMPONENT_STATUS_UNDEFINED,
+    }
+}
+
 /// The ARN of the database `database_id` of the application `application_id` in
 /// `region`: `arn:aws:ssm-sap:<region>:<account>:database/<ApplicationId>/<DatabaseId>`.
 ///
@@ -1777,6 +1936,18 @@ pub fn no_registered_application(reference: &str) -> ValidationException {
         "No registered application found for account: {}, and application: {reference}",
         ::engine::emulator_account_id()
     ))
+}
+
+/// Why a `ComponentId` that names no component of the application it was asked for is
+/// refused.
+///
+/// `GetComponent` models no `ResourceNotFoundException` (`smithy_query(query="operation",
+/// operation="GetComponent")`: `ValidationException` 400, `UnauthorizedException` 401 and
+/// `InternalServerException` 500 only), so a component id that resolves to nothing is the
+/// `ValidationException` it does model rather than a 404 — and the refusal names both the
+/// component asked for and the application the lookup ran in.
+pub fn no_component_message(application_id: &str, component_id: &str) -> String {
+    format!("No component with ID {component_id} exists for application {application_id}")
 }
 
 /// Why an `OperationId` that names no operation record of this account and Region is
