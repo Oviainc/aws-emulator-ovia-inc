@@ -11,6 +11,9 @@
 #[path = "all/job_arn_is_the_callers_job.rs"]
 mod job_arn_is_the_callers_job;
 
+#[path = "all/job_resolution.rs"]
+mod job_resolution;
+
 #[path = "all/modelled_rejections.rs"]
 mod modelled_rejections;
 
