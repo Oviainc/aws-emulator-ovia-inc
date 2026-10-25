@@ -186,13 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 store.assets.contains_key(&input.target_resource_id),
                 crate::state::RESOURCE_ASSET,
             ),
-            // Computation models are created by `CreateComputationModel`, which is
-            // still a scaffold stub here, so this service stores none and the one a
-            // request names resolves to nothing. When that writer lands it brings a
-            // store of its own, which is what this arm then resolves against.
-            crate::state::TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
-                (false, crate::state::RESOURCE_COMPUTATION_MODEL)
-            }
+            // A computation model is resolved against the store its create
+            // writes, exactly as an asset is: a model this service holds exists
+            // for this listing, and only an id naming none draws the refusal.
+            crate::state::TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => (
+                store
+                    .computation_models
+                    .contains_key(&input.target_resource_id),
+                crate::state::RESOURCE_COMPUTATION_MODEL,
+            ),
             // Unreachable: the runtime refuses a value the enum does not declare
             // before this handler runs. A value the model gains later names a
             // resource this listing cannot resolve, which is the refusal below,

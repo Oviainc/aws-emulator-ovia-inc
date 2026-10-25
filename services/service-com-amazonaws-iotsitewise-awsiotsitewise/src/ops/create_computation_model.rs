@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComputationModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComputationModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComputationModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below mints a computation model, persists it in this
+//! service's store with the configuration, data binding and tags the request
+//! carries plus the actions its computation type exposes, and starts the
+//! `CREATING` -> `ACTIVE` transition the call owes, so a later
+//! `DescribeComputationModel` reports exactly what was written here.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +177,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComputationModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComputationModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComputationModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateComputationModelError::Modeled(
+                CreateComputationModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The configuration names the computation type and references its data
+        // binding's variables, so the two shapes are checked together in the one place
+        // that holds that rule, and before anything is written: a refused create stores
+        // no computation model.
+        crate::state::check_computation_model(
+            &input.computation_model_configuration,
+            &input.computation_model_data_binding,
+        )
+        .map_err(invalid_request)?;
+
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, the way `CreateWorkspace` enforces it,
+        // and before anything is stored.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            crate::state::check_tag_key(tag_key).map_err(invalid_request)?;
+        }
+
+        let mut store = state.lock();
+
+        // `clientToken` makes the create idempotent, as the member documents: "A unique
+        // case-sensitive identifier that you can provide to ensure the idempotency of
+        // the request." A computation model is named by the id this call mints, so the
+        // token of the create that minted one is what a retry is recognised by.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .computation_models
+                .values()
+                .find(|model| model.client_token.as_deref() == Some(token))
+            {
+                return Ok(CreateComputationModelOutput {
+                    computation_model_id: existing.id.clone(),
+                    computation_model_arn: existing.arn.clone(),
+                    computation_model_status: existing.status(now),
+                });
+            }
+        }
+
+        // The store is bounded: a create is the only thing that adds a computation
+        // model and nothing evicts one, so past the cap this is a quota refusal.
+        if store.computation_models.len() >= crate::state::MAX_COMPUTATION_MODELS {
+            return Err(CreateComputationModelError::Modeled(
+                CreateComputationModelErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: format!(
+                            "This emulator holds at most {} computation models.",
+                            crate::state::MAX_COMPUTATION_MODELS
+                        ),
+                    },
+                ),
+            ));
+        }
+
+        let computation_model_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.computation_models.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        // The actions the model exposes follow from the computation type its
+        // configuration names, and their ids are minted once, here, so every later read
+        // reports the same ones without writing anything.
+        let action_definitions =
+            crate::state::computation_model_type(&input.computation_model_configuration)
+                .map(crate::state::action_definitions_for)
+                .unwrap_or_default();
+
+        let record = crate::state::ComputationModelRecord {
+            id: computation_model_id.clone(),
+            arn: crate::state::computation_model_arn(&region, &computation_model_id),
+            name: input.computation_model_name.clone(),
+            description: input.computation_model_description.clone(),
+            configuration: input.computation_model_configuration.clone(),
+            data_binding: input.computation_model_data_binding.clone(),
+            action_definitions,
+            creation_date: now,
+            last_update_date: now,
+            // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
+            version: crate::state::COMPUTATION_MODEL_INITIAL_VERSION,
+            client_token: input.client_token.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+
+        let output = CreateComputationModelOutput {
+            computation_model_id: record.id.clone(),
+            computation_model_arn: record.arn.clone(),
+            computation_model_status: record.status(now),
+        };
+
+        store.computation_models.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateComputationModelError {
+    CreateComputationModelError::Modeled(
+        CreateComputationModelErrorModeled::InvalidRequestException(InvalidRequestException {
+            message,
+        }),
+    )
 }
