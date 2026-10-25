@@ -234,12 +234,15 @@ fn force_state(
             stored.alarm.state_transitioned_timestamp = Some(crate::state::to_timestamp(now));
         }
         // "Temporarily sets the state of an alarm for testing purposes. […] Metric alarms
-        // return to their actual state quickly" — the thing that takes a metric alarm
-        // back is its next evaluation against the stored metric data, so the forced state
-        // stands for one evaluation period of this alarm and the evaluation owns the
-        // state again from its end.
+        // returns to their actual state quickly, often within seconds" — the thing that
+        // takes a metric alarm back is its next evaluation against the stored metric data,
+        // which is owed the same short span as every other transition this store's clock
+        // owes: the forced state is what a caller reading straight after this call sees, and
+        // the evaluation owns the state again from the end of that span. A later force into
+        // a state the evaluation has since taken the alarm out of is therefore a state
+        // change of its own, and invokes that state's actions again.
         stored.evaluation_due_secs =
-            now + crate::state::alarm_evaluation::forced_state_span_secs(&stored.alarm);
+            now + crate::state::alarm_evaluation::forced_state_span_secs();
         // And the state stands for that span even as new datapoints arrive, which is what
         // makes it a forced state rather than a value the next write overwrites.
         stored.forced_state_until_secs = Some(stored.evaluation_due_secs);

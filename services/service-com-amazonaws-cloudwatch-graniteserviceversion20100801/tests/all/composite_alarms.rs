@@ -35,6 +35,14 @@ fn wait_for_evaluation() {
 }
 
 /// A metric alarm the composite alarms below can reference.
+///
+/// It treats missing data as `ignore` — "the current alarm state is maintained"
+/// (`PutMetricAlarmInput$TreatMissingData`) — because every row here sets a CHILD's state with
+/// `SetAlarmState` and then asserts what the parent's rule makes of it: a state a caller forces
+/// is temporary ("Metric alarms returns to their actual state quickly", `SetAlarmState`), so
+/// under any other setting the child's own next evaluation, which has no datapoint of this
+/// series to grade, would take the state back before the rule is read. The composite rules
+/// themselves are what these rows vary, not the children's missing-data arm.
 async fn put_metric_alarm(router: &MultiServiceRouter, name: &str) {
     ok(
         router,
@@ -48,6 +56,7 @@ async fn put_metric_alarm(router: &MultiServiceRouter, name: &str) {
             "EvaluationPeriods": 1,
             "Threshold": 1.0,
             "ComparisonOperator": "GreaterThanThreshold",
+            "TreatMissingData": "ignore",
         }),
     )
     .await;
