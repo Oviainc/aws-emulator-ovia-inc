@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceConnectEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceConnectEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceConnectEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the EC2 Instance Connect Endpoints [`crate::state`] holds,
+//! narrowed by `InstanceConnectEndpointIds` and the documented filters and paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,279 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceConnectEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceConnectEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, invalid_pagination_token, matches_every_filter, page_from_cursor,
+            require_known_instance_connect_endpoint, require_service_state, CompiledFilter,
+            MatchBudget, PageTokenRule, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — an endpoint
+        // is named by id, which is unique across Regions in this store. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.instance_connect_endpoint_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceConnectEndpointIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored endpoints and the model
+        // bounds none of them, so the request-controlled factors are capped here, before any
+        // work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // endpoint would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is refused
+        // rather than read as an id, and it is refused before the store is read at all, so
+        // whether a bogus token is caught never depends on what the account holds. It is
+        // refused AFTER the request's own parameters have been checked, the same order the
+        // rest of this handler keeps: a request that is malformed in two ways is answered
+        // for the first one.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified EC2 Instance Connect Endpoints": an id that names no
+        // endpoint of the account is an error, not an absent row — a malformed one before an
+        // unknown one.
+        for endpoint_id in &requested_ids {
+            require_known_instance_connect_endpoint(&store, endpoint_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named endpoint
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that would
+        // have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The `create-in-progress` -> `create-complete` move the clock already owed each
+        // endpoint is observed here, not written: `view_at` derives the state from the stored
+        // due instant, so this read changes nothing a later caller sees — and the `state`
+        // filter therefore compares against the state the caller is shown.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceConnectEndpoints"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored endpoints,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<Ec2InstanceConnectEndpoint> = Vec::new();
+        for record in store.instance_connect_endpoints.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so an endpoint the request did
+            // not name costs no projection and no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids.iter().any(|id| {
+                    record.view.instance_connect_endpoint_id.as_deref() == Some(id.as_str())
+                })
+            {
+                continue;
+            }
+            let endpoint = record.view_at(now);
+            if matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(&endpoint, name)
+            }) {
+                selected.push(endpoint);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `InstanceConnectEndpointId` order, which the cursor below names a position
+        // in. The store is an ordered map, so its iteration order already satisfies this
+        // sort; doing it here establishes the invariant the cursor depends on at the point of
+        // use.
+        selected.sort_by(|left, right| {
+            left.instance_connect_endpoint_id
+                .cmp(&right.instance_connect_endpoint_id)
+        });
+
+        // A request that names no page size gets the largest page this OPERATION serves,
+        // so the unpaged and the paged path agree with the model. The modelled
+        // `InstanceConnectEndpointMaxResults` `@range` of 1..50 has already refused every
+        // other value at the request boundary; the page size is held inside that range here
+        // as well, so this handler cannot be made to answer an EMPTY page with a token
+        // naming the element it did not return — a walk that would never terminate — by a
+        // value that got past the boundary.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_INSTANCE_CONNECT_ENDPOINT_RESULTS)
+            .clamp(1, MAX_INSTANCE_CONNECT_ENDPOINT_RESULTS);
+
+        // The page and its token come from the crate's ONE paging definition rather than a
+        // second copy of the cursor semantics. A token only when an endpoint follows this
+        // page — "To get the next page of items, make another request with the token returned
+        // in the output", and "this value is null when there are no more items to return" —
+        // which is [`PageTokenRule::WhenAnotherItemFollows`].
+        let (page, next_token) = page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            PageTokenRule::WhenAnotherItemFollows,
+            |endpoint| {
+                endpoint
+                    .instance_connect_endpoint_id
+                    .as_deref()
+                    .unwrap_or_default()
+            },
+        );
+
+        Ok(DescribeInstanceConnectEndpointsOutput {
+            instance_connect_endpoints: Some(page.to_vec()),
+            next_token,
+        })
+    }
+}
+
+/// The largest page this operation serves, and the page size a request that names none
+/// gets: the maximum of the modelled `InstanceConnectEndpointMaxResults` `@range`
+/// (`smithy_query(query="operation",operation="DescribeInstanceConnectEndpoints")` reports
+/// `range {min: 1, max: 50}`). Serving a bigger unpaged page than the operation's own
+/// documented maximum is what this avoids.
+const MAX_INSTANCE_CONNECT_ENDPOINT_RESULTS: usize = 50;
+
+/// The filter names this operation documents, from
+/// `DescribeInstanceConnectEndpointsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeInstanceConnectEndpointsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const INSTANCE_CONNECT_ENDPOINT_FILTERS: [&str; 6] = [
+    "instance-connect-endpoint-id",
+    "state",
+    "subnet-id",
+    "tag-key",
+    "tag-value",
+    "vpc-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    INSTANCE_CONNECT_ENDPOINT_FILTERS
+        .contains(&name)
+        .then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this endpoint.
+///
+/// The AND/OR evaluation itself is [`crate::state::matches_every_filter`], the one place
+/// this crate defines it; this is the per-operation lookup it takes as `values_of`. A filter
+/// naming an attribute this endpoint does not carry compares against NO values, so it
+/// selects nothing. `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    endpoint: &'a Ec2InstanceConnectEndpoint,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return endpoint
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "instance-connect-endpoint-id" => text(endpoint.instance_connect_endpoint_id.as_deref()),
+        "state" => text(endpoint.state.as_deref()),
+        "subnet-id" => text(endpoint.subnet_id.as_deref()),
+        "tag-key" => endpoint
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "tag-value" => endpoint
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(endpoint.vpc_id.as_deref()),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNode
-//! Implemented: validates the node configuration against the network's framework and
-//! edition, then mints a node id under a stored network (and, on Hyperledger Fabric,
-//! under one of that network's members) and persists the node in [`crate::state`];
-//! `GetNode` and `ListNodes` project the same record.
+//! Implemented: resolves the member the request names (required on Hyperledger Fabric,
+//! and on any framework it must be one the named network holds), validates the node
+//! configuration against the network's framework and edition, then mints a node id under
+//! the stored network and persists the node in [`crate::state`]; `GetNode` and `ListNodes`
+//! project the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -246,11 +247,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `MemberId` is "The unique identifier of the member that owns this node.
-        // Applies only to Hyperledger Fabric": on a Fabric network a node belongs to a
-        // member, so the request must name one and it must be a member of this network.
+        // Applies only to Hyperledger Fabric": a request that names one names the owner
+        // of the node it is asking for, so the name has to resolve to a member THIS
+        // network holds before anything is minted — whatever framework the network runs.
+        // A framework whose networks hold no members resolves no member at all, so there
+        // a named owner is a resource that cannot exist and the request is not found,
+        // exactly as an unknown member id on a Fabric network is; it is never served with
+        // the member quietly dropped, which would persist a node the caller never asked
+        // for. On a Fabric network a node belongs to a member, so there the request must
+        // name one.
         let framework = network.framework.clone();
-        let member_id = if framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
-            let Some(member_id) = input.member_id.clone() else {
+        let member_id = match input.member_id.clone() {
+            Some(member_id) => {
+                let Some(member) = network.member(&region, &member_id) else {
+                    return Err(CreateNodeErrorModeled::ResourceNotFoundException(
+                        crate::state::not_found(crate::state::RESOURCE_MEMBER, &member_id),
+                    )
+                    .into());
+                };
+                if member.status != crate::state::STATUS_AVAILABLE {
+                    return Err(CreateNodeErrorModeled::ResourceNotReadyException(
+                        ResourceNotReadyException {
+                            message: Some(format!(
+                                "member {} is {} and cannot take a node until it is {}",
+                                member.id,
+                                member.status,
+                                crate::state::STATUS_AVAILABLE
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(member_id)
+            }
+            None if framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC => {
                 return Err(CreateNodeErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         message: Some(format!(
@@ -260,29 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
-            };
-            let Some(member) = network.member(&region, &member_id) else {
-                return Err(CreateNodeErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(crate::state::RESOURCE_MEMBER, &member_id),
-                )
-                .into());
-            };
-            if member.status != crate::state::STATUS_AVAILABLE {
-                return Err(CreateNodeErrorModeled::ResourceNotReadyException(
-                    ResourceNotReadyException {
-                        message: Some(format!(
-                            "member {} is {} and cannot take a node until it is {}",
-                            member.id,
-                            member.status,
-                            crate::state::STATUS_AVAILABLE
-                        )),
-                    },
-                )
-                .into());
             }
-            Some(member_id)
-        } else {
-            None
+            None => None,
         };
 
         // "The node inherits this parameter from the member that it belongs to"

@@ -47,6 +47,8 @@ mod job_runs;
 mod job_updates;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/registries.rs"]
+mod registries;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/state_roundtrip.rs"]

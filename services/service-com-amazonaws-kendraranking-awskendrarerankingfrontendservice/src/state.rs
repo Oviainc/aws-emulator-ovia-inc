@@ -8,8 +8,8 @@ use aws_smithy_schema_server::constraints::path;
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    CapacityUnitsConfiguration, ResourceNotFoundException, ServiceQuotaExceededException, Tag,
-    ValidationException,
+    CapacityUnitsConfiguration, ResourceNotFoundException, ResourceUnavailableException,
+    ServiceQuotaExceededException, Tag, ValidationException,
 };
 
 /// The `RescoreExecutionPlanStatus` value a plan that is ready to serve `Rescore`
@@ -55,6 +55,31 @@ pub const DOCUMENT_BODY_REQUIRED_MESSAGE: &str = "Document must have a Body or T
 pub fn plan_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(PLAN_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// How this service states that an ARN names no resource it holds, with `resource_arn`
+/// the ARN the caller addressed.
+///
+/// Unlike [`PLAN_NOT_FOUND_MESSAGE`], this sentence NAMES the identifier it was asked
+/// for: an ARN-addressed call's subject is the ARN itself, so the refusal quotes it and
+/// then states what to check.
+pub fn resource_unavailable_message(resource_arn: &str) -> String {
+    format!(
+        "Resource {resource_arn} was not found. Please check you have provided the \
+         correct resource information and try again."
+    )
+}
+
+/// The modelled `ResourceUnavailableException` for an ARN the store resolves to no plan
+/// — the ONE place that message is built, so every ARN-addressed path states it
+/// identically, exactly as [`plan_not_found`] does for the id-addressed ones. It reaches
+/// the wire with this service's client-error status (see
+/// [`crate::scaffolded::wire_status`]), not with the `@httpError 404` its shape is
+/// annotated with.
+pub fn resource_unavailable(resource_arn: &str) -> ResourceUnavailableException {
+    ResourceUnavailableException {
+        message: Some(resource_unavailable_message(resource_arn)),
     }
 }
 
@@ -627,6 +652,30 @@ impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
         let regional = self.regions.get_mut(region)?;
         let id = regional.arn_index.get(resource_arn)?.clone();
         regional.plans.get_mut(&id)
+    }
+
+    /// The plan an ARN-addressed call names in `region`, or the modelled refusal that
+    /// ARN resolves to nothing — the ONE place an ARN-addressed operation turns a
+    /// `ResourceARN` into either a plan or its refusal, so every such operation resolves
+    /// the ARN the same way and refuses it with the same sentence. The caller only lifts
+    /// the error into its own operation's error enum.
+    pub fn plan_for_arn(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Result<&RescoreExecutionPlan, ResourceUnavailableException> {
+        self.plan_by_arn(region, resource_arn)
+            .ok_or_else(|| resource_unavailable(resource_arn))
+    }
+
+    /// [`plan_for_arn`](Self::plan_for_arn), for a call that writes the plan it resolves.
+    pub fn plan_for_arn_mut(
+        &mut self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Result<&mut RescoreExecutionPlan, ResourceUnavailableException> {
+        self.plan_by_arn_mut(region, resource_arn)
+            .ok_or_else(|| resource_unavailable(resource_arn))
     }
 
     /// The plan a repeated `ClientToken` already created in `region`, if any: a token is

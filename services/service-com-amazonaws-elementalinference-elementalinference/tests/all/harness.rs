@@ -8,7 +8,9 @@
 //! what a client sees.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_elementalinference_elementalinference::state::TRANSITION_SPAN;
+use service_com_amazonaws_elementalinference_elementalinference::state::{
+    current_epoch_secs, default_fixture_catalog, TRANSITION_SPAN,
+};
 use service_com_amazonaws_elementalinference_elementalinference::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeMap;
@@ -166,7 +168,7 @@ pub fn output_config(kind: &str) -> Value {
         ]}}),
         "clipping" => json!({"clipping": {
             "callbackMetadata": "season opener",
-            "dataSourceConfiguration": {"fixtureId": "fixture-1"}
+            "dataSourceConfiguration": {"fixtureId": held_fixture_id()}
         }}),
         "subtitling" => json!({"subtitling": {
             "language": "eng-gb",
@@ -179,6 +181,30 @@ pub fn output_config(kind: &str) -> Value {
         }}),
         other => panic!("no such OutputConfig member: {other}"),
     }
+}
+
+/// Seconds in a UTC day: a UTC day has no offset changes, so an instant's day number is
+/// its epoch-second count divided by this.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The `fixtureId` of a fixture this emulator's data source really holds.
+///
+/// A clipping output's data source names the fixture whose event data the service maps
+/// onto that output, and the id comes from a `SearchFixtures` result
+/// (`DataSourceConfiguration$fixtureId`), so an output a suite sends has to name a
+/// fixture the catalog holds. The catalog a store comes up with is
+/// `default_fixture_catalog`, and a held fixture's id depends only on the sport, the UTC
+/// day and the slot — so the fixture scheduled TODAY is in the catalog of every store
+/// built within a day either side of this call, unlike one at the ends of the span the
+/// schedule covers.
+pub fn held_fixture_id() -> String {
+    let now = current_epoch_secs();
+    let today = now.div_euclid(SECONDS_PER_DAY);
+    default_fixture_catalog(now)
+        .into_iter()
+        .find(|fixture| fixture.scheduled_day() == today)
+        .map(|fixture| fixture.id)
+        .expect("the data source's schedule covers the present day")
 }
 
 /// One output named `name`, carrying the `kind` config and `status` — the three members

@@ -12,6 +12,12 @@
 //! (see [`crate::state::provisioning`]); a resource an owning service refuses leaves the
 //! stack in `UPDATE_FAILED` with that service's own refusal as the reason.
 //!
+//! The template is PROCESSED before it is deployed, exactly as a create's is: an
+//! `Fn::Transform` naming `AWS::Include` is the Amazon S3 object its `Location` names,
+//! spliced into the template ([`crate::state::include`]). An include that cannot be read
+//! changes nothing — the stack keeps the template, the parameters and the resources it has,
+//! and the update fails carrying the transform's own reason.
+//!
 //! Members this slice stores but has nothing to act on, because it performs no resource
 //! updates: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
 //! reports back) and `ResourceTypes`. `StackPolicyDuringUpdateBody` is a policy that
@@ -483,6 +489,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything above read the store; nothing below it does until the template has
         // been deployed.
         let operation_id = crate::state::new_operation_id();
+        // The template this update would deploy is PROCESSED first, exactly as a create's
+        // is: an `Fn::Transform` of `AWS::Include` is the Amazon S3 snippet its `Location`
+        // names, read and spliced in before anything is provisioned
+        // (`crate::state::include`).
+        let processing =
+            crate::state::include::process(ctx, &request_region, &template_body).await;
+        // The acknowledgement is held to the PROCESSED template, exactly as a create's is:
+        // a resource an included snippet contributes is one this update would deploy.
+        if let crate::state::include::Processed::Expanded(processed) = &processing {
+            if let Some(message) = crate::state::insufficient_capabilities(
+                processed,
+                input.capabilities.as_deref().unwrap_or_default(),
+            ) {
+                return Err(UpdateStackErrorModeled::InsufficientCapabilitiesException(
+                    InsufficientCapabilitiesException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+        let transform_failure = match &processing {
+            crate::state::include::Processed::Failed(reason) => Some(reason.clone()),
+            _ => None,
+        };
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
@@ -505,10 +536,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::stack_cannot_be_updated(&stack.stack_id, &stack.status),
                 ));
             }
+            // The template could not be PROCESSED, so this update never reached the stage
+            // that provisions anything: nothing about the stack changes — it keeps the
+            // template, the parameters and the resources it has — and the operation fails
+            // with the transform's own reason.
+            if let Some(reason) = transform_failure {
+                stack.begin_transition(
+                    now,
+                    status::UPDATE_IN_PROGRESS,
+                    status::UPDATE_COMPLETE,
+                    Some(operation_id.clone()),
+                    input.client_request_token.clone(),
+                );
+                stack.fail_transition(
+                    ::std::time::SystemTime::now(),
+                    status::UPDATE_FAILED,
+                    reason,
+                );
+                return Ok(UpdateStackOutput {
+                    stack_id: Some(stack.stack_id.clone()),
+                    operation_id: Some(operation_id),
+                });
+            }
             // What the stack's resources are BEFORE this deployment: what the update has
             // to keep, replace or delete in the services that own them.
             let previous_resources = stack.current_resources().to_vec();
             stack.set_template_body(template_body);
+            // The processed body, where the transforms the submitted one names produced one:
+            // that is the template this update deploys.
+            if let crate::state::include::Processed::Expanded(processed) = processing {
+                stack.set_processed_template_body(processed);
+            }
             stack.parameters = parameters;
             stack.tags = tags;
             stack.notification_arns = notification_arns;

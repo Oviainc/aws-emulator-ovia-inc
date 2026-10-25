@@ -21,7 +21,8 @@
 //! each addressable by the upload id the store minted for it ([`mint_upload_id`]) until a
 //! completion or an abort takes it away. An in-progress upload is not an object: it is
 //! where everything the initiating `CreateMultipartUpload` settled about the object it
-//! will become is kept in the meantime.
+//! will become is kept in the meantime, together with the parts uploaded into it so far
+//! ([`UploadedPart`]), each addressable by its own part number.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -300,6 +301,41 @@ pub enum MultipartUploadCreation {
     /// This emulator already holds [`MAX_MULTIPART_UPLOADS_TOTAL`] in-progress uploads
     /// across every bucket; nothing was written.
     TotalUploadCountReached,
+}
+
+/// The lowest part number a part of a multipart upload may carry.
+///
+/// From `UploadPartRequest$PartNumber`'s own documentation: "Part number of part being
+/// uploaded. This is a positive integer between 1 and 10,000." The model constrains the
+/// member not at all (`PartNumber` is a plain integer,
+/// `smithy_query(query="shape",shape="PartNumber")`), so nothing refuses a number outside
+/// the published range before a handler does.
+pub const MIN_PART_NUMBER: i32 = 1;
+
+/// The highest part number a part of a multipart upload may carry — the other end of the
+/// range [`MIN_PART_NUMBER`] opens, and so also the most parts one upload can hold, since
+/// "a part number uniquely identifies a part" (`UploadPart`'s own documentation).
+pub const MAX_PART_NUMBER: i32 = 10_000;
+
+/// What [`ComAmazonawsS3Amazons3State::upload_part`] did, so the caller answers each
+/// outcome without re-deriving it — and cannot record a part without having gone through
+/// the byte budgets, per bucket AND service-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartUpload {
+    /// The part was recorded against the upload. `replaced` is whether the upload already
+    /// held a part of that number: "If you upload a new part using the same part number
+    /// that was used with a previous part, the previously uploaded part is overwritten"
+    /// (`UploadPart`'s own documentation).
+    Stored { replaced: bool },
+    /// The bucket has no such upload in progress under that id and key; nothing was
+    /// written.
+    NoSuchUpload,
+    /// Recording the part would leave the bucket holding more than
+    /// [`MAX_OBJECT_BYTES_PER_BUCKET`] bytes; nothing was written.
+    ByteBudgetReached { would_hold: usize },
+    /// Recording the part would leave this emulator holding more than
+    /// [`MAX_OBJECT_BYTES_TOTAL`] bytes across every bucket; nothing was written.
+    TotalByteBudgetReached { would_hold: usize },
 }
 
 /// How many tags one bucket's tag set may carry.
@@ -4477,12 +4513,22 @@ impl Bucket {
     /// How many bytes this bucket's objects retain — payloads AND every string kept
     /// beside them, over every version it stores, so no part of a stored object escapes
     /// the budgets.
+    ///
+    /// The parts of the multipart uploads it has in progress are counted too: a part held
+    /// against an upload occupies this process's memory exactly as a stored object's
+    /// payload does, and is released only when a completion or an abort takes the upload
+    /// away — so the two share one budget rather than each having its own.
     fn retained_bytes(&self) -> usize {
         self.versions
             .values()
             .flatten()
             .map(StoredVersion::retained_bytes)
-            .sum()
+            .sum::<usize>()
+            + self
+                .multipart_uploads
+                .values()
+                .map(MultipartUpload::retained_bytes)
+                .sum::<usize>()
     }
 
     /// How many bytes this bucket would still retain with a write at `key` applied, not
@@ -4890,9 +4936,9 @@ impl Object {
 /// is what the completed object is made of — and the upload is addressed by its id in the
 /// meantime.
 ///
-/// The parts themselves are NOT here: `UploadPart` is still a scaffold stub, so this
-/// store records no part, and `ListParts` reports the empty part list that is the truth
-/// about an upload nothing has uploaded a part to.
+/// The parts uploaded into it so far are here too ([`Self::parts`]): a part belongs to the
+/// upload rather than to the object, because nothing of it is addressable as an object
+/// until a completion assembles it.
 #[derive(Debug, Clone)]
 pub struct MultipartUpload {
     /// The object key the upload was initiated for — "Object key for which the multipart
@@ -4935,6 +4981,20 @@ pub struct MultipartUpload {
     /// The `ChecksumType` the initiating request asked for, kept for the same reason as
     /// [`Self::checksum_algorithm`].
     pub checksum_type: Option<String>,
+    /// The parts `UploadPart` has recorded against this upload, by part number.
+    ///
+    /// Keyed by part number because that is what addresses a part — "A part number uniquely
+    /// identifies a part and also defines its position within the object being created"
+    /// (`UploadPart`'s own documentation) — so a second upload of one number replaces what
+    /// that number held rather than adding a part beside it. Sorted, because every reader
+    /// of an upload reports its parts in ascending part-number order
+    /// (`ListPartsRequest$PartNumberMarker`: "Only parts with higher part numbers will be
+    /// listed").
+    ///
+    /// A part is recorded only through [`ComAmazonawsS3Amazons3State::upload_part`], the
+    /// only place that sees the byte budgets a retained part counts against; an initiation
+    /// records an upload with no part at all.
+    pub parts: BTreeMap<i32, UploadedPart>,
 }
 
 impl MultipartUpload {
@@ -4946,6 +5006,61 @@ impl MultipartUpload {
             .iter()
             .map(|(key, value)| key.len() + value.len())
             .sum()
+    }
+
+    /// The part `part_number` names, or `None` when this upload holds no such part — which
+    /// is what makes a read of an upload report only the parts something really uploaded.
+    pub fn part(&self, part_number: i32) -> Option<&UploadedPart> {
+        self.parts.get(&part_number)
+    }
+
+    /// How many bytes the parts of this upload retain — what the per-bucket and
+    /// service-wide byte budgets count for an upload, measured the way
+    /// [`Object::retained_bytes`] measures a stored object's.
+    pub fn retained_bytes(&self) -> usize {
+        self.parts.values().map(UploadedPart::retained_bytes).sum()
+    }
+}
+
+/// One part `UploadPart` recorded against an in-progress multipart upload.
+///
+/// A part is the data "you provide … as a part of an object in your request"
+/// (`UploadPart`'s own documentation) plus what every reader of the upload reports about
+/// it: the members `Part` declares (`smithy_query(query="shape",shape="Part")`) — its
+/// number, the instant it was uploaded, its entity tag and its size — so `ListParts`
+/// answers from the recorded part rather than from anything re-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedPart {
+    /// "Part number identifying the part. This is a positive integer between 1 and 10,000"
+    /// (`Part$PartNumber`), inside [`MIN_PART_NUMBER`]..=[`MAX_PART_NUMBER`]. Kept on the
+    /// part as well as in the map's key so a reader that holds a part holds its number.
+    pub part_number: i32,
+    /// "Entity tag returned when the part was uploaded" (`Part$ETag`) — the quoted MD5 of
+    /// the part's own bytes, as [`object_etag`] renders it, so a later completion can be
+    /// judged against the tag the upload really answered.
+    pub etag: String,
+    /// "Date and time at which the part was uploaded" (`Part$LastModified`): the instant
+    /// the store recorded it. Reassigned only by an upload that overwrites the part, so a
+    /// reader sees the moment the bytes it is reporting arrived.
+    pub uploaded_at: SystemTime,
+    /// The part's data, which a completion assembles into the object's body. "Size in
+    /// bytes of the uploaded part data" (`Part$Size`) is its length, so nothing records a
+    /// size beside it that could disagree with the bytes.
+    pub body: Vec<u8>,
+}
+
+impl UploadedPart {
+    /// "Size in bytes of the uploaded part data" (`Part$Size`) — the length of the bytes
+    /// recorded, as the member's `long` type carries it.
+    pub fn size(&self) -> i64 {
+        i64::try_from(self.body.len()).unwrap_or(i64::MAX)
+    }
+
+    /// How many bytes this part retains: its data AND the entity tag kept beside it, the
+    /// way [`Object::retained_bytes`] counts a stored object's, so no part of an upload
+    /// escapes the budgets.
+    pub fn retained_bytes(&self) -> usize {
+        self.body.len() + self.etag.len()
     }
 }
 
@@ -4985,6 +5100,10 @@ pub fn mint_upload_id(bucket: &str, key: &str, sequence: u64) -> String {
 /// unencrypted PUT into a general purpose bucket — the only kind this emulator records —
 /// is exactly that case, so the tag is the MD5 of the stored bytes, lowercase hex, inside
 /// the double quotes S3 wraps it in.
+///
+/// One PART of a multipart upload carries the same tag over its own bytes — "Entity tag
+/// returned when the part was uploaded" (`Part$ETag`) — so `UploadPart` renders a part's
+/// tag through here too, rather than deriving one of its own.
 pub fn object_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
 }
@@ -5282,6 +5401,77 @@ impl ComAmazonawsS3Amazons3State {
             .multipart_uploads
             .insert(upload_id.clone(), upload);
         Some(MultipartUploadCreation::Initiated { upload_id })
+    }
+
+    /// Record `part` against the multipart upload `upload_id` names in the bucket named
+    /// `bucket`, reporting what that did — or `None` when this emulator holds no such
+    /// bucket (so a part upload refuses a name that is not a bucket instead of creating
+    /// one).
+    ///
+    /// An upload is addressed by its id AND the key it was initiated for, so a request
+    /// naming the id under another key names no upload
+    /// ([`PartUpload::NoSuchUpload`]) — the same address a read of the upload is answered
+    /// by, so neither can reach an upload the other cannot.
+    ///
+    /// A part REPLACES what its number held: "If you upload a new part using the same part
+    /// number that was used with a previous part, the previously uploaded part is
+    /// overwritten" (`UploadPart`'s own documentation), and the bytes the overwritten part
+    /// retained are released with it.
+    ///
+    /// This is the ONLY way a part is recorded, because it is the only place that can see
+    /// BOTH the per-bucket byte budget ([`MAX_OBJECT_BYTES_PER_BUCKET`]) and the
+    /// service-wide one ([`MAX_OBJECT_BYTES_TOTAL`]) — the same two budgets a stored
+    /// object is measured against, since a retained part holds this process's memory the
+    /// same way. Nothing is written unless the answer is [`PartUpload::Stored`].
+    pub fn upload_part(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        key: &str,
+        part: UploadedPart,
+    ) -> Option<PartUpload> {
+        let held_bucket = self.buckets.get(bucket)?;
+        let Some(upload) = held_bucket
+            .multipart_upload(upload_id)
+            .filter(|upload| upload.key == key)
+        else {
+            return Some(PartUpload::NoSuchUpload);
+        };
+
+        // What this write releases: the part the number already held, whose bytes go away
+        // as it is overwritten — so the budgets are over what the store WOULD hold, not
+        // over everything ever uploaded.
+        let released = upload
+            .part(part.part_number)
+            .map_or(0, UploadedPart::retained_bytes);
+        let incoming = part.retained_bytes();
+
+        let would_hold_in_bucket = held_bucket.retained_bytes().saturating_sub(released) + incoming;
+        if would_hold_in_bucket > MAX_OBJECT_BYTES_PER_BUCKET {
+            return Some(PartUpload::ByteBudgetReached {
+                would_hold: would_hold_in_bucket,
+            });
+        }
+        let would_hold: usize = self
+            .buckets
+            .values()
+            .map(Bucket::retained_bytes)
+            .sum::<usize>()
+            .saturating_sub(released)
+            + incoming;
+        if would_hold > MAX_OBJECT_BYTES_TOTAL {
+            return Some(PartUpload::TotalByteBudgetReached { would_hold });
+        }
+
+        let replaced = self
+            .buckets
+            .get_mut(bucket)?
+            .multipart_uploads
+            .get_mut(upload_id)?
+            .parts
+            .insert(part.part_number, part)
+            .is_some();
+        Some(PartUpload::Stored { replaced })
     }
 
     /// Record `configuration` as the whole notification configuration of the bucket named
@@ -5719,6 +5909,14 @@ pub const BUCKET_NOT_EMPTY_VERSIONED_MESSAGE: &str =
 /// carried: "The Content-MD5 or checksum value that you specified did not match what the
 /// server received."
 pub const BAD_DIGEST_CODE: &str = "BadDigest";
+/// See [`BAD_DIGEST_CODE`] — the text Amazon S3 "Error responses" publishes for that code
+/// in its list of error codes.
+pub const BAD_DIGEST_MESSAGE: &str =
+    "The Content-MD5 or checksum value that you specified did not match what the server \
+     received.";
+/// The HTTP status [`BAD_DIGEST_CODE`] is rendered with: 400, from the same list ("400 Bad
+/// Request").
+pub const BAD_DIGEST_STATUS: u16 = 400;
 /// The code S3 answers a write whose body is larger than one request may carry
 /// ([`MAX_OBJECT_BYTES`]).
 pub const ENTITY_TOO_LARGE_CODE: &str = "EntityTooLarge";

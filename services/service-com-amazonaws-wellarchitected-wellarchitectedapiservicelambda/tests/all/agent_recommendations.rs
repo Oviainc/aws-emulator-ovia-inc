@@ -50,7 +50,10 @@ use super::workload_harness::{encode_path_segment, Answer, Client};
 /// Every value the `RecommendationType` enum publishes, in the model's order
 /// (`smithy_query(query="shape", shape="RecommendationType")`). Spelled out here so the
 /// suite pins the catalog rather than reading it back out of the code under test.
-const RECOMMENDATION_TYPES: [&str; 3] = ["RESOURCE", "ARCHITECTURE", "APPLICATION"];
+///
+/// `pub(crate)` because the single-read suite beside this one generates its recommendations
+/// the same way, and a recommendation is produced by exactly one operation.
+pub(crate) const RECOMMENDATION_TYPES: [&str; 3] = ["RESOURCE", "ARCHITECTURE", "APPLICATION"];
 
 /// Every value the `RecommendationStatus` enum publishes, in the model's order
 /// (`smithy_query(query="shape", shape="RecommendationStatus")`).
@@ -78,14 +81,18 @@ const ROI_DETAIL_BOUNDS: (usize, usize) = (30, 300);
 
 /// How long after a start the generation it accepted is certainly complete: both spans the
 /// clock owes, plus a margin so a slow machine does not decide the assertion.
-fn until_complete() -> Duration {
+///
+/// `pub(crate)` for the reason [`RECOMMENDATION_TYPES`] gives.
+pub(crate) fn until_complete() -> Duration {
     state::GENERATION_QUEUE_DURATION + state::GENERATION_RUN_DURATION + Duration::from_millis(500)
 }
 
 /// `POST /api/v1/agent-profiles/{profileArn}/generations`: the ARN is a non-greedy
 /// `@httpLabel`, so it travels percent-encoded in one path segment, exactly as an SDK
 /// sends it.
-async fn start_generation(
+///
+/// `pub(crate)` for the reason [`RECOMMENDATION_TYPES`] gives.
+pub(crate) async fn start_generation(
     client: &Client,
     profile_arn: &str,
     pillars: &[&str],
@@ -122,7 +129,14 @@ async fn list_recommendations(client: &Client, profile_arn: &str, query: &str) -
 }
 
 /// `PATCH /api/v1/agent-recommendations/{recommendationArn}/status`.
-async fn update_status(client: &Client, recommendation_arn: &str, body: Value) -> Answer {
+///
+/// `pub(crate)` because the single-read suite beside this one reads back what an update
+/// recorded, and a status is moved by exactly one operation.
+pub(crate) async fn update_status(
+    client: &Client,
+    recommendation_arn: &str,
+    body: Value,
+) -> Answer {
     client
         .send(
             "PATCH",
@@ -150,7 +164,9 @@ fn items(answer: &Answer, case: &str) -> Vec<Value> {
 }
 
 /// One string member of a listed recommendation, or `""` when it carries none.
-fn text(item: &Value, name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`RECOMMENDATION_TYPES`] gives.
+pub(crate) fn text(item: &Value, name: &str) -> String {
     item.get(name)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -158,7 +174,14 @@ fn text(item: &Value, name: &str) -> String {
 }
 
 /// Every recommendation of one profile, in the listing's own order, taken in one page.
-async fn recommendations_of(client: &Client, profile_arn: &str, case: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because the single-read suite beside this one reads each listed
+/// recommendation back through the single-recommendation reader.
+pub(crate) async fn recommendations_of(
+    client: &Client,
+    profile_arn: &str,
+    case: &str,
+) -> Vec<Value> {
     let answer = list_recommendations(client, profile_arn, "?maxResults=1000").await;
     items(&answer, case)
 }

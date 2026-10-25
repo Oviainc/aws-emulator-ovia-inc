@@ -2424,7 +2424,7 @@ fn in_process_endpoint(service: &str) -> String {
 /// it routes in process and signs with the emulator's own credentials, so no network
 /// client is configured here. Path-style addressing is what the emulated S3 service routes
 /// on (its operations are bound under a `{Bucket}` path label).
-fn s3_client(
+pub(super) fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {

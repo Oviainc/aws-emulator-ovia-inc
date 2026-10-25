@@ -63,6 +63,8 @@ mod model_template;
 mod portal_lifecycle;
 #[path = "all/portal_product_lifecycle.rs"]
 mod portal_product_lifecycle;
+#[path = "all/portal_product_sharing_policy.rs"]
+mod portal_product_sharing_policy;
 #[path = "all/portal_product_update.rs"]
 mod portal_product_update;
 #[path = "all/portal_publication.rs"]

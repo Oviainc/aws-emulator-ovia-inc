@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeFieldIndexes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeFieldIndexes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeFieldIndexes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The field indexes in effect for the log groups the request names: one entry per field
+//! index the field index policy that applies to a named group creates — the policy stored on
+//! that group when it holds one of its own, otherwise the account-level `FIELD_INDEX_POLICY`
+//! whose `selectionCriteria` select it, which is the same policy `DescribeIndexPolicies`
+//! reports for that group.
+//!
+//! Each entry carries the field's name and the type its policy gives it, the `CUSTOM`
+//! category (the category of a field "you added manually to the field index policy"), and —
+//! because `FieldIndex$logGroupIdentifier` is where "if this field index appears in an index
+//! policy that applies only to a single log group, the ARN of that log group is displayed" —
+//! the group's ARN only for an index created by that group's OWN policy. An index an
+//! account-level policy creates is one entry for all the groups the request named, because
+//! the structure "describes one log event field that is used as an index in at least one
+//! index policy in this account".
+//!
+//! The scan times come from the log data the index was in effect for: an entry's
+//! `lastScanTime` is the most recent ingestion into the groups it covers since its policy
+//! was last updated, and its `firstEventTime` / `lastEventTime` are the earliest and most
+//! recent timestamps among those events whose message carries the indexed field. An index
+//! no such event matched carries neither, which is what an index policy put on a log group
+//! nothing has been written to since reports.
+//!
+//! Every index reported here is a `CUSTOM` one, so a request narrowed to the other
+//! categories alone reports none: an `AUTO` index is one "CloudWatch Logs indexes
+//! automatically based on your query patterns and usage", which nothing here observes; an
+//! `INACTIVE` one is a field "CloudWatch Logs indexed before but does not index now", of
+//! which no scan of this store leaves a record; and the `DEFAULT` fields a policy does not
+//! name are the `@`-prefixed generated ones, which are not values the modelled
+//! `FieldIndex$fieldIndexName` pattern (`^[\.\-_/#A-Za-z0-9]+$`) admits.
+//!
+//! It REPORTS: it reads the store and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +112,8 @@
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
 
+use std::collections::BTreeMap;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -126,6 +153,110 @@ impl From<DescribeFieldIndexesErrorModeled> for DescribeFieldIndexesError {
     }
 }
 
+/// The index categories one response carries when the request names none: "By default, the
+/// response includes the DEFAULT, CUSTOM, and INACTIVE index categories. To return indexes
+/// from other categories, use the indexCategories parameter." Spelled as the model's
+/// `IndexCategory` spells them ([`super::types::INDEX_CATEGORY_VALUES`]).
+const DEFAULT_INDEX_CATEGORIES: [&str; 3] = ["DEFAULT", "CUSTOM", "INACTIVE"];
+
+/// The category of a field index a field index policy names: "CUSTOM: Fields that you added
+/// manually to the field index policy. CloudWatch Logs always indexes these fields."
+const CATEGORY_CUSTOM: &str = "CUSTOM";
+
+/// THE EMULATOR'S OWN CEILING on how many stored log events ONE request scans in all, not
+/// an AWS quota: a log group may hold everything ever ingested into it, and one request names
+/// as many as 100 groups. The NEWEST events of a group are the ones scanned, so the cut falls
+/// on the oldest events and on the groups named last.
+const MAX_SCANNED_EVENTS: usize = 10_000;
+
+/// THE EMULATOR'S OWN CEILING on how many message BYTES one request scans in all, the
+/// second factor of the same product: one stream may hold megabytes of messages.
+const MAX_SCANNED_BYTES: usize = 4 * 1024 * 1024;
+
+/// THE EMULATOR'S OWN CEILING on how many stored events one request WALKS to find the ones
+/// to scan — a small multiple of what it scans, because an event ingested before the policy
+/// in effect was last updated is walked past without being taken. It bounds the walk itself,
+/// so what one request costs is this and not how much log data the named groups hold.
+const MAX_WALKED_EVENTS: usize = 4 * MAX_SCANNED_EVENTS;
+
+/// How many events the scan walks between yields, so a cancelled or timed-out request has
+/// somewhere to land instead of walking every group's events first.
+const SCAN_YIELD_INTERVAL: usize = 256;
+
+/// One log event the scan took out of the store: what the field indexes of its log group
+/// are judged against.
+struct ScannedEvent {
+    /// "The time the event occurred", which an entry's `firstEventTime` / `lastEventTime`
+    /// report.
+    timestamp: i64,
+    /// When the event was ingested, which is when the indexes in effect were scanned for
+    /// it.
+    ingestion_time: i64,
+    /// The event's raw message, whose fields decide which indexes it matches.
+    message: String,
+}
+
+/// One named log group's field indexes and the log events they were scanned against, taken
+/// out of the store in one pass so the scan itself runs with the lock released.
+struct ScannedGroup {
+    /// The `logGroupIdentifier` the group's entries carry: the group's ARN when the policy
+    /// in effect is its OWN, and nothing when it is an account-level one.
+    log_group_identifier: Option<String>,
+    /// The field indexes the policy in effect creates.
+    fields: Vec<crate::state::IndexedField>,
+    /// The group's log events ingested since that policy was last updated.
+    events: Vec<ScannedEvent>,
+}
+
+/// What one reported field index accumulates over the log events it was scanned against.
+struct IndexScan {
+    /// The field index's type, from the policy that creates it.
+    index_type: String,
+    /// The most recent ingestion the index was scanned for, or `None` when nothing was
+    /// ingested while it was in effect.
+    last_scan_time: Option<i64>,
+    /// The earliest matching event's timestamp.
+    first_event_time: Option<i64>,
+    /// The most recent matching event's timestamp.
+    last_event_time: Option<i64>,
+}
+
+/// Whether one log event's parsed message carries the field `field` indexes: the member of
+/// that name, or the member reached by walking a dotted path through nested objects, the way
+/// a structured log event's fields are named. Only a JSON OBJECT is a structured log event,
+/// so a message that is bare text carries no field at all.
+///
+/// "Matches of log events to the names of indexed fields are case-sensitive. For example, a
+/// field index of RequestId won't match a log event containing requestId" — so every
+/// comparison here is byte for byte.
+fn message_carries_field(message: Option<&::serde_json::Value>, field: &str) -> bool {
+    let Some(::serde_json::Value::Object(members)) = message else {
+        return false;
+    };
+    // A member whose own name carries dots is reached under that name, before the name is
+    // read as a path.
+    if members.contains_key(field) {
+        return true;
+    }
+    let mut segments = field.split('.');
+    let Some(head) = segments.next() else {
+        return false;
+    };
+    let Some(mut cursor) = members.get(head) else {
+        return false;
+    };
+    for segment in segments {
+        let Some(members) = cursor.as_object() else {
+            return false;
+        };
+        let Some(next) = members.get(segment) else {
+            return false;
+        };
+        cursor = next;
+    }
+    true
+}
+
 /// The `DescribeFieldIndexes` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,18 +293,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeFieldIndexes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeFieldIndexesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeFieldIndexes"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeFieldIndexesError::from(
+                DescribeFieldIndexesErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let invalid = |message: String| {
+            DescribeFieldIndexesError::from(
+                DescribeFieldIndexesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // A token this operation never mints cannot be a position in an enumeration it
+        // issued: it answers for the log groups one request names, which the model bounds
+        // to 100, in one page.
+        if let Some(token) = input.next_token.as_deref() {
+            return Err(invalid(format!(
+                "nextToken '{token}' was not issued by DescribeFieldIndexes"
+            )));
+        }
+
+        // "The index categories to return", defaulting to the three a response carries when
+        // the request names none. A field index policy's fields are the `CUSTOM` ones, so a
+        // request for other categories alone reports none of them.
+        let categories: Vec<&str> = match input.index_categories.as_deref() {
+            Some(categories) if !categories.is_empty() => {
+                categories.iter().map(String::as_str).collect()
+            }
+            _ => DEFAULT_INDEX_CATEGORIES.to_vec(),
+        };
+        let wants_custom = categories.contains(&CATEGORY_CUSTOM);
+
+        // "An array containing the names or ARNs of the log groups that you want to retrieve
+        // field indexes for": an ARN resolves to the name the store is keyed by, and a group
+        // named twice is still one log group.
+        let mut named: Vec<&str> = Vec::new();
+        for identifier in &input.log_group_identifiers {
+            let name = crate::state::log_group_name_from_identifier(identifier);
+            if !named.contains(&name) {
+                named.push(name);
+            }
+        }
+
+        let mut scanned: Vec<ScannedGroup> = Vec::new();
+        let mut byte_budget = MAX_SCANNED_BYTES;
+        let mut event_budget = MAX_SCANNED_EVENTS;
+        let mut walk_budget = MAX_WALKED_EVENTS;
+        {
+            let store = state.lock();
+            for name in named {
+                // Every named group is resolved, whichever categories the request asks for:
+                // a log group the account does not hold is a missing resource rather than an
+                // empty answer.
+                let Some(group) = store.log_groups.get(name) else {
+                    return Err(DescribeFieldIndexesErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::resource_not_found_message("log group")),
+                        },
+                    )
+                    .into());
+                };
+                if !wants_custom {
+                    continue;
+                }
+                // "Only log groups in the Standard log class support field index policies",
+                // so no field index is in effect for a group in any other class.
+                if group.log_group_class != crate::state::INDEX_POLICY_LOG_GROUP_CLASS {
+                    continue;
+                }
+
+                // The policy in effect for the group, which is the one
+                // `DescribeIndexPolicies` reports for it: its own when it holds one ("Log
+                // group-level field index policies created with PutIndexPolicy override
+                // account-level field index policies"), otherwise the account-level
+                // `FIELD_INDEX_POLICY` that selects it.
+                let (log_group_identifier, document, effective_ms) = match group
+                    .index_policy
+                    .as_ref()
+                {
+                    Some(policy) => (
+                        Some(group.log_group_arn.clone()),
+                        policy.policy_document.clone(),
+                        policy.last_update_time_ms,
+                    ),
+                    None => match crate::state::applicable_account_policy(
+                        &store.account_policies,
+                        crate::state::POLICY_TYPE_FIELD_INDEX,
+                        group,
+                    ) {
+                        Some(policy) => (
+                            None,
+                            policy.policy_document.clone(),
+                            policy.last_updated_time_ms,
+                        ),
+                        None => continue,
+                    },
+                };
+
+                // The field indexes the document names, read the way the put that stored it
+                // read them. A stored document went through that check when it was put, so
+                // one that no longer parses names no field index rather than refusing the
+                // read.
+                let fields =
+                    crate::state::check_field_index_policy_document(&document).unwrap_or_default();
+                if fields.is_empty() {
+                    continue;
+                }
+
+                // The events the indexes were in effect for: "the earliest log event that
+                // matches this field index, AFTER the index policy that contains it was
+                // created", so an event ingested before the policy was last updated is not
+                // one this index was scanned for. Every stream of the group carries them.
+                let mut events: Vec<ScannedEvent> = Vec::new();
+                for stream in group.streams.values() {
+                    // The newest events are the ones scanned, so both ceilings cut the
+                    // oldest.
+                    for event in stream.events.iter().rev() {
+                        if event_budget == 0 || byte_budget == 0 || walk_budget == 0 {
+                            break;
+                        }
+                        walk_budget = walk_budget.saturating_sub(1);
+                        if event.ingestion_time < effective_ms {
+                            continue;
+                        }
+                        event_budget = event_budget.saturating_sub(1);
+                        byte_budget = byte_budget.saturating_sub(event.message.len());
+                        events.push(ScannedEvent {
+                            timestamp: event.timestamp,
+                            ingestion_time: event.ingestion_time,
+                            message: event.message.clone(),
+                        });
+                    }
+                }
+
+                scanned.push(ScannedGroup {
+                    log_group_identifier,
+                    fields,
+                    events,
+                });
+            }
+        }
+
+        // One entry per field index, keyed by the identifier it is reported under and the
+        // field it matches: an index an account-level policy creates is reported once for
+        // every group the request named, because it "is used as an index in at least one
+        // index policy in this account" rather than in one log group's.
+        let mut entries: BTreeMap<(Option<String>, String), IndexScan> = BTreeMap::new();
+        let mut walked = 0usize;
+        for group in &scanned {
+            // "The most recent time that CloudWatch Logs scanned ingested log events to
+            // search for this field index": every event taken was scanned for every index in
+            // effect for its group, so the most recent scan is the most recent ingestion
+            // among them.
+            let last_scan_time = group
+                .events
+                .iter()
+                .map(|event| event.ingestion_time)
+                .max();
+            for field in &group.fields {
+                let entry = entries
+                    .entry((group.log_group_identifier.clone(), field.name.clone()))
+                    .or_insert_with(|| IndexScan {
+                        index_type: field.index_type.clone(),
+                        last_scan_time: None,
+                        first_event_time: None,
+                        last_event_time: None,
+                    });
+                entry.last_scan_time = entry.last_scan_time.max(last_scan_time);
+            }
+
+            for event in &group.events {
+                // A yield every `SCAN_YIELD_INTERVAL` events, so a cancelled or timed-out
+                // request has somewhere to land mid-scan.
+                if walked > 0 && walked.is_multiple_of(SCAN_YIELD_INTERVAL) {
+                    ::tokio::task::yield_now().await;
+                }
+                walked = walked.saturating_add(1);
+                let parsed = ::serde_json::from_str::<::serde_json::Value>(&event.message).ok();
+                for field in &group.fields {
+                    if !message_carries_field(parsed.as_ref(), &field.name) {
+                        continue;
+                    }
+                    let key = (group.log_group_identifier.clone(), field.name.clone());
+                    if let Some(entry) = entries.get_mut(&key) {
+                        entry.first_event_time = Some(
+                            entry
+                                .first_event_time
+                                .map_or(event.timestamp, |earliest| earliest.min(event.timestamp)),
+                        );
+                        entry.last_event_time = Some(
+                            entry
+                                .last_event_time
+                                .map_or(event.timestamp, |latest| latest.max(event.timestamp)),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(DescribeFieldIndexesOutput {
+            // "An array containing the field index information", ordered by the identifier
+            // each entry is reported under and then by field name, so one store answers one
+            // request the same way every time.
+            field_indexes: Some(
+                entries
+                    .into_iter()
+                    .map(|((log_group_identifier, name), scan)| FieldIndex {
+                        log_group_identifier,
+                        field_index_name: Some(name),
+                        last_scan_time: scan.last_scan_time,
+                        first_event_time: scan.first_event_time,
+                        last_event_time: scan.last_event_time,
+                        r#type: Some(scan.index_type),
+                        index_category: Some(CATEGORY_CUSTOM.to_string()),
+                    })
+                    .collect(),
+            ),
+            // Every answer is one page, so there is no position to hand back.
+            next_token: None,
+        })
     }
 }

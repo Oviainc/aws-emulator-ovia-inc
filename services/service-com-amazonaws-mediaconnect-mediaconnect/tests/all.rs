@@ -65,6 +65,8 @@ mod gateway_instances;
 mod gateway_lifecycle;
 #[path = "all/get_router_input.rs"]
 mod get_router_input;
+#[path = "all/global_resource_tag_listing.rs"]
+mod global_resource_tag_listing;
 #[path = "all/global_resource_tags.rs"]
 mod global_resource_tags;
 #[path = "all/lifecycle_preconditions.rs"]

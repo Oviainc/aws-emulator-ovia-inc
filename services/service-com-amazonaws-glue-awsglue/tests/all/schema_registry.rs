@@ -28,8 +28,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID};
 
 /// A registry seeded straight into the store, so a row can address a registry other than
-/// the default one. `CreateRegistry` is still a scaffold, so there is no over-the-wire way
-/// to make one.
+/// the default one, without this suite depending on `CreateRegistry` (which the
+/// registries suite covers).
 const SEEDED_REGISTRY: &str = "analytics-registry";
 
 /// The Region every request from this harness is scoped to, which is the Region the

@@ -4463,6 +4463,24 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .find_map(|flow| flow.sub_resource_tags(resource_arn))
     }
 
+    /// The tags of the GLOBAL resource `resource_arn` addresses, for a tag READ, or `None`
+    /// when this service holds no such resource.
+    ///
+    /// The read side of [`Self::global_resource_tags_mut`], which is the ONE place a global
+    /// `ResourceArn` is resolved: a reporting caller gets the record's own tag map and no
+    /// handle on the record, so the lookup a tag read and a tag write agree on cannot drift
+    /// between them. Which ARNs resolve, and why the clock's due work is materialised
+    /// first, is documented there.
+    pub fn global_tags_of(
+        &mut self,
+        resource_arn: &str,
+        now: SystemTime,
+    ) -> Option<&BTreeMap<String, String>> {
+        // `&mut` reborrowed as `&`: the reporting caller can read the map it resolves and
+        // cannot change it.
+        Some(self.global_resource_tags_mut(resource_arn, now)?.tags)
+    }
+
     /// The tags of the resource `resource_arn` addresses, for a tag write. See
     /// [`ComAmazonawsMediaconnectMediaconnectState::tags_of`] for which ARNs resolve.
     pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {

@@ -447,7 +447,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // notifications it owes are delivered with it released.
         {
             let mut store = state.lock();
+            let mut written: Vec<crate::state::MetricKey> = Vec::with_capacity(ingest.len());
             for (key, observations) in ingest {
+                let watched = key.clone();
                 if store.append_datapoints(key, observations).is_err() {
                     return Err(PutMetricDataErrorModeled::LimitExceededFault(
                         LimitExceededFault {
@@ -459,7 +461,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+                written.push(watched);
             }
+            // An alarm is evaluated FROM these datapoints, so storing one of the series it
+            // watches is what makes its evaluation due.
+            store.make_alarms_due(&written, now);
         }
 
         // These datapoints are what every metric alarm over them is evaluated from, so the
@@ -467,6 +473,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the resulting transitions owe go out, rather than waiting for whatever call reads
         // the alarm next.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // A publisher makes no further CloudWatch call before it looks for the notification
+        // the datapoints it just stored will owe, so the clock that materialises what they
+        // make due later is started here.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
 
         Ok(PutMetricDataOutput)
     }

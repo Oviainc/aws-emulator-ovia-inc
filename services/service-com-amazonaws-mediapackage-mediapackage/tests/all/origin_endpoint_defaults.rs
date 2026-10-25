@@ -9,14 +9,16 @@
 //! one stored record, so all three carry the same member set.
 //!
 //! The defaults are keyed by MEMBER, so the same member takes the same default wherever it
-//! appears (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`); the table below is
-//! the one in `crate::state`, with its sources. Every case is driven as real HTTP through
-//! the `MultiServiceRouter`, the same dispatch the served emulator uses.
+//! appears (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`, and the
+//! `StreamSelection` all four packaging shapes carry); the table below is the one in
+//! `crate::state`, with its sources. Every case is driven as real HTTP through the
+//! `MultiServiceRouter`, the same dispatch the served emulator uses.
 //!
 //! The rows span the class the rule generalises over: which packaging configuration the
 //! endpoint carries (HLS, DASH, CMAF, MSS), how many of the server-filled members the
 //! request supplies (none, some, all), the form of a supplied list (empty versus
-//! populated) and the number of CMAF child manifests.
+//! populated), the form of a supplied nested block (absent, partial, complete) and the
+//! number of CMAF child manifests.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -147,6 +149,31 @@ fn dash_package_defaults() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The `streamSelection` members MediaPackage server-fills, with the default each takes.
+/// `StreamSelection` is a member of all four packaging shapes
+/// (`smithy_query(query="shape",shape="HlsPackage,DashPackage,CmafPackage,MssPackage",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// so the block is filled on whichever one the endpoint carries. Each path here is
+/// relative to the packaging block.
+fn stream_selection_defaults() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "streamSelection/streamOrder",
+            json!(state::DEFAULT_STREAM_ORDER),
+        ),
+        (
+            "streamSelection/minVideoBitsPerSecond",
+            json!(state::DEFAULT_MIN_VIDEO_BITS_PER_SECOND),
+        ),
+        (
+            "streamSelection/maxVideoBitsPerSecond",
+            json!(state::DEFAULT_MAX_VIDEO_BITS_PER_SECOND),
+        ),
+    ]
+}
+
+/// The four packaging members an origin endpoint may carry, exactly one at a time.
+const PACKAGING_MEMBERS: [&str; 4] = ["hlsPackage", "dashPackage", "cmafPackage", "mssPackage"];
+
 /// What every projection of the endpoint created by `request` must carry, as JSON-pointer
 /// / value pairs: the value the request supplied where it supplied one, else that member's
 /// default. Derived from the request and the table above, so one row asserts BOTH halves
@@ -168,6 +195,13 @@ fn expected_members(request: &Value) -> Vec<(String, Value)> {
     if request.get("dashPackage").is_some() {
         for (member, default) in dash_package_defaults() {
             push(format!("/dashPackage/{member}"), default);
+        }
+    }
+    for package in PACKAGING_MEMBERS {
+        if request.get(package).is_some() {
+            for (member, default) in stream_selection_defaults() {
+                push(format!("/{package}/{member}"), default);
+            }
         }
     }
     let children = request
@@ -269,9 +303,49 @@ fn cases() -> Vec<(&'static str, Value)> {
                 }
             }),
         ),
-        // MSS: the endpoint-level members are filled, and no member is invented inside a
-        // package whose defaults neither the model nor a recording publishes.
+        // MSS: the endpoint-level members are filled, and the stream selection every
+        // packaging block the service stores carries.
         ("mss, nothing supplied", json!({ "mssPackage": {} })),
+        // A PARTLY supplied stream selection: the member sent survives and the two it
+        // leaves unset are completed, on a block whose other members publish no default.
+        (
+            "mss, partial streamSelection",
+            json!({
+                "mssPackage": {
+                    "manifestWindowSeconds": 45,
+                    "streamSelection": { "streamOrder": "VIDEO_BITRATE_ASCENDING" }
+                }
+            }),
+        ),
+        // A COMPLETE stream selection, no member of it a default value: none is rewritten.
+        (
+            "hls, complete streamSelection",
+            json!({
+                "hlsPackage": {
+                    "streamSelection": {
+                        "streamOrder": "VIDEO_BITRATE_DESCENDING",
+                        "minVideoBitsPerSecond": 500,
+                        "maxVideoBitsPerSecond": 5_000
+                    }
+                }
+            }),
+        ),
+        // A bitrate bound sent AS its own default is still a supplied value, and the
+        // selection on a CMAF block is completed like any other.
+        (
+            "cmaf, streamSelection with a floor of its own",
+            json!({
+                "cmafPackage": {
+                    "hlsManifests": [{ "id": "only" }],
+                    "streamSelection": { "minVideoBitsPerSecond": 0 }
+                }
+            }),
+        ),
+        // And on a DASH block, beside the DASH-only defaults.
+        (
+            "dash, streamSelection with a ceiling of its own",
+            json!({ "dashPackage": { "streamSelection": { "maxVideoBitsPerSecond": 1 } } }),
+        ),
     ]
 }
 
@@ -361,46 +435,94 @@ async fn every_origin_endpoint_projection_carries_the_server_filled_members() {
     }
 }
 
+/// The complete `streamSelection` block the service fills when the request sends none.
+fn default_stream_selection() -> Value {
+    json!({
+        "streamOrder": state::DEFAULT_STREAM_ORDER,
+        "minVideoBitsPerSecond": state::DEFAULT_MIN_VIDEO_BITS_PER_SECOND,
+        "maxVideoBitsPerSecond": state::DEFAULT_MAX_VIDEO_BITS_PER_SECOND
+    })
+}
+
 #[tokio::test]
-async fn a_package_with_no_published_defaults_gains_no_invented_member() {
+async fn an_mss_package_gains_its_stream_selection_and_no_other_member() {
     let router = emulator();
     let (status, _) = call(&router, "POST", "/channels", Some(&json!({ "id": CHANNEL }))).await;
     assert_eq!(status, 200, "creating the fixture channel expected 200");
 
-    // `MssPackage` publishes no default for any of its members, and neither does
-    // `HlsPackage.StreamSelection`/`SegmentDurationSeconds`, so a create must store those
-    // blocks exactly as sent: a default table may not grow a member AWS leaves absent.
-    // One row per such block, the rows differing in whether the block is empty or carries
-    // a member of its own.
-    let rows: Vec<(&str, &str, Value)> = vec![
-        ("empty mss", "mssPackage", json!({})),
+    // `MssPackage`'s window, segment and encryption members publish no default, so a
+    // create must store the block as sent except for the ONE member the service fills on
+    // every packaging block it stores — its `streamSelection`. Whole-block equality, so
+    // each row pins both halves at once: the selection is completed and no other member is
+    // invented. The rows differ in whether the block is empty or carries members of its
+    // own, and in whether the selection is supplied not at all, partly or completely.
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "empty mss",
+            json!({}),
+            json!({ "streamSelection": default_stream_selection() }),
+        ),
         (
             "mss with a window",
-            "mssPackage",
             json!({ "manifestWindowSeconds": 30 }),
+            json!({
+                "manifestWindowSeconds": 30,
+                "streamSelection": default_stream_selection()
+            }),
         ),
         (
-            "mss with a stream selection",
-            "mssPackage",
-            json!({ "streamSelection": { "streamOrder": "ORIGINAL" } }),
+            "mss with a window and a segment duration",
+            json!({ "manifestWindowSeconds": 45, "segmentDurationSeconds": 4 }),
+            json!({
+                "manifestWindowSeconds": 45,
+                "segmentDurationSeconds": 4,
+                "streamSelection": default_stream_selection()
+            }),
+        ),
+        (
+            "mss with a partial stream selection",
+            json!({ "streamSelection": { "streamOrder": "VIDEO_BITRATE_ASCENDING" } }),
+            json!({
+                "streamSelection": {
+                    "streamOrder": "VIDEO_BITRATE_ASCENDING",
+                    "minVideoBitsPerSecond": state::DEFAULT_MIN_VIDEO_BITS_PER_SECOND,
+                    "maxVideoBitsPerSecond": state::DEFAULT_MAX_VIDEO_BITS_PER_SECOND
+                }
+            }),
+        ),
+        (
+            "mss with a complete stream selection",
+            json!({
+                "streamSelection": {
+                    "streamOrder": "VIDEO_BITRATE_DESCENDING",
+                    "minVideoBitsPerSecond": 500,
+                    "maxVideoBitsPerSecond": 5_000
+                }
+            }),
+            json!({
+                "streamSelection": {
+                    "streamOrder": "VIDEO_BITRATE_DESCENDING",
+                    "minVideoBitsPerSecond": 500,
+                    "maxVideoBitsPerSecond": 5_000
+                }
+            }),
         ),
     ];
-    for (index, (case, member, package)) in rows.into_iter().enumerate() {
+    for (index, (case, package, want)) in rows.into_iter().enumerate() {
         let id = format!("unpublished-{index}");
-        let request = json!({ "channelId": CHANNEL, "id": id, member: package.clone() });
+        let request = json!({ "channelId": CHANNEL, "id": id, "mssPackage": package });
         let (status, created) = call(&router, "POST", "/origin_endpoints", Some(&request)).await;
         assert_eq!(
             status, 200,
             "case {case:?}: CreateOriginEndpoint expected 200, got {status} {created}"
         );
         let stored = created
-            .get(member)
+            .get("mssPackage")
             .cloned()
             .unwrap_or(Value::Object(Map::new()));
         assert_eq!(
-            &stored,
-            &package,
-            "case {case:?}: {member} must be stored exactly as sent, got {stored}"
+            &stored, &want,
+            "case {case:?}: mssPackage must be stored as {want}, got {stored}"
         );
     }
 }
@@ -414,6 +536,11 @@ async fn every_server_filled_enum_default_is_a_value_the_model_accepts() {
     let singles: Vec<(&str, &str, &[&str])> = vec![
         ("Origination", state::DEFAULT_ORIGINATION, types::ORIGINATION_VALUES),
         ("AdMarkers", state::DEFAULT_AD_MARKERS, types::AD_MARKERS_VALUES),
+        (
+            "StreamOrder",
+            state::DEFAULT_STREAM_ORDER,
+            types::STREAM_ORDER_VALUES,
+        ),
         (
             "AdsOnDeliveryRestrictions",
             state::DEFAULT_ADS_ON_DELIVERY_RESTRICTIONS,

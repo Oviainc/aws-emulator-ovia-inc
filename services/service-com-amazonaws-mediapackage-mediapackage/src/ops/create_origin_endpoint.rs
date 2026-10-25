@@ -348,7 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             hls_package: input.hls_package.clone(),
             dash_package: input.dash_package.clone(),
             cmaf_package: input.cmaf_package.as_ref().map(|params| {
-                crate::state::stored_cmaf_package(params, &region, &input.channel_id, &input.id)
+                // A child manifest sent without a `ManifestName` inherits the endpoint's
+                // effective one, resolved just above, so the name and the derived child URL
+                // agree with the endpoint's own.
+                crate::state::stored_cmaf_package(
+                    params,
+                    &region,
+                    &input.channel_id,
+                    &input.id,
+                    &manifest_name,
+                )
             }),
             mss_package: input.mss_package.clone(),
             authorization: input.authorization.clone(),

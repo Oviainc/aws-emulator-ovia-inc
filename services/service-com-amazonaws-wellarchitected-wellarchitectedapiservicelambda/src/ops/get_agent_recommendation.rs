@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentRecommendation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentRecommendation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentRecommendation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieves detailed information about a specific optimization recommendation": the
+//! recommendation the request's `recommendationArn` names is reported in full — what the
+//! service owns of it (the ARN, the profile and generation it came out of, the identity
+//! and instants it is attributed to), the status a caller has since moved it to, and the
+//! finding's own content, which belongs to the recommendation's pillar rather than to the
+//! request asking for it, so every read of one recommendation reports the same words.
 //!
 //! ## Shape of an operation
 //!
@@ -205,20 +203,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentRecommendation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentRecommendationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentRecommendation"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentRecommendationErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `remediationType`
+        // is a `RemediationType`, so the boundary walk in `crate::service` already refuses
+        // a value outside the published set with this same 400 before the handler runs. It
+        // is kept so an unpublished filter can never be answered as "no remediation of that
+        // type" — a value the enum does not publish names no remediation type at all.
+        if let Some(remediation_type) = input.remediation_type.as_deref() {
+            if !REMEDIATION_TYPE_VALUES.contains(&remediation_type) {
+                return Err(GetAgentRecommendationErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        REMEDIATION_TYPE_MEMBER,
+                        &format!(
+                            "Member must satisfy enum value set: [{}], got {remediation_type}",
+                            REMEDIATION_TYPE_VALUES.join(", ")
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The recommendations of a generation whose analysis the clock has finished exist
+        // from that instant, so they are recorded before this ARN is resolved: a caller may
+        // read one as soon as the generation that produced it completed, whether or not
+        // anybody polled that generation in between.
+        store.materialise_due_agent_recommendations(now);
+
+        // "The Amazon Resource Name (ARN) of the recommendation to retrieve": an ARN that
+        // names no recommendation this account holds has nothing to report, which is the
+        // 404 this operation models.
+        let Some(record) = store.agent_recommendation(&input.recommendation_arn) else {
+            return Err(GetAgentRecommendationErrorModeled::ResourceNotFoundException(
+                crate::state::agent_recommendation_not_found(&input.recommendation_arn),
+            )
+            .into());
+        };
+        let content = record.content;
+
+        // "Goals that this recommendation targets": the optimization goals of the profile
+        // the recommendation belongs to — "specific targets and objectives for the
+        // optimization process" (`CreateAgentGoal` doc) — that name this recommendation's
+        // pillar among the pillars they apply to (`GoalSummary$pillars`). A goal that
+        // targets other pillars is not one THIS finding advances, and a profile whose goals
+        // target none of this pillar targets nothing here: the member is modelled optional,
+        // so the answer is then nothing rather than an empty list.
+        let goals: Vec<RecommendationGoal> = store
+            .agent_goals
+            .get(&record.profile_arn)
+            .map(|goals| {
+                goals
+                    .values()
+                    .filter(|goal| goal.pillars.iter().any(|pillar| pillar == content.pillar))
+                    .map(|goal| RecommendationGoal {
+                        title: goal.title.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(GetAgentRecommendationOutput {
+            recommendation_arn: record.arn.clone(),
+            profile_arn: record.profile_arn.clone(),
+            generation_id: Some(record.generation_id.clone()),
+            title: content.title.to_string(),
+            description: content.description.to_string(),
+            r#type: record.recommendation_type.clone(),
+            pillar: content.pillar.to_string(),
+            priority: content.priority.to_string(),
+            effort: content.effort.to_string(),
+            status: record.status.clone(),
+            // Derived from the status rather than held beside it, so a read of one
+            // recommendation and a listing of it cannot disagree about its state.
+            state: record.state().to_string(),
+            update_reason: record.update_reason.clone(),
+            impact: content.impact.to_string(),
+            roi: content.roi(),
+            // `numberOfResources`, `businessUnits` and `applications` describe the
+            // customer's own resources, business units and applications, and this emulator
+            // analyses none — all three are modelled optional, so reporting nothing is what
+            // it has to say about them, exactly as a listing does
+            // (`crate::state::AgentRecommendationRecord::to_summary`).
+            number_of_resources: None,
+            aws_services: Some(content.aws_service_list()),
+            business_units: None,
+            applications: None,
+            impact_details: content.impact_detail_list(),
+            insights: content.insight_list(),
+            highlights: content.highlight_list(),
+            remediation_summary: content.remediation_summary(),
+            cross_pillar_benefits: content.cross_pillar_benefit_list(),
+            trade_offs: content.trade_off_list(),
+            // "Sources that generated this recommendation": every recommendation this
+            // service holds was produced by the agent's own recommendation generation
+            // (`StartAgentRecommendationGeneration`), which is the `RecommendationSource`
+            // named here; nothing else generates one.
+            sources: Some(vec![GENERATED_BY.to_string()]),
+            goals: (!goals.is_empty()).then_some(goals),
+            // A recommendation carries no tags of its own: nothing in this service tags
+            // one, and the member is modelled optional.
+            tags: None,
+            created_by: record.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+            last_modified_by: record.last_modified_by.clone(),
+            last_modified_at: record
+                .last_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+            // The fix the finding publishes, as the request asked for it: narrowed to one
+            // `RemediationType` when the request filters on one, and an empty list when
+            // this finding publishes none of that type — the filter selected nothing, which
+            // is not the same as the finding publishing no remediation at all. The ARN and
+            // the identity and instant a remediation carries are the recommendation's: the
+            // service published the two together.
+            remediations: Some(content.remediation_list(
+                &record.arn,
+                &record.created_by,
+                record.created_at,
+                input.remediation_type.as_deref(),
+            )),
+        })
     }
 }
+
+/// The modelled input member a remediation-type finding names
+/// (`GetAgentRecommendationRequest$remediationType`), as `ValidationExceptionField$Name`
+/// reports it.
+const REMEDIATION_TYPE_MEMBER: &str = "remediationType";
+
+/// `RecommendationSource$WELL_ARCHITECTED_AGENT`: the source every recommendation this
+/// service holds was generated by — the agent whose generation produced it
+/// (`smithy_query(query="shape", shape="RecommendationSource")`).
+const GENERATED_BY: &str = "WELL_ARCHITECTED_AGENT";
