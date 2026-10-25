@@ -50,6 +50,10 @@ use crate::ops::types::{AggregateResourceIdentifier, ConfigurationItem};
 // of stored queries reports each one as.
 use crate::ops::types::StoredQueryMetadata;
 
+// `AggregatedSourceStatus` is named separately for the same reason: it is the sync
+// status an aggregator read reports one of its aggregation sources as.
+use crate::ops::types::AggregatedSourceStatus;
+
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
 /// for every ARN this emulator mints.
 pub const ARN_SERVICE: &str = "config";
@@ -128,6 +132,25 @@ pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED: &str = "ResourceDeleted";
 /// the values it takes IN, so a filter that lists resource types aggregates those
 /// types and no others.
 pub const AGGREGATOR_FILTER_TYPE_INCLUDE: &str = "INCLUDE";
+
+/// `AggregatedSourceType` values (`com.amazonaws.configservice#AggregatedSourceType`):
+/// an aggregation source is either individual source accounts (`ACCOUNT`) or an
+/// organization (`ORGANIZATION`), which is the pair of forms an aggregator aggregates
+/// (see [`ConfigurationAggregatorEntry`]).
+pub const AGGREGATED_SOURCE_TYPE_ACCOUNT: &str = "ACCOUNT";
+/// See [`AGGREGATED_SOURCE_TYPE_ACCOUNT`].
+pub const AGGREGATED_SOURCE_TYPE_ORGANIZATION: &str = "ORGANIZATION";
+
+/// The `AggregatedSourceStatusType` of a source whose Config data reached the
+/// aggregator (`com.amazonaws.configservice#AggregatedSourceStatusType`: "Valid value
+/// SUCCEEDED indicates the data was successfully moved").
+///
+/// It is the status of every source relationship this store records, because the only
+/// aggregation this store performs is the one it serves itself: the other two values
+/// report a sync that failed (`FAILED`, "errors while moving data") or has fallen
+/// behind (`OUTDATED`, "the data is not the most recent"), and no call served here
+/// records either, so no source carries one.
+pub const AGGREGATED_SOURCE_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// The `RecordingScope` of a CUSTOMER MANAGED configuration recorder
 /// (`com.amazonaws.configservice#RecordingScope`: `INTERNAL` when the recorded
@@ -608,6 +631,14 @@ pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 /// modelled `Limit` range maximum.
 pub const DESCRIBE_AGGREGATION_AUTHORIZATIONS_PAGE_SIZE: i32 = 100;
 
+/// How many source statuses one `DescribeConfigurationAggregatorSourcesStatus` page
+/// carries when the request asks for no `Limit`
+/// (`DescribeConfigurationAggregatorSourcesStatusRequest$Limit`: "The maximum number
+/// of AggregatorSourceStatus returned on each page. The default is maximum. If you
+/// specify 0, Config uses the default") — the maximum being the modelled `Limit` range
+/// maximum.
+pub const DESCRIBE_CONFIGURATION_AGGREGATOR_SOURCES_STATUS_PAGE_SIZE: i32 = 100;
+
 /// The most aggregation authorizations this account and Region can hold, after which
 /// `PutAggregationAuthorization` refuses a NEW authorized pair.
 ///
@@ -617,6 +648,30 @@ pub const DESCRIBE_AGGREGATION_AUTHORIZATIONS_PAGE_SIZE: i32 = 100;
 /// grow it one entry per distinct pair without end. It is two orders of magnitude above
 /// the aggregator quota Config does publish, so no faithful workload meets it.
 pub const AGGREGATION_AUTHORIZATIONS_QUOTA: usize = 5_000;
+
+/// The most source accounts one account aggregation source can name, after which
+/// `PutConfigurationAggregator` refuses it with `LimitExceededException`
+/// (`LimitExceededException`: "For PutConfigurationAggregator API, this exception is
+/// thrown if the number of accounts and aggregators exceeds the limit").
+///
+/// The model bounds `AccountAggregationSourceAccountList` only from below (length
+/// 1..), so this is the EMULATOR's own bound, like [`AGGREGATION_AUTHORIZATIONS_QUOTA`]
+/// above: a source-status read reports one record per (account, Region) PAIR, so a
+/// stored source whose account list were unbounded would let one write decide how much
+/// work every later read of it has to do. It is two orders of magnitude above the
+/// aggregator quota Config does publish, so no faithful workload meets it.
+pub const AGGREGATION_SOURCE_ACCOUNTS_QUOTA: usize = 10_000;
+
+/// The most Regions one aggregation source can list, after which
+/// `PutConfigurationAggregator` refuses it. The emulator's own bound, for the same
+/// reason as [`AGGREGATION_SOURCE_ACCOUNTS_QUOTA`] — the Regions are the other factor
+/// of that product, and `AggregatorRegionList` is likewise bounded only from below
+/// (length 1..).
+///
+/// It is above every count of Regions Amazon Web Services has published, and a source
+/// that aggregates all of them says so with `AllAwsRegions` rather than by listing
+/// them, so no faithful workload meets it either.
+pub const AGGREGATION_SOURCE_REGIONS_QUOTA: usize = 100;
 
 /// How many rules one `DescribeConfigRules` page carries.
 ///
@@ -2136,6 +2191,135 @@ impl ConfigurationAggregatorEntry {
             _ => listed.iter().any(|named| named == resource_type),
         }
     }
+
+    /// The sources this aggregator takes in: the kind of source, the sources it names
+    /// and the Regions each of them is collected from, or `None` for an aggregator
+    /// that names no source at all.
+    ///
+    /// An aggregator aggregates EITHER one account aggregation source
+    /// (`AccountAggregationSourceList`, length 0..1) OR an organization source, so the
+    /// sources it takes in are ONE set of source ids collected over ONE set of
+    /// Regions: an account source names the accounts it lists, under
+    /// [`AGGREGATED_SOURCE_TYPE_ACCOUNT`], and an organization source names the
+    /// organization, under [`AGGREGATED_SOURCE_TYPE_ORGANIZATION`] and identified by
+    /// `account_id` — the account whose organization this store stands for, which is
+    /// the only organization identity it holds.
+    ///
+    /// Both lists come back SORTED and without repeats, because one (source, Region)
+    /// pair is one sync relationship however many times the source names it, and
+    /// because the pairs in that order are the order a page of statuses is served in.
+    pub fn aggregated_sources<'a>(
+        &'a self,
+        account_id: &'a str,
+        aggregator_region: &'a str,
+    ) -> Option<AggregatedSources<'a>> {
+        let (source_type, source_ids, source) =
+            if let Some(source) = self.account_aggregation_sources.first() {
+                let accounts = source.account_ids.iter().map(String::as_str).collect();
+                (AGGREGATED_SOURCE_TYPE_ACCOUNT, accounts, Some(source))
+            } else {
+                (AGGREGATED_SOURCE_TYPE_ORGANIZATION, vec![account_id], None)
+            };
+        let (all_aws_regions, aws_regions) = match source {
+            Some(source) => (source.all_aws_regions, source.aws_regions.as_deref()),
+            None => {
+                let source = self.organization_aggregation_source.as_ref()?;
+                (source.all_aws_regions, source.aws_regions.as_deref())
+            }
+        };
+        let sources = AggregatedSources {
+            source_type,
+            last_update_status: AGGREGATED_SOURCE_STATUS_SUCCEEDED,
+            source_ids: sorted_unique(source_ids),
+            aws_regions: sorted_unique(aggregated_regions(
+                all_aws_regions,
+                aws_regions,
+                aggregator_region,
+            )),
+        };
+        (!sources.source_ids.is_empty() && !sources.aws_regions.is_empty()).then_some(sources)
+    }
+
+    /// The sync status this aggregator reports for the source `source_id`, of kind
+    /// `source_type`, collected from `aws_region`.
+    ///
+    /// `LastUpdateTime` is the instant the relationship was last verified, which is
+    /// when the aggregator's sources were last written ([`Self::last_updated_at`]), so
+    /// it is stable across reads and moves only when the sources themselves do.
+    pub fn source_status(
+        &self,
+        source_id: &str,
+        source_type: &str,
+        aws_region: &str,
+    ) -> AggregatedSourceStatus {
+        AggregatedSourceStatus {
+            source_id: Some(source_id.to_string()),
+            source_type: Some(source_type.to_string()),
+            aws_region: Some(aws_region.to_string()),
+            last_update_status: Some(AGGREGATED_SOURCE_STATUS_SUCCEEDED.to_string()),
+            last_update_time: Some(timestamp(self.last_updated_at)),
+            // No sync served here has failed, so there is no error to report: see
+            // [`AGGREGATED_SOURCE_STATUS_SUCCEEDED`].
+            last_error_code: None,
+            last_error_message: None,
+        }
+    }
+}
+
+/// The sources one configuration aggregator takes in
+/// ([`ConfigurationAggregatorEntry::aggregated_sources`]): every (source id, Region)
+/// pair it holds a sync relationship for is one source id of [`Self::source_ids`]
+/// collected from one Region of [`Self::aws_regions`].
+///
+/// The pairs are held as the two lists rather than as the pairs themselves, so a read
+/// that serves one page of them walks the lists and builds only that page: neither the
+/// account list nor the Region list of an aggregation source is bounded by the model,
+/// and their PRODUCT is what a caller would otherwise have materialised by one call.
+#[derive(Debug, Clone)]
+pub struct AggregatedSources<'a> {
+    /// Which kind of source the ids name ([`AGGREGATED_SOURCE_TYPE_ACCOUNT`] or
+    /// [`AGGREGATED_SOURCE_TYPE_ORGANIZATION`]).
+    pub source_type: &'static str,
+    /// The `LastUpdateStatus` every one of these relationships is in, which is the one
+    /// [`ConfigurationAggregatorEntry::source_status`] reports for each of them. A
+    /// status filter is matched against THIS, once, so a filter that names no status
+    /// these sources are in is answered without walking a single pair.
+    pub last_update_status: &'static str,
+    /// The sources, sorted and without repeats.
+    pub source_ids: Vec<&'a str>,
+    /// The Regions each source is collected from, sorted and without repeats.
+    pub aws_regions: Vec<&'a str>,
+}
+
+/// `values` sorted and without repeats: one entry per distinct value, in the one
+/// ordering a paged read can resume in.
+fn sorted_unique(mut values: Vec<&str>) -> Vec<&str> {
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+/// The Regions one aggregation source aggregates: the ones it LISTS, or — when it
+/// aggregates every Region (`AllAwsRegions`) — `aggregator_region`.
+///
+/// An aggregation source names its Regions one of those two ways, which is what
+/// `PutConfigurationAggregator` holds it to. A source that names every Region takes in
+/// whichever Regions hold Config data, and one engine's store stands for ONE account
+/// in ONE Region, so the single Region it resolves to here is the aggregator's own.
+fn aggregated_regions<'a>(
+    all_aws_regions: bool,
+    aws_regions: Option<&'a [String]>,
+    aggregator_region: &'a str,
+) -> Vec<&'a str> {
+    let listed: Vec<&str> = aws_regions
+        .unwrap_or_default()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if listed.is_empty() && all_aws_regions {
+        return vec![aggregator_region];
+    }
+    listed
 }
 
 /// The key one resource evaluation is listed at: the instant its execution started,
@@ -3407,6 +3591,32 @@ pub fn decode_aggregation_authorization_token(token: &str) -> Option<String> {
         None => false,
     };
     well_formed.then_some(key)
+}
+
+/// The separator between the two halves of the key one aggregated source status is
+/// held under ([`ConfigurationAggregatorEntry::source_statuses`]). A source id is an
+/// account id (`^\d{12}$`), which leaves no room for it, so the key splits
+/// unambiguously at its FIRST occurrence even when the Region contains one.
+const AGGREGATED_SOURCE_STATUS_KEY_SEPARATOR: char = '/';
+
+/// Encode the (source id, Region) pair a `DescribeConfigurationAggregatorSourcesStatus`
+/// page should resume at as an opaque `NextToken`.
+pub fn encode_aggregated_source_status_token(source_id: &str, aws_region: &str) -> String {
+    encode_page_token(&format!(
+        "{source_id}{AGGREGATED_SOURCE_STATUS_KEY_SEPARATOR}{aws_region}"
+    ))
+}
+
+/// The (source id, Region) pair a `NextToken` resumes at, or `None` when the token is
+/// malformed — i.e. not something [`encode_aggregated_source_status_token`] produced,
+/// so it does not decode to a source id of exactly twelve digits (`AccountId`, pattern
+/// `^\d{12}$`) and a Region within `AwsRegion`'s 1..64 length.
+pub fn decode_aggregated_source_status_token(token: &str) -> Option<(String, String)> {
+    let key = decode_page_token(token)?;
+    let (source_id, aws_region) = key.split_once(AGGREGATED_SOURCE_STATUS_KEY_SEPARATOR)?;
+    let well_formed = is_account_id(source_id)
+        && (1..=AWS_REGION_MAX_LENGTH).contains(&aws_region.chars().count());
+    well_formed.then(|| (source_id.to_string(), aws_region.to_string()))
 }
 
 /// The ARN of a Config rule: `arn:aws:config:<region>:<account>:config-rule/<id>`.
