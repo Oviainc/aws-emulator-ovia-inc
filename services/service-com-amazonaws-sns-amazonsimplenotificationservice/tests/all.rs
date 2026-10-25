@@ -14,6 +14,9 @@
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 
+#[path = "all/phone_number_opt_in.rs"]
+mod phone_number_opt_in;
+
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
 
