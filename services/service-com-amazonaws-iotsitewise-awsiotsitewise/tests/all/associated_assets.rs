@@ -55,7 +55,10 @@ async fn list_associated(
 }
 
 /// The `id` of every summary in a `ListAssociatedAssets` answer, in answer order.
-fn summary_ids(body: &Value) -> Vec<String> {
+///
+/// `pub(crate)` so the sibling suite that drives the same operation reads an answer
+/// through THIS reader rather than a second copy of it.
+pub(crate) fn summary_ids(body: &Value) -> Vec<String> {
     body["assetSummaries"]
         .as_array()
         .unwrap_or_else(|| panic!("no assetSummaries in {body}"))
