@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEndpoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: endpoint discovery, answered with the address this request actually
+//! reached this server on, so a client that re-targets itself at the discovered endpoint
+//! keeps talking to the server it already reached. An address a client is handed here is
+//! one it can dial again, which is why the answer carries no host beyond the endpoint this
+//! request arrived on: a name that resolves somewhere else would send the client off this
+//! server with the next call it makes.
 //!
 //! ## Shape of an operation
 //!
@@ -58,6 +56,50 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How long a client may cache a discovered endpoint, in minutes (`Endpoint`'s
+/// `CachePeriodInMinutes`: "Endpoint cache time to live (TTL) value.").
+///
+/// CHOSEN, not documented: this emulator's address does not move while it runs, so a
+/// 24-hour TTL keeps endpoint discovery to one call per client without ever handing out
+/// an address that goes stale.
+const ENDPOINT_CACHE_PERIOD_MINUTES: i64 = 24 * 60;
+
+/// The address this request reached the emulator on — host and, when present, port, with
+/// no scheme, which is the form the modelled `Address` carries.
+///
+/// The `Host` header is what the client actually dialled, so it is read first; an HTTP/2
+/// request carries the same value as the URI authority instead. Each candidate has to BE
+/// a host with an optional port ([`host_and_port`]) — the value is the caller's own, and a
+/// value that is not an endpoint address is not reported as one. With no usable candidate
+/// (a bare origin-form request, or a `Host` that is not an address), fall back to loopback
+/// on the port the emulator serves, which is the only other address that reaches this
+/// process.
+fn serving_address(parts: &::http::request::Parts) -> String {
+    [
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(host_and_port)
+    .unwrap_or_else(|| format!("127.0.0.1:{}", ::emulator_server::data_port_from_env()))
+}
+
+/// `candidate` as a host with an optional port, or `None` when it is not one.
+///
+/// The whole trimmed value has to parse as a URI authority, so a candidate carrying a
+/// scheme, a path or any character an authority cannot hold names no address. Userinfo
+/// (`user@host`) parses as an authority but is a credential rather than part of an
+/// endpoint address, so it is refused too.
+fn host_and_port(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    let authority = ::http::uri::Authority::try_from(trimmed).ok()?;
+    (authority.as_str() == trimmed && !trimmed.contains('@')).then(|| trimmed.to_string())
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -126,18 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEndpoints"))
+        // `DescribeEndpointsRequest` has no members, and the answer is a property of the
+        // endpoint this request arrived on — not of the store — so no state is read or
+        // written here.
+        let _ = (&input, &self.engine);
+        // The endpoint the caller is serving this request from is the one endpoint there
+        // is to discover, so exactly one is reported, and a client that re-targets itself
+        // at it dials the server it already reached.
+        Ok(DescribeEndpointsOutput {
+            endpoints: vec![Endpoint {
+                address: serving_address(ctx.parts()),
+                cache_period_in_minutes: ENDPOINT_CACHE_PERIOD_MINUTES,
+            }],
+        })
     }
 }
