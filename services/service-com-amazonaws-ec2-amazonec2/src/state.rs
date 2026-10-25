@@ -5478,6 +5478,56 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         }
+        // One internet registry association a delete left transient: it reaches the terminal
+        // state that delete recorded for it at the instant it was owed, whether or not
+        // anybody called, and "a message describing the current state of the internet
+        // registry association" (`IpamInternetRegistryAssociation$StateMessage`) moves with
+        // the state rather than keeping the in-progress wording.
+        //
+        // The due associations are collected first, the way the policy block below collects
+        // its due policies, so each swap of the stored message is charged against the store's
+        // byte budget exactly as the write that started the deletion charged it
+        // ([`Self::begin_ipam_internet_registry_association_deletion`]) — the budget cannot
+        // drift by the length difference between the two messages.
+        let due_associations: Vec<String> = self
+            .ipam_internet_registry_associations
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.due_by(now).is_some())
+            })
+            .map(|(association_id, _)| association_id.clone())
+            .collect();
+        for association_id in due_associations {
+            let Some(record) = self
+                .ipam_internet_registry_associations
+                .get_mut(&association_id)
+            else {
+                continue;
+            };
+            let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.due_by(now))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let mut released = 0usize;
+            let mut charged = 0usize;
+            if state == IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE {
+                released = record.view.state_message.as_deref().map_or(0, str::len);
+                charged = IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE.len();
+                record.view.state_message =
+                    Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE.to_string());
+            }
+            record.view.state = Some(state);
+            record.pending = None;
+            self.release_stored_bytes(released);
+            self.add_stored_bytes(charged);
+        }
         // One IPAM policy a delete left transient: it reaches the terminal state that
         // delete recorded for it at the instant it was owed, whether or not anybody called,
         // and "a message about the state of the IPAM policy" (`IpamPolicy$StateMessage`)
@@ -29159,6 +29209,29 @@ pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_ID_PREFIX: &str = "ipam-ir-assoc";
 pub const RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION: &str =
     "ipam-internet-registry-association";
 
+/// An association whose deletion has been asked for and is not finished: the
+/// `IpamInternetRegistryAssociationState` catalog's `delete-in-progress` member (the generated
+/// catalog is `crate::ops::types::IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_VALUES`), the
+/// TRANSIENT state a delete answers with.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_IN_PROGRESS: &str =
+    "delete-in-progress";
+
+/// An association whose deletion is finished: that catalog's `delete-complete` member, which
+/// the clock owes every association a delete has started on.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE: &str = "delete-complete";
+
+/// The `StateMessage` an association carries while its deletion is under way — "a message
+/// describing the current state of the internet registry association"
+/// (`IpamInternetRegistryAssociation$StateMessage`), in this crate's own words rather than a
+/// recording's.
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_IN_PROGRESS_MESSAGE: &str =
+    "The internet registry association is being deleted.";
+
+/// The `StateMessage` an association carries once its deletion is finished, written by the
+/// clock that owed it ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]).
+pub const IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_COMPLETE_MESSAGE: &str =
+    "The internet registry association has been deleted.";
+
 /// The id prefix a routing policy registration delta is minted with.
 ///
 /// "The unique identifier of the delta" (`IpamRoutingPolicyRegistrationDelta$DeltaId`) carries
@@ -29349,6 +29422,59 @@ pub struct IpamInternetRegistryAssociationRecord {
     pub view: IpamInternetRegistryAssociation,
     /// The routing policy registrations under this association, by canonical CIDR prefix.
     pub registrations: BTreeMap<String, IpamRoutingPolicyRegistrationRecord>,
+    /// The terminal state the clock owes this association while it is still transient
+    /// (`delete-in-progress` -> `delete-complete`); `None` for one that owes none.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl IpamInternetRegistryAssociationRecord {
+    /// The association's current `IpamInternetRegistryAssociationState`.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a deletion of this association has already been asked for: it is either still
+    /// `delete-in-progress` or already `delete-complete`, and in neither state is there an
+    /// association left to delete.
+    pub fn is_deleting(&self) -> bool {
+        self.state() == IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_IN_PROGRESS
+            || self.state() == IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE
+    }
+
+    /// The prefixes this association still holds a routing policy registration for, in the
+    /// store's own order.
+    ///
+    /// A registration is REMOVED once its withdrawal is finished
+    /// ([`IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_COMPLETE`]), so one a delete has only
+    /// started on still counts: it is an authorization the internet registry has not dropped
+    /// yet. The ONE definition of "what still depends on this association", so the operation
+    /// that deletes one and any later reader cannot disagree about it.
+    pub fn held_registration_cidrs(&self) -> Vec<&str> {
+        self.registrations
+            .iter()
+            .filter(|(_, registration)| {
+                registration.state() != IPAM_ROUTING_POLICY_REGISTRATION_STATE_DELETE_COMPLETE
+            })
+            .map(|(cidr, _)| cidr.as_str())
+            .collect()
+    }
+}
+
+/// The bytes one stored IPAM internet registry association holds: the tags assigned to it,
+/// its description, its organization handle at the registry and the message about its state,
+/// on top of the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+///
+/// The ONE definition of that charge, the way [`ipam_policy_payload_bytes`] is for a policy:
+/// a writer charges exactly it, so a write that swaps one stored message for another cannot
+/// drift the store's budget.
+pub fn ipam_internet_registry_association_payload_bytes(
+    view: &IpamInternetRegistryAssociation,
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(tag_list_bytes(view.tags.as_deref().unwrap_or_default()))
+        .saturating_add(view.description.as_deref().map_or(0, str::len))
+        .saturating_add(view.organization_handle.as_deref().map_or(0, str::len))
+        .saturating_add(view.state_message.as_deref().map_or(0, str::len))
 }
 
 /// One routing policy registration delta: the modelled
@@ -29475,17 +29601,13 @@ impl ComAmazonawsEc2Amazonec2State {
         // association" (`IpamInternetRegistryAssociation$OwnerId`): this emulator serves one
         // account, so the association is owned by it rather than by anything a request says.
         view.owner_id = Some(::engine::emulator_account_id().to_string());
-        self.add_stored_bytes(
-            STORED_RECORD_OVERHEAD_BYTES
-                + tag_list_bytes(view.tags.as_deref().unwrap_or_default())
-                + view.description.as_deref().unwrap_or_default().len()
-                + view.organization_handle.as_deref().unwrap_or_default().len(),
-        );
+        self.add_stored_bytes(ipam_internet_registry_association_payload_bytes(&view));
         self.ipam_internet_registry_associations.insert(
             association_id.clone(),
             IpamInternetRegistryAssociationRecord {
                 view,
                 registrations: BTreeMap::new(),
+                pending: None,
             },
         );
         Some(association_id)
@@ -29618,6 +29740,53 @@ impl ComAmazonawsEc2Amazonec2State {
         delta_id: &str,
     ) -> Option<&IpamRoutingPolicyRegistrationDeltaRecord> {
         self.ipam_routing_policy_registration_deltas.get(delta_id)
+    }
+
+    /// The IPAM internet registry association `association_id` names, as it now stands.
+    pub fn ipam_internet_registry_association(
+        &self,
+        association_id: &str,
+    ) -> Option<&IpamInternetRegistryAssociationRecord> {
+        self.ipam_internet_registry_associations.get(association_id)
+    }
+
+    /// Start deleting the IPAM internet registry association `association_id` names, and
+    /// answer it as the store then holds it — `None` when the account holds no such
+    /// association.
+    ///
+    /// "Deletes an IPAM internet registry association" is work AWS reports as under way: the
+    /// `IpamInternetRegistryAssociationState` catalog carries both `delete-in-progress` and
+    /// `delete-complete`, so the association is left in the TRANSIENT state with the clock
+    /// owing it the terminal one ([`PendingStateMove`], materialised by
+    /// [`Self::materialize_due_transitions`]). The span is never zero, so a caller acting
+    /// straight after this call still sees `delete-in-progress`.
+    ///
+    /// The record STAYS in the store, because an association in either delete state still has
+    /// a state to report ([`IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE`]) — so
+    /// its caller-chosen bytes stay charged to the store's budget, which still holds them, the
+    /// same arrangement as [`Self::begin_ipam_policy_deletion`].
+    pub fn begin_ipam_internet_registry_association_deletion(
+        &mut self,
+        association_id: &str,
+    ) -> Option<IpamInternetRegistryAssociation> {
+        let record = self
+            .ipam_internet_registry_associations
+            .get_mut(association_id)?;
+        let message = IPAM_INTERNET_REGISTRY_ASSOCIATION_DELETE_IN_PROGRESS_MESSAGE.to_string();
+        let charged = message.len();
+        let released = record.view.state_message.as_deref().map_or(0, str::len);
+        record.view.state =
+            Some(IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_IN_PROGRESS.to_string());
+        record.view.state_message = Some(message);
+        record.pending = Some(PendingStateMove::starting_now(
+            IPAM_INTERNET_REGISTRY_ASSOCIATION_STATE_DELETE_COMPLETE,
+        ));
+        let view = record.view.clone();
+        // The state message is stored text, charged like every other byte this store retains;
+        // the message it replaces goes back to the budget.
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(charged);
+        Some(view)
     }
 }
 
