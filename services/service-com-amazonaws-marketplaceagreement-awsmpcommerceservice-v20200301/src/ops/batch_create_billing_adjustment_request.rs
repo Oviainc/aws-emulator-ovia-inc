@@ -12,6 +12,13 @@
 //! entry instead, on the batch's own `errors` channel, so a call whose other
 //! entries still fit is answered rather than refused.
 //!
+//! An ENTRY is resolved against the invoice it adjusts: `originalInvoiceId` has
+//! to name an invoice of the agreement the entry names
+//! ([`crate::state::Invoice`]), `currencyCode` has to be the currency that
+//! invoice is denominated in, and `adjustmentAmount` has to be within what the
+//! invoice still has open to adjustment. Each of those is reported for that one
+//! entry, under its own `clientToken`, and stores nothing.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -276,12 +283,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
 
-            if !crate::state::is_positive_amount(&entry.adjustment_amount) {
+            if !crate::state::is_acceptable_adjustment_amount(&entry.adjustment_amount) {
                 errors.push(BatchCreateBillingAdjustmentError {
                     code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
-                    message: format!(
-                        "adjustmentAmount {:?} is not a positive amount",
-                        entry.adjustment_amount
+                    message: crate::state::billing_adjustment_entry_message(
+                        crate::state::REASON_INVALID_ADJUSTMENT_AMOUNT,
+                        format!(
+                            "adjustmentAmount must be a positive amount of at most {} characters",
+                            crate::state::BILLING_ADJUSTMENT_AMOUNT_MAX_LEN
+                        ),
+                    ),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            }
+
+            // "The identifier of the original invoice to adjust": the entry
+            // adjusts ONE invoice of that agreement, so the id has to resolve
+            // to one. An id naming no invoice of it — including one naming
+            // another agreement's invoice — names nothing to adjust, which is
+            // the per-entry not-found the `errors` channel carries.
+            let Some(invoice) = store
+                .invoice_of(&entry.agreement_id, &entry.original_invoice_id)
+                .cloned()
+            else {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_NOT_FOUND.to_string(),
+                    message: crate::state::BILLING_ADJUSTMENT_INVOICE_NOT_FOUND_MESSAGE
+                        .to_string(),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            };
+
+            // `currencyCode` "must match the currency code of the offer
+            // associated with the agreement", which is the currency the invoice
+            // being adjusted is denominated in: an adjustment in any other
+            // currency is not an amount of that invoice.
+            if entry.currency_code != invoice.currency_code {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
+                    message: crate::state::billing_adjustment_entry_message(
+                        crate::state::REASON_INVALID_CURRENCY_CODE,
+                        format!(
+                            "invoice {} is denominated in {}",
+                            invoice.id, invoice.currency_code
+                        ),
+                    ),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            }
+
+            // An adjustment credits part of what the invoice billed, so it is
+            // bounded by what that invoice still has open to adjustment
+            // (`PricingCurrencyAmount$maxAdjustmentAmount`, which
+            // `ListAgreementInvoiceLineItems` reports): an entry asking for more
+            // asks to credit money the invoice never billed.
+            let Some(requested) = crate::state::amount_units(&entry.adjustment_amount) else {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
+                    message: crate::state::billing_adjustment_entry_message(
+                        crate::state::REASON_INVALID_ADJUSTMENT_AMOUNT,
+                        "adjustmentAmount must be a decimal amount",
+                    ),
+                    client_token: entry.client_token.clone(),
+                });
+                continue;
+            };
+            if requested > invoice.open_units() {
+                errors.push(BatchCreateBillingAdjustmentError {
+                    code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
+                    message: crate::state::billing_adjustment_entry_message(
+                        crate::state::REASON_EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT,
+                        format!(
+                            "invoice {} has {} {} open to adjustment",
+                            invoice.id, invoice.open_amount, invoice.currency_code
+                        ),
                     ),
                     client_token: entry.client_token.clone(),
                 });
@@ -328,6 +406,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 completes_at: now + crate::state::BILLING_ADJUSTMENT_SETTLEMENT,
             };
             store.billing_adjustment_requests.insert(id.clone(), request);
+            // What this request asks to credit is no longer open on the invoice
+            // it adjusts, so a later entry — in this batch or a later call — is
+            // held to what is left.
+            store.hold_against_invoice(&invoice.id, requested);
             crate::state::audit(
                 "BatchCreateBillingAdjustmentRequest",
                 "created",

@@ -130,6 +130,11 @@ mod ec2_query;
 // carries, whichever operation answered.
 #[path = "all/ec2_query_envelope.rs"]
 mod ec2_query_envelope;
+// Which request-id element each side of one operation's envelope reports: the pair on
+// `CreateVpnConnectionRoute`, on top of the across-operations rule
+// `ec2_query_error_envelope` owns.
+#[path = "all/ec2_query_error_request_id.rs"]
+mod ec2_query_error_request_id;
 #[path = "all/elastic_ip_addresses.rs"]
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
@@ -277,8 +282,12 @@ mod vpc_endpoints_and_byoip;
 mod vpc_lifecycle;
 #[path = "all/vpc_network_lifecycle.rs"]
 mod vpc_network_lifecycle;
+#[path = "all/vpc_resources_blocking_encryption_enforcement.rs"]
+mod vpc_resources_blocking_encryption_enforcement;
 #[path = "all/vpn_connection_device_types.rs"]
 mod vpn_connection_device_types;
+#[path = "all/vpn_connection_routes.rs"]
+mod vpn_connection_routes;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
 #[path = "all/wire.rs"]
 mod wire;

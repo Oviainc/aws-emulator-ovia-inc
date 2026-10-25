@@ -198,6 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        // The accounts the discoverable inventory reports resources in, read
+        // BEFORE this service's store is locked: that read locks the stores of
+        // the services that own those resources, and this service holds no lock
+        // of its own while it does (see `crate::state::discoverable_accounts`).
+        let discoverable = crate::state::discoverable_accounts(&*self.engine, &region);
         let mut store = state.lock();
         // The authorization gate, BEFORE the resource set is looked up and before
         // any item is examined.
@@ -236,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| record.resource_set.resource_type_list.clone())
             .unwrap_or_default();
         let partition = crate::state::emulator_partition();
-        let accounts = crate::state::organization_accounts(&store);
+        let accounts = crate::state::organization_accounts(&store, discoverable);
         let mut failed_items = Vec::new();
         let mut associated = Vec::new();
         for uri in &input.items {

@@ -27,7 +27,7 @@
 //!
 //! The deletion half and the refusal half are rows of the same rule: deleting the stack
 //! deletes the topics it created, and a topic SNS REFUSES to create leaves the stack
-//! `CREATE_FAILED` naming the resource rather than publishing a dangling ARN. Drift
+//! `ROLLBACK_COMPLETE` naming the resource rather than publishing a dangling ARN. Drift
 //! detection is the same rule read the other way: it asks SNS what the topic IS now, so a
 //! topic changed out of band is `MODIFIED` and an untouched one `IN_SYNC`.
 //!
@@ -809,9 +809,9 @@ async fn a_topic_sns_refuses_to_create_fails_the_stack() {
     let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than publish a topic ARN nothing \
-         answers to, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than publish a \
+         topic ARN nothing answers to, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(
@@ -856,9 +856,9 @@ async fn a_subscription_sns_refuses_fails_the_stack_and_leaves_no_topic() {
     let body = create_and_settle(&router, case, stack_name, template, &[]).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than report a topic whose \
-         declared subscription does not exist, got {body}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back rather than report a \
+         topic whose declared subscription does not exist, got {body}"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
     assert!(

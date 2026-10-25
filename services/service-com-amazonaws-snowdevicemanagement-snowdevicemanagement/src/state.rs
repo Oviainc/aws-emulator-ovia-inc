@@ -15,8 +15,9 @@
 //! before an id is resolved and before a field is validated. The tagging operations,
 //! which the model declares no `AccessDeniedException` on, are served regardless.
 //! Everything else in here is minted by a caller: `CreateTask` persists a [`Task`]
-//! plus one [`Execution`] per target, `CancelTask` moves them to `CANCELED`, and the
-//! reporting operations compute their answers from these records.
+//! plus one [`Execution`] per target, `CancelTask` moves the ones no device has
+//! started yet ([`Execution::is_cancellable`]) to `CANCELED`, and the reporting
+//! operations compute their answers from these records.
 //!
 //! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
 //! Management reports "all devices on your Amazon Web Services account that have
@@ -366,6 +367,18 @@ impl Execution {
             self.state.as_str(),
             "SUCCEEDED" | "FAILED" | "CANCELED" | "REJECTED" | "TIMED_OUT"
         )
+    }
+
+    /// True while this execution can still be stopped: the device has not been
+    /// given the command yet, so it is still waiting in the queue.
+    ///
+    /// `CancelTask` "can cancel a task only if it's still in a `QUEUED` state.
+    /// Tasks that are already running can't be cancelled." `TaskState` carries
+    /// no `QUEUED` value, so the state that sentence names is this record's
+    /// `ExecutionState`: once the device has started the command the cancel has
+    /// arrived too late and the execution runs to its own outcome.
+    pub fn is_cancellable(&self) -> bool {
+        self.state == "QUEUED"
     }
 
     /// The `ExecutionSummary` projection `ListExecutions` returns.

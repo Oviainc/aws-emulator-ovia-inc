@@ -51,24 +51,32 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 
 /// The `DataType` values this service's catalogs publish — the four the engines' own
 /// parameter lists use.
-const DATA_TYPES: [&str; 4] = ["boolean", "float", "integer", "string"];
+///
+/// `pub(crate)` for the same reason as [`Reported`]: the cluster-parameter suite asserts the
+/// same published set.
+pub(crate) const DATA_TYPES: [&str; 4] = ["boolean", "float", "integer", "string"];
 
 /// One reported `<Parameter>`.
+///
+/// `pub(crate)` with the reader below because the sibling suite for
+/// `DescribeEngineDefaultClusterParameters` reads the same `<Parameter>` element out of its
+/// own responses: one projection of that element, not two.
 #[derive(Debug, Clone)]
-struct Reported {
-    name: String,
-    value: Option<String>,
-    description: Option<String>,
-    source: Option<String>,
-    apply_type: Option<String>,
-    data_type: Option<String>,
-    allowed_values: Option<String>,
-    is_modifiable: Option<String>,
-    apply_method: Option<String>,
+pub(crate) struct Reported {
+    pub(crate) name: String,
+    pub(crate) value: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) apply_type: Option<String>,
+    pub(crate) data_type: Option<String>,
+    pub(crate) allowed_values: Option<String>,
+    pub(crate) is_modifiable: Option<String>,
+    pub(crate) minimum_engine_version: Option<String>,
+    pub(crate) apply_method: Option<String>,
 }
 
 /// Every `<Parameter>` in a response body, in the order it was reported.
-fn reported(xml: &str) -> Vec<Reported> {
+pub(crate) fn reported(xml: &str) -> Vec<Reported> {
     subtrees(xml, "Parameter")
         .into_iter()
         .map(|entry| Reported {
@@ -80,6 +88,7 @@ fn reported(xml: &str) -> Vec<Reported> {
             data_type: optional_text(&entry, "DataType"),
             allowed_values: optional_text(&entry, "AllowedValues"),
             is_modifiable: optional_text(&entry, "IsModifiable"),
+            minimum_engine_version: optional_text(&entry, "MinimumEngineVersion"),
             apply_method: optional_text(&entry, "ApplyMethod"),
         })
         .collect()
@@ -680,7 +689,7 @@ async fn the_documented_max_records_window_is_served_and_its_bounds_are_refused(
             );
             continue;
         }
-        expect_error(case, response, 400, "ValidationException");
+        expect_error(case, response, 400, INVALID_PARAMETER_VALUE);
     }
 
     // A `Marker` this operation never issued names no record of the result set.

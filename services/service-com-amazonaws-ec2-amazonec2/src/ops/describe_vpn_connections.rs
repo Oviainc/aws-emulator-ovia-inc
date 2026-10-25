@@ -1,36 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpnConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpnConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpnConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's Site-to-Site VPN connections, each with the static routes it
+//! holds, out of [`crate::state::ComAmazonawsEc2Amazonec2State::vpn_connections`].
+//!
+//! A reporting operation: it writes nothing of its own and only materialises the moves the
+//! clock already owed (a static route's `pending` -> `available`), so two reads of an
+//! untouched store answer the same thing.
 //!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
 //! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
 //! `DescribeVpnConnections::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! deserialize -> validate -> `handle` -> serialize. You write ONLY the `handle` body.
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::require_service_state`] and read it through the guard it
+//! hands back.
 //!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
-//!
-//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
+//! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only -
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
 //! The engine is NOT reached through `ctx`.
 //!
@@ -42,7 +34,7 @@
 //! # Modeled contract for `DescribeVpnConnections`
 //!
 //! What AWS documents for this operation, from this service's Smithy model. HTML is
-//! stripped and long entries are clipped at ` …`. For the FULL text of any one item,
+//! stripped and long entries are clipped at ` ...`. For the FULL text of any one item,
 //! ask the model rather than reading the raw JSON:
 //!
 //! ```text
@@ -54,11 +46,11 @@
 //!
 //! ## Input
 //!
-//! * `DryRun` (Boolean) — Checks whether you have the required permissions for the action,
+//! * `DryRun` (Boolean) - Checks whether you have the required permissions for the action,
 //!   without actually making the request, and provides an error response. If you have the
 //!   required permissions, the error response is DryRunOperation. Otherwise, it is
 //!   UnauthorizedOperation.
-//! * `Filters` (FilterList) — One or more filters. customer-gateway-configuration - The
+//! * `Filters` (FilterList) - One or more filters. customer-gateway-configuration - The
 //!   configuration information for the customer gateway. customer-gateway-id - The ID of a
 //!   customer gateway associated with the VPN connection. state - The state of the VPN
 //!   connection (pending | available | deleting | deleted). option.static-routes-only -
@@ -66,13 +58,13 @@
 //!   support Border Gateway Protocol (BGP). route.destination-cidr-block - The destination
 //!   CIDR block. This corresponds to the subnet used in a customer data center. bgp-asn - The
 //!   BGP Autonomous System Number (ASN) associated with a BGP device. tag: - The key/value
-//!   combination of a tag assigned to the …
-//! * `VpnConnectionIds` (VpnConnectionIdStringList) — One or more VPN connection IDs.
+//!   combination of a tag assigned to the ...
+//! * `VpnConnectionIds` (VpnConnectionIdStringList) - One or more VPN connection IDs.
 //!   Default: Describes your VPN connections.
 //!
 //! ## Output
 //!
-//! * `VpnConnections` (VpnConnectionList) — Information about one or more VPN connections.
+//! * `VpnConnections` (VpnConnectionList) - Information about one or more VPN connections.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -144,18 +136,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpnConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpnConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpnConnections"))
+        // `ctx` carries request metadata only; this operation reads none of it - a VPN
+        // connection is named by id, which is unique across Regions in this store.
+        let _ = ctx;
+        use crate::state;
+
+        // Matching cost is filters x values x held values x stored connections, and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done - and their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give. The same bounds every sibling describe of this crate applies
+        // (`describe_vpc_endpoints.rs`).
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > state::MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {maximum}",
+                supplied = filters.len(),
+                maximum = state::MAX_FILTERS,
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // connection would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let mut selectors: Vec<(&str, &[String])> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let documented = documented_filter_name(name).ok_or_else(|| {
+                state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > state::MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {maximum}",
+                    supplied = values.len(),
+                    maximum = state::MAX_FILTER_VALUES,
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > state::MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {maximum}",
+                    supplied = oversize.len(),
+                    maximum = state::MAX_FILTER_VALUE_BYTES,
+                )));
+            }
+            selectors.push((documented, values));
+        }
+
+        // "One or more VPN connection IDs" (`VpnConnectionIds`): the model publishes no
+        // bound on the list, so the number of ids one request may name is capped here,
+        // before any per-id work.
+        let requested: &[String] = input.vpn_connection_ids.as_deref().unwrap_or_default();
+        if requested.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "VpnConnectionIds carries {supplied} ids, above the maximum of {maximum}",
+                supplied = requested.len(),
+                maximum = state::MAX_RESOURCE_IDS,
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeVpnConnectionsRequest$DryRun`): the flag asks about PERMISSION, so it is
+        // answered once the request's own form has been checked and before anything is
+        // resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply: a static route
+        // `CreateVpnConnectionRoute` answered as `pending` is `available` once its due
+        // instant has passed, whether or not anybody called, so applying it here changes
+        // nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "One or more VPN connection IDs. Default: Describes your VPN connections"
+        // (`DescribeVpnConnectionsRequest$VpnConnectionIds`): an id that names no
+        // connection of the account is an error, not an absent row. The ids are held as an
+        // ordered SET, so the per-connection selection below costs O(log R) rather than a
+        // walk of the whole list per candidate.
+        let named_ids: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = named_ids
+            .iter()
+            .find(|id| store.vpn_connection(id).is_none())
+        {
+            return Err(state::invalid_vpn_connection_id(unknown));
+        }
+
+        // The ids narrow the store, and every filter must then hold ("If you specify
+        // multiple filters, the filters are joined with an AND" - `Filter`). Every
+        // comparison is charged to ONE budget - one step per candidate even when no filter
+        // was given, so an unfiltered scan is counted too - which bounds the PRODUCT of
+        // stored connections, filters, values, held values and value length however the
+        // caller combines them. The store is keyed by `VpnConnectionId`, so the report comes
+        // back in id order.
+        let mut budget = state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
+        let compiled: Vec<state::CompiledFilter> = selectors
+            .iter()
+            .map(|(name, values)| {
+                state::CompiledFilter::new((*name).to_string(), values.to_vec())
+            })
+            .collect();
+        let mut reported: Vec<VpnConnection> = Vec::new();
+        for record in store.vpn_connections.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let named = named_ids.is_empty() || named_ids.contains(record.vpn_connection_id());
+            if named
+                && state::matches_every_filter(&compiled, &mut budget, &|name| {
+                    filter_values(&record.view, name)
+                })
+            {
+                reported.push(reported_connection(&record.view));
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated report.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {steps} comparisons to \
+                     evaluate; narrow them",
+                    steps = state::MAX_FILTER_MATCH_STEPS,
+                ),
+            ));
+        }
+
+        Ok(DescribeVpnConnectionsOutput {
+            vpn_connections: Some(reported),
+        })
+    }
+}
+
+/// One stored connection as THIS operation reports it.
+///
+/// "This element is always present in the `CreateVpnConnection` response; however, it's
+/// present in the `DescribeVpnConnections` response only if the VPN connection is in the
+/// `pending` or `available` state" (`VpnConnection$CustomerGatewayConfiguration`) - so a
+/// connection on its way out is reported without it. Everything else is the stored view
+/// itself, so no member a writer set can be silently dropped here.
+fn reported_connection(stored: &VpnConnection) -> VpnConnection {
+    let mut reported = stored.clone();
+    let reportable = matches!(
+        reported.state.as_deref().unwrap_or_default(),
+        crate::state::VPN_STATE_PENDING | crate::state::VPN_STATE_AVAILABLE
+    );
+    if !reportable {
+        reported.customer_gateway_configuration = None;
+    }
+    reported
+}
+
+/// The filter names this operation documents, from
+/// `DescribeVpnConnectionsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVpnConnectionsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const VPN_CONNECTION_FILTERS: [&str; 11] = [
+    "bgp-asn",
+    "customer-gateway-configuration",
+    "customer-gateway-id",
+    "option.static-routes-only",
+    "route.destination-cidr-block",
+    "state",
+    "tag-key",
+    "transit-gateway-id",
+    "type",
+    "vpn-connection-id",
+    "vpn-gateway-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact - and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on. The tag prefix is the crate's own [`crate::state::TAG_FILTER_PREFIX`], so
+/// this operation holds no second copy of it.
+fn documented_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    VPN_CONNECTION_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this VPN connection.
+///
+/// A filter naming an attribute the connection does not carry compares against NO values,
+/// so it selects nothing - the same answer AWS gives for, say, `transit-gateway-id` on a
+/// connection attached to a virtual private gateway. `name` is a name
+/// [`documented_filter_name`] resolved.
+///
+/// `bgp-asn` compares against no value on ANY connection: it is "the BGP Autonomous System
+/// Number (ASN) associated with a BGP device", a fact of the CUSTOMER GATEWAY, and the
+/// modelled `VpnConnection` shape carries no member for it
+/// (`smithy_query(query="shape",shape="VpnConnection")`) while this crate has no customer
+/// gateway store to resolve `CustomerGatewayId` against yet. So the documented name is
+/// accepted and selects nothing rather than being refused as unknown; it selects the
+/// connections AWS would once `CreateCustomerGateway` and its store are implemented under
+/// their own issue, which is where the ASN a connection's gateway carries will come from.
+///
+/// KNOWN GAP, keyed to that operation: until it lands, no stored connection can carry an
+/// ASN at all, so "selects nothing" is the same answer any absent attribute gives; when it
+/// lands, this arm must resolve `CustomerGatewayId` and compare the gateway's ASN instead.
+/// The `bgp-asn` row of `tests/all/vpn_connection_routes.rs::
+/// describe_answers_every_documented_filter_name` pins today's answer, so that change
+/// cannot be made without updating the row that states it.
+fn filter_values<'a>(connection: &'a VpnConnection, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return connection
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "customer-gateway-configuration" => {
+            text(connection.customer_gateway_configuration.as_deref())
+        }
+        "customer-gateway-id" => text(connection.customer_gateway_id.as_deref()),
+        "state" => text(connection.state.as_deref()),
+        // A boolean attribute is filtered on the value a client sends for it, which is how
+        // the wire renders it: `true` or `false`. A connection whose option is not set
+        // carries no value for the filter to match, like any other absent attribute.
+        "option.static-routes-only" => connection
+            .options
+            .as_ref()
+            .and_then(|options| options.static_routes_only)
+            .map(|only| Cow::Borrowed(if only { "true" } else { "false" }))
+            .into_iter()
+            .collect(),
+        "route.destination-cidr-block" => connection
+            .routes
+            .iter()
+            .flatten()
+            .filter_map(|route| route.destination_cidr_block.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "tag-key" => connection
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "transit-gateway-id" => text(connection.transit_gateway_id.as_deref()),
+        "type" => text(connection.r#type.as_deref()),
+        "vpn-connection-id" => text(connection.vpn_connection_id.as_deref()),
+        "vpn-gateway-id" => text(connection.vpn_gateway_id.as_deref()),
+        // `bgp-asn` (see above) and, unreachably, every name `documented_filter_name` has
+        // already refused: an attribute nothing is stored for compares against nothing, so
+        // it could never widen a result even if that check were bypassed.
+        _ => Vec::new(),
     }
 }

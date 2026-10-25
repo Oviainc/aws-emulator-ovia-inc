@@ -15,6 +15,8 @@
 mod account_configuration;
 #[path = "all/batch_get_findings_classification.rs"]
 mod batch_get_findings_classification;
+#[path = "all/create_scan_tag_merge.rs"]
+mod create_scan_tag_merge;
 #[path = "all/findings_metrics.rs"]
 mod findings_metrics;
 #[path = "all/list_scans_scan_type.rs"]

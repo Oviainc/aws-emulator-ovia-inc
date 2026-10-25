@@ -142,6 +142,25 @@ const DESTINATION_REQUIREMENT: &str = "Member must be an IPv4 or IPv6 address";
 /// [`Probe::activates_at`]) so no handler ever sleeps for it.
 pub const ACTIVATION_AFTER: Duration = Duration::from_millis(500);
 
+/// The HTTP status a successful TAG MUTATION answers with.
+///
+/// Both tag mutations leave their success code defaulted in the model (`@http` on
+/// `TagResource` and on `UntagResource` carries no `code:`, i.e. `codeDefaulted`), so
+/// Smithy's default of 200 is not a statement about this service: the success status is
+/// a behavioural fact and the recorded AWS responses are what state it. A tag mutation
+/// writes only the tag set of the resource its `resourceArn` names and reports nothing
+/// back about it — `TagResourceOutput` and `UntagResourceOutput` declare no members —
+/// so there is no entity for a caller to parse and the answer is 204 No Content. A 200
+/// there promises a body the response does not carry, and every client path gated on
+/// the no-content status (conditional body parsing, caches and proxies that key on it)
+/// takes the wrong branch. The two operations share the `/tags/{resourceArn}` route and
+/// this one status, so the rule lives here rather than twice in the handlers.
+///
+/// This does NOT extend to every output structure that happens to declare no members:
+/// `DeleteMonitor` and `DeleteProbe` report nothing either, and the recorded AWS
+/// responses answer those with the defaulted 200, which they keep.
+pub const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
 /// The page size `ListMonitors` uses when the caller names no `maxResults`: the
 /// model's own `MaxResults` maximum (`@range(min: 1, max: 25)`), so one
 /// unpaginated call returns as much as a paginated one could.

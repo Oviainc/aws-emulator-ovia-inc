@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeEngineDefaultParametersError::validation)?;
+            .map_err(DescribeEngineDefaultParametersError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
         check_filter_names(&filters)
             .map_err(DescribeEngineDefaultParametersError::invalid_parameter_value)?;
@@ -259,6 +259,11 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
 /// The parameters are the ENGINE's, not the family's: a family is one major version of an
 /// engine, and the catalog below publishes the parameters that engine carries across the
 /// versions this service serves (see [`MYSQL_PARAMETERS`] for where the data comes from).
+///
+/// This reports the parameters of a DB PARAMETER group family — the ones that belong to a
+/// single DB instance. The cluster-level ones are a different catalog, reported by
+/// `DescribeEngineDefaultClusterParameters`, which resolves its family through the same
+/// [`family_engine`].
 pub(crate) fn engine_default_parameters(
     family: &str,
 ) -> Option<&'static [crate::state::ClusterParameterSpec]> {
@@ -304,7 +309,10 @@ pub(crate) fn engine_default_parameters(
 /// published list is (`check_db_cluster_engine`, `crate::state::published_parameters`):
 /// AWS publishes each family lowercase, so a differently-cased value still names the one
 /// family it can only have meant, and the response echoes the caller's own spelling back.
-fn family_engine(family: &str) -> Option<&'static str> {
+/// `pub(crate)` because `DescribeEngineDefaultClusterParameters` reads a
+/// `DBParameterGroupFamily` by this same rule — a family is a family whichever of the two
+/// reports is asked — and the two must not disagree about what is one.
+pub(crate) fn family_engine(family: &str) -> Option<&'static str> {
     let lowered = family.to_ascii_lowercase();
     // The engines this front door serves: the ones `CreateDBInstance` publishes, plus the
     // two sibling control planes' own (`docdb`, `neptune`), which this service claims too.
@@ -344,7 +352,7 @@ const VERSIONLESS_FAMILY_ENGINES: [&str; 3] = ["db2-ae", "db2-ce", "db2-se"];
 /// the description the API reports for it. One argument per member of the record it
 /// builds, which is what lets the tables below be read as rows of published data.
 #[allow(clippy::too_many_arguments)]
-const fn parameter(
+pub(crate) const fn parameter(
     name: &'static str,
     apply_type: &'static str,
     data_type: &'static str,

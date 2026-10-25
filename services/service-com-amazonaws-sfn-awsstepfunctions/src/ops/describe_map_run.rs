@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMapRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMapRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a REPORTING operation. It answers from the ONE Map Run record the
+//! Distributed Map state that started it left, resolved by the Map Run's own ARN.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMapRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +162,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMapRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMapRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMapRun"))
+        // `mapRunArn` (1..2000) is modelled, so the centralized walk has already
+        // refused anything outside it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
+        // service and an ARN of another region are defects in the REQUEST, which
+        // `InvalidArn` reports, not a Map Run that is absent here.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        if let Err(message) = crate::state::read_map_run_arn(&input.map_run_arn, &endpoint_region) {
+            return Err(DescribeMapRunErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The one write a report may make: a Map Run whose items the clock had already
+        // made due reports the status they produced here.
+        store.settle(crate::state::now());
+
+        let Some(map_run) = store.map_runs.get(&input.map_run_arn) else {
+            return Err(DescribeMapRunErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::resource_not_found_message(&input.map_run_arn)),
+                resource_name: Some(input.map_run_arn.clone()),
+            })
+            .into());
+        };
+
+        // "A JSON object that contains information about the total number of items,
+        // and the item count for each processing status": which status each item is
+        // counted under follows from the Map Run's own status. While it is RUNNING
+        // nothing it iterates has finished, so every item is still pending; once it
+        // reached a terminal status the items are counted as their iterations turned
+        // out; and a Map Run its execution STOPPED finished none of them.
+        let total = map_run.total_items;
+        let (pending, succeeded, failed, aborted) = match map_run.status.as_str() {
+            crate::state::MAP_RUN_STATUS_RUNNING => (total, 0, 0, 0),
+            crate::state::MAP_RUN_STATUS_ABORTED => (0, 0, 0, total),
+            _ => (0, map_run.succeeded_items, map_run.failed_items, 0),
+        };
+        // "The item count for each processing status" and "the count of child workflow
+        // executions for each status" are the SAME counts here: a Distributed Map runs
+        // one child workflow execution per item, and this emulator interprets each of
+        // them. `resultsWritten` is what the Map state actually put in its output,
+        // which is one result per item whose iteration succeeded.
+        let counts = || MapRunItemCounts {
+            pending,
+            // No item of a Map Run this emulator ran is left part-way: the walk runs
+            // each one to its own outcome inside the call that started the execution,
+            // so an item is pending or finished and never running.
+            running: 0,
+            succeeded,
+            failed,
+            // Nothing times an ITEM out: a `TimeoutSeconds` the iteration's own states
+            // declare fails that item, which `failed` counts.
+            timed_out: 0,
+            aborted,
+            total,
+            results_written: succeeded,
+            // "items [...] that cannot be redriven because their execution status is
+            // terminal" and "items [...] currently waiting to be redriven": a redrive
+            // of this Map Run's execution re-runs its `Map` state in the call that
+            // asks for it, so nothing is ever left waiting, and no item is left in a
+            // status a re-run cannot start from.
+            failures_not_redrivable: Some(0),
+            pending_redrive: Some(0),
+        };
+        let items = counts();
+        let executions = execution_counts(&counts());
+        Ok(DescribeMapRunOutput {
+            map_run_arn: map_run.arn.clone(),
+            execution_arn: map_run.execution_arn.clone(),
+            status: map_run.status.clone(),
+            start_date: crate::state::to_date_time(map_run.start_date),
+            stop_date: map_run.stop_date.map(crate::state::to_date_time),
+            max_concurrency: map_run.max_concurrency,
+            tolerated_failure_percentage: map_run.tolerated_failure_percentage,
+            tolerated_failure_count: map_run.tolerated_failure_count,
+            item_counts: items,
+            execution_counts: executions,
+            // "If you have not yet redriven a Map Run, the redriveCount is 0" and
+            // "the redriveDate is null".
+            redrive_count: Some(map_run.redrive_count),
+            redrive_date: map_run.redrive_date.map(crate::state::to_date_time),
+        })
+    }
+}
+
+/// The same counts as a `MapRunExecutionCounts`: the two structures carry the same
+/// members, and this emulator's Distributed Map runs one child workflow execution per
+/// item, so one count is written once and projected here.
+fn execution_counts(items: &MapRunItemCounts) -> MapRunExecutionCounts {
+    MapRunExecutionCounts {
+        pending: items.pending,
+        running: items.running,
+        succeeded: items.succeeded,
+        failed: items.failed,
+        timed_out: items.timed_out,
+        aborted: items.aborted,
+        total: items.total,
+        results_written: items.results_written,
+        failures_not_redrivable: items.failures_not_redrivable,
+        pending_redrive: items.pending_redrive,
     }
 }

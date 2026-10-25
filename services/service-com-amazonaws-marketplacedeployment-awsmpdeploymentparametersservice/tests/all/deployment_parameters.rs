@@ -121,15 +121,13 @@ pub(crate) fn stored_parameters(engine: &engine::InMemoryEngine) -> usize {
         .len()
 }
 
-/// How many targets the store has recorded: one per product an agreement covers.
+/// How many targets the store has recorded: one per product an agreement covers,
+/// read through the store's own accessor.
 pub(crate) fn recorded_targets(engine: &engine::InMemoryEngine) -> usize {
     service_state(engine)
         .expect("the shared engine holds this service's store")
         .lock()
-        .agreements
-        .values()
-        .map(|agreement| agreement.product_ids.len())
-        .sum()
+        .recorded_targets()
 }
 
 /// A request signed for `aws-marketplace` in [`REGION`]: the signal the router

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates one application in a workspace: an id is minted, the record is written to
+//! [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::applications`] and the
+//! answer is read off that record, so `DescribeApplication` reports exactly what this
+//! call stored. The application reports `CREATING` until the transition this call owes
+//! falls due (the instant is stored, never slept on) and `ACTIVE` from then on.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `clientToken` is honoured for idempotent replay: a retry carrying the token of a
+//! create this store already served, and naming the same application, answers from the
+//! application that create minted and stores nothing further; a token already spent on
+//! a different request is a conflict.
+//!
+//! The workspace named must be one this store holds, since the application is created in
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +181,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationError::Modeled(
+                CreateApplicationErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The application is created IN a workspace ("Creates a new application for
+        // the workspace and IdC application provided"), so a workspace this store
+        // does not hold is the same absence every other workspace-scoped operation
+        // in this service reports.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(CreateApplicationError::Modeled(
+                CreateApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_WORKSPACE,
+                            &input.workspace_name,
+                        ),
+                    },
+                ),
+            ));
+        }
+
+        // The boundary validator reaches a map's VALUES but not its KEYS, so
+        // `TagKey`'s own bound is enforced here, and with the error this service's
+        // own boundary refusals carry for a constraint violation, so one class of
+        // failure has one error code. Checked AFTER the workspace the create
+        // addresses is resolved: a request naming a resource that is not there is
+        // answered as absence, whatever else it carries.
+        for tag_key in input.tags.iter().flatten().map(|(tag_key, _)| tag_key) {
+            if let Err(message) = crate::state::check_tag_key(tag_key) {
+                return Err(invalid_request(message));
+            }
+        }
+
+        // `clientToken` is an `@idempotencyToken`: a retry carrying the token of a
+        // create this store already served answers from the application THAT create
+        // minted and writes nothing. The retry has to be the SAME request, so the
+        // members that identify the application are compared too; a token already
+        // spent on a different request collides with the application it made,
+        // rather than answering from it.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .applications
+                .values()
+                .find(|record| record.client_token.as_deref() == Some(token))
+            {
+                if existing.workspace_name == input.workspace_name
+                    && existing.name == input.name
+                    && existing.idc_instance_arn == input.idc_instance_arn
+                    && existing.description == input.description
+                    // Every member the create carries, `tags` included: a retry
+                    // whose tags differ is a different request, so it collides
+                    // rather than silently dropping the tags it carried. A record
+                    // stores an absent `tags` as the empty set, which is what a
+                    // request carrying none asks for.
+                    && existing.tags == input.tags.clone().unwrap_or_default()
+                {
+                    return Ok(created(existing, now));
+                }
+                return Err(CreateApplicationError::Modeled(
+                    CreateApplicationErrorModeled::ConflictingOperationException(
+                        ConflictingOperationException {
+                            message: crate::state::already_using_message(
+                                crate::state::RESOURCE_APPLICATION,
+                                "clientToken",
+                            ),
+                            resource_id: existing.id.clone(),
+                            resource_arn: existing.arn.clone(),
+                        },
+                    ),
+                ));
+            }
+        }
+
+        // The store is bounded: a create is the only thing that adds an application
+        // and nothing evicts one, so past the cap this is a quota refusal.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationError::Modeled(
+                CreateApplicationErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} applications.",
+                        crate::state::MAX_APPLICATIONS
+                    ),
+                }),
+            ));
+        }
+
+        let application_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.applications.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::ApplicationRecord {
+            arn: crate::state::application_arn(&region, &application_id),
+            workspace_name: input.workspace_name.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            idc_application_arn: crate::state::idc_application_arn(
+                &input.idc_instance_arn,
+                &application_id,
+            ),
+            idc_instance_arn: input.idc_instance_arn.clone(),
+            dns_subdomain: crate::state::application_dns_subdomain(&application_id),
+            created_at: now,
+            // Nothing has written to the application since the create, so its last
+            // write IS the create.
+            updated_at: now,
+            // The transition the clock owes this application: `CREATING` now,
+            // `ACTIVE` once the span falls due. The instant is STORED, never slept
+            // on, so a caller reading the application straight after this call still
+            // sees `CREATING`.
+            active_at: now + crate::state::ACTIVATION_DELAY,
+            client_token: input.client_token.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            id: application_id,
+        };
+
+        let output = created(&record, now);
+        store.applications.insert(record.id.clone(), record);
+
+        Ok(output)
     }
 }
+
+/// What this operation answers for a stored application, as of `now` — every
+/// member read off the record rather than off the request.
+fn created(
+    record: &crate::state::ApplicationRecord,
+    now: ::std::time::SystemTime,
+) -> CreateApplicationOutput {
+    CreateApplicationOutput {
+        arn: record.arn.clone(),
+        id: record.id.clone(),
+        dns_subdomain: record.dns_subdomain.clone(),
+        name: record.name.clone(),
+        status: record.status(now),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — "The request isn't
+/// valid", which is what this service answers a constraint violation with.
+fn invalid_request(message: String) -> CreateApplicationError {
+    CreateApplicationError::Modeled(CreateApplicationErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+

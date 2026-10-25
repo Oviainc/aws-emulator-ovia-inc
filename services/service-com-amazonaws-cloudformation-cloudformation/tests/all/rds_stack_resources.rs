@@ -540,9 +540,9 @@ async fn a_declaration_amazon_rds_refuses_leaves_the_stack_failed_and_nothing_cr
     let (_, described) = describe_stack(&router, "rds-refused").await;
     assert_eq!(
         xml_text(&described, "StackStatus").as_deref(),
-        Some(status::CREATE_FAILED),
-        "a resource the owning service refused must leave the stack CREATE_FAILED, got \
-         {described}"
+        Some(status::ROLLBACK_COMPLETE),
+        "a resource the owning service refused must roll the stack back to \
+         ROLLBACK_COMPLETE, got {described}"
     );
     let (status_code, reported) = describe_db_instance(&router, "cfn-probe-refused").await;
     assert_eq!(
@@ -574,9 +574,9 @@ async fn a_property_this_emulator_does_not_provision_is_refused_rather_than_drop
     let (_, described) = describe_stack(&router, "rds-unsupported").await;
     assert_eq!(
         xml_text(&described, "StackStatus").as_deref(),
-        Some(status::CREATE_FAILED),
-        "a property no create of this emulator sends must leave the stack CREATE_FAILED, \
-         got {described}"
+        Some(status::ROLLBACK_COMPLETE),
+        "a property no create of this emulator sends must roll the stack back to \
+         ROLLBACK_COMPLETE, got {described}"
     );
     let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
     assert!(

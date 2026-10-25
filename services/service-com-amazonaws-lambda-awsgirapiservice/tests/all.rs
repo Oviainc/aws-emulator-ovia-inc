@@ -23,6 +23,8 @@ mod capacity_provider_bounds;
 mod capacity_provider_listing;
 #[path = "all/capacity_provider_naming.rs"]
 mod capacity_provider_naming;
+#[path = "all/capacity_provider_update.rs"]
+mod capacity_provider_update;
 #[path = "all/capacity_providers.rs"]
 mod capacity_providers;
 #[path = "all/code_signing_configs.rs"]

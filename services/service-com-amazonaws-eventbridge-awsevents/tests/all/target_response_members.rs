@@ -271,9 +271,10 @@ async fn put_targets_always_reports_a_failed_entries_list() {
     }
 }
 
-/// `RemoveTargets` always reports `FailedEntries`, holding the ids the rule did
-/// not carry: the rows differ along how many ids are asked for and how many of
-/// them name a stored target, including the all-success row whose list is empty.
+/// `RemoveTargets` always reports `FailedEntries`, and it is always EMPTY: the
+/// call is idempotent about an id the rule does not carry, since the state that
+/// id asks for already holds. The rows differ along how many ids are asked for
+/// and how many of them name a stored target, including rows where none does.
 #[tokio::test]
 async fn remove_targets_always_reports_a_failed_entries_list() {
     // (case, targets stored first, ids to remove)
@@ -304,25 +305,19 @@ async fn remove_targets_always_reports_a_failed_entries_list() {
             "case {case:?}: RemoveTargets answered {status} {body}"
         );
 
-        let expected_failed: Vec<&str> = ids
-            .iter()
-            .filter(|id| !stored.iter().any(|held| held.as_str() == **id))
-            .copied()
-            .collect();
         let failed = collection(&body, "FailedEntries", case);
         let reported: Vec<&str> = failed
             .iter()
             .map(|entry| entry["TargetId"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(
-            reported, expected_failed,
-            "case {case:?}: expected FailedEntries for {expected_failed:?}, got {body}"
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected no FailedEntries, got {reported:?} in {body}"
         );
         assert_eq!(
             body["FailedEntryCount"],
-            json!(expected_failed.len()),
-            "case {case:?}: expected FailedEntryCount {}, got {body}",
-            expected_failed.len()
+            json!(0),
+            "case {case:?}: expected FailedEntryCount 0, got {body}"
         );
 
         // Round trip: the ids that were removed are gone from the reader, and

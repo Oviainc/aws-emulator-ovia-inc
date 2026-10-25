@@ -4180,6 +4180,11 @@ pub fn check_identifier(member: &str, value: &str, max_len: usize) -> Result<(),
 }
 
 /// Refuse a `MaxRecords` outside the range every describe operation documents.
+///
+/// The caller answers this with `InvalidParameterValue` — the Query API common error Amazon
+/// RDS itself answers a `MaxRecords` outside the documented window with ("Constraints:
+/// Minimum 20, maximum 100" is a constraint on the VALUE of a parameter) — rather than with
+/// a synthetic `ValidationException`, because the error code is what a client branches on.
 pub fn check_max_records(max_records: Option<i32>) -> Result<usize, String> {
     check_max_records_in(max_records, &MAX_RECORDS_RANGE)
 }
@@ -4188,6 +4193,10 @@ pub fn check_max_records(max_records: Option<i32>) -> Result<usize, String> {
 /// a different bound than [`MAX_RECORDS_RANGE`] — `DescribeOrderableDBInstanceOptions`
 /// documents "Minimum 20, maximum 1000". The default page size and the wording of the
 /// refusal stay here, shared by every describe operation.
+///
+/// The message is built from the request and the member's own documented window: the value
+/// rejected, the member it was sent for and the bounds it must lie between, in the wording
+/// Amazon RDS states that refusal with, so a caller can fix the request from the text alone.
 pub fn check_max_records_in(
     max_records: Option<i32>,
     range: &std::ops::RangeInclusive<i32>,
@@ -4196,7 +4205,7 @@ pub fn check_max_records_in(
         None => Ok(DEFAULT_MAX_RECORDS),
         Some(value) if range.contains(&value) => Ok(value as usize),
         Some(value) => Err(format!(
-            "invalid value {value} for MaxRecords: must be a value from {} to {}",
+            "Invalid value {value} for MaxRecords. Must be between {} and {}",
             range.start(),
             range.end()
         )),

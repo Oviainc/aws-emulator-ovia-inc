@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSatellite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSatellite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSatellite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE of the satellites this account is on-boarded to, addressed by the
+//! `{satelliteId}` its path carries — the same stored onboarding `ListSatellites` reports
+//! in its page, read through this service's own `satellites` store so the two operations
+//! answer one record rather than two copies of it.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +110,16 @@ impl From<GetSatelliteErrorModeled> for GetSatelliteError {
     }
 }
 
+/// What this operation answers when the `{satelliteId}` a request carries names no
+/// onboarding of this account: a fixed literal, in the form this service's other
+/// not-found literals take (`<Resource> not found`), that discloses neither the id that
+/// was asked for nor any satellite this account does hold.
+///
+/// It lives here rather than in `crate::state` because `GetSatellite` is the only
+/// operation of this service that resolves a satellite by id — the listing beside it
+/// reports every onboarding and resolves none — so this is one operation's text.
+pub const SATELLITE_NOT_FOUND: &str = "Satellite not found";
+
 /// The `GetSatellite` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,23 +151,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_SATELLITE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the satellite `{satelliteId}` addresses.
+    ///
+    /// `@readonly`: the answer is computed from the stored onboarding and nothing is
+    /// written, so reading a satellite changes nothing a later caller sees. Nothing in
+    /// this API onboards a satellite — AWS does that outside it — so an id this account
+    /// holds no onboarding for names no satellite and is refused with
+    /// [`SATELLITE_NOT_FOUND`].
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSatellite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSatelliteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSatellite"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSatelliteErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let guard = state.lock();
+        let stored = guard.satellites.get(&input.satellite_id).ok_or_else(|| {
+            GetSatelliteErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(SATELLITE_NOT_FOUND.to_string()),
+            })
+        })?;
+
+        Ok(GetSatelliteOutput {
+            satellite_id: Some(stored.satellite_id.clone()),
+            satellite_arn: Some(stored.satellite_arn.clone()),
+            norad_satellite_id: stored.norad_satellite_id,
+            ground_stations: Some(stored.ground_stations.clone()),
+            current_ephemeris: stored.current_ephemeris.clone(),
+        })
     }
 }

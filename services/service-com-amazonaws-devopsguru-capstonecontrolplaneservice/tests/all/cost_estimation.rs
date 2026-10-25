@@ -25,11 +25,11 @@ use crate::configuration_lifecycle::{cloud_formation, tags, Emulator, Reply};
 
 /// Money is compared to well under a cent: a cost is a product of floats, so the
 /// reported value may differ from the recomputed one in the last bits.
-const MONEY_EPSILON: f64 = 1e-6;
+pub(crate) const MONEY_EPSILON: f64 = 1e-6;
 
 /// `PUT /cost-estimation` — `StartCostEstimation`, with `ClientToken` only when the
 /// case supplies one (the member is optional).
-async fn start_cost_estimation(
+pub(crate) async fn start_cost_estimation(
     emulator: &Emulator,
     collection: &Value,
     client_token: Option<&str>,
@@ -43,7 +43,7 @@ async fn start_cost_estimation(
 
 /// `GET /cost-estimation` — `GetCostEstimation`, with `NextToken` in the query string
 /// the model binds it to.
-async fn get_cost_estimation(emulator: &Emulator, next_token: Option<&str>) -> Reply {
+pub(crate) async fn get_cost_estimation(emulator: &Emulator, next_token: Option<&str>) -> Reply {
     let path = match next_token {
         Some(token) => format!("/cost-estimation?NextToken={token}"),
         None => "/cost-estimation".to_string(),
@@ -106,7 +106,7 @@ fn reported_cost_lines(reply: &Reply) -> Vec<(String, i64)> {
         .unwrap_or_default()
 }
 
-fn reported_status(reply: &Reply) -> Option<&str> {
+pub(crate) fn reported_status(reply: &Reply) -> Option<&str> {
     reply.at("/Status").and_then(Value::as_str)
 }
 
@@ -114,11 +114,11 @@ fn reported_status(reply: &Reply) -> Option<&str> {
 /// instant the clock is on. Used where the row is about an estimation EXISTING, so a
 /// slow machine that crosses the completion instant before the read does not change
 /// what the row asserts; the transition itself has its own test.
-fn reports_an_estimation(reply: &Reply) -> bool {
+pub(crate) fn reports_an_estimation(reply: &Reply) -> bool {
     matches!(reported_status(reply), Some("ONGOING") | Some("COMPLETED"))
 }
 
-fn reported_total_cost(reply: &Reply) -> f64 {
+pub(crate) fn reported_total_cost(reply: &Reply) -> f64 {
     reply
         .at("/TotalCost")
         .and_then(Value::as_f64)
@@ -126,7 +126,7 @@ fn reported_total_cost(reply: &Reply) -> f64 {
 }
 
 /// `ADD` coverage for a collection, failing loudly if the setup itself is refused.
-async fn add_coverage(emulator: &Emulator, collection: Value) {
+pub(crate) async fn add_coverage(emulator: &Emulator, collection: Value) {
     let reply = emulator
         .update_resource_collection("ADD", collection.clone())
         .await;
@@ -148,28 +148,29 @@ enum Expect {
 
 struct ResolutionCase {
     name: &'static str,
-    /// Coverage to declare through `UpdateResourceCollection` before the start, if
-    /// any. The rule is that it makes NO difference to the estimate, so the rows vary
-    /// it deliberately: absent, disjoint, identical, differing only in letter case.
+    /// The resources the account holds, declared through `UpdateResourceCollection`
+    /// before the start. The rows vary how it overlaps the submitted collection:
+    /// identical, or a superset that holds resources the collection does not name.
     coverage: Option<Value>,
     collection: Value,
     expect: Expect,
 }
 
 /// RULE: a cost estimate prices the `CostEstimationResourceCollectionFilter` the
-/// request itself submits — DevOps Guru's estimate exists so a customer can price
-/// analysis of resources BEFORE enabling analysis for them — so `StartCostEstimation`
-/// never resolves that collection against the account's analysis coverage: a
-/// well-formed collection is accepted (200) and read back by `GetCostEstimation`
-/// whichever resources the coverage holds, and only a collection no estimate can be
-/// made of (one naming no resource at all, or one outside a modelled or documented
-/// size) is refused, with `ValidationException` (400), creating no estimation.
+/// request itself submits — one cost line per resource type that collection names, and
+/// nothing for a resource the account holds that the collection does not name — while a
+/// collection naming no resource at all, or one outside a modelled or documented size,
+/// is refused with `ValidationException` (400) and creates no estimation. (That every
+/// entry must also select a resource the account holds, on pain of
+/// `ResourceNotFoundException` (404), is the rule the `cost_estimation_scope` suite
+/// pins; the rows here hold the resources they name so this table stays about prices.)
 ///
 /// The rows differ along which half of the collection is named, how many entries it
-/// names (none, one, two) and how the coverage declared first overlaps it (absent,
-/// disjoint, identical, differing only in letter case).
+/// names (none, one, two) and how the resources the account holds overlap it
+/// (identical, a superset) — plus the app-boundary key's form, inside and outside the
+/// documented `Devops-guru-` prefix.
 #[tokio::test]
-async fn a_start_prices_its_own_collection_whatever_the_coverage_holds() {
+async fn a_start_prices_the_collection_it_names_and_not_what_else_the_account_holds() {
     /// `ServiceResourceCost.Type` for the stack half of a collection.
     const STACK: &str = "AWS::CloudFormation::Stack";
     /// `ServiceResourceCost.Type` for the tag half of a collection.
@@ -177,58 +178,43 @@ async fn a_start_prices_its_own_collection_whatever_the_coverage_holds() {
 
     let cases = [
         ResolutionCase {
-            name: "a stack with no coverage declared at all",
-            coverage: None,
-            collection: cloud_formation(&["my-stack"]),
-            expect: Expect::Accepted(&[(STACK, 1)]),
-        },
-        ResolutionCase {
-            name: "the stack the coverage already holds",
+            name: "the stack the account holds",
             coverage: Some(cloud_formation(&["my-stack"])),
             collection: cloud_formation(&["my-stack"]),
             expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
-            name: "a stack other than the covered one",
-            coverage: Some(cloud_formation(&["covered-stack"])),
-            collection: cloud_formation(&["other-stack"]),
+            name: "one stack of the several the account holds",
+            coverage: Some(cloud_formation(&["first-stack", "second-stack"])),
+            collection: cloud_formation(&["second-stack"]),
             expect: Expect::Accepted(&[(STACK, 1)]),
         },
         ResolutionCase {
-            name: "a covered stack name in different letter case",
-            coverage: Some(cloud_formation(&["MyStack"])),
-            collection: cloud_formation(&["mystack"]),
-            expect: Expect::Accepted(&[(STACK, 1)]),
-        },
-        ResolutionCase {
-            name: "a tag no covered resource carries",
-            coverage: None,
+            name: "the tag filter the account holds a resource for",
+            coverage: Some(tags(&[("Devops-guru-app", &["production"])])),
             collection: tags(&[("Devops-guru-app", &["production"])]),
             expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
-            name: "a covered app boundary key with an uncovered value",
-            coverage: Some(tags(&[("Devops-guru-app", &["production"])])),
+            name: "one tag value of the several the key holds",
+            coverage: Some(tags(&[("Devops-guru-app", &["production", "staging"])])),
             collection: tags(&[("Devops-guru-app", &["staging"])]),
             expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
-            name: "the tag filter the coverage already holds",
-            coverage: Some(tags(&[("Devops-guru-app", &["production"])])),
-            collection: tags(&[("Devops-guru-app", &["production"])]),
-            expect: Expect::Accepted(&[(TAG, 1)]),
-        },
-        ResolutionCase {
             name: "an app boundary key outside the Devops-guru- prefix",
-            coverage: None,
+            coverage: Some(tags(&[("Team", &["payments"])])),
             collection: tags(&[("Team", &["payments"])]),
             expect: Expect::Accepted(&[(TAG, 1)]),
         },
         ResolutionCase {
-            name: "both halves, neither of them covered",
-            coverage: Some(cloud_formation(&["covered-stack"])),
+            name: "both halves, each held by the account",
+            coverage: Some(json!({
+                "CloudFormation": { "StackNames": ["held-stack"] },
+                "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["staging"] }],
+            })),
             collection: json!({
-                "CloudFormation": { "StackNames": ["uncovered-stack"] },
+                "CloudFormation": { "StackNames": ["held-stack"] },
                 "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["staging"] }],
             }),
             expect: Expect::Accepted(&[(STACK, 1), (TAG, 1)]),
@@ -236,6 +222,15 @@ async fn a_start_prices_its_own_collection_whatever_the_coverage_holds() {
         ResolutionCase {
             name: "a collection naming neither half",
             coverage: Some(cloud_formation(&["my-stack"])),
+            collection: json!({}),
+            expect: Expect::Refused("ValidationException", 400),
+        },
+        ResolutionCase {
+            // A collection naming nothing is refused for its shape, before any
+            // resource is looked for: the 400 does not become a 404 just because the
+            // account holds nothing either.
+            name: "a collection naming neither half with nothing held",
+            coverage: None,
             collection: json!({}),
             expect: Expect::Refused("ValidationException", 400),
         },
@@ -343,67 +338,67 @@ async fn a_start_prices_its_own_collection_whatever_the_coverage_holds() {
     }
 }
 
-/// RULE: the pre-onboarding workflow a cost estimate exists for — estimate first,
-/// onboard afterwards — works in that order: a start before any
-/// `UpdateResourceCollection` is accepted, the estimate it created reports the
-/// collection it was given, and onboarding resources afterwards neither creates nor
-/// changes an estimate.
+/// RULE: an estimate is a snapshot of the collection the start named: it reports that
+/// collection and the cost of the resources IT names — not every resource the account
+/// holds — and a later change to the resources the account holds neither creates an
+/// estimate nor rewrites the one that exists.
 ///
-/// The steps differ along the order of the calls relative to the coverage change and
-/// along which half of the collection each call names.
+/// The steps differ along the order of the calls relative to the change in what the
+/// account holds and along which half of the collection each call names.
 #[tokio::test]
-async fn an_estimate_can_be_made_before_anything_is_onboarded() {
+async fn an_estimate_is_a_snapshot_of_the_collection_its_start_named() {
     let emulator = Emulator::new();
 
-    // Nothing is onboarded: the account's coverage is empty.
-    let collection = cloud_formation(&["not-yet-onboarded"]);
-    let started = start_cost_estimation(&emulator, &collection, Some("preonboarding")).await;
+    // The account holds two stacks; the start names one of them.
+    add_coverage(&emulator, cloud_formation(&["named-stack", "other-stack"])).await;
+    let collection = cloud_formation(&["named-stack"]);
+    let started = start_cost_estimation(&emulator, &collection, Some("snapshottoken")).await;
     assert_eq!(
         started.status, 200,
-        "case {:?}: expected 200 before anything is onboarded, got {} {}",
-        "start with an empty coverage", started.status, started.raw
+        "case {:?}: expected 200 for a collection the account holds, got {} {}",
+        "start naming one of the held stacks", started.status, started.raw
     );
 
     let read = get_cost_estimation(&emulator, None).await;
     assert!(
         reports_an_estimation(&read),
         "case {:?}: expected the estimate to be reported, got {}",
-        "read before onboarding",
+        "read after the start",
         read.raw
     );
     assert_eq!(
         read.strings_at("/ResourceCollection/CloudFormation/StackNames"),
-        vec!["not-yet-onboarded".to_string()],
+        vec!["named-stack".to_string()],
         "case {:?}: expected the submitted collection to be reported, got {}",
-        "read before onboarding",
+        "read after the start",
         read.raw
     );
     let priced = reported_total_cost(&read);
     assert!(
         (priced - monthly_cost(1)).abs() < MONEY_EPSILON,
         "case {:?}: expected the one named stack to be priced at {}, got {priced} in {}",
-        "read before onboarding",
+        "read after the start",
         monthly_cost(1),
         read.raw
     );
 
-    // Onboarding is the NEXT step of the workflow, and it is not what makes an
-    // estimate: it changes neither the estimate's collection nor its cost.
-    add_coverage(&emulator, cloud_formation(&["not-yet-onboarded"])).await;
+    // Taking on more resources is not what makes an estimate: it changes neither the
+    // estimate's collection nor its cost.
+    add_coverage(&emulator, cloud_formation(&["later-stack"])).await;
     add_coverage(&emulator, tags(&[("Devops-guru-app", &["production"])])).await;
     let after = get_cost_estimation(&emulator, None).await;
     assert_eq!(
         after.at("/ResourceCollection"),
         read.at("/ResourceCollection"),
-        "case {:?}: onboarding must not rewrite the estimate's collection, got {}",
-        "read after onboarding",
+        "case {:?}: a later coverage change must not rewrite the estimate's collection, got {}",
+        "read after taking on more resources",
         after.raw
     );
     let after_total = reported_total_cost(&after);
     assert!(
         (after_total - priced).abs() < MONEY_EPSILON,
         "case {:?}: expected the estimate's cost to stay {priced}, got {after_total} in {}",
-        "read after onboarding",
+        "read after taking on more resources",
         after.raw
     );
 }
@@ -411,8 +406,9 @@ async fn an_estimate_can_be_made_before_anything_is_onboarded() {
 struct PricingCase {
     name: &'static str,
     /// Every coverage filter to declare through `UpdateResourceCollection` first, so a
-    /// row needs no code outside the table. Empty for a row that prices a collection
-    /// nothing has been onboarded for, which is priced exactly like an onboarded one.
+    /// row needs no code outside the table. Each row declares the resources its
+    /// collection names, because a collection naming a resource the account does not
+    /// hold is refused rather than priced.
     coverage: Vec<Value>,
     collection: Value,
     /// The `(Type, Count)` lines the estimate must report, in order.
@@ -425,37 +421,37 @@ struct PricingCase {
 /// the sum of the lines in the response.
 ///
 /// The rows differ along which half of the collection is named, how many types the
-/// estimate therefore prices (one, two) and whether the named resources have been
-/// onboarded for analysis (which does not change the price).
+/// estimate therefore prices (one, two) and how much of what the account holds the
+/// collection names (all of it, one entry of several).
 #[tokio::test]
 async fn the_estimate_prices_every_resource_its_collection_names() {
     let cases = [
         PricingCase {
-            name: "an onboarded stack",
+            name: "the one stack the account holds",
             coverage: vec![cloud_formation(&["my-stack"])],
             collection: cloud_formation(&["my-stack"]),
             expect_lines: &[("AWS::CloudFormation::Stack", 1)],
         },
         PricingCase {
-            name: "a stack nothing has been onboarded for",
-            coverage: vec![],
-            collection: cloud_formation(&["unonboarded-stack"]),
+            name: "one stack of the several the account holds",
+            coverage: vec![cloud_formation(&["first-stack", "second-stack"])],
+            collection: cloud_formation(&["second-stack"]),
             expect_lines: &[("AWS::CloudFormation::Stack", 1)],
         },
         PricingCase {
-            name: "an onboarded tag value",
+            name: "the one tag value the account holds",
             coverage: vec![tags(&[("Devops-guru-app", &["production"])])],
             collection: tags(&[("Devops-guru-app", &["production"])]),
             expect_lines: &[("AWS::Tag", 1)],
         },
         PricingCase {
-            name: "a tag value nothing has been onboarded for",
-            coverage: vec![],
+            name: "one tag value of the several the key holds",
+            coverage: vec![tags(&[("Devops-guru-app", &["production", "staging"])])],
             collection: tags(&[("Devops-guru-app", &["staging"])]),
             expect_lines: &[("AWS::Tag", 1)],
         },
         PricingCase {
-            name: "both halves onboarded",
+            name: "both halves held by the account",
             coverage: vec![
                 cloud_formation(&["my-stack"]),
                 tags(&[("Devops-guru-app", &["production"])]),
@@ -467,8 +463,11 @@ async fn the_estimate_prices_every_resource_its_collection_names() {
             expect_lines: &[("AWS::CloudFormation::Stack", 1), ("AWS::Tag", 1)],
         },
         PricingCase {
-            name: "both halves with an empty coverage",
-            coverage: vec![],
+            name: "both halves of a collection naming part of what is held",
+            coverage: vec![
+                cloud_formation(&["fresh-stack", "spare-stack"]),
+                tags(&[("Devops-guru-app", &["canary", "spare"])]),
+            ],
             collection: json!({
                 "CloudFormation": { "StackNames": ["fresh-stack"] },
                 "Tags": [{ "AppBoundaryKey": "Devops-guru-app", "TagValues": ["canary"] }],

@@ -19,7 +19,13 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `unbounded_depth`: the parser's own depth default is replaced by this service's
+# published `Detail` nesting bound (`state::MAX_DETAIL_DEPTH`), which the parse
+# enforces up front instead.
+# `raw_value`: reading a document as a raw value is how its well-formedness is
+# checked without descending into it, so a document at the published nesting
+# bound is read without the stack a recursive read of it would need.
+serde_json = { workspace = true, features = ["unbounded_depth", "raw_value"] }
 tracing = { workspace = true }
 # Opaque list page tokens are hex-encoded so they are URL- and header-safe.
 hex = { workspace = true }

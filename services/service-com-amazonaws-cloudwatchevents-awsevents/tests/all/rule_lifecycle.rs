@@ -944,7 +944,9 @@ async fn a_disabled_rule_matches_nothing() {
 
 /// `PutEvents` answers one outcome per entry, index-aligned with the request: an accepted
 /// entry carries a unique `EventId`, a refused one carries its reason, and
-/// `FailedEntryCount` counts the refused ones.
+/// `FailedEntryCount` counts the refused ones. An entry naming a bus the account does not
+/// hold is ACCEPTED — the destination is not a property of the entry — and recorded
+/// nowhere.
 #[tokio::test]
 async fn put_events_reports_one_unique_id_per_accepted_entry_and_counts_the_rest() {
     let emulator = emulator();
@@ -978,8 +980,8 @@ async fn put_events_reports_one_unique_id_per_accepted_entry_and_counts_the_rest
     );
     assert_eq!(
         answer.body["FailedEntryCount"],
-        json!(3),
-        "three of the ten entries are refused, got {:?}",
+        json!(2),
+        "two of the ten entries are refused, got {:?}",
         answer.body
     );
     let entries = answer.body["Entries"].as_array().cloned().unwrap_or_default();
@@ -988,7 +990,7 @@ async fn put_events_reports_one_unique_id_per_accepted_entry_and_counts_the_rest
         10,
         "one outcome per entry, index-aligned, got {entries:?}"
     );
-    let accepted = [0_usize, 2, 4, 5, 6, 8, 9];
+    let accepted = [0_usize, 2, 4, 5, 6, 7, 8, 9];
     let ids: BTreeSet<String> = accepted
         .into_iter()
         .map(|index| {
@@ -1016,8 +1018,7 @@ async fn put_events_reports_one_unique_id_per_accepted_entry_and_counts_the_rest
             "an EventId carries only hex digits and dashes, got {id:?}"
         );
     }
-    // A malformed entry and one naming an absent bus fail for DIFFERENT reasons, each on
-    // its own row.
+    // The two malformed entries fail on their own rows, each naming its reason.
     for index in [1_usize, 3] {
         assert_eq!(
             entries[index]["ErrorCode"],
@@ -1030,15 +1031,14 @@ async fn put_events_reports_one_unique_id_per_accepted_entry_and_counts_the_rest
             "a refused entry carries no id, got {entries:?}"
         );
     }
-    assert_eq!(
-        entries[7]["ErrorCode"],
-        json!("ResourceNotFoundException"),
-        "an entry naming a bus the account does not hold names THAT reason, got {entries:?}"
+    assert!(
+        entries[7].get("ErrorCode").is_none(),
+        "an entry naming a bus the account does not hold is still ingested, got {entries:?}"
     );
     assert_eq!(
         emulator.recorded_event_count(DEFAULT_BUS),
-        accepted.len(),
-        "only the accepted entries are recorded"
+        accepted.len() - 1,
+        "every accepted entry but the one addressed to an absent bus is recorded"
     );
 }
 

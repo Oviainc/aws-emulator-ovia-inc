@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region =
             crate::state::request_region(ctx).map_err(DescribeCertificatesError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
-            .map_err(DescribeCertificatesError::validation)?;
+            .map_err(DescribeCertificatesError::invalid_parameter_value)?;
         let filters = input.filters.unwrap_or_default();
         if !filters.is_empty() {
             // `DescribeCertificatesMessage$Filters`: "This parameter isn't currently

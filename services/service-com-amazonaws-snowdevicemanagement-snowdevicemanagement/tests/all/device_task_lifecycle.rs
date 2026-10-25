@@ -192,15 +192,15 @@ pub(crate) async fn tag_resource(
     .await
 }
 
-async fn cancel_task(router: &MultiServiceRouter, task_id: &str) -> Answer {
+pub(crate) async fn cancel_task(router: &MultiServiceRouter, task_id: &str) -> Answer {
     call(router, "POST", &format!("/task/{task_id}/cancel"), None).await
 }
 
-async fn list_executions(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_executions(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("/executions{query}"), None).await
 }
 
-async fn describe_execution(
+pub(crate) async fn describe_execution(
     router: &MultiServiceRouter,
     task_id: &str,
     managed_device_id: &str,
@@ -269,7 +269,7 @@ fn devices_of(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// The `executions` array of a `ListExecutions` answer.
-fn executions_of(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn executions_of(body: &Value, case: &str) -> Vec<Value> {
     body["executions"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected an executions array, got {body}"))
@@ -616,7 +616,7 @@ async fn describe_device_404s_an_id_that_names_no_device() {
 
 /// Create a task over the first `target_count` devices with `command`, returning its
 /// id, ARN and the targets it was given (in the order they were submitted).
-async fn queue_task(
+pub(crate) async fn queue_task(
     router: &MultiServiceRouter,
     commands: &[&str],
     target_count: usize,

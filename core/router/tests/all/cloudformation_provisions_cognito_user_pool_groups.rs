@@ -680,8 +680,8 @@ async fn a_group_the_owning_service_refuses_fails_the_stack() {
         cloudformation(&router, region, "DescribeStacks", &[("StackName", "group-clash")]).await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail, got {described}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
     assert!(
@@ -751,8 +751,8 @@ async fn a_group_declaring_no_user_pool_fails_the_stack() {
     .await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
-        Some("CREATE_FAILED"),
-        "case {case:?}: expected the stack to fail, got {described}"
+        Some("ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
     assert!(

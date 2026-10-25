@@ -883,9 +883,9 @@ async fn a_declaration_the_owning_service_refuses_fails_the_stack() {
             cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
         assert_eq!(
             opt_element(&described, "StackStatus").as_deref(),
-            Some("CREATE_FAILED"),
-            "case {case:?}: expected the stack to fail rather than report a resource nothing \
-             created, got {described}"
+            Some("ROLLBACK_COMPLETE"),
+            "case {case:?}: expected the failed create to be rolled back rather than report \
+             a resource nothing created, got {described}"
         );
         let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
         assert!(

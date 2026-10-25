@@ -48,7 +48,11 @@ const CATALOG: &str = "25994=Ohio 1+Oregon 1+Hawaii 1,27424=Punta Arenas 1,0,339
 
 /// The satellites `setting` onboards, written into this service's store, as a handler
 /// sees them.
-fn onboard(engine: &engine::InMemoryEngine, setting: &str) -> HashMap<String, Satellite> {
+///
+/// `pub(crate)` here and on the three helpers below: the sibling suite that reads ONE
+/// satellite back (`satellite_reads.rs`) seeds the same catalogue through the same door,
+/// so the seeding and the ARN assertion are written once rather than copied per suite.
+pub(crate) fn onboard(engine: &engine::InMemoryEngine, setting: &str) -> HashMap<String, Satellite> {
     let catalog = parse_satellites(setting);
     let state = service_state(engine).expect("this service's state store");
     state.lock().satellites = catalog.clone();
@@ -57,7 +61,7 @@ fn onboard(engine: &engine::InMemoryEngine, setting: &str) -> HashMap<String, Sa
 
 /// The on-boarded satellites in the order `ListSatellites` must report them: by NORAD
 /// catalogue number, then by `satelliteId`.
-fn in_listing_order(catalog: &HashMap<String, Satellite>) -> Vec<Satellite> {
+pub(crate) fn in_listing_order(catalog: &HashMap<String, Satellite>) -> Vec<Satellite> {
     let mut ordered: Vec<Satellite> = catalog.values().cloned().collect();
     ordered.sort_by(|left, right| {
         (left.norad_satellite_id, &left.satellite_id)
@@ -76,7 +80,7 @@ async fn list_all(router: &MultiServiceRouter, page_size: Option<i64>) -> Vec<Va
 /// EMPTY region segment (the modelled pattern makes the region optional — an on-boarded
 /// satellite belongs to the account, not to one region), the emulator's account, the
 /// `satellite/<uuid>` resource, and a length inside the modelled 82..132.
-fn assert_satellite_arn(arn: &str, satellite_id: &str, case: &str) {
+pub(crate) fn assert_satellite_arn(arn: &str, satellite_id: &str, case: &str) {
     let expected = format!(
         "arn:aws:groundstation::{}:satellite/{satellite_id}",
         engine::emulator_account_id()
@@ -94,7 +98,7 @@ fn assert_satellite_arn(arn: &str, satellite_id: &str, case: &str) {
 
 /// A JSON member of `item`, as a string (empty when absent, so a missing member fails the
 /// comparison it is part of rather than panicking here).
-fn member(item: &Value, name: &str) -> String {
+pub(crate) fn member(item: &Value, name: &str) -> String {
     item.get(name)
         .and_then(Value::as_str)
         .unwrap_or_default()
