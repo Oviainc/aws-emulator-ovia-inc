@@ -891,6 +891,12 @@ async fn the_broker_node_operations_refuse_a_serverless_cluster() {
             None,
         ),
         (
+            "ListNodes",
+            "GET",
+            format!("/v1/clusters/{}/nodes", pct(&arn)),
+            None,
+        ),
+        (
             "UpdateBrokerType",
             "PUT",
             format!("/v1/clusters/{}/nodes/type", pct(&arn)),

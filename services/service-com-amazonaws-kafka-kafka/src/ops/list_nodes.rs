@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNodes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNodes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNodes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored broker nodes of one cluster in broker-id order: the cluster
+//! is resolved first (a `ClusterArn` that is not an MSK cluster ARN is a bad
+//! request, a well-formed one this region holds no cluster for is a 404, and a
+//! cluster with no broker nodes is refused as provisioned-only), then
+//! `MaxResults` / `NextToken` page the brokers the record holds. Each node is
+//! rendered by [`crate::state::Cluster::to_node_info`], so what this reader
+//! reports about a broker is what the stored cluster says about it.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +76,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The largest page `MaxResults` may ask for, from that member's `range` in the
+// model (1..100), and the size used when the request names none. The crate's own
+// bound, shared with every other listing rather than restated here.
+use crate::state::MAX_RESULTS_LIMIT;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -111,6 +114,38 @@ impl From<ListNodesErrorModeled> for ListNodesError {
     fn from(modeled: ListNodesErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Marker that prefixes this listing's page-token plaintext, so a token minted
+/// for some other list cannot be mistaken for one of these. The cluster the
+/// token was minted for is part of the plaintext, so one cluster's page cannot
+/// resume another's node listing.
+const NEXT_TOKEN_PREFIX: &str = "kafka:nodes:";
+
+/// Separates the cluster ARN a token was minted for from the broker id the page
+/// stopped at. An MSK ARN cannot contain it, so the plaintext splits back into
+/// exactly two fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the cluster and the broker id a page stopped at as a token, through
+/// the crate's one page-token codec ([`crate::state::encode_page_token`]).
+fn encode_next_token(cluster_arn: &str, last_broker_id: i32) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &format!("{cluster_arn}{NEXT_TOKEN_SEPARATOR}{last_broker_id}"),
+    )
+}
+
+/// The broker id a token resumes after, or `None` when the token is not one this
+/// operation minted FOR THIS CLUSTER: a token carries the list it was minted
+/// from, so one cluster's token cannot resume another cluster's listing.
+fn decode_next_token(token: &str, cluster_arn: &str) -> Option<i32> {
+    let plaintext = crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token)?;
+    let (arn, last_broker_id) = plaintext.split_once(NEXT_TOKEN_SEPARATOR)?;
+    if arn != cluster_arn {
+        return None;
+    }
+    last_broker_id.parse().ok()
 }
 
 /// The `ListNodes` operation.
@@ -149,18 +184,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNodes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNodesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNodes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListNodesErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The shape check depends on the request alone, so it runs before the
+        // state lock is taken: a value that is not a cluster ARN is a request
+        // this reader cannot act on, which every cluster reader refuses the same
+        // way.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                ListNodesErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // A token names the broker the previous page stopped at; the next page
+        // starts after it in broker-id order, so a node list that grows between
+        // pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, &input.cluster_arn) {
+                Some(broker_id) => Some(broker_id),
+                None => {
+                    return Err(ListNodesErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("nextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        let mut state = state.lock();
+        // Reporting only: the one write this makes materialises the transitions
+        // the clock already owed THIS cluster (`CREATING` -> `ACTIVE`, and an
+        // update whose completion is due), which were owed at the same instant
+        // whether or not anybody called. An applied `UpdateBrokerType` is what
+        // moves the instance type every node reports.
+        let Some(cluster) = state.settled_cluster_in(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                ListNodesErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // `NodeInfo` describes a broker node the customer's cluster holds, so a
+        // cluster that has none cannot be listed: a serverless cluster's brokers
+        // belong to the service, which is why it has no node list rather than an
+        // empty one.
+        if cluster.is_serverless() {
+            return Err(
+                ListNodesErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // The brokers are stored in broker-id order, so the page walks them from
+        // its resume point and stops as soon as it is full.
+        let mut page: Vec<NodeInfo> = Vec::with_capacity(page_size);
+        let mut last_broker_id: Option<i32> = None;
+        let mut more_remain = false;
+        for broker in cluster
+            .brokers
+            .iter()
+            .filter(|broker| resume_after.is_none_or(|last| broker.id > last))
+        {
+            if page.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            page.push(cluster.to_node_info(broker));
+            last_broker_id = Some(broker.id);
+        }
+
+        // The token is minted from the BROKER ID the resume comparison uses, so
+        // the two can never disagree and a full page that exhausted the cluster's
+        // nodes closes the list rather than promising another page.
+        let next_token = if more_remain {
+            last_broker_id.map(|last| encode_next_token(&input.cluster_arn, last))
+        } else {
+            None
+        };
+
+        Ok(ListNodesOutput {
+            node_info_list: Some(page),
+            next_token,
+        })
     }
 }
