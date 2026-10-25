@@ -414,6 +414,14 @@ pub const GLOBAL_CLUSTER_STATUS_DELETING: &str = "deleting";
 /// was accepted for it, from `EventSubscription$Status`'s published list.
 pub const EVENT_SUBSCRIPTION_STATUS_DELETING: &str = "deleting";
 
+/// The status an event notification subscription reports while a change to it is being
+/// applied, from `EventSubscription$Status`'s published list ("creating | modifying |
+/// deleting | active | no-permission | topic-not-exist").
+///
+/// `ModifyEventSubscription` answers with the subscription in this status, so the clock
+/// owes it [`EVENT_SUBSCRIPTION_STATUS_ACTIVE`] [`STATUS_TRANSITION_DELAY`] later.
+pub const EVENT_SUBSCRIPTION_STATUS_MODIFYING: &str = "modifying";
+
 /// `GlobalCluster$StorageEncryptionType` for one encrypted under the key the service
 /// applies itself: "`sse-rds` - The global database cluster is encrypted using an Amazon
 /// Web Services owned KMS key."
@@ -1244,6 +1252,21 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         }
         for key in gone {
             self.custom_db_engine_versions.remove(&key);
+        }
+        let mut gone: Vec<RegionalKey> = Vec::new();
+        for (key, subscription) in self
+            .event_subscriptions
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if subscription.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.event_subscriptions.remove(&key);
         }
     }
 
@@ -2991,6 +3014,10 @@ pub struct EventSubscriptionRecord {
     pub event_categories: Vec<String>,
     /// `Enabled`.
     pub enabled: bool,
+    /// The status this record owes, and when; see [`PendingStatus`]. A subscription is
+    /// `active` from its create onwards and only a modify puts it in a transient status,
+    /// so this is `None` for a subscription nothing has changed.
+    pub pending_status: Option<PendingStatus>,
     /// The tags `CreateEventSubscription$Tags` assigned to the subscription. The modelled
     /// `EventSubscription` shape carries no tag member, so nothing reports them yet —
     /// `ListTagsForResource`, which does, is still scaffolded — but the caller's input is
@@ -3024,8 +3051,41 @@ impl EventSubscriptionRecord {
             source_ids,
             event_categories,
             enabled,
+            pending_status: None,
             tags,
         }
+    }
+
+    /// Accept a modify: the subscription reports [`EVENT_SUBSCRIPTION_STATUS_MODIFYING`]
+    /// while the change is applied, and the clock owes it
+    /// [`EVENT_SUBSCRIPTION_STATUS_ACTIVE`] [`STATUS_TRANSITION_DELAY`] later — so a
+    /// caller reading straight after the modify sees the transient status the real
+    /// service reports.
+    pub fn begin_modifying(&mut self) {
+        self.status = EVENT_SUBSCRIPTION_STATUS_MODIFYING.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(
+            EVENT_SUBSCRIPTION_STATUS_ACTIVE,
+        ));
+    }
+
+    /// Apply a change whose due instant has passed. Returns whether the record is now
+    /// gone, exactly as [`DbInstanceRecord::settle`] does.
+    fn settle(&mut self, now: Instant) -> bool {
+        let due = self
+            .pending_status
+            .as_ref()
+            .is_some_and(|pending| now >= pending.due_at);
+        if !due {
+            return false;
+        }
+        match self.pending_status.take().map(|pending| pending.change) {
+            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Removal) => return true,
+            // Unreachable: the change was there a line ago, under this one `&mut self`.
+            // Answered as "nothing was due" rather than with a panic in a request path.
+            None => {}
+        }
+        false
     }
 
     /// Accept a delete: the subscription's own answer reports the `deleting` status that

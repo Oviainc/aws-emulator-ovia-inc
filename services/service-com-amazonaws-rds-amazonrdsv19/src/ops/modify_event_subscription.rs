@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyEventSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyEventSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modifies an existing RDS event notification subscription: the members this operation
+//! names are updated on the stored subscription, every other member keeps the value it
+//! already held, and the answer reports the subscription as it now stands.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyEventSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The source identifiers are NOT among them — "You can't modify the source identifiers
+//! using this call" — so `AddSourceIdentifierToSubscription` and
+//! `RemoveSourceIdentifierFromSubscription` stay the only writers of that list.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyEventSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyEventSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyEventSubscription"))
+        // A subscription belongs to the region it was created in, so only that region's
+        // subscriptions are in scope for a call signed for it.
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyEventSubscriptionError::validation)?;
+        let name = input.subscription_name;
+
+        // Every value this request names is checked BEFORE the store is touched, so a
+        // request this service refuses changes no subscription.
+        crate::state::check_subscription_name(&name)
+            .map_err(ModifyEventSubscriptionError::invalid_parameter_value)?;
+        // A value that is not an SNS topic ARN names no topic at all, which is the
+        // modelled `SNSInvalidTopicFault` — the same resolution `CreateEventSubscription`
+        // gives the topic it stores. Whether a topic of a well-formed ARN exists is
+        // Amazon SNS's state, which this service does not hold, so the modelled
+        // `SNSTopicArnNotFoundFault` and `SNSNoAuthorizationFault` are not raised rather
+        // than claimed about a topic this service cannot see.
+        if let Some(sns_topic_arn) = &input.sns_topic_arn {
+            if let Err(message) = crate::state::check_sns_topic_arn(sns_topic_arn) {
+                return Err(ModifyEventSubscriptionErrorModeled::SNSInvalidTopicFault(
+                    SNSInvalidTopicFault {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+        if let Some(source_type) = &input.source_type {
+            crate::state::check_event_subscription_source_type(source_type)
+                .map_err(ModifyEventSubscriptionError::invalid_parameter_value)?;
+        }
+        // The categories this request carries are STORED, so they are bounded in count
+        // and in length exactly as the create bounds the ones it stores.
+        if let Some(event_categories) = &input.event_categories {
+            crate::state::check_request_list_len(
+                "EventCategories",
+                event_categories.len(),
+                crate::state::MAX_EVENT_CATEGORIES_PER_REQUEST,
+            )
+            .map_err(ModifyEventSubscriptionError::invalid_parameter_value)?;
+            for category in event_categories {
+                crate::state::check_stored_text(
+                    "EventCategories",
+                    category,
+                    crate::state::MAX_EVENT_CATEGORY_LEN,
+                )
+                .map_err(ModifyEventSubscriptionError::invalid_parameter_value)?;
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated subscription.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // A name this region holds no subscription under is the modelled 404. This
+        // operation changes an EXISTING subscription and creates none, which is also why
+        // the modelled `EventSubscriptionQuotaExceededFault` cannot arise here: the
+        // region holds exactly as many subscriptions after this call as before it.
+        let key = (region.clone(), name.clone());
+        let Some(record) = store.event_subscriptions.get(&key) else {
+            return Err(
+                ModifyEventSubscriptionErrorModeled::SubscriptionNotFoundFault(
+                    SubscriptionNotFoundFault {
+                        message: Some(format!("Event Subscription {name} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A member this request does not name keeps the value the subscription already
+        // holds: a modify changes what it was asked to change and nothing else.
+        let source_type = input
+            .source_type
+            .clone()
+            .or_else(|| record.source_type.clone());
+        let event_categories = input
+            .event_categories
+            .clone()
+            .unwrap_or_else(|| record.event_categories.clone());
+
+        // The subscription this call LEAVES BEHIND has to satisfy the same rule a create
+        // of it would, so the resulting source type and category list are resolved
+        // together rather than one at a time: `EventCategories` is "a list of event
+        // categories for a source type (SourceType) that you want to subscribe to", so
+        // each category has to be one the resulting source type publishes, and a
+        // subscription that names no source type has no type for a category to belong to.
+        match &source_type {
+            None => {
+                if !event_categories.is_empty() {
+                    return Err(ModifyEventSubscriptionError::invalid_parameter_combination(
+                        "SourceType must be provided when EventCategories is supplied: \
+                         both name values of one source type",
+                    ));
+                }
+            }
+            // A category the source type does not publish names no event, which is the
+            // modelled `SubscriptionCategoryNotFoundFault`.
+            Some(source_type) => {
+                if let Err(message) =
+                    crate::state::check_event_categories(source_type, &event_categories)
+                {
+                    return Err(
+                        ModifyEventSubscriptionErrorModeled::SubscriptionCategoryNotFoundFault(
+                            SubscriptionCategoryNotFoundFault {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The record was read above under this same lock, so it is still here; a store
+        // that lost it between the two reads is a failure of this emulator's own
+        // invariant, never of the request.
+        let Some(record) = store.event_subscriptions.get_mut(&key) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "event subscription {name} was read and then gone under one lock"
+            )));
+        };
+        if let Some(sns_topic_arn) = input.sns_topic_arn {
+            record.sns_topic_arn = sns_topic_arn;
+        }
+        record.source_type = source_type;
+        record.event_categories = event_categories;
+        // "Specifies whether to activate the subscription": a request that says nothing
+        // about it leaves the subscription activated or deactivated exactly as it was.
+        if let Some(enabled) = input.enabled {
+            record.enabled = enabled;
+        }
+        // RDS answers this call with the subscription in the transient `modifying` status
+        // and reaches `active` again a span later, so a caller reading straight after the
+        // modify sees the change being applied rather than a status nothing passed through.
+        record.begin_modifying();
+
+        Ok(ModifyEventSubscriptionOutput {
+            event_subscription: Some(record.to_wire()),
+        })
     }
 }
