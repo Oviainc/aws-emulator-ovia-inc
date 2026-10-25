@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteInstrumentationConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteInstrumentationConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteInstrumentationConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes several dynamic instrumentation configurations in one call, either every
+//! configuration of a scope or the ones a list of resource ARNs names.
 //!
 //! ## Shape of an operation
 //!
@@ -142,23 +135,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::BATCH_DELETE_INSTRUMENTATION_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Remove the configurations the `DeletionTarget` selects, and report what each removal
+    /// did — the batch's own per-item result, not a whole-request failure.
+    ///
+    /// The two selection methods are the two members of the modelled union, so exactly one
+    /// of them holds for a request:
+    ///
+    /// * By SCOPE: every configuration of the service, environment and instrumentation type
+    ///   the target names goes, whatever its signal type or location, and each removal is
+    ///   reported by the `SignalType` and `LocationHash` that identified it within the scope
+    ///   ("deleting by scope populates SignalType and LocationHash per item"). A scope that
+    ///   holds nothing deletes nothing, which is a success reporting zero: a scope selector
+    ///   names a set, not a resource, so an empty one is not a missing resource.
+    /// * By ARN LIST: each ARN is resolved against the stored configurations of the
+    ///   instrumentation type the target names, and the ones that resolve go, each reported
+    ///   by the `ResourceArn` that named it ("deleting by ARN list populates ResourceArn per
+    ///   item"). An ARN naming no such configuration — one never created, one already
+    ///   deleted, one whose lifetime the clock has run out, one repeated later in the same
+    ///   list, or one of the other instrumentation type — fails that ITEM with the modelled
+    ///   `ResourceNotFoundException` code, leaving every other ARN of the list deleted: a
+    ///   batch answers per-item outcomes, so one missing resource is not a refusal of the
+    ///   request.
+    ///
+    /// `DeletedCount` is the number of configurations this call removed, which by ARN list
+    /// "equals the length of SuccessfulDeletions" and by scope is that same length — the
+    /// total it deleted.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteInstrumentationConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteInstrumentationConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteInstrumentationConfigurations"))
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteInstrumentationConfigurationsErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // A configuration whose expiry has already fallen due is gone for the same reason it
+        // is gone for a reader — the clock, not this call — so it is neither deleted here nor
+        // counted, and an ARN naming it names nothing.
+        store.expire_instrumentation_configurations(&now);
+
+        let mut successful_deletions: Vec<BatchDeleteSuccessfulDeletion> = Vec::new();
+        let mut errors: Vec<BatchDeleteError> = Vec::new();
+
+        match &input.deletion_target {
+            BatchDeleteDeletionTarget::Scope(target) => {
+                let scope = crate::state::InstrumentationScope::new(
+                    &target.instrumentation_type,
+                    &target.service,
+                    &target.environment,
+                );
+                for key in store.instrumentation_configuration_keys(&scope) {
+                    if let Some(removed) =
+                        store.remove_instrumentation_configuration(&scope, &key, now)
+                    {
+                        successful_deletions.push(BatchDeleteSuccessfulDeletion {
+                            resource_arn: None,
+                            signal_type: Some(removed.signal_type),
+                            location_hash: Some(removed.location_hash),
+                        });
+                    }
+                }
+            }
+            BatchDeleteDeletionTarget::ResourceArns(target) => {
+                for resource_arn in &target.resource_arns {
+                    let located = store.locate_instrumentation_configuration(
+                        &target.instrumentation_type,
+                        resource_arn,
+                    );
+                    match located {
+                        Some((scope, key)) => {
+                            store.remove_instrumentation_configuration(&scope, &key, now);
+                            successful_deletions.push(BatchDeleteSuccessfulDeletion {
+                                resource_arn: Some(resource_arn.clone()),
+                                signal_type: None,
+                                location_hash: None,
+                            });
+                        }
+                        None => errors.push(BatchDeleteError {
+                            resource_arn: resource_arn.clone(),
+                            code: crate::state::BATCH_DELETE_ERROR_RESOURCE_NOT_FOUND.to_string(),
+                            message: crate::state::instrumentation_configuration_missing(
+                                resource_arn,
+                            ),
+                        }),
+                    }
+                }
+            }
+        }
+
+        // The store holds at most `MAX_INSTRUMENTATION_CONFIGURATIONS` configurations and an
+        // ARN list at most the modelled 50 entries, so the count is far inside `Integer`.
+        let deleted_count = i32::try_from(successful_deletions.len()).unwrap_or(i32::MAX);
+
+        Ok(BatchDeleteInstrumentationConfigurationsOutput {
+            deleted_count,
+            successful_deletions,
+            errors,
+        })
     }
 }

@@ -3719,6 +3719,12 @@ pub fn instrumentation_configuration_already_exists(arn: &str) -> ConflictExcept
 /// configuration has been removed."
 pub const DELETION_STATUS_DELETED: &str = "DELETED";
 
+/// The `BatchDeleteErrorCode` a batch delete reports against an ARN that names no stored
+/// configuration (`smithy_query(query="shape",shape="BatchDeleteErrorCode")` ->
+/// `["ResourceNotFoundException", "AccessDeniedException", "InternalServiceException"]`), the
+/// per-item counterpart of the `ResourceNotFoundException` a single-resource delete answers.
+pub const BATCH_DELETE_ERROR_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
 /// The `ResourceType` an instrumentation configuration failure reports: the resource's TYPE
 /// NAME (the modelled `InstrumentationConfiguration` shape), not the camel-case segment an
 /// ARN spells ([`INSTRUMENTATION_CONFIG_ARN_RESOURCE`]) — the same distinction
@@ -3741,12 +3747,17 @@ pub fn instrumentation_configuration_not_found(
 ) -> ResourceNotFoundException {
     let arn = instrumentation_configuration_arn(region, scope, signal_type, location_hash);
     ResourceNotFoundException {
-        message: format!(
-            "{INSTRUMENTATION_CONFIG_RESOURCE_TYPE} with arn '{arn}' does not exist."
-        ),
+        message: instrumentation_configuration_missing(&arn),
         resource_type: INSTRUMENTATION_CONFIG_RESOURCE_TYPE.to_string(),
         resource_id: arn,
     }
+}
+
+/// What a failure states about an ARN that names no stored configuration, shared by the
+/// single-resource `ResourceNotFoundException` above and the per-item error a batch delete
+/// reports, so the two agree on one wording for one fact.
+pub fn instrumentation_configuration_missing(arn: &str) -> String {
+    format!("{INSTRUMENTATION_CONFIG_RESOURCE_TYPE} with arn '{arn}' does not exist.")
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
@@ -3785,6 +3796,47 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             ));
         }
         Some(removed)
+    }
+
+    /// The [`instrumentation_key`] of every configuration stored in `scope`, in the order
+    /// the ordered store holds them — the same order a list reports.
+    ///
+    /// Handed back as owned keys so a caller may remove each one in turn while the borrow of
+    /// the store is released, which is what a delete over a whole scope does.
+    pub fn instrumentation_configuration_keys(&self, scope: &InstrumentationScope) -> Vec<String> {
+        self.instrumentation_configurations
+            .get(scope)
+            .map(|set| set.configurations.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The scope and [`instrumentation_key`] of the configuration stored under `arn` within
+    /// `instrumentation_type`, or `None` when no configuration of that type carries that ARN.
+    ///
+    /// An `InstrumentationConfigurationArn` spells the service, the environment, the signal
+    /// type and the location hash but NOT the instrumentation type, so the type comes from
+    /// the request — the same selector every instrumentation operation takes, and the one
+    /// that "determines which backing store to query": an ARN naming a configuration of the
+    /// OTHER type names nothing in the store the request addressed. The ARN is matched
+    /// against the one each stored record was minted with, rather than by taking the identity
+    /// apart again, because a service or environment name may itself contain `/` (the same
+    /// reason [`Self::tagged_resource_arn`] compares whole ARNs). The scan is bounded by
+    /// [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
+    pub fn locate_instrumentation_configuration(
+        &self,
+        instrumentation_type: &str,
+        arn: &str,
+    ) -> Option<(InstrumentationScope, String)> {
+        self.instrumentation_configurations
+            .iter()
+            .filter(|(scope, _)| scope.instrumentation_type == instrumentation_type)
+            .flat_map(|(scope, set)| {
+                set.configurations
+                    .iter()
+                    .map(move |(key, configuration)| (scope, key, configuration))
+            })
+            .find(|(_, _, configuration)| configuration.arn == arn)
+            .map(|(scope, key, _)| (scope.clone(), key.clone()))
     }
 }
 
