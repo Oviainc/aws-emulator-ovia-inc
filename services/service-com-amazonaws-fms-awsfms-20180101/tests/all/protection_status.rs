@@ -79,17 +79,21 @@ fn stamp(offset_secs: u64) -> Value {
 
 /// One attack row: what the store holds about an attack Shield Advanced
 /// recorded.
-struct Attack {
-    attack_id: &'static str,
-    account: &'static str,
+///
+/// `pub(crate)` (with its fields) so a sibling suite in this test target seeds
+/// an attack through [`seed_attack`] rather than growing a second copy of the
+/// record it writes.
+pub(crate) struct Attack {
+    pub(crate) attack_id: &'static str,
+    pub(crate) account: &'static str,
     /// When the attack started, as an offset from [`BASE_SECS`].
-    start_secs: u64,
+    pub(crate) start_secs: u64,
     /// The sub-second part of the start instant, so two attacks can start within
     /// the same second and still have a total chronological order.
-    start_millis: u64,
+    pub(crate) start_millis: u64,
     /// How long the attack lasted, or `None` while it is still ongoing.
-    duration_secs: Option<u64>,
-    vectors: &'static [&'static str],
+    pub(crate) duration_secs: Option<u64>,
+    pub(crate) vectors: &'static [&'static str],
 }
 
 impl Attack {
@@ -229,7 +233,10 @@ async fn put_policy(router: &MultiServiceRouter, name: &str, service_type: &str)
 
 /// Put one attack in the store's inventory, under the key the service derives
 /// from the record itself.
-fn seed_attack(
+///
+/// `pub(crate)` so a sibling suite in this test target seeds an attack through
+/// this one helper rather than writing the record a second way.
+pub(crate) fn seed_attack(
     store: &mut state::ComAmazonawsFmsAwsfms20180101State,
     policy_id: &str,
     attack: &Attack,

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegrationResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegrationResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegrationResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +185,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegrationResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegrationResponse"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateIntegrationResponse",
+            ));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(CreateIntegrationResponseErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "API",
+                        &input.api_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // An integration response belongs to the WebSocket two-way communication model:
+        // `IntegrationResponse$ContentHandlingStrategy` is "Supported only for WebSocket
+        // APIs", `CreateIntegrationResponse$TemplateSelectionExpression` is "the template
+        // selection expression for the integration response. Supported only for WebSocket
+        // APIs", and an HTTP api has no integration-response resource to create.
+        if let Err(message) = crate::state::validate_protocol_restricted_resource(
+            &api.protocol_type,
+            "Integration responses",
+            crate::state::WEBSOCKET_PROTOCOL_TYPE,
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        let Some(integration) = api.integrations.get_mut(&input.integration_id) else {
+            return Err(CreateIntegrationResponseErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        "Integration",
+                        &input.integration_id,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // A template selection expression is a selection EXPRESSION, so it may name only
+        // the variable namespaces this service evaluates — the same requirement every
+        // other writer of one goes through (`crate::state::validate_selection_expression`).
+        // Checked after the path's own resources are resolved, so a request naming an
+        // integration that does not exist is answered about THAT, whatever its body says.
+        if let Some(expression) = input.template_selection_expression.as_deref() {
+            if let Err(message) = crate::state::validate_selection_expression(expression) {
+                return Err(bad_request(&message));
+            }
+        }
+
+        // The integration response key is what an integration response is SELECTED by
+        // ("the result is compared against one or more selection keys to find a matching
+        // key", `SelectionKey`), so one integration cannot carry two responses under one
+        // key.
+        if integration
+            .integration_responses
+            .values()
+            .any(|response| response.integration_response_key == input.integration_response_key)
+        {
+            return Err(CreateIntegrationResponseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Integration response with key {} already exists for this integration.",
+                        input.integration_response_key
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Bound the growth a caller drives: an integration holds at most
+        // `MAX_INTEGRATION_RESPONSES_PER_INTEGRATION` integration responses, and
+        // `TooManyRequestsException` is the modelled error for "a limit has been
+        // exceeded" (it carries the limit's name in `LimitType`). The key check above
+        // refuses a DUPLICATE key; this bounds the number of distinct ones, and with it
+        // the cost of that scan.
+        if integration.integration_responses.len()
+            >= crate::state::MAX_INTEGRATION_RESPONSES_PER_INTEGRATION
+        {
+            return Err(
+                CreateIntegrationResponseErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        limit_type: Some("IntegrationResponse".to_string()),
+                        message: Some(format!(
+                            "The maximum number of integration responses ({}) for this \
+                             integration has been reached.",
+                            crate::state::MAX_INTEGRATION_RESPONSES_PER_INTEGRATION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let integration_response_id = integration.mint_integration_response_id();
+        let record = crate::state::IntegrationResponse {
+            integration_response_id: integration_response_id.clone(),
+            integration_response_key: input.integration_response_key,
+            content_handling_strategy: input.content_handling_strategy,
+            response_parameters: input
+                .response_parameters
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            response_templates: input
+                .response_templates
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            template_selection_expression: input.template_selection_expression,
+        };
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetIntegrationResponse will report. `integration_response_id` comes from
+        // this integration's own id bijection, so it names no existing response and this
+        // inserts.
+        let stored = integration
+            .integration_responses
+            .entry(integration_response_id)
+            .or_insert(record)
+            .to_wire();
+        Ok(CreateIntegrationResponseOutput {
+            content_handling_strategy: stored.content_handling_strategy,
+            integration_response_id: stored.integration_response_id,
+            integration_response_key: Some(stored.integration_response_key),
+            response_parameters: stored.response_parameters,
+            response_templates: stored.response_templates,
+            template_selection_expression: stored.template_selection_expression,
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names what the request asked for.
+fn bad_request(message: &str) -> CreateIntegrationResponseError {
+    CreateIntegrationResponseErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
