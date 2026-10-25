@@ -143,6 +143,12 @@
 //!   `bucket/<bucket>/index/<name>` one, so the names each create carries are read back off
 //!   that ARN ([`vector_bucket_name`], [`vector_index_identity`]) and the delete and the
 //!   drift read address the resource by the ARN itself.
+//! * the two `AWS::Scheduler::*` types' properties ARE their creates' own members, spelled
+//!   identically all the way down, with the name CloudFormation decides carried in the URI
+//!   those `restJson1` operations bind it to — so each arm passes the evaluated property
+//!   document through, a group's declared tags beside the ones CloudFormation gives it. A
+//!   schedule is keyed by its name AND the group holding it
+//!   ([`scheduled_group_of`]), so its delete and its drift read carry both.
 //!
 //! ## The tags every created resource carries
 //!
@@ -177,16 +183,16 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::provisioning::{
-    call_json_rpc, call_query, call_rest_json, xml_element, xml_entry_map, xml_scalar_children,
-    Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
+    call_json_rpc, call_query, call_rest_json, percent_encoded, xml_element, xml_entry_map,
+    xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
 };
 use super::template::{
     AOSS_COLLECTION, AOSS_SECURITY_POLICY, CLOUDWATCH_METRIC_STREAM, COGNITO_USER_POOL_GROUP,
-    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM,
-    FIS_EXPERIMENT_TEMPLATE, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, S3VECTORS_BUCKET_SEGMENT,
-    S3VECTORS_INDEX,
-    S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, SSM_PARAMETER,
-    STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
+    DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER, EVENTS_RULE,
+    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR,
+    S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX, S3VECTORS_VECTOR_BUCKET,
+    SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE, SCHEDULER_SCHEDULE_GROUP, SNS_TOPIC,
+    SQS_QUEUE, SSM_PARAMETER, STEP_FUNCTIONS_ACTIVITY, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -242,6 +248,8 @@ pub(super) enum Provisioner {
     EventsRule,
     SsmParameter,
     StepFunctionsActivity,
+    SchedulerScheduleGroup,
+    SchedulerSchedule,
     CognitoUserPoolGroup,
 }
 
@@ -273,6 +281,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
+        SCHEDULER_SCHEDULE_GROUP => Some(Provisioner::SchedulerScheduleGroup),
+        SCHEDULER_SCHEDULE => Some(Provisioner::SchedulerSchedule),
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         _ => None,
     }
@@ -362,6 +372,13 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 create_activity(ctx, region, resource, propagated).await
             }
+            Self::SchedulerScheduleGroup => {
+                create_schedule_group(ctx, region, resource, propagated).await
+            }
+            // `AWS::Scheduler::Schedule` publishes no `Tags` property — EventBridge
+            // Scheduler tags a schedule GROUP, not a schedule — so the type is not
+            // taggable and no tags are propagated to it.
+            Self::SchedulerSchedule => create_schedule(ctx, region, resource).await,
             // `AWS::Cognito::UserPoolGroup` publishes `Description`, `GroupName`,
             // `Precedence`, `RoleArn` and `UserPoolId` and no `Tags`: the type is not
             // taggable, so no tags are propagated to a group.
@@ -376,8 +393,9 @@ impl Provisioner {
     /// client's own call takes, which is what makes a stack's resource indistinguishable
     /// from one a client created. Some of those APIs refuse a tag key in AWS's reserved
     /// `aws:` namespace, which is AWS's rule for a CALLER's request ("don't use the `aws:`
-    /// prefix ... it is reserved for AWS use"): IAM's `CreateRole` and CodePipeline's
-    /// `CreatePipeline` both do, in their own crates' tag validation. AWS sets the
+    /// prefix ... it is reserved for AWS use"): IAM's `CreateRole`, CodePipeline's
+    /// `CreatePipeline` and EventBridge Scheduler's `CreateScheduleGroup` all do, in their
+    /// own crates' tag validation. AWS sets the
     /// `aws:cloudformation:*` tags from inside itself, which no public API models and this
     /// emulator has no privileged channel for, so for such a type those three are left off
     /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
@@ -390,6 +408,7 @@ impl Provisioner {
                 | Self::CodePipelinePipeline
                 | Self::S3VectorsVectorBucket
                 | Self::S3VectorsIndex
+                | Self::SchedulerScheduleGroup
         );
         propagated
             .iter()
@@ -528,6 +547,12 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 delete_activity(ctx, region, physical_resource_id).await
             }
+            Self::SchedulerScheduleGroup => {
+                delete_schedule_group(ctx, region, physical_resource_id).await
+            }
+            // A schedule is addressed by its name AND the group that holds it, which only
+            // the resource's own record carries, so the delete takes the record.
+            Self::SchedulerSchedule => delete_schedule(ctx, region, resource).await,
             // The delete addresses the group by the PAIR that identifies it, and the pool
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
@@ -604,6 +629,12 @@ impl Provisioner {
             Self::StepFunctionsActivity => {
                 describe_activity(ctx, region, physical_resource_id).await
             }
+            Self::SchedulerScheduleGroup => {
+                describe_schedule_group(ctx, region, physical_resource_id).await
+            }
+            // The read is addressed by the schedule's name AND its group, which only the
+            // resource's own record carries.
+            Self::SchedulerSchedule => describe_schedule(ctx, region, resource).await,
             // The read is addressed by the group's name AND the pool that holds it, which
             // only the resource's own record carries.
             Self::CognitoUserPoolGroup => describe_group(ctx, region, resource).await,
@@ -6360,6 +6391,283 @@ async fn call_s3vectors(
         Some(request),
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EventBridge Scheduler: AWS::Scheduler::ScheduleGroup / ::Schedule
+// ---------------------------------------------------------------------------
+
+/// EventBridge Scheduler's signing name, from its model (`sigv4Name: scheduler`, service
+/// shape `AWSChronosService`), which speaks `restJson1` — so its calls ride on
+/// [`call_rest_json`], each on the URI its own operation's `@http` binding declares.
+const SCHEDULER_SIGNING_NAME: &str = "scheduler";
+
+/// The URIs the EventBridge Scheduler operations a stack makes are bound to, as that
+/// model's `@http` traits declare them: `POST|GET|DELETE /schedule-groups/{Name}` and
+/// `POST|GET|DELETE /schedules/{Name}`, the latter naming the group in the `groupName`
+/// query parameter its read and its delete bind it to.
+const SCHEDULER_SCHEDULE_GROUPS_URI: &str = "/schedule-groups";
+const SCHEDULER_SCHEDULES_URI: &str = "/schedules";
+
+/// The error code EventBridge Scheduler answers for a schedule group or a schedule it does
+/// not hold (`ResourceNotFoundException`, the modelled 404 of its reads and its deletes).
+const SCHEDULER_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The members of a `CreateSchedule` request that are TIMESTAMPS (`StartDate` and
+/// `EndDate`, each `@timestamp` in that model), which a template spells as an ISO-8601
+/// instant and the wire carries as a number ([`epoch_seconds`]).
+const SCHEDULER_INSTANT_MEMBERS: &[&str] = &["StartDate", "EndDate"];
+
+/// Create the schedule group an `AWS::Scheduler::ScheduleGroup` declares, so a client that
+/// deployed the stack and then calls `scheduler GetScheduleGroup` with the name the stack
+/// publishes reads the group back rather than a `ResourceNotFoundException`.
+///
+/// "Ref returns the schedule group name", which is this resource's physical id and the one
+/// member `CreateScheduleGroup` carries in its URI (`POST /schedule-groups/{Name}`), so the
+/// group is created under the name CloudFormation decided. The type's one other property is
+/// that create's own `Tags` member — the tags the declaration asks for plus the ones
+/// CloudFormation gives the resource ([`tags_of`]), as the `[{Key, Value}]` list that
+/// model's own `Tag` shape spells, so `scheduler ListTagsForResource` on the ARN the stack
+/// publishes answers with the stack's tags and the `aws:cloudformation:*` ones.
+///
+/// The group's ARN is reported back as its `Arn` attribute, so the handle the stack
+/// publishes is the one that service really minted.
+async fn create_schedule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let answered = call_rest_json(
+        ctx,
+        SCHEDULER_SIGNING_NAME,
+        region,
+        "POST",
+        &format!(
+            "{SCHEDULER_SCHEDULE_GROUPS_URI}/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let arn = answered
+        .get("ScheduleGroupArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "EventBridge Scheduler answered CreateScheduleGroup without a \
+                      ScheduleGroupArn"
+                .to_string(),
+        })?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.to_string());
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the schedule group a stack created, addressed by its name — this resource's
+/// physical id. A group EventBridge Scheduler no longer holds
+/// (`ResourceNotFoundException`, judged on the CODE and never on a message that carries
+/// the request's own name) is already in the state the delete asks for.
+async fn delete_schedule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = format!(
+        "{SCHEDULER_SCHEDULE_GROUPS_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The schedule group's configuration as EventBridge Scheduler reports it, for drift
+/// detection: `GetScheduleGroup`'s own record. One it no longer holds
+/// (`ResourceNotFoundException`) was deleted.
+///
+/// The one property its read reports under the name this type declares is the group's
+/// `Name`; the tags it holds are answered by a tagging call of its own, and a property the
+/// read does not report is not evidence of anything ([`super::drift`]).
+async fn describe_schedule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = format!(
+        "{SCHEDULER_SCHEDULE_GROUPS_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(&answer, &[("Name", "Name")]))),
+        Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Create the schedule an `AWS::Scheduler::Schedule` declares, in the group its
+/// declaration names.
+///
+/// The type's properties ARE `CreateSchedule`'s own members — `Description`, `EndDate`,
+/// `FlexibleTimeWindow`, `GroupName`, `KmsKeyArn`, `ScheduleExpression`,
+/// `ScheduleExpressionTimezone`, `StartDate`, `State` and `Target` are named identically on
+/// both sides, and the correspondence holds all the way down (a `Target`'s `Arn`, `RoleArn`,
+/// `Input`, `DeadLetterConfig`, `RetryPolicy` and the five templated parameter structures;
+/// a `FlexibleTimeWindow`'s `Mode` and `MaximumWindowInMinutes` —
+/// `smithy_query(shape="Target,FlexibleTimeWindow")`) — so the evaluated property document
+/// IS the request. `Name` is the one member CloudFormation decides, and the one that create
+/// binds to its URI (`POST /schedules/{Name}`), so it is lifted out of the body; the two
+/// timestamp members are carried as the wire carries a timestamp ([`epoch_seconds`]).
+///
+/// "Ref returns the schedule name", so the physical id stays the name the stack computed,
+/// and the schedule's ARN is reported back as its `Arn` attribute.
+async fn create_schedule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let mut request = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    request.remove("Name");
+    for member in SCHEDULER_INSTANT_MEMBERS {
+        let Some(declared) = request.get(*member).cloned() else {
+            continue;
+        };
+        // A template that already wrote the number goes through as written; only the
+        // ISO-8601 TEXT a template spells a timestamp property with is converted, and text
+        // that is not an instant is refused here rather than sent to be rejected.
+        let Some(text) = declared.as_str() else {
+            continue;
+        };
+        let instant = epoch_seconds(text).ok_or_else(|| Refusal {
+            code: "ValidationException".to_string(),
+            message: format!("{member} must be an ISO-8601 instant"),
+        })?;
+        request.insert((*member).to_string(), instant);
+    }
+    let answered = call_rest_json(
+        ctx,
+        SCHEDULER_SIGNING_NAME,
+        region,
+        "POST",
+        &format!(
+            "{SCHEDULER_SCHEDULES_URI}/{}",
+            percent_encoded(&resource.physical_resource_id)
+        ),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let arn = answered
+        .get("ScheduleArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+        .ok_or_else(|| Refusal {
+            code: "InternalFailure".to_string(),
+            message: "EventBridge Scheduler answered CreateSchedule without a ScheduleArn"
+                .to_string(),
+        })?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Arn".to_string(), arn.to_string());
+    Ok(Created::attributes(attributes))
+}
+
+/// Delete the schedule a stack created, addressed by the pair EventBridge Scheduler keys
+/// one by: its name — this resource's physical id — and the group holding it
+/// ([`scheduled_group_of`]). One that service no longer holds
+/// (`ResourceNotFoundException`, judged on the CODE) is already in the state the delete
+/// asks for, which is also the state a deleted group leaves its schedules in ("deleting a
+/// schedule group results in EventBridge Scheduler deleting all schedules associated with
+/// the group").
+async fn delete_schedule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let uri = schedule_uri(resource);
+    match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The schedule's configuration as EventBridge Scheduler reports it, for drift detection:
+/// `GetSchedule`'s own record, read by the same name-and-group pair the delete uses. One it
+/// no longer holds (`ResourceNotFoundException`) was deleted.
+///
+/// Every member that read reports is spelled exactly as this type's property is, so the
+/// comparison is the declaration against what the service really holds; a property the read
+/// does not report is not evidence of anything ([`super::drift`]).
+async fn describe_schedule(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let uri = schedule_uri(resource);
+    match call_rest_json(ctx, SCHEDULER_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &answer,
+            &[
+                ("Description", "Description"),
+                ("FlexibleTimeWindow", "FlexibleTimeWindow"),
+                ("GroupName", "GroupName"),
+                ("KmsKeyArn", "KmsKeyArn"),
+                ("Name", "Name"),
+                ("ScheduleExpression", "ScheduleExpression"),
+                ("ScheduleExpressionTimezone", "ScheduleExpressionTimezone"),
+                ("State", "State"),
+                ("Target", "Target"),
+            ],
+        ))),
+        Err(refusal) if refusal.code == SCHEDULER_RESOURCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The URI that addresses ONE schedule: its name in the path and its group in the
+/// `groupName` query parameter `GetSchedule` and `DeleteSchedule` bind it to.
+fn schedule_uri(resource: &StoredResource) -> String {
+    format!(
+        "{SCHEDULER_SCHEDULES_URI}/{}?groupName={}",
+        percent_encoded(&resource.physical_resource_id),
+        percent_encoded(&scheduled_group_of(resource))
+    )
+}
+
+/// The schedule group a provisioned `AWS::Scheduler::Schedule` record belongs to: the
+/// `GroupName` its declaration names, else the account's `default` group — "if you omit
+/// this, the default schedule group is used" — which is the group the create landed it in
+/// and half of the pair EventBridge Scheduler keys a schedule by.
+fn scheduled_group_of(resource: &StoredResource) -> String {
+    resource
+        .properties
+        .get("GroupName")
+        .and_then(Value::as_str)
+        .filter(|group| !group.is_empty())
+        .unwrap_or(DEFAULT_SCHEDULE_GROUP)
+        .to_string()
+}
+
+/// One declared instant as the seconds since the epoch a `restJson1` timestamp member is
+/// carried as (that protocol's default timestamp format, which the member declares no
+/// `@timestampFormat` over), or `None` for text that is not an ISO-8601 instant.
+fn epoch_seconds(declared: &str) -> Option<Value> {
+    let instant = ::aws_smithy_types::DateTime::from_str(
+        declared,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    ::serde_json::Number::from_f64(instant.as_secs_f64()).map(Value::Number)
 }
 
 #[cfg(test)]

@@ -1636,8 +1636,7 @@ fn attach_attributes(
 ///
 /// That minted form is the same kind of approximation as the physical id it is built
 /// from, and it diverges the same way: a type whose published ARN carries a
-/// multi-segment resource path (`AWS::Scheduler::Schedule` is `schedule/<group>/<name>`,
-/// `AWS::AutoScaling::AutoScalingGroup` is
+/// multi-segment resource path (`AWS::AutoScaling::AutoScalingGroup` is
 /// `autoScalingGroup:<id>:autoScalingGroupName/<name>`) gets an ARN of this emulator's
 /// uniform shape rather than of that type's. Narrowing it is the business of the open
 /// fidelity issue on the identifiers a stack's outputs carry
@@ -1980,6 +1979,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Systems Manager `PutParameter.Name`: `PSParameterName`,
         // `@length(min: 1, max: 2048)` (the SSM model's own bound).
         SSM_PARAMETER => rules(2048, Characters::AsGenerated),
+        // EventBridge Scheduler `CreateScheduleGroup.Name` (`ScheduleGroupName`) and
+        // `CreateSchedule.Name` (`Name`): each `@length(min: 1, max: 64)` with pattern
+        // `^[0-9a-zA-Z-_.]+$` (that service's own Smithy model), which a generated name is
+        // already inside but may be longer than.
+        SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => rules(64, Characters::AsGenerated),
         // Amazon Cognito `CreateGroup.GroupName`: `GroupNameType`,
         // `@length(min: 1, max: 128)` with pattern `^[\p{L}\p{M}\p{S}\p{N}\p{P}]+$`
         // (cognito-idp's own Smithy model), which a generated name is already inside —
@@ -2387,6 +2391,8 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     S3_BUCKET,
     S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET,
+    SCHEDULER_SCHEDULE,
+    SCHEDULER_SCHEDULE_GROUP,
     SNS_TOPIC,
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
@@ -2712,6 +2718,43 @@ fn return_values(
                     attributes.insert(attribute.to_string(), declared);
                 }
             }
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the schedule group name"; Fn::GetAtt: Arn (and the group's State,
+        // CreationDate and LastModificationDate, which are EventBridge Scheduler's own to
+        // decide and are not computed here). This is the type `super::provisioning`
+        // creates in that service, which keys a group by its name and mints the same ARN
+        // from the Region and that name (`schedule_group_arn` in its own state module).
+        SCHEDULER_SCHEDULE_GROUP => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    SCHEDULER_ARN_NAMESPACE,
+                    region,
+                    &format!("schedule-group/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the schedule name"; Fn::GetAtt: Arn. A schedule ARN nests the
+        // schedule inside the GROUP that holds it (`schedule/<group>/<name>`), and a
+        // declaration naming no group is in the account's `default` group — the same ARN
+        // EventBridge Scheduler mints for the schedule this stack provisions
+        // (`schedule_arn` in its own state module).
+        SCHEDULER_SCHEDULE => {
+            let group = properties
+                .get("GroupName")
+                .and_then(|value| text(value, scope, 0, budget))
+                .filter(|group| !group.is_empty())
+                .unwrap_or_else(|| DEFAULT_SCHEDULE_GROUP.to_string());
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    SCHEDULER_ARN_NAMESPACE,
+                    region,
+                    &format!("schedule/{group}/{name}"),
+                ),
+            );
             (name.to_string(), attributes)
         }
         // "Ref returns the repository name"; Fn::GetAtt: Arn. Amazon ECR Public is a
@@ -3303,6 +3346,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
         STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
+        SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => &["Arn"],
         _ => &[],
     }
 }
@@ -3510,6 +3554,28 @@ pub const STEP_FUNCTIONS_ACTIVITY: &str = "AWS::StepFunctions::Activity";
 /// Manager itself, and "Ref returns the name of the parameter", so the parameter a stack
 /// declares is the one `ssm GetParameter` answers with.
 pub const SSM_PARAMETER: &str = "AWS::SSM::Parameter";
+
+/// An EventBridge Scheduler schedule group's resource type (that model:
+/// `cloudFormationName: Scheduler`, `arnNamespace: scheduler`). This is a type
+/// `super::provisioning` creates in EventBridge Scheduler itself, and "Ref returns the
+/// schedule group name", so the group a stack declares is the one
+/// `scheduler GetScheduleGroup` answers with.
+pub const SCHEDULER_SCHEDULE_GROUP: &str = "AWS::Scheduler::ScheduleGroup";
+
+/// An EventBridge Scheduler schedule's resource type. Also created in that service, and
+/// "Ref returns the schedule name", so the schedule a stack declares is one
+/// `scheduler ListSchedules` reports under its group.
+pub const SCHEDULER_SCHEDULE: &str = "AWS::Scheduler::Schedule";
+
+/// The ARN namespace EventBridge Scheduler mints its resources under (that model's
+/// `awsService.arnNamespace`).
+pub const SCHEDULER_ARN_NAMESPACE: &str = "scheduler";
+
+/// The schedule group a schedule declaring none lands in: `GetSchedule$GroupName` — "the
+/// name of the schedule group associated with this schedule. If you omit this, the default
+/// schedule group is used" — whose name is `default`, and the group whose name a schedule's
+/// ARN still carries a segment for (`schedule/<group>/<name>`).
+pub const DEFAULT_SCHEDULE_GROUP: &str = "default";
 
 /// How many characters the id Amazon GuardDuty mints for a detector carries: 32 lowercase
 /// hexadecimal, the form that service's own `mint_id` produces (`DETECTOR_ID_LEN` in

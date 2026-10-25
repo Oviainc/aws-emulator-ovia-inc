@@ -8,7 +8,8 @@
 //! configuration in force, the way the service reports it — so `GetExport`,
 //! `ListExports` and `ListTagsForResource` read back exactly what the service stored. A
 //! definition whose destination configuration names a delivery this service does not
-//! write is refused instead of stored.
+//! write is refused instead of stored, as is a `ResourceTags` claiming the reserved
+//! `aws:` tag-key namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]).
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -197,8 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Each tag consists of a key and a value, and each key must be unique for the
         // resource" (the modelled doc for `ResourceTags`), so a request carrying one key
-        // twice names two values for one tag and cannot be satisfied. The same reading of
-        // a `ResourceTagList` serves every operation that accepts one, so it lives in
+        // twice names two values for one tag and cannot be satisfied, and a key claiming
+        // the reserved `aws:` namespace names a tag Amazon Web Services generates, which a
+        // create may no more seed than `TagResource` may add. The same reading of a
+        // `ResourceTagList` serves every operation that accepts one, so it lives in
         // `crate::state` rather than here.
         let tags = crate::state::tag_map(input.resource_tags.unwrap_or_default())
             .map_err(CreateExportErrorModeled::ValidationException)?;

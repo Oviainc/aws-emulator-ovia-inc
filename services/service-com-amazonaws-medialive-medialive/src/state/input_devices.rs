@@ -51,6 +51,15 @@
 //! runs first — is what closes it once it comes due, back to `UP_TO_DATE`. The
 //! instant is stored and never slept on.
 //!
+//! A pending transfer waits on the RECIPIENT's decision rather than on the
+//! clock, so `settle` never touches it: `AcceptInputDeviceTransfer` is what ends
+//! one ([`InputDeviceRecord::accept_transfer`]), and only for the transfer the
+//! asking account is the recipient of — "the ownership of the device will
+//! transfer to your AWS account". This emulator serves one account, so the
+//! transfer it can accept is one addressed to
+//! [`engine::emulator_account_id`], and one addressed to any other account id
+//! stays pending for a recipient that never calls.
+//!
 //! A device's latest THUMBNAIL is one optional record on the device it is a
 //! thumbnail of ([`InputDeviceThumbnailRecord`]): the image data, the media type
 //! it is in and the instant the device last updated it — which is exactly what
@@ -495,6 +504,30 @@ impl InputDeviceRecord {
         self.transfer = Some(transfer);
     }
 
+    /// Accept the transfer pending on this device on behalf of the account this
+    /// emulator serves, and report what that resolved to.
+    ///
+    /// Only an INCOMING transfer is accepted — "the ownership of the device will
+    /// transfer to your AWS account" is what the operation does, and a transfer
+    /// addressed to another account is not waiting on this one. Which transfers
+    /// are incoming is the slice's one definition of the direction
+    /// ([`transfer_has_direction`]), the same one the listing filters by.
+    /// Accepting is what ENDS the transfer: the device is the recipient's from
+    /// then on, so nothing is pending on it any more and a second accept has
+    /// nothing left to resolve.
+    pub fn accept_transfer(&mut self) -> TransferAcceptance {
+        let Some(transfer) = &self.transfer else {
+            return TransferAcceptance::NotBeingTransferred;
+        };
+        if !transfer_has_direction(transfer, input_device_transfer_type::INCOMING) {
+            return TransferAcceptance::NotTheRecipient(transfer_recipient(
+                transfer.target_customer_id.as_deref(),
+            ));
+        }
+        self.transfer = None;
+        TransferAcceptance::Accepted
+    }
+
     /// The latest thumbnail this device has sent, or `None` while it has sent
     /// none — which is every device of this emulator, because no Link unit is
     /// connected to it to send one (see the module docs).
@@ -521,6 +554,43 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         // And it has sent no image until it sends one.
         thumbnail: None,
     }
+}
+
+/// What accepting a device's pending transfer resolved to
+/// ([`InputDeviceRecord::accept_transfer`]).
+///
+/// The rule lives on the store rather than in the handler, so the operations
+/// that resolve a transfer cannot disagree about which transfer an account may
+/// accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferAcceptance {
+    /// The transfer was incoming and is now complete: ownership of the device is
+    /// the recipient's — the account this emulator serves — and nothing is
+    /// pending on it any more.
+    Accepted,
+    /// No transfer is pending on this device, so there is none to accept.
+    NotBeingTransferred,
+    /// The pending transfer names a different recipient, so the account asking
+    /// is its sender rather than the account it waits on. Carries the recipient
+    /// ALREADY WORDED for a refusal to report ([`transfer_recipient`]), so no
+    /// caller can word it a second way.
+    NotTheRecipient(String),
+}
+
+/// How a refusal about a pending transfer names the recipient that transfer is
+/// waiting on: the account id it named, or that it named none (the
+/// `TargetCustomerId` member is optional in the model).
+///
+/// ONE helper, so the operations that refuse something about a pending transfer
+/// — `AcceptInputDeviceTransfer` today, `RejectInputDeviceTransfer` and
+/// `CancelInputDeviceTransfer` when their own issues land — cannot word its
+/// recipient two ways. Private to the slice: every caller reads it through the
+/// [`TransferAcceptance::NotTheRecipient`] it is carried in.
+fn transfer_recipient(target_customer_id: Option<&str>) -> String {
+    target_customer_id.map_or_else(
+        || "no account".to_string(),
+        |target| format!("account {target}"),
+    )
 }
 
 /// Whether the pending transfer `transfer` has the direction `transfer_type`

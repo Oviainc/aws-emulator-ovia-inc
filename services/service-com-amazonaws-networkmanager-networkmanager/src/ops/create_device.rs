@@ -281,8 +281,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.next_id(crate::state::DEVICE_KIND);
         let now = ::std::time::SystemTime::now();
         let record = crate::state::DeviceRecord {
-            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+            // A device exists only inside its global network, so its ARN names that global
+            // network ahead of the device's own id.
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::scoped_resource_arn(
                 crate::state::DEVICE_KIND,
+                &input.global_network_id,
                 &id,
             ),
             id: id.clone(),
