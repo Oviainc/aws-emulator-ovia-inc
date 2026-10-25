@@ -34,7 +34,12 @@
 //!   evaluation with FEWER datapoints than that, once every one of the datapoints it does
 //!   have breaches, because an alarm evaluated on the datapoints that are present cannot be
 //!   asked for more of them than it has; it is in `OK` when fewer breach, and in
-//!   `INSUFFICIENT_DATA` when no datapoint was evaluated at all.
+//!   `INSUFFICIENT_DATA` when no datapoint was evaluated at all;
+//! * the `StateReason` ("An explanation for the alarm state, in text format.") explains how
+//!   the state was decided, so a window that held NO datapoint of the metric is reported as
+//!   the hole it was, naming the missing-data arm that was applied to it, rather than being
+//!   counted as a datapoint the evaluation graded — a client can tell an alarm that saw clean
+//!   data from one that saw none.
 //!
 //! The evaluation is a pure function of the stored datapoints and the clock, and it writes
 //! only when the state it computes differs from the state the alarm already reports — so
@@ -479,6 +484,13 @@ impl State {
             .iter()
             .filter(|slot| slot.datapoint != Datapoint::Missing)
             .count();
+        // The slots no real datapoint filled that the treatment SUBSTITUTED a datapoint for:
+        // these are the holes the evaluation graded without having seen any data for them, and
+        // the reason has to report them as holes rather than as datapoints it counted.
+        let substituted = evaluated
+            .iter()
+            .filter(|slot| slot.window.is_none() && slot.datapoint != Datapoint::Missing)
+            .count();
         // "The number of data points that must be breaching to trigger the alarm. This is
         // used only if you are setting an "M out of N" alarm." — an alarm that names no M
         // breaches when every one of its N datapoints does.
@@ -510,13 +522,19 @@ impl State {
         } else {
             ALARM_STATE_OK
         };
+        let counts = EvaluationCounts {
+            breaching,
+            present,
+            substituted,
+            periods: evaluated.len(),
+            required,
+        };
         Some(Evaluation {
             state,
             reason: state_reason(
                 state,
-                breaching,
-                evaluation_periods,
-                required,
+                counts,
+                missing_data_arm(treat_missing),
                 alarm.comparison_operator.as_deref().unwrap_or_default(),
                 threshold,
             ),
@@ -624,37 +642,117 @@ impl AlarmStatistic<'_> {
     }
 }
 
+/// What ONE evaluation counted over the slots it evaluated, which is what its `StateReason`
+/// explains.
+#[derive(Debug, Clone, Copy)]
+struct EvaluationCounts {
+    /// Datapoints whose comparison against the threshold held.
+    breaching: usize,
+    /// Datapoints the evaluation really had to decide on: the real ones plus the ones the
+    /// missing-data treatment substituted.
+    present: usize,
+    /// How many of those were SUBSTITUTED for a window that held no datapoint of the metric.
+    substituted: usize,
+    /// How many windows the look-back covered — the alarm's `EvaluationPeriods`.
+    periods: usize,
+    /// How many breaching datapoints this evaluation needed to put the alarm in `ALARM`.
+    required: usize,
+}
+
+/// The name the missing-data treatment is reported under in a `StateReason`, or `None` for a
+/// treatment that substitutes no datapoint at all (`missing` and `ignore` leave a hole out of
+/// the evaluation instead, so no arm decided anything for it).
+///
+/// The bracketed names are the recorded wording of the reason AWS reports for an evaluation
+/// whose windows held no data; the arms themselves are the documented `TreatMissingData`
+/// values (`smithy_query(query="doc",shape="MetricAlarm",member="TreatMissingData")`).
+fn missing_data_arm(treat_missing: &str) -> Option<&'static str> {
+    match treat_missing {
+        MISSING_BREACHING => Some("Breaching"),
+        MISSING_NOT_BREACHING => Some("NonBreaching"),
+        _ => None,
+    }
+}
+
+/// The noun suffix and verb a count takes: "1 datapoint was", "2 datapoints were".
+fn plural(count: usize) -> (&'static str, &'static str) {
+    if count == 1 {
+        ("", "was")
+    } else {
+        ("s", "were")
+    }
+}
+
 /// The `StateReason` an evaluated state reports: what the evaluation counted, against what it
-/// needed.
+/// needed — and, where a window held no datapoint of the metric at all, that the window was
+/// EMPTY and which missing-data arm was applied to it.
+///
+/// A hole is reported as a hole: an evaluation every one of whose datapoints was substituted
+/// by the missing-data treatment graded no data, so it says it received none and names the arm
+/// that decided the state instead of reporting a count of datapoints it never had, and an
+/// evaluation that mixed real datapoints with substituted ones names the arm beside its
+/// counts.
 ///
 /// Built from the evaluation rather than from any request: the text states the counts, the
 /// comparison and the threshold the alarm is configured with. Well inside the modelled
 /// `@length 0..1023` of `StateReason` for every alarm, because the only variable parts are
-/// three counts, an operator name of at most 41 characters and one number.
+/// four counts, an operator name of at most 41 characters and one number.
 fn state_reason(
     state: &str,
-    breaching: usize,
-    evaluation_periods: usize,
-    required: usize,
+    counts: EvaluationCounts,
+    arm: Option<&str>,
     comparison: &str,
     threshold: f64,
 ) -> String {
+    let EvaluationCounts {
+        breaching,
+        present,
+        substituted,
+        periods,
+        required,
+    } = counts;
     if state == ALARM_STATE_INSUFFICIENT_DATA {
-        return format!("Insufficient Data: {evaluation_periods} datapoints were unknown.");
+        // No datapoint was evaluated and the treatment substituted none: the evaluation had
+        // nothing to decide on.
+        let (plural_suffix, verb) = plural(periods);
+        return format!("Insufficient Data: {periods} datapoint{plural_suffix} {verb} unknown.");
     }
-    if state == ALARM_STATE_ALARM {
+    if let Some(arm) = arm.filter(|_| substituted > 0 && substituted == present) {
+        // EVERY slot was substituted: the state was decided by the missing-data arm alone, so
+        // that — and not a graded verdict over datapoints the evaluation never received — is
+        // what the reason reports.
+        let (periods_suffix, _) = plural(periods);
+        let (datapoints_suffix, verb) = plural(substituted);
         return format!(
-            "Threshold Crossed: {breaching} out of the last {evaluation_periods} datapoints \
-             satisfied {comparison} with the threshold ({threshold}); {required} datapoints \
-             must for the alarm to be in ALARM state."
+            "Threshold Crossed: no datapoints were received for {periods} \
+             period{periods_suffix} and {substituted} missing datapoint{datapoints_suffix} \
+             {verb} treated as [{arm}]."
         );
     }
-    // The alarm is in OK, so the comparison did NOT hold often enough: the reason reads as the
-    // non-breach it is rather than as a crossing.
+    // Some real datapoint was graded. Where the treatment also substituted datapoints for
+    // windows that held none, the reason names those holes and the arm applied to them beside
+    // the counts.
+    let substituted_clause = match arm.filter(|_| substituted > 0) {
+        Some(arm) => {
+            let (datapoints_suffix, verb) = plural(substituted);
+            format!(
+                " {substituted} missing datapoint{datapoints_suffix} {verb} treated as [{arm}]."
+            )
+        }
+        None => String::new(),
+    };
+    if state == ALARM_STATE_ALARM {
+        return format!(
+            "Threshold Crossed: {breaching} out of the last {present} datapoints \
+             satisfied {comparison} with the threshold ({threshold}); {required} datapoints \
+             must for the alarm to be in ALARM state.{substituted_clause}"
+        );
+    }
+    // The alarm is in OK, so the comparison did not hold often enough.
     format!(
-        "Threshold not Crossed: {breaching} out of the last {evaluation_periods} datapoints \
-         satisfied {comparison} with the threshold ({threshold}), fewer than the {required} \
-         datapoints required for the alarm to be in ALARM state."
+        "Threshold Crossed: {breaching} out of the last {present} datapoints satisfied \
+         {comparison} with the threshold ({threshold}), fewer than the {required} datapoints \
+         required for the alarm to be in ALARM state.{substituted_clause}"
     )
 }
 

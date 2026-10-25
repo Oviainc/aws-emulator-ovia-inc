@@ -16,6 +16,8 @@
 //! * a `resourceArn` the store holds no resource for is a 404, and one that is not an ARN
 //!   of this service is a 400 — for `ListTagsForResource`, `TagResource` and
 //!   `UntagResource` alike, never a 501 and never a success;
+//! * that 404 carries the service's SINGLE not-found template, built from the input member
+//!   that named the missing resource — the same wording the id-keyed lookups answer with;
 //! * a read changes nothing a later caller sees.
 //!
 //! What `UntagResource` REMOVES, and that removing is idempotent, is asserted in
@@ -632,6 +634,134 @@ async fn an_unknown_or_foreign_resource_arn_is_refused_by_every_tagging_operatio
         2,
         "case \"refused calls\": a refused tagging call must not create a tag row, got {}",
         emulator.stored_tag_rows()
+    );
+}
+
+/// The one message a refusal carries when the resource the request NAMED does not exist:
+/// `Unable to find resource with <member>: <value>`, with `<member>` the input member that
+/// identified the missing resource and `<value>` the value the caller sent.
+fn not_found_message(member: &str, value: &str) -> String {
+    format!("Unable to find resource with {member}: {value}")
+}
+
+/// Every tagging refusal of a resource the store does not hold words it with that single
+/// template, keyed on the member the request used (`resourceArn`) — over rows differing in
+/// resource KIND (suite definition, suite run), in WHY the resource is missing (never
+/// created, the right id under another definition, another region, another account) and in
+/// the LENGTH of the id the ARN carries. The last case shows the template is the service's
+/// and not the tagging surface's: an id-keyed read of a missing resource words it the same
+/// way, with the member THAT request named.
+#[tokio::test]
+async fn every_tagging_refusal_carries_the_services_single_not_found_template() {
+    let emulator = Emulator::new();
+    let (definition_id, definition_arn) = emulator
+        .create_definition("template-suite", &json!({ "team": "iot" }))
+        .await;
+    let run_arn = emulator
+        .start_run("template", &definition_id, &json!({ "team": "iot" }))
+        .await;
+    let known_run_id = run_arn
+        .rsplit('/')
+        .next()
+        .expect("the run ARN ends in the run id")
+        .to_string();
+
+    // `UUID` is `len 12..36` (source: `smithy_query(query="shape",shape="UUID")`), so a
+    // 36-character id and one at the shortest legal length are both rows below.
+    let never_created = "11111111-2222-3333-4444-555555555555";
+    let shortest = "abcdefghijkl";
+
+    // (case, the resourceArn the call names)
+    let rows: Vec<(String, String)> = vec![
+        (
+            "a suite definition the store does not hold".to_string(),
+            format!(
+                "arn:aws:iotdeviceadvisor:{REGION}:000000000000:suitedefinition/{never_created}"
+            ),
+        ),
+        (
+            "a definition id at the shortest legal length".to_string(),
+            format!("arn:aws:iotdeviceadvisor:{REGION}:000000000000:suitedefinition/{shortest}"),
+        ),
+        (
+            "a suite run the store does not hold".to_string(),
+            format!(
+                "arn:aws:iotdeviceadvisor:{REGION}:000000000000:suiterun/{definition_id}/\
+                 {never_created}"
+            ),
+        ),
+        (
+            "a known run id under another definition".to_string(),
+            format!(
+                "arn:aws:iotdeviceadvisor:{REGION}:000000000000:suiterun/{never_created}/\
+                 {known_run_id}"
+            ),
+        ),
+        (
+            "the right definition in another region".to_string(),
+            definition_arn.replace(REGION, "eu-central-1"),
+        ),
+        (
+            "the right definition in another account".to_string(),
+            definition_arn.replace("000000000000", "111111111111"),
+        ),
+        (
+            "the right run in another region".to_string(),
+            run_arn.replace(REGION, "ap-southeast-2"),
+        ),
+    ];
+
+    for (case, arn) in rows {
+        let expected = not_found_message("resourceArn", &arn);
+        for (operation, answer) in [
+            ("ListTagsForResource", emulator.list_tags(&arn).await),
+            (
+                "TagResource",
+                emulator.tag_resource(&arn, &json!({ "env": "test" })).await,
+            ),
+            (
+                "UntagResource",
+                emulator.untag_resource(&arn, &["env"]).await,
+            ),
+        ] {
+            assert_eq!(
+                (answer.status, answer.error_code.as_deref()),
+                (404, Some("ResourceNotFoundException")),
+                "case {case:?} on {operation}: expected HTTP 404 ResourceNotFoundException, \
+                 got {} {:?} {}",
+                answer.status,
+                answer.error_code,
+                answer.body
+            );
+            assert_eq!(
+                answer.member("message").as_str(),
+                Some(expected.as_str()),
+                "case {case:?} on {operation}: expected message {expected:?}, got {}",
+                answer.body
+            );
+        }
+    }
+
+    // Same template, different member: the rule belongs to the service, not to one surface.
+    let read = emulator
+        .call("GET", &format!("/suiteDefinitions/{never_created}"), None)
+        .await;
+    let expected = not_found_message("suiteDefinitionId", never_created);
+    assert_eq!(
+        (read.status, read.error_code.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case \"an id-keyed read of a missing definition\": expected HTTP 404 \
+         ResourceNotFoundException, got {} {:?} {}",
+        read.status,
+        read.error_code,
+        read.body
+    );
+    assert_eq!(
+        read.member("message").as_str(),
+        Some(expected.as_str()),
+        "case \"an id-keyed read of a missing definition\": expected message {expected:?}, \
+         got {}",
+        read.body
     );
 }
 

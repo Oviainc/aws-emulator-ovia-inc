@@ -15,6 +15,8 @@
 mod activity_callbacks;
 #[path = "all/activity_create_admission.rs"]
 mod activity_create_admission;
+#[path = "all/activity_heartbeats.rs"]
+mod activity_heartbeats;
 #[path = "all/activity_lifecycle.rs"]
 mod activity_lifecycle;
 #[path = "all/activity_tasks.rs"]

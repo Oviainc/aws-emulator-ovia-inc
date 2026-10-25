@@ -2,9 +2,10 @@
 
 //! @op ListRescoreExecutionPlans
 //!
-//! Reports one summary per plan currently in this service's store, in the store's
-//! stable id order, honouring `MaxResults` and round-tripping `NextToken` so a paged
-//! walk visits every plan exactly once. A pure read: it writes nothing.
+//! Reports one summary per plan this service holds IN THE REQUEST'S REGION, in the
+//! store's stable id order, honouring `MaxResults` and round-tripping `NextToken` so a
+//! paged walk visits every plan exactly once. A plan created in another region is not
+//! among them. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,7 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a value outside them is already refused with a 400 `ValidationException`
         // before this handler runs. What is NOT modelled is whether an in-range token is
         // one this service issued — that is checked below.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListRescoreExecutionPlansErrorModeled::InternalServerException(
                 InternalServerException {
@@ -183,14 +183,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .map_or(usize::MAX, |requested| requested.max(0) as usize);
 
+        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let now = crate::state::now_millis();
-        // `plans` is a BTreeMap, so this walk is in ascending id order: paging from the
-        // last id returned visits every plan exactly once, and a deleted plan is simply
-        // no longer there.
+        // Only the plans of THIS request's region are listed: a plan belongs to the
+        // region its create was signed for, so a region nothing was created in reports
+        // an empty page. `plans` is a BTreeMap, so this walk is in ascending id order:
+        // paging from the last id returned visits every plan exactly once, and a deleted
+        // plan is simply no longer there.
         let mut page: Vec<RescoreExecutionPlanSummary> = store
-            .plans
-            .values()
+            .plans_in(&region)
+            .into_iter()
+            .flat_map(|regional| regional.plans.values())
             .filter(|plan| {
                 start_after
                     .as_deref()

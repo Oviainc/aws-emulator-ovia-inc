@@ -231,9 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No application with id or name {} exists.",
-                        input.application_identifier
+                    message: Some(crate::state::application_not_found(
+                        &input.application_identifier,
                     )),
                     resource_name: Some(input.application_identifier),
                 },
@@ -262,9 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No environment with id or name {} exists in application {}.",
-                        input.environment_identifier, application.id
+                    message: Some(crate::state::environment_not_found(
+                        &application.id,
+                        &input.environment_identifier,
                     )),
                     resource_name: Some(input.environment_identifier),
                 },
@@ -277,9 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateExperimentDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No configuration profile with id or name {} exists in application {}.",
-                        input.configuration_profile_identifier, application.id
+                    message: Some(crate::state::configuration_profile_not_found(
+                        &application.id,
+                        &input.configuration_profile_identifier,
                     )),
                     resource_name: Some(input.configuration_profile_identifier),
                 },

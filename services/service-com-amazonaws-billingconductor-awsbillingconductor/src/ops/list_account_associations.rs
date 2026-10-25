@@ -4,10 +4,12 @@
 //! Reads the linked accounts and the billing group each one is associated with out
 //! of state. A pure read: it writes nothing.
 //!
-//! LIMITATION: `BillingPeriod` selects the month to report for. This emulator keeps
-//! no per-billing-period history of the associations, so every period reports the
-//! CURRENT ones. The operation models no `MaxResults`, so a page is bounded by
-//! `crate::state::DEFAULT_PAGE_SIZE` and continued through the modelled `NextToken`.
+//! `BillingPeriod` selects the month to report for: each account is answered with the
+//! billing group its membership was in force for in that month
+//! (`crate::state::linked_accounts`), and an absent `BillingPeriod` means
+//! `crate::state::current_billing_period`. The operation models no `MaxResults`, so a
+//! page is bounded by `crate::state::DEFAULT_PAGE_SIZE` and continued through the
+//! modelled `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -177,8 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `BillingPeriod` selects the month to report for; this emulator keeps no
-        // per-period history, so every period reports the current associations.
+        // "list linked accounts that are linked to the payer account for the
+        // specified time period. If no information is provided, the current billing
+        // period is used" — so the report is answered from the memberships in force
+        // in that month, and the month defaults to the current one. The modelled
+        // `BillingPeriod` pattern is enforced before the handler runs.
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
         let filters = input.filters.unwrap_or_default();
 
         // An `Association` that is neither MONITORED nor UNMONITORED is a billing
@@ -203,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut selected: Vec<(String, AccountAssociationsListElement)> = Vec::new();
-        for (account_id, group_arn) in state.linked_accounts() {
+        for (account_id, group_arn) in state.linked_accounts(&billing_period) {
             let association_matches = match filters.association.as_deref() {
                 None => true,
                 Some(MONITORED) => group_arn.is_some(),

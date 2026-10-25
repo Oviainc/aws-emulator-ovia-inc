@@ -220,6 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::recovery_group_arn(&input.recovery_group_name);
+        // THE CONTAINMENT GATE. A cell belongs to one parent cell or to one recovery
+        // group, so a create may not name a cell another record already contains —
+        // refused before anything is written.
+        state
+            .check_containment_available(&arn, input.cells.as_deref().unwrap_or_default())
+            .map_err(|message| {
+                CreateRecoveryGroupErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                })
+            })?;
+
         let record = crate::state::RecoveryGroupRecord {
             arn: arn.clone(),
             name: input.recovery_group_name.clone(),

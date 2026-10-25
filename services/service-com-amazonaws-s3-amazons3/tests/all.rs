@@ -23,6 +23,8 @@ mod bucket_encryption;
 mod bucket_intelligent_tiering;
 #[path = "all/bucket_lifecycle.rs"]
 mod bucket_lifecycle;
+#[path = "all/bucket_lifecycle_configuration.rs"]
+mod bucket_lifecycle_configuration;
 #[path = "all/bucket_location.rs"]
 mod bucket_location;
 #[path = "all/bucket_metrics_configuration.rs"]

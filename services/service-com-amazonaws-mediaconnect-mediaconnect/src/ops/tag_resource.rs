@@ -197,12 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model bounds neither a tag key nor a tag value, so the pairs reach this
         // handler unchecked; the service's own bounds live in `crate::state`, where
-        // CreateFlow's `FlowTags` is checked against the same function. Every pair is
-        // checked before anything is written, so a refused call stores none of them.
-        for (key, value) in &input.tags {
-            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
-                return Err(bad_request(reason));
-            }
+        // CreateFlow's `FlowTags` is checked against the same function. The whole request
+        // is checked before anything is written, so a refused call stores none of its
+        // pairs.
+        if let Some(reason) = crate::state::tag_pairs_rejection(&input.tags) {
+            return Err(bad_request(reason));
         }
 
         let mut store = state.lock();
@@ -213,27 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The merged set is what the resource will carry, so it is the set the
         // tags-per-resource bound applies to — a key the request re-states does not grow
         // it. Checked before the first insert, so a refused call changes nothing.
-        let merged_entries = tags.len()
-            + input
-                .tags
-                .keys()
-                .filter(|key| !tags.contains_key(*key))
-                .count();
-        if merged_entries > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(bad_request(format!(
-                "A resource keeps at most {} tags; tagging {} with these keys would give it \
-                 {merged_entries}.",
-                crate::state::MAX_TAGS_PER_RESOURCE,
-                input.resource_arn
-            )));
+        if let Some(reason) =
+            crate::state::tag_capacity_rejection(tags, input.tags.keys(), &input.resource_arn)
+        {
+            return Err(bad_request(reason));
         }
 
         // "If existing tags on a resource are not specified in the request parameters,
         // they are not changed": add or overwrite the named keys IN PLACE, leaving every
         // other key the value it had.
-        for (key, value) in input.tags {
-            tags.insert(key, value);
-        }
+        //
+        // Whether the merge CHANGED anything is not read here: the resources this
+        // operation's `ResourceArn` resolves to (a flow and its sub-resources) report no
+        // `UpdatedAt` for a change to move, unlike the global resources TagGlobalResource
+        // writes to.
+        let _ = crate::state::merge_tags(tags, input.tags);
 
         Ok(TagResourceOutput)
     }

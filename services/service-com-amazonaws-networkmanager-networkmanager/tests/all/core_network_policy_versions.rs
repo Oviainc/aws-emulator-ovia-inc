@@ -544,7 +544,7 @@ async fn a_delete_removes_exactly_the_version_it_names() {
         );
         assert_eq!(
             core_network["CoreNetwork"]["Segments"],
-            json!([{ "Name": "live", "EdgeLocations": ["us-west-2"] }]),
+            json!([{ "Name": "live", "EdgeLocations": ["us-west-2"], "SharedSegments": [] }]),
             "case {:?}: only the LIVE policy shapes the topology, got {core_network}",
             case.name
         );

@@ -618,8 +618,8 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// passes a pair the service itself would refuse: the lengths come from the member's own
 /// documentation ([`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`]) and a tag is addressed
 /// by its key, so an empty key names no tag. Both bounds count CHARACTERS, as the
-/// documentation does. Every operation that writes tags (CreateFlow's `FlowTags`,
-/// TagResource) refuses through this one function.
+/// documentation does. Every operation that writes tags (CreateFlow's `FlowTags`, the
+/// regional and the global TagResource) refuses through this one function.
 pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
     if key.is_empty() {
         return Some("A tag key must not be empty.".to_string());
@@ -639,6 +639,66 @@ pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// Why the pairs of one tag write are not pairs this service stores, or `None` when every
+/// one of them is: [`tag_pair_rejection`] over the whole request, answered for the FIRST
+/// unacceptable pair.
+///
+/// Every tag write checks its whole request through this before it resolves or writes
+/// anything, so a refused write stores none of the pairs it carried.
+pub fn tag_pairs_rejection<'a, I>(pairs: I) -> Option<String>
+where
+    I: IntoIterator<Item = (&'a String, &'a String)>,
+{
+    pairs
+        .into_iter()
+        .find_map(|(key, value)| tag_pair_rejection(key, value))
+}
+
+/// Why MERGING the keys `keys` into the tag map `tags` would leave the resource
+/// `resource_arn` carrying more tags than one resource may, or `None` when it would not.
+///
+/// The bound ([`MAX_TAGS_PER_RESOURCE`]) applies to the MERGED set the write would leave,
+/// so a key the request re-states does not grow it. Every tag write checks it before the
+/// first insert, so a refused write changes nothing.
+pub fn tag_capacity_rejection<'a, I>(
+    tags: &BTreeMap<String, String>,
+    keys: I,
+    resource_arn: &str,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let merged_entries =
+        tags.len() + keys.into_iter().filter(|key| !tags.contains_key(*key)).count();
+    (merged_entries > MAX_TAGS_PER_RESOURCE).then(|| {
+        format!(
+            "A resource keeps at most {MAX_TAGS_PER_RESOURCE} tags; tagging {resource_arn} \
+             with these keys would give it {merged_entries}."
+        )
+    })
+}
+
+/// MERGE `pairs` into `tags`: a key `pairs` names is set or overwritten IN PLACE, and a key
+/// it does not name keeps the value it had ("if existing tags on a resource are not
+/// specified in the request parameters, they are not changed").
+///
+/// Answers whether the map CHANGED, which is what decides whether the record's `UpdatedAt`
+/// moves: a write that re-states the values a resource already carries changes nothing.
+#[must_use]
+pub fn merge_tags(
+    tags: &mut BTreeMap<String, String>,
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> bool {
+    let mut changed = false;
+    for (key, value) in pairs {
+        if tags.get(&key).is_none_or(|stored| *stored != value) {
+            changed = true;
+        }
+        tags.insert(key, value);
+    }
+    changed
 }
 
 /// The tag map a resource is created with, from the tag member of the request that created
@@ -4106,6 +4166,24 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     pub next_arn_suffix: u64,
 }
 
+/// A mutable handle on the tag state of ONE global resource, as
+/// [`ComAmazonawsMediaconnectMediaconnectState::global_resource_tags_mut`] resolves it:
+/// the record's tag map, and the record's `UpdatedAt`, which a write that CHANGES the map
+/// moves (the same reading of "last changed" every router resource's `UpdatedAt` carries).
+///
+/// The three global resource records are different types with no shared field layout, so
+/// the two things a tag write touches are handed back as borrows of the record rather than
+/// as the record itself — which is also what keeps the write identical whichever of the
+/// three it addresses.
+#[derive(Debug)]
+pub struct GlobalResourceTags<'a> {
+    /// The resource's stored tag map, the one a tag read reports and a tag write merges
+    /// into.
+    pub tags: &'a mut BTreeMap<String, String>,
+    /// The record's `UpdatedAt`.
+    pub updated_at: &'a mut SystemTime,
+}
+
 impl ComAmazonawsMediaconnectMediaconnectState {
     /// The next value of the ARN-fragment counter. Never repeats within a process.
     pub fn next_suffix(&mut self) -> u64 {
@@ -4130,9 +4208,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     /// reservation), a flow sub-resource with no ARN of its own (a media stream and a VPC
     /// interface are addressed by name within their flow, so no `ResourceArn` can name
     /// one), and a router input / router output / router network interface, whose tags are
-    /// the GLOBAL tag operations' subject (TagGlobalResource / UntagGlobalResource /
-    /// ListTagsForGlobalResource, which cover exactly those three). Any other ARN addresses
-    /// nothing whose tags these operations reach.
+    /// the GLOBAL tag operations' subject ([`Self::global_resource_tags_mut`], which covers
+    /// exactly those three). Any other ARN addresses nothing whose tags these operations
+    /// reach.
     pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
         if let Some(flow) = self.flows.get(resource_arn) {
             return Some(&flow.tags);
@@ -4155,6 +4233,48 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.flows
             .values_mut()
             .find_map(|flow| flow.sub_resource_tags_mut(resource_arn))
+    }
+
+    /// The tag state of the GLOBAL resource `resource_arn` addresses, or `None` when this
+    /// service holds no such resource.
+    ///
+    /// A global tag operation "supports the following global resources: router inputs,
+    /// router outputs and router network interfaces"
+    /// (`smithy_query(query="operation",operation="TagGlobalResource")`), so a
+    /// `ResourceArn` resolves against those three stores and nothing else — a flow, or one
+    /// of its ARN-bearing sub-resources, is a REGIONAL resource, whose tags
+    /// [`Self::tags_of`] is the lookup for. Each of the three ARN forms carries its own
+    /// resource-type segment (`routerInput`, `routerOutput`, `routerNetworkInterface`), so
+    /// one ARN can be a key in at most one of the maps and the order they are tried in
+    /// cannot change which record is found.
+    ///
+    /// Everything the clock already made due is materialised first
+    /// ([`Self::settle_due_transitions`]), exactly as [`Self::router_input_mut`] does, so a
+    /// resource whose removal has already come due resolves to nothing here rather than
+    /// taking tags no later caller could read.
+    pub fn global_resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+        now: SystemTime,
+    ) -> Option<GlobalResourceTags<'_>> {
+        self.settle_due_transitions(now);
+        if let Some(router_input) = self.router_inputs.get_mut(resource_arn) {
+            return Some(GlobalResourceTags {
+                tags: &mut router_input.tags,
+                updated_at: &mut router_input.updated_at,
+            });
+        }
+        if let Some(router_output) = self.router_outputs.get_mut(resource_arn) {
+            return Some(GlobalResourceTags {
+                tags: &mut router_output.tags,
+                updated_at: &mut router_output.updated_at,
+            });
+        }
+        let interface = self.router_network_interfaces.get_mut(resource_arn)?;
+        Some(GlobalResourceTags {
+            tags: &mut interface.tags,
+            updated_at: &mut interface.updated_at,
+        })
     }
 
     /// Every entitlement the store holds that is granted TO the account `account_id`,

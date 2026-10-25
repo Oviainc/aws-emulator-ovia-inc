@@ -20,6 +20,9 @@ mod batch_delete;
 #[path = "all/channel_alerts.rs"]
 mod channel_alerts;
 
+#[path = "all/channel_class_update.rs"]
+mod channel_class_update;
+
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
