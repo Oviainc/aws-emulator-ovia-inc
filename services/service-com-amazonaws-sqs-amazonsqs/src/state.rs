@@ -32,6 +32,11 @@
 //! resend inside the interval is accepted without delivering a second copy, and
 //! sequences the message from [`Queue::sequenced`].
 //!
+//! A FIFO RECEIVE is idempotent the same way: the batch it handed over under a
+//! `ReceiveRequestAttemptId` is remembered in [`Queue::receive_attempts`], so a retry
+//! carrying that same token hands the identical messages and receipt handles back
+//! instead of a second, different batch.
+//!
 //! # Message movement tasks
 //!
 //! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
@@ -119,11 +124,25 @@ pub const DEDUPLICATION_SCOPE: &str = "DeduplicationScope";
 /// level the attribute's own documentation names as the alternative.
 pub const DEDUPLICATION_SCOPE_MESSAGE_GROUP: &str = "messageGroup";
 
+/// The attribute that says whether the FIFO throughput quota "applies to the entire
+/// queue or per message group": "Valid values are perQueue and perMessageGroupId."
+pub const FIFO_THROUGHPUT_LIMIT: &str = "FifoThroughputLimit";
+
+/// The [`FIFO_THROUGHPUT_LIMIT`] value that scopes the quota to each message group. It
+/// "is allowed only when the value for DeduplicationScope is messageGroup", which is
+/// what [`attribute_combination_refusal`] enforces.
+pub const FIFO_THROUGHPUT_LIMIT_PER_MESSAGE_GROUP: &str = "perMessageGroupId";
+
 /// How long a deduplication token suppresses a resend: a message carrying a
 /// `MessageDeduplicationId` already seen is "accepted successfully but aren't delivered
 /// during the 5-minute deduplication interval"
 /// (`SendMessageRequest$MessageDeduplicationId`).
 pub const DEDUPLICATION_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How long a `ReceiveRequestAttemptId` can be retried under: "You can use
+/// ReceiveRequestAttemptId only for 5 minutes after a ReceiveMessage action"
+/// (`ReceiveMessageRequest$ReceiveRequestAttemptId`).
+pub const RECEIVE_REQUEST_ATTEMPT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long a deleted queue's NAME stays unavailable: "If you delete a queue, you must
 /// wait at least 60 seconds before creating a queue with the same name" (`CreateQueue`'s
@@ -137,7 +156,8 @@ pub const QUEUE_DELETED_RECENTLY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The longest `MessageGroupId` / `MessageDeduplicationId` a message may carry: "The
 /// length of MessageGroupId is 128 characters" and "The maximum length of
-/// MessageDeduplicationId is 128 characters" (their own member documentation).
+/// MessageDeduplicationId is 128 characters" (their own member documentation), which is
+/// also "the maximum length of ReceiveRequestAttemptId".
 pub const MAX_MESSAGE_TOKEN_LENGTH: usize = 128;
 
 /// The value the first sequence number a FIFO queue assigns counts up from.
@@ -150,14 +170,15 @@ pub const MAX_MESSAGE_TOKEN_LENGTH: usize = 128;
 /// client comparing them as text needs.
 pub const SEQUENCE_NUMBER_BASE: u128 = 10_u128.pow(19);
 
-/// Why the `MessageGroupId` / `MessageDeduplicationId` called `member` cannot be
-/// accepted, as the text of the refusal a caller has to fix the request from, or `None`
-/// when it can.
+/// Why the FIFO token called `member` — a `MessageGroupId`, a `MessageDeduplicationId`
+/// or a `ReceiveRequestAttemptId` — cannot be accepted, as the text of the refusal a
+/// caller has to fix the request from, or `None` when it can.
 ///
-/// The rule is the one both members publish: at most [`MAX_MESSAGE_TOKEN_LENGTH`]
+/// The rule is the one all three members publish: at most [`MAX_MESSAGE_TOKEN_LENGTH`]
 /// characters, "alphanumeric characters and punctuation
 /// (!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~)" — which is exactly the ASCII punctuation set.
-/// An empty token names no group and no send attempt, so it is not one either.
+/// An empty token names no group, no send and no receive attempt, so it is not one
+/// either.
 pub fn message_token_refusal(member: &str, token: &str) -> Option<String> {
     let length = token.chars().count();
     if length == 0 || length > MAX_MESSAGE_TOKEN_LENGTH {
@@ -310,8 +331,8 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         // "Valid values are perQueue and perMessageGroupId."
-        name: "FifoThroughputLimit",
-        kind: AttributeKind::OneOf(&["perQueue", "perMessageGroupId"]),
+        name: FIFO_THROUGHPUT_LIMIT,
+        kind: AttributeKind::OneOf(&["perQueue", FIFO_THROUGHPUT_LIMIT_PER_MESSAGE_GROUP]),
         create_only: false,
         fifo_only: true,
         default: None,
@@ -551,6 +572,13 @@ pub const MAX_MESSAGE_ATTRIBUTES: usize = 10;
 /// bounds are not.
 pub const MAX_DEDUPLICATION_TOKENS_PER_QUEUE: usize = 1_000;
 
+/// How many `ReceiveRequestAttemptId` batches one queue remembers. Each one lapses with
+/// [`RECEIVE_REQUEST_ATTEMPT_INTERVAL`] and names at most the messages one receive can
+/// hand over, and its only effect is replaying that batch to a retry — derived data, so
+/// past this bound the queue forgets the oldest attempts first rather than refusing the
+/// receive, exactly as it forgets the oldest deduplication tokens.
+pub const MAX_RECEIVE_ATTEMPTS_PER_QUEUE: usize = 1_000;
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -652,6 +680,32 @@ pub struct Deduplication {
     pub accepted_at: SystemTime,
 }
 
+/// One message a receive handed over under a `ReceiveRequestAttemptId`, as the retry
+/// carrying that token has to see it again.
+#[derive(Debug, Clone)]
+pub struct DeliveredMessage {
+    /// The `MessageId` handed over.
+    pub message_id: String,
+    /// The receipt handle minted for it: "subsequent calls with the same
+    /// ReceiveRequestAttemptId return the same messages and receipt handles".
+    pub receipt_handle: String,
+    /// The instant that receive made the message invisible until. The clock may lapse
+    /// it, but only a caller can move it elsewhere, which is what makes a visibility
+    /// change recognisable — see [`Queue::receive_attempt_was_modified`].
+    pub invisible_until: SystemTime,
+}
+
+/// The batch one `ReceiveRequestAttemptId` handed over, so a retry carrying that token
+/// "retrieve[s] the same set of messages, even if their visibility timeout has not yet
+/// expired".
+#[derive(Debug, Clone)]
+pub struct ReceiveAttempt {
+    /// The messages handed over, in the order they were handed over.
+    pub delivered: Vec<DeliveredMessage>,
+    /// When the receive was served; [`RECEIVE_REQUEST_ATTEMPT_INTERVAL`] runs from here.
+    pub served_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-sqs-amazonsqs. A handler reaches it through [`service_state`].
 ///
 /// `queues` is a `BTreeMap` rather than a `HashMap` so iteration is in name order:
@@ -705,6 +759,11 @@ pub struct Queue {
     /// queue writes here; entries lapse with [`DEDUPLICATION_INTERVAL`] and are bounded
     /// by [`MAX_DEDUPLICATION_TOKENS_PER_QUEUE`].
     pub deduplication: BTreeMap<(String, String), Deduplication>,
+    /// The batch each `ReceiveRequestAttemptId` this queue has served handed over, keyed
+    /// by that token. Only a FIFO receive writes here, and only when it handed something
+    /// over; entries lapse with [`RECEIVE_REQUEST_ATTEMPT_INTERVAL`] and are bounded by
+    /// [`MAX_RECEIVE_ATTEMPTS_PER_QUEUE`].
+    pub receive_attempts: BTreeMap<String, ReceiveAttempt>,
     /// How many messages this queue has sequenced. The sequence number of the next one
     /// is derived from it, so "SequenceNumber continues to increase" across the queue
     /// and therefore across each of its message groups.
@@ -833,6 +892,48 @@ impl Queue {
         }
     }
 
+    /// Remember that the receive served under `attempt_id` handed `attempt` over,
+    /// forgetting the oldest attempts if that takes the queue past
+    /// [`MAX_RECEIVE_ATTEMPTS_PER_QUEUE`](crate::state::MAX_RECEIVE_ATTEMPTS_PER_QUEUE).
+    pub fn record_receive_attempt(&mut self, attempt_id: String, attempt: ReceiveAttempt) {
+        self.receive_attempts.insert(attempt_id, attempt);
+        while self.receive_attempts.len() > MAX_RECEIVE_ATTEMPTS_PER_QUEUE {
+            let Some(oldest) = self
+                .receive_attempts
+                .iter()
+                .min_by_key(|(_, remembered)| remembered.served_at)
+                .map(|(attempt_id, _)| attempt_id.clone())
+            else {
+                break;
+            };
+            self.receive_attempts.remove(&oldest);
+        }
+    }
+
+    /// Whether the batch `attempt` handed over has been modified since, so it can no
+    /// longer be handed over again.
+    ///
+    /// A retry works "if none of the messages have been modified (deleted or had their
+    /// visibility changes)": a message the queue no longer holds was deleted, and one
+    /// whose receipt handle or invisible-until instant is no longer the one the receive
+    /// left had its visibility changed. An instant the CLOCK lapsed is not a
+    /// modification — nobody touched the message, so the retry still owes the same batch.
+    pub fn receive_attempt_was_modified(&self, attempt: &ReceiveAttempt) -> bool {
+        attempt.delivered.iter().any(|delivered| {
+            let held = self
+                .messages
+                .iter()
+                .find(|message| message.message_id == delivered.message_id);
+            let Some(message) = held else {
+                return true;
+            };
+            self.handles.get(&delivered.receipt_handle) != Some(&delivered.message_id)
+                || message
+                    .invisible_until
+                    .is_some_and(|until| until != delivered.invisible_until)
+        })
+    }
+
     /// Mint the next sequence number for this queue: a decimal integer inside 128 bits
     /// that is larger than every one it has already assigned.
     pub fn next_sequence_number(&mut self) -> String {
@@ -906,6 +1007,15 @@ impl Queue {
         // interval"; past it, "Amazon SQS can't detect duplicate messages".
         self.deduplication.retain(|_, remembered| {
             !lapsed(remembered.accepted_at, DEDUPLICATION_INTERVAL, now)
+        });
+        // "You can use ReceiveRequestAttemptId only for 5 minutes after a ReceiveMessage
+        // action", so past that a token names no batch and a receive carrying it is a
+        // fresh one.
+        self.receive_attempts.retain(|_, remembered| {
+            remembered
+                .served_at
+                .checked_add(RECEIVE_REQUEST_ATTEMPT_INTERVAL)
+                .is_none_or(|lapses| now < lapses)
         });
     }
 
@@ -1824,6 +1934,35 @@ pub fn validate_attributes(
         check_attribute_value(spec, value)?;
     }
     Ok(())
+}
+
+/// Why the attribute set a call would LEAVE a queue carrying cannot hold together, or
+/// `None` when it can.
+///
+/// Some attributes are each individually valid yet constrain one another, so the pair
+/// can only be judged over the resulting set rather than over the map one call supplies:
+/// the per-message-group FIFO throughput limit "is allowed only when the value for
+/// DeduplicationScope is messageGroup".
+pub fn attribute_combination_refusal(
+    attributes: &BTreeMap<String, String>,
+) -> Option<InvalidAttributeValue> {
+    let per_message_group = attributes
+        .get(FIFO_THROUGHPUT_LIMIT)
+        .is_some_and(|value| value == FIFO_THROUGHPUT_LIMIT_PER_MESSAGE_GROUP);
+    let message_group_scope = attributes
+        .get(DEDUPLICATION_SCOPE)
+        .is_some_and(|value| value == DEDUPLICATION_SCOPE_MESSAGE_GROUP);
+    (per_message_group && !message_group_scope).then(|| InvalidAttributeValue {
+        // The fixed text Amazon SQS words a refused attribute value in — recorded for
+        // this error class against three different attributes, differing only in the
+        // parameter it names — instantiated with the parameter this request got wrong.
+        // The rule itself is the one that parameter's documentation states: "the
+        // perMessageGroupId value is allowed only when the value for DeduplicationScope
+        // is messageGroup".
+        message: Some(format!(
+            "Invalid value for the parameter {FIFO_THROUGHPUT_LIMIT}."
+        )),
+    })
 }
 
 /// Check one attribute value against what its own documentation says it accepts.
