@@ -457,6 +457,84 @@ pub fn bound_part_chars(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Resource identifiers
+//
+// Every resource this service holds is keyed by the `Id` its create carried, and that
+// same id is the `{Id}` http label of that resource's OWN reads and writes
+// (`smithy_query(query="operation",operation="DescribeChannel,DeleteChannel,DescribeOriginEndpoint,DescribeHarvestJob")`
+// bind `GET/PUT/DELETE /<collection>/{Id}`) as well as the last segment of its ARN. So an
+// id the service could not address afterwards is not an id at all: the record would be
+// listed forever and reachable by nothing. The v1 model targets each of them at the plain
+// `__string` shape and publishes no `@pattern`, so the framework's constraint walk cannot
+// refuse one — the rule is the service's, enforced here for every create that NAMES the
+// resource it stores, and answered with `UnprocessableEntityException` (422) keyed by the
+// member, storing nothing.
+// ---------------------------------------------------------------------------
+
+/// The non-alphanumeric characters a resource id may carry, as the refusal names them.
+const ID_PUNCTUATION_CHARACTERS: &str = "_ -";
+
+/// The shortest id a resource can be addressed by. One, not zero: the empty string
+/// leaves the `{Id}` path segment of that resource's reads empty, which addresses the
+/// collection rather than a member of it, so a record stored under it is unreachable.
+pub const MIN_ID_CHARS: usize = 1;
+
+/// The wire name of the member every create carries its new resource's id in
+/// (`Id` is `@jsonName("id")` on all three create requests).
+pub const ID_MEMBER: &str = "id";
+
+/// Whether `c` is a character a MediaPackage resource id may carry.
+///
+/// The identifier alphabet: ASCII letters, digits, and the characters
+/// [`ID_PUNCTUATION_CHARACTERS`] names. ASCII-only, like a log group name's set
+/// ([`is_log_group_character`]) and unlike a tag's ([`is_tag_character`]), because the
+/// MediaPackage v2 model pins the same identifier as `^[a-zA-Z0-9_-]+$` — and because
+/// every character outside this set either has to be percent-encoded to survive the
+/// `{Id}` label or splits the path entirely.
+fn is_id_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+}
+
+/// Whether `value` is an id a resource of this service can be addressed by: at least
+/// [`MIN_ID_CHARS`] character, every one of them in [`is_id_character`]'s set.
+pub fn is_resource_id(value: &str) -> bool {
+    value.chars().count() >= MIN_ID_CHARS && value.chars().all(is_id_character)
+}
+
+/// The requirement a refused id failed: the member's whole accepted domain in one
+/// sentence, so a blank id and one carrying a character outside the alphabet are answered
+/// with the same rule.
+///
+/// Built here rather than written at each call site, so the sentence and the set it states
+/// cannot disagree and the suite asserting it reads the service's own words.
+pub fn resource_id_requirement() -> String {
+    format!(
+        "must be {MIN_ID_CHARS} or more characters of letters, numbers and \
+         `{ID_PUNCTUATION_CHARACTERS}`"
+    )
+}
+
+/// Refuse a member whose value is not an id this service could address a resource by,
+/// keyed by the member path the wire names.
+pub fn check_resource_id(member: &str, value: &str) -> Result<(), ServiceError> {
+    if is_resource_id(value) {
+        return Ok(());
+    }
+    Err(member_invalid(member, resource_id_requirement()))
+}
+
+/// Refuse the id a create names its new resource with — by SIZE, then by what an id may
+/// say — before anything is stored.
+///
+/// The one function all three creates call, so the id a channel, an origin endpoint and a
+/// harvest job may be stored under cannot drift apart: each of those ids is the http label
+/// of its own resource's reads, so each has to satisfy the same rule.
+pub fn check_created_id(value: &str) -> Result<(), ServiceError> {
+    bound_chars(ID_MEMBER, value, MAX_STRING_CHARS)?;
+    check_resource_id(ID_MEMBER, value)
+}
+
 /// Whether `c` is a character a tag key or a tag value may carry.
 ///
 /// AWS's tag restrictions publish the set for every tagged resource: a key or a value

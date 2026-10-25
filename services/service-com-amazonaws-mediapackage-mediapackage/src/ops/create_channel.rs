@@ -158,7 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Bound what the caller may make this record cost, before anything is stored.
         // Each refusal is this service's own envelope, keyed by the member it is about.
-        crate::state::bound_chars("id", &input.id, crate::state::MAX_STRING_CHARS)?;
+        // The id is the only handle the record has — the `{Id}` label of this channel's
+        // own reads and the last segment of its ARN — so an id the service could not
+        // address afterwards is refused before the store is touched.
+        crate::state::check_created_id(&input.id)?;
         if let Some(description) = &input.description {
             crate::state::bound_chars(
                 "description",
