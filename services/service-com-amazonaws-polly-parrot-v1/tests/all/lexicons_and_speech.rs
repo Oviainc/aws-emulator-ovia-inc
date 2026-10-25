@@ -1126,11 +1126,13 @@ async fn describe_voices_filters_the_catalog() {
         en_us.len()
     );
 
-    // A language no seeded voice speaks is an empty list, not the whole catalog.
-    let none = voices(&polly, "?LanguageCode=de-CH").await;
+    // A query no voice satisfies is an empty list, not the whole catalog. Every
+    // modelled language has a voice, so the empty case is a language crossed with an
+    // engine none of its voices supports (Welsh is a standard-only language).
+    let none = voices(&polly, "?LanguageCode=cy-GB&Engine=generative").await;
     assert!(
         none.is_empty(),
-        "a language with no voices must answer an empty list, got {none:?}"
+        "a query with no matching voices must answer an empty list, got {none:?}"
     );
 
     // `Aditi` speaks hi-IN as an additional language (the model documents exactly
@@ -1202,7 +1204,10 @@ async fn a_voice_page_token_only_resumes_its_own_query() {
 }
 
 /// Every voice a `DescribeVoices` query reports, following `NextToken` to the end.
-async fn voices(polly: &Polly, query: &str) -> Vec<serde_json::Value> {
+///
+/// `pub(crate)` so the catalog suite pages the same way this one does rather than
+/// standing up a second pager.
+pub(crate) async fn voices(polly: &Polly, query: &str) -> Vec<serde_json::Value> {
     let mut all: Vec<serde_json::Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -1229,7 +1234,7 @@ async fn voices(polly: &Polly, query: &str) -> Vec<serde_json::Value> {
     all
 }
 
-fn ids(voices: &[serde_json::Value]) -> BTreeSet<String> {
+pub(crate) fn ids(voices: &[serde_json::Value]) -> BTreeSet<String> {
     voices
         .iter()
         .map(|voice| voice["Id"].as_str().unwrap_or_default().to_string())
