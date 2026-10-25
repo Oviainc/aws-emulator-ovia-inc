@@ -21,7 +21,8 @@
 //! * "A filter to return only the specified kinds of origin request policies" selects by
 //!   where a policy came from, so a filter that admits the policies created in this account
 //!   lists all of them and one that admits only the policies Amazon Web Services creates
-//!   lists none of this account's;
+//!   lists the published catalog instead ([`crate::managed_policy_catalogs`] asserts that
+//!   catalog's own content);
 //! * a page size that names no page, and a `Marker` that is no resume point this service
 //!   handed out, are refused with the errors the operation models and change nothing;
 //! * a listing is a READ: it answers the same records again and mints nothing.
@@ -36,7 +37,8 @@
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::
     ORIGIN_REQUEST_POLICY_TYPE_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE, NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
+    MANAGED_ORIGIN_REQUEST_POLICIES, MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE,
+    NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -141,15 +143,16 @@ fn the_filter_values_are_the_modelled_ones() {
     );
 }
 
-/// An account holding no origin request policies lists none: a page with nothing in it,
-/// carrying no `Items` element at all, the default page size, and nothing that says more
-/// remain.
+/// An account holding no origin request policies of its OWN lists none of its own: a page
+/// with nothing in it, carrying no `Items` element at all, the default page size, and
+/// nothing that says more remain. (The policies AWS published are a different kind, so the
+/// filter that names this account's kind excludes them.)
 #[tokio::test]
 async fn an_account_holding_no_policies_lists_no_items() {
     let router = emulator();
     let case = "empty account";
 
-    let listed = list_policies(&router, "").await;
+    let listed = list_policies(&router, "?Type=custom").await;
     assert_eq!(
         listed.status, 200,
         "case {case}: expected HTTP 200 from ListOriginRequestPolicies, got {} with {}",
@@ -187,7 +190,7 @@ async fn a_listing_reports_every_stored_policy_as_this_account_created_it() {
     let created = create_all(&router, &policy_table()).await;
     let expected = in_id_order(&created);
 
-    let listed = list_policies(&router, "").await;
+    let listed = list_policies(&router, "?Type=custom").await;
     assert_eq!(
         listed.status, 200,
         "case whole collection: expected HTTP 200, got {} with {}",
@@ -258,7 +261,7 @@ async fn a_listing_reports_every_stored_policy_as_this_account_created_it() {
     }
 
     // A listing is a READ: the same request answers the same records again.
-    let again = list_policies(&router, "").await;
+    let again = list_policies(&router, "?Type=custom").await;
     assert_eq!(
         listed_ids(again.root()),
         listed_ids(listed.root()),
@@ -297,8 +300,8 @@ async fn walking_the_pages_enumerates_every_policy_exactly_once() {
         // fails here rather than looping forever.
         for page in 0..=order.len() + 1 {
             let query = match &marker {
-                Some(value) => format!("?MaxItems={size}&Marker={value}"),
-                None => format!("?MaxItems={size}"),
+                Some(value) => format!("?MaxItems={size}&Type=custom&Marker={value}"),
+                None => format!("?MaxItems={size}&Type=custom"),
             };
             let answer = list_policies(&router, &query).await;
             assert_eq!(
@@ -361,9 +364,10 @@ async fn walking_the_pages_enumerates_every_policy_exactly_once() {
         );
     }
 
-    // A `Marker` naming the last stored policy resumes after it: nothing is ordered there.
+    // A `Marker` naming the last stored policy resumes after it: nothing of this account's
+    // kind is ordered there.
     let last = order.last().cloned().expect("the table created policies");
-    let after_last = list_policies(&router, &format!("?Marker={last}")).await;
+    let after_last = list_policies(&router, &format!("?Type=custom&Marker={last}")).await;
     assert_eq!(
         after_last.status, 200,
         "case resume at the last id: expected HTTP 200, got {} with {}",
@@ -378,7 +382,7 @@ async fn walking_the_pages_enumerates_every_policy_exactly_once() {
 
 /// The filter selects by where a policy came from: the kind this account's creates produce
 /// lists all of them, at every page size, and the kind only Amazon Web Services creates
-/// lists none of them.
+/// lists the catalog AWS published instead.
 #[tokio::test]
 async fn the_type_filter_selects_the_kind_of_policy_it_names() {
     let router = emulator();
@@ -387,15 +391,23 @@ async fn the_type_filter_selects_the_kind_of_policy_it_names() {
         .into_iter()
         .map(|(_, id)| id)
         .collect();
+    // The published catalog, in the one id order both sources are listed in.
+    let mut published: Vec<String> = MANAGED_ORIGIN_REQUEST_POLICIES
+        .iter()
+        .map(|managed| managed.id.to_string())
+        .collect();
+    published.sort();
+    let mut both: Vec<String> = published.iter().chain(order.iter()).cloned().collect();
+    both.sort();
 
-    // Rows: no filter at all, the kind this account created, and the kind it holds none of
-    // — each at a page size that cuts the collection and one that does not.
+    // Rows: no filter at all, the kind this account created, and the kind AWS creates —
+    // each at a page size that cuts the collection and one that does not.
     let rows: &[(&str, Option<&str>, usize)] = &[
-        ("no filter, whole collection", None, order.len()),
+        ("no filter, whole collection", None, both.len()),
         ("no filter, a cut page", None, 2),
         ("the account's own kind, whole collection", Some(TYPE_CUSTOM), order.len()),
         ("the account's own kind, a cut page", Some(TYPE_CUSTOM), 2),
-        ("the Amazon Web Services kind, whole collection", Some(TYPE_MANAGED), order.len()),
+        ("the Amazon Web Services kind, whole collection", Some(TYPE_MANAGED), published.len()),
         ("the Amazon Web Services kind, a cut page", Some(TYPE_MANAGED), 2),
     ];
     for (case, filter, size) in rows {
@@ -409,11 +421,12 @@ async fn the_type_filter_selects_the_kind_of_policy_it_names() {
             "case {case}: expected HTTP 200 for {query}, got {} with {}",
             answer.status, answer.raw
         );
-        let expected: Vec<String> = if *filter == Some(TYPE_MANAGED) {
-            Vec::new()
-        } else {
-            order.iter().take(*size).cloned().collect()
+        let source = match *filter {
+            Some(TYPE_MANAGED) => &published,
+            Some(TYPE_CUSTOM) => &order,
+            _ => &both,
         };
+        let expected: Vec<String> = source.iter().take(*size).cloned().collect();
         assert_eq!(
             listed_ids(answer.root()),
             expected,
@@ -572,8 +585,9 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         listed.raw
     );
     assert_eq!(
-        created.len(),
+        created.len() + MANAGED_ORIGIN_REQUEST_POLICIES.len(),
         before.len(),
-        "case refusals: expected the created policies to be the listed ones"
+        "case refusals: expected the created policies and the published catalog to be the \
+         listed ones"
     );
 }

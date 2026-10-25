@@ -7,10 +7,12 @@
 //! total order over policy ids, and `Marker` names the policy the previous page ended at,
 //! so walking the pages enumerates every policy exactly once.
 //!
-//! `Type` filters the page by where a policy came from: every record this store holds was
-//! put there by a `CreateOriginRequestPolicy` call in this account, so each one is a
-//! `custom` policy and a request asking only for the `managed` ones (the policies Amazon
-//! Web Services itself creates) lists none.
+//! `Type` filters the page by where a policy came from: a policy this store holds was put
+//! there by a `CreateOriginRequestPolicy` call in this account, so it is a `custom` policy,
+//! while the policies Amazon Web Services itself creates are reference data every account
+//! holds ([`crate::state::MANAGED_ORIGIN_REQUEST_POLICIES`]) and are listed as `managed`. A
+//! request naming one kind is served that kind alone; one naming none is served both, in
+//! one total order over ids.
 //!
 //! A reporting operation: it reads the stored records and writes nothing beyond what the
 //! clock already owed the rest of this service's state.
@@ -87,15 +89,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::ops::Bound;
 use std::time::SystemTime;
 
 /// `OriginRequestPolicySummary$Type` for a policy this account created: "The type of origin
 /// request policy, either `managed` (created by Amazon Web Services) or `custom` (created in
 /// this Amazon Web Services account)" — one of the two values
-/// [`ORIGIN_REQUEST_POLICY_TYPE_VALUES`] admits. Every record this store holds was put there
-/// by a `CreateOriginRequestPolicy` call, so every summary reports this one.
-const TYPE_CUSTOM: &str = "custom";
+/// [`ORIGIN_REQUEST_POLICY_TYPE_VALUES`] admits. A record this store holds was put there by
+/// a `CreateOriginRequestPolicy` call, so every summary of one reports this.
+const TYPE_CUSTOM: &str = crate::state::ORIGIN_REQUEST_POLICY_TYPE_CUSTOM;
+
+/// The other value the same enum admits, which the policies AWS published report.
+const TYPE_MANAGED: &str = crate::state::ORIGIN_REQUEST_POLICY_TYPE_MANAGED;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -196,9 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "To get the next page of the list, set this field's value to the value of
         // NextMarker from the current page's response": the marker is a resume point this
         // service handed out — an origin request policy id — so a value outside that shape
-        // was never one (`InvalidArgument`), and one that is but names no stored policy is a
-        // policy that does not exist, which is the resource this listing is about and the
-        // reason it models `NoSuchOriginRequestPolicy`.
+        // was never one (`InvalidArgument`), and one that is but names no policy, in neither
+        // the account's records nor the catalog AWS published, is a policy that does not
+        // exist, which is the resource this listing is about and the reason it models
+        // `NoSuchOriginRequestPolicy`.
         if let Some(marker) = input.marker.as_deref() {
             if !crate::state::is_minted_uuid(marker) {
                 return Err(ListOriginRequestPoliciesErrorModeled::InvalidArgument(
@@ -211,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            if store.origin_request_policy(marker).is_none() {
+            if store.readable_origin_request_policy(marker).is_none() {
                 return Err(
                     ListOriginRequestPoliciesErrorModeled::NoSuchOriginRequestPolicy(
                         crate::state::no_such_origin_request_policy(),
@@ -223,39 +228,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A filter to return only the specified kinds of origin request policies": a
         // request naming no filter is about every kind, one naming `custom` is about the
-        // policies created in this account — which is every record this store holds — and
-        // one naming `managed` is about the policies Amazon Web Services creates, of which
-        // this account holds none. The value is one the model's enum admits by the time a
+        // policies created in this account — the records this store holds — and one naming
+        // `managed` is about the policies Amazon Web Services creates, which every account
+        // holds as reference data. The value is one the model's enum admits by the time a
         // request reaches here.
-        let serves_stored_policies = input
-            .r#type
-            .as_deref()
-            .is_none_or(|kind| kind == TYPE_CUSTOM);
+        let kind = input.r#type.as_deref();
+        let serves_managed = kind != Some(TYPE_CUSTOM);
+        let serves_custom = kind != Some(TYPE_MANAGED);
 
-        // `Marker` names where the previous page ENDED, so this page starts after it:
-        // walking the pages enumerates every policy exactly once. The store is ordered by
-        // id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
-            Some(marker) => Bound::Excluded(marker),
-            None => Bound::Unbounded,
-        };
-        let mut items: Vec<OriginRequestPolicySummary> = Vec::new();
-        let mut more_remain = false;
-        if serves_stored_policies {
-            for (_, stored) in store
-                .origin_request_policies
-                .range::<str, _>((start, Bound::Unbounded))
-            {
-                if items.len() >= page_size {
-                    more_remain = true;
-                    break;
-                }
-                items.push(OriginRequestPolicySummary {
+        // The policies this request is about, in ONE total order over ids: the published
+        // catalog and the account's own records are two sources of the same resource kind,
+        // so they are ordered together rather than concatenated — which is what lets
+        // `Marker` resume at an id whichever source it came from.
+        let mut candidates: Vec<OriginRequestPolicySummary> = Vec::new();
+        if serves_managed {
+            candidates.extend(
+                crate::state::MANAGED_ORIGIN_REQUEST_POLICIES
+                    .iter()
+                    .map(|managed| OriginRequestPolicySummary {
+                        r#type: TYPE_MANAGED.to_string(),
+                        origin_request_policy: managed.to_origin_request_policy(),
+                    }),
+            );
+        }
+        if serves_custom {
+            candidates.extend(store.origin_request_policies.values().map(|stored| {
+                OriginRequestPolicySummary {
                     // Read from the stored record, never from the request being served.
                     r#type: TYPE_CUSTOM.to_string(),
                     origin_request_policy: stored.to_origin_request_policy(),
-                });
+                }
+            }));
+        }
+        candidates.sort_by(|left, right| {
+            left.origin_request_policy
+                .id
+                .cmp(&right.origin_request_policy.id)
+        });
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every policy exactly once.
+        let mut items: Vec<OriginRequestPolicySummary> = Vec::new();
+        let mut more_remain = false;
+        for summary in candidates {
+            if input
+                .marker
+                .as_deref()
+                .is_some_and(|marker| summary.origin_request_policy.id.as_str() <= marker)
+            {
+                continue;
             }
+            if items.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            items.push(summary);
         }
 
         // "If there are more items in the list than are in this response, this element is

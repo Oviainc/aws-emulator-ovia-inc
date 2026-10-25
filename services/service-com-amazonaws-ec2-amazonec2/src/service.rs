@@ -36,13 +36,13 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. This service takes the entry's
+//!   protocol-correct rendering (query -> 400 InvalidAction) and stamps EC2's
+//!   error envelope on it, so a routing failure closes with the same
+//!   `<RequestID>` and media type every other error does.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
-//!   body). The default returns `None`, keeping the entry's protocol-correct
-//!   rendering. Return `Some(resp)` to reword it if desired.
+//!   body). Answered the same way as the routing failure above.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -159,12 +159,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. A query service's default is the
+        // protocol-correct 400 `InvalidAction`, which is an EC2 ERROR RESPONSE and
+        // so closes the same envelope every other one does: this takes that
+        // default rendering, code and message and all, and stamps the envelope on
+        // it ([`stamp_error_envelope`]) rather than wording the failure again.
+        let mut response = self.entry.routing_error_response(req);
+        stamp_error_envelope(&mut response);
+        Some(response)
     }
 
     fn override_framework_error(
@@ -173,12 +175,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
-        let _ = error;
-        None
+        // `aws-chunked` body. That answer is an EC2 error response too, so it is
+        // the default rendering with this service's envelope stamped on it, as the
+        // routing failure above. The error is BORROWED here (the default renderer
+        // consumes one), so it is restated as an owned error of the same kind
+        // first; an error [`restated`] cannot restate answers `None`, which keeps
+        // the framework's own rendering rather than reporting the failure as a
+        // different kind.
+        let mut response = self.entry.framework_error_response(restated(error)?);
+        stamp_error_envelope(&mut response);
+        Some(response)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
@@ -219,15 +225,18 @@ const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
 /// [`Ec2QueryEnvelope`] is the one place a serializer's media type is chosen, so
 /// it reaches every response this SERVICE renders: each success and each modelled
 /// error, including the scaffold's 501 — the same reach the envelope's
-/// `<RequestID>` has. It does not reach the responses the
-/// FRAMEWORK renders in front of the service — the refusal tail that answers a
-/// constraint the model declares, a routing failure, a transport failure — which
-/// `override_protocol` deliberately leaves in the model-derived envelope (its
-/// contract in `vendor/smithy-server-runtime/src/service.rs`) and which therefore
-/// still announce the bare `text/xml` and state no request id. Those paths are a
-/// separate seam (`override_refusal` / `override_routing_error` /
-/// `override_framework_error`) and are
-/// left to the issue that owns them rather than reworded here.
+/// `<RequestID>` has. What `override_protocol` does NOT reach is the responses the
+/// FRAMEWORK renders in front of the service; of those, the two the router offers
+/// this service — a routing failure and a transport failure — are taken back
+/// through `override_routing_error` / `override_framework_error` and stamped with
+/// the same envelope ([`stamp_error_envelope`]), so they too announce this media
+/// type and state a request id.
+///
+/// Two framework responses remain outside every seam, because the router renders
+/// them without consulting the service: the refusal tail of a matched operation (a
+/// value outside a constraint the model declares, which the service can only
+/// RE-WORD, through `override_refusal`) and an authentication refusal. Both still
+/// answer the model-derived envelope.
 const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 
 /// The element an ec2Query ERROR envelope names its request id with.
@@ -295,6 +304,60 @@ fn with_error_request_id(body: &[u8]) -> Option<Vec<u8>> {
         )
         .into_bytes(),
     )
+}
+
+/// Stamp EC2's error envelope on `response`: the media type it declares
+/// ([`RESPONSE_CONTENT_TYPE`]) and the `<RequestID>` it closes with
+/// ([`with_error_request_id`]).
+///
+/// The one place an EC2 error response is finished, so every error this service
+/// answers — a modelled error from a handler, the scaffold's 501, a routing failure,
+/// a transport failure — carries the same envelope. The body the renderer built is
+/// in memory, so it can be read back and rewritten here; a body that is not an
+/// envelope this can close is left exactly as it was.
+fn stamp_error_envelope(response: &mut RtResponse) {
+    response
+        .headers_mut()
+        .insert("content-type", RESPONSE_CONTENT_TYPE);
+    let rewritten = response
+        .body()
+        .bytes()
+        .and_then(with_error_request_id)
+        .map(::aws_smithy_types::body::SdkBody::from);
+    if let Some(body) = rewritten {
+        *response.body_mut() = body;
+    }
+}
+
+/// `error` as an owned error of the same kind, or `None` for a kind that cannot be
+/// restated.
+///
+/// The router hands `override_framework_error` a BORROWED error, because the
+/// default renderer it falls back to consumes one and a [`ProtocolError`] is not
+/// `Clone`. Rendering the default and then stamping the envelope on it needs an
+/// owned error, so each kind is restated from the data it carries. The transport
+/// failure the router detects up front is a `Malformed`; every other kind is
+/// restated too, so the stamp does not depend on which one arrives. A codec error
+/// carries an error that cannot be restated, and answers `None` — the framework's
+/// own rendering, unstamped, rather than a failure reported as a different kind.
+fn restated(error: &ProtocolError) -> Option<ProtocolError> {
+    match error {
+        ProtocolError::Malformed(detail) => Some(ProtocolError::Malformed(detail.clone())),
+        ProtocolError::BodyRead(detail) => Some(ProtocolError::BodyRead(detail.clone())),
+        ProtocolError::MissingHeader(name) => Some(ProtocolError::MissingHeader(name)),
+        ProtocolError::InvalidHeader { name, message } => Some(ProtocolError::InvalidHeader {
+            name,
+            message: message.clone(),
+        }),
+        ProtocolError::UnknownOperation(action) => {
+            Some(ProtocolError::UnknownOperation(action.clone()))
+        }
+        ProtocolError::Invalid(violations) => Some(ProtocolError::Invalid(violations.clone())),
+        ProtocolError::Unauthenticated { code, message } => {
+            Some(ProtocolError::Unauthenticated { code, message })
+        }
+        _ => None,
+    }
 }
 
 /// The envelope's success flag, as the `<return>` element an ec2Query response
@@ -441,20 +504,9 @@ impl ServerProtocol for Ec2QueryEnvelope {
         let mut response = self
             .inner
             .serialize_error(error, error_schema, error_code, http_status)?;
-        response
-            .headers_mut()
-            .insert("content-type", RESPONSE_CONTENT_TYPE);
-        // The envelope's own request id, which the framework's ec2Query error body does not
-        // carry; see [`ERROR_REQUEST_ID_ELEMENT`]. The body the serializer built is in
-        // memory, so it can be read back and rewritten here.
-        let rewritten = response
-            .body()
-            .bytes()
-            .and_then(with_error_request_id)
-            .map(::aws_smithy_types::body::SdkBody::from);
-        if let Some(body) = rewritten {
-            *response.body_mut() = body;
-        }
+        // The media type and the envelope's own request id, neither of which the
+        // framework's ec2Query error body carries; see [`stamp_error_envelope`].
+        stamp_error_envelope(&mut response);
         Ok(response)
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResponseHeadersPolicyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResponseHeadersPolicyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResponseHeadersPolicyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the configuration of the response headers policy the request's `Id` names,
+//! beside its version token: the SAME record `GetResponseHeadersPolicy` answers from, so a
+//! policy this account created and one AWS published
+//! ([`crate::state::MANAGED_RESPONSE_HEADERS_POLICIES`]) are both readable here, and an id
+//! outside both is the modelled 404.
+//!
+//! A reporting operation: it reads the stored records and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResponseHeadersPolicyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResponseHeadersPolicyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResponseHeadersPolicyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        // A response headers policy id addresses ONE policy whoever created it: one this
+        // account created, or one AWS published and every account holds.
+        let Some(stored) = store.readable_response_headers_policy(&input.id) else {
+            return Err(
+                GetResponseHeadersPolicyConfigErrorModeled::NoSuchResponseHeadersPolicy(
+                    crate::state::no_such_response_headers_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetResponseHeadersPolicyConfigOutput {
+            // "Contains a response headers policy" — the configuration as stored, not as
+            // any request describes it.
+            response_headers_policy_config: Some(stored.config.clone()),
+            // "The version identifier for the current version of the response headers
+            // policy": the token the last mutation handed back, the same one
+            // `GetResponseHeadersPolicy` reports.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

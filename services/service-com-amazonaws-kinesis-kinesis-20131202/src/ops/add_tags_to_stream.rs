@@ -252,16 +252,14 @@ fn assign_tags(
     // "You can assign up to 50 tags to a data stream" — the ceiling is on what the STREAM
     // carries once the request is served, not on what the request names, and it is checked
     // BEFORE the stored map grows. An assignment overwrites a key the stream already
-    // carries, so re-tagging a fully tagged stream stays inside the ceiling.
+    // carries, so re-tagging a fully tagged stream stays inside the ceiling. The refusal is
+    // the one sentence this service states the ceiling in, shared with the other operation
+    // that writes the same stored tag set.
     let resulting = stream.tag_count_with(&input.tags);
     if resulting > crate::state::MAX_STREAM_TAGS {
         return Err(AddTagsToStreamErrorModeled::LimitExceededException(
             LimitExceededException {
-                message: Some(format!(
-                    "assigning these tags would leave the stream carrying {resulting} tags, \
-                     past the {} tags one stream may carry",
-                    crate::state::MAX_STREAM_TAGS
-                )),
+                message: Some(crate::state::tag_ceiling_exceeded_message(resulting)),
             },
         )
         .into());
