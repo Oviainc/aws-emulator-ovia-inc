@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpnGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpnGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates the virtual private gateway the request describes — the requested
+//! type and Availability Zone, the Amazon-side ASN the request asked for or the default its
+//! documentation publishes, and the tags of a `vpn-gateway` tag specification — in the
+//! non-terminal `pending` state the clock then owes `available`, and reports it as it was
+//! stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpnGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpnGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpnGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpnGateway"))
+        use crate::state;
+
+        // The Region the request was signed for, which is the Region whose Availability
+        // Zones a gateway may be created in.
+        let region = state::request_region(ctx.parts());
+
+        // "The Availability Zone for the virtual private gateway" (`AvailabilityZone`): a
+        // zone the Region does not have names no place to create one, and the naming rule
+        // for those zones lives in one place, `availability_zones_in_region`. A request
+        // that names none gets a gateway that reports none — "This field may be empty or
+        // not returned" (`VpnGateway$AvailabilityZone`).
+        let availability_zone = match input.availability_zone.as_deref() {
+            None => None,
+            Some(zone_name) => {
+                // The Region's zone set and the one place a zone a Region does not have is
+                // refused, shared with every other handler that lets a request name a zone.
+                let zones = state::availability_zones_in_region(&region);
+                let zone = state::availability_zone_of_region(
+                    &zones,
+                    &region,
+                    "availabilityZone",
+                    zone_name,
+                    |zone| zone.zone_name.as_str(),
+                )?;
+                Some(zone.zone_name.clone())
+            }
+        };
+
+        // "A private Autonomous System Number (ASN) for the Amazon side of a BGP session"
+        // (`AmazonSideAsn`), at the default its own documentation publishes when the request
+        // names none and refused when it is outside the two published private ranges — the
+        // one place this crate holds an Amazon-side ASN to those ranges.
+        let amazon_side_asn = state::private_amazon_side_asn(input.amazon_side_asn)?;
+
+        // "The tags to apply to the virtual private gateway" (`TagSpecifications`) — "you
+        // must specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the gateway it
+        // creates. The tag payload's own bounds (the count per resource, each key and
+        // value's length, no key twice, nothing in the reserved namespace) are applied by
+        // the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_VPN_GATEWAY,
+            Self::NAME,
+        )?;
+
+        let spec = state::VpnGatewaySpec {
+            // "The type of VPN connection this virtual private gateway supports" (`Type`):
+            // the modelled `GatewayType`, which the boundary validator has already held to
+            // its one member, so it is stored as the request asked for it.
+            gateway_type: input.r#type,
+            availability_zone,
+            amazon_side_asn,
+            tags,
+        };
+        // The bytes this gateway would add to the store, charged against the crate's one
+        // byte budget below so the store is bounded in bytes and not only in records.
+        let payload_bytes = state::vpn_gateway_payload_bytes(&spec);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_vpn_gateway_capacity() {
+            return Err(state::vpn_gateway_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The record itself, built the one way this crate builds a virtual private gateway
+        // — the id, the `pending` state and the clock-owed `available` move all come from
+        // the store, never from the request.
+        let vpn_gateway_id = store.insert_vpn_gateway(spec);
+
+        // The answer is the record as it was stored, so `CreateVpnGateway` and
+        // `DescribeVpnGateways` cannot drift apart.
+        let Some(record) = store.vpn_gateways.get(&vpn_gateway_id) else {
+            return Err(state::internal_error(
+                "the virtual private gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateVpnGatewayOutput {
+            vpn_gateway: Some(record.view.clone()),
+        })
     }
 }
